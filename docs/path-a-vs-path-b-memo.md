@@ -94,6 +94,22 @@ This is **opportunistic content-addressable caching of weight blobs**, not a dis
 
 The model is loaded by the master via `llama_model_load_from_file` (`llama.h:451-453`). There is no API for partial loading. The closest things are `vocab_only` (`llama.h:310`) and `no_alloc` (`llama.h:317`, "only load metadata and simulate memory allocations"); neither produces a working partial-model worker. `tensor_split` (`llama.h:296`) controls splitting *across already-loaded devices*, not which layers exist.
 
+### 1.6 Empirical validation needed before committing to Path B-prime
+
+The central claim of this memo — that llama.cpp has no usable partial-model load path — is based on reading `llama.h` and `src/llama.cpp`. Before committing 10–14 weeks of C++ work, this claim should be validated empirically with a short experiment:
+
+1. Take a real GGUF file (Llama-3.3-70B-Instruct-Q4_K_M is available on bishwa).
+2. Use `gguf-py/` to write a Python script that parses the GGUF, identifies tensors belonging to layers [0, N), and writes a sub-GGUF containing only those tensors plus the embedding.
+3. Try to load that sub-GGUF with `llama-cli`. Capture and analyze the error.
+
+Expected outcomes:
+
+- **Hard error like "missing tensor: blk.20.attn_q.weight"** → confirms §1.5's claim. The model loader walks the layer count from metadata without partial-load support. Path B-prime's central assumption holds.
+- **Soft error or partial load** → llama.cpp may have partial-load capabilities we missed. Re-read the loader code, possibly revise the memo.
+- **Loads successfully but errors at inference time** → most informative. Tells us exactly where in the inference pipeline llama.cpp assumes complete-model presence, narrowing the scope of the patch.
+
+This experiment is half a day of work and would harden the memo's central claim. **Recommended before any C++ work begins.**
+
 ---
 
 ## 2. Whether Nakshatra's protocol can sit on top
@@ -158,25 +174,48 @@ Each Nakshatra worker is a customized llama.cpp inference process. It links agai
 
 ### 5.4 Estimated effort
 
-For the C++ wrapper described in §5.3, with one full-time-equivalent engineer comfortable with llama.cpp's codebase:
+For the C++ wrapper described in §5.3, with one full-time-equivalent engineer **already comfortable with llama.cpp's codebase**:
 
 - **Pre-split GGUF script** (Python, using `gguf-py/`): ~1 week.
 - **Customized inference entry point** (option b: patched `llama_decode` accepting hidden-state input/output): **6–10 weeks** depending on how much of `src/llama-graph.cpp` and `src/llama-context.cpp` needs to be touched. This is the dominant effort.
 - **DLPack boundary shim**: ~1 week.
 - **Integration with Nakshatra's gRPC service**: ~2 weeks.
 
-**Total: 10–14 weeks for the C++ side.** This is in the lower half of §9's "8–16 weeks" budget for the LlamaCppBackend wrapper, and below the §8.7 "Path B" upper estimate of 16+. The savings come from reusing llama.cpp's per-architecture graph builders instead of reimplementing them on top of GGML.
+**Total: 10–14 weeks for the C++ side, with prior llama.cpp experience.**
+
+**For an engineer new to llama.cpp internals, add 50–100% ramp-up.** Realistic total: 15–28 weeks of focused C++ work for a first-time-on-llama.cpp engineer. This is consistent with §9 of the architecture doc's "8–16 weeks" range, but Path B-prime sits in the upper half of that range, not the lower half.
 
 ### 5.5 Specific blockers and risks
 
 - **No upstream API for partial-layer execution.** The recommended approach (option b in §5.3) is a fork-and-patch of `llama_decode`. Upstreaming a clean version of this (option a) is a 4–8 week additional effort and a separate political/coordination question with the llama.cpp maintainers. v0.1 should ship on the local patch; upstreaming can come later.
 - **Pre-split GGUF format is unofficial.** v0.1 tooling will produce sub-GGUFs that the broader llama.cpp ecosystem doesn't recognise as valid. This is fine for our private clusters but is a gotcha for documentation and operator UX.
 - **`cb_eval` is not a substitute for proper API.** Option (c) — using the eval callback to inject and extract hidden states — would technically avoid the patch but produces a fragile, inverted control flow that will rot fast. Reject it unless the patch path proves blocked.
-- **llama.cpp is fast-moving.** The patched `llama_decode` will need rebasing roughly monthly. Budget ~0.5 engineer-day per upstream resync.
+- **llama.cpp is fast-moving.** The patched `llama_decode` will need rebasing against upstream. We commit to monthly rebases as project policy. If we skip more than two cycles, the cost of catching up may exceed budget. Mitigation: maintain a comprehensive test suite (§7's v0.1 success criterion is the floor) that fails loudly on any regression after rebase. Budget ~0.5 engineer-day per scheduled rebase, plus 2–5 days for the occasional upstream change that conflicts with our patch (model architecture additions, graph-builder refactors).
 
 ### 5.6 What llama.cpp's existing RPC is still useful for
 
 Within a single Nakshatra worker that has multiple local GPUs (e.g. a future cloud-NVIDIA deployment with 4× H100), llama.cpp's RPC-as-internal-fabric remains valid. The Nakshatra worker can use llama.cpp's standard RPC mode internally to span its local GPUs while still presenting a single Nakshatra-protocol endpoint upstream. This is an internal optimisation, not a v0.1 concern, and does not change the architecture above.
+
+### 5.7 v0.0 spike option using cb_eval
+
+§5.5 dismisses option (c) — using `cb_eval` to inject and extract hidden states — as fragile for production. That's correct.
+
+But for a **v0.0 architecture spike**, option (c) might be the fastest path to a working two-worker demo, *before* committing to the 10–14 weeks of v0.1 C++ work:
+
+- Two workers, each loading the **full** Llama-2-7B (no partial loading).
+- Worker 1 runs `llama_decode` with a `cb_eval` callback that captures the hidden state after layer N/2 and ships it over the network.
+- Worker 2 receives that hidden state and runs `llama_decode` with a `cb_eval` callback that overrides the layer-N/2 input with the received bytes, then continues to the end.
+- The token sampled at the end goes back to the client.
+
+This is a **hack**: each worker holds the full model (so we don't validate partial loading), the control flow is inverted (callbacks instead of clean APIs), it's not the production architecture. But it would prove the orchestration protocol and activation transport at a fraction of the cost.
+
+Estimated effort for the v0.0 spike: 1–2 weekends of work. If it works, it validates the protocol design before any patched-`llama_decode` work begins. If it fails, we learn the failure cheaply.
+
+**Recommended sequence:**
+
+1. Run the empirical validation in §1.6 (half a day).
+2. Build the v0.0 cb_eval spike (1–2 weekends).
+3. If both succeed, commit to the v0.1 Path B-prime C++ work with confidence.
 
 ---
 
