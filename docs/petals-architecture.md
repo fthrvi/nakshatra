@@ -31,6 +31,7 @@ References below use `path:line` against the upstream Petals tree as cloned into
    - 8.6 Worker capability handshake
    - 8.7 Reuse llama.cpp's existing RPC backend, or bypass it?
 9. [Realistic scope and timeline](#9-realistic-scope-and-timeline)
+- [A.1 Operational addendum: lab-cluster optimization surfaced during research](#a1-operational-addendum-lab-cluster-optimization-surfaced-during-research)
 10. [Appendix: file map for future edits](#10-appendix-file-map-for-future-edits)
 
 ---
@@ -559,7 +560,14 @@ The naive Path A is infeasible. llama.cpp's existing RPC (`tools/rpc/rpc-server.
 
 Pure Path B (drop all the way to GGML graph APIs) is rejected as too expensive — it throws away llama.cpp's per-architecture graph builders.
 
-**Path B-prime**, recommended: each Nakshatra worker links llama.cpp as a library, uses its existing graph builders, but (a) loads only its assigned layer range from a pre-split sub-GGUF and (b) exposes a patched `llama_decode_layers(hidden_in, layer_start, layer_end) → hidden_out` entry point. The Nakshatra inter-worker protocol (gRPC over Tailscale, §6.2) sits above this. Estimated C++ effort: **10–14 weeks**, in the lower half of §9's 8–16 week LlamaCppBackend budget. Dominant risk is rebasing the patched `llama_decode` against fast-moving upstream (~0.5 engineer-day/month). Long-term play is to upstream a clean `llama_decode_layers` API; v0.1 ships on the local patch.
+**Path B-prime**, recommended: each Nakshatra worker links llama.cpp as a library, uses its existing graph builders, but (a) loads only its assigned layer range from a pre-split sub-GGUF and (b) exposes a patched `llama_decode_layers(hidden_in, layer_start, layer_end) → hidden_out` entry point. The Nakshatra inter-worker protocol (gRPC over Tailscale, §6.2) sits above this. Estimated C++ effort: **10–14 weeks** with prior llama.cpp experience, **15–28 weeks** for an engineer new to llama.cpp internals (memo §5.4). Dominant risk is rebasing the patched `llama_decode` against fast-moving upstream — committed monthly rebase cadence, ~0.5 engineer-day per scheduled rebase plus 2–5 days for occasional conflicts (memo §5.5). Long-term play is to upstream a clean `llama_decode_layers` API; v0.1 ships on the local patch.
+
+**Pre-implementation validation plan.** Before C++ work begins, two experiments establish whether Path B-prime is feasible:
+
+1. **Partial-GGUF load test** (½ day): produce a sub-GGUF with `gguf-py/` and attempt to load it with `llama-cli`. Confirms or revises the "no partial load" claim that justifies Path B-prime. See memo §1.6.
+2. **v0.0 cb_eval spike** (1–2 weekends): two workers each loading the full 7B model, activations flowing between them via `cb_eval` callbacks. Validates the protocol and orchestration without paying the v0.1 C++ cost upfront. See memo §5.7.
+
+Both should be completed before the v0.1 timeline (§9) starts running.
 
 ---
 
@@ -580,6 +588,16 @@ Pure Path B (drop all the way to GGML graph APIs) is rejected as too expensive �
 **Without a committed engineer — the user themselves or a co-implementing collaborator — this project will join the long list of decentralized-AI projects that produced compelling architecture documents and no working code.** The architecture doc is the cheap part. The implementation is the work.
 
 That said: the architectural commitments here are well-scoped. LlamaCppBackend as primary (§4.2) collapses most of the cross-vendor complexity into a problem llama.cpp has already solved. The activation-transport math (§4.1) confirms the design is bandwidth-feasible on home hardware. The trust model (§5) and deferred features (§6) make v0.1 tractable. The MVP gradient (§7) is incremental enough to debug. The remaining work is to do the work.
+
+---
+
+## A.1 Operational addendum: lab-cluster optimization surfaced during research
+
+While reading llama.cpp's RPC source for the §8.7 memo, we discovered that `rpc-server` supports a `--cache` flag (`tools/rpc/rpc-server.cpp`, `ggml/src/ggml-rpc/ggml-rpc.cpp:1240–1314`) that enables FNV-1a content-addressable caching of weight blobs ≥10 MiB on workers' local disks. The first cluster startup pays the full weight-streaming cost (the 9-minute number observed during the lab cluster's 70B commissioning). Subsequent startups with the same model send only hashes; cached blobs are loaded from disk.
+
+This is **not a Nakshatra feature** — it's an upstream llama.cpp capability we didn't know we were missing. Adding `--cache /path/to/cache` to the lab cluster's rpc-server invocations should meaningfully reduce warm-cache cluster startup time without any Nakshatra code.
+
+Relevance to Nakshatra: confirms that llama.cpp's RPC, despite being the wrong abstraction for Nakshatra, has more sophisticated machinery than the surface appears. Worth re-reading periodically; future llama.cpp versions may add capabilities (e.g. partial-model load) that change Nakshatra's design space.
 
 ---
 
