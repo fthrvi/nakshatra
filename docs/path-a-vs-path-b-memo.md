@@ -92,23 +92,19 @@ This is **opportunistic content-addressable caching of weight blobs**, not a dis
 
 `src/llama.cpp:923-936` confirms the architecture: when the master process inits the model, RPC-backed devices are enumerated alongside local CUDA/Metal/Vulkan devices and inserted into `model->devices`. They are inserted **at the front** of the device list (`src/llama.cpp:970`) "to minimize network transfers" — the master prefers to assign weights to RPC devices first, so distant slow weights live there and local fast weights live locally.
 
-The model is loaded by the master via `llama_model_load_from_file` (`llama.h:451-453`). There is no API for partial loading. The closest things are `vocab_only` (`llama.h:310`) and `no_alloc` (`llama.h:317`, "only load metadata and simulate memory allocations"); neither produces a working partial-model worker. `tensor_split` (`llama.h:296`) controls splitting *across already-loaded devices*, not which layers exist.
+The model is loaded by the master via `llama_model_load_from_file` (`llama.h:451-453`). The loader does not expose a "load layers [N, M) of this full GGUF" API, but — as the validation in §1.6 shows — it will load any GGUF whose tensor set is self-consistent with its declared `block_count`. So a worker can be handed a pre-built sub-GGUF (its `block_count` overridden to match the included layers) and the loader treats it as a coherent smaller model. The closer-named flags `vocab_only` (`llama.h:310`) and `no_alloc` (`llama.h:317`) don't help — neither produces a working partial-model worker. `tensor_split` (`llama.h:296`) controls splitting *across already-loaded devices*, not which layers exist.
 
-### 1.6 Empirical validation needed before committing to Path B-prime
+The load-bearing missing piece is therefore **not** in the loader, but in the **forward-pass entry point** — see §3.
 
-The central claim of this memo — that llama.cpp has no usable partial-model load path — is based on reading `llama.h` and `src/llama.cpp`. Before committing 10–14 weeks of C++ work, this claim should be validated empirically with a short experiment:
+### 1.6 Empirical validation — DONE 2026-05-04
 
-1. Take a real GGUF file (Llama-3.3-70B-Instruct-Q4_K_M is available on bishwa).
-2. Use `gguf-py/` to write a Python script that parses the GGUF, identifies tensors belonging to layers [0, N), and writes a sub-GGUF containing only those tensors plus the embedding.
-3. Try to load that sub-GGUF with `llama-cli`. Capture and analyze the error.
+This experiment was run; full write-up in `docs/v0.1-validation-partial-gguf.md`.
 
-Expected outcomes:
+**Procedure.** Converted Qwen3-0.6B (28 blocks, 311 tensors) HF → GGUF. Built a sub-GGUF retaining `blk.0..blk.13`, `token_embd`, `output_norm`, `output` and overriding `qwen3.block_count = 14` (157 tensors, 1.07 GB). Ran `llama-completion` against both.
 
-- **Hard error like "missing tensor: blk.20.attn_q.weight"** → confirms §1.5's claim. The model loader walks the layer count from metadata without partial-load support. Path B-prime's central assumption holds.
-- **Soft error or partial load** → llama.cpp may have partial-load capabilities we missed. Re-read the loader code, possibly revise the memo.
-- **Loads successfully but errors at inference time** → most informative. Tells us exactly where in the inference pipeline llama.cpp assumes complete-model presence, narrowing the scope of the patch.
+**Result.** **The strict claim — "llama.cpp will refuse to load a partial GGUF" — is falsified.** Both files loaded cleanly. The half GGUF generated 4 tokens of nonsense (`eightheenth_re`) at exit code 0, with memory and decode speed scaling correctly to the smaller model. llama.cpp accepted the sub-GGUF as a self-consistent 14-layer Qwen3.
 
-This experiment is half a day of work and would harden the memo's central claim. **Recommended before any C++ work begins.**
+**The architectural conclusion (Path B-prime) survives, for a more accurate reason.** The output was garbage *because* the model was loaded fully and run end-to-end: token IDs → embed → blocks 0..13 → `output_norm` → lm_head → logits. With only the first half of the original layers, `output_norm` and the lm_head read activations they were never trained to read. That nonsense is exactly the signature of the missing abstraction we actually need: a forward-pass entry point that takes **hidden states as input** (skipping embed) and returns **hidden states as output** (skipping `output_norm` + lm_head), running only the assigned layer range. That entry point is what Path B-prime's C++ patches add — see §5.3 and §3.
 
 ---
 
@@ -134,11 +130,11 @@ The question as originally posed in §8.7 — "does llama.cpp's RPC support per-
 
 Concretely on Nakshatra's three needs:
 
-- **"Load layers [N, M) from a partial GGUF on the worker."** Not supported. llama.cpp has no partial-model load. The master must load the full GGUF (or pretend to with `vocab_only`/`no_alloc`, which doesn't produce runnable inference). The closest thing — pre-splitting a GGUF into per-worker sub-GGUFs and loading each on its respective worker — is doable as a build-time script but is independent of llama.cpp's RPC code.
-- **"Run forward over those layers."** Not directly. llama.cpp's `llama_decode` (the standard inference call) runs the *entire* forward pass: embed → layers → norm → lm_head → logits. To run only layers [N, M), you have to either modify the graph builder or operate at the GGML level.
-- **"Return activations."** Not directly. `llama_decode` returns logits or embeddings, not raw mid-layer hidden states. There is `cb_eval` (`llama.h:350`, a per-eval callback) which lets you observe intermediate tensors, but observing is not the same as exporting them as the official output of a worker.
+- **"Load layers [N, M) from a partial GGUF on the worker."** Supported with one Python step. As validated in §1.6, llama.cpp will load any self-consistent sub-GGUF (drop `blk.M..blk.N-1` tensors, override `block_count` to `M-N`). Pre-splitting a full GGUF into per-worker sub-GGUFs is therefore a ~110 line Python script using `gguf-py/`, with no llama.cpp patches required.
+- **"Run forward over those layers."** **Not supported.** This is the load-bearing missing abstraction. llama.cpp's `llama_decode` runs the *entire* forward pass: tokens → embed → layers → norm → lm_head → logits. There is no entry point that says "given hidden states, run layers [N, M), return hidden states." Adding that entry point is the dominant C++ patch in Path B-prime.
+- **"Return activations."** Same problem, output side. `llama_decode` returns logits or embeddings, not raw mid-layer hidden states. `cb_eval` (`llama.h:350`) lets you observe intermediate tensors via callback, but observing is not the same as making them a worker's official output. The proper fix is the same forward-pass entry point above, which returns hidden states by construction.
 
-So: even ignoring RPC, the *single-process llama.cpp inference path* does not natively expose the operation Nakshatra needs ("hidden state in → run layers [N, M) → hidden state out"). This is the load-bearing missing piece, and it exists at the `llama_decode`/graph-builder layer, not the RPC layer.
+So: the *single-process llama.cpp inference path* does not natively expose the operation Nakshatra needs ("hidden state in → run layers [N, M) → hidden state out"). This is the load-bearing missing piece, and it exists at the `llama_decode`/graph-builder layer, not the loader and not the RPC layer.
 
 ---
 
@@ -168,7 +164,7 @@ Going all the way down to GGML graph APIs — building each layer's subgraph fro
 
 Each Nakshatra worker is a customized llama.cpp inference process. It links against llama.cpp as a library and uses llama.cpp's per-architecture graph construction code, but:
 
-- **Loads only its layer range.** v0.1: pre-split the GGUF into per-worker sub-GGUFs as a build-time script, so each worker's `llama_model_load_from_file` sees only its assigned layers plus whatever pre/post-processing tensors that worker needs (embedding for worker 0, lm_head for worker N-1, RoPE freqs everywhere). Pre-splitting is operational work, not llama.cpp work.
+- **Loads only its layer range.** v0.1: pre-split the GGUF into per-worker sub-GGUFs as a build-time Python script, so each worker's `llama_model_load_from_file` sees only its assigned layers plus whatever pre/post-processing tensors that worker needs (embedding for worker 0, lm_head for worker N-1, RoPE freqs everywhere). Validated in §1.6 — llama.cpp loads self-consistent sub-GGUFs without modification. Pre-splitting is operational work, not llama.cpp work.
 - **Exposes a "hidden-state in → hidden-state out" entry point.** This is the C++ work. It requires either (a) a new `llama_decode_layers(ctx, hidden_in, layer_start, layer_end, hidden_out)` API contributed upstream, (b) a Nakshatra-side fork/patch of `llama_decode` that does the same, or (c) using `cb_eval` (`llama.h:350`) to inject and extract activations through a hacky callback path. Option (a) is the cleanest; option (b) is the most pragmatic for a v0.1 timeline.
 - **Speaks Nakshatra's protocol on top.** gRPC over Tailscale for the inter-worker protocol (per `docs/petals-architecture.md` §6.2). The Nakshatra protocol layer is independent of llama.cpp.
 
@@ -225,7 +221,7 @@ Estimated effort for the v0.0 spike: 1–2 weekends of work. If it works, it val
 |---|---|
 | Does llama.cpp's RPC support per-layer dispatch? | No — it dispatches arbitrary ggml graphs, finer-grained than layers but in the wrong direction. |
 | Can Nakshatra spawn rpc-server as a subprocess? | No — wire format mismatch is a missing abstraction, not a missing field. |
-| Does it support partial-model loading on workers? | No — master loads the full model; worker is a dumb GPU-over-TCP. |
+| Does it support partial-model loading on workers? | Loader: yes — feed it a self-consistent sub-GGUF (drop tensors + override `block_count`), validated in §1.6. Forward pass: no — `llama_decode` is fixed at token-in / logits-out, no hidden-state I/O. The latter is the actual missing piece. |
 | Path A or Path B? | Neither as originally framed. **Path B-prime**: bypass RPC, reuse llama.cpp's graph builder, patch `llama_decode` for hidden-state I/O. |
 | Estimated C++ effort | 10–14 weeks for v0.1, dominated by the patched `llama_decode` work. |
 | Blocker for naive Path A? | Yes — llama.cpp's RPC operates at GGML primitive level, not transformer-layer level. Reusing it would require Nakshatra's worker to assemble per-layer ggml subgraphs itself, which is more work than just doing Path B-prime. |
