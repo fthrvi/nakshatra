@@ -22,3 +22,4 @@ endfunction()
 
 add_spike_target(cb_eval_observe cb_eval_observe.cpp)
 add_spike_target(cb_eval_write   cb_eval_write.cpp)
+add_spike_target(cb_eval_handoff cb_eval_handoff.cpp)

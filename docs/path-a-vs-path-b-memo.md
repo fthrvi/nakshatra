@@ -192,26 +192,49 @@ For the C++ wrapper described in §5.3, with one full-time-equivalent engineer *
 
 Within a single Nakshatra worker that has multiple local GPUs (e.g. a future cloud-NVIDIA deployment with 4× H100), llama.cpp's RPC-as-internal-fabric remains valid. The Nakshatra worker can use llama.cpp's standard RPC mode internally to span its local GPUs while still presenting a single Nakshatra-protocol endpoint upstream. This is an internal optimisation, not a v0.1 concern, and does not change the architecture above.
 
-### 5.7 v0.0 spike option using cb_eval
+### 5.7 v0.0 spike — cb_eval option attempted, falsified, pivoted (2026-05-06)
 
-§5.5 dismisses option (c) — using `cb_eval` to inject and extract hidden states — as fragile for production. That's correct.
+This section originally proposed a `cb_eval`-based two-worker spike as a
+fast alternative to the C++ patches. It was attempted, and **the
+mechanism does not work**. Full failure analysis in
+`spike/v0.0/STEP-RESULTS.md`. Summary:
 
-But for a **v0.0 architecture spike**, option (c) might be the fastest path to a working two-worker demo, *before* committing to the 10–14 weeks of v0.1 C++ work:
+- `cb_eval`'s contract is not "observe-and-modify the in-flight tensor."
+  Returning `true` on `ask=true` for any mid-graph tensor causes
+  downstream ops to read from a stale or uninitialised buffer (consistent
+  with `ggml-sched` treating the tensor as a graph output staged for host
+  delivery, while consumers read from a different buffer than where the
+  callback writes).
+- **Empirical signature:** with a callback that registers interest in
+  `l_out-13` of Qwen3-0.6B and performs *no modification at all*, all
+  output logits are exactly 0.0 (`min=max=mean=0`, `n_nan=0`,
+  `n_inf=0`). With the callback removed, output is correct (` Paris`).
+- This kills both the capture side (need `ask=false` to read `t->data`,
+  which requires returning true on `ask=true`, which breaks downstream)
+  and the inject side (modifications go to a buffer downstream doesn't
+  read).
 
-- Two workers, each loading the **full** Llama-2-7B (no partial loading).
-- Worker 1 runs `llama_decode` with a `cb_eval` callback that captures the hidden state after layer N/2 and ships it over the network.
-- Worker 2 receives that hidden state and runs `llama_decode` with a `cb_eval` callback that overrides the layer-N/2 input with the received bytes, then continues to the end.
-- The token sampled at the end goes back to the client.
+**Pivoted spike (in progress):**
+- **Capture (Worker A):** sub-GGUF with `blk.0..13` + `token_embd` +
+  `output_norm` + `output`, `block_count=14`. Run `llama_decode` with
+  `embeddings=true`, `pooling_type=NONE`. The 14-block model's last
+  hidden state is `l_out-13` of the original 28-block model.
+- **Inject (Worker B):** sub-GGUF with `blk.14..27` re-indexed to
+  `blk.0..13` + `output_norm` + `output`, `block_count=14`, no
+  `token_embd`. Set `llama_batch.embd` to A's hidden states.
+  `llama_decode` produces logits.
+- **Pass criterion unchanged:** B's argmax must equal the
+  single-process reference (token 12095, ` Paris`).
 
-This is a **hack**: each worker holds the full model (so we don't validate partial loading), the control flow is inverted (callbacks instead of clean APIs), it's not the production architecture. But it would prove the orchestration protocol and activation transport at a fraction of the cost.
+The pivoted spike uses only documented llama.cpp APIs and looks much
+more like v0.1 production code than the original cb_eval hack would
+have. De-risking value goes up, not down.
 
-Estimated effort for the v0.0 spike: 1–2 weekends of work. If it works, it validates the protocol design before any patched-`llama_decode` work begins. If it fails, we learn the failure cheaply.
+**Original recommended sequence (kept for context):**
 
-**Recommended sequence:**
-
-1. Run the empirical validation in §1.6 (half a day).
-2. Build the v0.0 cb_eval spike (1–2 weekends).
-3. If both succeed, commit to the v0.1 Path B-prime C++ work with confidence.
+1. Run the empirical validation in §1.6 (half a day) — ✅ done 2026-05-04.
+2. Build the v0.0 cb_eval spike (1–2 weekends) — attempted, falsified, pivoted (see above).
+3. If both succeed, commit to the v0.1 Path B-prime C++ work with confidence — pending pivot completion.
 
 ---
 
