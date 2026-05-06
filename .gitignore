@@ -128,3 +128,6 @@ dmypy.json
 .pyre/
 
 .idea/
+
+# Track experiment artifacts (the empirical record), even though *.log is otherwise ignored.
+!experiments/**/*.log
