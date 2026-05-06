@@ -1,0 +1,15 @@
+[reading]  /Users/MentoringInstitute/models/llama-3.3-70b/Llama-3.3-70B-Instruct-Q4_K_M.gguf
+[arch]     llama
+[blocks]   src=80, keeping=[0, 20)
+[tensors]  src=724  keeping=184  dropping=540
+[kept first 6]    ['output.weight', 'output_norm.weight', 'rope_freqs.weight', 'token_embd.weight', 'blk.0.attn_k.weight', 'blk.0.attn_norm.weight']
+[dropped first 4] ['blk.20.attn_k.weight', 'blk.20.attn_norm.weight', 'blk.20.attn_output.weight', 'blk.20.attn_q.weight']
+[dropped last 4]  ['blk.79.ffn_down.weight', 'blk.79.ffn_gate.weight', 'blk.79.ffn_norm.weight', 'blk.79.ffn_up.weight']
+[writing]  /Users/MentoringInstitute/nakshatra-v0/partial_layersonly.gguf
+[kvs]      copied=35  skipped=0
+[tensor]   added output.weight [  8192 128256] 14
+[tensor]   added output_norm.weight [8192] 0
+[tensor]   added rope_freqs.weight [64] 0
+[tensor]   added blk.19.ffn_up.weight [ 8192 28672] 12
+[finalize]
+[done]     wrote /Users/MentoringInstitute/nakshatra-v0/partial_layersonly.gguf

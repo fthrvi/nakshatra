@@ -94,11 +94,23 @@ This is **opportunistic content-addressable caching of weight blobs**, not a dis
 
 The model is loaded by the master via `llama_model_load_from_file` (`llama.h:451-453`). There is no API for partial loading. The closest things are `vocab_only` (`llama.h:310`) and `no_alloc` (`llama.h:317`, "only load metadata and simulate memory allocations"); neither produces a working partial-model worker. `tensor_split` (`llama.h:296`) controls splitting *across already-loaded devices*, not which layers exist.
 
-### 1.6 Empirical validation needed before committing to Path B-prime
+### 1.6 Empirical validation needed before committing to Path B-prime — RESOLVED
+
+**Resolution (2026-05-06): experiment ran on the lab Mac `bishwa` against `Llama-3.3-70B-Instruct-Q4_K_M.gguf` (80 blocks). Outcome was the predicted "Hard error" branch — Path B-prime's central assumption holds.** Findings: [`experiments/v0.0/partial_gguf_findings.md`](../experiments/v0.0/partial_gguf_findings.md). Reproducibility script: [`experiments/v0.0/partial_gguf.py`](../experiments/v0.0/partial_gguf.py).
+
+Two runs were performed:
+- Drop output head + layers `[20, 80)` → loader bailed at `missing tensor 'output_norm.weight'`.
+- Drop only layers `[20, 80)` → loader bailed at `missing tensor 'blk.20.attn_norm.weight'`.
+
+The exact missing-tensor name differs from the predicted `blk.20.attn_q.weight` because the loader iterates per-block tensors alphabetically (`attn_norm` < `attn_q`); the conclusion is identical. v0.1 commits to Path B-prime.
+
+The original prediction text follows for reference and for future regression-checking against upstream llama.cpp evolution.
+
+---
 
 The central claim of this memo — that llama.cpp has no usable partial-model load path — is based on reading `llama.h` and `src/llama.cpp`. Before committing 10–14 weeks of C++ work, this claim should be validated empirically with a short experiment:
 
-1. Take a real GGUF file (Llama-3.3-70B-Instruct-Q4_K_M is available on bishwa).
+1. Take a real GGUF file (Llama-3.3-70B-Instruct-Q4_K_M is available on the lab Mac `bishwa` at `~/models/llama-3.3-70b/`).
 2. Use `gguf-py/` to write a Python script that parses the GGUF, identifies tensors belonging to layers [0, N), and writes a sub-GGUF containing only those tensors plus the embedding.
 3. Try to load that sub-GGUF with `llama-cli`. Capture and analyze the error.
 
