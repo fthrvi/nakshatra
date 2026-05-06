@@ -1,65 +1,63 @@
 #!/usr/bin/env python3
-"""Nakshatra client stub (M1) — calls Info on each worker, prints capabilities,
-verifies the chain forms a contiguous layer partition.
+"""Nakshatra client (M2) — Info + single-worker Forward end-to-end test.
+
+Tokenizes prompt locally (vocab-only Llama instance for speed), calls Forward
+on a single worker carrying the full model, prints the next-token id+string.
+For multi-worker chain walk, see M5.
 """
 import argparse
+import struct
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
 import grpc
-import yaml
 import nakshatra_pb2 as pb
 import nakshatra_pb2_grpc as pb_grpc
 
 
-def call_info(addr: str):
-    channel = grpc.insecure_channel(addr)
-    stub = pb_grpc.NakshatraStub(channel)
-    return stub.Info(pb.InfoRequest(), timeout=5.0)
+def tokenize_local(model_path: str, prompt: str):
+    """Use vocab-only Llama for fast tokenization without loading the full model."""
+    from llama_cpp import Llama
+    llama = Llama(model_path=model_path, vocab_only=True, verbose=False)
+    return llama.tokenize(prompt.encode("utf-8"), add_bos=True, special=True), llama
+
+
+def detokenize_one(llama, token_id: int) -> str:
+    try:
+        return llama.detokenize([token_id]).decode("utf-8", errors="replace")
+    except Exception:
+        return "?"
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", type=str, help="cluster YAML config")
-    ap.add_argument("--addr", type=str, action="append",
-                    help="worker addr (e.g. localhost:5500); repeatable. Used if --config not given.")
+    ap.add_argument("--addr", type=str, default="localhost:5500")
+    ap.add_argument("--model-path", type=str, required=True, help="path used for tokenizer (must match worker's model)")
+    ap.add_argument("--prompt", type=str, default="The capital of France is")
     args = ap.parse_args()
 
-    if args.config:
-        cfg = yaml.safe_load(Path(args.config).read_text())
-        workers = [(w["id"], f"{w['address']}:{w['port']}", w.get("layer_range")) for w in cfg["workers"]]
-    elif args.addr:
-        workers = [(f"w{i}", a, None) for i, a in enumerate(args.addr)]
-    else:
-        workers = [("w0", "localhost:5500", None)]
+    print(f"[client] tokenizing locally")
+    token_ids, llama = tokenize_local(args.model_path, args.prompt)
+    print(f"[client] {len(token_ids)} tokens: {token_ids}")
 
-    print(f"[client] querying {len(workers)} worker(s)")
-    rs = []
-    for wid, addr, expected_range in workers:
-        try:
-            r = call_info(addr)
-            rs.append((wid, addr, r))
-            print(f"  {wid:12s} {addr:25s}  layers=[{r.layer_start},{r.layer_end})  backend={r.backend}  model={r.model_id}  hidden={r.hidden_size}  embd={r.has_token_embd}  lm_head={r.has_lm_head}")
-            if expected_range and (r.layer_start != expected_range[0] or r.layer_end != expected_range[1]):
-                print(f"    !! MISMATCH: config says {expected_range}, worker reports [{r.layer_start},{r.layer_end})")
-        except grpc.RpcError as e:
-            print(f"  {wid:12s} {addr:25s}  ERROR: {e.code()} {e.details()}")
+    payload = struct.pack(f"={len(token_ids)}i", *token_ids)
+    req = pb.ForwardRequest(hidden_in=payload, batch=1, n_tokens=len(token_ids), has_token_ids=True)
 
-    if len(rs) >= 2:
-        print()
-        print("[client] chain validation:")
-        ranges = sorted([(r.layer_start, r.layer_end, wid) for wid, _, r in rs])
-        prev_end = ranges[0][0]
-        ok = True
-        for s, e, w in ranges:
-            if s != prev_end:
-                print(f"  GAP between previous and {w}: prev_end={prev_end}, this_start={s}")
-                ok = False
-            prev_end = e
-        if ok:
-            print(f"  OK: contiguous coverage of [{ranges[0][0]}, {ranges[-1][1]})")
+    print(f"[client] calling Forward on {args.addr}")
+    channel = grpc.insecure_channel(args.addr)
+    stub = pb_grpc.NakshatraStub(channel)
+
+    t0 = time.time()
+    resp = stub.Forward(req, timeout=120.0)
+    elapsed = time.time() - t0
+
+    top_id, = struct.unpack("=i", resp.hidden_out)
+    top_str = detokenize_one(llama, top_id)
+    print(f"[client] top-1 next token: id={top_id} '{top_str}'  rtt={elapsed*1000:.0f}ms")
+    print(f"TOPTOK {top_id} {top_str}")
 
 
 if __name__ == "__main__":
