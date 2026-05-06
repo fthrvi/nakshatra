@@ -1,0 +1,62 @@
+syntax = "proto3";
+
+package nakshatra.v0_1;
+
+// v0.1 service surface. See docs/v0.1-implementation-plan.md §3.5 for the
+// full rationale; in short:
+//   - Info: capability handshake at session start (model id, layer range, headroom)
+//   - Forward: stateless single forward pass over the worker's layers (testing aid)
+//   - Inference: stateful bidirectional stream, one per session_id
+//
+// Wire dtype is fp16 by default. Activation transport is always full-precision;
+// no on-wire quantization in v0.1.
+
+service Nakshatra {
+  rpc Info(InfoRequest) returns (InfoResponse);
+  rpc Forward(ForwardRequest) returns (ForwardResponse);
+  rpc Inference(stream InferenceStep) returns (stream InferenceStep);
+}
+
+message InfoRequest {}
+
+message InfoResponse {
+  string protocol_version    = 1;   // semver, e.g. "0.1.0"
+  string backend             = 2;   // e.g. "llamacpp-rocm", "llamacpp-vulkan"
+  string model_id            = 3;   // e.g. "llama-3.3-70b-q4-k-m"
+  bytes  model_content_hash  = 4;   // sha256 of the source full GGUF
+  int32  layer_start         = 5;
+  int32  layer_end           = 6;   // half-open [start, end)
+  int32  hidden_size         = 7;
+  string wire_dtype          = 8;   // "f16" (v0.1 default), "f32"
+  int32  kv_cache_tokens_free = 9;
+  bool   has_token_embd      = 10;  // worker 0 only
+  bool   has_lm_head         = 11;  // last worker only
+}
+
+message ForwardRequest {
+  bytes  hidden_in     = 1;          // raw bytes, shape [batch, n_tokens, hidden_size] in wire_dtype
+  int32  batch         = 2;
+  int32  n_tokens      = 3;
+  bool   has_token_ids = 4;          // if true, hidden_in is actually token IDs (worker 0 path)
+}
+
+message ForwardResponse {
+  bytes hidden_out = 1;
+}
+
+message InferenceStep {
+  string session_id     = 1;         // stable across the stream
+  string step_id        = 2;         // idempotency key for retries
+  int32  prefix_length  = 3;         // tokens already in KV cache before this step
+
+  oneof payload {
+    HiddenState hidden_state = 10;   // hidden state going *into* this worker's layer range
+    TokenIds    token_ids    = 11;   // worker 0 input: token IDs to embed
+    Logits      logits       = 12;   // last worker output: final logits over vocab
+    bytes       error        = 13;   // serialized error string when something goes wrong
+  }
+}
+
+message TokenIds    { repeated int32 ids = 1; }
+message HiddenState { bytes raw = 1; int32 batch = 2; int32 n_tokens = 3; }
+message Logits      { bytes raw = 1; int32 vocab_size = 2; }
