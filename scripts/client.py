@@ -41,11 +41,17 @@ def detok_one(llama, tid):
         return "?"
 
 
-def call_forward(stub, payload, n_tokens, has_token_ids):
+def call_forward(stub, payload, n_tokens, has_token_ids, worker_id="<unknown>"):
     req = pb.ForwardRequest(
         hidden_in=payload, batch=1, n_tokens=n_tokens, has_token_ids=has_token_ids,
     )
-    resp = stub.Forward(req, timeout=300.0)
+    try:
+        resp = stub.Forward(req, timeout=300.0)
+    except grpc.RpcError as e:
+        sys.exit(
+            f"[chain] Forward RPC to worker {worker_id!r} failed: "
+            f"{e.code().name} — {e.details()}"
+        )
     return resp.hidden_out
 
 
@@ -104,21 +110,24 @@ def main():
         # Step 1: tokens → first worker → hidden
         token_payload = struct.pack(f"<{n}i", *ctx_tokens)
         first_w, first_stub, _ = sorted_stubs[0]
-        hidden = call_forward(first_stub, token_payload, n, has_token_ids=True)
+        hidden = call_forward(first_stub, token_payload, n, has_token_ids=True,
+                              worker_id=first_w["id"])
         if len(hidden) != n * n_embd * 4:
-            sys.exit(f"first worker returned {len(hidden)} bytes, expected {n*n_embd*4}")
+            sys.exit(f"[chain] first worker {first_w['id']!r} returned {len(hidden)} bytes, expected {n*n_embd*4} (n_tokens={n} hidden_size={n_embd})")
 
         # Steps 2..N-1: middle workers
         for w, stub, info in sorted_stubs[1:-1]:
-            hidden = call_forward(stub, hidden, n, has_token_ids=False)
+            hidden = call_forward(stub, hidden, n, has_token_ids=False,
+                                  worker_id=w["id"])
             if len(hidden) != n * n_embd * 4:
-                sys.exit(f"middle worker {w['id']} returned wrong size")
+                sys.exit(f"[chain] middle worker {w['id']!r} returned {len(hidden)} bytes, expected {n*n_embd*4}")
 
         # Step N: last worker → token id
         last_w, last_stub, _ = sorted_stubs[-1]
-        last_resp = call_forward(last_stub, hidden, n, has_token_ids=False)
+        last_resp = call_forward(last_stub, hidden, n, has_token_ids=False,
+                                 worker_id=last_w["id"])
         if len(last_resp) != 4:
-            sys.exit(f"last worker returned {len(last_resp)} bytes, expected 4")
+            sys.exit(f"[chain] last worker {last_w['id']!r} returned {len(last_resp)} bytes, expected 4 (one int32 token id)")
         next_id = struct.unpack("<i", last_resp)[0]
         generated.append(next_id)
 

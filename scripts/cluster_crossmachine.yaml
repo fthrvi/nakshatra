@@ -5,7 +5,7 @@
 # Wire dtype is fp32. Hidden state per token = 3072 * 4 = 12 KB.
 # Chain length = 6 prompt tokens × 12 KB = 72 KB across one Tailscale hop.
 model:
-  id: "prithvi-q8-llama32-3b"
+  id: "prithvi-q8"
   hidden_size: 3072
   num_blocks: 28
   wire_dtype: f32
