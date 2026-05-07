@@ -144,6 +144,11 @@ int main(int argc, char ** argv) {
         }
 
         int rc = -1;
+        // For v0.1's brute-force "resend full context per step" pattern we
+        // clear the KV cache before every decode. M7+ adds a streaming
+        // Inference RPC where the daemon keeps KV cache state across calls.
+        llama_memory_clear(llama_get_memory(ctx), true);
+
         if (cmd == 1) {
             // TOKEN_DECODE
             if (payload_bytes != n_tokens * sizeof(int32_t)) {
