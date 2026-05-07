@@ -1,0 +1,25 @@
+# M6 — cross-machine 2-worker cluster over Tailscale.
+#   w0:    prithvi-system-product-name (Linux/CPU, ROCm GPU idle), layers [0,14)
+#   wlast: bishwa (Mac/CPU, AMD Radeon Pro 5700 XT idle), layers [14,28)
+#
+# Wire dtype is fp32. Hidden state per token = 3072 * 4 = 12 KB.
+# Chain length = 6 prompt tokens × 12 KB = 72 KB across one Tailscale hop.
+model:
+  id: "prithvi-q8-llama32-3b"
+  hidden_size: 3072
+  num_blocks: 28
+  wire_dtype: f32
+
+workers:
+  - id: home-pc
+    address: 100.101.134.33      # prithvi-system-product-name
+    port: 5530
+    layer_range: [0, 14]
+    sub_gguf_path: /tmp/cuts/w0_v2.gguf
+    mode: first
+  - id: bishwa
+    address: 100.109.164.69      # bishwa (lab Mac)
+    port: 5531
+    layer_range: [14, 28]
+    sub_gguf_path: /tmp/wlast_v2.gguf
+    mode: last
