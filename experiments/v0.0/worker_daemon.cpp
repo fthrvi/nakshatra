@@ -78,7 +78,7 @@ static void send_response(uint32_t status, const void* payload, uint32_t payload
 
 int main(int argc, char ** argv) {
     if (argc < 3) {
-        fprintf(stderr, "usage: %s <sub_gguf_path> <mode: first|middle|last> [n_ctx]\n", argv[0]);
+        fprintf(stderr, "usage: %s <sub_gguf_path> <mode: first|middle|last> [n_ctx] [n_threads]\n", argv[0]);
         return 1;
     }
     std::string sub_gguf = argv[1];
@@ -90,7 +90,8 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "[daemon] bad mode '%s' (expected first|middle|last)\n", mode_str.c_str());
         return 1;
     }
-    int n_ctx = argc > 3 ? atoi(argv[3]) : 256;
+    int n_ctx     = argc > 3 ? atoi(argv[3]) : 256;
+    int n_threads = argc > 4 ? atoi(argv[4]) : 0;  // 0 = leave llama.cpp's default
 
     common_init();
     llama_backend_init();
@@ -106,6 +107,10 @@ int main(int argc, char ** argv) {
     cp.n_ctx     = n_ctx;
     cp.n_batch   = n_ctx;
     cp.embeddings = true;
+    if (n_threads > 0) {
+        cp.n_threads       = n_threads;
+        cp.n_threads_batch = n_threads;
+    }
     llama_context* ctx = llama_init_from_model(model, cp);
     if (!ctx) {
         fprintf(stderr, "[daemon] failed to init context\n");

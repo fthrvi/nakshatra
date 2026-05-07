@@ -42,11 +42,12 @@ def detok_one(llama, tid):
 
 
 def call_forward(stub, payload, n_tokens, has_token_ids, worker_id="<unknown>",
-                 keep_kv=False, start_pos=0):
+                 keep_kv=False, start_pos=0, timing=None):
     req = pb.ForwardRequest(
         hidden_in=payload, batch=1, n_tokens=n_tokens, has_token_ids=has_token_ids,
         keep_kv=keep_kv, start_pos=start_pos,
     )
+    t0 = time.time()
     try:
         resp = stub.Forward(req, timeout=300.0)
     except grpc.RpcError as e:
@@ -54,6 +55,8 @@ def call_forward(stub, payload, n_tokens, has_token_ids, worker_id="<unknown>",
             f"[chain] Forward RPC to worker {worker_id!r} failed: "
             f"{e.code().name} — {e.details()}"
         )
+    if timing is not None:
+        timing.setdefault(worker_id, []).append(time.time() - t0)
     return resp.hidden_out
 
 
@@ -109,6 +112,7 @@ def main():
     # start_pos=prefix_length) — workers append to their existing KV cache.
     generated = []
     prefix_length = 0
+    timing = {}  # worker_id -> [per-call seconds]
     t0 = time.time()
     for step in range(args.max_tokens):
         if step == 0:
@@ -124,7 +128,7 @@ def main():
         first_w, first_stub, _ = sorted_stubs[0]
         hidden = call_forward(first_stub, token_payload, n_step, has_token_ids=True,
                               worker_id=first_w["id"],
-                              keep_kv=keep_kv, start_pos=prefix_length)
+                              keep_kv=keep_kv, start_pos=prefix_length, timing=timing)
         if len(hidden) != n_step * n_embd * 4:
             sys.exit(f"[chain] first worker {first_w['id']!r} returned {len(hidden)} bytes, expected {n_step*n_embd*4}")
 
@@ -132,7 +136,7 @@ def main():
         for w, stub, info in sorted_stubs[1:-1]:
             hidden = call_forward(stub, hidden, n_step, has_token_ids=False,
                                   worker_id=w["id"],
-                                  keep_kv=keep_kv, start_pos=prefix_length)
+                                  keep_kv=keep_kv, start_pos=prefix_length, timing=timing)
             if len(hidden) != n_step * n_embd * 4:
                 sys.exit(f"[chain] middle worker {w['id']!r} returned {len(hidden)} bytes")
 
@@ -140,7 +144,7 @@ def main():
         last_w, last_stub, _ = sorted_stubs[-1]
         last_resp = call_forward(last_stub, hidden, n_step, has_token_ids=False,
                                  worker_id=last_w["id"],
-                                 keep_kv=keep_kv, start_pos=prefix_length)
+                                 keep_kv=keep_kv, start_pos=prefix_length, timing=timing)
         if len(last_resp) != 4:
             sys.exit(f"[chain] last worker {last_w['id']!r} returned {len(last_resp)} bytes, expected 4")
         next_id = struct.unpack("<i", last_resp)[0]
@@ -156,6 +160,11 @@ def main():
     full = llama.detokenize(tokens + generated).decode("utf-8", errors="replace")
     gen = llama.detokenize(generated).decode("utf-8", errors="replace") if generated else ""
     print(f"[chain] generated {len(generated)} tokens in {elapsed:.2f}s  ({len(generated)/elapsed:.2f} tok/s)")
+    print(f"[chain] per-worker total RPC time:")
+    for wid, ts in timing.items():
+        avg_first = ts[0] if ts else 0.0
+        avg_rest = sum(ts[1:]) / max(1, len(ts) - 1)
+        print(f"    {wid:14s}  step1(prefill)={avg_first*1000:.0f}ms  steps2-N(stream) avg={avg_rest*1000:.0f}ms  total={sum(ts):.2f}s  n_calls={len(ts)}")
     print(f"[chain] full: {full!r}")
     print(f"[chain] gen:  {gen!r}")
     print(f"TOPTOKS_CHAIN {' '.join(str(t) for t in generated)}")
