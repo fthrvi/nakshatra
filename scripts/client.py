@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
-"""Nakshatra client (M2) — Info + single-worker Forward end-to-end test.
+"""Nakshatra client (M5) — chain walker over a multi-worker gRPC chain.
 
-Tokenizes prompt locally (vocab-only Llama instance for speed), calls Forward
-on a single worker carrying the full model, prints the next-token id+string.
-For multi-worker chain walk, see M5.
+Reads a cluster YAML, queries Info on each worker, validates the layer
+partition is contiguous, then walks the chain:
+  worker[0]  : tokens IN, hidden state OUT
+  worker[1..N-2] (middle): hidden IN, hidden OUT
+  worker[N-1] (last): hidden IN, top-1 token id OUT
+
+For multi-token generation the loop replays from the prompt each step
+(same brute-force as M2.5; KV-cache reuse arrives with the streaming
+Inference RPC in a later milestone).
 """
 import argparse
 import struct
@@ -14,74 +20,120 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 import grpc
+import yaml
 import nakshatra_pb2 as pb
 import nakshatra_pb2_grpc as pb_grpc
 
 
-def tokenize_local(model_path: str, prompt: str):
-    """Use vocab-only Llama for fast tokenization without loading the full model."""
+LLAMA3_EOS_IDS = {128001, 128008, 128009}
+
+
+def tokenize_local(model_path, prompt):
     from llama_cpp import Llama
     llama = Llama(model_path=model_path, vocab_only=True, verbose=False)
     return llama.tokenize(prompt.encode("utf-8"), add_bos=True, special=True), llama
 
 
-def detokenize_one(llama, token_id: int) -> str:
+def detok_one(llama, tid):
     try:
-        return llama.detokenize([token_id]).decode("utf-8", errors="replace")
+        return llama.detokenize([tid]).decode("utf-8", errors="replace")
     except Exception:
         return "?"
 
 
-def call_forward(stub, token_ids):
-    payload = struct.pack(f"={len(token_ids)}i", *token_ids)
-    req = pb.ForwardRequest(hidden_in=payload, batch=1, n_tokens=len(token_ids), has_token_ids=True)
-    resp = stub.Forward(req, timeout=120.0)
-    next_id, = struct.unpack("=i", resp.hidden_out)
-    return next_id
-
-
-# Llama-3 family special tokens that should terminate generation.
-LLAMA3_EOS_IDS = {128001, 128008, 128009}
+def call_forward(stub, payload, n_tokens, has_token_ids):
+    req = pb.ForwardRequest(
+        hidden_in=payload, batch=1, n_tokens=n_tokens, has_token_ids=has_token_ids,
+    )
+    resp = stub.Forward(req, timeout=300.0)
+    return resp.hidden_out
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--addr", type=str, default="localhost:5500")
-    ap.add_argument("--model-path", type=str, required=True, help="path used for tokenizer (must match worker's model)")
+    ap.add_argument("--config", type=str, required=True, help="cluster YAML")
+    ap.add_argument("--model-path", type=str, required=True, help="full GGUF path for tokenizer (must match the model that was split)")
     ap.add_argument("--prompt", type=str, default="The capital of France is")
-    ap.add_argument("--max-tokens", "-n", type=int, default=1, help="number of tokens to generate (greedy)")
+    ap.add_argument("--max-tokens", "-n", type=int, default=1)
     args = ap.parse_args()
 
-    print(f"[client] tokenizing locally")
-    token_ids, llama = tokenize_local(args.model_path, args.prompt)
-    print(f"[client] {len(token_ids)} prompt tokens: {token_ids}")
+    cfg = yaml.safe_load(Path(args.config).read_text())
+    workers = cfg["workers"]
+    print(f"[chain] {len(workers)} workers in config")
 
-    print(f"[client] connecting to {args.addr}")
-    channel = grpc.insecure_channel(args.addr)
-    stub = pb_grpc.NakshatraStub(channel)
+    # Open channels + Info on each
+    stubs = []
+    n_embd = None
+    for w in workers:
+        addr = f"{w['address']}:{w['port']}"
+        ch = grpc.insecure_channel(addr)
+        stub = pb_grpc.NakshatraStub(ch)
+        info = stub.Info(pb.InfoRequest(), timeout=10.0)
+        print(f"  {w['id']:12s} {addr:25s}  layers=[{info.layer_start},{info.layer_end})  embd={info.has_token_embd}  lm={info.has_lm_head}  hidden={info.hidden_size}")
+        if n_embd is None:
+            n_embd = info.hidden_size
+        elif info.hidden_size != n_embd:
+            sys.exit(f"hidden_size mismatch across workers: {n_embd} vs {info.hidden_size}")
+        stubs.append((w, stub, info))
+
+    # Validate chain partition
+    n_workers = len(stubs)
+    sorted_stubs = sorted(stubs, key=lambda x: x[2].layer_start)
+    prev_end = sorted_stubs[0][2].layer_start
+    for w, _, info in sorted_stubs:
+        if info.layer_start != prev_end:
+            sys.exit(f"chain GAP between previous and {w['id']}")
+        prev_end = info.layer_end
+    if not sorted_stubs[0][2].has_token_embd:
+        sys.exit("first worker must have token_embd")
+    if not sorted_stubs[-1][2].has_lm_head:
+        sys.exit("last worker must have lm_head")
+    print(f"[chain] OK: contiguous coverage of [{sorted_stubs[0][2].layer_start}, {sorted_stubs[-1][2].layer_end})")
+
+    # Tokenize
+    print(f"[chain] tokenizing locally")
+    tokens, llama = tokenize_local(args.model_path, args.prompt)
+    print(f"[chain] {len(tokens)} prompt tokens: {tokens}")
 
     generated = []
     t0 = time.time()
-    for i in range(args.max_tokens):
-        # M2.5: re-send the entire context each step. M5 will use the streaming
-        # Inference RPC with worker-side KV cache so we don't re-process the prompt.
-        next_id = call_forward(stub, token_ids + generated)
+    for step in range(args.max_tokens):
+        ctx_tokens = tokens + generated
+        n = len(ctx_tokens)
+
+        # Step 1: tokens → first worker → hidden
+        token_payload = struct.pack(f"<{n}i", *ctx_tokens)
+        first_w, first_stub, _ = sorted_stubs[0]
+        hidden = call_forward(first_stub, token_payload, n, has_token_ids=True)
+        if len(hidden) != n * n_embd * 4:
+            sys.exit(f"first worker returned {len(hidden)} bytes, expected {n*n_embd*4}")
+
+        # Steps 2..N-1: middle workers
+        for w, stub, info in sorted_stubs[1:-1]:
+            hidden = call_forward(stub, hidden, n, has_token_ids=False)
+            if len(hidden) != n * n_embd * 4:
+                sys.exit(f"middle worker {w['id']} returned wrong size")
+
+        # Step N: last worker → token id
+        last_w, last_stub, _ = sorted_stubs[-1]
+        last_resp = call_forward(last_stub, hidden, n, has_token_ids=False)
+        if len(last_resp) != 4:
+            sys.exit(f"last worker returned {len(last_resp)} bytes, expected 4")
+        next_id = struct.unpack("<i", last_resp)[0]
         generated.append(next_id)
+
         if next_id in LLAMA3_EOS_IDS:
-            print(f"[client] step {i+1}: EOS token {next_id} — stopping", flush=True)
+            print(f"[chain] step {step+1}: EOS {next_id} — stopping")
             break
-        next_str = detokenize_one(llama, next_id)
-        print(f"[client] step {i+1}: id={next_id} '{next_str}'", flush=True)
+        print(f"[chain] step {step+1}: id={next_id} '{detok_one(llama, next_id)}'", flush=True)
 
     elapsed = time.time() - t0
-    full_text = llama.detokenize(token_ids + generated).decode("utf-8", errors="replace")
-    gen_text = llama.detokenize(generated).decode("utf-8", errors="replace") if generated else ""
-    n_gen = len(generated)
-    tps = n_gen / elapsed if elapsed > 0 else 0.0
-    print(f"[client] generated {n_gen} tokens in {elapsed:.2f}s  ({tps:.1f} tok/s)")
-    print(f"[client] full output: {full_text!r}")
-    print(f"[client] generated only: {gen_text!r}")
-    print(f"TOPTOKS {' '.join(str(t) for t in generated)}")
+    full = llama.detokenize(tokens + generated).decode("utf-8", errors="replace")
+    gen = llama.detokenize(generated).decode("utf-8", errors="replace") if generated else ""
+    print(f"[chain] generated {len(generated)} tokens in {elapsed:.2f}s  ({len(generated)/elapsed:.2f} tok/s)")
+    print(f"[chain] full: {full!r}")
+    print(f"[chain] gen:  {gen!r}")
+    print(f"TOPTOKS_CHAIN {' '.join(str(t) for t in generated)}")
 
 
 if __name__ == "__main__":

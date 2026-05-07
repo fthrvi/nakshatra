@@ -1,0 +1,21 @@
+# Local 2-worker cluster for M5 testing on the home PC.
+# Both workers run as separate processes against split sub-GGUFs of prithvi-q8.
+model:
+  id: "prithvi-q8-llama32-3b"
+  hidden_size: 3072
+  num_blocks: 28
+  wire_dtype: f32
+
+workers:
+  - id: w0
+    address: localhost
+    port: 5530
+    layer_range: [0, 14]
+    sub_gguf_path: /tmp/cuts/w0_v2.gguf
+    mode: first
+  - id: wlast
+    address: localhost
+    port: 5531
+    layer_range: [14, 28]
+    sub_gguf_path: /tmp/cuts/wlast_v2.gguf
+    mode: last
