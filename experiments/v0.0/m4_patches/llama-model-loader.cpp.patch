@@ -1,10 +1,9 @@
---- /home/prithvi/llama.cpp/src/llama-model-loader.cpp.orig	2026-05-06 18:40:43.829848853 -0600
-+++ /home/prithvi/llama.cpp/src/llama-model-loader.cpp	2026-05-06 18:40:43.845495651 -0600
-@@ -417,6 +417,9 @@
+--- /home/prithvi/llama.cpp/src/llama-model-loader.cpp.orig	2026-05-06 19:45:59.311530689 -0600
++++ /home/prithvi/llama.cpp/src/llama-model-loader.cpp	2026-05-06 19:45:59.322462652 -0600
+@@ -417,6 +417,8 @@
      template bool llama_model_loader::get_key<float>      (enum llm_kv kid, float & result,       bool required);
      template bool llama_model_loader::get_key<uint32_t>   (enum llm_kv kid, uint32_t & result,    bool required);
      template bool llama_model_loader::get_key<std::string>(enum llm_kv kid, std::string & result, bool required);
-+    // ===== NAKSHATRA M3+M4: explicit instantiations for the string-keyed get_key overload =====
 +    template bool llama_model_loader::get_key<bool>    (const std::string & key, bool & result,     bool required);
 +    template bool llama_model_loader::get_key<uint32_t>(const std::string & key, uint32_t & result, bool required);
  

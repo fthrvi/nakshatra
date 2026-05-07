@@ -1,14 +1,12 @@
---- /home/prithvi/llama.cpp/src/llama-model.h.orig	2026-05-06 18:40:43.827227539 -0600
-+++ /home/prithvi/llama.cpp/src/llama-model.h	2026-05-06 18:40:43.864745167 -0600
-@@ -514,6 +514,16 @@
+--- /home/prithvi/llama.cpp/src/llama-model.h.orig	2026-05-06 19:45:59.307633009 -0600
++++ /home/prithvi/llama.cpp/src/llama-model.h	2026-05-06 19:45:59.322338401 -0600
+@@ -514,6 +514,14 @@
  
      std::vector<llama_layer> layers;
  
 +    // ===== NAKSHATRA M4: partial-load layout =====
-+    // Populated by load_tensors() from nakshatra.* metadata KVs (M3+).
-+    // Defaults preserve full-model behavior on a normal GGUF.
 +    int  nks_layer_start    = 0;
-+    int  nks_layer_end      = 0;     // 0 means "treat as hparams.n_layer in load_tensors"
++    int  nks_layer_end      = 0;
 +    bool nks_has_token_embd = true;
 +    bool nks_has_lm_head    = true;
 +    bool nks_partial        = false;

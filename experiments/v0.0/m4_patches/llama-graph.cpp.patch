@@ -1,13 +1,9 @@
---- /home/prithvi/llama.cpp/src/llama-graph.cpp.orig	2026-05-06 19:32:52.001304938 -0600
-+++ /home/prithvi/llama.cpp/src/llama-graph.cpp	2026-05-06 19:32:52.012440805 -0600
-@@ -1568,6 +1568,26 @@
+--- /home/prithvi/llama.cpp/src/llama-graph.cpp.orig	2026-05-06 19:45:59.311900214 -0600
++++ /home/prithvi/llama.cpp/src/llama-graph.cpp	2026-05-06 19:45:59.323902733 -0600
+@@ -1568,6 +1568,21 @@
      cb(inp->embd, "inp_embd", -1);
      ggml_set_input(inp->embd);
  
-+    // ===== NAKSHATRA M4 step 2: when tok_embd is nullptr the worker has no
-+    // token embedding tensor (not the first worker in a chain). Skip the
-+    // tokens-and-select path entirely; the caller MUST populate ubatch.embd
-+    // with the upstream worker's hidden state.
 +    if (tok_embd == nullptr) {
 +        ggml_tensor * cur = inp->embd;
 +        if (n_embd_inp != n_embd) {
@@ -22,7 +18,6 @@
 +        ggml_build_forward_expand(gf, cur);
 +        return cur;
 +    }
-+    // ============================================================================
 +
      // select one of the 2 inputs, based on the batch contents
      // ref: https://github.com/ggml-org/llama.cpp/pull/18550
