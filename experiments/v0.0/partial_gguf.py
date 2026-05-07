@@ -60,10 +60,18 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("src", type=Path)
     ap.add_argument("dst", type=Path)
-    ap.add_argument("--keep", type=int, default=20,
-                    help="number of leading blocks to retain (default 20)")
+    # Two ways to specify the cut: legacy --keep N (= start 0, end N) for
+    # backward compat with Phase 0a tests, OR the general --start S --end E.
+    ap.add_argument("--keep", type=int, default=None,
+                    help="legacy: keep blocks [0, KEEP). Implies --start 0 --end KEEP.")
+    ap.add_argument("--start", type=int, default=None,
+                    help="first block index to retain (inclusive). Default 0.")
+    ap.add_argument("--end", type=int, default=None,
+                    help="one-past-last block index to retain. Default n_layer.")
+    ap.add_argument("--keep-token-embd", action="store_true",
+                    help="force-include token_embd.weight (default: only when --start == 0)")
     ap.add_argument("--keep-output", action="store_true",
-                    help="retain output.weight and output_norm.weight (default: drop them)")
+                    help="force-include output.weight + output_norm.weight (default: only when --end == n_layer)")
     args = ap.parse_args()
 
     print(f"[reading]  {args.src}", flush=True)
@@ -76,11 +84,30 @@ def main():
             arch = field_value(f)
         if f.name.endswith(".block_count"):
             block_count = int(field_value(f))
-    print(f"[arch]     {arch}", flush=True)
-    print(f"[blocks]   src={block_count}, keeping=[0, {args.keep})", flush=True)
+    # Resolve start/end from the various flags, with legacy --keep for back-compat
+    if args.keep is not None and (args.start is not None or args.end is not None):
+        sys.exit("--keep is mutually exclusive with --start/--end")
+    if args.keep is not None:
+        layer_start, layer_end = 0, args.keep
+    else:
+        layer_start = args.start if args.start is not None else 0
+        layer_end   = args.end   if args.end   is not None else (block_count or 0)
+    if block_count is None:
+        sys.exit("could not read block_count from source GGUF metadata")
+    if not (0 <= layer_start < layer_end <= block_count):
+        sys.exit(f"invalid range [{layer_start}, {layer_end}) for {block_count}-block model")
 
-    KEEP = args.keep
-    drop_top = set() if args.keep_output else {"output.weight", "output_norm.weight"}
+    has_token_embd = args.keep_token_embd or (layer_start == 0)
+    has_lm_head    = args.keep_output     or (layer_end == block_count)
+
+    print(f"[arch]     {arch}", flush=True)
+    print(f"[range]    src={block_count}, keeping=[{layer_start}, {layer_end})  embd={has_token_embd}  lm_head={has_lm_head}", flush=True)
+
+    drop_top = set()
+    if not has_token_embd:
+        drop_top.add("token_embd.weight")
+    if not has_lm_head:
+        drop_top.update({"output.weight", "output_norm.weight"})
 
     def keep_tensor(name: str) -> bool:
         if name in drop_top:
@@ -88,7 +115,7 @@ def main():
         if name.startswith("blk."):
             try:
                 n = int(name.split(".")[1])
-                return n < KEEP
+                return layer_start <= n < layer_end
             except (IndexError, ValueError):
                 return True
         return True
@@ -137,15 +164,11 @@ def main():
 
     # Nakshatra metadata: declare which slice of the model this sub-GGUF covers.
     # Read by the patched llama.cpp loader (M3) to allow partial load.
-    # The current script always cuts at the upper end (worker-0 shape); v0.1's
-    # production tooling will support arbitrary [start, end) cuts.
-    layer_start = 0
-    layer_end = KEEP
     w.add_uint32("nakshatra.layer_range_start", layer_start)
     w.add_uint32("nakshatra.layer_range_end",   layer_end)
-    w.add_bool  ("nakshatra.has_token_embd",    layer_start == 0)
-    w.add_bool  ("nakshatra.has_lm_head",       bool(args.keep_output))
-    print(f"[nks-kv]   layer_range=[{layer_start}, {layer_end})  has_token_embd={layer_start==0}  has_lm_head={bool(args.keep_output)}", flush=True)
+    w.add_bool  ("nakshatra.has_token_embd",    has_token_embd)
+    w.add_bool  ("nakshatra.has_lm_head",       has_lm_head)
+    print(f"[nks-kv]   range=[{layer_start},{layer_end})  embd={has_token_embd}  lm_head={has_lm_head}", flush=True)
 
     for i, t in enumerate(keep_t):
         w.add_tensor(t.name, np.array(t.data), raw_dtype=t.tensor_type)
