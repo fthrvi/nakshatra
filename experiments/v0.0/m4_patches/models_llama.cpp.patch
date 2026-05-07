@@ -1,5 +1,5 @@
---- /home/prithvi/llama.cpp/src/models/llama.cpp.orig	2026-05-06 19:45:59.312499626 -0600
-+++ /home/prithvi/llama.cpp/src/models/llama.cpp	2026-05-06 19:52:44.359367731 -0600
+--- /home/prithvi/llama.cpp/src/models/llama.cpp.orig	2026-05-06 20:03:20.893504365 -0600
++++ /home/prithvi/llama.cpp/src/models/llama.cpp	2026-05-06 20:18:35.970121960 -0600
 @@ -26,9 +26,14 @@
  
      const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f/sqrtf(float(n_embd_head)) : hparams.f_attention_scale;

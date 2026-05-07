@@ -1,5 +1,5 @@
---- /home/prithvi/llama.cpp/src/llama-model.h.orig	2026-05-06 19:45:59.307633009 -0600
-+++ /home/prithvi/llama.cpp/src/llama-model.h	2026-05-06 19:45:59.322338401 -0600
+--- /home/prithvi/llama.cpp/src/llama-model.h.orig	2026-05-06 20:03:20.890911906 -0600
++++ /home/prithvi/llama.cpp/src/llama-model.h	2026-05-06 20:03:20.904741744 -0600
 @@ -514,6 +514,14 @@
  
      std::vector<llama_layer> layers;
