@@ -40,9 +40,9 @@ CMD_INFO         = 3
 class DaemonClient:
     """Manages a long-lived llama-nakshatra-worker subprocess over stdin/stdout."""
 
-    def __init__(self, daemon_bin: str, sub_gguf: str, mode: str, n_ctx: int):
+    def __init__(self, daemon_bin: str, sub_gguf: str, mode: str, n_ctx: int, n_threads: int = 0):
         self.proc = subprocess.Popen(
-            [daemon_bin, sub_gguf, mode, str(n_ctx)],
+            [daemon_bin, sub_gguf, mode, str(n_ctx), str(n_threads)],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
         self.lock = threading.Lock()
@@ -172,10 +172,12 @@ def main():
     ap.add_argument("--model-id", type=str, default="nakshatra-v0.1")
     ap.add_argument("--daemon-bin", type=str, default="/home/prithvi/llama.cpp/build/bin/llama-nakshatra-worker")
     ap.add_argument("--n-ctx", type=int, default=256)
+    ap.add_argument("--n-threads", type=int, default=0,
+                    help="threads for llama_decode; 0 = let llama.cpp pick a default")
     args = ap.parse_args()
 
-    print(f"[worker] spawning daemon: {args.daemon_bin} {args.sub_gguf} {args.mode} {args.n_ctx}", flush=True)
-    daemon = DaemonClient(args.daemon_bin, args.sub_gguf, args.mode, args.n_ctx)
+    print(f"[worker] spawning daemon: {args.daemon_bin} {args.sub_gguf} {args.mode} {args.n_ctx} threads={args.n_threads}", flush=True)
+    daemon = DaemonClient(args.daemon_bin, args.sub_gguf, args.mode, args.n_ctx, args.n_threads)
 
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
     servicer = WorkerServicer(daemon, args.mode, args.layer_start, args.layer_end, args.model_id)
