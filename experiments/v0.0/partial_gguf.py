@@ -108,6 +108,14 @@ def main():
         drop_top.add("token_embd.weight")
     if not has_lm_head:
         drop_top.update({"output.weight", "output_norm.weight"})
+    # rope_freqs.weight is a top-level tensor that the loader claims via the
+    # i==0 iteration of the per-layer create_tensor loop. When layer_start>0
+    # we skip i==0, which leaves the tensor unclaimed and the loader's
+    # done_getting_tensors check fails ("wrong number of tensors"). Drop it
+    # from non-first-worker sub-GGUFs so the file's tensor count matches what
+    # the patched loader will claim. M4 step 1 finding §1.
+    if layer_start > 0:
+        drop_top.add("rope_freqs.weight")
 
     def keep_tensor(name: str) -> bool:
         if name in drop_top:
