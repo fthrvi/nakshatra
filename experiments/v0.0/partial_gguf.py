@@ -135,6 +135,18 @@ def main():
         for name, reason in skipped[:10]:
             print(f"           SKIP {name} :: {reason}", flush=True)
 
+    # Nakshatra metadata: declare which slice of the model this sub-GGUF covers.
+    # Read by the patched llama.cpp loader (M3) to allow partial load.
+    # The current script always cuts at the upper end (worker-0 shape); v0.1's
+    # production tooling will support arbitrary [start, end) cuts.
+    layer_start = 0
+    layer_end = KEEP
+    w.add_uint32("nakshatra.layer_range_start", layer_start)
+    w.add_uint32("nakshatra.layer_range_end",   layer_end)
+    w.add_bool  ("nakshatra.has_token_embd",    layer_start == 0)
+    w.add_bool  ("nakshatra.has_lm_head",       bool(args.keep_output))
+    print(f"[nks-kv]   layer_range=[{layer_start}, {layer_end})  has_token_embd={layer_start==0}  has_lm_head={bool(args.keep_output)}", flush=True)
+
     for i, t in enumerate(keep_t):
         w.add_tensor(t.name, np.array(t.data), raw_dtype=t.tensor_type)
         if i < 3 or i == len(keep_t) - 1:

@@ -1,0 +1,56 @@
+--- /home/prithvi/llama.cpp/src/llama-model.cpp.orig	2026-05-06 17:39:31.650928246 -0600
++++ /home/prithvi/llama.cpp/src/llama-model.cpp	2026-05-06 17:46:12.733407244 -0600
+@@ -2718,18 +2718,51 @@
+             case LLM_ARCH_MISTRAL3:
+             case LLM_ARCH_LLAMA_EMBED:
+                 {
+-                    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
++                    // ===== NAKSHATRA M3: partial-load via metadata KVs =====
++                    // If nakshatra.layer_range_{start,end} are present, this is a
++                    // sub-GGUF containing only [start, end) of the model. Skip
++                    // tensor creation for layers outside that range, and conditionally
++                    // skip token_embd / output / output_norm based on the
++                    // nakshatra.has_token_embd and nakshatra.has_lm_head flags.
++                    // Behavior on a normal full GGUF (no Nakshatra KVs): unchanged.
++                    uint32_t nks_start_u = 0, nks_end_u = (uint32_t) n_layer;
++                    bool nks_partial =
++                        ml.get_key(std::string("nakshatra.layer_range_start"), nks_start_u, false)
++                     && ml.get_key(std::string("nakshatra.layer_range_end"),   nks_end_u,   false);
++                    bool nks_has_embd = (nks_start_u == 0);
++                    bool nks_has_lm   = ((int)nks_end_u >= n_layer);
++                    if (nks_partial) {
++                        ml.get_key(std::string("nakshatra.has_token_embd"), nks_has_embd, false);
++                        ml.get_key(std::string("nakshatra.has_lm_head"),    nks_has_lm,   false);
++                        LLAMA_LOG_INFO("%s: nakshatra partial-load: layers [%u, %u) of %d, embd=%d lm_head=%d\n",
++                                       __func__, nks_start_u, nks_end_u, n_layer, (int)nks_has_embd, (int)nks_has_lm);
++                    }
++                    const int nks_start = (int) nks_start_u;
++                    const int nks_end   = (int) nks_end_u;
++                    // ========================================================
++
++                    if (nks_has_embd) {
++                        tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
++                    }
+ 
+-                    // output
+-                    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
+-                    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
++                    if (nks_has_lm) {
++                        // output
++                        output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
++                        output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
+ 
+-                    // if output is NULL, init from the input tok embed
+-                    if (output == NULL) {
+-                        output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_DUPLICATED);
++                        // if output is NULL, init from the input tok embed
++                        if (output == NULL) {
++                            output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_DUPLICATED);
++                        }
+                     }
+ 
+                     for (int i = 0; i < n_layer; ++i) {
++                        if (i < nks_start || i >= nks_end) continue;
+                         auto & layer = layers[i];
+ 
+                         layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
