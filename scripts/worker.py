@@ -70,9 +70,9 @@ class DaemonClient:
                 time.sleep(0.5)
         raise TimeoutError("daemon never became ready")
 
-    def call(self, cmd: int, n_tokens: int, payload: bytes):
+    def call(self, cmd: int, n_tokens: int, payload: bytes, start_pos: int = 0, flags: int = 0):
         with self.lock:
-            hdr = struct.pack("<III", cmd, n_tokens, len(payload))
+            hdr = struct.pack("<IIIII", cmd, n_tokens, start_pos, flags, len(payload))
             self.proc.stdin.write(hdr + payload)
             self.proc.stdin.flush()
             head = self.proc.stdout.read(8)
@@ -126,19 +126,23 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
 
     def Forward(self, request, context):
         n = request.n_tokens
+        flags = 0x1 if request.keep_kv else 0x0
+        start_pos = int(request.start_pos)
         if request.has_token_ids:
             if len(request.hidden_in) != n * 4:
                 context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
                 context.set_details(f"hidden_in size mismatch for token_ids mode")
                 return pb.ForwardResponse()
-            status, resp = self.daemon.call(CMD_TOKEN_DECODE, n, request.hidden_in)
+            status, resp = self.daemon.call(CMD_TOKEN_DECODE, n, request.hidden_in,
+                                             start_pos=start_pos, flags=flags)
         else:
             expected = n * self.n_embd * 4
             if len(request.hidden_in) != expected:
                 context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
                 context.set_details(f"hidden_in size mismatch: got {len(request.hidden_in)}, expected {expected}")
                 return pb.ForwardResponse()
-            status, resp = self.daemon.call(CMD_EMBD_DECODE, n, request.hidden_in)
+            status, resp = self.daemon.call(CMD_EMBD_DECODE, n, request.hidden_in,
+                                             start_pos=start_pos, flags=flags)
 
         if status != 0 or len(resp) < 4:
             context.set_code(grpc.StatusCode.INTERNAL)

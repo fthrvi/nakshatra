@@ -5,8 +5,14 @@
 // responses to stdout. One message = one llama_decode call.
 //
 // Wire format (all little-endian):
-//   request:  u32 cmd | u32 n_tokens | u32 payload_bytes | bytes payload
+//   request:  u32 cmd | u32 n_tokens | u32 start_pos | u32 flags | u32 payload_bytes | bytes payload
 //   response: u32 status | u32 payload_bytes | bytes payload
+//
+// Flags:
+//   bit 0 (0x1) = keep_kv. If set, daemon skips llama_memory_clear before
+//                 decode (streaming generation). Tokens are placed in KV
+//                 cache at positions [start_pos, start_pos + n_tokens).
+//                 If unset, daemon clears KV first (single-shot prefill).
 //
 // Commands:
 //   1 = TOKEN_DECODE  payload = int32 token_ids[n_tokens]
@@ -122,13 +128,17 @@ int main(int argc, char ** argv) {
 
     // Main message loop
     while (true) {
-        uint32_t cmd, n_tokens, payload_bytes;
+        uint32_t cmd, n_tokens, start_pos, flags, payload_bytes;
         if (read_u32(&cmd) != 0) break;
         if (read_u32(&n_tokens) != 0) break;
+        if (read_u32(&start_pos) != 0) break;
+        if (read_u32(&flags) != 0) break;
         if (read_u32(&payload_bytes) != 0) break;
 
         std::vector<uint8_t> payload(payload_bytes);
         if (payload_bytes > 0 && read_all_fd(0, payload.data(), payload_bytes) != 0) break;
+
+        const bool keep_kv = (flags & 0x1) != 0;
 
         if (cmd == 3) {
             // INFO
@@ -144,19 +154,33 @@ int main(int argc, char ** argv) {
         }
 
         int rc = -1;
-        // For v0.1's brute-force "resend full context per step" pattern we
-        // clear the KV cache before every decode. M7+ adds a streaming
-        // Inference RPC where the daemon keeps KV cache state across calls.
-        llama_memory_clear(llama_get_memory(ctx), true);
+        // Streaming KV reuse: skip the clear when caller asserts keep_kv.
+        // First step in a session always sends keep_kv=false (cold prefill);
+        // subsequent steps send keep_kv=true with start_pos = prefix_length
+        // so the new tokens append to the existing KV cache.
+        if (!keep_kv) {
+            llama_memory_clear(llama_get_memory(ctx), true);
+        }
 
         if (cmd == 1) {
-            // TOKEN_DECODE
+            // TOKEN_DECODE — use llama_batch_init so we can set explicit
+            // positions (start_pos + i) instead of relying on the auto-zeroed
+            // positions of llama_batch_get_one.
             if (payload_bytes != n_tokens * sizeof(int32_t)) {
                 send_response(2, nullptr, 0); continue;
             }
             const int32_t* tok = (const int32_t*) payload.data();
-            std::vector<llama_token> tokens(tok, tok + n_tokens);
-            rc = llama_decode(ctx, llama_batch_get_one(tokens.data(), tokens.size()));
+            llama_batch batch = llama_batch_init(n_tokens, 0, 1);
+            batch.n_tokens = n_tokens;
+            for (uint32_t i = 0; i < n_tokens; ++i) {
+                batch.token[i] = (llama_token) tok[i];
+                batch.pos[i] = (int32_t)(start_pos + i);
+                batch.n_seq_id[i] = 1;
+                batch.seq_id[i][0] = 0;
+                batch.logits[i] = (i == n_tokens - 1) ? 1 : 0;
+            }
+            rc = llama_decode(ctx, batch);
+            llama_batch_free(batch);
         } else if (cmd == 2) {
             // EMBD_DECODE
             if (payload_bytes != n_tokens * (uint32_t)n_embd * sizeof(float)) {
@@ -166,7 +190,7 @@ int main(int argc, char ** argv) {
             batch.n_tokens = n_tokens;
             memcpy(batch.embd, payload.data(), payload_bytes);
             for (uint32_t i = 0; i < n_tokens; ++i) {
-                batch.pos[i] = (int32_t)i;
+                batch.pos[i] = (int32_t)(start_pos + i);
                 batch.n_seq_id[i] = 1;
                 batch.seq_id[i][0] = 0;
                 batch.logits[i] = (i == n_tokens - 1) ? 1 : 0;
