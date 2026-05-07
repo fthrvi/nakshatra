@@ -41,9 +41,11 @@ def detok_one(llama, tid):
         return "?"
 
 
-def call_forward(stub, payload, n_tokens, has_token_ids, worker_id="<unknown>"):
+def call_forward(stub, payload, n_tokens, has_token_ids, worker_id="<unknown>",
+                 keep_kv=False, start_pos=0):
     req = pb.ForwardRequest(
         hidden_in=payload, batch=1, n_tokens=n_tokens, has_token_ids=has_token_ids,
+        keep_kv=keep_kv, start_pos=start_pos,
     )
     try:
         resp = stub.Forward(req, timeout=300.0)
@@ -101,35 +103,49 @@ def main():
     tokens, llama = tokenize_local(args.model_path, args.prompt)
     print(f"[chain] {len(tokens)} prompt tokens: {tokens}")
 
+    # Streaming KV reuse: workers keep their KV cache across steps. Step 0 is
+    # the cold prefill (full prompt, keep_kv=False, start_pos=0). Each later
+    # step ships only the previous newly-generated token (n=1, keep_kv=True,
+    # start_pos=prefix_length) — workers append to their existing KV cache.
     generated = []
+    prefix_length = 0
     t0 = time.time()
     for step in range(args.max_tokens):
-        ctx_tokens = tokens + generated
-        n = len(ctx_tokens)
+        if step == 0:
+            input_tokens = tokens
+            keep_kv = False
+        else:
+            input_tokens = [generated[-1]]
+            keep_kv = True
+        n_step = len(input_tokens)
 
         # Step 1: tokens → first worker → hidden
-        token_payload = struct.pack(f"<{n}i", *ctx_tokens)
+        token_payload = struct.pack(f"<{n_step}i", *input_tokens)
         first_w, first_stub, _ = sorted_stubs[0]
-        hidden = call_forward(first_stub, token_payload, n, has_token_ids=True,
-                              worker_id=first_w["id"])
-        if len(hidden) != n * n_embd * 4:
-            sys.exit(f"[chain] first worker {first_w['id']!r} returned {len(hidden)} bytes, expected {n*n_embd*4} (n_tokens={n} hidden_size={n_embd})")
+        hidden = call_forward(first_stub, token_payload, n_step, has_token_ids=True,
+                              worker_id=first_w["id"],
+                              keep_kv=keep_kv, start_pos=prefix_length)
+        if len(hidden) != n_step * n_embd * 4:
+            sys.exit(f"[chain] first worker {first_w['id']!r} returned {len(hidden)} bytes, expected {n_step*n_embd*4}")
 
         # Steps 2..N-1: middle workers
         for w, stub, info in sorted_stubs[1:-1]:
-            hidden = call_forward(stub, hidden, n, has_token_ids=False,
-                                  worker_id=w["id"])
-            if len(hidden) != n * n_embd * 4:
-                sys.exit(f"[chain] middle worker {w['id']!r} returned {len(hidden)} bytes, expected {n*n_embd*4}")
+            hidden = call_forward(stub, hidden, n_step, has_token_ids=False,
+                                  worker_id=w["id"],
+                                  keep_kv=keep_kv, start_pos=prefix_length)
+            if len(hidden) != n_step * n_embd * 4:
+                sys.exit(f"[chain] middle worker {w['id']!r} returned {len(hidden)} bytes")
 
         # Step N: last worker → token id
         last_w, last_stub, _ = sorted_stubs[-1]
-        last_resp = call_forward(last_stub, hidden, n, has_token_ids=False,
-                                 worker_id=last_w["id"])
+        last_resp = call_forward(last_stub, hidden, n_step, has_token_ids=False,
+                                 worker_id=last_w["id"],
+                                 keep_kv=keep_kv, start_pos=prefix_length)
         if len(last_resp) != 4:
-            sys.exit(f"[chain] last worker {last_w['id']!r} returned {len(last_resp)} bytes, expected 4 (one int32 token id)")
+            sys.exit(f"[chain] last worker {last_w['id']!r} returned {len(last_resp)} bytes, expected 4")
         next_id = struct.unpack("<i", last_resp)[0]
         generated.append(next_id)
+        prefix_length += n_step
 
         if next_id in LLAMA3_EOS_IDS:
             print(f"[chain] step {step+1}: EOS {next_id} — stopping")

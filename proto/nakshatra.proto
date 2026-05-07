@@ -38,6 +38,8 @@ message ForwardRequest {
   int32  batch         = 2;
   int32  n_tokens      = 3;
   bool   has_token_ids = 4;          // if true, hidden_in is actually token IDs (worker 0 path)
+  bool   keep_kv       = 5;          // streaming: don't clear KV cache before decode (set true on steps after the prefill)
+  int32  start_pos     = 6;          // streaming: position of the first token in the worker's KV cache
 }
 
 message ForwardResponse {
