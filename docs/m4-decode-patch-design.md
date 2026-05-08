@@ -98,7 +98,7 @@ I am keeping the plan's **6–10 weeks** estimate as authoritative; this design 
 
 - **Wire-dtype decision.** The plan §8.3 says fp16. Confirm on M4 start; the entry-point signature uses `float` but bytes-based shape allows fp16 just as easily.
 - **Sub-GGUF generation for the chosen v0.1 model.** [`partial_gguf.py`](../experiments/v0.0/partial_gguf.py) supports arbitrary cuts after the recent generalization; settle on the v0.1 model (per `v0.1-implementation-plan.md` §9 open question) before producing test sub-GGUFs at scale.
-- **Branch hygiene.** The M3 patch lives in `experiments/v0.0/m3_patches/` only as a documentation artifact. M4 starts a real branch in a llama.cpp fork. Pick the fork host (probably `bbastola899/llama.cpp` mirroring our nakshatra fork) and the branch name (`nakshatra-v0.1` is the obvious choice).
+- **Branch hygiene.** The M3 patch lives in `experiments/v0.0/m3_patches/` only as a documentation artifact. M4 starts a real branch in a llama.cpp fork. Pick the fork host (probably `fthrvi/llama.cpp` mirroring our nakshatra fork) and the branch name (`nakshatra-v0.1` is the obvious choice).
 
 ## Sequencing within M4
 
