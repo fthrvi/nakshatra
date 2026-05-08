@@ -17,7 +17,11 @@ CLI:
   --n-ctx          context length cap (default 256)
 """
 import argparse
+import hashlib
 import json
+import os
+import platform
+import shutil
 import socket
 import struct
 import subprocess
@@ -193,6 +197,57 @@ def heartbeat_loop(pillar_url: str, payload: dict, interval: float = 30.0,
         register_with_pillar(pillar_url, payload, log_prefix="[heartbeat]")
 
 
+def detect_ram_gb() -> float:
+    """Best-effort total RAM detection (stdlib only). Returns 0.0 on failure."""
+    sys_name = platform.system()
+    try:
+        if sys_name == "Linux":
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemTotal:"):
+                        kb = int(line.split()[1])
+                        return kb / (1024 * 1024)
+        elif sys_name == "Darwin":
+            out = subprocess.check_output(["sysctl", "-n", "hw.memsize"], timeout=2).decode().strip()
+            return int(out) / (1024 ** 3)
+    except Exception:
+        pass
+    return 0.0
+
+
+def detect_disk_avail_gb(path: str = "/") -> float:
+    """Free disk space at `path` in GB."""
+    try:
+        return shutil.disk_usage(path).free / (1024 ** 3)
+    except Exception:
+        return 0.0
+
+
+def detect_cpu_model() -> str:
+    sys_name = platform.system()
+    try:
+        if sys_name == "Linux":
+            with open("/proc/cpuinfo") as f:
+                for line in f:
+                    if line.startswith("model name"):
+                        return line.split(":", 1)[1].strip()
+        elif sys_name == "Darwin":
+            out = subprocess.check_output(["sysctl", "-n", "machdep.cpu.brand_string"], timeout=2)
+            return out.decode().strip()
+    except Exception:
+        pass
+    return platform.processor() or "unknown"
+
+
+def sha256_of_file(path: str) -> str:
+    """Stream SHA-256 of a file. ~5s for 8 GB on SSD, fine for one-time startup cost."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8 * 1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=5500)
@@ -216,6 +271,25 @@ def main():
     ap.add_argument("--node-id", type=str, default="",
                     help="Stable node identifier for the registry. Defaults to "
                          "hostname-port (e.g. mac3-2-5530).")
+    # Phase 3.5 — hardware declarations. Operator-declared (network trusts you).
+    ap.add_argument("--gpu-vendor", type=str, default="",
+                    help="GPU vendor string e.g. AMD / NVIDIA / Apple / Intel.")
+    ap.add_argument("--gpu-model", type=str, default="",
+                    help="GPU model string e.g. 'Radeon Pro 5700 XT'.")
+    ap.add_argument("--gpu-vram-gb", type=float, default=0.0,
+                    help="Total GPU VRAM in GB. 0 = no GPU declared.")
+    ap.add_argument("--gpu-backend", type=str, default="cpu",
+                    help="Inference backend: rocm/cuda/metal/vulkan/cpu.")
+    ap.add_argument("--vram-offered-gb", type=float, default=-1.0,
+                    help="VRAM you're offering to the network. Default = gpu-vram-gb.")
+    ap.add_argument("--ram-offered-gb", type=float, default=-1.0,
+                    help="RAM offered to the network. Default = half of system RAM.")
+    ap.add_argument("--cpu-threads-offered", type=int, default=0,
+                    help="CPU threads offered. Default = --n-threads value.")
+    ap.add_argument("--disk-for-cache-gb", type=float, default=0.0,
+                    help="Disk space available for layer cache.")
+    ap.add_argument("--skip-sha256", action="store_true",
+                    help="Skip SHA-256 of sub-GGUF (for fast restarts; cached_files lacks hash).")
     args = ap.parse_args()
 
     print(f"[worker] spawning daemon: {args.daemon_bin} {args.sub_gguf} {args.mode} {args.n_ctx} threads={args.n_threads} gpu_layers={args.n_gpu_layers}", flush=True)
@@ -236,16 +310,79 @@ def main():
     if args.pillar_url:
         public_addr = args.public_address or f"{socket.gethostname()}:{args.port}"
         node_id = args.node_id or f"{socket.gethostname()}-{args.port}"
+
+        # Phase 3.5: compute SHA-256 of the sub-GGUF (one-time at startup)
+        sub_gguf_sha256 = ""
+        sub_gguf_size = 0
+        try:
+            sub_gguf_size = os.path.getsize(args.sub_gguf)
+            if not args.skip_sha256:
+                t0 = time.time()
+                print(f"[worker] computing sha256 of {args.sub_gguf} ({sub_gguf_size/1e9:.1f} GB)…", flush=True)
+                sub_gguf_sha256 = sha256_of_file(args.sub_gguf)
+                print(f"[worker] sha256={sub_gguf_sha256[:16]}... ({time.time()-t0:.1f}s)", flush=True)
+        except Exception as e:
+            print(f"[worker] sub-GGUF inspection failed (continuing without hash): {e}", flush=True)
+
+        # Hardware auto-detection (best-effort) + operator overrides
+        ram_total = detect_ram_gb()
+        disk_avail = detect_disk_avail_gb(os.path.dirname(args.sub_gguf) or "/")
+        cpu_model = detect_cpu_model()
+        cpu_threads = os.cpu_count() or 0
+
+        gpus = []
+        if args.gpu_vram_gb > 0:
+            gpus.append({
+                "vendor": args.gpu_vendor or "unknown",
+                "model": args.gpu_model or "unknown",
+                "vram_total_gb": args.gpu_vram_gb,
+                "backend": args.gpu_backend,
+            })
+        hardware = {
+            "platform": platform.system().lower(),
+            "arch": platform.machine(),
+            "cpu_model": cpu_model,
+            "cpu_threads": cpu_threads,
+            "ram_total_gb": ram_total,
+            "disk_avail_gb": disk_avail,
+            "gpus": gpus,
+        }
+
+        # Budget: operator declares; sensible defaults
+        vram_offered = args.vram_offered_gb if args.vram_offered_gb >= 0 else args.gpu_vram_gb
+        ram_offered = args.ram_offered_gb if args.ram_offered_gb >= 0 else max(ram_total / 2, 0.0)
+        cpu_offered = args.cpu_threads_offered or args.n_threads or cpu_threads
+        budget = {
+            "vram_offered_gb": vram_offered,
+            "ram_offered_gb": ram_offered,
+            "cpu_threads_offered": cpu_offered,
+            "disk_for_cache_gb": args.disk_for_cache_gb,
+        }
+
+        cached_files = []
+        if sub_gguf_size > 0:
+            cached_files.append({
+                "model_id": args.model_id,
+                "model_sha256": sub_gguf_sha256,
+                "layer_start": args.layer_start,
+                "layer_end": args.layer_end,
+                "size_bytes": sub_gguf_size,
+                "file_path": str(Path(args.sub_gguf).resolve()),
+            })
+
         register_payload = {
             "node_id": node_id,
             "node_type": "compute",
             "address": public_addr,
             "layer_offerings": [{
                 "model_id": args.model_id,
-                "model_sha256": "",
+                "model_sha256": sub_gguf_sha256,
                 "layer_start": args.layer_start,
                 "layer_end": args.layer_end,
             }],
+            "hardware": hardware,
+            "budget": budget,
+            "cached_files": cached_files,
         }
         register_with_pillar(args.pillar_url, register_payload)
         heartbeat_thread = threading.Thread(
