@@ -1,0 +1,41 @@
+# 5-worker cluster: home PC + 4 lab Macs.
+# Layer split: 28 layers / 5 workers = 6,6,5,6,5
+#
+# Hidden-state per token = 3072 fp32 = 12 KB; 5 workers = 4 hops = 48 KB per token.
+model:
+  id: "prithvi-q8"
+  hidden_size: 3072
+  num_blocks: 28
+  wire_dtype: f32
+
+workers:
+  - id: home-pc
+    address: 100.101.134.33    # prithvi@prithvi-system-product-name (Linux/CPU)
+    port: 5530
+    layer_range: [0, 6]
+    sub_gguf_path: /tmp/cuts5/w0.gguf
+    mode: first
+  - id: mac3-2
+    address: 100.121.48.32     # midev@mac3-2 (macOS/CPU, Radeon Pro 5700 XT)
+    port: 5531
+    layer_range: [6, 12]
+    sub_gguf_path: /tmp/w1.gguf
+    mode: middle
+  - id: mentorings
+    address: 100.122.70.52     # MentoringInstitute@mentorings-imac-pro (Vega 56)
+    port: 5532
+    layer_range: [12, 17]
+    sub_gguf_path: /tmp/w2.gguf
+    mode: middle
+  - id: mac4
+    address: 100.93.112.98     # mi@mac4 (macOS/CPU, Radeon Pro 5700 XT)
+    port: 5533
+    layer_range: [17, 23]
+    sub_gguf_path: /tmp/w3.gguf
+    mode: middle
+  - id: bishwa
+    address: 100.109.164.69    # MentoringInstitute@bishwa (last, has lm_head)
+    port: 5534
+    layer_range: [23, 28]
+    sub_gguf_path: /tmp/w4.gguf
+    mode: last
