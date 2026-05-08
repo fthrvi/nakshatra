@@ -17,10 +17,12 @@ CLI:
   --n-ctx          context length cap (default 256)
 """
 import argparse
+import collections
 import hashlib
 import json
 import os
 import platform
+import re
 import shutil
 import socket
 import struct
@@ -53,15 +55,69 @@ class DaemonClient:
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
         self.lock = threading.Lock()
-        # Drain stderr in a background thread so it doesn't fill up.
+        # Stderr buffer (Phase 3.6): keeps last N lines so we can verify what
+        # the daemon ACTUALLY did (e.g., GPU offload count) vs. what we asked.
+        self.stderr_lines = collections.deque(maxlen=500)
         threading.Thread(target=self._drain_stderr, daemon=True).start()
         # Wait for the "[daemon] ready" line so info+forward are valid.
         self._wait_ready()
 
     def _drain_stderr(self):
         for line in iter(self.proc.stderr.readline, b""):
-            sys.stderr.write(f"[daemon] {line.decode('utf-8', 'replace')}")
+            text = line.decode("utf-8", "replace")
+            self.stderr_lines.append(text)
+            sys.stderr.write(f"[daemon] {text}")
             sys.stderr.flush()
+
+    def gpu_offload_status(self) -> dict:
+        """Parse stderr buffer for what the daemon ACTUALLY did with the GPU.
+
+        Returns:
+          {
+            "n_offloaded": int,    # N from "offloaded N/M layers to GPU"
+            "total_layers": int,   # M from same
+            "uses_gpu": bool,      # n_offloaded > 0
+            "backend_hints": [],   # any backend names spotted in stderr
+            "log_lines": [],       # relevant excerpt for diagnostics
+          }
+        """
+        n_offloaded = 0
+        total_layers = 0
+        uses_gpu = False
+        backend_hints = set()
+        relevant = []
+
+        # Pattern: "load_tensors: offloaded N/M layers to GPU"
+        offload_re = re.compile(r"offloaded\s+(\d+)\s*/\s*(\d+)\s+layers", re.IGNORECASE)
+        # Backend signature lines llama.cpp prints (Metal/ROCm/CUDA buffers)
+        backend_signals = (
+            ("metal",   re.compile(r"\bMetal\b|ggml-metal|MPS", re.IGNORECASE)),
+            ("rocm",    re.compile(r"\bROCm\b|HIP\b|hipMalloc|amdhip", re.IGNORECASE)),
+            ("cuda",    re.compile(r"\bCUDA\b|cudaMalloc|cuBLAS",     re.IGNORECASE)),
+            ("vulkan",  re.compile(r"\bVulkan\b|vk_buffer|MoltenVK",  re.IGNORECASE)),
+            ("cpu",     re.compile(r"\bCPU\b\s+(KV|compute|output)\s+buffer", re.IGNORECASE)),
+        )
+
+        for line in self.stderr_lines:
+            m = offload_re.search(line)
+            if m:
+                n_offloaded = int(m.group(1))
+                total_layers = int(m.group(2))
+                uses_gpu = n_offloaded > 0
+                relevant.append(line.rstrip())
+            for name, rx in backend_signals:
+                if rx.search(line):
+                    backend_hints.add(name)
+                    if name != "cpu" or "compute buffer" in line.lower():
+                        relevant.append(line.rstrip())
+
+        return {
+            "n_offloaded": n_offloaded,
+            "total_layers": total_layers,
+            "uses_gpu": uses_gpu,
+            "backend_hints": sorted(backend_hints),
+            "log_lines": relevant[:20],
+        }
 
     def _wait_ready(self, timeout: float = 60.0):
         # Daemon prints to stderr; we wait until it has loaded the model.
@@ -330,13 +386,38 @@ def main():
         cpu_model = detect_cpu_model()
         cpu_threads = os.cpu_count() or 0
 
+        # Phase 3.6 — verify declared GPU backend against daemon reality.
+        # The daemon's stderr tells us what actually happened on model load
+        # (it prints "offloaded N/M layers to GPU"). If we declared a GPU
+        # backend on the CLI but the daemon offloaded 0 layers, the binary
+        # was almost certainly built without that backend. We DOWNGRADE the
+        # declaration to "cpu" before posting to the pillar — better to be
+        # truthful than to lie about capability.
+        offload_status = daemon.gpu_offload_status()
+        actual_backend = args.gpu_backend
+        declared_gpu = (args.gpu_vram_gb > 0 and args.gpu_backend != "cpu")
+        if declared_gpu and not offload_status["uses_gpu"]:
+            print(f"[worker] WARNING: declared --gpu-backend={args.gpu_backend} "
+                  f"but daemon offloaded {offload_status['n_offloaded']}/"
+                  f"{offload_status['total_layers']} layers — daemon binary likely "
+                  f"lacks {args.gpu_backend} support; downgrading registration to cpu",
+                  flush=True)
+            actual_backend = "cpu"
+        elif declared_gpu:
+            print(f"[worker] verified: daemon offloaded "
+                  f"{offload_status['n_offloaded']}/{offload_status['total_layers']} "
+                  f"layers via {args.gpu_backend} (backends seen in log: "
+                  f"{offload_status['backend_hints']})", flush=True)
+
         gpus = []
         if args.gpu_vram_gb > 0:
             gpus.append({
                 "vendor": args.gpu_vendor or "unknown",
                 "model": args.gpu_model or "unknown",
                 "vram_total_gb": args.gpu_vram_gb,
-                "backend": args.gpu_backend,
+                "backend": actual_backend,
+                "actual_layers_offloaded": offload_status["n_offloaded"],
+                "total_layers_loaded": offload_status["total_layers"],
             })
         hardware = {
             "platform": platform.system().lower(),
