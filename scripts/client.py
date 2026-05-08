@@ -1,21 +1,28 @@
 #!/usr/bin/env python3
 """Nakshatra client (M5) — chain walker over a multi-worker gRPC chain.
 
-Reads a cluster YAML, queries Info on each worker, validates the layer
+Two ways to discover the chain:
+  - --config <yaml>      static cluster YAML (M5 default)
+  - --registry <url>     query Sthambha pillar for live peer registry
+                         and build a chain plan dynamically (Phase 3b)
+
+After discovery, queries Info on each worker, validates the layer
 partition is contiguous, then walks the chain:
   worker[0]  : tokens IN, hidden state OUT
   worker[1..N-2] (middle): hidden IN, hidden OUT
   worker[N-1] (last): hidden IN, top-1 token id OUT
 
-For multi-token generation the loop replays from the prompt each step
-(same brute-force as M2.5; KV-cache reuse arrives with the streaming
-Inference RPC in a later milestone).
+For multi-token generation: streaming KV reuse — first step is full
+prompt with keep_kv=False; later steps ship 1 token with keep_kv=True
+and start_pos=prefix_length.
 """
 import argparse
+import json
 import struct
 import sys
 import time
 from pathlib import Path
+from urllib import request as urlrequest
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -60,17 +67,83 @@ def call_forward(stub, payload, n_tokens, has_token_ids, worker_id="<unknown>",
     return resp.hidden_out
 
 
+def build_chain_from_registry(registry_url: str, model_id: str) -> list:
+    """Query Sthambha registry, return a contiguous chain plan for `model_id`.
+
+    Greedy walk: at each layer cursor, pick the first online peer with a
+    matching offering. Returns list of dicts in cluster-YAML format
+    (id, address, port, layer_start, layer_end) so downstream code stays
+    identical between YAML mode and registry mode.
+
+    Raises RuntimeError if no contiguous chain can be built.
+    """
+    url = f"{registry_url.rstrip('/')}/peers?model={model_id}"
+    with urlrequest.urlopen(url, timeout=10) as resp:
+        data = json.loads(resp.read())
+
+    # Collect (peer, offering) pairs from online compute peers
+    pairs = []
+    for p in data.get("peers", []):
+        if not p.get("is_online"):
+            continue
+        for o in p.get("layer_offerings", []):
+            if o.get("model_id") == model_id:
+                pairs.append((p, o))
+
+    if not pairs:
+        raise RuntimeError(f"no online peers advertise model_id={model_id!r} on {registry_url}")
+
+    # Sort by layer_start, walk greedily
+    pairs.sort(key=lambda po: po[1]["layer_start"])
+
+    chain = []
+    cursor = 0
+    used_node_ids = set()
+    for peer, offering in pairs:
+        if offering["layer_start"] == cursor and peer["node_id"] not in used_node_ids:
+            host, _, port = peer["address"].rpartition(":")
+            if not port:
+                raise RuntimeError(f"peer {peer['node_id']!r} has malformed address {peer['address']!r} (expected host:port)")
+            chain.append({
+                "id": peer["node_id"][:14],
+                "address": host,
+                "port": int(port),
+                "layer_start": offering["layer_start"],
+                "layer_end": offering["layer_end"],
+            })
+            used_node_ids.add(peer["node_id"])
+            cursor = offering["layer_end"]
+
+    if not chain:
+        raise RuntimeError(f"no peer offers layer 0 of model {model_id!r}; cannot start chain")
+
+    return chain
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", type=str, required=True, help="cluster YAML")
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--config", type=str, help="cluster YAML (static)")
+    src.add_argument("--registry", type=str,
+                     help="Sthambha pillar URL (e.g. http://umbrel:7777). Builds "
+                          "chain plan from live registry.")
+    ap.add_argument("--model-id", type=str, default="",
+                    help="Model id to query in the registry (required if --registry)")
     ap.add_argument("--model-path", type=str, required=True, help="full GGUF path for tokenizer (must match the model that was split)")
     ap.add_argument("--prompt", type=str, default="The capital of France is")
     ap.add_argument("--max-tokens", "-n", type=int, default=1)
     args = ap.parse_args()
 
-    cfg = yaml.safe_load(Path(args.config).read_text())
-    workers = cfg["workers"]
-    print(f"[chain] {len(workers)} workers in config")
+    if args.registry:
+        if not args.model_id:
+            sys.exit("--registry requires --model-id")
+        print(f"[chain] querying Sthambha registry: {args.registry} (model={args.model_id})")
+        workers = build_chain_from_registry(args.registry, args.model_id)
+        print(f"[chain] registry returned a chain of {len(workers)} workers covering layers [0,{workers[-1]['layer_end']})")
+    else:
+        cfg = yaml.safe_load(Path(args.config).read_text())
+        workers = cfg["workers"]
+        print(f"[chain] {len(workers)} workers in config")
 
     # Open channels + Info on each
     stubs = []

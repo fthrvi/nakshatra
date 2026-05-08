@@ -17,6 +17,8 @@ CLI:
   --n-ctx          context length cap (default 256)
 """
 import argparse
+import json
+import socket
 import struct
 import subprocess
 import sys
@@ -24,6 +26,7 @@ import threading
 import time
 from concurrent import futures
 from pathlib import Path
+from urllib import request as urlrequest, error as urlerror
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -40,9 +43,9 @@ CMD_INFO         = 3
 class DaemonClient:
     """Manages a long-lived llama-nakshatra-worker subprocess over stdin/stdout."""
 
-    def __init__(self, daemon_bin: str, sub_gguf: str, mode: str, n_ctx: int, n_threads: int = 0):
+    def __init__(self, daemon_bin: str, sub_gguf: str, mode: str, n_ctx: int, n_threads: int = 0, n_gpu_layers: int = 0):
         self.proc = subprocess.Popen(
-            [daemon_bin, sub_gguf, mode, str(n_ctx), str(n_threads)],
+            [daemon_bin, sub_gguf, mode, str(n_ctx), str(n_threads), str(n_gpu_layers)],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
         self.lock = threading.Lock()
@@ -162,6 +165,34 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
         return iter([])
 
 
+def register_with_pillar(pillar_url: str, payload: dict, log_prefix: str = "[worker]"):
+    """POST to <pillar_url>/peer. Best-effort: log on failure, never raise."""
+    try:
+        req = urlrequest.Request(
+            f"{pillar_url.rstrip('/')}/peer",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlrequest.urlopen(req, timeout=5) as resp:
+            body = resp.read().decode()
+            print(f"{log_prefix} registered with pillar: {body}", flush=True)
+            return True
+    except (urlerror.URLError, OSError, TimeoutError) as e:
+        print(f"{log_prefix} pillar registration failed ({pillar_url}): {e}", flush=True)
+        return False
+
+
+def heartbeat_loop(pillar_url: str, payload: dict, interval: float = 30.0,
+                   stop_event: threading.Event = None):
+    """Re-register with pillar every `interval` seconds. Run as daemon thread."""
+    stop_event = stop_event or threading.Event()
+    while not stop_event.is_set():
+        if stop_event.wait(timeout=interval):
+            break
+        register_with_pillar(pillar_url, payload, log_prefix="[heartbeat]")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=5500)
@@ -174,10 +205,21 @@ def main():
     ap.add_argument("--n-ctx", type=int, default=256)
     ap.add_argument("--n-threads", type=int, default=0,
                     help="threads for llama_decode; 0 = let llama.cpp pick a default")
+    ap.add_argument("--n-gpu-layers", type=int, default=0,
+                    help="layers to offload to GPU; 0 = CPU only, 99 = all on GPU")
+    ap.add_argument("--pillar-url", type=str, default="",
+                    help="Sthambha pillar URL (e.g. http://umbrel:7777). If set, "
+                         "worker registers self + sends heartbeat every 30s.")
+    ap.add_argument("--public-address", type=str, default="",
+                    help="Address other peers should use to reach this worker "
+                         "(default: hostname:port). Override for special routing.")
+    ap.add_argument("--node-id", type=str, default="",
+                    help="Stable node identifier for the registry. Defaults to "
+                         "hostname-port (e.g. mac3-2-5530).")
     args = ap.parse_args()
 
-    print(f"[worker] spawning daemon: {args.daemon_bin} {args.sub_gguf} {args.mode} {args.n_ctx} threads={args.n_threads}", flush=True)
-    daemon = DaemonClient(args.daemon_bin, args.sub_gguf, args.mode, args.n_ctx, args.n_threads)
+    print(f"[worker] spawning daemon: {args.daemon_bin} {args.sub_gguf} {args.mode} {args.n_ctx} threads={args.n_threads} gpu_layers={args.n_gpu_layers}", flush=True)
+    daemon = DaemonClient(args.daemon_bin, args.sub_gguf, args.mode, args.n_ctx, args.n_threads, args.n_gpu_layers)
 
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
     servicer = WorkerServicer(daemon, args.mode, args.layer_start, args.layer_end, args.model_id)
@@ -185,9 +227,39 @@ def main():
     server.add_insecure_port(f"[::]:{args.port}")
     print(f"[worker] M5 listening on :{args.port}  mode={args.mode}  layers=[{args.layer_start},{args.layer_end})  model={args.model_id}", flush=True)
     server.start()
+
+    # Pillar registration (Phase 3b). Best-effort — worker still serves
+    # requests if the pillar is unreachable (back-compat with static YAML
+    # cluster configs). Heartbeat thread keeps the registry view fresh.
+    stop_event = threading.Event()
+    heartbeat_thread = None
+    if args.pillar_url:
+        public_addr = args.public_address or f"{socket.gethostname()}:{args.port}"
+        node_id = args.node_id or f"{socket.gethostname()}-{args.port}"
+        register_payload = {
+            "node_id": node_id,
+            "node_type": "compute",
+            "address": public_addr,
+            "layer_offerings": [{
+                "model_id": args.model_id,
+                "model_sha256": "",
+                "layer_start": args.layer_start,
+                "layer_end": args.layer_end,
+            }],
+        }
+        register_with_pillar(args.pillar_url, register_payload)
+        heartbeat_thread = threading.Thread(
+            target=heartbeat_loop,
+            args=(args.pillar_url, register_payload, 30.0, stop_event),
+            daemon=True,
+        )
+        heartbeat_thread.start()
+        print(f"[worker] heartbeat → {args.pillar_url} every 30s as {node_id} @ {public_addr}", flush=True)
+
     try:
         server.wait_for_termination()
     finally:
+        stop_event.set()
         daemon.close()
 
 
