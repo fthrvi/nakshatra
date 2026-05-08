@@ -7,7 +7,7 @@ Nakshatra is the **L2 inference engine** in a three-project architecture. One la
 In short:
 - **Sthambha (L3)** — peer registry, Pi pillar, identity, layer cache. New repo, not yet created. L3 work goes there.
 - **Nakshatra (L2)** — *this repo*. Patched llama.cpp + worker daemon + sub-GGUF tooling + gRPC chain protocol.
-- **Prithvi (L4)** — the agent / being / consciousness. `bbastola899/prithvi` on home PC.
+- **Prithvi (L4)** — the agent / being / consciousness. `fthrvi/prithvi` on home PC.
 
 ## What goes here, what does not
 
