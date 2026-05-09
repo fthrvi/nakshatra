@@ -78,7 +78,7 @@ static void send_response(uint32_t status, const void* payload, uint32_t payload
 
 int main(int argc, char ** argv) {
     if (argc < 3) {
-        fprintf(stderr, "usage: %s <sub_gguf_path> <mode: first|middle|last> [n_ctx] [n_threads]\n", argv[0]);
+        fprintf(stderr, "usage: %s <sub_gguf_path> <mode: first|middle|last> [n_ctx] [n_threads] [n_gpu_layers]\n", argv[0]);
         return 1;
     }
     std::string sub_gguf = argv[1];
@@ -90,14 +90,15 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "[daemon] bad mode '%s' (expected first|middle|last)\n", mode_str.c_str());
         return 1;
     }
-    int n_ctx     = argc > 3 ? atoi(argv[3]) : 256;
-    int n_threads = argc > 4 ? atoi(argv[4]) : 0;  // 0 = leave llama.cpp's default
+    int n_ctx        = argc > 3 ? atoi(argv[3]) : 256;
+    int n_threads    = argc > 4 ? atoi(argv[4]) : 0;  // 0 = leave llama.cpp's default
+    int n_gpu_layers = argc > 5 ? atoi(argv[5]) : 0;  // 0 = CPU only; 99 = all GPU
 
     common_init();
     llama_backend_init();
 
     auto mp = llama_model_default_params();
-    mp.n_gpu_layers = 0;
+    mp.n_gpu_layers = n_gpu_layers;
     llama_model* model = llama_model_load_from_file(sub_gguf.c_str(), mp);
     if (!model) {
         fprintf(stderr, "[daemon] failed to load model: %s\n", sub_gguf.c_str());
@@ -128,8 +129,8 @@ int main(int argc, char ** argv) {
     // layers correctly, and we trust the cluster config rather than
     // round-tripping the metadata. The INFO response surfaces what we know.
 
-    fprintf(stderr, "[daemon] ready: %s n_embd=%d n_layer=%d n_vocab=%d n_ctx=%d\n",
-            sub_gguf.c_str(), n_embd, n_layer, n_vocab, n_ctx);
+    fprintf(stderr, "[daemon] ready: %s n_embd=%d n_layer=%d n_vocab=%d n_ctx=%d n_gpu_layers=%d\n",
+            sub_gguf.c_str(), n_embd, n_layer, n_vocab, n_ctx, n_gpu_layers);
 
     // Main message loop
     while (true) {
