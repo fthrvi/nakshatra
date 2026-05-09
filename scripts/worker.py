@@ -371,11 +371,16 @@ def start_file_server(serving_dir: str, port: int):
 
 def fetch_sub_gguf_from_peer(pillar_url: str, model_id: str,
                               layer_start: int, layer_end: int,
-                              dest_path: str) -> str:
+                              dest_path: str,
+                              own_node_id: str = "") -> str:
     """Query Sthambha for a peer with the requested file and download it.
 
     Returns the local path on success; raises RuntimeError on failure.
     Verifies SHA-256 against the pillar's recorded hash if present.
+
+    Skips candidates whose node_id matches `own_node_id` (don't fetch
+    from yourself). Retries the next candidate on connection failure
+    so a stale-but-still-listed peer doesn't block the bootstrap.
     """
     # 1. Ask the pillar for the file index
     files_url = f"{pillar_url.rstrip('/')}/files?model={model_id}"
@@ -385,13 +390,14 @@ def fetch_sub_gguf_from_peer(pillar_url: str, model_id: str,
     except Exception as e:
         raise RuntimeError(f"could not query pillar at {files_url}: {e}")
 
-    # 2. Find a candidate online peer holding (model_id, layer_start, layer_end)
+    # 2. Find candidate online peers holding (model_id, layer_start, layer_end)
     candidates = [
         f for f in data.get("files", [])
         if f.get("model_id") == model_id
         and int(f.get("layer_start", -1)) == layer_start
         and int(f.get("layer_end", -1)) == layer_end
         and f.get("is_online")
+        and f.get("node_id") != own_node_id  # don't fetch from yourself
     ]
     if not candidates:
         raise RuntimeError(
@@ -399,63 +405,68 @@ def fetch_sub_gguf_from_peer(pillar_url: str, model_id: str,
             f" — file not available on the network"
         )
 
-    # 3. Pick first (could rank by latency / hash trust later)
-    chosen = candidates[0]
-    addr = chosen.get("address", "")
-    if ":" not in addr:
-        raise RuntimeError(f"peer {chosen.get('node_id')} has malformed address {addr!r}")
-    host, _, port_str = addr.rpartition(":")
-    grpc_port = int(port_str)
-    file_port = grpc_port + 1000  # convention: file server on grpc_port + 1000
-    expected_sha = chosen.get("model_sha256", "")
-    src_basename = Path(chosen.get("file_path", "")).name or f"w-{layer_start}-{layer_end}.gguf"
+    # 3. Try each candidate in order; on connection failure, fall through
+    last_error = None
+    for chosen in candidates:
+        addr = chosen.get("address", "")
+        if ":" not in addr:
+            last_error = f"malformed address {addr!r}"
+            continue
+        host, _, port_str = addr.rpartition(":")
+        grpc_port = int(port_str)
+        file_port = grpc_port + 1000  # convention: file server on grpc_port + 1000
+        expected_sha = chosen.get("model_sha256", "")
+        src_basename = Path(chosen.get("file_path", "")).name or f"w-{layer_start}-{layer_end}.gguf"
 
-    fetch_url = f"http://{host}:{file_port}/file/{src_basename}"
-    print(f"[fetch] downloading {chosen.get('node_id')}'s {src_basename} from {fetch_url}", flush=True)
+        fetch_url = f"http://{host}:{file_port}/file/{src_basename}"
+        print(f"[fetch] trying {chosen.get('node_id')} → {fetch_url}", flush=True)
 
-    # 4. Download to dest+".tmp", computing SHA on the fly
-    Path(dest_path).parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = dest_path + ".tmp"
-    h = hashlib.sha256()
-    bytes_received = 0
-    t0 = time.time()
-    try:
-        with urlrequest.urlopen(fetch_url, timeout=60) as resp:
-            content_length = int(resp.headers.get("Content-Length", "0"))
-            with open(tmp_path, "wb") as out:
-                while True:
-                    chunk = resp.read(8 * 1024 * 1024)
-                    if not chunk:
-                        break
-                    out.write(chunk)
-                    h.update(chunk)
-                    bytes_received += len(chunk)
-                    # Progress every ~200 MB
-                    if bytes_received and bytes_received % (200 * 1024 * 1024) < 8 * 1024 * 1024:
-                        pct = (bytes_received / content_length * 100) if content_length else 0
-                        elapsed = time.time() - t0
-                        rate_mbps = (bytes_received / 1e6) / max(elapsed, 0.001)
-                        print(f"[fetch]   {bytes_received/1e9:.1f}/{content_length/1e9:.1f} GB ({pct:.0f}%) at {rate_mbps:.1f} MB/s",
-                              flush=True)
-    except Exception as e:
-        try: os.unlink(tmp_path)
-        except Exception: pass
-        raise RuntimeError(f"download from {fetch_url} failed: {e}")
+        Path(dest_path).parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = dest_path + ".tmp"
+        h = hashlib.sha256()
+        bytes_received = 0
+        t0 = time.time()
+        try:
+            with urlrequest.urlopen(fetch_url, timeout=60) as resp:
+                content_length = int(resp.headers.get("Content-Length", "0"))
+                with open(tmp_path, "wb") as out:
+                    while True:
+                        chunk = resp.read(8 * 1024 * 1024)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                        h.update(chunk)
+                        bytes_received += len(chunk)
+                        if bytes_received and bytes_received % (200 * 1024 * 1024) < 8 * 1024 * 1024:
+                            pct = (bytes_received / content_length * 100) if content_length else 0
+                            elapsed = time.time() - t0
+                            rate_mbps = (bytes_received / 1e6) / max(elapsed, 0.001)
+                            print(f"[fetch]   {bytes_received/1e9:.1f}/{content_length/1e9:.1f} GB ({pct:.0f}%) at {rate_mbps:.1f} MB/s",
+                                  flush=True)
+        except Exception as e:
+            print(f"[fetch] {chosen.get('node_id')} failed ({e}); trying next candidate", flush=True)
+            try: os.unlink(tmp_path)
+            except Exception: pass
+            last_error = str(e)
+            continue
 
-    # 5. Verify SHA-256 if the pillar gave us one
-    actual_sha = h.hexdigest()
-    if expected_sha and actual_sha != expected_sha:
-        os.unlink(tmp_path)
-        raise RuntimeError(
-            f"sha mismatch: expected {expected_sha[:16]}..., got {actual_sha[:16]}..."
-        )
+        # Verify SHA-256 if the pillar gave us one
+        actual_sha = h.hexdigest()
+        if expected_sha and actual_sha != expected_sha:
+            print(f"[fetch] {chosen.get('node_id')} sha mismatch (got {actual_sha[:12]}, expected {expected_sha[:12]}); trying next", flush=True)
+            try: os.unlink(tmp_path)
+            except Exception: pass
+            last_error = "sha mismatch"
+            continue
 
-    # 6. Atomic move into place
-    os.rename(tmp_path, dest_path)
-    elapsed = time.time() - t0
-    print(f"[fetch] saved {dest_path} ({bytes_received:,} bytes, sha={actual_sha[:12]}..., "
-          f"{elapsed:.1f}s, {(bytes_received/1e6)/max(elapsed,0.001):.1f} MB/s)", flush=True)
-    return dest_path
+        # Atomic move into place
+        os.rename(tmp_path, dest_path)
+        elapsed = time.time() - t0
+        print(f"[fetch] saved {dest_path} ({bytes_received:,} bytes, sha={actual_sha[:12]}..., "
+              f"{elapsed:.1f}s, {(bytes_received/1e6)/max(elapsed,0.001):.1f} MB/s) from {chosen.get('node_id')}", flush=True)
+        return dest_path
+
+    raise RuntimeError(f"all {len(candidates)} candidate peers failed; last error: {last_error}")
 
 
 def detect_ram_gb() -> float:
@@ -568,11 +579,13 @@ def main():
     if not os.path.exists(args.sub_gguf):
         if args.auto_fetch and args.pillar_url:
             print(f"[worker] sub-gguf missing at {args.sub_gguf}; auto-fetching from peer", flush=True)
+            own_node_id = args.node_id or f"{socket.gethostname()}-{args.port}"
             try:
                 fetch_sub_gguf_from_peer(
                     args.pillar_url, args.model_id,
                     args.layer_start, args.layer_end,
                     args.sub_gguf,
+                    own_node_id=own_node_id,
                 )
             except Exception as e:
                 sys.exit(f"[worker] auto-fetch failed: {e}")
