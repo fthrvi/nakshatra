@@ -469,6 +469,89 @@ def fetch_sub_gguf_from_peer(pillar_url: str, model_id: str,
     raise RuntimeError(f"all {len(candidates)} candidate peers failed; last error: {last_error}")
 
 
+def scan_cache_dir(cache_dir: str, model_id: str,
+                    sha_cache: dict = None) -> list:
+    """Phase 4a: scan a directory for Nakshatra sub-GGUFs, return list of
+    CachedFile-shaped dicts (model_id, model_sha256, layer_start, layer_end,
+    size_bytes, file_path).
+
+    Reads each .gguf's metadata for `nakshatra.layer_range_start/end` and
+    treats files that don't carry these as not-Nakshatra (skipped).
+
+    `sha_cache` (optional) is a {file_path: sha} dict — useful when the
+    caller has already hashed a file (avoids re-streaming 8 GB).
+
+    SHA-256 is otherwise streamed with sidecar caching: a file at
+    `<gguf_path>.sha256` records the hash; if it exists and is newer
+    than the gguf, we trust it. Cuts ~5-30s per cached file on restart.
+    """
+    results = []
+    sha_cache = sha_cache or {}
+    if not os.path.isdir(cache_dir):
+        return results
+
+    try:
+        import gguf
+    except ImportError:
+        print(f"[cache-scan] gguf lib not available; only single sub-GGUF will be advertised",
+              flush=True)
+        return results
+
+    files = sorted(f for f in os.listdir(cache_dir) if f.endswith(".gguf"))
+    for filename in files:
+        path = os.path.join(cache_dir, filename)
+        try:
+            reader = gguf.GGUFReader(path)
+            layer_start = layer_end = None
+            for field in reader.fields.values():
+                if field.name == "nakshatra.layer_range_start":
+                    layer_start = int(field.parts[field.data[0]][0])
+                elif field.name == "nakshatra.layer_range_end":
+                    layer_end = int(field.parts[field.data[0]][0])
+            if layer_start is None or layer_end is None:
+                continue  # not a Nakshatra sub-GGUF
+
+            size = os.path.getsize(path)
+
+            # SHA: cache > sidecar > recompute
+            if path in sha_cache:
+                sha = sha_cache[path]
+            else:
+                sidecar = path + ".sha256"
+                if (os.path.isfile(sidecar) and
+                    os.path.getmtime(sidecar) >= os.path.getmtime(path)):
+                    try:
+                        sha = open(sidecar).read().strip().split()[0]
+                        if len(sha) != 64:
+                            raise ValueError("malformed sidecar sha")
+                    except Exception:
+                        sha = None
+                    if sha is None:
+                        sha = sha256_of_file(path)
+                        try: open(sidecar, "w").write(sha + "\n")
+                        except Exception: pass
+                else:
+                    print(f"[cache-scan] hashing {filename} ({size/1e9:.1f} GB)…", flush=True)
+                    t0 = time.time()
+                    sha = sha256_of_file(path)
+                    try: open(sidecar, "w").write(sha + "\n")
+                    except Exception: pass
+                    print(f"[cache-scan]   sha={sha[:12]}... ({time.time()-t0:.1f}s)", flush=True)
+
+            results.append({
+                "model_id": model_id,
+                "model_sha256": sha,
+                "layer_start": layer_start,
+                "layer_end": layer_end,
+                "size_bytes": size,
+                "file_path": path,
+            })
+            print(f"[cache-scan] {filename}: layers=[{layer_start},{layer_end}) sha={sha[:12]}", flush=True)
+        except Exception as e:
+            print(f"[cache-scan] {filename}: skipped ({e})", flush=True)
+    return results
+
+
 def detect_ram_gb() -> float:
     """Best-effort total RAM detection (stdlib only). Returns 0.0 on failure."""
     sys_name = platform.system()
@@ -571,6 +654,13 @@ def main():
     ap.add_argument("--auto-fetch", action="store_true",
                     help="If --sub-gguf doesn't exist, query --pillar-url for who "
                          "has the file and download it before spawning the daemon.")
+    ap.add_argument("--cache-dir", type=str, default="",
+                    help="Directory to scan for additional cached sub-GGUFs that "
+                         "this worker can serve to peers. Default: parent of "
+                         "--sub-gguf. Workers advertise EVERY Nakshatra sub-GGUF "
+                         "found here in cached_files (Phase 4a redundancy).")
+    ap.add_argument("--no-cache-scan", action="store_true",
+                    help="Disable cache-dir scan; only advertise --sub-gguf.")
     args = ap.parse_args()
 
     # Phase 4: if sub-GGUF is missing AND we have a pillar to ask, fetch it
@@ -700,16 +790,27 @@ def main():
             "disk_for_cache_gb": args.disk_for_cache_gb,
         }
 
+        # Phase 4a: scan the cache dir for ALL Nakshatra sub-GGUFs (not
+        # just the one this worker is serving). Any peer with multiple
+        # cached files advertises them all — natural redundancy.
         cached_files = []
-        if sub_gguf_size > 0:
-            cached_files.append({
+        if not args.no_cache_scan:
+            cache_dir = args.cache_dir or str(Path(args.sub_gguf).resolve().parent)
+            sha_seed = {str(Path(args.sub_gguf).resolve()): sub_gguf_sha256} if sub_gguf_sha256 else {}
+            cached_files = scan_cache_dir(cache_dir, args.model_id, sha_cache=sha_seed)
+            print(f"[worker] cache-scan found {len(cached_files)} sub-GGUF(s) in {cache_dir}", flush=True)
+
+        # Fallback: if scan found nothing (legacy / non-Nakshatra files),
+        # advertise just the one we're serving.
+        if not cached_files and sub_gguf_size > 0:
+            cached_files = [{
                 "model_id": args.model_id,
                 "model_sha256": sub_gguf_sha256,
                 "layer_start": args.layer_start,
                 "layer_end": args.layer_end,
                 "size_bytes": sub_gguf_size,
                 "file_path": str(Path(args.sub_gguf).resolve()),
-            })
+            }]
 
         register_payload = {
             "node_id": node_id,
