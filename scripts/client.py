@@ -67,13 +67,44 @@ def call_forward(stub, payload, n_tokens, has_token_ids, worker_id="<unknown>",
     return resp.hidden_out
 
 
+def _peer_chain_score(peer: dict) -> int:
+    """Phase 5: lower is better. Prefers peers whose GPUs are not flagged
+    as 'drifty' in the registry (Vega-class etc.). Ties broken by ordering
+    GPU > CPU since GPU is faster when correct.
+
+    Returns:
+        0  for verified-GPU peers with chain_status='ok'
+        1  for CPU peers (no drift risk, but slow)
+        2  for GPU peers with chain_status='drifty' (use only as last resort)
+        3  for peers we can't classify (unknown hardware)
+    """
+    hw = peer.get("hardware") or {}
+    gpus = hw.get("gpus") or []
+    if not gpus:
+        return 1  # plain CPU peer
+    g = gpus[0]
+    backend = (g.get("backend") or "cpu").lower()
+    chain_status = (g.get("chain_status") or "ok").lower()
+    actual = int(g.get("actual_layers_offloaded", 0))
+    if backend != "cpu" and actual > 0:
+        if chain_status == "drifty":
+            return 2  # GPU but known to drift — last resort
+        return 0      # verified GPU, ok
+    return 1          # declared GPU but didn't actually offload → CPU
+
+
 def build_chain_from_registry(registry_url: str, model_id: str) -> list:
     """Query Sthambha registry, return a contiguous chain plan for `model_id`.
 
-    Greedy walk: at each layer cursor, pick the first online peer with a
-    matching offering. Returns list of dicts in cluster-YAML format
-    (id, address, port, layer_start, layer_end) so downstream code stays
-    identical between YAML mode and registry mode.
+    Phase-5 chain-quality ordering: at each layer cursor, prefer peers
+    that score better (verified non-drifty GPU > CPU > drifty GPU >
+    unknown). Prevents scheduling a known-bad GPU into the chain when
+    a CPU peer covers the same range, while still allowing a drifty GPU
+    if no alternative exists.
+
+    Returns list of dicts in cluster-YAML format (id, address, port,
+    layer_start, layer_end) so downstream code stays identical between
+    YAML mode and registry mode.
 
     Raises RuntimeError if no contiguous chain can be built.
     """
@@ -93,17 +124,29 @@ def build_chain_from_registry(registry_url: str, model_id: str) -> list:
     if not pairs:
         raise RuntimeError(f"no online peers advertise model_id={model_id!r} on {registry_url}")
 
-    # Sort by layer_start, walk greedily
-    pairs.sort(key=lambda po: po[1]["layer_start"])
+    # Sort: layer_start ascending, then chain-quality score ascending.
+    # Greedy walk picks first match per cursor → naturally prefers
+    # higher-quality peers when alternatives exist for the same range.
+    pairs.sort(key=lambda po: (po[1]["layer_start"], _peer_chain_score(po[0])))
 
     chain = []
     cursor = 0
     used_node_ids = set()
+    saw_drifty = False
     for peer, offering in pairs:
         if offering["layer_start"] == cursor and peer["node_id"] not in used_node_ids:
             host, _, port = peer["address"].rpartition(":")
             if not port:
                 raise RuntimeError(f"peer {peer['node_id']!r} has malformed address {peer['address']!r} (expected host:port)")
+            score = _peer_chain_score(peer)
+            if score == 2:
+                saw_drifty = True
+                gpus = (peer.get("hardware") or {}).get("gpus") or [{}]
+                print(f"[chain] WARNING: including drifty-flagged peer {peer['node_id']} "
+                      f"({gpus[0].get('model','?')}) in chain — "
+                      f"output may be incoherent. No alternative for layers "
+                      f"[{offering['layer_start']},{offering['layer_end']}).",
+                      file=sys.stderr)
             chain.append({
                 "id": peer["node_id"][:14],
                 "address": host,
