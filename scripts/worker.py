@@ -59,6 +59,10 @@ class DaemonClient:
         # Stderr buffer (Phase 3.6): keeps last N lines so we can verify what
         # the daemon ACTUALLY did (e.g., GPU offload count) vs. what we asked.
         self.stderr_lines = collections.deque(maxlen=500)
+        # Phase H: rolling per-RPC timing. Each Forward() records its
+        # daemon-call duration here; main thread averages the last N for
+        # the heartbeat payload so the pillar can latency-rank peers.
+        self.recent_rpc_ms = collections.deque(maxlen=20)
         threading.Thread(target=self._drain_stderr, daemon=True).start()
         # Wait for the "[daemon] ready" line so info+forward are valid.
         self._wait_ready()
@@ -136,6 +140,7 @@ class DaemonClient:
 
     def call(self, cmd: int, n_tokens: int, payload: bytes, start_pos: int = 0, flags: int = 0):
         with self.lock:
+            t0 = time.time()
             hdr = struct.pack("<IIIII", cmd, n_tokens, start_pos, flags, len(payload))
             self.proc.stdin.write(hdr + payload)
             self.proc.stdin.flush()
@@ -144,6 +149,10 @@ class DaemonClient:
                 raise RuntimeError(f"short read from daemon (got {len(head)} bytes)")
             status, plen = struct.unpack("<II", head)
             data = self.proc.stdout.read(plen) if plen else b""
+            # Phase H: track per-call timing for latency-aware chain builds.
+            # Skip cmd=3 (INFO) — those don't reflect inference latency.
+            if cmd != CMD_INFO:
+                self.recent_rpc_ms.append((time.time() - t0) * 1000.0)
             return status, data
 
     def info(self):
@@ -245,12 +254,22 @@ def register_with_pillar(pillar_url: str, payload: dict, log_prefix: str = "[wor
 
 
 def heartbeat_loop(pillar_url: str, payload: dict, interval: float = 30.0,
-                   stop_event: threading.Event = None):
-    """Re-register with pillar every `interval` seconds. Run as daemon thread."""
+                   stop_event: threading.Event = None,
+                   daemon_for_timing=None):
+    """Re-register with pillar every `interval` seconds. Run as daemon thread.
+
+    Phase H: if `daemon_for_timing` is supplied, refresh the heartbeat
+    payload's `recent_rpc_ms` field with the average of the daemon's
+    last N call timings. The pillar then has up-to-date latency data
+    for peer-ranking.
+    """
     stop_event = stop_event or threading.Event()
     while not stop_event.is_set():
         if stop_event.wait(timeout=interval):
             break
+        if daemon_for_timing is not None and daemon_for_timing.recent_rpc_ms:
+            avg = sum(daemon_for_timing.recent_rpc_ms) / len(daemon_for_timing.recent_rpc_ms)
+            payload["recent_rpc_ms"] = avg
         register_with_pillar(pillar_url, payload, log_prefix="[heartbeat]")
 
 
@@ -908,11 +927,13 @@ def main():
             "hardware": hardware,
             "budget": budget,
             "cached_files": cached_files,
+            "recent_rpc_ms": 0.0,  # Phase H — populated by heartbeat as data accrues
         }
         register_with_pillar(args.pillar_url, register_payload)
         heartbeat_thread = threading.Thread(
             target=heartbeat_loop,
             args=(args.pillar_url, register_payload, 30.0, stop_event),
+            kwargs={"daemon_for_timing": daemon},
             daemon=True,
         )
         heartbeat_thread.start()

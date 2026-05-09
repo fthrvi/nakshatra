@@ -124,10 +124,17 @@ def build_chain_from_registry(registry_url: str, model_id: str) -> list:
     if not pairs:
         raise RuntimeError(f"no online peers advertise model_id={model_id!r} on {registry_url}")
 
-    # Sort: layer_start ascending, then chain-quality score ascending.
-    # Greedy walk picks first match per cursor → naturally prefers
-    # higher-quality peers when alternatives exist for the same range.
-    pairs.sort(key=lambda po: (po[1]["layer_start"], _peer_chain_score(po[0])))
+    # Sort: layer_start ascending, then chain-quality score ascending,
+    # then recent_rpc_ms ascending (lower latency wins WITHIN a quality
+    # tier — Phase H tiebreaker; never overrides drift status). Peers
+    # with no rpc data yet (recent_rpc_ms == 0) get a high stand-in so
+    # we prefer peers with KNOWN good latency.
+    def _rpc_key(p):
+        v = p.get("recent_rpc_ms") or 0.0
+        return v if v > 0 else 9e9
+    pairs.sort(key=lambda po: (po[1]["layer_start"],
+                                _peer_chain_score(po[0]),
+                                _rpc_key(po[0])))
 
     chain = []
     cursor = 0
