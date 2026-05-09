@@ -552,6 +552,57 @@ def scan_cache_dir(cache_dir: str, model_id: str,
     return results
 
 
+def detect_free_vram_gb(backend: str):
+    """Phase B: best-effort query of actual free GPU VRAM via the backend's
+    SMI tool. Returns dict {free_gb, total_gb, detected_via} on success,
+    None if detection isn't supported or fails. Catches the home-pc-OOM
+    case where total VRAM is large but most is held by another process
+    (ollama, browser, etc.).
+
+    Backends:
+      rocm:   rocm-smi --showmeminfo vram --json
+      cuda:   nvidia-smi --query-gpu=memory.total,memory.free
+      metal:  no clean stdlib path; returns None (operator declares)
+    """
+    backend = (backend or "").lower()
+    try:
+        if backend == "rocm":
+            out = subprocess.check_output(
+                ["rocm-smi", "--showmeminfo", "vram", "--json"],
+                timeout=5, stderr=subprocess.DEVNULL,
+            ).decode()
+            data = json.loads(out)
+            for card_id, card in data.items():
+                if not card_id.startswith("card"):
+                    continue
+                total_b = int(card.get("VRAM Total Memory (B)", "0"))
+                used_b = int(card.get("VRAM Total Used Memory (B)", "0"))
+                if total_b > 0:
+                    return {
+                        "free_gb": (total_b - used_b) / (1024 ** 3),
+                        "total_gb": total_b / (1024 ** 3),
+                        "detected_via": "rocm-smi",
+                    }
+        elif backend == "cuda":
+            out = subprocess.check_output(
+                ["nvidia-smi", "--query-gpu=memory.total,memory.free",
+                 "--format=csv,noheader,nounits"],
+                timeout=5, stderr=subprocess.DEVNULL,
+            ).decode().strip()
+            line = out.splitlines()[0]
+            parts = [p.strip() for p in line.split(",")]
+            total_mb, free_mb = int(parts[0]), int(parts[1])
+            return {
+                "free_gb": free_mb / 1024,
+                "total_gb": total_mb / 1024,
+                "detected_via": "nvidia-smi",
+            }
+        # metal / vulkan / cpu: no auto-detect
+    except Exception:
+        return None
+    return None
+
+
 def detect_ram_gb() -> float:
     """Best-effort total RAM detection (stdlib only). Returns 0.0 on failure."""
     sys_name = platform.system()
@@ -661,6 +712,10 @@ def main():
                          "found here in cached_files (Phase 4a redundancy).")
     ap.add_argument("--no-cache-scan", action="store_true",
                     help="Disable cache-dir scan; only advertise --sub-gguf.")
+    ap.add_argument("--no-vram-autodetect", action="store_true",
+                    help="Disable Phase-B auto-detection of free VRAM via "
+                         "rocm-smi/nvidia-smi. Use the declared --vram-offered-gb "
+                         "as-is (operator override).")
     args = ap.parse_args()
 
     # Phase 4: if sub-GGUF is missing AND we have a pillar to ask, fetch it
@@ -783,6 +838,34 @@ def main():
         vram_offered = args.vram_offered_gb if args.vram_offered_gb >= 0 else args.gpu_vram_gb
         ram_offered = args.ram_offered_gb if args.ram_offered_gb >= 0 else max(ram_total / 2, 0.0)
         cpu_offered = args.cpu_threads_offered or args.n_threads or cpu_threads
+
+        # Phase B: auto-detect actual free VRAM and downgrade if declared
+        # is over-optimistic. Catches the case where another process
+        # (ollama, browser, prior daemon) is hogging the GPU.
+        if not args.no_vram_autodetect:
+            vram_detected = detect_free_vram_gb(args.gpu_backend)
+            if vram_detected:
+                free = vram_detected["free_gb"]
+                total = vram_detected["total_gb"]
+                via = vram_detected["detected_via"]
+                if free < vram_offered:
+                    print(f"[worker] vram-autodetect ({via}): only {free:.1f} GB free of "
+                          f"{total:.1f} GB; downgrading vram_offered_gb {vram_offered:.1f} → {free:.1f}",
+                          flush=True)
+                    vram_offered = free
+                else:
+                    print(f"[worker] vram-autodetect ({via}): {free:.1f} GB free of "
+                          f"{total:.1f} GB; declared {vram_offered:.1f} GB OK", flush=True)
+                # Also override gpu_vram_gb display if operator left it default
+                if args.gpu_vram_gb <= 0:
+                    args.gpu_vram_gb = total
+            else:
+                if args.gpu_backend in ("rocm", "cuda"):
+                    print(f"[worker] vram-autodetect: failed for backend={args.gpu_backend} "
+                          f"(SMI tool missing or unreadable); trusting declared values",
+                          flush=True)
+                # metal/vulkan/cpu: no detection; silent
+
         budget = {
             "vram_offered_gb": vram_offered,
             "ram_offered_gb": ram_offered,
