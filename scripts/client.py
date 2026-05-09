@@ -93,14 +93,50 @@ def _peer_chain_score(peer: dict) -> int:
     return 1          # declared GPU but didn't actually offload → CPU
 
 
+def _try_pillar_chain(registry_url: str, model_id: str) -> list | None:
+    """Phase I: ask the pillar to assemble the chain itself.
+
+    Pillars from Phase I onward expose GET /chain?model=<id>. Returns
+    None if the pillar is older (404) or returns an empty chain (so
+    callers fall back to the local builder, which can produce a
+    clearer error message). Other failures propagate."""
+    url = f"{registry_url.rstrip('/')}/chain?model={model_id}"
+    try:
+        with urlrequest.urlopen(url, timeout=10) as resp:
+            data = json.loads(resp.read())
+    except urlrequest.HTTPError as e:
+        if e.code == 404:
+            return None
+        raise
+    chain = data.get("chain") or []
+    if not chain:
+        return None
+    for warn in data.get("warnings") or []:
+        print(f"[chain] WARNING (from pillar): {warn}", file=sys.stderr)
+    workers = []
+    for c in chain:
+        host, _, port = (c.get("address") or "").rpartition(":")
+        if not port:
+            raise RuntimeError(
+                f"pillar returned malformed chain entry for "
+                f"{c.get('node_id')!r}: address={c.get('address')!r}"
+            )
+        workers.append({
+            "id": (c.get("node_id") or "")[:14],
+            "address": host,
+            "port": int(port),
+            "layer_start": int(c["layer_start"]),
+            "layer_end": int(c["layer_end"]),
+        })
+    return workers
+
+
 def build_chain_from_registry(registry_url: str, model_id: str) -> list:
     """Query Sthambha registry, return a contiguous chain plan for `model_id`.
 
-    Phase-5 chain-quality ordering: at each layer cursor, prefer peers
-    that score better (verified non-drifty GPU > CPU > drifty GPU >
-    unknown). Prevents scheduling a known-bad GPU into the chain when
-    a CPU peer covers the same range, while still allowing a drifty GPU
-    if no alternative exists.
+    Phase I: prefer the pillar's own /chain endpoint; if absent, fall
+    back to the local algorithm (verified-GPU > CPU > drifty-GPU,
+    rpc_ms tiebreak inside a tier).
 
     Returns list of dicts in cluster-YAML format (id, address, port,
     layer_start, layer_end) so downstream code stays identical between
@@ -108,6 +144,11 @@ def build_chain_from_registry(registry_url: str, model_id: str) -> list:
 
     Raises RuntimeError if no contiguous chain can be built.
     """
+    pillar_chain = _try_pillar_chain(registry_url, model_id)
+    if pillar_chain is not None:
+        print(f"[chain] using pillar-served chain plan ({len(pillar_chain)} workers)")
+        return pillar_chain
+
     url = f"{registry_url.rstrip('/')}/peers?model={model_id}"
     with urlrequest.urlopen(url, timeout=10) as resp:
         data = json.loads(resp.read())
