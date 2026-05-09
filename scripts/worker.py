@@ -31,6 +31,7 @@ import sys
 import threading
 import time
 from concurrent import futures
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from urllib import request as urlrequest, error as urlerror
 
@@ -253,6 +254,210 @@ def heartbeat_loop(pillar_url: str, payload: dict, interval: float = 30.0,
         register_with_pillar(pillar_url, payload, log_prefix="[heartbeat]")
 
 
+_FILE_SERVER_DIR = ""
+
+
+class FileServerHandler(BaseHTTPRequestHandler):
+    """Phase-4 file server. Serves files from this worker's sub-GGUF directory
+    over HTTP with byte-range support, so other peers can bootstrap their
+    layer range from us instead of needing manual scp.
+
+    Endpoints:
+        GET /file/<basename>     — sends the file (full or Range-restricted)
+        GET /                    — info ping ("worker file server")
+    """
+    server_version = "NakshatraFileServer/0.1"
+
+    def log_message(self, format, *args):
+        # Quiet by default; uncomment for debugging
+        # sys.stderr.write(f"[fileserver] {self.address_string()} {format % args}\n")
+        pass
+
+    def do_GET(self):
+        if self.path == "/" or self.path == "/health":
+            body = b'{"server":"nakshatra-file","status":"ok"}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        if not self.path.startswith("/file/"):
+            self.send_error(404, "not found")
+            return
+
+        # Sanitize: only allow simple basenames, no traversal
+        filename = self.path[len("/file/"):]
+        if "/" in filename or ".." in filename or filename.startswith("."):
+            self.send_error(400, "bad filename")
+            return
+        path = os.path.join(_FILE_SERVER_DIR, filename)
+        if not os.path.isfile(path):
+            self.send_error(404, "file not found")
+            return
+
+        size = os.path.getsize(path)
+        range_header = self.headers.get("Range", "")
+        if range_header.startswith("bytes="):
+            try:
+                spec = range_header[6:].strip()
+                start_str, _, end_str = spec.partition("-")
+                start = int(start_str) if start_str else 0
+                end = int(end_str) if end_str else size - 1
+                if start < 0 or end >= size or start > end:
+                    self.send_error(416, "bad range")
+                    return
+                length = end - start + 1
+                self.send_response(206)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+                self.send_header("Content-Length", str(length))
+                self.send_header("Accept-Ranges", "bytes")
+                self.end_headers()
+                with open(path, "rb") as f:
+                    f.seek(start)
+                    remaining = length
+                    while remaining > 0:
+                        chunk = f.read(min(8 * 1024 * 1024, remaining))
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        remaining -= len(chunk)
+            except Exception as e:
+                self.send_error(400, f"range error: {e}")
+            return
+
+        # Full-file send
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(size))
+        self.send_header("Accept-Ranges", "bytes")
+        self.end_headers()
+        try:
+            with open(path, "rb") as f:
+                shutil.copyfileobj(f, self.wfile, 8 * 1024 * 1024)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+
+class _ThreadingHTTPServer(HTTPServer):
+    """Allow multiple concurrent fetches (without this, parallel byte-range
+    requests would serialize through one handler thread)."""
+    daemon_threads = True
+    def process_request(self, request, client_address):
+        threading.Thread(
+            target=self._handle_request_thread, args=(request, client_address),
+            daemon=True,
+        ).start()
+    def _handle_request_thread(self, request, client_address):
+        try:
+            self.finish_request(request, client_address)
+        except Exception:
+            pass
+        finally:
+            try: self.shutdown_request(request)
+            except Exception: pass
+
+
+def start_file_server(serving_dir: str, port: int):
+    """Start the Phase-4 file server in a background thread."""
+    global _FILE_SERVER_DIR
+    _FILE_SERVER_DIR = str(Path(serving_dir).resolve())
+    server = _ThreadingHTTPServer(("0.0.0.0", port), FileServerHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    print(f"[fileserver] listening on :{port}, serving from {_FILE_SERVER_DIR}", flush=True)
+
+
+def fetch_sub_gguf_from_peer(pillar_url: str, model_id: str,
+                              layer_start: int, layer_end: int,
+                              dest_path: str) -> str:
+    """Query Sthambha for a peer with the requested file and download it.
+
+    Returns the local path on success; raises RuntimeError on failure.
+    Verifies SHA-256 against the pillar's recorded hash if present.
+    """
+    # 1. Ask the pillar for the file index
+    files_url = f"{pillar_url.rstrip('/')}/files?model={model_id}"
+    try:
+        with urlrequest.urlopen(files_url, timeout=10) as resp:
+            data = json.loads(resp.read())
+    except Exception as e:
+        raise RuntimeError(f"could not query pillar at {files_url}: {e}")
+
+    # 2. Find a candidate online peer holding (model_id, layer_start, layer_end)
+    candidates = [
+        f for f in data.get("files", [])
+        if f.get("model_id") == model_id
+        and int(f.get("layer_start", -1)) == layer_start
+        and int(f.get("layer_end", -1)) == layer_end
+        and f.get("is_online")
+    ]
+    if not candidates:
+        raise RuntimeError(
+            f"no online peer holds {model_id} layers [{layer_start},{layer_end})"
+            f" — file not available on the network"
+        )
+
+    # 3. Pick first (could rank by latency / hash trust later)
+    chosen = candidates[0]
+    addr = chosen.get("address", "")
+    if ":" not in addr:
+        raise RuntimeError(f"peer {chosen.get('node_id')} has malformed address {addr!r}")
+    host, _, port_str = addr.rpartition(":")
+    grpc_port = int(port_str)
+    file_port = grpc_port + 1000  # convention: file server on grpc_port + 1000
+    expected_sha = chosen.get("model_sha256", "")
+    src_basename = Path(chosen.get("file_path", "")).name or f"w-{layer_start}-{layer_end}.gguf"
+
+    fetch_url = f"http://{host}:{file_port}/file/{src_basename}"
+    print(f"[fetch] downloading {chosen.get('node_id')}'s {src_basename} from {fetch_url}", flush=True)
+
+    # 4. Download to dest+".tmp", computing SHA on the fly
+    Path(dest_path).parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = dest_path + ".tmp"
+    h = hashlib.sha256()
+    bytes_received = 0
+    t0 = time.time()
+    try:
+        with urlrequest.urlopen(fetch_url, timeout=60) as resp:
+            content_length = int(resp.headers.get("Content-Length", "0"))
+            with open(tmp_path, "wb") as out:
+                while True:
+                    chunk = resp.read(8 * 1024 * 1024)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    h.update(chunk)
+                    bytes_received += len(chunk)
+                    # Progress every ~200 MB
+                    if bytes_received and bytes_received % (200 * 1024 * 1024) < 8 * 1024 * 1024:
+                        pct = (bytes_received / content_length * 100) if content_length else 0
+                        elapsed = time.time() - t0
+                        rate_mbps = (bytes_received / 1e6) / max(elapsed, 0.001)
+                        print(f"[fetch]   {bytes_received/1e9:.1f}/{content_length/1e9:.1f} GB ({pct:.0f}%) at {rate_mbps:.1f} MB/s",
+                              flush=True)
+    except Exception as e:
+        try: os.unlink(tmp_path)
+        except Exception: pass
+        raise RuntimeError(f"download from {fetch_url} failed: {e}")
+
+    # 5. Verify SHA-256 if the pillar gave us one
+    actual_sha = h.hexdigest()
+    if expected_sha and actual_sha != expected_sha:
+        os.unlink(tmp_path)
+        raise RuntimeError(
+            f"sha mismatch: expected {expected_sha[:16]}..., got {actual_sha[:16]}..."
+        )
+
+    # 6. Atomic move into place
+    os.rename(tmp_path, dest_path)
+    elapsed = time.time() - t0
+    print(f"[fetch] saved {dest_path} ({bytes_received:,} bytes, sha={actual_sha[:12]}..., "
+          f"{elapsed:.1f}s, {(bytes_received/1e6)/max(elapsed,0.001):.1f} MB/s)", flush=True)
+    return dest_path
+
+
 def detect_ram_gb() -> float:
     """Best-effort total RAM detection (stdlib only). Returns 0.0 on failure."""
     sys_name = platform.system()
@@ -346,7 +551,34 @@ def main():
                     help="Disk space available for layer cache.")
     ap.add_argument("--skip-sha256", action="store_true",
                     help="Skip SHA-256 of sub-GGUF (for fast restarts; cached_files lacks hash).")
+    ap.add_argument("--file-server-port", type=int, default=0,
+                    help="Phase 4: HTTP file-server port for peer-to-peer fetch. "
+                         "Default = grpc port + 1000 (e.g. 5530 → 6530).")
+    ap.add_argument("--no-file-server", action="store_true",
+                    help="Disable the Phase-4 HTTP file server (this worker won't "
+                         "let peers fetch its sub-GGUF).")
+    ap.add_argument("--auto-fetch", action="store_true",
+                    help="If --sub-gguf doesn't exist, query --pillar-url for who "
+                         "has the file and download it before spawning the daemon.")
     args = ap.parse_args()
+
+    # Phase 4: if sub-GGUF is missing AND we have a pillar to ask, fetch it
+    # before doing anything else. This is what lets a fresh machine bootstrap
+    # without manual scp.
+    if not os.path.exists(args.sub_gguf):
+        if args.auto_fetch and args.pillar_url:
+            print(f"[worker] sub-gguf missing at {args.sub_gguf}; auto-fetching from peer", flush=True)
+            try:
+                fetch_sub_gguf_from_peer(
+                    args.pillar_url, args.model_id,
+                    args.layer_start, args.layer_end,
+                    args.sub_gguf,
+                )
+            except Exception as e:
+                sys.exit(f"[worker] auto-fetch failed: {e}")
+        else:
+            sys.exit(f"[worker] sub-gguf does not exist: {args.sub_gguf} "
+                     f"(use --auto-fetch with --pillar-url to bootstrap from a peer)")
 
     print(f"[worker] spawning daemon: {args.daemon_bin} {args.sub_gguf} {args.mode} {args.n_ctx} threads={args.n_threads} gpu_layers={args.n_gpu_layers}", flush=True)
     daemon = DaemonClient(args.daemon_bin, args.sub_gguf, args.mode, args.n_ctx, args.n_threads, args.n_gpu_layers)
@@ -357,6 +589,21 @@ def main():
     server.add_insecure_port(f"[::]:{args.port}")
     print(f"[worker] M5 listening on :{args.port}  mode={args.mode}  layers=[{args.layer_start},{args.layer_end})  model={args.model_id}", flush=True)
     server.start()
+
+    # Phase 4: file server lets peers fetch this worker's sub-GGUF over HTTP
+    # byte-range. New peers joining the cluster don't need their files
+    # pre-shipped — they query the pillar's file index, find a peer that has
+    # the file, and download it. Convention: file-server port = grpc port + 1000.
+    file_server_port = args.file_server_port or (args.port + 1000)
+    if not args.no_file_server:
+        try:
+            start_file_server(serving_dir=str(Path(args.sub_gguf).parent),
+                              port=file_server_port)
+        except Exception as e:
+            print(f"[fileserver] failed to start: {e} (peers won't be able to fetch from this worker)", flush=True)
+            file_server_port = 0
+    else:
+        file_server_port = 0
 
     # Pillar registration (Phase 3b). Best-effort — worker still serves
     # requests if the pillar is unreachable (back-compat with static YAML
