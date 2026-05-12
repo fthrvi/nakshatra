@@ -1,0 +1,109 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" width="1200" height="630">
+  <defs>
+    <radialGradient id="bg" cx="40%" cy="50%" r="65%">
+      <stop offset="0%"  stop-color="#1A1B40"/>
+      <stop offset="100%" stop-color="#06081A"/>
+    </radialGradient>
+    <radialGradient id="star" cx="50%" cy="50%" r="50%">
+      <stop offset="0%"  stop-color="#FFF6D6"/>
+      <stop offset="60%" stop-color="#F5B942"/>
+      <stop offset="100%" stop-color="#A6671A"/>
+    </radialGradient>
+    <radialGradient id="antares" cx="50%" cy="50%" r="50%">
+      <stop offset="0%"  stop-color="#FFE0BE"/>
+      <stop offset="30%" stop-color="#FF8A3A"/>
+      <stop offset="70%" stop-color="#E13A1C"/>
+      <stop offset="100%" stop-color="#7A1408"/>
+    </radialGradient>
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="3.5" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="bigglow" x="-100%" y="-100%" width="300%" height="300%">
+      <feGaussianBlur stdDeviation="10" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <rect x="0" y="0" width="1200" height="630" fill="url(#bg)"/>
+
+  <!-- Background star speckle -->
+  <g fill="#FFE3A8" fill-opacity="0.45">
+    <circle cx="80"   cy="60"  r="1.2"/>
+    <circle cx="140"  cy="540" r="1.0"/>
+    <circle cx="220"  cy="110" r="1.5"/>
+    <circle cx="980"  cy="80"  r="1.0"/>
+    <circle cx="1100" cy="200" r="1.2"/>
+    <circle cx="1050" cy="510" r="1.5"/>
+    <circle cx="60"   cy="320" r="1.0"/>
+    <circle cx="1150" cy="380" r="1.0"/>
+    <circle cx="900"  cy="560" r="1.2"/>
+    <circle cx="430"  cy="40"  r="0.9"/>
+    <circle cx="780"  cy="600" r="0.9"/>
+  </g>
+
+  <!-- Constellation: scaled from 512-unit source space to 540 px, offset to (20, 45) -->
+  <g transform="translate(20 45) scale(1.055)">
+    <g stroke="#F5B942" stroke-width="1.6" stroke-opacity="0.55" stroke-linecap="round" fill="none">
+      <line x1="89"  y1="60"  x2="71"  y2="107"/>
+      <line x1="71"  y1="107" x2="67"  y2="166"/>
+      <line x1="67"  y1="166" x2="60"  y2="217"/>
+      <line x1="71"  y1="107" x2="146" y2="157"/>
+      <line x1="146" y1="157" x2="174" y2="171"/>
+      <line x1="174" y1="171" x2="199" y2="201"/>
+      <line x1="199" y1="201" x2="249" y2="303"/>
+      <line x1="249" y1="303" x2="256" y2="365"/>
+      <line x1="256" y1="365" x2="264" y2="439"/>
+      <line x1="264" y1="439" x2="328" y2="452"/>
+      <line x1="328" y1="452" x2="417" y2="449"/>
+      <line x1="417" y1="449" x2="448" y2="400"/>
+      <line x1="448" y1="400" x2="435" y2="382"/>
+      <line x1="435" y1="382" x2="403" y2="350"/>
+      <line x1="403" y1="350" x2="392" y2="353"/>
+    </g>
+
+    <g filter="url(#glow)">
+      <circle cx="89"  cy="60"  r="8"   fill="url(#star)"/>
+      <circle cx="71"  cy="107" r="7"   fill="url(#star)"/>
+      <circle cx="67"  cy="166" r="5.5" fill="url(#star)"/>
+      <circle cx="60"  cy="217" r="5"   fill="url(#star)"/>
+      <circle cx="146" cy="157" r="6"   fill="url(#star)"/>
+      <circle cx="199" cy="201" r="6"   fill="url(#star)"/>
+      <circle cx="249" cy="303" r="7"   fill="url(#star)"/>
+      <circle cx="256" cy="365" r="5.5" fill="url(#star)"/>
+      <circle cx="264" cy="439" r="5.5" fill="url(#star)"/>
+      <circle cx="328" cy="452" r="5"   fill="url(#star)"/>
+      <circle cx="417" cy="449" r="7"   fill="url(#star)"/>
+      <circle cx="448" cy="400" r="5"   fill="url(#star)"/>
+      <circle cx="435" cy="382" r="5"   fill="url(#star)"/>
+      <circle cx="403" cy="350" r="9"   fill="url(#star)"/>
+      <circle cx="392" cy="353" r="6"   fill="url(#star)"/>
+    </g>
+
+    <circle cx="174" cy="171" r="22" fill="url(#antares)" opacity="0.55" filter="url(#bigglow)"/>
+    <circle cx="174" cy="171" r="13" fill="url(#antares)" filter="url(#glow)"/>
+    <circle cx="174" cy="171" r="4"  fill="#FFE6CC"/>
+  </g>
+
+  <!-- Wordmark + tagline + bullets + URL -->
+  <g font-family="'Iowan Old Style','Charter','Palatino','Georgia',serif">
+    <text x="600" y="240" font-size="84" font-weight="600" letter-spacing="3" fill="#FFE3A8">NAKSHATRA</text>
+    <text x="604" y="290" font-size="22" font-weight="400" letter-spacing="2" fill="#F5B942" fill-opacity="0.85"
+          font-family="'SF Mono','Menlo','Consolas',monospace">
+      distributed inference for the hardware you own
+    </text>
+    <text x="604" y="380" font-size="22" font-weight="400" letter-spacing="0.5" fill="#FFE3A8" fill-opacity="0.78">
+      One model · split across many machines
+    </text>
+    <text x="604" y="415" font-size="22" font-weight="400" letter-spacing="0.5" fill="#FFE3A8" fill-opacity="0.78">
+      16 KB/token on the wire · llama.cpp
+    </text>
+    <text x="604" y="450" font-size="22" font-weight="400" letter-spacing="0.5" fill="#FFE3A8" fill-opacity="0.78">
+      CUDA · ROCm · Metal · Vulkan · CPU
+    </text>
+    <text x="604" y="560" font-size="20" font-weight="400" letter-spacing="1" fill="#F5B942" fill-opacity="0.75"
+          font-family="'SF Mono','Menlo','Consolas',monospace">
+      github.com/fthrvi/nakshatra
+    </text>
+  </g>
+</svg>

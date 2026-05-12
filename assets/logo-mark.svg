@@ -1,0 +1,102 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <!--
+    Logo mark: Vrischika Rashi (Scorpius constellation).
+    Star positions computed from real RA/Dec, mapped onto a 512×512 canvas.
+    Antares (α Sco) — red supergiant — anchors the heart.
+  -->
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="50%" r="55%">
+      <stop offset="0%"  stop-color="#161734"/>
+      <stop offset="100%" stop-color="#06081A"/>
+    </radialGradient>
+    <radialGradient id="star" cx="50%" cy="50%" r="50%">
+      <stop offset="0%"  stop-color="#FFF6D6"/>
+      <stop offset="60%" stop-color="#F5B942"/>
+      <stop offset="100%" stop-color="#A6671A"/>
+    </radialGradient>
+    <radialGradient id="antares" cx="50%" cy="50%" r="50%">
+      <stop offset="0%"  stop-color="#FFE0BE"/>
+      <stop offset="30%" stop-color="#FF8A3A"/>
+      <stop offset="70%" stop-color="#E13A1C"/>
+      <stop offset="100%" stop-color="#7A1408"/>
+    </radialGradient>
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="3.2" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="bigglow" x="-100%" y="-100%" width="300%" height="300%">
+      <feGaussianBlur stdDeviation="8" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <!-- Background -->
+  <rect x="0" y="0" width="512" height="512" rx="96" ry="96" fill="url(#bg)"/>
+
+  <!-- Faint background star speckle -->
+  <g fill="#FFE3A8" fill-opacity="0.35">
+    <circle cx="48"  cy="120" r="0.8"/>
+    <circle cx="430" cy="80"  r="0.9"/>
+    <circle cx="380" cy="200" r="0.7"/>
+    <circle cx="90"  cy="350" r="0.8"/>
+    <circle cx="470" cy="270" r="0.9"/>
+    <circle cx="160" cy="450" r="0.7"/>
+    <circle cx="40"  cy="460" r="0.9"/>
+    <circle cx="490" cy="450" r="0.8"/>
+  </g>
+
+  <!-- Asterism connection lines (thin amber, faint) -->
+  <g stroke="#F5B942" stroke-width="1.6" stroke-opacity="0.55" stroke-linecap="round" fill="none">
+    <!-- Head / claws -->
+    <line x1="89"  y1="60"  x2="71"  y2="107"/>
+    <line x1="71"  y1="107" x2="67"  y2="166"/>
+    <line x1="67"  y1="166" x2="60"  y2="217"/>
+    <!-- Head joining the heart -->
+    <line x1="71"  y1="107" x2="146" y2="157"/>
+    <line x1="146" y1="157" x2="174" y2="171"/>
+    <!-- Heart to body -->
+    <line x1="174" y1="171" x2="199" y2="201"/>
+    <line x1="199" y1="201" x2="249" y2="303"/>
+    <line x1="249" y1="303" x2="256" y2="365"/>
+    <line x1="256" y1="365" x2="264" y2="439"/>
+    <!-- Tail -->
+    <line x1="264" y1="439" x2="328" y2="452"/>
+    <line x1="328" y1="452" x2="417" y2="449"/>
+    <!-- Stinger hook -->
+    <line x1="417" y1="449" x2="448" y2="400"/>
+    <line x1="448" y1="400" x2="435" y2="382"/>
+    <line x1="435" y1="382" x2="403" y2="350"/>
+    <line x1="403" y1="350" x2="392" y2="353"/>
+  </g>
+
+  <!-- Stars: sized by approximate visual magnitude.
+       Brightest are Antares (α) and Shaula (λ); medium for β1, δ, ε, θ; rest small. -->
+  <g filter="url(#glow)">
+    <!-- Head / claws -->
+    <circle cx="89"  cy="60"  r="8"  fill="url(#star)"/>  <!-- β1 Acrab -->
+    <circle cx="71"  cy="107" r="7"  fill="url(#star)"/>  <!-- δ Dschubba -->
+    <circle cx="67"  cy="166" r="5.5" fill="url(#star)"/> <!-- π -->
+    <circle cx="60"  cy="217" r="5"  fill="url(#star)"/>  <!-- ρ -->
+    <!-- Upper body -->
+    <circle cx="146" cy="157" r="6"  fill="url(#star)"/>  <!-- σ -->
+    <!-- Heart -->
+    <circle cx="199" cy="201" r="6"  fill="url(#star)"/>  <!-- τ -->
+    <!-- Body / lower -->
+    <circle cx="249" cy="303" r="7"  fill="url(#star)"/>  <!-- ε -->
+    <circle cx="256" cy="365" r="5.5" fill="url(#star)"/> <!-- μ1 -->
+    <circle cx="264" cy="439" r="5.5" fill="url(#star)"/> <!-- ζ2 -->
+    <!-- Tail -->
+    <circle cx="328" cy="452" r="5"  fill="url(#star)"/>  <!-- η -->
+    <circle cx="417" cy="449" r="7"  fill="url(#star)"/>  <!-- θ Sargas -->
+    <!-- Stinger -->
+    <circle cx="448" cy="400" r="5"  fill="url(#star)"/>  <!-- ι1 -->
+    <circle cx="435" cy="382" r="5"  fill="url(#star)"/>  <!-- κ Girtab -->
+    <circle cx="403" cy="350" r="9"  fill="url(#star)"/>  <!-- λ Shaula -->
+    <circle cx="392" cy="353" r="6"  fill="url(#star)"/>  <!-- υ Lesath -->
+  </g>
+
+  <!-- Antares: red supergiant, rendered last + with bigger halo -->
+  <circle cx="174" cy="171" r="22" fill="url(#antares)" opacity="0.55" filter="url(#bigglow)"/>
+  <circle cx="174" cy="171" r="13" fill="url(#antares)" filter="url(#glow)"/>
+  <circle cx="174" cy="171" r="4"  fill="#FFE6CC"/>
+</svg>
