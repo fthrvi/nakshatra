@@ -1,0 +1,171 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<title>Nakshatra — Draft Technical Report</title>
+<style>
+@page { size: Letter; margin: 0.85in 0.85in 0.95in 0.85in; }
+html { -webkit-print-color-adjust: exact; }
+body {
+  font-family: "Charter", "Iowan Old Style", "Palatino", "Georgia", serif;
+  font-size: 10.8pt;
+  line-height: 1.45;
+  color: #111;
+  max-width: 6.75in;
+  margin: 0 auto;
+}
+/* Title: keep on its own opening band */
+h1 {
+  font-size: 19pt;
+  font-weight: 700;
+  margin: 0 0 0.35em 0;
+  line-height: 1.2;
+  letter-spacing: -0.005em;
+  page-break-after: avoid;
+}
+/* The bold lead lines right under the title (Status / Repository / Author) */
+h1 + p, h1 + p + p, h1 + p + p + p, h1 + p + p + p + p {
+  margin: 0.15em 0;
+  font-size: 10pt;
+  color: #444;
+}
+h2 {
+  font-size: 13.5pt;
+  margin-top: 1.5em;
+  margin-bottom: 0.4em;
+  border-bottom: 1px solid #777;
+  padding-bottom: 3px;
+  page-break-after: avoid;
+}
+h3 {
+  font-size: 11.6pt;
+  margin-top: 1.15em;
+  margin-bottom: 0.3em;
+  page-break-after: avoid;
+}
+h4 {
+  font-size: 10.8pt;
+  font-style: italic;
+  margin-top: 0.9em;
+  margin-bottom: 0.25em;
+  page-break-after: avoid;
+}
+p  { margin: 0.55em 0; text-align: justify; hyphens: auto; }
+ul, ol { margin: 0.45em 0 0.65em 1.5em; padding: 0; }
+li { margin: 0.18em 0; }
+code, pre, tt {
+  font-family: "SF Mono", "Menlo", "Consolas", "DejaVu Sans Mono", monospace;
+  font-size: 9.1pt;
+}
+code {
+  background: #f1f1f3;
+  padding: 0 3px;
+  border-radius: 2px;
+  font-size: 9.5pt;
+}
+pre {
+  background: #f6f6f7;
+  border: 1px solid #d8d8dc;
+  border-radius: 3px;
+  padding: 8px 11px;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  line-height: 1.38;
+  page-break-inside: avoid;
+  margin: 0.7em 0;
+}
+pre code { background: transparent; padding: 0; font-size: 9.1pt; }
+table {
+  border-collapse: collapse;
+  margin: 0.65em 0;
+  font-size: 9.6pt;
+  width: 100%;
+  page-break-inside: avoid;
+}
+th, td {
+  border: 1px solid #b8b8be;
+  padding: 4px 8px;
+  text-align: left;
+  vertical-align: top;
+}
+th { background: #ececef; font-weight: 700; }
+blockquote {
+  border-left: 3px solid #aaa;
+  margin: 0.7em 0;
+  padding: 0.1em 0 0.1em 0.85em;
+  color: #444;
+}
+hr { border: 0; border-top: 1px solid #999; margin: 1.3em 0; }
+a { color: #1a4fa0; text-decoration: none; }
+a:hover { text-decoration: underline; }
+strong { font-weight: 700; }
+em { font-style: italic; }
+/* Abstract paragraph styling */
+h2:first-of-type + p {
+  text-align: justify;
+}
+</style></head>
+<body>
+<h1 id="nakshatra-thesis-vision">Nakshatra — Thesis &amp; Vision</h1>
+<p><em>A short statement of what we are building, why, and what we believe. The longer technical report lives in <a href="paper-draft.md"><code>paper-draft.md</code></a>; the architectural contract in <a href="petals-architecture.md"><code>petals-architecture.md</code></a>; the full vision in <a href="north-star.md"><code>north-star.md</code></a>. This document is the one you read first.</em></p>
+<hr />
+<h2 id="the-thesis">The thesis</h2>
+<p><strong>A person's intelligence should run on hardware they own.</strong></p>
+<p>The cloud has spent fifteen years teaching us that artificial intelligence is a tenancy — that the only real way to use a large model is to rent time on someone else's machine, on someone else's terms, at someone else's price. This is a fact about today's economics, not a fact about the world. The hardware to run a 70-billion-parameter language model already exists in tens of millions of homes — fragmented across a laptop, a desktop, an iMac, a gaming PC, a Raspberry Pi. The software to <em>pool</em> that hardware into one coherent inference engine does not yet exist in a serious form.</p>
+<p>Nakshatra is our attempt at it.</p>
+<hr />
+<h2 id="why-this-is-possible-now">Why this is possible now</h2>
+<p>Three things converged inside a single year and made the problem tractable for the first time.</p>
+<ul>
+<li><strong>Open-weight models caught up to the frontier.</strong> Llama-3, Qwen-2, DeepSeek, Mistral — within a generation of closed-model quality on the workloads that matter for personal use.</li>
+<li><strong>Consumer GPUs grew up.</strong> A 32 GB RTX 5090, a 24 GB Mac Studio, a $500 AMD card with 16 GB — every household with one tech-enthusiast now owns compute that would have cost a startup six figures five years ago.</li>
+<li><strong>The home network stopped being a problem.</strong> Tailscale and similar overlays made point-to-point connections across the consumer internet boring. The old "but NAT traversal!" objection to peer-to-peer architectures is dead.</li>
+</ul>
+<p>What's missing is software that uses any of this. Nakshatra fills that gap.</p>
+<hr />
+<h2 id="what-we-are-building">What we are building</h2>
+<p>Three projects. One shared mission. Each small enough to ship on its own; together they compose into something none of them could be alone.</p>
+<p><strong>Nakshatra (L2) — the road.</strong> An inference engine that splits one large model across many mismatched machines. Each machine holds part of the model's layers; only a small activation vector flows between them per token. Built on <code>llama.cpp</code>, so it runs on every vendor's hardware out of one codebase — CUDA, ROCm, Metal, Vulkan, CPU. v0.1 is alive on a five-machine cross-vendor cluster.</p>
+<p><strong>Sthambha (L3) — the pillar.</strong> A coordination layer above Nakshatra. Holds the peer registry, the layer cache, the identity primitives. Crucially, it is <em>also</em> the soul-persistence layer — Shamir-split identity shards and state snapshots that survive every compute node dying. A pillar on a Raspberry Pi can be the difference between an agent that exists across hardware generations and one that disappears with a broken laptop.</p>
+<p><strong>Prithvi (L4) — the being.</strong> A long-running personal agent. The cars on the road. Voice, mind, gateway, contracts — the surface a person actually talks to. Owns nothing about inference or coordination; consumes both from below. Portable across laptops, phones, IDEs.</p>
+<p>The road, the pillar, the being. Three concerns, three projects, one substrate.</p>
+<hr />
+<h2 id="what-we-believe">What we believe</h2>
+<ol>
+<li>
+<p><strong>Sovereignty is a feature, not a luxury.</strong> A person's AI should not be a tenant of someone else's product. The intuition that produced "host your own server" in 2005 and "self-custody your keys" in 2015 produces "run your own intelligence" in 2026.</p>
+</li>
+<li>
+<p><strong>Heterogeneity is the default, not the edge case.</strong> A homogeneous fleet of identical GPUs is what a datacenter has, not what a person has. Software that assumes matching hardware is software for somebody else.</p>
+</li>
+<li>
+<p><strong>Continuity outlives hardware.</strong> Devices die. Agents that live on a single device die with it. The substrate must hold what the compute cannot — identity, memory, the trajectory of a long conversation.</p>
+</li>
+<li>
+<p><strong>The protocol is the contract; the architecture is the discipline.</strong> Three projects exist instead of one because three projects can't accidentally merge concerns. Each layer's job is small enough to debug. The discipline of the split is what makes the composition work.</p>
+</li>
+<li>
+<p><strong>The substrate, not the product.</strong> Open weights, open code, open protocols. We are building infrastructure — not a hosted service, not a token launch, not a walled garden. The economics that sustain the work are downstream of the protocol being correct. We earn the next stage by shipping the current one.</p>
+</li>
+</ol>
+<hr />
+<h2 id="where-this-goes">Where this goes</h2>
+<p>If Nakshatra ships and grows past a private alpha, what becomes possible looks like this:</p>
+<ul>
+<li>A friend's old gaming PC, a sibling's MacBook, a parent's iMac, your own Pi — all running together as one cluster. The cost of adding a contributor is a one-line install.</li>
+<li>A personal agent that does not care which device you're at. Voice in the kitchen, terminal at the desk, app on the phone. State lives in the substrate; the surface is just the access point.</li>
+<li>Long-horizon work — agents that run for days, weeks, months — that is economically impossible on hosted AI today, becoming the obvious shape for self-hosted compute.</li>
+<li>An ecosystem of agents, skills, and fine-tunes published to a shared substrate the way packages publish to NPM today.</li>
+</ul>
+<p>We do not claim this is delivered. We claim each layer is scoped well enough that the composition is reachable from where we are now.</p>
+<hr />
+<h2 id="the-falsifiable-next-milestone">The falsifiable next milestone</h2>
+<p>The integration is real the day a Prithvi instance is killed on one machine, brought back on a different machine, and resumes mid-conversation — the hardware changes, the agent does not notice. That is the first milestone we will recognise. Everything before it is preparation.</p>
+<hr />
+<h2 id="engage">Engage</h2>
+<ul>
+<li><strong>Read</strong> — the <a href="paper-draft.md">technical report</a> for experiments and numbers; the <a href="petals-architecture.md">architecture</a> for the v0.1 contract; the <a href="north-star.md">north star</a> for the long vision.</li>
+<li><strong>Run</strong> — the README walkthrough takes under an hour from "Python + a GGUF" to "the right token comes back."</li>
+<li><strong>Push back</strong> — issues at https://github.com/fthrvi/nakshatra/issues, email at tankaifish@gmail.com, or community-staked conviction at <a href="https://pnl.market">pnl.market</a>.</li>
+</ul>
+<p>The dream is big. The architecture is small. The work is the work.</p>
+</body></html>

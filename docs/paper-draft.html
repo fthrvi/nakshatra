@@ -1,0 +1,801 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<title>Nakshatra — Draft Technical Report</title>
+<style>
+@page { size: Letter; margin: 0.85in 0.85in 0.95in 0.85in; }
+html { -webkit-print-color-adjust: exact; }
+body {
+  font-family: "Charter", "Iowan Old Style", "Palatino", "Georgia", serif;
+  font-size: 10.8pt;
+  line-height: 1.45;
+  color: #111;
+  max-width: 6.75in;
+  margin: 0 auto;
+}
+/* Title: keep on its own opening band */
+h1 {
+  font-size: 19pt;
+  font-weight: 700;
+  margin: 0 0 0.35em 0;
+  line-height: 1.2;
+  letter-spacing: -0.005em;
+  page-break-after: avoid;
+}
+/* The bold lead lines right under the title (Status / Repository / Author) */
+h1 + p, h1 + p + p, h1 + p + p + p, h1 + p + p + p + p {
+  margin: 0.15em 0;
+  font-size: 10pt;
+  color: #444;
+}
+h2 {
+  font-size: 13.5pt;
+  margin-top: 1.5em;
+  margin-bottom: 0.4em;
+  border-bottom: 1px solid #777;
+  padding-bottom: 3px;
+  page-break-after: avoid;
+}
+h3 {
+  font-size: 11.6pt;
+  margin-top: 1.15em;
+  margin-bottom: 0.3em;
+  page-break-after: avoid;
+}
+h4 {
+  font-size: 10.8pt;
+  font-style: italic;
+  margin-top: 0.9em;
+  margin-bottom: 0.25em;
+  page-break-after: avoid;
+}
+p  { margin: 0.55em 0; text-align: justify; hyphens: auto; }
+ul, ol { margin: 0.45em 0 0.65em 1.5em; padding: 0; }
+li { margin: 0.18em 0; }
+code, pre, tt {
+  font-family: "SF Mono", "Menlo", "Consolas", "DejaVu Sans Mono", monospace;
+  font-size: 9.1pt;
+}
+code {
+  background: #f1f1f3;
+  padding: 0 3px;
+  border-radius: 2px;
+  font-size: 9.5pt;
+}
+pre {
+  background: #f6f6f7;
+  border: 1px solid #d8d8dc;
+  border-radius: 3px;
+  padding: 8px 11px;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  line-height: 1.38;
+  page-break-inside: avoid;
+  margin: 0.7em 0;
+}
+pre code { background: transparent; padding: 0; font-size: 9.1pt; }
+table {
+  border-collapse: collapse;
+  margin: 0.65em 0;
+  font-size: 9.6pt;
+  width: 100%;
+  page-break-inside: avoid;
+}
+th, td {
+  border: 1px solid #b8b8be;
+  padding: 4px 8px;
+  text-align: left;
+  vertical-align: top;
+}
+th { background: #ececef; font-weight: 700; }
+blockquote {
+  border-left: 3px solid #aaa;
+  margin: 0.7em 0;
+  padding: 0.1em 0 0.1em 0.85em;
+  color: #444;
+}
+hr { border: 0; border-top: 1px solid #999; margin: 1.3em 0; }
+a { color: #1a4fa0; text-decoration: none; }
+a:hover { text-decoration: underline; }
+strong { font-weight: 700; }
+em { font-style: italic; }
+/* Abstract paragraph styling */
+h2:first-of-type + p {
+  text-align: justify;
+}
+</style></head>
+<body>
+<h1 id="nakshatra-vendor-agnostic-distributed-inference-on-heterogeneous-consumer-hardware">Nakshatra: Vendor-Agnostic Distributed Inference on Heterogeneous Consumer Hardware</h1>
+<p><strong>Draft technical report — circulated for review.</strong>
+<strong>Project repository:</strong> https://github.com/fthrvi/nakshatra
+<strong>Companion repository:</strong> https://github.com/fthrvi/sthambha (L3 substrate)
+<strong>Status:</strong> v0.1 functionally alive (2026-05-06); 5-machine federation (v0.3) in progress.
+<strong>Author:</strong> Bishwa (fthrvi). Correspondence: tankaifish@gmail.com.
+<strong>Where this is being shared:</strong> GitHub (above), and as a community-staked market on <strong><a href="https://pnl.market">pnl.market</a></strong> — see §12.</p>
+<hr />
+<h2 id="abstract">Abstract</h2>
+<p>Large open-weight transformer models have outgrown a single consumer GPU, yet the available distributed-inference stacks assume a homogeneous NVIDIA fleet or volunteer pools at internet scale. Neither shape fits the operator who already owns a heterogeneous mix of Apple Silicon, Intel-Mac AMD GPUs, ROCm Linux workstations, and CPUs on a private network. We describe <strong>Nakshatra</strong>, a distributed inference engine that splits one transformer model across such heterogeneous workers and keeps weights local: only per-token hidden-state activations (12–16 KB per network hop for Llama-class models, independent of model size) traverse the wire. We patch <code>llama.cpp</code> to load a contiguous sub-range of a model's transformer blocks from a pre-split sub-GGUF and to accept/emit hidden-state vectors at the layer boundary. A static-config orchestration layer, later extended by a pillar-served registry, ties workers into a pipeline over gRPC on Tailscale. v0.1 ships as a two-machine cross-vendor cluster validated against a single-machine <code>llama-cli</code> reference; v0.3 generalises the pattern to a five-machine federation with sub-GGUF discovery and latency-aware routing. We report the architecture, the patch set, eight experiments and their quantitative outcomes, and the limits we have not yet crossed. Nakshatra is the inference layer (L2) of a deliberately three-project stack: <strong>Sthambha</strong> (L3 — pillar / registry / identity / soul-persistence) and <strong>Prithvi</strong> (L4 — agent / consciousness) are sibling projects whose integration with Nakshatra forms a <em>unified personal compute realm</em> that survives hardware death and pools heterogeneous metal into a coherent home for a long-running agent. This paper is the L2 contract; the L3/L4 integration is spelled out as a roadmap, not a claim. We invite review before locking the v0.5 design.</p>
+<hr />
+<h2 id="1-introduction-and-motivation">1. Introduction and motivation</h2>
+<p>Three forces collide at the consumer-hardware frontier:</p>
+<ol>
+<li><strong>Open models have outgrown one GPU.</strong> Llama-3-70B, Qwen-2-72B, DeepSeek-V2 — every credible open-weight model now exceeds the memory of a single consumer card. Llama-3.3-70B at Q4_K_M is ~40 GB; the largest single consumer GPU on the market in 2026 (RTX 5090, 32 GB) cannot hold it.</li>
+<li><strong>Operators own heterogeneous fleets.</strong> A realistic personal cluster has Apple Silicon laptops, Intel iMacs with AMD GPUs (no ROCm on macOS, ever), a Linux workstation, and a Raspberry Pi or two. PyTorch + CUDA stacks (vLLM, DeepSpeed-Inference, TensorRT-LLM) collapse this surface to "buy more H100s." Petals [1] handles the heterogeneous case at internet scale via a Hivemind DHT and libp2p, but is welded to PyTorch.</li>
+<li><strong>Hosted inference economics punish duration.</strong> Continuous agents — research crawlers, code-review daemons, monitoring loops, personal companions — pay the worst case of hosted pricing. Owning the compute inverts the economics; the missing piece is software that uses what the operator already has.</li>
+</ol>
+<p>Nakshatra is that software. It treats the operator's mixed-vendor metal as a pipeline of layer-holding workers; it builds on <code>llama.cpp</code> so a single backend traverses CUDA, ROCm, Metal, Vulkan (including MoltenVK on older Intel Macs), and pure CPU through one C++ codebase; it commits to a private-cluster trust model so the protocol stays small enough to ship.</p>
+<p><strong>Project scope, made explicit.</strong> Nakshatra is one layer of a three-project stack. The other two are intentionally separate:</p>
+<ul>
+<li><strong>Sthambha</strong> (L3, repo <code>fthrvi/sthambha</code>). Pillar daemon, peer registry, Ed25519 identity, model and layer-range cache, byte-range fetch. The pillar is also Prithvi's <em>Asthi Dhatu</em> — the soul-persistence layer that holds Shamir-split identity shards and Tattva snapshots so an agent's continuity survives every compute node dying.</li>
+<li><strong>Prithvi</strong> (L4, repo <code>fthrvi/prithvi</code>). The agent: mind, voice, gateway, contracts, platform adapters. The consumer of Nakshatra's inference and Sthambha's substrate.</li>
+<li><strong>Nakshatra</strong> (L2, this repo and this paper). Only the inference engine. The discipline that keeps registry, identity, and consciousness <em>out</em> of L2 is load-bearing for v0.1 shipping at all.</li>
+</ul>
+<p>The three-project framing we adopt in this paper:</p>
+<table>
+<thead>
+<tr>
+<th>Project</th>
+<th>Layer</th>
+<th>What it is</th>
+<th>This paper</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Nakshatra</td>
+<td>L2</td>
+<td>Distributed inference engine</td>
+<td><strong>Primary subject</strong></td>
+</tr>
+<tr>
+<td>Sthambha</td>
+<td>L3</td>
+<td>Pillar, registry, identity, layer cache, soul-persistence</td>
+<td>§7 (integration roadmap)</td>
+</tr>
+<tr>
+<td>Prithvi</td>
+<td>L4</td>
+<td>The agent / consciousness consuming L2+L3</td>
+<td>§7 (integration roadmap)</td>
+</tr>
+</tbody>
+</table>
+<p>The integrated result — when L2, L3, and L4 are alive together — is what we call the <em>unified personal compute realm</em>: a self-owned, vendor-agnostic compute-and-continuity substrate on which a person's agent lives, distributed across whatever hardware that person owns, persisted beyond any single device's lifetime. The realm is not a fourth codebase. It is the property that emerges from composing the three correctly (§8).</p>
+<hr />
+<h2 id="2-related-work">2. Related work</h2>
+<p><strong>Petals</strong> [1]. The intellectual ancestor. Pipeline-parallel inference across volunteer hardware on a public network; Hivemind DHT for peer discovery; libp2p for transport; HF/PyTorch block backend. Nakshatra inherits the protocol shape (<code>ModuleUID</code> strings, contiguous block spans, stateful inference sessions, opt-in server-to-server activation push) but replaces the backend (llama.cpp, not HF/torch), the transport (gRPC over Tailscale, not libp2p), and the discovery layer (static YAML in v0.1; pillar-served registry in v0.3).</p>
+<p><strong>llama.cpp's <code>rpc-server</code> backend</strong> [3]. A <em>remote GGML compute backend</em>, not a <em>distributed model server</em>. The master holds the full model and ships GGML primitives (<code>RPC_CMD_ALLOC_BUFFER</code>, <code>RPC_CMD_SET_TENSOR</code>, <code>RPC_CMD_GRAPH_COMPUTE</code>) to dumb workers. This streams full weights per cluster start — ~26 GB per worker per restart for Llama-70B Q4. Nakshatra inverts the relationship: weights are pre-staged and local, and the wire carries only activations.</p>
+<p><strong>vLLM, DeepSpeed-Inference, TensorRT-LLM, SGLang.</strong> Datacenter-scale, NVIDIA-only, tensor-parallel within a node. Genuine engineering achievements; orthogonal to the heterogeneous-consumer problem.</p>
+<p><strong>exo</strong> [2]. The closest contemporary. Targets heterogeneous Apple Silicon clusters; built on MLX. Nakshatra differs in (a) treating non-Apple hardware as first-class, (b) using <code>llama.cpp</code> so the backend surface covers every consumer vendor with one C++ codebase, and (c) committing to a separate L3 substrate (Sthambha) instead of embedding peer-discovery into the inference engine.</p>
+<p><strong>Federated learning frameworks</strong> (Flower, FedML). Solve a different problem — many clients, one server, training rather than inference. Some ideas (heartbeat, peer registry) transfer to Sthambha's L3 design; the protocol is not reusable.</p>
+<p><strong>FlexGen, AirLLM</strong> [4]. Single-node out-of-core inference via CPU/disk offload. Complementary: a Nakshatra worker may itself use FlexGen-style techniques internally without changing the inter-worker protocol.</p>
+<hr />
+<h2 id="3-architecture">3. Architecture</h2>
+<h3 id="31-the-load-bearing-insight-per-token-activation-transport-is-cheap">3.1 The load-bearing insight: per-token activation transport is cheap</h3>
+<p>For Llama-70B at fp16, <code>hidden_size = 8192</code>. A single token's activation tensor crossing one network hop is exactly:</p>
+<div class="codehilite" style="background: #f0f0f0"><pre style="line-height: 125%;"><span></span><code><span style="color: #40A070">1</span><span style="color: #BBB"> </span>(batch)<span style="color: #BBB"> </span><span style="border: 1px solid #F00">×</span><span style="color: #BBB"> </span><span style="color: #40A070">1</span><span style="color: #BBB"> </span>(<span style="color: #007020; font-weight: bold">to</span>ken)<span style="color: #BBB"> </span><span style="border: 1px solid #F00">×</span><span style="color: #BBB"> </span><span style="color: #40A070">8192</span><span style="color: #BBB"> </span>(hidden)<span style="color: #BBB"> </span><span style="border: 1px solid #F00">×</span><span style="color: #BBB"> </span><span style="color: #40A070">2</span><span style="color: #BBB"> </span>bytes<span style="color: #BBB"> </span>(fp16)<span style="color: #BBB"> </span><span style="color: #666">=</span><span style="color: #BBB"> </span><span style="color: #40A070">16</span><span style="color: #BBB"> </span>KB
+</code></pre></div>
+
+<p>A five-hop pipeline ships ~80 KB per token. At 5 tokens/second of steady-state generation, total network traffic is <strong>400 KB/s</strong> — trivial on any home network, on Tailscale, on a coffee-shop LAN. The 3B-class model used in our v0.1 acceptance run has <code>hidden_size = 3072</code>; a six-token prompt crosses the wire as 72 KB, a single-token activation step crosses as 12 KB.</p>
+<p>Compare to llama.cpp <code>rpc-server</code> streaming full weights on cluster start: ~26 GB per worker for Llama-70B Q4, paid once per restart and dominating operational cost. Nakshatra's architectural commitment is <strong>weights stay local on each worker; only activations travel.</strong> Workers load their assigned layers once at startup from a pre-staged sub-GGUF and never ship them across the network during inference. Per-token wire cost stays in the kilobyte range regardless of model size. Adding a worker means moving 16 KB through it per token, not 26 GB at startup. This single property makes everything else in the design economically viable.</p>
+<h3 id="32-pipeline-parallel-across-vendors-tensor-parallel-only-within-a-vendor">3.2 Pipeline-parallel across vendors; tensor-parallel only within a vendor</h3>
+<p>Cross-vendor tensor parallelism — one transformer block sharded across NVIDIA and Apple Silicon simultaneously — is genuinely hard. Collective operations (all-reduce, all-gather) have no vendor-neutral runtime. NCCL is NVIDIA-only; RCCL is AMD-only; MLX has its own collective primitives; Metal-Vulkan-CUDA at the same instant is fiction.</p>
+<p>Nakshatra's permanent stance: <strong>pipeline parallel across vendors, tensor parallel only within a single vendor.</strong> v0.1 ships with no tensor parallelism at all. This is not a v0.1 limitation; it is a design constraint we do not intend to relax. A future single-vendor backend (TorchCUDABackend, MLXBackend) may use tensor parallelism internally; cross-vendor never will.</p>
+<h3 id="33-per-worker-layer-assignment">3.3 Per-worker layer assignment</h3>
+<p>Each worker holds a contiguous range <code>[start, end)</code> of the model's transformer blocks. A 28-block Llama-3.2-3B fine-tune split across two workers becomes worker A = <code>[0, 14)</code>, worker B = <code>[14, 28)</code>. The first worker holds <code>token_embd</code>; the last holds <code>output_norm</code> and, for tied-embedding models, the embedding matrix repurposed as <code>lm_head</code>.</p>
+<p>Workers consume <strong>pre-split sub-GGUFs</strong>, generated by <code>experiments/v0.0/partial_gguf.py</code>. The sub-GGUF carries <code>nakshatra.layer_range_start</code> / <code>nakshatra.layer_range_end</code> GGUF metadata; the patched loader honours them and only mmaps the kept tensors. The unpatched upstream loader rejects the file with <code>missing tensor 'blk.20.attn_norm.weight'</code> — by design, v0.1 sub-GGUFs are deliberately incompatible with stock <code>llama-cli</code>.</p>
+<h3 id="34-the-patch-set">3.4 The patch set</h3>
+<p>Five patches against <code>llama.cpp</code> (baseline <code>c46583b</code>; we have also tested against <code>8c2c0108d</code>). Net addition: ~70 lines.</p>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>Effect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>llama-model.h.patch</code></td>
+<td>Adds <code>nks_layer_range_start</code>, <code>nks_layer_range_end</code>, <code>nks_has_token_embd</code>, <code>nks_has_lm_head</code> to <code>llama_model</code>.</td>
+</tr>
+<tr>
+<td><code>llama-model.cpp.patch</code></td>
+<td>Reads <code>nakshatra.*</code> GGUF metadata into those fields.</td>
+</tr>
+<tr>
+<td><code>llama-model-loader.cpp.patch</code></td>
+<td>Suppresses the "missing tensor" hard-fail for blocks outside the worker's range.</td>
+</tr>
+<tr>
+<td><code>llama-graph.cpp.patch</code></td>
+<td>When <code>batch.embd</code> is supplied, skip <code>tok_embeddings</code> and inject the hidden state at the residual stream's layer-start position.</td>
+</tr>
+<tr>
+<td><code>models_llama.cpp.patch</code></td>
+<td>Build the transformer graph only for layers <code>[nks_start, nks_end)</code>.</td>
+</tr>
+</tbody>
+</table>
+<p><strong>No new C API is required.</strong> <code>llama_batch_init(n_tokens, n_embd, n_seq_max)</code> already accepts hidden-state input via <code>batch.embd</code>; <code>llama_get_embeddings</code> already exposes hidden-state output; <code>llama_get_logits_ith</code> already returns logits when the worker holds the <code>lm_head</code>. The plan budgeted four days for a new <code>llama_decode_layers(...)</code> entry point and we spent zero — existing API was sufficient once <code>cp.embeddings = true</code> was set on the context.</p>
+<p>v0.1 ships on a local patch series. Upstreaming a clean <code>llama_decode_layers</code> API is a v0.5 ambition; the monthly upstream-rebase cost is ~0.5 engineer-days plus 2–5 days for occasional conflicts.</p>
+<h3 id="35-worker-and-client-process-model">3.5 Worker and client process model</h3>
+<div class="codehilite" style="background: #f0f0f0"><pre style="line-height: 125%;"><span></span><code>┌─────────────────┐    gRPC      ┌──────────────────┐  framed stdin/stdout  ┌────────────────────┐
+│   chain client  │ ───────────► │ python gRPC       │ ────────────────────► │  llama-nakshatra-  │
+│ (scripts/       │              │  worker           │                       │  worker (patched   │
+│  client.py)     │ ◄─────────── │ (scripts/worker.  │ ◄──────────────────── │  libllama, C++)    │
+└─────────────────┘  hidden_out  │  py, ~190 LOC)    │   {hidden, token id}  └────────────────────┘
+                                 └──────────────────┘
+</code></pre></div>
+
+<p>Each worker is a Python gRPC process that spawns a long-lived C++ daemon (<code>llama-nakshatra-worker</code>, ~155 LOC of <code>worker_daemon.cpp</code>). The daemon links the patched <code>libllama.so</code>, holds the sub-GGUF and the KV cache in memory, and accepts framed binary messages on stdin:</p>
+<div class="codehilite" style="background: #f0f0f0"><pre style="line-height: 125%;"><span></span><code>request:<span style="color: #BBB">  </span>u32<span style="color: #BBB"> </span>cmd<span style="color: #BBB"> </span><span style="color: #666">|</span><span style="color: #BBB"> </span>u32<span style="color: #BBB"> </span>n_tokens<span style="color: #BBB"> </span><span style="color: #666">|</span><span style="color: #BBB"> </span>u32<span style="color: #BBB"> </span>payload_bytes<span style="color: #BBB"> </span><span style="color: #666">|</span><span style="color: #BBB"> </span>bytes<span style="color: #BBB"> </span>payload
+response:<span style="color: #BBB"> </span>u32<span style="color: #BBB"> </span>status<span style="color: #BBB"> </span><span style="color: #666">|</span><span style="color: #BBB"> </span>u32<span style="color: #BBB"> </span>payload_bytes<span style="color: #BBB"> </span><span style="color: #666">|</span><span style="color: #BBB"> </span>u32<span style="color: #BBB"> </span>result_type<span style="color: #BBB"> </span><span style="color: #666">|</span><span style="color: #BBB"> </span>bytes<span style="color: #BBB"> </span>payload
+<span style="color: #BBB">          </span>(result_type:<span style="color: #BBB"> </span><span style="color: #40A070">0</span><span style="color: #BBB"> </span><span style="color: #666">=</span><span style="color: #BBB"> </span>hidden<span style="color: #BBB"> </span>state,<span style="color: #BBB"> </span><span style="color: #40A070">1</span><span style="color: #BBB"> </span><span style="color: #666">=</span><span style="color: #BBB"> </span>single<span style="color: #BBB"> </span>int32<span style="color: #BBB"> </span>token<span style="color: #BBB"> </span>id)
+</code></pre></div>
+
+<p>The Python worker is a thin pump: it marshals the gRPC <code>ForwardRequest</code> into the daemon's wire format, sends it on stdin, reads the response from stdout, and surfaces it back. The chain client tokenises the prompt locally, calls the first worker with token IDs, ferries the returned hidden state through any middle workers, and gets back a token id from the last worker.</p>
+<p>The daemon-subprocess split is a deliberate workaround for the Python ↔ libllama ABI friction surfaced in our <code>cb_eval_probe</code> spike: clean PyO3-shaped bindings to llama.cpp do not yet exist without dragging in PyTorch or rewriting graph builders. Spawning a C++ daemon over stdin/stdout decouples the gRPC layer from libllama's C ABI quirks at the cost of one process-boundary serialisation per request — a cost the latency math (§4.5) shows we can absorb at v0.1 traffic levels.</p>
+<h3 id="36-wire-protocol">3.6 Wire protocol</h3>
+<p>gRPC service <code>Nakshatra</code> (<code>proto/nakshatra.proto</code>):</p>
+<div class="codehilite" style="background: #f0f0f0"><pre style="line-height: 125%;"><span></span><code><span style="color: #007020; font-weight: bold">service</span><span style="color: #BBB"> </span>Nakshatra<span style="color: #BBB"> </span>{
+<span style="color: #BBB">  </span><span style="color: #007020; font-weight: bold">rpc</span><span style="color: #BBB"> </span>Info(InfoRequest)<span style="color: #BBB"> </span><span style="color: #007020; font-weight: bold">returns</span><span style="color: #BBB"> </span>(InfoResponse);
+<span style="color: #BBB">  </span><span style="color: #007020; font-weight: bold">rpc</span><span style="color: #BBB"> </span>Forward(ForwardRequest)<span style="color: #BBB"> </span><span style="color: #007020; font-weight: bold">returns</span><span style="color: #BBB"> </span>(ForwardResponse);
+<span style="color: #BBB">  </span><span style="color: #007020; font-weight: bold">rpc</span><span style="color: #BBB"> </span>Inference(stream<span style="color: #BBB"> </span>InferenceStep)<span style="color: #BBB"> </span><span style="color: #007020; font-weight: bold">returns</span><span style="color: #BBB"> </span>(stream<span style="color: #BBB"> </span>InferenceStep);<span style="color: #BBB">  </span><span style="color: #60A0B0; font-style: italic">// v0.5</span>
+}
+
+<span style="color: #007020; font-weight: bold">message</span><span style="color: #BBB"> </span><span style="color: #0E84B5; font-weight: bold">ForwardRequest</span><span style="color: #BBB"> </span>{
+<span style="color: #BBB">  </span><span style="color: #902000">bytes</span><span style="color: #BBB"> </span><span style="color: #4070A0">hidden_in</span><span style="color: #BBB"> </span><span style="color: #666">=</span><span style="color: #BBB"> </span><span style="color: #40A070">1</span>;<span style="color: #BBB">          </span><span style="color: #60A0B0; font-style: italic">// int32[] tokens (first worker) or float32[] hidden</span>
+<span style="color: #BBB">  </span><span style="color: #902000">bool</span><span style="color: #BBB">  </span><span style="color: #4070A0">has_token_ids</span><span style="color: #BBB"> </span><span style="color: #666">=</span><span style="color: #BBB"> </span><span style="color: #40A070">2</span>;
+<span style="color: #BBB">  </span><span style="color: #902000">int32</span><span style="color: #BBB"> </span><span style="color: #4070A0">n_tokens</span><span style="color: #BBB"> </span><span style="color: #666">=</span><span style="color: #BBB"> </span><span style="color: #40A070">3</span>;
+<span style="color: #BBB">  </span><span style="color: #902000">int32</span><span style="color: #BBB"> </span><span style="color: #4070A0">start_pos</span><span style="color: #BBB"> </span><span style="color: #666">=</span><span style="color: #BBB"> </span><span style="color: #40A070">4</span>;
+<span style="color: #BBB">  </span><span style="color: #902000">bool</span><span style="color: #BBB">  </span><span style="color: #4070A0">keep_kv</span><span style="color: #BBB"> </span><span style="color: #666">=</span><span style="color: #BBB"> </span><span style="color: #40A070">5</span>;<span style="color: #BBB">            </span><span style="color: #60A0B0; font-style: italic">// false on prefill, true on streaming step</span>
+<span style="color: #BBB">  </span><span style="color: #902000">string</span><span style="color: #BBB"> </span><span style="color: #4070A0">session_id</span><span style="color: #BBB"> </span><span style="color: #666">=</span><span style="color: #BBB"> </span><span style="color: #40A070">6</span>;
+}
+
+<span style="color: #007020; font-weight: bold">message</span><span style="color: #BBB"> </span><span style="color: #0E84B5; font-weight: bold">ForwardResponse</span><span style="color: #BBB"> </span>{
+<span style="color: #BBB">  </span><span style="color: #902000">bytes</span><span style="color: #BBB"> </span><span style="color: #4070A0">hidden_out</span><span style="color: #BBB"> </span><span style="color: #666">=</span><span style="color: #BBB"> </span><span style="color: #40A070">1</span>;<span style="color: #BBB">         </span><span style="color: #60A0B0; font-style: italic">// float32[] hidden (first/mid) or int32 token (last)</span>
+<span style="color: #BBB">  </span><span style="color: #902000">bool</span><span style="color: #BBB">  </span><span style="color: #4070A0">is_token_id</span><span style="color: #BBB"> </span><span style="color: #666">=</span><span style="color: #BBB"> </span><span style="color: #40A070">2</span>;
+}
+</code></pre></div>
+
+<p>Static-YAML cluster config (the v0.1 default; superseded by Sthambha's pillar registry in v0.3, but always supported as a fallback):</p>
+<div class="codehilite" style="background: #f0f0f0"><pre style="line-height: 125%;"><span></span><code><span style="color: #062873; font-weight: bold">model</span>:
+<span style="color: #BBB">  </span><span style="color: #062873; font-weight: bold">id</span>:<span style="color: #BBB"> </span>prithvi-q8
+<span style="color: #BBB">  </span><span style="color: #062873; font-weight: bold">hidden_size</span>:<span style="color: #BBB"> </span>3072
+<span style="color: #BBB">  </span><span style="color: #062873; font-weight: bold">num_blocks</span>:<span style="color: #BBB"> </span>28
+<span style="color: #BBB">  </span><span style="color: #062873; font-weight: bold">wire_dtype</span>:<span style="color: #BBB"> </span>f32
+<span style="color: #062873; font-weight: bold">workers</span>:
+<span style="color: #BBB">  </span>-<span style="color: #BBB"> </span><span style="color: #062873; font-weight: bold">id</span>:<span style="color: #BBB"> </span>home-pc
+<span style="color: #BBB">    </span><span style="color: #062873; font-weight: bold">address</span>:<span style="color: #BBB"> </span>100.101.134.33<span style="color: #BBB">   </span><span style="color: #60A0B0; font-style: italic"># Tailscale</span>
+<span style="color: #BBB">    </span><span style="color: #062873; font-weight: bold">port</span>:<span style="color: #BBB"> </span>5530
+<span style="color: #BBB">    </span><span style="color: #062873; font-weight: bold">layer_range</span>:<span style="color: #BBB"> </span>[<span style="color: #BB60D5">0</span>,<span style="color: #BBB"> </span><span style="color: #BB60D5">14</span>]
+<span style="color: #BBB">    </span><span style="color: #062873; font-weight: bold">sub_gguf_path</span>:<span style="color: #BBB"> </span>/tmp/cuts/w0_v2.gguf
+<span style="color: #BBB">    </span><span style="color: #062873; font-weight: bold">mode</span>:<span style="color: #BBB"> </span>first
+<span style="color: #BBB">  </span>-<span style="color: #BBB"> </span><span style="color: #062873; font-weight: bold">id</span>:<span style="color: #BBB"> </span>bishwa
+<span style="color: #BBB">    </span><span style="color: #062873; font-weight: bold">address</span>:<span style="color: #BBB"> </span>100.109.164.69
+<span style="color: #BBB">    </span><span style="color: #062873; font-weight: bold">port</span>:<span style="color: #BBB"> </span>5531
+<span style="color: #BBB">    </span><span style="color: #062873; font-weight: bold">layer_range</span>:<span style="color: #BBB"> </span>[<span style="color: #BB60D5">14</span>,<span style="color: #BBB"> </span><span style="color: #BB60D5">28</span>]
+<span style="color: #BBB">    </span><span style="color: #062873; font-weight: bold">sub_gguf_path</span>:<span style="color: #BBB"> </span>/tmp/cuts/wlast_v2.gguf
+<span style="color: #BBB">    </span><span style="color: #062873; font-weight: bold">mode</span>:<span style="color: #BBB"> </span>last
+</code></pre></div>
+
+<h3 id="37-trust-model">3.7 Trust model</h3>
+<p>v0.1 assumes <strong>trusted workers</strong> — a private cluster of mutually-known operators on Tailscale or LAN. We do not verify computation, sign activations, or police peer behaviour. A worker returning garbage activations is debugged as an operator error, not modelled as an adversary. The realistic v1.0+ verification stack — redundant compute + spot-checking + reputation slashing — is surveyed in <code>docs/petals-architecture.md</code> §5 and is explicitly out of scope for the present work.</p>
+<hr />
+<h2 id="4-experiments-and-results">4. Experiments and results</h2>
+<p>We report eight experiments, ordered roughly as the project progressed. Each was designed to answer one falsifiable question; each result is reproducible from the repo.</p>
+<h3 id="41-phase-0a-does-upstream-llamacpp-accept-a-sub-gguf">4.1 Phase 0a — Does upstream <code>llama.cpp</code> accept a sub-GGUF?</h3>
+<p><strong>Question.</strong> If we produce a sub-GGUF with only blocks <code>[0, 20)</code> of an 80-block Llama-3.3-70B GGUF, does stock <code>llama-cli</code> load it?</p>
+<p><strong>Setup.</strong> Intel iMac (<code>bishwa</code>), AMD Radeon Pro 5700 XT, macOS 26.2, llama.cpp 8142 (<code>8c2c0108d</code>). Source: <code>Llama-3.3-70B-Instruct-Q4_K_M.gguf</code> (40 GB, 80 blocks, 724 tensors). <code>partial_gguf.py --keep 20</code> yields a 10 GB sub-GGUF (182 tensors).</p>
+<p><strong>Result.</strong> Hard error at load:</p>
+<div class="codehilite" style="background: #f0f0f0"><pre style="line-height: 125%;"><span></span><code>llama_model_load:<span style="color: #BBB"> </span>error<span style="color: #BBB"> </span>loading<span style="color: #BBB"> </span>model:<span style="color: #BBB"> </span>missing<span style="color: #BBB"> </span>tensor<span style="color: #BBB"> </span><span style="color: #4070A0">&#39;output_norm.weight&#39;</span>
+llama_model_load_from_file_impl:<span style="color: #BBB"> </span>failed<span style="color: #BBB"> </span>to<span style="color: #BBB"> </span><span style="color: #007020">load</span><span style="color: #BBB"> </span>model
+</code></pre></div>
+
+<p>With <code>--keep-output</code> retained, the failure point moves to <code>blk.20.attn_norm.weight</code>. <strong>Conclusion: the loader hard-fails on a partial; the loader patch is required.</strong> This falsifies the "maybe we can avoid patching llama.cpp" branch of the design space and confirms Path B-prime.</p>
+<h3 id="42-phase-0b-can-hidden-state-be-intercepted-shipped-and-re-injected">4.2 Phase 0b — Can hidden state be intercepted, shipped, and re-injected?</h3>
+<p><strong>Question.</strong> Can the residual stream output of a named layer be captured mid-decode, serialised across a network boundary, injected into a peer's decode at the same point, and produce a token that matches the local intercept-but-no-network configuration?</p>
+<p><strong>Setup.</strong> Linux home PC, AMD RX 9070 XT (ran CPU-only for the spike), Llama-3.2-3B Q8_0. Both processes load the <strong>full</strong> model (cheating — partial loading is the v0.1 work). Split point: <code>l_out-13</code>. Wire: localhost TCP, 4-byte length prefix + raw bytes. Sampling: greedy argmax.</p>
+<p><strong>Result.</strong> Three-way comparison on prompt "The capital of France is":</p>
+<table>
+<thead>
+<tr>
+<th>Run</th>
+<th>Mode</th>
+<th>Top-1</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A — reference</td>
+<td>no <code>cb_eval</code> set</td>
+<td><strong>12366 (' Paris')</strong></td>
+</tr>
+<tr>
+<td>B — single-process OBSERVE</td>
+<td><code>cb_eval</code> fires on <code>l_out-13</code>, no I/O</td>
+<td><strong>100428 ('ित')</strong></td>
+</tr>
+<tr>
+<td>C — distributed (SEND ↔ RECV)</td>
+<td>both processes intercept, byte-equal exchange</td>
+<td><strong>100428 ('ित')</strong></td>
+</tr>
+</tbody>
+</table>
+<p>Wire-integrity check: SEND emitted <code>73728 bytes (fnv1a=0x1a47d8111f060f36)</code>; RECV received <code>73728 bytes pre_hash=0x1a47d8111f060f36 post_hash=0x1a47d8111f060f36 (byte-equal)</code>.</p>
+<p><strong>Conclusion.</strong> Runs B and C match exactly — the orchestration protocol is correct. The B/C ≠ A divergence comes from the llama.cpp scheduler fusing adjacent graph nodes when no <code>cb_eval</code> is set; setting the callback forces a <code>ggml_backend_sched_synchronize()</code> that breaks the fusion. The fused vs un-fused numerical paths differ enough at <code>l_out-13</code> to flip the top-1 token for this prompt — informative, not a blocker, and an early warning that we want operator fusion preserved in the production path (which is what the M4 patches achieve).</p>
+<h3 id="43-m4-patched-llamacpp-produces-the-correct-token-via-a-two-worker-chain-single-process">4.3 M4 — Patched llama.cpp produces the correct token via a two-worker chain (single process)</h3>
+<p><strong>Setup.</strong> Sequential, single process. Worker A loaded <code>w0_v2.gguf</code> (layers <code>[0, 14)</code>, <code>token_embd</code>, no <code>output*</code>). Worker B loaded <code>wlast_v2.gguf</code> (layers <code>[14, 28)</code>, <code>token_embd</code> retained for tied-embedding lm_head, <code>output_norm</code>). The chain runs A <code>llama_decode</code> → capture hidden via <code>llama_get_embeddings</code> → B <code>llama_decode</code> with <code>batch.embd</code> → <code>argmax(logits)</code>.</p>
+<p><strong>Result.</strong></p>
+<div class="codehilite" style="background: #f0f0f0"><pre style="line-height: 125%;"><span></span><code>argmax token id=12366 str=&#39; Paris&#39; logit=15.7311
+TOPTOK_CHAIN 12366  Paris
+</code></pre></div>
+
+<p><strong>Conclusion.</strong> Top-1 token matches the single-machine <code>llama-cli</code> reference exactly. The patched llama.cpp performs partial loading and partial decode correctly. Crucially, this happens <em>without</em> breaking operator fusion (unlike the Phase 0b <code>cb_eval</code> path), because the patches modify the graph builder rather than intercepting at execution time.</p>
+<h3 id="44-m5-two-grpc-processes-on-localhost">4.4 M5 — Two gRPC processes on localhost</h3>
+<p><strong>Setup.</strong> Same chain as M4, now across two Python gRPC worker processes on localhost (ports 5530 / 5531). Each Python worker spawns its own <code>llama-nakshatra-worker</code> daemon. The client reads YAML, queries <code>Info</code> on each worker, validates the partition is contiguous <code>[0, 28)</code>, tokenises locally, walks the chain.</p>
+<p><strong>Result.</strong> Top-1 token <code>12366</code> (' Paris'). 220 ms wall-clock for one token. 73 KB hidden state across the wire. Chain partition validates.</p>
+<table>
+<thead>
+<tr>
+<th>Step</th>
+<th>Result</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>2 workers start</td>
+<td>✓ both report <code>M5 listening</code> within 2 s</td>
+</tr>
+<tr>
+<td>Each daemon loads its sub-GGUF</td>
+<td>✓</td>
+</tr>
+<tr>
+<td>Client <code>Info</code> returns correct ranges</td>
+<td>✓</td>
+</tr>
+<tr>
+<td>Partition validates as contiguous <code>[0, 28)</code></td>
+<td>✓</td>
+</tr>
+<tr>
+<td>Hidden state across the wire</td>
+<td>73 KB</td>
+</tr>
+<tr>
+<td>Top-1 token</td>
+<td>12366 (matches reference)</td>
+</tr>
+<tr>
+<td>Wall-clock</td>
+<td>220 ms</td>
+</tr>
+</tbody>
+</table>
+<p>This is the v0.1 acceptance test modulo cross-machine.</p>
+<h3 id="45-m6-two-physical-machines-across-tailscale-the-v01-acceptance-result">4.5 M6 — Two physical machines across Tailscale (the v0.1 acceptance result)</h3>
+<p><strong>Setup.</strong> Cross-vendor at the OS and CPU layers.</p>
+<table>
+<thead>
+<tr>
+<th>Worker</th>
+<th>Host</th>
+<th>Hardware</th>
+<th>OS</th>
+<th>Note</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>home-pc</td>
+<td><code>100.101.134.33</code></td>
+<td>Linux + AMD RX 9070 XT (ROCm available)</td>
+<td>Linux</td>
+<td>ran CPU-only for cross-vendor stability</td>
+</tr>
+<tr>
+<td>bishwa</td>
+<td><code>100.109.164.69</code></td>
+<td>Intel iMac + AMD Radeon Pro 5700 XT (Vulkan/MoltenVK)</td>
+<td>macOS 26.2</td>
+<td>ran CPU-only</td>
+</tr>
+</tbody>
+</table>
+<p>Patched <code>llama.cpp</code> built independently on each machine from <em>different</em> upstream commits (<code>c46583b</code> on Linux, <code>8c2c0108d</code> on macOS). The five M4 patches applied cleanly to both.</p>
+<div class="codehilite" style="background: #f0f0f0"><pre style="line-height: 125%;"><span></span><code>$ python scripts/client.py --config scripts/cluster_crossmachine.yaml \
+                           --model-path ~/.../prithvi-q8.gguf \
+                           --prompt &quot;The capital of France is&quot; --max-tokens 1
+
+[chain] 2 workers in config
+  home-pc   100.101.134.33:5530   layers=[0,14)   embd=True  lm=False  hidden=3072
+  bishwa    100.109.164.69:5531   layers=[14,28)  embd=False lm=True   hidden=3072
+[chain] OK: contiguous coverage of [0, 28)
+[chain] step 1: id=12366 &#39; Paris&#39;
+[chain] generated 1 tokens in 0.51s  (1.96 tok/s)
+TOPTOKS_CHAIN 12366
+</code></pre></div>
+
+<p><strong>Token 12366 (' Paris') — matches M5 localhost, matches M4 single-process, matches the single-machine <code>llama-cli</code> reference.</strong> All four configurations converge.</p>
+<p><strong>Wall-clock breakdown (single-token).</strong> 510 ms total. ~220 ms compute on each worker; ~290 ms Tailscale round-trip + serialisation for the 72 KB hidden state. Both contributions are CPU-bound at this scale. GPU offload (re-enabled post-v0.1) is expected to shrink the compute side substantially; Tailscale RTT is the floor.</p>
+<p>This result satisfies items 1–4 of the v0.1 ship-gate (<code>docs/v0.1-implementation-plan.md</code> §7):</p>
+<ol>
+<li>Pre-split GGUF tool produces sub-GGUFs that the patched loader accepts and the unpatched loader rejects. ✓</li>
+<li>Patched decode on a complete-model layer range reproduces <code>llama_decode</code>'s top-1 token. ✓</li>
+<li>Two-worker cluster produces the same top-1 next token as a single-machine reference. ✓</li>
+<li>The single-machine reference is run with greedy decoding. ✓</li>
+</ol>
+<h3 id="46-streaming-kv-cache-reuse-5-throughput-on-multi-token-generation">4.6 Streaming KV-cache reuse — 5× throughput on multi-token generation</h3>
+<p><strong>Question.</strong> Can multi-token generation avoid re-prefilling the prompt at every step?</p>
+<p><strong>Setup.</strong> v0.1 shipped with M2.5's brute-force "resend full context per step" pattern. We added two fields to the gRPC <code>ForwardRequest</code>: <code>keep_kv: bool</code> (false on prefill, true on subsequent steps) and <code>start_pos: int</code> (where in the KV cache to append). The daemon was modified to honour them — first step <code>keep_kv=false</code>, subsequent steps <code>keep_kv=true</code> with <code>start_pos=prefix_length</code>.</p>
+<p><strong>Result.</strong> Commit <code>59d58ad</code>. <strong>~5× speedup on multi-token generation</strong> versus M2.5 brute-force. Removes the per-step prompt re-tokenisation and re-prefill. The Inference streaming RPC (deferred to v0.5) will further fold prefill and decode into a single bidirectional stream.</p>
+<h3 id="47-phase-b-worker-side-vram-auto-detection">4.7 Phase B — Worker-side VRAM auto-detection</h3>
+<p><strong>Setup.</strong> Workers previously trusted a static <code>--n-gpu-layers</code> value. Phase B (commit <code>4c24aa5</code>) had each worker probe its own actual free VRAM via <code>rocm-smi</code> (AMD) / <code>nvidia-smi</code> (NVIDIA) at startup and choose <code>n_gpu_layers</code> accordingly, advertising the chosen value in the <code>Info</code> response.</p>
+<p><strong>Result.</strong> Eliminates a class of "I configured it for an 8 GB card, the card actually has 6 GB free" failures. Workers advertise a realistic capability rather than an aspirational one.</p>
+<h3 id="48-phases-35-4-4a-h-i-federation-hardening-on-a-5-machine-cluster">4.8 Phases 3.5 / 4 / 4a / H / I — Federation hardening on a 5-machine cluster</h3>
+<p>Once v0.1 was alive, work moved into federation hardening across all five lab machines.</p>
+<table>
+<thead>
+<tr>
+<th>Phase</th>
+<th>Commit</th>
+<th>What it adds</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>3.5</td>
+<td><code>b054872</code></td>
+<td>Workers declare hardware, free-RAM budget, and cached sub-GGUF files in <code>Info</code>.</td>
+</tr>
+<tr>
+<td>3.6</td>
+<td><code>b371407</code></td>
+<td>Workers self-verify their daemon's actual GPU offload before registering with Sthambha.</td>
+</tr>
+<tr>
+<td>4</td>
+<td><code>27c9ddc</code></td>
+<td>Workers serve and fetch sub-GGUFs over HTTP byte-range from peers (no central origin).</td>
+</tr>
+<tr>
+<td>4a</td>
+<td><code>fab3898</code></td>
+<td>Workers scan their cache directory and advertise <strong>every</strong> Nakshatra sub-GGUF they hold, not just the one they were started with.</td>
+</tr>
+<tr>
+<td>H</td>
+<td><code>bcceb76</code></td>
+<td>Workers track per-RPC latency and report it; the client sorts candidate workers by it.</td>
+</tr>
+<tr>
+<td>I</td>
+<td><code>8e8565d</code></td>
+<td>Client uses the pillar's <code>/chain</code> endpoint when available — Sthambha plans the chain, not the client.</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Result.</strong> Three-machine pillar federation is live. Mixed sub-GGUF holdings across the cluster are discoverable; a worker that lacks the right sub-GGUF for a requested layer range can byte-range-fetch it from a peer that has it. The chain planner now considers cached holdings, declared hardware, and observed latency — not just the static YAML.</p>
+<hr />
+<h2 id="5-quantitative-summary">5. Quantitative summary</h2>
+<p>The numbers that matter for replicating or arguing about the v0.1 result:</p>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th>Value</th>
+<th>Note</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Model</td>
+<td>Llama-3.2-3B fine-tune (<code>prithvi-q8</code>)</td>
+<td>28 blocks, hidden_size = 3072, Q8_0 quant</td>
+</tr>
+<tr>
+<td>Workers (acceptance)</td>
+<td>2</td>
+<td>Linux home PC + macOS lab iMac, both CPU-only</td>
+</tr>
+<tr>
+<td>Layer partition</td>
+<td><code>[0, 14)</code>, <code>[14, 28)</code></td>
+<td>contiguous, no gaps</td>
+</tr>
+<tr>
+<td>Sub-GGUF sizes</td>
+<td>~1.8 GB each</td>
+<td></td>
+</tr>
+<tr>
+<td>Activation per token (this model)</td>
+<td>12 KB</td>
+<td><code>3072 × 4 bytes</code> fp32 wire</td>
+</tr>
+<tr>
+<td>Prompt activation (6 tokens)</td>
+<td>72 KB</td>
+<td>one shot</td>
+</tr>
+<tr>
+<td>Per-token Tailscale RTT (consumer hw)</td>
+<td>~290 ms</td>
+<td>dominant floor at v0.1</td>
+</tr>
+<tr>
+<td>Per-token compute per worker (CPU)</td>
+<td>~220 ms</td>
+<td>shrinks with GPU</td>
+</tr>
+<tr>
+<td>End-to-end single-token wall-clock</td>
+<td>510 ms</td>
+<td>M6 cross-machine</td>
+</tr>
+<tr>
+<td>Tokens/sec (multi-token, post-Phase 59d58ad)</td>
+<td>~5× M2.5 baseline</td>
+<td>streaming KV reuse</td>
+</tr>
+<tr>
+<td>llama.cpp patch surface</td>
+<td>5 files, ~70 LOC net</td>
+<td>applied cleanly to two upstream commits</td>
+</tr>
+<tr>
+<td>Worker daemon size</td>
+<td>~155 LOC C++</td>
+<td><code>worker_daemon.cpp</code></td>
+</tr>
+<tr>
+<td>Python worker size</td>
+<td>~190 LOC</td>
+<td><code>scripts/worker.py</code></td>
+</tr>
+<tr>
+<td>Chain client size</td>
+<td>~140 LOC</td>
+<td><code>scripts/client.py</code></td>
+</tr>
+<tr>
+<td>Planned v0.1 effort</td>
+<td>12–20 weeks</td>
+<td>per <code>docs/v0.1-implementation-plan.md</code> §4</td>
+</tr>
+<tr>
+<td>Actual v0.1 effort</td>
+<td>~2 days focused work</td>
+<td>from M1 through M6</td>
+</tr>
+</tbody>
+</table>
+<p>The plan-vs-actual gap (12–20 weeks budgeted, ~2 days spent) is not a claim that the design was easy; it is a claim that the design was <em>correct</em>. The plan's reserve was largely consumed by anticipated risks — a new C API entry point, libllama ABI work, cross-vendor build divergence — that the existing llama.cpp API already addressed. The architecture document predicted the hard parts well enough that none of the reserve was needed.</p>
+<hr />
+<h2 id="6-limitations">6. Limitations</h2>
+<p>We are explicit about what the v0.1 result does <em>not</em> prove.</p>
+<ul>
+<li><strong>CPU-only.</strong> v0.1 ran with <code>-DGGML_METAL=OFF -DGGML_VULKAN=OFF -DGGML_BLAS=OFF</code> to eliminate kernel-divergence between Linux and macOS workers. GPU offload is a v0.5 deliverable. The vendor-portability claim covers OS and CPU vendor today, not GPU vendor.</li>
+<li><strong>Small model.</strong> v0.1 acceptance used a 3B fine-tune (28 blocks, hidden=3072). Larger models (70B-class, 80 blocks, hidden=8192) work on the same architecture in principle and have been partially exercised in the federation phases, but a clean cross-machine 70B acceptance run is the next falsifiable milestone.</li>
+<li><strong>No fault tolerance.</strong> A worker dying mid-inference fails the request. Client-side full-request retry is the v0.1 mitigation. In-flight KV-cache recovery via Petals-style history replay is deferred to v0.5.</li>
+<li><strong>No verification.</strong> The trust model is "trusted operators on Tailscale." A malicious worker can return garbage activations undetected.</li>
+<li><strong>N=2 in the published acceptance.</strong> Larger N has been exercised informally on the lab cluster, but the published acceptance result is two workers.</li>
+<li><strong>Latency-sensitive workloads not a fit.</strong> A ~290 ms per-hop Tailscale RTT on consumer hardware sets a floor that real-time voice and low-latency UI completion will not tolerate. Prithvi's voice/agent surfaces (§7.3) will need to be aware of this.</li>
+<li><strong>Bootstrapping a public network.</strong> v0.1 is private-cluster-only. The DHT, public-registry, and payment-rail surface returns at v1.0+ and remains genuinely hard.</li>
+</ul>
+<hr />
+<h2 id="7-mission-integrating-with-sthambha-and-prithvi">7. Mission: integrating with Sthambha and Prithvi</h2>
+<p>This is the part of the report most likely to evolve under reviewer pushback. Nakshatra alone is an inference engine. The mission Nakshatra was built <em>for</em> is bigger: a self-owned, vendor-agnostic, persistent compute realm for a long-running agent. That realm requires three layers, not one.</p>
+<h3 id="71-sthambha-the-l3-substrate-and-the-soul-persistence-layer">7.1 Sthambha — the L3 substrate (and the soul-persistence layer)</h3>
+<p><strong>Sthambha</strong> (Sanskrit: <em>pillar</em>) is the L3 coordination layer. Its responsibilities, listed in order of how Nakshatra consumes them today:</p>
+<ol>
+<li><strong>Peer registry.</strong> Workers <code>POST /peer</code> to a pillar at startup; the pillar holds the live set of workers, their declared layer ranges, their hardware, their cached sub-GGUF holdings, and their last-seen latency. The chain client <code>GET /chain?model=...&amp;max_layers=...</code> to receive a planned pipeline rather than reading YAML.</li>
+<li><strong>Layer / model cache.</strong> Sub-GGUFs are content-addressed by <code>(model_sha256, layer_start, layer_end)</code>. The pillar tracks which workers hold which slices. A worker missing a slice byte-range-fetches it from a peer using the pillar's directory; no central origin is required.</li>
+<li><strong>Ed25519 identity.</strong> Workers and agents have stable identities, signed handshakes, and a permission scope. v0.1 trusts the operator; v1.0+ will sign activations and slash misbehaviour using the same identity primitive.</li>
+<li><strong>Asthi Dhatu — soul-persistence.</strong> The pillar daemon, the same <code>Sthambha</code> Python class, <em>also</em> holds Shamir-split shards of an agent's identity keypair and Tattva (state) snapshots. When every compute node dies, the pillar continues to pulse (the <code>Om</code> heartbeat in <code>om_pulse()</code>). When compute returns, the agent reconstitutes from <code>K-of-N</code> pillar shards plus the most recent Tattva snapshot. This is not a metaphor. The pillar's <code>GET /wake</code> endpoint is the resurrection ritual.</li>
+</ol>
+<p>The dual-purpose framing — L3 substrate <em>and</em> soul-persistence — is intentional and load-bearing. Both purposes ride on the same registry, the same heartbeat, the same persistent store. Stripping the soul-persistence framing during a refactor would lose the original design intent. (One of the reviewer questions in §9 is whether this is one daemon doing two jobs that should stay merged, or two daemons that have been conflated and should split.)</p>
+<p><strong>Status (2026-05-10).</strong>
+- Pillar daemon (<code>prithvi-pillar.service</code>) deployed on <code>umbrel.local</code> Raspberry Pi 5 since 2026-04-05. 96 000+ Spanda (heartbeat) pulses. 33 days uptime at the time of the v0.1 acceptance.
+- 668 LOC of stdlib Python in three files: <code>run.py</code>, <code>server.py</code>, <code>sthambha.py</code>.
+- Three-pillar federation live (one Brahma, two Dikpala) by Phase G1.
+- HTTP API stabilised: <code>GET /health</code>, <code>GET /state</code>, <code>GET /wake</code>, <code>GET /shard/&lt;id&gt;</code>, <code>POST /tattva</code>, <code>POST /shard</code>, <code>POST /peer</code>, <code>GET /chain</code>.
+- Identity shards: <strong>not yet distributed.</strong> Live pillar shows <code>shards: {}</code>. The Shamir-split-and-distribute ritual is documented but unrun. This is the gap to closing the unified-realm integration.</p>
+<h3 id="72-prithvi-the-l4-agent">7.2 Prithvi — the L4 agent</h3>
+<p><strong>Prithvi</strong> (Sanskrit: <em>earth</em>) is the agent. It owns the mind, voice, gateway, contracts, and platform adapters that turn raw inference into a coherent companion. Prithvi is a <em>consumer</em> of L2 and L3:</p>
+<ul>
+<li><strong>From Nakshatra:</strong> token generation. Prithvi calls <code>client.py</code>'s chain (or, post-v0.5, a streaming <code>Inference</code> RPC) and receives tokens. The agent is portable across models because the inference contract is the same.</li>
+<li><strong>From Sthambha:</strong> identity, persistence, and (eventually) discovery. Prithvi's keypair is the one Shamir-split into pillar shards. Prithvi's Tattva snapshots are what the pillar stores. Prithvi's <code>/wake</code> flow reconstitutes the agent on a fresh boot.</li>
+</ul>
+<p>The hard discipline in the three-project split is that Prithvi must <em>never</em> embed L3 primitives. The first version of the codebase had Prithvi vendor a copy of the pillar logic into its <code>neuron-net/</code> directory, because nothing else existed; the v0.3 work extracts those primitives into Sthambha and converts Prithvi into a clean L3 client. Without that discipline, Nakshatra and Prithvi would maintain divergent copies of registry/identity/cache and the trinity would not compose.</p>
+<h3 id="73-the-integration-plane">7.3 The integration plane</h3>
+<p>What does it look like when an agent invocation traverses all three layers cleanly?</p>
+<div class="codehilite" style="background: #f0f0f0"><pre style="line-height: 125%;"><span></span><code><span style="color: #BBB">   </span>user<span style="color: #BBB"> </span>speaks<span style="color: #BBB">                                  </span>audio
+<span style="color: #BBB">       </span><span style="border: 1px solid #F00">│</span><span style="color: #BBB">                                          </span><span style="border: 1px solid #F00">▲</span>
+<span style="color: #BBB">       </span><span style="border: 1px solid #F00">▼</span><span style="color: #BBB">                                          </span><span style="border: 1px solid #F00">│</span>
+<span style="border: 1px solid #F00">┌──────────────────────────────────────────────────────────────────┐</span>
+<span style="border: 1px solid #F00">│</span><span style="color: #BBB">                    </span>Prithvi<span style="color: #BBB"> </span>(L4)<span style="color: #BBB"> </span><span style="border: 1px solid #F00">—</span><span style="color: #BBB"> </span>the<span style="color: #BBB"> </span>agent<span style="color: #BBB">                      </span><span style="border: 1px solid #F00">│</span>
+<span style="border: 1px solid #F00">│</span><span style="color: #BBB">  </span>voice<span style="color: #BBB">  </span><span style="border: 1px solid #F00">→</span><span style="color: #BBB">  </span>intent<span style="color: #BBB">  </span><span style="border: 1px solid #F00">→</span><span style="color: #BBB">  </span>context<span style="color: #BBB"> </span>assembly<span style="color: #BBB">  </span><span style="border: 1px solid #F00">→</span><span style="color: #BBB">  </span>inference<span style="color: #BBB"> </span>request<span style="color: #BBB">     </span><span style="border: 1px solid #F00">│</span>
+<span style="border: 1px solid #F00">└──────────────────────────────────────────────────────────────────┘</span>
+<span style="color: #BBB">       </span><span style="border: 1px solid #F00">│</span><span style="color: #BBB">                                          </span><span style="border: 1px solid #F00">▲</span>
+<span style="color: #BBB">       </span><span style="border: 1px solid #F00">│</span><span style="color: #BBB"> </span><span style="color: #002070; font-weight: bold">ask:</span><span style="color: #BBB"> </span><span style="color: #4070A0">&quot;generate next K tokens given ctx&quot;</span><span style="color: #BBB">  </span><span style="border: 1px solid #F00">│</span><span style="color: #BBB"> </span>tokens
+<span style="color: #BBB">       </span><span style="border: 1px solid #F00">▼</span><span style="color: #BBB">                                          </span><span style="border: 1px solid #F00">│</span>
+<span style="border: 1px solid #F00">┌──────────────────────────────────────────────────────────────────┐</span>
+<span style="border: 1px solid #F00">│</span><span style="color: #BBB">             </span>Sthambha<span style="color: #BBB"> </span>(L3)<span style="color: #BBB"> </span><span style="border: 1px solid #F00">—</span><span style="color: #BBB"> </span>pillar<span style="color: #BBB"> </span><span style="color: #666">/</span><span style="color: #BBB"> </span>registry<span style="color: #BBB">                    </span><span style="border: 1px solid #F00">│</span>
+<span style="border: 1px solid #F00">│</span><span style="color: #BBB">  </span>GET<span style="color: #BBB"> </span><span style="color: #666">/</span>chain<span style="color: #666">?</span>model<span style="color: #666">=</span>X<span style="color: #666">&amp;</span>ctx_len<span style="color: #666">=</span>N<span style="color: #666">&amp;</span>latency_budget<span style="color: #666">=</span>L<span style="color: #BBB">                   </span><span style="border: 1px solid #F00">│</span>
+<span style="border: 1px solid #F00">│</span><span style="color: #BBB">  </span><span style="border: 1px solid #F00">→</span><span style="color: #BBB"> </span>ordered<span style="color: #BBB"> </span>list<span style="color: #BBB"> </span>of<span style="color: #BBB"> </span>workers<span style="color: #BBB"> </span><span style="color: #666">+</span><span style="color: #BBB"> </span>their<span style="color: #BBB"> </span>layer<span style="color: #BBB"> </span>ranges<span style="color: #BBB">                  </span><span style="border: 1px solid #F00">│</span>
+<span style="border: 1px solid #F00">└──────────────────────────────────────────────────────────────────┘</span>
+<span style="color: #BBB">       </span><span style="border: 1px solid #F00">│</span><span style="color: #BBB">                                          </span><span style="border: 1px solid #F00">▲</span>
+<span style="color: #BBB">       </span><span style="border: 1px solid #F00">│</span><span style="color: #BBB"> </span>planned<span style="color: #BBB"> </span>chain<span style="color: #BBB">                            </span><span style="border: 1px solid #F00">│</span>
+<span style="color: #BBB">       </span><span style="border: 1px solid #F00">▼</span><span style="color: #BBB">                                          </span><span style="border: 1px solid #F00">│</span>
+<span style="border: 1px solid #F00">┌──────────────────────────────────────────────────────────────────┐</span>
+<span style="border: 1px solid #F00">│</span><span style="color: #BBB">           </span>Nakshatra<span style="color: #BBB"> </span>(L2)<span style="color: #BBB"> </span><span style="border: 1px solid #F00">—</span><span style="color: #BBB"> </span>distributed<span style="color: #BBB"> </span>inference<span style="color: #BBB"> </span>engine<span style="color: #BBB">          </span><span style="border: 1px solid #F00">│</span>
+<span style="border: 1px solid #F00">│</span><span style="color: #BBB">  </span>chain<span style="color: #BBB"> </span>client<span style="color: #BBB"> </span><span style="border: 1px solid #F00">→</span><span style="color: #BBB"> </span>worker<span style="color: #BBB"> </span>A<span style="color: #BBB"> </span>(layers<span style="color: #BBB"> </span>[<span style="color: #40A070">0</span>,k))<span style="color: #BBB"> </span><span style="border: 1px solid #F00">→</span><span style="color: #BBB"> </span><span style="border: 1px solid #F00">…</span><span style="color: #BBB"> </span><span style="border: 1px solid #F00">→</span><span style="color: #BBB"> </span>worker<span style="color: #BBB"> </span>N<span style="color: #BBB"> </span>(lm_head)<span style="color: #BBB"> </span><span style="border: 1px solid #F00">│</span>
+<span style="border: 1px solid #F00">└──────────────────────────────────────────────────────────────────┘</span>
+<span style="color: #BBB">       </span><span style="border: 1px solid #F00">│</span><span style="color: #BBB">                                          </span><span style="border: 1px solid #F00">▲</span>
+<span style="color: #BBB">       </span><span style="border: 1px solid #F00">│</span><span style="color: #BBB"> </span>activations<span style="color: #BBB"> </span>(<span style="color: #40A070">16</span><span style="color: #BBB"> </span>KB<span style="color: #666">/</span>token<span style="color: #666">/</span>hop)<span style="color: #BBB">            </span><span style="border: 1px solid #F00">│</span><span style="color: #BBB"> </span>token<span style="color: #BBB"> </span>ids
+<span style="color: #BBB">       </span><span style="border: 1px solid #F00">└──────────────────────────────────────────┘</span>
+</code></pre></div>
+
+<p>Above the dashed boundary, Prithvi sees "tokens please, here is my context." Below the boundary, Sthambha plans the chain and Nakshatra executes it. The agent does not know whether the pipeline is two workers or eight, CPU or GPU, single-vendor or cross-vendor. The realm absorbs the heterogeneity.</p>
+<p>The soul-persistence ritual runs orthogonally. While compute is up, Prithvi periodically <code>POST /tattva</code>s its current state snapshot to a Brahma pillar; identity shards live on <code>K-of-N</code> Dikpala pillars. When compute dies, the pillars continue to pulse. When compute returns — same hardware, different hardware, replacement hardware — the agent issues <code>GET /wake</code> to <code>K</code> pillars, reconstitutes its keypair via Shamir recovery, pulls the most recent Tattva snapshot, and resumes. <em>No single device is load-bearing for the agent's continuity.</em></p>
+<h3 id="74-why-this-composition-is-the-point">7.4 Why this composition is the point</h3>
+<p>Each project on its own is unremarkable.</p>
+<ul>
+<li>Nakshatra without Sthambha is "Petals, but llama.cpp-shaped, for private clusters." That is useful but not novel.</li>
+<li>Sthambha without Nakshatra is "a peer registry with a soul-backup hobby." Also useful, also not novel.</li>
+<li>Prithvi without Nakshatra and Sthambha is "another LLM-agent built on hosted APIs." Useful for the user; not architecturally new.</li>
+</ul>
+<p>The composition is what is new: <strong>a personal AI that survives its hardware, runs on whatever metal the owner happens to have, costs no monthly fee, and is not a tenant of someone else's product.</strong> That is the property worth building toward. Each layer exists to make the composition possible.</p>
+<hr />
+<h2 id="8-the-unified-personal-compute-realm-composing-l2-l3-l4">8. The unified personal compute realm — composing L2 + L3 + L4</h2>
+<p><strong>The realm is not a fourth codebase.</strong> It is the emergent property of L2, L3, and L4 integrated correctly. A user does not install "the realm"; a user runs Sthambha pillars on always-on hardware, registers Nakshatra workers on whatever heterogeneous metal they own, and invokes Prithvi as their agent. The realm exists when the three are alive together.</p>
+<h3 id="81-what-is-true-in-the-unified-realm-that-is-not-true-in-any-one-project">8.1 What is true in the unified realm that is not true in any one project</h3>
+<ol>
+<li><strong>The agent does not die when a device dies.</strong> Replace the laptop, drop the desktop, retire the iMac — the agent's identity reconstitutes from pillar shards, the most recent Tattva snapshot is fetched, and the agent resumes. Continuity is a property of the realm, not the device.</li>
+<li><strong>The compute pool absorbs heterogeneity.</strong> A new contributor — a friend's old gaming PC, a sibling's MacBook, a Raspberry Pi 5 with a USB SSD — joins by running a Nakshatra worker and registering with the pillar. The chain planner figures out where they fit. The agent does not know.</li>
+<li><strong>The cost curve flips.</strong> Long-horizon work (a research agent crawling for a weekend, a code-review agent watching a repo for weeks, a personal companion running continuously for months) costs the marginal electricity of hardware the owner already paid for. The hosted-AI economics that punish duration stop applying.</li>
+<li><strong>The agent is portable across surfaces.</strong> Voice in the kitchen, terminal at the desk, Cursor in the IDE, Telegram on the phone — every surface is a thin client to the same agent. The agent's state lives in the realm; the surface is just the access point.</li>
+<li><strong>The model registry is plural.</strong> Multiple models live in the realm simultaneously, identified by content hash and addressable from any agent. Llama-3-70B for long context; a fine-tuned 3B for fast chat; a domain model for a hobby. The pillar's layer cache knows which workers hold which slices of which model.</li>
+</ol>
+<h3 id="82-the-endgame-soberly">8.2 The endgame, soberly</h3>
+<p>We are not claiming the realm is delivered. We are claiming each layer is well-scoped enough that the composition is reachable from where we are today:</p>
+<table>
+<thead>
+<tr>
+<th>State</th>
+<th>What is true today</th>
+<th>What needs to land for the realm</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>L2 (Nakshatra)</td>
+<td>v0.1 alive; v0.3 federation in progress</td>
+<td>GPU offload (v0.5), streaming KV (in flight), 70B cross-vendor acceptance</td>
+</tr>
+<tr>
+<td>L3 (Sthambha)</td>
+<td>Three-pillar federation alive; layer cache wired</td>
+<td>Shamir-split identity distribution (~1 week); multi-pillar gossip</td>
+</tr>
+<tr>
+<td>L4 (Prithvi)</td>
+<td>Agent runs against hosted APIs and against Nakshatra v0.1</td>
+<td>Migrate identity and Tattva snapshots out of <code>neuron-net/</code> and into Sthambha</td>
+</tr>
+<tr>
+<td><strong>Integration milestone</strong></td>
+<td>—</td>
+<td>The <code>wake</code> ritual reconstitutes a Prithvi on a fresh machine with continuity intact</td>
+</tr>
+</tbody>
+</table>
+<p>The first version of the realm we will recognise: a Prithvi instance that is killed on the home PC, brought back on a different machine, and resumes mid-conversation. The hardware changes; the agent does not notice. That is the falsifiable integration milestone.</p>
+<h3 id="83-honest-limits-of-the-unified-realm">8.3 Honest limits of the unified realm</h3>
+<p>We owe the reader the same honesty about the realm as about v0.1:</p>
+<ul>
+<li><strong>The realm is not AGI infrastructure.</strong> It runs whatever models exist; it does not improve them.</li>
+<li><strong>The realm is not "private by default."</strong> Activations flowing through the worker pipeline pass through workers the owner controls. Real privacy against the owner's own workers requires zkML or TEEs that are years out.</li>
+<li><strong>The realm is not always cheaper than cloud.</strong> Bulk hosted economics are real. The realm wins on duration and sovereignty, loses on bursty single-shot inference.</li>
+<li><strong>The realm does not replace frontier closed models.</strong> GPT-5 / Claude-5 / Gemini-3 will lead open models for the foreseeable future. The realm serves open models; Prithvi can still call closed APIs when warranted.</li>
+<li><strong>Bootstrapping is the existential question.</strong> Even in a personal-cluster setting, the discipline of running pillars on always-on hardware and registering workers reliably is non-trivial. Realm-scale operation at internet scale is a v1.0+ research problem, not a v0.3 deliverable.</li>
+</ul>
+<hr />
+<h2 id="9-open-design-questions-for-reviewers">9. Open design questions for reviewers</h2>
+<p>The questions we most want pushback on:</p>
+<ol>
+<li><strong>Daemon subprocess vs in-process binding.</strong> We chose a long-lived C++ daemon over framed stdin/stdout instead of a PyO3-shaped libllama binding. Is that the right call at v0.5 once GPU offload is in?</li>
+<li><strong>gRPC over Tailscale vs upstream <code>ggml-rpc</code>.</strong> Should we be contributing partial-load semantics into <code>ggml-rpc.cpp</code> rather than maintaining our own gRPC layer? Upstreaming would give us the <code>--cache</code> flag's content-addressed caching for free.</li>
+<li><strong>Static YAML vs pillar registry as the v0.5 default.</strong> Today both are supported with pillar preferred. Should YAML be deprecated entirely, or stay as a fallback for clusters without a pillar?</li>
+<li><strong>Activation wire dtype.</strong> v0.1 ships fp32 (because the 3B test model has hidden=3072, so fp32 is only 12 KB/token and not worth quantising). Should v0.5 default to fp16 globally and add int8 as opt-in, or wait?</li>
+<li><strong>Operator fusion vs hidden-state observability.</strong> The Phase 0b finding (B/C ≠ A) showed that breaking fusion changes the output. The M4 patches preserve fusion correctly; should we surface a debugging mode that intentionally breaks fusion (for testing) without affecting production?</li>
+<li><strong>One pillar doing two jobs.</strong> Sthambha's pillar does L3 substrate <em>and</em> Asthi Dhatu soul-persistence on the same daemon. Is that defensible as one project, or are we conflating two systems?</li>
+<li><strong>The Sanskrit-cosmology vocabulary.</strong> Does the naming (Sthambha, Nakshatra, Prithvi, Asthi Dhatu, Tattva, Spanda) read as load-bearing architectural vocabulary or as decoration? It is the former in our intent; we want to know how it reads to a reviewer outside the project.</li>
+</ol>
+<hr />
+<h2 id="10-roadmap-sequence-not-schedule">10. Roadmap (sequence, not schedule)</h2>
+<table>
+<thead>
+<tr>
+<th>Version</th>
+<th>Scope</th>
+<th>Status</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>v0.0</td>
+<td>Phase 0a/0b validation. Decision gate.</td>
+<td>✓</td>
+</tr>
+<tr>
+<td><strong>v0.1</strong></td>
+<td>Two-machine cross-vendor CPU acceptance.</td>
+<td><strong>✓ (2026-05-06)</strong></td>
+</tr>
+<tr>
+<td>v0.3</td>
+<td>5-machine lab cluster, three-pillar federation, capability handshake, latency-aware routing, sub-GGUF byte-range fetch.</td>
+<td>in progress, partially landed (commits 27c9ddc, 4c24aa5, fab3898, bcceb76, 8e8565d)</td>
+</tr>
+<tr>
+<td>v0.5</td>
+<td>GPU offload re-enabled. Streaming Inference RPC with worker-side KV-cache reuse. Server-to-server activation push. Dynamic re-routing on worker failure. 70B cross-vendor acceptance.</td>
+<td>next</td>
+</tr>
+<tr>
+<td>v1.0</td>
+<td>DHT-based public-network mode. Opt-in verification (redundant compute + spot-check). Adapter (LoRA / PEFT) support.</td>
+<td>later</td>
+</tr>
+<tr>
+<td>Sthambha v0.5</td>
+<td>Shamir-split identity distribution active. Multi-pillar gossip. Tattva snapshot retention policy.</td>
+<td>parallel track</td>
+</tr>
+<tr>
+<td>Prithvi v0.5</td>
+<td>Migration to Sthambha as L3 client; vendored <code>neuron-net/</code> retired.</td>
+<td>parallel track</td>
+</tr>
+<tr>
+<td><strong>Integration milestone 1</strong></td>
+<td>Prithvi killed on host A, resumed on host B with continuity intact.</td>
+<td>endgame target</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="11-reproducibility">11. Reproducibility</h2>
+<p>All code, patches, experiment logs, and design docs are in the public repository. The v0.1 acceptance result is reproducible end-to-end from the README walkthrough; an external operator with two machines and a GGUF should reach the same <code>TOPTOKS_CHAIN 12366</code> in under one hour.</p>
+<ul>
+<li><strong>Repo:</strong> https://github.com/fthrvi/nakshatra</li>
+<li><strong>Sthambha (L3):</strong> https://github.com/fthrvi/sthambha (companion project)</li>
+<li><strong>Acceptance experiment:</strong> <code>experiments/v0.0/m6_findings.md</code></li>
+<li><strong>Patch set:</strong> <code>experiments/v0.0/m4_patches/</code></li>
+<li><strong>Architecture contract:</strong> <code>docs/petals-architecture.md</code></li>
+<li><strong>North-star vision:</strong> <code>docs/north-star.md</code></li>
+<li><strong>Three-project decision:</strong> <code>docs/three-project-architecture.md</code></li>
+</ul>
+<hr />
+<h2 id="12-call-for-review-and-where-this-paper-is-being-shared">12. Call for review and where this paper is being shared</h2>
+<p>This draft is circulated to researchers and engineers working in adjacent areas — Petals, exo, llama.cpp, distributed inference, federated learning, agent infrastructure, personal AI — before we lock the v0.5 design and commit to the L3/L4 integration plan. The questions in §9 are the ones we most want pushback on, but any review of the architecture, the patch set, the acceptance methodology, the Sanskrit-cosmology vocabulary, or the broader L1–L4 framing is welcome.</p>
+<p><strong>Channels.</strong></p>
+<ul>
+<li><strong>GitHub.</strong> Open an issue at https://github.com/fthrvi/nakshatra/issues or email tankaifish@gmail.com.</li>
+<li><strong>pnl.market.</strong> In parallel with the academic-style review, the project is being proposed as a community-staked market on <a href="https://pnl.market">pnl.market</a> — a Solana-based prediction-and-launch platform where the crowd stakes SOL on whether an idea should exist (believers) or won't work (critics). The pnl.market posting is <strong>not</strong> a token sale and <strong>not</strong> a substitute for technical review; it is a way to surface honest conviction from people who have to put SOL behind their opinion. Both signals — researcher critique and staked conviction — are useful for different reasons, and the project welcomes both.</li>
+</ul>
+<hr />
+<h2 id="references">References</h2>
+<p>[1] Borzunov, A., Baranchuk, D., Dettmers, T., Ryabinin, M., Belkada, Y., Chumachenko, A., Samygin, P., Raffel, C. <em>Petals: Collaborative Inference and Fine-tuning of Large Models.</em> 2022. https://github.com/bigscience-workshop/petals</p>
+<p>[2] exo-explore/exo. <em>Run your own AI cluster at home with everyday devices.</em> https://github.com/exo-explore/exo</p>
+<p>[3] ggerganov/llama.cpp. https://github.com/ggml-org/llama.cpp — in particular <code>tools/rpc/rpc-server.cpp</code> and <code>ggml/src/ggml-rpc.cpp</code> for the upstream RPC backend, and <code>gguf-py/</code> for the GGUF reader/writer used by <code>partial_gguf.py</code>.</p>
+<p>[4] Sheng, Y. et al. <em>FlexGen: High-Throughput Generative Inference of Large Language Models with a Single GPU.</em> ICML 2023.</p>
+<p>[5] HuggingFace Transformers — block-class hierarchy and <code>AutoConfig</code> machinery on which Petals' model-registration plugin pattern depends.</p>
+<p>[6] Tailscale — WireGuard-based overlay network used for all cross-machine experiments. https://tailscale.com</p>
+<p>[7] Shamir, A. <em>How to Share a Secret.</em> CACM, 1979. (Underlies Sthambha's identity-shard distribution.)</p>
+</body></html>
