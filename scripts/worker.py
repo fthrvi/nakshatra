@@ -22,6 +22,7 @@ import hashlib
 import json
 import os
 import platform
+import plistlib
 import re
 import shutil
 import socket
@@ -287,41 +288,62 @@ def detect_gpus() -> list:
     """
     try:
         if platform.system() == "Darwin":
+            # ioreg sees hidden Intel iGPUs that SPDisplaysDataType drops when
+            # a discrete AMD GPU is active on Intel iMacs. We walk every
+            # IOPCIDevice in the I/O Registry and pick those whose PCI class
+            # code starts with 0x03 (display controller).
+            out = subprocess.run(
+                ["ioreg", "-a", "-r", "-c", "IOPCIDevice"],
+                capture_output=True, timeout=5, check=False,
+            ).stdout
+            plist = plistlib.loads(out) if out else []
+            vendor_map = {0x8086: "intel", 0x1002: "amd", 0x10de: "nvidia", 0x106B: "apple"}
+            # vendors whose GPUs in a Mac chassis are always integrated
+            integrated_vendors = {0x8086, 0x106B}
+            gpus = []
+
+            def walk(entries):
+                for e in entries:
+                    cc = e.get("class-code") or b""
+                    # vendor-id and class-code come as little-endian 4-byte
+                    # values; display class is the third byte = 0x03.
+                    if len(cc) >= 3 and cc[2] == 0x03:
+                        model = e.get("model") or b""
+                        if isinstance(model, bytes):
+                            name = model.rstrip(b"\x00").decode("utf-8", "replace") or "unknown"
+                        else:
+                            name = str(model) or e.get("IOName", "unknown")
+                        vid_b = e.get("vendor-id") or b""
+                        vid = int.from_bytes(vid_b[:2], "little") if vid_b else None
+                        vendor = vendor_map.get(vid, f"0x{vid:04x}" if vid is not None else "")
+                        ioname = e.get("IOName", "")
+                        integrated = (vid in integrated_vendors) or ioname == "IGPU"
+                        gpus.append({
+                            "name": name, "vendor": vendor,
+                            "integrated": integrated, "vram_mb": None,
+                        })
+                    for c in e.get("IORegistryEntryChildren") or []:
+                        walk([c])
+
+            walk(plist)
+            if gpus:
+                return gpus
+            # Apple Silicon: GPU is on the SoC, not enumerated via IOPCIDevice.
+            # Fall back to SPDisplaysDataType which still surfaces it under a
+            # synthetic entry (e.g. "Apple M1 Pro", integrated by definition).
             out = subprocess.run(
                 ["system_profiler", "-json", "SPDisplaysDataType"],
                 capture_output=True, timeout=5, text=True, check=False,
             ).stdout
             data = json.loads(out) if out else {}
-            gpus = []
             for d in data.get("SPDisplaysDataType", []):
                 name = d.get("_name") or d.get("sppci_model", "unknown")
-                # system_profiler sometimes returns the resource key instead of
-                # the localized name on Intel Macs (e.g. "kHW_AMDRadeonProVega56Item").
-                # Strip the prefix/suffix and split camel-case into words.
-                if name.startswith("kHW_") and name.endswith("Item"):
-                    raw = name[4:-4]
-                    name = re.sub(r"(?<=[a-z])(?=[A-Z0-9])|(?<=[A-Z])(?=[A-Z][a-z])", " ", raw)
                 vendor = d.get("spdisplays_vendor", "")
-                # system_profiler returns "sppci_vendor_Apple" / "sppci_vendor_Intel"
-                # as internal keys when localized strings aren't filled in.
                 if vendor.startswith("sppci_vendor_"):
                     vendor = vendor[len("sppci_vendor_"):]
-                vendor = vendor.lower()
-                # iGPU on Intel Macs uses shared system RAM (vram_shared) and
-                # sits on the built-in bus; dGPU has dedicated vram + PCIe bus.
-                integrated = (
-                    "spdisplays_vram_shared" in d
-                    or d.get("sppci_bus") == "spdisplays_builtin"
-                )
-                vram_str = str(d.get("spdisplays_vram") or d.get("spdisplays_vram_shared", ""))
-                vram_mb = None
-                m = re.match(r"(\d+)\s*(MB|GB)", vram_str, re.IGNORECASE)
-                if m:
-                    n = int(m.group(1))
-                    vram_mb = n * 1024 if m.group(2).upper() == "GB" else n
                 gpus.append({
-                    "name": name, "vendor": vendor,
-                    "integrated": integrated, "vram_mb": vram_mb,
+                    "name": name, "vendor": vendor.lower(),
+                    "integrated": True, "vram_mb": None,
                 })
             return gpus
         if platform.system() == "Linux":
