@@ -274,16 +274,17 @@ def heartbeat_loop(pillar_url: str, payload: dict, interval: float = 30.0,
 
 
 _FILE_SERVER_DIR = ""
+_HEALTH_STATE: dict = {}
 
 
 class FileServerHandler(BaseHTTPRequestHandler):
-    """Phase-4 file server. Serves files from this worker's sub-GGUF directory
-    over HTTP with byte-range support, so other peers can bootstrap their
-    layer range from us instead of needing manual scp.
+    """Phase-4 file server + worker health endpoint.
 
     Endpoints:
         GET /file/<basename>     — sends the file (full or Range-restricted)
-        GET /                    — info ping ("worker file server")
+        GET /healthz             — rich JSON health for ops dashboards; 200 OK
+                                   if daemon alive, 503 if not.
+        GET /health, /           — aliases for /healthz.
     """
     server_version = "NakshatraFileServer/0.1"
 
@@ -292,12 +293,43 @@ class FileServerHandler(BaseHTTPRequestHandler):
         # sys.stderr.write(f"[fileserver] {self.address_string()} {format % args}\n")
         pass
 
+    def _health_payload(self):
+        daemon = _HEALTH_STATE.get("daemon")
+        daemon_alive = daemon is not None and daemon.proc.poll() is None
+        started_at = _HEALTH_STATE.get("started_at", time.time())
+        samples = list(daemon.recent_rpc_ms) if daemon is not None else []
+        recent_avg = (sum(samples) / len(samples)) if samples else None
+        gpu = daemon.gpu_offload_status() if daemon is not None else None
+        return {
+            "status": "ok" if daemon_alive else "down",
+            "node_id": _HEALTH_STATE.get("node_id", ""),
+            "model_id": _HEALTH_STATE.get("model_id", ""),
+            "mode": _HEALTH_STATE.get("mode", ""),
+            "layer_start": _HEALTH_STATE.get("layer_start", -1),
+            "layer_end": _HEALTH_STATE.get("layer_end", -1),
+            "grpc_port": _HEALTH_STATE.get("grpc_port", 0),
+            "file_server_port": _HEALTH_STATE.get("file_server_port", 0),
+            "uptime_seconds": round(time.time() - started_at, 1),
+            "daemon_alive": daemon_alive,
+            "recent_rpc_ms_avg": round(recent_avg, 2) if recent_avg is not None else None,
+            "recent_rpc_ms_samples": len(samples),
+            "gpu": {
+                "uses_gpu": gpu["uses_gpu"] if gpu else False,
+                "offloaded": (f"{gpu['n_offloaded']}/{gpu['total_layers']}"
+                              if gpu and gpu["total_layers"] > 0 else None),
+                "backends": gpu["backend_hints"] if gpu else [],
+            },
+            "protocol_version": "0.1.0",
+        }
+
     def do_GET(self):
-        if self.path == "/" or self.path == "/health":
-            body = b'{"server":"nakshatra-file","status":"ok"}'
-            self.send_response(200)
+        if self.path in ("/", "/health", "/healthz"):
+            payload = self._health_payload()
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(200 if payload["daemon_alive"] else 503)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(body)
             return
@@ -772,6 +804,18 @@ def main():
     # pre-shipped — they query the pillar's file index, find a peer that has
     # the file, and download it. Convention: file-server port = grpc port + 1000.
     file_server_port = args.file_server_port or (args.port + 1000)
+    node_id = args.node_id or f"{socket.gethostname()}-{args.port}"
+    _HEALTH_STATE.update({
+        "daemon": daemon,
+        "started_at": time.time(),
+        "node_id": node_id,
+        "model_id": args.model_id,
+        "mode": args.mode,
+        "layer_start": args.layer_start,
+        "layer_end": args.layer_end,
+        "grpc_port": args.port,
+        "file_server_port": file_server_port if not args.no_file_server else 0,
+    })
     if not args.no_file_server:
         try:
             start_file_server(serving_dir=str(Path(args.sub_gguf).parent),
@@ -779,6 +823,7 @@ def main():
         except Exception as e:
             print(f"[fileserver] failed to start: {e} (peers won't be able to fetch from this worker)", flush=True)
             file_server_port = 0
+            _HEALTH_STATE["file_server_port"] = 0
     else:
         file_server_port = 0
 
@@ -789,7 +834,6 @@ def main():
     heartbeat_thread = None
     if args.pillar_url:
         public_addr = args.public_address or f"{socket.gethostname()}:{args.port}"
-        node_id = args.node_id or f"{socket.gethostname()}-{args.port}"
 
         # Phase 3.5: compute SHA-256 of the sub-GGUF (one-time at startup)
         sub_gguf_sha256 = ""
