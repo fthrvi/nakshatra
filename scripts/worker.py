@@ -231,9 +231,87 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
         return pb.ForwardResponse(hidden_out=payload)
 
     def Inference(self, request_iterator, context):
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details("Inference streaming will arrive after multi-token testing on Forward")
-        return iter([])
+        """v0.5 M0.5.1 — streaming inference RPC.
+
+        Per-stream session: the first step decodes with KV-cache cleared, every
+        subsequent step keeps the KV cache and advances start_pos. Mirrors
+        Forward's daemon-call behaviour exactly; this is a transport-layer
+        change, not a semantic one.
+
+        Routes each step to the daemon based on payload type:
+          token_ids    -> CMD_TOKEN_DECODE (typical first-worker input)
+          hidden_state -> CMD_EMBD_DECODE  (middle/last input)
+
+        Responds with the typed payload appropriate for this worker's mode:
+          mode=last  -> token_ids (a single sampled token id)
+          otherwise  -> hidden_state (one vector per input token)
+        """
+        first_step = True
+        try:
+            for step in request_iterator:
+                if step.HasField("token_ids"):
+                    ids = list(step.token_ids.ids)
+                    n_tokens = len(ids)
+                    if n_tokens == 0:
+                        yield pb.InferenceStep(
+                            session_id=step.session_id, step_id=step.step_id,
+                            error=b"empty token_ids payload",
+                        )
+                        return
+                    input_bytes = struct.pack(f"<{n_tokens}i", *ids)
+                    cmd = CMD_TOKEN_DECODE
+                elif step.HasField("hidden_state"):
+                    hs = step.hidden_state
+                    n_tokens = hs.n_tokens
+                    expected = n_tokens * self.n_embd * 4
+                    if len(hs.raw) != expected:
+                        yield pb.InferenceStep(
+                            session_id=step.session_id, step_id=step.step_id,
+                            error=f"hidden_state size mismatch: got {len(hs.raw)}, expected {expected}".encode(),
+                        )
+                        return
+                    input_bytes = hs.raw
+                    cmd = CMD_EMBD_DECODE
+                else:
+                    yield pb.InferenceStep(
+                        session_id=step.session_id, step_id=step.step_id,
+                        error=b"InferenceStep payload must be token_ids or hidden_state",
+                    )
+                    return
+
+                flags = 0x0 if first_step else 0x1
+                first_step = False
+                status, resp = self.daemon.call(
+                    cmd, n_tokens, input_bytes,
+                    start_pos=int(step.prefix_length), flags=flags,
+                )
+                if status != 0 or len(resp) < 4:
+                    yield pb.InferenceStep(
+                        session_id=step.session_id, step_id=step.step_id,
+                        error=f"daemon decode failed status={status} resp_len={len(resp)}".encode(),
+                    )
+                    return
+                # Daemon prefixes payload with rtype; Forward drops it, we do too.
+                payload = resp[4:]
+
+                out = pb.InferenceStep(
+                    session_id=step.session_id,
+                    step_id=step.step_id,
+                    prefix_length=step.prefix_length + n_tokens,
+                )
+                if self.mode == "last":
+                    token_id = struct.unpack("<i", payload[:4])[0]
+                    out.token_ids.ids.append(token_id)
+                else:
+                    out.hidden_state.raw = payload
+                    out.hidden_state.batch = 1
+                    out.hidden_state.n_tokens = n_tokens
+                yield out
+        except Exception as e:
+            sys.stderr.write(f"[inference] stream aborted: {e}\n")
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(f"Inference stream error: {e}")
+            return
 
 
 def register_with_pillar(pillar_url: str, payload: dict, log_prefix: str = "[worker]"):
