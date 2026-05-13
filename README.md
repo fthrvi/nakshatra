@@ -1,6 +1,6 @@
 # Nakshatra
 
-> A distributed inference engine. Runs one large language model split across many heterogeneous workers (NVIDIA / AMD / Apple Silicon / CPU). Forked from [Petals](README_PETALS.md); the v0.1 design is independent.
+> Distributed LLM inference across heterogeneous workers (NVIDIA / AMD / Apple Silicon / CPU). Splits one model by layer ranges; patched llama.cpp + gRPC chain protocol. (Inspired by [Petals](README_PETALS.md); v0.1 design is independent.)
 
 Status (2026-05-06): **v0.1 functionally alive.** Two-worker cluster on Tailscale produces the same top-1 token as a single-machine `llama-cli` reference. See [`experiments/v0.0/m6_findings.md`](experiments/v0.0/m6_findings.md) for the empirical result.
 
