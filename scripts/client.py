@@ -18,9 +18,11 @@ and start_pos=prefix_length.
 """
 import argparse
 import json
+import queue
 import struct
 import sys
 import time
+import uuid
 from pathlib import Path
 from urllib import request as urlrequest
 
@@ -65,6 +67,89 @@ def call_forward(stub, payload, n_tokens, has_token_ids, worker_id="<unknown>",
     if timing is not None:
         timing.setdefault(worker_id, []).append(time.time() - t0)
     return resp.hidden_out
+
+
+class InferenceStream:
+    """One bidi Inference stream to one worker, exposed as a sync send→recv.
+
+    v0.5 M0.5.1: the worker keeps KV state for the lifetime of this stream,
+    so the client doesn't pass keep_kv — the worker treats the first
+    InferenceStep on the stream as a cold-prefill and every subsequent step
+    as a decode that reuses the existing KV cache.
+
+    The request side is a generator that pulls from a thread-safe queue;
+    grpc reads from that generator on its own thread, calling us back with
+    responses one at a time. Putting them through a single queue makes the
+    stream look like a synchronous send-then-recv to chain-walk code.
+    """
+
+    def __init__(self, stub, worker_id):
+        self.worker_id = worker_id
+        self._req_q = queue.Queue()
+        self._closed = False
+        self._responses = stub.Inference(self._request_gen())
+
+    def _request_gen(self):
+        while True:
+            step = self._req_q.get()
+            if step is None:
+                return
+            yield step
+
+    def step(self, request_step):
+        if self._closed:
+            raise RuntimeError(f"stream to {self.worker_id} already closed")
+        self._req_q.put(request_step)
+        try:
+            return next(self._responses)
+        except grpc.RpcError as e:
+            raise RuntimeError(
+                f"Inference stream to {self.worker_id!r} failed: "
+                f"{e.code().name} — {e.details()}"
+            ) from e
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        self._req_q.put(None)
+
+
+def call_inference_step(streamer, payload, n_tokens, has_token_ids,
+                         session_id, step_idx, prefix_length, timing=None):
+    """v0.5 M0.5.1 streaming equivalent of call_forward. Returns raw bytes
+    matching Forward's return shape (hidden state OR int32 token id), so
+    chain-walk code consumes the result identically."""
+    step = pb.InferenceStep(
+        session_id=session_id,
+        step_id=f"step-{step_idx}",
+        prefix_length=prefix_length,
+    )
+    if has_token_ids:
+        ids = list(struct.unpack(f"<{n_tokens}i", payload))
+        step.token_ids.ids.extend(ids)
+    else:
+        step.hidden_state.raw = payload
+        step.hidden_state.batch = 1
+        step.hidden_state.n_tokens = n_tokens
+
+    t0 = time.time()
+    try:
+        resp = streamer.step(step)
+    except RuntimeError as e:
+        sys.exit(f"[chain] {e}")
+    if timing is not None:
+        timing.setdefault(streamer.worker_id, []).append(time.time() - t0)
+
+    if resp.HasField("error"):
+        sys.exit(f"[chain] worker {streamer.worker_id!r} reported error: "
+                 f"{resp.error.decode('utf-8', 'replace')}")
+    if resp.HasField("token_ids"):
+        ids = list(resp.token_ids.ids)
+        return struct.pack(f"<{len(ids)}i", *ids)
+    if resp.HasField("hidden_state"):
+        return resp.hidden_state.raw
+    sys.exit(f"[chain] worker {streamer.worker_id!r} returned an empty step")
 
 
 def _peer_chain_score(peer: dict) -> int:
@@ -223,6 +308,11 @@ def main():
     ap.add_argument("--model-path", type=str, required=True, help="full GGUF path for tokenizer (must match the model that was split)")
     ap.add_argument("--prompt", type=str, default="The capital of France is")
     ap.add_argument("--max-tokens", "-n", type=int, default=1)
+    ap.add_argument("--use-streaming", action="store_true",
+                    help="v0.5 M0.5.1: use the streaming Inference RPC instead "
+                         "of per-step Forward calls. One bidi stream per worker "
+                         "for the entire session; KV state lives in the stream. "
+                         "Output must be identical to the non-streaming path.")
     args = ap.parse_args()
 
     if args.registry:
@@ -274,51 +364,74 @@ def main():
     # the cold prefill (full prompt, keep_kv=False, start_pos=0). Each later
     # step ships only the previous newly-generated token (n=1, keep_kv=True,
     # start_pos=prefix_length) — workers append to their existing KV cache.
+    #
+    # In streaming mode (v0.5 M0.5.1), the worker tracks first-step-vs-rest
+    # implicitly from the position in the stream; the client doesn't pass
+    # keep_kv at all. Otherwise the chain walk is structurally identical.
     generated = []
     prefix_length = 0
     timing = {}  # worker_id -> [per-call seconds]
+
+    streamers = []
+    session_id = ""
+    if args.use_streaming:
+        session_id = uuid.uuid4().hex
+        for w, stub, _ in sorted_stubs:
+            streamers.append(InferenceStream(stub, w["id"]))
+        print(f"[chain] streaming mode: {len(streamers)} bidi streams open  session_id={session_id[:8]}…")
+
+    def _step_call(idx, stub_tup, payload, n, has_tok, keep_kv, prefix_length):
+        w = stub_tup[0]
+        if args.use_streaming:
+            return call_inference_step(streamers[idx], payload, n, has_tok,
+                                       session_id=session_id, step_idx=step,
+                                       prefix_length=prefix_length, timing=timing)
+        return call_forward(stub_tup[1], payload, n, has_token_ids=has_tok,
+                            worker_id=w["id"],
+                            keep_kv=keep_kv, start_pos=prefix_length, timing=timing)
+
     t0 = time.time()
-    for step in range(args.max_tokens):
-        if step == 0:
-            input_tokens = tokens
-            keep_kv = False
-        else:
-            input_tokens = [generated[-1]]
-            keep_kv = True
-        n_step = len(input_tokens)
+    try:
+        for step in range(args.max_tokens):
+            if step == 0:
+                input_tokens = tokens
+                keep_kv = False
+            else:
+                input_tokens = [generated[-1]]
+                keep_kv = True
+            n_step = len(input_tokens)
 
-        # Step 1: tokens → first worker → hidden
-        token_payload = struct.pack(f"<{n_step}i", *input_tokens)
-        first_w, first_stub, _ = sorted_stubs[0]
-        hidden = call_forward(first_stub, token_payload, n_step, has_token_ids=True,
-                              worker_id=first_w["id"],
-                              keep_kv=keep_kv, start_pos=prefix_length, timing=timing)
-        if len(hidden) != n_step * n_embd * 4:
-            sys.exit(f"[chain] first worker {first_w['id']!r} returned {len(hidden)} bytes, expected {n_step*n_embd*4}")
-
-        # Steps 2..N-1: middle workers
-        for w, stub, info in sorted_stubs[1:-1]:
-            hidden = call_forward(stub, hidden, n_step, has_token_ids=False,
-                                  worker_id=w["id"],
-                                  keep_kv=keep_kv, start_pos=prefix_length, timing=timing)
+            # Step 1: tokens → first worker → hidden
+            token_payload = struct.pack(f"<{n_step}i", *input_tokens)
+            hidden = _step_call(0, sorted_stubs[0], token_payload, n_step, True,
+                                keep_kv, prefix_length)
             if len(hidden) != n_step * n_embd * 4:
-                sys.exit(f"[chain] middle worker {w['id']!r} returned {len(hidden)} bytes")
+                sys.exit(f"[chain] first worker {sorted_stubs[0][0]['id']!r} returned {len(hidden)} bytes, expected {n_step*n_embd*4}")
 
-        # Step N: last worker → token id
-        last_w, last_stub, _ = sorted_stubs[-1]
-        last_resp = call_forward(last_stub, hidden, n_step, has_token_ids=False,
-                                 worker_id=last_w["id"],
-                                 keep_kv=keep_kv, start_pos=prefix_length, timing=timing)
-        if len(last_resp) != 4:
-            sys.exit(f"[chain] last worker {last_w['id']!r} returned {len(last_resp)} bytes, expected 4")
-        next_id = struct.unpack("<i", last_resp)[0]
-        generated.append(next_id)
-        prefix_length += n_step
+            # Steps 2..N-1: middle workers
+            for idx, stub_tup in enumerate(sorted_stubs[1:-1], start=1):
+                hidden = _step_call(idx, stub_tup, hidden, n_step, False,
+                                    keep_kv, prefix_length)
+                if len(hidden) != n_step * n_embd * 4:
+                    sys.exit(f"[chain] middle worker {stub_tup[0]['id']!r} returned {len(hidden)} bytes")
 
-        if next_id in LLAMA3_EOS_IDS:
-            print(f"[chain] step {step+1}: EOS {next_id} — stopping")
-            break
-        print(f"[chain] step {step+1}: id={next_id} '{detok_one(llama, next_id)}'", flush=True)
+            # Step N: last worker → token id
+            last_idx = len(sorted_stubs) - 1
+            last_resp = _step_call(last_idx, sorted_stubs[last_idx], hidden, n_step, False,
+                                   keep_kv, prefix_length)
+            if len(last_resp) != 4:
+                sys.exit(f"[chain] last worker {sorted_stubs[last_idx][0]['id']!r} returned {len(last_resp)} bytes, expected 4")
+            next_id = struct.unpack("<i", last_resp)[0]
+            generated.append(next_id)
+            prefix_length += n_step
+
+            if next_id in LLAMA3_EOS_IDS:
+                print(f"[chain] step {step+1}: EOS {next_id} — stopping")
+                break
+            print(f"[chain] step {step+1}: id={next_id} '{detok_one(llama, next_id)}'", flush=True)
+    finally:
+        for s in streamers:
+            s.close()
 
     elapsed = time.time() - t0
     full = llama.detokenize(tokens + generated).decode("utf-8", errors="replace")
