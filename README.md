@@ -4,8 +4,9 @@
 
 Status (2026-05-06): **v0.1 functionally alive.** Two-worker cluster on Tailscale produces the same top-1 token as a single-machine `llama-cli` reference. See [`experiments/v0.0/m6_findings.md`](experiments/v0.0/m6_findings.md) for the empirical result.
 
+**Paper:** [Nakshatra: Vendor-Agnostic Distributed Inference on Heterogeneous Consumer Hardware](https://pnl.market/research/6a017d83b86a1bf1c69ea714) (Bastola, 2026).
+
 ---
-https://pnl.market/research/6a017d83b86a1bf1c69ea714
 
 ## What this is
 
