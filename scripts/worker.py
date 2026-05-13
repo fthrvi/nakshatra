@@ -277,6 +277,81 @@ _FILE_SERVER_DIR = ""
 _HEALTH_STATE: dict = {}
 
 
+def detect_gpus() -> list:
+    """Best-effort enumeration of physical GPUs on the host (iGPU + dGPU).
+
+    Inventory data for ops dashboards. Independent of which GPU the daemon
+    actually offloaded to (that lives in DaemonClient.gpu_offload_status()).
+    Returns a list of {name, vendor, integrated, vram_mb} dicts; [] on
+    unsupported OS or tool failure. Slow (~1-2s) — call once at startup.
+    """
+    try:
+        if platform.system() == "Darwin":
+            out = subprocess.run(
+                ["system_profiler", "-json", "SPDisplaysDataType"],
+                capture_output=True, timeout=5, text=True, check=False,
+            ).stdout
+            data = json.loads(out) if out else {}
+            gpus = []
+            for d in data.get("SPDisplaysDataType", []):
+                name = d.get("_name") or d.get("sppci_model", "unknown")
+                # system_profiler sometimes returns the resource key instead of
+                # the localized name on Intel Macs (e.g. "kHW_AMDRadeonProVega56Item").
+                # Strip the prefix/suffix and split camel-case into words.
+                if name.startswith("kHW_") and name.endswith("Item"):
+                    raw = name[4:-4]
+                    name = re.sub(r"(?<=[a-z])(?=[A-Z0-9])|(?<=[A-Z])(?=[A-Z][a-z])", " ", raw)
+                vendor = d.get("spdisplays_vendor", "")
+                # system_profiler returns "sppci_vendor_Apple" / "sppci_vendor_Intel"
+                # as internal keys when localized strings aren't filled in.
+                if vendor.startswith("sppci_vendor_"):
+                    vendor = vendor[len("sppci_vendor_"):]
+                vendor = vendor.lower()
+                # iGPU on Intel Macs uses shared system RAM (vram_shared) and
+                # sits on the built-in bus; dGPU has dedicated vram + PCIe bus.
+                integrated = (
+                    "spdisplays_vram_shared" in d
+                    or d.get("sppci_bus") == "spdisplays_builtin"
+                )
+                vram_str = str(d.get("spdisplays_vram") or d.get("spdisplays_vram_shared", ""))
+                vram_mb = None
+                m = re.match(r"(\d+)\s*(MB|GB)", vram_str, re.IGNORECASE)
+                if m:
+                    n = int(m.group(1))
+                    vram_mb = n * 1024 if m.group(2).upper() == "GB" else n
+                gpus.append({
+                    "name": name, "vendor": vendor,
+                    "integrated": integrated, "vram_mb": vram_mb,
+                })
+            return gpus
+        if platform.system() == "Linux":
+            out = subprocess.run(
+                ["lspci"], capture_output=True, timeout=5, text=True, check=False,
+            ).stdout
+            gpus = []
+            for line in out.splitlines():
+                if not any(k in line for k in ("VGA compatible", "3D controller", "Display controller")):
+                    continue
+                # "01:00.0 VGA compatible controller: AMD/ATI Navi … [Radeon RX …]"
+                bus, _, rest = line.partition(" ")
+                _, _, name = rest.partition(": ")
+                name = name.strip()
+                # iGPUs are typically on PCIe bus 00:xx and named for Intel or
+                # AMD APU codenames; dGPUs sit on a separate root complex.
+                integrated = bus.startswith("00:") and any(
+                    k in name for k in ("Intel", "Renoir", "Cezanne", "Raphael", "Rembrandt", "Phoenix")
+                )
+                vendor = "intel" if "Intel" in name else ("amd" if ("AMD" in name or "ATI" in name) else "")
+                gpus.append({
+                    "name": name, "vendor": vendor,
+                    "integrated": integrated, "vram_mb": None,
+                })
+            return gpus
+    except Exception as e:
+        sys.stderr.write(f"[healthz] detect_gpus failed: {e}\n")
+    return []
+
+
 class FileServerHandler(BaseHTTPRequestHandler):
     """Phase-4 file server + worker health endpoint.
 
@@ -319,6 +394,7 @@ class FileServerHandler(BaseHTTPRequestHandler):
                               if gpu and gpu["total_layers"] > 0 else None),
                 "backends": gpu["backend_hints"] if gpu else [],
             },
+            "gpus_present": _HEALTH_STATE.get("gpus_present", []),
             "protocol_version": "0.1.0",
         }
 
@@ -815,6 +891,7 @@ def main():
         "layer_end": args.layer_end,
         "grpc_port": args.port,
         "file_server_port": file_server_port if not args.no_file_server else 0,
+        "gpus_present": detect_gpus(),
     })
     if not args.no_file_server:
         try:
