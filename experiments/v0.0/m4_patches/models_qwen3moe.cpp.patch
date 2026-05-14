@@ -1,0 +1,66 @@
+--- /tmp/qwen3moe.cpp.orig	2026-05-13 19:42:07
++++ /tmp/qwen3moe.cpp	2026-05-13 19:43:24
+@@ -16,9 +16,14 @@
+ 
+     auto * inp_attn = build_attn_inp_kv();
+ 
+-    ggml_tensor * inp_out_ids = build_inp_out_ids();
++    ggml_tensor * inp_out_ids = model.nks_has_lm_head ? build_inp_out_ids() : nullptr;
+ 
+-    for (int il = 0; il < n_layer; ++il) {
++    // ===== NAKSHATRA M4 step 3: iterate only this worker's layer range =====
++    const int nks_il_start = model.nks_layer_start;
++    const int nks_il_end   = model.nks_layer_end > 0 ? model.nks_layer_end : n_layer;
++    // ========================================================================
++
++    for (int il = nks_il_start; il < nks_il_end; ++il) {
+         ggml_tensor * inpSA = inpL;
+ 
+         // norm
+@@ -69,7 +74,7 @@
+                     model.layers[il].wo, model.layers[il].bo,
+                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
+         }
+-        if (il == n_layer - 1 && inp_out_ids) {
++        if (il == nks_il_end - 1 && inp_out_ids && model.nks_has_lm_head) {
+             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
+             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
+         }
+@@ -107,18 +112,28 @@
+     }
+     cur = inpL;
+ 
+-    cur = build_norm(cur,
+-            model.output_norm, NULL,
+-            LLM_NORM_RMS, -1);
++    if (model.nks_has_lm_head) {
++        cur = build_norm(cur,
++                model.output_norm, NULL,
++                LLM_NORM_RMS, -1);
+ 
+-    cb(cur, "result_norm", -1);
+-    res->t_embd = cur;
++        cb(cur, "result_norm", -1);
++        res->t_embd = cur;
+ 
+-    // lm_head
+-    cur = build_lora_mm(model.output, cur);
++        // lm_head
++        cur = build_lora_mm(model.output, cur);
+ 
+-    cb(cur, "result_output", -1);
+-    res->t_logits = cur;
++        cb(cur, "result_output", -1);
++        res->t_logits = cur;
++    } else {
++        // ===== NAKSHATRA M4 step 3: middle/first worker — no norm, no lm_head.
++        // Terminal tensor is the residual stream output of the last layer in
++        // this worker's range; downstream worker will receive it as its
++        // input hidden state via ubatch.embd.
++        cb(cur, "result_partial_hidden", -1);
++        res->t_embd = cur;
++        // ===========================================================================
++    }
+ 
+     ggml_build_forward_expand(gf, cur);
+ }
