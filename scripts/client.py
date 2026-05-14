@@ -360,33 +360,62 @@ def main():
         workers = cfg["workers"]
         print(f"[chain] {len(workers)} workers in config")
 
-    # Open channels + Info on each
-    stubs = []
-    n_embd = None
+    # v0.5 M0.5.4 v1: alternate-worker recovery. Each worker has a list of
+    # candidates: primary first, then optional alternates from yaml. A
+    # per-worker cursor selects the active candidate. On failure, the
+    # recovery handler advances cursors and rebuilds the chain.
     for w in workers:
-        addr = f"{w['address']}:{w['port']}"
-        ch = grpc.insecure_channel(addr)
-        stub = pb_grpc.NakshatraStub(ch)
-        info = stub.Info(pb.InfoRequest(), timeout=10.0)
-        print(f"  {w['id']:12s} {addr:25s}  layers=[{info.layer_start},{info.layer_end})  embd={info.has_token_embd}  lm={info.has_lm_head}  hidden={info.hidden_size}")
-        if n_embd is None:
-            n_embd = info.hidden_size
-        elif info.hidden_size != n_embd:
-            sys.exit(f"hidden_size mismatch across workers: {n_embd} vs {info.hidden_size}")
-        stubs.append((w, stub, info))
+        primary = {k: w[k] for k in ("id", "address", "port", "layer_range", "mode")
+                   if k in w}
+        primary["sub_gguf_path"] = w.get("sub_gguf_path", "")
+        w["candidates"] = [primary] + list(w.get("alternates") or [])
+        w["cursor"] = 0
 
-    # Validate chain partition
-    n_workers = len(stubs)
-    sorted_stubs = sorted(stubs, key=lambda x: x[2].layer_start)
-    prev_end = sorted_stubs[0][2].layer_start
-    for w, _, info in sorted_stubs:
-        if info.layer_start != prev_end:
-            sys.exit(f"chain GAP between previous and {w['id']}")
-        prev_end = info.layer_end
-    if not sorted_stubs[0][2].has_token_embd:
-        sys.exit("first worker must have token_embd")
-    if not sorted_stubs[-1][2].has_lm_head:
-        sys.exit("last worker must have lm_head")
+    def _spec(w):
+        return w["candidates"][w["cursor"]]
+
+    def _setup_chain():
+        """Open channels + call Info on each worker's current candidate.
+        Returns (sorted_stubs, n_embd). Validates chain partition."""
+        stubs_local = []
+        n_embd_local = None
+        for w in workers:
+            spec = _spec(w)
+            addr = f"{spec['address']}:{spec['port']}"
+            ch = grpc.insecure_channel(addr)
+            stub = pb_grpc.NakshatraStub(ch)
+            info = stub.Info(pb.InfoRequest(), timeout=10.0)
+            print(f"  {w['id']:12s} {addr:25s}  layers=[{info.layer_start},{info.layer_end})  "
+                  f"embd={info.has_token_embd}  lm={info.has_lm_head}  hidden={info.hidden_size}"
+                  + (f"  [alt cursor={w['cursor']}/{len(w['candidates'])-1}]" if w['cursor'] > 0 else ""))
+            if n_embd_local is None:
+                n_embd_local = info.hidden_size
+            elif info.hidden_size != n_embd_local:
+                sys.exit(f"hidden_size mismatch across workers: {n_embd_local} vs {info.hidden_size}")
+            stubs_local.append((w, stub, info))
+        sorted_local = sorted(stubs_local, key=lambda x: x[2].layer_start)
+        prev_end = sorted_local[0][2].layer_start
+        for w, _, info in sorted_local:
+            if info.layer_start != prev_end:
+                sys.exit(f"chain GAP between previous and {w['id']}")
+            prev_end = info.layer_end
+        if not sorted_local[0][2].has_token_embd:
+            sys.exit("first worker must have token_embd")
+        if not sorted_local[-1][2].has_lm_head:
+            sys.exit("last worker must have lm_head")
+        return sorted_local, n_embd_local
+
+    def _advance_one_alternate():
+        """Find the first worker with a remaining alternate candidate; advance
+        its cursor. Returns the worker dict that was advanced, or None if no
+        alternates remain anywhere."""
+        for w in workers:
+            if w["cursor"] + 1 < len(w["candidates"]):
+                w["cursor"] += 1
+                return w
+        return None
+
+    sorted_stubs, n_embd = _setup_chain()
     print(f"[chain] OK: contiguous coverage of [{sorted_stubs[0][2].layer_start}, {sorted_stubs[-1][2].layer_end})")
 
     # Tokenize
@@ -564,6 +593,24 @@ def main():
                 for s in streamers:
                     s.close()
                 raise
+            # v0.5 M0.5.4 v1: try advancing to a fresh alternate worker first;
+            # only fall back to retry-same-worker if no alternates remain.
+            advanced = _advance_one_alternate()
+            if advanced is not None:
+                new_spec = _spec(advanced)
+                print(f"[recovery] swapping worker {advanced['id']!r} to alternate "
+                      f"{new_spec['address']}:{new_spec['port']} "
+                      f"(candidate {advanced['cursor']}/{len(advanced['candidates'])-1})",
+                      file=sys.stderr)
+                # Re-setup chain with new candidate(s)
+                sorted_stubs[:], n_embd_new = _setup_chain()
+                # n_embd shouldn't change across same-arch alternates; if it does, error.
+                if n_embd_new != n_embd:
+                    sys.exit(f"[recovery] alternate has different hidden_size "
+                             f"({n_embd_new} vs {n_embd}); cannot continue")
+            else:
+                print(f"[recovery] no alternates remaining; retrying same workers",
+                      file=sys.stderr)
             restart_requested = True
             # streams are closed at the top of the next iteration
 

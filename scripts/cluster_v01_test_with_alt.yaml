@@ -1,0 +1,35 @@
+# v0.5 M0.5.4 v1 test config — 2-worker toy chain with one alternate.
+#
+# Primary chain: bishwa:5550 (first) → mac4:5551 (last)
+# Alternate for the first worker:  mac3-2:5557
+#
+# On --simulate-fail-step 2, the client should detect the synthetic
+# failure, advance its candidate cursor for the first-worker slot,
+# and re-open the stream against mac3-2:5557 — the chain continues
+# to completion via the alternate.
+model:
+  id: "prithvi-q8"
+  hidden_size: 3072
+  num_blocks: 28
+  wire_dtype: f32
+
+workers:
+  - id: bishwa-test
+    address: 100.109.164.69
+    port: 5550
+    layer_range: [0, 14]
+    sub_gguf_path: /tmp/w0_v2.gguf
+    mode: first
+    alternates:
+      - id: mac3-2-alt-first
+        address: 100.121.48.32
+        port: 5557
+        layer_range: [0, 14]
+        sub_gguf_path: /tmp/w0_v2.gguf
+        mode: first
+  - id: mac4-test
+    address: 100.93.112.98
+    port: 5551
+    layer_range: [14, 28]
+    sub_gguf_path: /tmp/wlast_v2.gguf
+    mode: last
