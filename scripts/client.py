@@ -327,6 +327,15 @@ def main():
                          "next worker. Workers chain via peer connections; the "
                          "response unwinds back. v1 supports 2-worker chains; "
                          "longer chains need v2 (multi-hop next_server).")
+    ap.add_argument("--simulate-fail-step", type=int, default=-1,
+                    help="v0.5 M0.5.4 v0: inject a synthetic failure AFTER this "
+                         "step (1-indexed). Triggers the recovery path: close "
+                         "streams, re-open, replay history (prompt + tokens "
+                         "generated so far), continue. -1 disables. Only honored "
+                         "in streaming mode.")
+    ap.add_argument("--max-recovery-attempts", type=int, default=3,
+                    help="v0.5 M0.5.4 v0: how many times the client retries via "
+                         "recovery before surfacing failure to the caller.")
     args = ap.parse_args()
     # --use-streaming-push implies --use-streaming
     if args.use_streaming_push:
@@ -389,29 +398,15 @@ def main():
     prefix_length = 0
     timing = {}  # worker_id -> [per-call seconds]
 
-    streamers = []
+    streamers: list = []
     session_id = ""
-    if args.use_streaming:
-        session_id = uuid.uuid4().hex
-        # In push mode, client only opens a stream to the FIRST worker; the
-        # chain unwinds via worker-to-worker peer streams. In non-push streaming
-        # mode, client maintains a stream to every worker like before.
-        if args.use_streaming_push:
-            if len(sorted_stubs) > 2:
-                print(f"[chain] WARNING: --use-streaming-push v1 only supports "
-                      f"2-worker chains; this chain has {len(sorted_stubs)} workers. "
-                      f"Worker {sorted_stubs[1][0]['id']} won't know who to forward to "
-                      f"after worker 0 pushes to it. Expect a hung step at worker 1.",
-                      file=sys.stderr)
-            first_w, first_stub, _ = sorted_stubs[0]
-            streamers.append(InferenceStream(first_stub, first_w["id"]))
-            print(f"[chain] streaming-push mode: 1 stream to {first_w['id']}; "
-                  f"{len(sorted_stubs)-1} workers chained via peer push  "
-                  f"session_id={session_id[:8]}…")
-        else:
-            for w, stub, _ in sorted_stubs:
-                streamers.append(InferenceStream(stub, w["id"]))
-            print(f"[chain] streaming mode: {len(streamers)} bidi streams open  session_id={session_id[:8]}…")
+    if args.use_streaming and args.use_streaming_push and len(sorted_stubs) > 2:
+        print(f"[chain] WARNING: --use-streaming-push v1 only supports "
+              f"2-worker chains; this chain has {len(sorted_stubs)} workers. "
+              f"Worker {sorted_stubs[1][0]['id']} won't know who to forward to "
+              f"after worker 0 pushes to it. Expect a hung step at worker 1.",
+              file=sys.stderr)
+    # Streamers are opened/re-opened by the recovery loop below — see M0.5.4 v0.
 
     def _next_server_for(idx):
         """Return a NextServer proto pointing at the worker AFTER idx, or None
@@ -441,59 +436,128 @@ def main():
                             worker_id=w["id"],
                             keep_kv=keep_kv, start_pos=prefix_length, timing=timing)
 
+    # v0.5 M0.5.4 v0: recovery loop. Wraps the chain walk in an outer
+    # retry that, on stream/RPC failure, closes streams, opens fresh ones,
+    # and re-prefills with (prompt + tokens already generated). The model
+    # picks up generation from where we left off; the next produced token
+    # will differ from what the dead chain would have produced (per the
+    # Metal non-determinism finding — see v0.5-design-lock.md preface),
+    # but the request completes without surfacing an error to the caller.
+    recovery_attempts = 0
+    restart_requested = True
+
+    class SimulatedFailure(Exception):
+        """Test-only synthetic failure for --simulate-fail-step."""
+
     t0 = time.time()
-    try:
-        for step in range(args.max_tokens):
-            if step == 0:
-                input_tokens = tokens
-                keep_kv = False
-            else:
-                input_tokens = [generated[-1]]
-                keep_kv = True
-            n_step = len(input_tokens)
-
-            # v0.5 M0.5.3 push mode: client only contacts the FIRST worker.
-            # The response we receive comes from the last worker (via the chain
-            # of peer pushes); it's a token id, not a hidden state.
-            token_payload = struct.pack(f"<{n_step}i", *input_tokens)
-            if args.use_streaming_push:
-                last_resp = _step_call(0, sorted_stubs[0], token_payload, n_step, True,
-                                       keep_kv, prefix_length)
-                if len(last_resp) != 4:
-                    sys.exit(f"[chain] push mode: expected 4-byte token id from chain, got {len(last_resp)} bytes")
-                next_id = struct.unpack("<i", last_resp)[0]
-                generated.append(next_id)
-            else:
-                # Step 1: tokens → first worker → hidden
-                hidden = _step_call(0, sorted_stubs[0], token_payload, n_step, True,
-                                    keep_kv, prefix_length)
-                if len(hidden) != n_step * n_embd * 4:
-                    sys.exit(f"[chain] first worker {sorted_stubs[0][0]['id']!r} returned {len(hidden)} bytes, expected {n_step*n_embd*4}")
-
-                # Steps 2..N-1: middle workers
-                for idx, stub_tup in enumerate(sorted_stubs[1:-1], start=1):
-                    hidden = _step_call(idx, stub_tup, hidden, n_step, False,
-                                        keep_kv, prefix_length)
-                    if len(hidden) != n_step * n_embd * 4:
-                        sys.exit(f"[chain] middle worker {stub_tup[0]['id']!r} returned {len(hidden)} bytes")
-
-                # Step N: last worker → token id
-                last_idx = len(sorted_stubs) - 1
-                last_resp = _step_call(last_idx, sorted_stubs[last_idx], hidden, n_step, False,
-                                       keep_kv, prefix_length)
-                if len(last_resp) != 4:
-                    sys.exit(f"[chain] last worker {sorted_stubs[last_idx][0]['id']!r} returned {len(last_resp)} bytes, expected 4")
-                next_id = struct.unpack("<i", last_resp)[0]
-                generated.append(next_id)
-            prefix_length += n_step
-
-            if next_id in LLAMA3_EOS_IDS:
-                print(f"[chain] step {step+1}: EOS {next_id} — stopping")
-                break
-            print(f"[chain] step {step+1}: id={next_id} '{detok_one(llama, next_id)}'", flush=True)
-    finally:
+    while restart_requested:
+        restart_requested = False
+        # Open / re-open streamers on every (re-)attempt. Fresh session_id
+        # so the worker idempotency cache from the dead session can't poison
+        # the new one.
         for s in streamers:
             s.close()
+        streamers.clear()
+        if args.use_streaming:
+            session_id = uuid.uuid4().hex
+            if args.use_streaming_push:
+                first_w, first_stub, _ = sorted_stubs[0]
+                streamers.append(InferenceStream(first_stub, first_w["id"]))
+                tag = f"streaming-push, 1 stream to {first_w['id']}"
+            else:
+                for w, stub, _ in sorted_stubs:
+                    streamers.append(InferenceStream(stub, w["id"]))
+                tag = f"streaming, {len(streamers)} streams"
+            if recovery_attempts == 0:
+                print(f"[chain] {tag}  session_id={session_id[:8]}…")
+            else:
+                print(f"[recovery] attempt {recovery_attempts}: {tag}; "
+                      f"replaying {len(generated)} pre-failure tokens",
+                      file=sys.stderr)
+
+        prefix_length = 0  # workers' KV is fresh on (re-)open
+        already_done = len(generated)
+
+        try:
+            for step in range(already_done, args.max_tokens):
+                if step == already_done:
+                    # Cold prefill: prompt + any tokens already generated
+                    # before this attempt. This rebuilds KV state on the
+                    # fresh streams so generation can resume at step+1.
+                    input_tokens = tokens + list(generated)
+                    keep_kv = False
+                else:
+                    input_tokens = [generated[-1]]
+                    keep_kv = True
+                n_step = len(input_tokens)
+
+                # v0.5 M0.5.3 push mode: client only contacts the FIRST worker.
+                # The response we receive comes from the last worker (via the chain
+                # of peer pushes); it's a token id, not a hidden state.
+                token_payload = struct.pack(f"<{n_step}i", *input_tokens)
+                if args.use_streaming_push:
+                    last_resp = _step_call(0, sorted_stubs[0], token_payload, n_step, True,
+                                           keep_kv, prefix_length)
+                    if len(last_resp) != 4:
+                        sys.exit(f"[chain] push mode: expected 4-byte token id from chain, got {len(last_resp)} bytes")
+                    next_id = struct.unpack("<i", last_resp)[0]
+                    generated.append(next_id)
+                else:
+                    # Step 1: tokens → first worker → hidden
+                    hidden = _step_call(0, sorted_stubs[0], token_payload, n_step, True,
+                                        keep_kv, prefix_length)
+                    if len(hidden) != n_step * n_embd * 4:
+                        sys.exit(f"[chain] first worker {sorted_stubs[0][0]['id']!r} returned {len(hidden)} bytes, expected {n_step*n_embd*4}")
+
+                    # Steps 2..N-1: middle workers
+                    for idx, stub_tup in enumerate(sorted_stubs[1:-1], start=1):
+                        hidden = _step_call(idx, stub_tup, hidden, n_step, False,
+                                            keep_kv, prefix_length)
+                        if len(hidden) != n_step * n_embd * 4:
+                            sys.exit(f"[chain] middle worker {stub_tup[0]['id']!r} returned {len(hidden)} bytes")
+
+                    # Step N: last worker → token id
+                    last_idx = len(sorted_stubs) - 1
+                    last_resp = _step_call(last_idx, sorted_stubs[last_idx], hidden, n_step, False,
+                                           keep_kv, prefix_length)
+                    if len(last_resp) != 4:
+                        sys.exit(f"[chain] last worker {sorted_stubs[last_idx][0]['id']!r} returned {len(last_resp)} bytes, expected 4")
+                    next_id = struct.unpack("<i", last_resp)[0]
+                    generated.append(next_id)
+                prefix_length += n_step
+
+                if next_id in LLAMA3_EOS_IDS:
+                    print(f"[chain] step {step+1}: EOS {next_id} — stopping")
+                    break
+                print(f"[chain] step {step+1}: id={next_id} '{detok_one(llama, next_id)}'", flush=True)
+
+                # v0.5 M0.5.4 v0: synthetic failure injection for testing.
+                # Triggers AFTER step `simulate_fail_step` completes, so the
+                # token from that step is already in `generated[]` — the
+                # recovery loop will replay it as part of the new prefill.
+                if (args.simulate_fail_step >= 0
+                        and step + 1 == args.simulate_fail_step
+                        and recovery_attempts == 0):
+                    raise SimulatedFailure(
+                        f"injected failure after step {step+1} "
+                        f"(--simulate-fail-step {args.simulate_fail_step})"
+                    )
+        except (grpc.RpcError, RuntimeError, SimulatedFailure) as e:
+            recovery_attempts += 1
+            kind = "simulated" if isinstance(e, SimulatedFailure) else type(e).__name__
+            print(f"[recovery] {kind} failure: {e}", file=sys.stderr)
+            if recovery_attempts > args.max_recovery_attempts:
+                print(f"[recovery] {recovery_attempts-1} attempts exhausted; "
+                      f"surfacing failure to caller", file=sys.stderr)
+                for s in streamers:
+                    s.close()
+                raise
+            restart_requested = True
+            # streams are closed at the top of the next iteration
+
+    # Successful exit from the recovery loop
+    for s in streamers:
+        s.close()
 
     elapsed = time.time() - t0
     full = llama.detokenize(tokens + generated).decode("utf-8", errors="replace")
