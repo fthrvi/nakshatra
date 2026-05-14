@@ -70,7 +70,8 @@ EOF
 
 # Add nakshatra-spike to examples/CMakeLists.txt's add_subdirectory list, then:
 mkdir -p build && cd build
-cmake -DGGML_METAL=OFF -DGGML_VULKAN=OFF ..  # CPU-only for v0.1; GPU is v0.5+
+cmake -DGGML_METAL=ON ..   # macOS Metal. For Linux: -DGGML_HIPBLAS=ON (ROCm) or -DGGML_CUDA=ON (NVIDIA).
+                           # For deterministic regression tests only, build with ALL GPU backends OFF.
 cmake --build . --target llama-nakshatra-worker -j
 ```
 
@@ -231,17 +232,34 @@ scripts/
 
 ## Architecture in one paragraph
 
-Each worker is a Python gRPC process that spawns a long-lived C++ daemon (`llama-nakshatra-worker`). The daemon holds the model slice and KV cache, accepts framed binary messages over stdin/stdout, and runs `llama_decode` per request. The Python worker pumps gRPC requests through to the daemon and back. The client tokenizes the prompt locally, calls the first worker with token IDs, ferries the returned hidden state through any middle workers, and gets back a token id from the last worker. A 2-worker cluster on Tailscale typically runs at 2–5 tokens/sec on CPU at this scale; GPU offload is a v0.5+ deliverable.
+Each worker is a Python gRPC process that spawns a long-lived C++ daemon (`llama-nakshatra-worker`). The daemon holds the model slice and KV cache, accepts framed binary messages over stdin/stdout, and runs `llama_decode` per request. The Python worker pumps gRPC requests through to the daemon and back. The client tokenizes the prompt locally, calls the first worker with token IDs, ferries the returned hidden state through any middle workers, and gets back a token id from the last worker. The v0.3 federation extends this with sub-GGUF auto-fetch (workers download missing slices from peers), latency-aware chain assembly via a pillar registry, and Metal / ROCm GPU offload across heterogeneous machines. **Outputs on GPU paths are reproducible *in distribution*, not byte-for-byte** — kernel-level non-determinism in current backends. Bit-identical reproducibility is available via CPU-only workers (`--gpu-backend cpu`), kept for regression tests. See `docs/v0.5-design-lock.md` for the full property statement.
 
-## What's deferred to v0.5+
+## Status — what's shipped, what's coming
 
-- GPU acceleration (Metal / CUDA / ROCm / Vulkan) — currently CPU-only for cross-vendor stability
-- Streaming `Inference` RPC with worker-side KV cache reuse — currently the chain client re-prefills the prompt every step (M2.5 brute-force pattern)
-- Server-to-server activation push (skip the client hop)
-- Dynamic re-routing on worker failure (currently the chain fails fast)
-- DHT-based peer discovery (currently static YAML)
+**Shipped (v0.1 → v0.3):**
 
-See [`docs/v0.1-implementation-plan.md`](docs/v0.1-implementation-plan.md) §8 for the full deferred list.
+- GPU acceleration — Metal on Macs, ROCm on Linux. Live on the 5-machine lab cluster.
+- Streaming KV-cache reuse (M2.5) — 5× speedup on multi-token generation vs naive re-prefill.
+- Sub-GGUF distribution: workers advertise their cached slices and auto-fetch missing ones from peers over HTTP byte-range (Phase 4 / 4a).
+- Latency-aware chain assembly via a pillar registry (Phase H / I).
+- `/healthz` endpoint per worker with rich state (identity, daemon liveness, recent RPC latency, GPU offload, GPU inventory via ioreg).
+
+**In-progress (v0.5 protocol foundations, partial):**
+
+- `Inference` streaming RPC (`--use-streaming`) — bidi streams replace per-step Forward calls (M0.5.1).
+- Idempotency cache on workers (M0.5.2) — replayed `(session_id, step_id)` returns cached response without re-decoding.
+- Server-to-server activation push (`--use-streaming-push`, M0.5.3 v1) — 2-worker chains working today; multi-hop is v2.
+- Client-side recovery on stream failure (M0.5.4 v0) — replays history through fresh streams; continuation is plausible but not bit-identical (per the non-determinism property).
+
+**Deferred:**
+
+- Alternate-worker recovery from a registry of redundant peers (M0.5.4 v1).
+- Latency-based silent-failure detection (M0.5.4 v2).
+- Non-Llama model architectures — the partial-load patches today gate only `models_llama.cpp`; Qwen3 / Gemma / etc. need their own per-arch patch.
+- DHT-based public-network peer discovery (v1.0+).
+- Opt-in cryptographic verification (v1.0+).
+
+See [`docs/v0.5-design-lock.md`](docs/v0.5-design-lock.md) for the v0.5 design contract and acceptance criteria.
 
 ## License & attribution
 
