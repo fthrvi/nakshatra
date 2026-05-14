@@ -31,6 +31,15 @@ message InfoResponse {
   int32  kv_cache_tokens_free = 9;
   bool   has_token_embd      = 10;  // worker 0 only
   bool   has_lm_head         = 11;  // last worker only
+  // v0.5 §9.1 closure — capability handshake. Clients reading an older
+  // worker get an empty list and assume base v0.1 behaviour (Forward only,
+  // no streaming/push/idempotency). Known tokens:
+  //   "streaming"          — Inference RPC implemented
+  //   "rpc_push"           — server-to-server push via NextServer/chain
+  //   "idempotency_cache"  — (session_id, step_id) replay cache
+  //   "recovery_replay"    — supports cold-prefill of a (prompt + already-
+  //                          generated-tokens) replay after recovery
+  repeated string protocol_capabilities = 12;
 }
 
 message ForwardRequest {

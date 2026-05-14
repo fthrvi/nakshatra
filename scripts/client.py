@@ -39,6 +39,13 @@ import nakshatra_pb2_grpc as pb_grpc
 LLAMA3_EOS_IDS = {128001, 128008, 128009}
 
 
+class PushFailure(RuntimeError):
+    """v0.5 §9.5: a worker advertised rpc_push but its peer connection failed.
+    Caught by the recovery loop to downgrade the session to streaming-only
+    (client-relay) mode without swapping workers — the broken link is between
+    the two peer workers, not in either worker itself."""
+
+
 def tokenize_local(model_path, prompt):
     from llama_cpp import Llama
     llama = Llama(model_path=model_path, vocab_only=True, verbose=False)
@@ -157,8 +164,12 @@ def call_inference_step(streamer, payload, n_tokens, has_token_ids,
         timing.setdefault(streamer.worker_id, []).append(time.time() - t0)
 
     if resp.HasField("error"):
-        sys.exit(f"[chain] worker {streamer.worker_id!r} reported error: "
-                 f"{resp.error.decode('utf-8', 'replace')}")
+        err_str = resp.error.decode("utf-8", "replace")
+        # v0.5 §9.5: structured push-failure signal — propagates to the
+        # recovery loop, which downgrades the session to relay mode.
+        if err_str.startswith("push_failed:"):
+            raise PushFailure(f"worker {streamer.worker_id!r}: {err_str}")
+        sys.exit(f"[chain] worker {streamer.worker_id!r} reported error: {err_str}")
     if resp.HasField("token_ids"):
         ids = list(resp.token_ids.ids)
         return struct.pack(f"<{len(ids)}i", *ids)
@@ -385,8 +396,11 @@ def main():
             ch = grpc.insecure_channel(addr)
             stub = pb_grpc.NakshatraStub(ch)
             info = stub.Info(pb.InfoRequest(), timeout=10.0)
+            caps = list(info.protocol_capabilities)
+            cap_tag = f"  caps={caps}" if caps else "  caps=<v0.1>"
             print(f"  {w['id']:12s} {addr:25s}  layers=[{info.layer_start},{info.layer_end})  "
                   f"embd={info.has_token_embd}  lm={info.has_lm_head}  hidden={info.hidden_size}"
+                  + cap_tag
                   + (f"  [alt cursor={w['cursor']}/{len(w['candidates'])-1}]" if w['cursor'] > 0 else ""))
             if n_embd_local is None:
                 n_embd_local = info.hidden_size
@@ -417,6 +431,21 @@ def main():
 
     sorted_stubs, n_embd = _setup_chain()
     print(f"[chain] OK: contiguous coverage of [{sorted_stubs[0][2].layer_start}, {sorted_stubs[-1][2].layer_end})")
+
+    # v0.5 §9.1 closure — session-start capability negotiation. If the user
+    # requested push but any worker doesn't advertise rpc_push, downgrade
+    # the whole session to streaming-only mode (no per-token retry — just
+    # don't enable push). Older workers report an empty capability list,
+    # which we treat as "no streaming/push" → downgrade.
+    if args.use_streaming_push:
+        non_pushers = [w["id"] for w, _, info in sorted_stubs
+                       if "rpc_push" not in info.protocol_capabilities]
+        if non_pushers:
+            print(f"[chain] WARNING: push requested but workers lack rpc_push capability: "
+                  f"{non_pushers} — downgrading session to streaming-only "
+                  f"(client relays per-step).", file=sys.stderr)
+            args.use_streaming_push = False
+            # streaming stays on; only push is disabled
 
     # Tokenize
     print(f"[chain] tokenizing locally")
@@ -593,6 +622,18 @@ def main():
                 for s in streamers:
                     s.close()
                 raise
+            # v0.5 §9.5: push failure is a session-scope downgrade, not a
+            # worker swap. The broken link is between two healthy workers —
+            # advancing to an alternate wouldn't help and might mask the
+            # underlying connectivity issue. We just turn push off for the
+            # rest of this session and let streaming-only relay continue.
+            if isinstance(e, PushFailure) and args.use_streaming_push:
+                print(f"[recovery] push failed mid-session — downgrading to "
+                      f"streaming-only (client relays per-step) for the rest "
+                      f"of this session", file=sys.stderr)
+                args.use_streaming_push = False
+                restart_requested = True
+                continue
             # v0.5 M0.5.4 v1: try advancing to a fresh alternate worker first;
             # only fall back to retry-same-worker if no alternates remain.
             advanced = _advance_one_alternate()
