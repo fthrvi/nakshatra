@@ -173,7 +173,8 @@ class DaemonClient:
 
 
 class WorkerServicer(pb_grpc.NakshatraServicer):
-    def __init__(self, daemon: DaemonClient, mode: str, layer_start: int, layer_end: int, model_id: str):
+    def __init__(self, daemon: DaemonClient, mode: str, layer_start: int, layer_end: int, model_id: str,
+                 idem_max_entries: int = 6400, idem_ttl_seconds: float = 60.0):
         self.daemon = daemon
         self.mode = mode
         self.layer_start = layer_start
@@ -182,6 +183,55 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
         self.daemon_info = daemon.info()
         print(f"[worker] daemon info: {self.daemon_info}", flush=True)
         self.n_embd = self.daemon_info["n_embd"]
+        # v0.5 M0.5.2: idempotency cache. Maps session_id -> {"steps": {step_id: response_proto},
+        # "last_touch": float}. On a duplicate (session_id, step_id) we return the cached
+        # response without touching the daemon. TTL-expires per-session; hard-capped by
+        # total entries across all sessions.
+        self._idem_lock = threading.Lock()
+        self._idem_cache: dict = {}
+        self._idem_ttl = idem_ttl_seconds
+        self._idem_max = idem_max_entries
+        self._idem_hits = 0
+        self._idem_misses = 0
+
+    def _idem_evict(self, now: float):
+        """Drop expired sessions, then cap total entries. Caller holds _idem_lock."""
+        expired = [s for s, e in self._idem_cache.items() if now - e["last_touch"] > self._idem_ttl]
+        for s in expired:
+            del self._idem_cache[s]
+        total = sum(len(e["steps"]) for e in self._idem_cache.values())
+        while total > self._idem_max and self._idem_cache:
+            oldest = min(self._idem_cache.keys(), key=lambda s: self._idem_cache[s]["last_touch"])
+            total -= len(self._idem_cache[oldest]["steps"])
+            del self._idem_cache[oldest]
+
+    def _idem_get(self, session_id: str, step_id: str):
+        with self._idem_lock:
+            sess = self._idem_cache.get(session_id)
+            if sess and step_id in sess["steps"]:
+                self._idem_hits += 1
+                sess["last_touch"] = time.time()
+                return sess["steps"][step_id]
+            self._idem_misses += 1
+            return None
+
+    def _idem_put(self, session_id: str, step_id: str, response):
+        with self._idem_lock:
+            now = time.time()
+            sess = self._idem_cache.setdefault(session_id, {"steps": {}, "last_touch": now})
+            sess["steps"][step_id] = response
+            sess["last_touch"] = now
+            self._idem_evict(now)
+
+    def idem_stats(self) -> dict:
+        with self._idem_lock:
+            sessions = len(self._idem_cache)
+            entries = sum(len(e["steps"]) for e in self._idem_cache.values())
+            return {
+                "hits": self._idem_hits, "misses": self._idem_misses,
+                "sessions": sessions, "entries": entries,
+                "max_entries": self._idem_max, "ttl_seconds": self._idem_ttl,
+            }
 
     def Info(self, request, context):
         return pb.InfoResponse(
@@ -249,6 +299,18 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
         first_step = True
         try:
             for step in request_iterator:
+                # v0.5 M0.5.2: idempotency cache. If this (session_id, step_id) has
+                # been served before, return the cached response without touching
+                # the daemon. Note: a cache hit advances first_step too — the
+                # daemon's KV state was already updated by the original call, so
+                # subsequent steps in this stream should treat themselves as
+                # "not first" with respect to keep_kv semantics.
+                cached = self._idem_get(step.session_id, step.step_id)
+                if cached is not None:
+                    first_step = False
+                    yield cached
+                    continue
+
                 if step.HasField("token_ids"):
                     ids = list(step.token_ids.ids)
                     n_tokens = len(ids)
@@ -306,6 +368,11 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                     out.hidden_state.raw = payload
                     out.hidden_state.batch = 1
                     out.hidden_state.n_tokens = n_tokens
+                # v0.5 M0.5.2: store before yielding so a concurrent duplicate
+                # gets the cached response. Only cache fully-formed successful
+                # responses; error responses are not cached (the error was the
+                # whole point of failure, replays should retry).
+                self._idem_put(step.session_id, step.step_id, out)
                 yield out
         except Exception as e:
             sys.stderr.write(f"[inference] stream aborted: {e}\n")
@@ -495,6 +562,8 @@ class FileServerHandler(BaseHTTPRequestHandler):
                 "backends": gpu["backend_hints"] if gpu else [],
             },
             "gpus_present": _HEALTH_STATE.get("gpus_present", []),
+            "idem_cache": (_HEALTH_STATE["servicer"].idem_stats()
+                           if _HEALTH_STATE.get("servicer") is not None else None),
             "protocol_version": "0.1.0",
         }
 
@@ -983,6 +1052,7 @@ def main():
     node_id = args.node_id or f"{socket.gethostname()}-{args.port}"
     _HEALTH_STATE.update({
         "daemon": daemon,
+        "servicer": servicer,
         "started_at": time.time(),
         "node_id": node_id,
         "model_id": args.model_id,
