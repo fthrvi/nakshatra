@@ -1,0 +1,47 @@
+# Llama-3.3-70B 5-machine chain — v0.5 §7 acceptance target.
+#   w0:  prithvi (ROCm, RX 9070 XT)         layers [0,16)   has token_embd
+#   w1:  mac3-2  (Metal, 5700 XT)           layers [16,32)
+#   w2:  mentorings (CPU, Vega 56 drift)    layers [32,40)
+#   w3:  mac4    (Metal, 5700 XT)           layers [40,56)
+#   w4:  bishwa  (Metal, 5700 XT)           layers [56,80)  has lm_head
+#
+# Ports 5530-5534 are the long-running prod chain. The 4 Mac workers have
+# been up multi-day; prithvi:5530 was missing since the 2026-05-13 reboot
+# and is being relaunched fresh for this acceptance run.
+model:
+  id: "llama-3.3-70b"
+  hidden_size: 8192
+  num_blocks: 80
+  wire_dtype: f32
+
+workers:
+  - id: prithvi-5530
+    address: 100.101.134.33
+    port: 5530
+    layer_range: [0, 16]
+    sub_gguf_path: /home/prithvi/llama70b/w0.gguf
+    mode: first
+  - id: mac3-2-5531
+    address: 100.121.48.32
+    port: 5531
+    layer_range: [16, 32]
+    sub_gguf_path: /tmp/l3370b_w0_16-32.gguf
+    mode: middle
+  - id: mentorings-imac-pro-5532
+    address: 100.122.70.52
+    port: 5532
+    layer_range: [32, 40]
+    sub_gguf_path: /tmp/l3370b_w_32-40.gguf
+    mode: middle
+  - id: mac4-5533
+    address: 100.93.112.98
+    port: 5533
+    layer_range: [40, 56]
+    sub_gguf_path: /tmp/l3370b_w_40-56.gguf
+    mode: middle
+  - id: bishwa-5534
+    address: 100.109.164.69
+    port: 5534
+    layer_range: [56, 80]
+    sub_gguf_path: /tmp/l3370b_w_56-80.gguf
+    mode: last

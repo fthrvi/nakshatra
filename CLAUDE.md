@@ -2,7 +2,7 @@
 
 ## What this project is
 
-Nakshatra is the **L2 inference engine** in a four-project architecture. One layer in the stack — not the whole system. Read `docs/three-project-architecture.md` first if you have not already; it is the source of truth for project boundaries (filename predates the Neuron extraction; will be renamed in a later pass).
+Nakshatra is the **L2 inference engine** in a four-project architecture. One layer in the stack — not the whole system. Read `docs/four-project-architecture.md` first if you have not already; it is the source of truth for project boundaries.
 
 In short:
 - **Neuron (L1)** — chain & economic substrate. `~/neuron/` (`fthrvi/neuron`, not yet pushed). PAUSED at the project level; extracted from Prithvi- on 2026-05-14.
@@ -29,7 +29,7 @@ If a feature wants to do registry / identity / cache work, it is Sthambha-shaped
 
 ## Key reference docs (read in this order)
 
-1. `docs/three-project-architecture.md` — architectural decision (2026-05-08), project boundaries, migration plan.
+1. `docs/four-project-architecture.md` — architectural decision (2026-05-08), project boundaries, migration plan.
 2. `docs/north-star.md` — L1-L4 long vision.
 3. `docs/petals-architecture.md` — v0.1 spec (the contract we shipped against).
 4. `docs/v0.1-implementation-plan.md` — milestones M1-M7 (all green).

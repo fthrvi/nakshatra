@@ -518,7 +518,7 @@ Tell us which regime you want when re-running our experiments. The repo's `clust
 - **Patch set:** `experiments/v0.0/m4_patches/`
 - **Architecture contract:** `docs/petals-architecture.md`
 - **North-star vision:** `docs/north-star.md`
-- **Three-project decision:** `docs/three-project-architecture.md`
+- **Four-project decision:** `docs/four-project-architecture.md`
 
 ---
 

@@ -1,14 +1,13 @@
 # Four-Project Architecture — canonical doc moved
-> *Filename retained as `three-project-architecture.md` for now; the canonical doc grew to four projects on 2026-05-14 when Neuron was extracted from Prithvi-. Rename pass will land separately.*
 
 The full architecture decision document lives in the **Sthambha** repo, where it is canonical:
 
-→ **https://github.com/fthrvi/sthambha/blob/main/docs/three-project-architecture.md**
+→ **https://github.com/fthrvi/sthambha/blob/main/docs/four-project-architecture.md**
 
 If you have Sthambha cloned locally:
 
 ```bash
-$EDITOR ~/sthambha/docs/three-project-architecture.md
+$EDITOR ~/sthambha/docs/four-project-architecture.md
 ```
 
 ## Why it moved
