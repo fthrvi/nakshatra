@@ -2,12 +2,13 @@
 
 ## What this project is
 
-Nakshatra is the **L2 inference engine** in a three-project architecture. One layer in the stack — not the whole system. Read `docs/three-project-architecture.md` first if you have not already; it is the source of truth for project boundaries.
+Nakshatra is the **L2 inference engine** in a four-project architecture. One layer in the stack — not the whole system. Read `docs/three-project-architecture.md` first if you have not already; it is the source of truth for project boundaries (filename predates the Neuron extraction; will be renamed in a later pass).
 
 In short:
-- **Sthambha (L3)** — peer registry, Pi pillar, identity, layer cache. New repo, not yet created. L3 work goes there.
+- **Neuron (L1)** — chain & economic substrate. `~/neuron/` (`fthrvi/neuron`, not yet pushed). PAUSED at the project level; extracted from Prithvi- on 2026-05-14.
 - **Nakshatra (L2)** — *this repo*. Patched llama.cpp + worker daemon + sub-GGUF tooling + gRPC chain protocol.
-- **Prithvi (L4)** — the agent / being / consciousness. `fthrvi/prithvi` on home PC.
+- **Sthambha (L3)** — peer registry, pillar daemon, identity, layer cache, planner (`plan_split` shipped 2026-05-14), network fabric (designed). `~/sthambha/` (`fthrvi/sthambha`).
+- **Prithvi (L4)** — the agent / being / consciousness. `fthrvi/Prithvi-` on home PC.
 
 ## What goes here, what does not
 
@@ -20,9 +21,9 @@ In short:
 - Streaming KV reuse, per-token routing, latency / vendor-portability
 
 **Does NOT belong in Nakshatra:**
-- Peer registry, identity, pillar daemon, model/layer cache → Sthambha
+- Peer registry, identity, pillar daemon, model/layer cache, fabric → Sthambha
 - Consciousness, voice, gateway, OpenAI-compatible API → Prithvi
-- Substrate chain / NRN tokenomics → **PAUSED.** Returns at v1.0+ public-network. Don't add code that imports it.
+- Substrate chain / NRN tokenomics / wallet / receipts → **Neuron** at `~/neuron/`. Still PAUSED at the project level; returns alongside Sthambha fabric Mode C. Don't add code that imports chain modules.
 
 If a feature wants to do registry / identity / cache work, it is Sthambha-shaped — flag it as such rather than absorbing it here. Nakshatra stays an inference engine.
 
