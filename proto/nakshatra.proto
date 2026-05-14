@@ -58,15 +58,21 @@ message InferenceStep {
     bytes       error        = 13;   // serialized error string when something goes wrong
   }
 
-  // v0.5 M0.5.3 — server-to-server push. When `next_server` is set on a step
-  // arriving at worker N, after N produces its output activation it opens (or
-  // reuses) a gRPC Inference stream to next_server.address and pushes the
-  // computed hidden_state there as an InferenceStep with pushed=true. N waits
-  // for the downstream response on that peer stream and yields it back to its
-  // own caller — so the response chain unwinds back to the original client.
-  // Implementation: piggybacks on the existing Inference RPC; no new method.
+  // v0.5 M0.5.3 — server-to-server push. When `next_server` (v1) or `chain`
+  // (v2) carries a downstream worker, after we produce the output activation
+  // we open (or reuse) a gRPC Inference stream to that peer and push the
+  // hidden_state there. We then wait for the peer's response and yield it
+  // back up to our own caller — the response chain unwinds backward.
+  //
+  // v1 (`next_server`): single immediate-next worker. Sufficient for 2-worker
+  //   chains. Kept for back-compat; v2 clients should prefer `chain`.
+  // v2 (`chain`): repeated NextServer listing the FULL remaining chain after
+  //   the current worker. Each worker uses chain[0] as the immediate next and
+  //   forwards chain[1:] to it. The final worker in the chain receives chain=[]
+  //   and behaves as mode=last (returns token_id). Enables 3+ worker push.
   NextServer next_server = 14;
   bool       pushed      = 15;       // true when this step arrived via push, not direct from client
+  repeated NextServer chain = 16;    // v2: full remaining chain; head = immediate next; pop on forward
 }
 
 message NextServer {
