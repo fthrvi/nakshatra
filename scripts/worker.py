@@ -173,6 +173,12 @@ class DaemonClient:
             self.proc.kill()
 
 
+# v0.5 §9.7: idempotency cache is sized in MB, internally converted to an
+# entry cap using this per-entry estimate. ~10 KB matches a typical hidden-state
+# response (3072-dim × f32 + proto overhead). Adjust if the average grows.
+IDEM_BYTES_PER_ENTRY = 10 * 1024
+
+
 class WorkerServicer(pb_grpc.NakshatraServicer):
     def __init__(self, daemon: DaemonClient, mode: str, layer_start: int, layer_end: int, model_id: str,
                  idem_max_entries: int = 6400, idem_ttl_seconds: float = 60.0):
@@ -288,6 +294,14 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
             kv_cache_tokens_free=256,
             has_token_embd=(self.mode == "first"),
             has_lm_head=(self.mode == "last"),
+            # v0.5 §9.1 closure — advertised features so the client can
+            # negotiate push at session start without runtime probing.
+            protocol_capabilities=[
+                "streaming",
+                "rpc_push",
+                "idempotency_cache",
+                "recovery_replay",
+            ],
         )
 
     def Forward(self, request, context):
@@ -461,11 +475,28 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                     except Exception as e:
                         with self._peer_lock:
                             self._push_errors += 1
+                            # Evict the broken peer stream so a future session
+                            # opens a fresh one instead of reusing the wedged
+                            # channel. The downgraded session won't use push
+                            # again, but later sessions might.
+                            cached = self._peer_streams.pop(next_addr, None)
+                            if cached is not None:
+                                try: cached[1].put(None)  # close request side
+                                except Exception: pass
+                                try: cached[0].close()    # close channel
+                                except Exception: pass
                         sys.stderr.write(f"[push] to {next_addr!r} failed: {e}\n")
-                        # Fall back: yield our own output, let caller handle
-                        # the broken chain. (M0.5.3 v1: no transparent fallback.)
-                        self._idem_put(step.session_id, step.step_id, out)
-                        yield out
+                        # v0.5 §9.5 closure: emit a structured "push_failed:"
+                        # error so the client can downgrade this session to
+                        # client-relay mode. Yielding our raw hidden state
+                        # here would corrupt the chain (in push mode the
+                        # client expects a final token id, not a mid-chain
+                        # hidden state).
+                        err_msg = f"push_failed: peer={next_addr} error={e}".encode()
+                        yield pb.InferenceStep(
+                            session_id=step.session_id, step_id=step.step_id,
+                            error=err_msg,
+                        )
                         continue
                     # Cache the peer's response under OUR (session_id, step_id)
                     # so a replay of our step returns the same final result.
@@ -1119,6 +1150,13 @@ def main():
                     help="Disable Phase-B auto-detection of free VRAM via "
                          "rocm-smi/nvidia-smi. Use the declared --vram-offered-gb "
                          "as-is (operator override).")
+    # v0.5 §9.7 closure: idempotency cache sizing.
+    ap.add_argument("--idempotency-cache-mb", type=int, default=64,
+                    help="Idempotency cache memory cap, MB (default 64). "
+                         "Converted internally to an entry count at "
+                         f"~{IDEM_BYTES_PER_ENTRY//1024} KB per cached step.")
+    ap.add_argument("--idempotency-cache-ttl", type=float, default=60.0,
+                    help="Idempotency cache per-session TTL in seconds (default 60).")
     args = ap.parse_args()
 
     # Phase 4: if sub-GGUF is missing AND we have a pillar to ask, fetch it
@@ -1145,7 +1183,13 @@ def main():
     daemon = DaemonClient(args.daemon_bin, args.sub_gguf, args.mode, args.n_ctx, args.n_threads, args.n_gpu_layers)
 
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
-    servicer = WorkerServicer(daemon, args.mode, args.layer_start, args.layer_end, args.model_id)
+    idem_max_entries = max(1, (args.idempotency_cache_mb * 1024 * 1024) // IDEM_BYTES_PER_ENTRY)
+    servicer = WorkerServicer(daemon, args.mode, args.layer_start, args.layer_end, args.model_id,
+                              idem_max_entries=idem_max_entries,
+                              idem_ttl_seconds=args.idempotency_cache_ttl)
+    print(f"[worker] idempotency cache: {args.idempotency_cache_mb} MB "
+          f"(~{idem_max_entries} entries @ {IDEM_BYTES_PER_ENTRY//1024} KB), "
+          f"ttl={args.idempotency_cache_ttl}s", flush=True)
     pb_grpc.add_NakshatraServicer_to_server(servicer, server)
     server.add_insecure_port(f"[::]:{args.port}")
     print(f"[worker] M5 listening on :{args.port}  mode={args.mode}  layers=[{args.layer_start},{args.layer_end})  model={args.model_id}", flush=True)
