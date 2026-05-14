@@ -23,6 +23,7 @@ import json
 import os
 import platform
 import plistlib
+import queue
 import re
 import shutil
 import socket
@@ -193,6 +194,13 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
         self._idem_max = idem_max_entries
         self._idem_hits = 0
         self._idem_misses = 0
+        # v0.5 M0.5.3: peer-stream cache for rpc_push. One persistent bidi
+        # Inference stream per next-hop peer address, reused across sessions.
+        # Map: address (str) -> (grpc.Channel, queue.Queue request side, response iterator)
+        self._peer_lock = threading.Lock()
+        self._peer_streams: dict = {}
+        self._push_count = 0
+        self._push_errors = 0
 
     def _idem_evict(self, now: float):
         """Drop expired sessions, then cap total entries. Caller holds _idem_lock."""
@@ -231,6 +239,40 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                 "hits": self._idem_hits, "misses": self._idem_misses,
                 "sessions": sessions, "entries": entries,
                 "max_entries": self._idem_max, "ttl_seconds": self._idem_ttl,
+            }
+
+    def _get_peer_stream(self, address: str):
+        """Open or reuse a bidi Inference stream to a peer worker.
+
+        v0.5 M0.5.3 — server-to-server push. Returns (req_queue, response_iterator).
+        Sending None to the queue closes the stream. We never close in normal
+        operation; streams persist across all sessions until process exit.
+        """
+        with self._peer_lock:
+            cached = self._peer_streams.get(address)
+            if cached is not None:
+                return cached[1], cached[2]
+            channel = grpc.insecure_channel(address)
+            stub = pb_grpc.NakshatraStub(channel)
+            req_q: queue.Queue = queue.Queue()
+
+            def request_gen():
+                while True:
+                    step = req_q.get()
+                    if step is None:
+                        return
+                    yield step
+
+            resp_iter = stub.Inference(request_gen())
+            self._peer_streams[address] = (channel, req_q, resp_iter)
+            return req_q, resp_iter
+
+    def push_stats(self) -> dict:
+        with self._peer_lock:
+            return {
+                "active_peers": len(self._peer_streams),
+                "push_count": self._push_count,
+                "push_errors": self._push_errors,
             }
 
     def Info(self, request, context):
@@ -368,6 +410,45 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                     out.hidden_state.raw = payload
                     out.hidden_state.batch = 1
                     out.hidden_state.n_tokens = n_tokens
+
+                # v0.5 M0.5.3: server-to-server push. If the incoming step
+                # carries a next_server hint AND we produced a hidden_state
+                # (non-terminal worker), open/reuse a peer stream and forward
+                # our output downstream instead of returning it to our caller.
+                # We then wait for the peer's response and yield THAT back, so
+                # the response chain unwinds up the call graph.
+                next_srv = step.next_server
+                if next_srv.address and self.mode != "last":
+                    push_step = pb.InferenceStep(
+                        session_id=next_srv.session_id or step.session_id,
+                        step_id=step.step_id,
+                        prefix_length=step.prefix_length + n_tokens,
+                        pushed=True,
+                    )
+                    push_step.hidden_state.raw = payload
+                    push_step.hidden_state.batch = 1
+                    push_step.hidden_state.n_tokens = n_tokens
+                    try:
+                        req_q, resp_iter = self._get_peer_stream(next_srv.address)
+                        req_q.put(push_step)
+                        peer_resp = next(resp_iter)
+                        with self._peer_lock:
+                            self._push_count += 1
+                    except Exception as e:
+                        with self._peer_lock:
+                            self._push_errors += 1
+                        sys.stderr.write(f"[push] to {next_srv.address!r} failed: {e}\n")
+                        # Fall back: yield our own output, let caller handle
+                        # the broken chain. (M0.5.3 v1: no transparent fallback.)
+                        self._idem_put(step.session_id, step.step_id, out)
+                        yield out
+                        continue
+                    # Cache the peer's response under OUR (session_id, step_id)
+                    # so a replay of our step returns the same final result.
+                    self._idem_put(step.session_id, step.step_id, peer_resp)
+                    yield peer_resp
+                    continue
+
                 # v0.5 M0.5.2: store before yielding so a concurrent duplicate
                 # gets the cached response. Only cache fully-formed successful
                 # responses; error responses are not cached (the error was the
@@ -564,6 +645,8 @@ class FileServerHandler(BaseHTTPRequestHandler):
             "gpus_present": _HEALTH_STATE.get("gpus_present", []),
             "idem_cache": (_HEALTH_STATE["servicer"].idem_stats()
                            if _HEALTH_STATE.get("servicer") is not None else None),
+            "rpc_push": (_HEALTH_STATE["servicer"].push_stats()
+                         if _HEALTH_STATE.get("servicer") is not None else None),
             "protocol_version": "0.1.0",
         }
 
