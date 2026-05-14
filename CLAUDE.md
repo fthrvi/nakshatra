@@ -5,10 +5,10 @@
 Nakshatra is the **L2 inference engine** in a four-project architecture. One layer in the stack — not the whole system. Read `docs/four-project-architecture.md` first if you have not already; it is the source of truth for project boundaries.
 
 In short:
-- **Neuron (L1)** — chain & economic substrate. `~/neuron/` (`fthrvi/neuron`, not yet pushed). PAUSED at the project level; extracted from Prithvi- on 2026-05-14.
+- **Neuron (L1)** — chain & economic substrate. `~/neuron/` (`fthrvi/neuron`, not yet pushed). PAUSED at the project level; extracted from prithvi on 2026-05-14.
 - **Nakshatra (L2)** — *this repo*. Patched llama.cpp + worker daemon + sub-GGUF tooling + gRPC chain protocol.
 - **Sthambha (L3)** — peer registry, pillar daemon, identity, layer cache, planner (`plan_split` shipped 2026-05-14), network fabric (designed). `~/sthambha/` (`fthrvi/sthambha`).
-- **Prithvi (L4)** — the agent / being / consciousness. `fthrvi/Prithvi-` on home PC.
+- **Prithvi (L4)** — the agent / being / consciousness. `fthrvi/prithvi` on home PC.
 
 ## What goes here, what does not
 

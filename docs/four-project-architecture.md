@@ -16,9 +16,9 @@ The L1-L4 architecture is shared concern across all four repos. Keeping the cano
 
 ## TL;DR (for readers who don't click)
 
-- **Neuron (L1):** chain & economic substrate. Substrate validator + NRN token + on-chain accounting. `~/neuron/` (`fthrvi/neuron`, not yet pushed). **PAUSED at the project level** — extracted from Prithvi- on 2026-05-14 for hygiene. Returns alongside Sthambha fabric Mode C, when the network actually has untrusted public peers.
+- **Neuron (L1):** chain & economic substrate. Substrate validator + NRN token + on-chain accounting. `~/neuron/` (`fthrvi/neuron`, not yet pushed). **PAUSED at the project level** — extracted from prithvi on 2026-05-14 for hygiene. Returns alongside Sthambha fabric Mode C, when the network actually has untrusted public peers.
 - **Nakshatra (L2, this repo):** distributed inference engine. Patched llama.cpp + worker daemon + sub-GGUF tooling. v0.5 design-locked. 5-machine cluster runs Llama-70B + Qwen3-MoE.
 - **Sthambha (L3, what holds everything):** peer registry, pillar daemon, identity, model/layer cache, **planner** (`plan_split` shipped 2026-05-14), **network fabric** (designed). Also Prithvi's *Asthi Dhatu* (soul-persistence layer) — Shamir-split identity shards + Tattva snapshots + Om pulse that survives compute death. Repo: `fthrvi/sthambha`. Pillar deployed on `umbrel.local` since 2026-04-05.
-- **Prithvi (L4):** agent / consciousness / voice / gateway. Repo: `fthrvi/Prithvi-`. Now L4-only after the 2026-05-14 chain extraction.
+- **Prithvi (L4):** agent / consciousness / voice / gateway. Repo: `fthrvi/prithvi`. Now L4-only after the 2026-05-14 chain extraction.
 
 For the full plan including phase-by-phase migration, current status, and the soul-backup activation ritual, read the canonical doc.
