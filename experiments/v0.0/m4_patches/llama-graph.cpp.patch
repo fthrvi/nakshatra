@@ -1,0 +1,24 @@
+--- /home/prithvi/llama.cpp/src/llama-graph.cpp.orig	2026-05-06 20:03:20.892939380 -0600
++++ /home/prithvi/llama.cpp/src/llama-graph.cpp	2026-05-06 20:03:20.906353342 -0600
+@@ -1568,6 +1568,21 @@
+     cb(inp->embd, "inp_embd", -1);
+     ggml_set_input(inp->embd);
+ 
++    if (tok_embd == nullptr) {
++        ggml_tensor * cur = inp->embd;
++        if (n_embd_inp != n_embd) {
++            cur = ggml_view_2d(ctx0, cur, n_embd, n_tokens, cur->nb[1], 0);
++        }
++        res->t_inp_embd = cur;
++        if (hparams.f_embedding_scale != 0.0f) {
++            cur = ggml_scale(ctx0, cur, hparams.f_embedding_scale);
++        }
++        cb(cur, "embd", -1);
++        res->add_input(std::move(inp));
++        ggml_build_forward_expand(gf, cur);
++        return cur;
++    }
++
+     // select one of the 2 inputs, based on the batch contents
+     // ref: https://github.com/ggml-org/llama.cpp/pull/18550
+     std::array<ggml_tensor *, 2> inps;

@@ -1,0 +1,17 @@
+--- /home/prithvi/llama.cpp/src/llama-model.h.orig	2026-05-06 20:03:20.890911906 -0600
++++ /home/prithvi/llama.cpp/src/llama-model.h	2026-05-06 20:03:20.904741744 -0600
+@@ -514,6 +514,14 @@
+ 
+     std::vector<llama_layer> layers;
+ 
++    // ===== NAKSHATRA M4: partial-load layout =====
++    int  nks_layer_start    = 0;
++    int  nks_layer_end      = 0;
++    bool nks_has_token_embd = true;
++    bool nks_has_lm_head    = true;
++    bool nks_partial        = false;
++    // =============================================
++
+     //Dense linear projections for SentenceTransformers models like embeddinggemma
+     // For Sentence Transformers models structure see
+     // https://sbert.net/docs/sentence_transformer/usage/custom_models.html#structure-of-sentence-transformer-models

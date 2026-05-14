@@ -1,0 +1,26 @@
+# v0.1 acceptance redux — same-vendor 2-Mac chain.
+#   w0:    bishwa (Mac/CPU via -ngl 0, Radeon Pro 5700 XT idle), layers [0,14)
+#   wlast: mac4   (Mac/CPU via -ngl 0, Radeon Pro 5700 XT idle), layers [14,28)
+#
+# Both Macs are Intel iMacs with 5700 XT GPUs. Running CPU-only to match the
+# M6 conditions exactly. Different ports from the live 70b cluster (5530-5536)
+# so the two clusters can coexist on the same hosts.
+model:
+  id: "prithvi-q8"
+  hidden_size: 3072
+  num_blocks: 28
+  wire_dtype: f32
+
+workers:
+  - id: bishwa-test
+    address: 100.109.164.69
+    port: 5550
+    layer_range: [0, 14]
+    sub_gguf_path: /tmp/w0_v2.gguf
+    mode: first
+  - id: mac4-test
+    address: 100.93.112.98
+    port: 5551
+    layer_range: [14, 28]
+    sub_gguf_path: /tmp/wlast_v2.gguf
+    mode: last

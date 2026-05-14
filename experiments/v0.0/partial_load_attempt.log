@@ -1,0 +1,14 @@
+ggml_vulkan: Found 1 Vulkan devices:
+ggml_vulkan: 0 = AMD Radeon Pro 5700 XT (MoltenVK) | uma: 0 | fp16: 1 | bf16: 0 | warp size: 64 | shared memory: 65536 | int dot: 0 | matrix cores: none
+--no-conversation is not supported by llama-cli
+please use llama-completion instead
+
+Loading model... |-\llama_model_load: error loading model: missing tensor 'output_norm.weight'
+llama_model_load_from_file_impl: failed to load model
+llama_params_fit: encountered an error while trying to fit params to free device memory: failed to load model
+|/llama_model_load: error loading model: missing tensor 'output_norm.weight'
+llama_model_load_from_file_impl: failed to load model
+common_init_from_params: failed to load model '/Users/MentoringInstitute/nakshatra-v0/partial.gguf'
+srv    load_model: failed to load model, '/Users/MentoringInstitute/nakshatra-v0/partial.gguf'
+ 
+Failed to load the model

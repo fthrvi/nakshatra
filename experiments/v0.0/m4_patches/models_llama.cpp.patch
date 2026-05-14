@@ -1,0 +1,70 @@
+--- /home/prithvi/llama.cpp/src/models/llama.cpp.orig	2026-05-06 20:03:20.893504365 -0600
++++ /home/prithvi/llama.cpp/src/models/llama.cpp	2026-05-06 20:18:35.970121960 -0600
+@@ -26,9 +26,14 @@
+ 
+     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f/sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
+ 
+-    ggml_tensor * inp_out_ids = build_inp_out_ids();
++    ggml_tensor * inp_out_ids = model.nks_has_lm_head ? build_inp_out_ids() : nullptr;
+ 
+-    for (int il = 0; il < n_layer; ++il) {
++    // ===== NAKSHATRA M4 step 3: iterate only this worker's layer range =====
++    const int nks_il_start = model.nks_layer_start;
++    const int nks_il_end   = model.nks_layer_end > 0 ? model.nks_layer_end : n_layer;
++    // ========================================================================
++
++    for (int il = nks_il_start; il < nks_il_end; ++il) {
+         ggml_tensor * inpSA = inpL;
+ 
+         // norm
+@@ -96,7 +101,7 @@
+             }
+             cb(cur, "attn_out", il);
+         }
+-        if (il == n_layer - 1 && inp_out_ids) {
++        if (il == nks_il_end - 1 && inp_out_ids && model.nks_has_lm_head) {
+             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
+             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
+         }
+@@ -153,19 +158,29 @@
+     }
+     cur = inpL;
+ 
+-    cur = build_norm(cur,
+-            model.output_norm, NULL,
+-            LLM_NORM_RMS, -1);
+-
+-    cb(cur, "result_norm", -1);
+-    res->t_embd = cur;
+-
+-    if constexpr (!embed) {
+-        // lm_head
+-        cur = build_lora_mm(model.output, cur);
++    if (model.nks_has_lm_head) {
++        cur = build_norm(cur,
++                model.output_norm, NULL,
++                LLM_NORM_RMS, -1);
++
++        cb(cur, "result_norm", -1);
++        res->t_embd = cur;
++
++        if constexpr (!embed) {
++            // lm_head
++            cur = build_lora_mm(model.output, cur);
+ 
+-        cb(cur, "result_output", -1);
+-        res->t_logits = cur;
++            cb(cur, "result_output", -1);
++            res->t_logits = cur;
++        }
++    } else {
++        // ===== NAKSHATRA M4 step 3: middle/first worker — no norm, no lm_head.
++        // Terminal tensor is the residual stream output of the last layer in
++        // this worker's range; downstream worker will receive it as its
++        // input hidden state via ubatch.embd.
++        cb(cur, "result_partial_hidden", -1);
++        res->t_embd = cur;
++        // ===========================================================================
+     }
+ 
+     ggml_build_forward_expand(gf, cur);

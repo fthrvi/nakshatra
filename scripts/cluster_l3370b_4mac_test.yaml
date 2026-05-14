@@ -1,0 +1,39 @@
+# Llama-3.3-70B 4-Mac chain (no prithvi) — v0.5 M0.5.1 verification target.
+#   w0:  mac3-2  (Metal, 5700 XT)        layers [0,20)   has token_embd
+#   w1:  mentorings (CPU, Vega 56 drift) layers [20,40)
+#   w2:  mac4    (Metal, 5700 XT)        layers [40,60)
+#   w3:  bishwa  (Metal, 5700 XT)        layers [60,80)  has lm_head
+#
+# Ports 5560-5563 to coexist with the prod 70b chain (5530-5534) and the
+# v0.1 toy (5550-5551).
+model:
+  id: "llama-3.3-70b-test4"
+  hidden_size: 8192
+  num_blocks: 80
+  wire_dtype: f32
+
+workers:
+  - id: mac3-2-test
+    address: 100.121.48.32
+    port: 5560
+    layer_range: [0, 20]
+    sub_gguf_path: /tmp/l3370b_w0.gguf
+    mode: first
+  - id: mentorings-test
+    address: 100.122.70.52
+    port: 5561
+    layer_range: [20, 40]
+    sub_gguf_path: /tmp/l3370b_w1.gguf
+    mode: middle
+  - id: mac4-test
+    address: 100.93.112.98
+    port: 5562
+    layer_range: [40, 60]
+    sub_gguf_path: /tmp/l3370b_w2.gguf
+    mode: middle
+  - id: bishwa-test
+    address: 100.109.164.69
+    port: 5563
+    layer_range: [60, 80]
+    sub_gguf_path: /tmp/l3370b_slices/w3.gguf
+    mode: last

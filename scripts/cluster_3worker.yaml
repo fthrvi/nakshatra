@@ -1,0 +1,27 @@
+# 3-worker cluster across home PC + mentorings + bishwa.
+# Hidden state per token: 3072 fp32 = 12 KB; 6 prompt tokens × 2 hops = 144 KB.
+model:
+  id: "prithvi-q8"
+  hidden_size: 3072
+  num_blocks: 28
+  wire_dtype: f32
+
+workers:
+  - id: home-pc
+    address: 100.101.134.33      # Linux, layers [0,10)
+    port: 5530
+    layer_range: [0, 10]
+    sub_gguf_path: /tmp/cuts3/w0.gguf
+    mode: first
+  - id: mentorings
+    address: 100.122.70.52       # Mac, middle, layers [10,19)
+    port: 5532
+    layer_range: [10, 19]
+    sub_gguf_path: /tmp/wmid3.gguf
+    mode: middle
+  - id: bishwa
+    address: 100.109.164.69      # Mac, layers [19,28)
+    port: 5531
+    layer_range: [19, 28]
+    sub_gguf_path: /tmp/wlast3.gguf
+    mode: last

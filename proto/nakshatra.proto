@@ -1,0 +1,94 @@
+syntax = "proto3";
+
+package nakshatra.v0_1;
+
+// v0.1 service surface. See docs/v0.1-implementation-plan.md §3.5 for the
+// full rationale; in short:
+//   - Info: capability handshake at session start (model id, layer range, headroom)
+//   - Forward: stateless single forward pass over the worker's layers (testing aid)
+//   - Inference: stateful bidirectional stream, one per session_id
+//
+// Wire dtype is fp16 by default. Activation transport is always full-precision;
+// no on-wire quantization in v0.1.
+
+service Nakshatra {
+  rpc Info(InfoRequest) returns (InfoResponse);
+  rpc Forward(ForwardRequest) returns (ForwardResponse);
+  rpc Inference(stream InferenceStep) returns (stream InferenceStep);
+}
+
+message InfoRequest {}
+
+message InfoResponse {
+  string protocol_version    = 1;   // semver, e.g. "0.1.0"
+  string backend             = 2;   // e.g. "llamacpp-rocm", "llamacpp-vulkan"
+  string model_id            = 3;   // e.g. "llama-3.3-70b-q4-k-m"
+  bytes  model_content_hash  = 4;   // sha256 of the source full GGUF
+  int32  layer_start         = 5;
+  int32  layer_end           = 6;   // half-open [start, end)
+  int32  hidden_size         = 7;
+  string wire_dtype          = 8;   // "f16" (v0.1 default), "f32"
+  int32  kv_cache_tokens_free = 9;
+  bool   has_token_embd      = 10;  // worker 0 only
+  bool   has_lm_head         = 11;  // last worker only
+  // v0.5 §9.1 closure — capability handshake. Clients reading an older
+  // worker get an empty list and assume base v0.1 behaviour (Forward only,
+  // no streaming/push/idempotency). Known tokens:
+  //   "streaming"          — Inference RPC implemented
+  //   "rpc_push"           — server-to-server push via NextServer/chain
+  //   "idempotency_cache"  — (session_id, step_id) replay cache
+  //   "recovery_replay"    — supports cold-prefill of a (prompt + already-
+  //                          generated-tokens) replay after recovery
+  repeated string protocol_capabilities = 12;
+}
+
+message ForwardRequest {
+  bytes  hidden_in     = 1;          // raw bytes, shape [batch, n_tokens, hidden_size] in wire_dtype
+  int32  batch         = 2;
+  int32  n_tokens      = 3;
+  bool   has_token_ids = 4;          // if true, hidden_in is actually token IDs (worker 0 path)
+  bool   keep_kv       = 5;          // streaming: don't clear KV cache before decode (set true on steps after the prefill)
+  int32  start_pos     = 6;          // streaming: position of the first token in the worker's KV cache
+}
+
+message ForwardResponse {
+  bytes hidden_out = 1;
+}
+
+message InferenceStep {
+  string session_id     = 1;         // stable across the stream
+  string step_id        = 2;         // idempotency key for retries
+  int32  prefix_length  = 3;         // tokens already in KV cache before this step
+
+  oneof payload {
+    HiddenState hidden_state = 10;   // hidden state going *into* this worker's layer range
+    TokenIds    token_ids    = 11;   // worker 0 input: token IDs to embed
+    Logits      logits       = 12;   // last worker output: final logits over vocab
+    bytes       error        = 13;   // serialized error string when something goes wrong
+  }
+
+  // v0.5 M0.5.3 — server-to-server push. When `next_server` (v1) or `chain`
+  // (v2) carries a downstream worker, after we produce the output activation
+  // we open (or reuse) a gRPC Inference stream to that peer and push the
+  // hidden_state there. We then wait for the peer's response and yield it
+  // back up to our own caller — the response chain unwinds backward.
+  //
+  // v1 (`next_server`): single immediate-next worker. Sufficient for 2-worker
+  //   chains. Kept for back-compat; v2 clients should prefer `chain`.
+  // v2 (`chain`): repeated NextServer listing the FULL remaining chain after
+  //   the current worker. Each worker uses chain[0] as the immediate next and
+  //   forwards chain[1:] to it. The final worker in the chain receives chain=[]
+  //   and behaves as mode=last (returns token_id). Enables 3+ worker push.
+  NextServer next_server = 14;
+  bool       pushed      = 15;       // true when this step arrived via push, not direct from client
+  repeated NextServer chain = 16;    // v2: full remaining chain; head = immediate next; pop on forward
+}
+
+message NextServer {
+  string address    = 1;   // host:port of the next worker (e.g. "100.93.112.98:5562")
+  string session_id = 2;   // session_id the next worker should use (may differ from caller's)
+}
+
+message TokenIds    { repeated int32 ids = 1; }
+message HiddenState { bytes raw = 1; int32 batch = 2; int32 n_tokens = 3; }
+message Logits      { bytes raw = 1; int32 vocab_size = 2; }

@@ -1,0 +1,41 @@
+# Qwen3-Coder-30B-A3B 4-Mac chain — first multi-arch federation (qwen3moe).
+#
+# Layer split: 48 layers / 4 workers = 12 each.
+#   w0: mac3-2     (Metal, 5700 XT)        layers [0,12)   has token_embd
+#   w1: mentorings (CPU, Vega 56 drift)    layers [12,24)
+#   w2: mac4       (Metal, 5700 XT)        layers [24,36)
+#   w3: bishwa     (CPU; Metal last-worker GGML_ASSERT bug)  layers [36,48) has lm_head
+#
+# Ports 5570-5573 to coexist with the v0.1 toy (5550-5551), the Llama-70B
+# test chain (5560-5563), and the live 70B prod chain (5530-5534).
+model:
+  id: "qwen3-coder-30b-a3b-test4"
+  hidden_size: 2048
+  num_blocks: 48
+  wire_dtype: f32
+
+workers:
+  - id: mac3-2-qwen
+    address: 100.121.48.32
+    port: 5570
+    layer_range: [0, 12]
+    sub_gguf_path: /tmp/qwen3_w0.gguf
+    mode: first
+  - id: mentorings-qwen
+    address: 100.122.70.52
+    port: 5571
+    layer_range: [12, 24]
+    sub_gguf_path: /tmp/qwen3_w1.gguf
+    mode: middle
+  - id: mac4-qwen
+    address: 100.93.112.98
+    port: 5572
+    layer_range: [24, 36]
+    sub_gguf_path: /tmp/qwen3_w2.gguf
+    mode: middle
+  - id: bishwa-qwen
+    address: 100.109.164.69
+    port: 5573
+    layer_range: [36, 48]
+    sub_gguf_path: /tmp/qwen3_slices/w3.gguf
+    mode: last

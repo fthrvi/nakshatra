@@ -1,0 +1,66 @@
+--- /home/prithvi/llama.cpp/src/llama-model.cpp.orig	2026-05-06 20:03:20.891545258 -0600
++++ /home/prithvi/llama.cpp/src/llama-model.cpp	2026-05-06 20:03:20.905771976 -0600
+@@ -2575,6 +2575,28 @@
+ }
+ 
+ bool llama_model::load_tensors(llama_model_loader & ml) {
++    {
++        uint32_t nks_start_u = 0, nks_end_u = (uint32_t) hparams.n_layer;
++        bool found =
++            ml.get_key(std::string("nakshatra.layer_range_start"), nks_start_u, false)
++         && ml.get_key(std::string("nakshatra.layer_range_end"),   nks_end_u,   false);
++        if (found) {
++            this->nks_partial        = true;
++            this->nks_layer_start    = (int) nks_start_u;
++            this->nks_layer_end      = (int) nks_end_u;
++            this->nks_has_token_embd = (this->nks_layer_start == 0);
++            this->nks_has_lm_head    = (this->nks_layer_end   >= (int) hparams.n_layer);
++            ml.get_key(std::string("nakshatra.has_token_embd"), this->nks_has_token_embd, false);
++            ml.get_key(std::string("nakshatra.has_lm_head"),    this->nks_has_lm_head,    false);
++            LLAMA_LOG_INFO("%s: nakshatra partial-load: layers [%d, %d) of %d, embd=%d lm_head=%d\n",
++                           __func__, this->nks_layer_start, this->nks_layer_end,
++                           (int) hparams.n_layer,
++                           (int) this->nks_has_token_embd,
++                           (int) this->nks_has_lm_head);
++        } else {
++            this->nks_layer_end = (int) hparams.n_layer;
++        }
++    }
+     const auto & split_mode   = params.split_mode;
+     const auto & use_mlock    = params.use_mlock;
+     const auto & tensor_split = params.tensor_split;
+@@ -2718,18 +2740,26 @@
+             case LLM_ARCH_MISTRAL3:
+             case LLM_ARCH_LLAMA_EMBED:
+                 {
+-                    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
++                    const int nks_start = this->nks_layer_start;
++                    const int nks_end   = this->nks_layer_end > 0 ? this->nks_layer_end : n_layer;
++                    const bool nks_has_embd = this->nks_has_token_embd;
++                    const bool nks_has_lm   = this->nks_has_lm_head;
++
++                    if (nks_has_embd) {
++                        tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
++                    }
+ 
+-                    // output
+-                    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
+-                    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
+-
+-                    // if output is NULL, init from the input tok embed
+-                    if (output == NULL) {
+-                        output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_DUPLICATED);
++                    if (nks_has_lm) {
++                        output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
++                        output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
++
++                        if (output == NULL) {
++                            output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_DUPLICATED);
++                        }
+                     }
+ 
+                     for (int i = 0; i < n_layer; ++i) {
++                        if (i < nks_start || i >= nks_end) continue;
+                         auto & layer = layers[i];
+ 
+                         layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
