@@ -419,10 +419,17 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                 # the response chain unwinds up the call graph.
                 next_srv = step.next_server
                 if next_srv.address and self.mode != "last":
+                    # The next worker processes the SAME token positions we
+                    # just did — it's running a different layer range over the
+                    # same sequence. So pushed prefix_length is our INPUT
+                    # prefix_length, not our advanced output prefix_length.
+                    # (Bug found 2026-05-13 on first M0.5.3 push run: mac4
+                    # daemon rejected with "sequence positions inconsistent"
+                    # when we advanced by n_tokens here.)
                     push_step = pb.InferenceStep(
                         session_id=next_srv.session_id or step.session_id,
                         step_id=step.step_id,
-                        prefix_length=step.prefix_length + n_tokens,
+                        prefix_length=step.prefix_length,
                         pushed=True,
                     )
                     push_step.hidden_state.raw = payload
