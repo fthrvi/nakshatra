@@ -119,12 +119,18 @@ class InferenceStream:
 
 def call_inference_step(streamer, payload, n_tokens, has_token_ids,
                          session_id, step_idx, prefix_length, timing=None,
-                         next_server=None):
+                         next_server=None, chain=None):
     """v0.5 M0.5.1 streaming equivalent of call_forward. Returns raw bytes
     matching Forward's return shape (hidden state OR int32 token id), so
-    chain-walk code consumes the result identically. v0.5 M0.5.3 adds the
-    optional next_server kwarg: when set, the receiving worker pushes its
-    output to that peer and the response comes from the END of the chain."""
+    chain-walk code consumes the result identically.
+
+    Push-related kwargs (mutually exclusive):
+      - next_server (v0.5 M0.5.3 v1): single immediate-next worker. The
+        receiving worker forwards there. Sufficient for 2-worker chains.
+      - chain (v0.5 M0.5.3 v2): list of NextServer for the WHOLE remaining
+        chain after the receiving worker. Each downstream worker pops the
+        head and forwards the rest. Works for chains of any length.
+    """
     step = pb.InferenceStep(
         session_id=session_id,
         step_id=f"step-{step_idx}",
@@ -139,6 +145,8 @@ def call_inference_step(streamer, payload, n_tokens, has_token_ids,
         step.hidden_state.n_tokens = n_tokens
     if next_server is not None:
         step.next_server.CopyFrom(next_server)
+    if chain:
+        step.chain.extend(chain)
 
     t0 = time.time()
     try:
@@ -400,34 +408,38 @@ def main():
 
     streamers: list = []
     session_id = ""
-    if args.use_streaming and args.use_streaming_push and len(sorted_stubs) > 2:
-        print(f"[chain] WARNING: --use-streaming-push v1 only supports "
-              f"2-worker chains; this chain has {len(sorted_stubs)} workers. "
-              f"Worker {sorted_stubs[1][0]['id']} won't know who to forward to "
-              f"after worker 0 pushes to it. Expect a hung step at worker 1.",
-              file=sys.stderr)
     # Streamers are opened/re-opened by the recovery loop below — see M0.5.4 v0.
 
     def _next_server_for(idx):
         """Return a NextServer proto pointing at the worker AFTER idx, or None
-        if idx is the last worker. v0.5 M0.5.3."""
+        if idx is the last worker. v0.5 M0.5.3 v1."""
         if idx + 1 >= len(sorted_stubs):
             return None
         nxt_w = sorted_stubs[idx + 1][0]
         return pb.NextServer(address=f"{nxt_w['address']}:{nxt_w['port']}",
                               session_id=session_id)
 
+    def _chain_from(idx):
+        """Return the full remaining chain after worker idx — i.e. workers
+        idx+1, idx+2, ..., last. Empty if idx is the last worker. v0.5 M0.5.3 v2."""
+        out = []
+        for w, _, _ in sorted_stubs[idx + 1:]:
+            out.append(pb.NextServer(address=f"{w['address']}:{w['port']}",
+                                      session_id=session_id))
+        return out
+
     def _step_call(idx, stub_tup, payload, n, has_tok, keep_kv, prefix_length):
         w = stub_tup[0]
         if args.use_streaming_push:
-            # Only the first worker is contacted directly. We set next_server
-            # on each step so worker 0 knows where to forward. The response
-            # we receive on our single stream IS the last worker's token_id.
-            ns = _next_server_for(0)
+            # Only the first worker is contacted directly. The step carries
+            # the FULL remaining chain (v2) so each worker downstream knows
+            # who to forward to. The response we receive on our single stream
+            # is the last worker's token_id, unwound back through the chain.
+            chain = _chain_from(0)
             return call_inference_step(streamers[0], payload, n, has_tok,
                                        session_id=session_id, step_idx=step,
                                        prefix_length=prefix_length, timing=timing,
-                                       next_server=ns)
+                                       chain=chain)
         if args.use_streaming:
             return call_inference_step(streamers[idx], payload, n, has_tok,
                                        session_id=session_id, step_idx=step,

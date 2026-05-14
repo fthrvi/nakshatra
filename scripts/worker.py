@@ -417,8 +417,20 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                 # our output downstream instead of returning it to our caller.
                 # We then wait for the peer's response and yield THAT back, so
                 # the response chain unwinds up the call graph.
-                next_srv = step.next_server
-                if next_srv.address and self.mode != "last":
+                # v0.5 M0.5.3 push: decide whether to forward our output
+                # downstream. Prefer the v2 `chain` field; fall back to v1's
+                # `next_server` for back-compat.
+                next_addr = ""
+                next_session = ""
+                remaining_chain = []
+                if step.chain:
+                    next_addr = step.chain[0].address
+                    next_session = step.chain[0].session_id
+                    remaining_chain = list(step.chain[1:])
+                elif step.next_server.address:
+                    next_addr = step.next_server.address
+                    next_session = step.next_server.session_id
+                if next_addr and self.mode != "last":
                     # The next worker processes the SAME token positions we
                     # just did — it's running a different layer range over the
                     # same sequence. So pushed prefix_length is our INPUT
@@ -427,7 +439,7 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                     # daemon rejected with "sequence positions inconsistent"
                     # when we advanced by n_tokens here.)
                     push_step = pb.InferenceStep(
-                        session_id=next_srv.session_id or step.session_id,
+                        session_id=next_session or step.session_id,
                         step_id=step.step_id,
                         prefix_length=step.prefix_length,
                         pushed=True,
@@ -435,8 +447,13 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                     push_step.hidden_state.raw = payload
                     push_step.hidden_state.batch = 1
                     push_step.hidden_state.n_tokens = n_tokens
+                    # v2: forward the rest of the chain so the next worker
+                    # knows who to push to AFTER it. v1 next_server callers
+                    # send no chain; remaining_chain stays empty.
+                    if remaining_chain:
+                        push_step.chain.extend(remaining_chain)
                     try:
-                        req_q, resp_iter = self._get_peer_stream(next_srv.address)
+                        req_q, resp_iter = self._get_peer_stream(next_addr)
                         req_q.put(push_step)
                         peer_resp = next(resp_iter)
                         with self._peer_lock:
@@ -444,7 +461,7 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                     except Exception as e:
                         with self._peer_lock:
                             self._push_errors += 1
-                        sys.stderr.write(f"[push] to {next_srv.address!r} failed: {e}\n")
+                        sys.stderr.write(f"[push] to {next_addr!r} failed: {e}\n")
                         # Fall back: yield our own output, let caller handle
                         # the broken chain. (M0.5.3 v1: no transparent fallback.)
                         self._idem_put(step.session_id, step.step_id, out)
