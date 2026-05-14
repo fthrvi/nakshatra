@@ -57,6 +57,21 @@ message InferenceStep {
     Logits      logits       = 12;   // last worker output: final logits over vocab
     bytes       error        = 13;   // serialized error string when something goes wrong
   }
+
+  // v0.5 M0.5.3 — server-to-server push. When `next_server` is set on a step
+  // arriving at worker N, after N produces its output activation it opens (or
+  // reuses) a gRPC Inference stream to next_server.address and pushes the
+  // computed hidden_state there as an InferenceStep with pushed=true. N waits
+  // for the downstream response on that peer stream and yields it back to its
+  // own caller — so the response chain unwinds back to the original client.
+  // Implementation: piggybacks on the existing Inference RPC; no new method.
+  NextServer next_server = 14;
+  bool       pushed      = 15;       // true when this step arrived via push, not direct from client
+}
+
+message NextServer {
+  string address    = 1;   // host:port of the next worker (e.g. "100.93.112.98:5562")
+  string session_id = 2;   // session_id the next worker should use (may differ from caller's)
 }
 
 message TokenIds    { repeated int32 ids = 1; }

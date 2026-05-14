@@ -16,6 +16,8 @@ For multi-token generation: streaming KV reuse — first step is full
 prompt with keep_kv=False; later steps ship 1 token with keep_kv=True
 and start_pos=prefix_length.
 """
+from __future__ import annotations
+
 import argparse
 import json
 import queue
@@ -116,10 +118,13 @@ class InferenceStream:
 
 
 def call_inference_step(streamer, payload, n_tokens, has_token_ids,
-                         session_id, step_idx, prefix_length, timing=None):
+                         session_id, step_idx, prefix_length, timing=None,
+                         next_server=None):
     """v0.5 M0.5.1 streaming equivalent of call_forward. Returns raw bytes
     matching Forward's return shape (hidden state OR int32 token id), so
-    chain-walk code consumes the result identically."""
+    chain-walk code consumes the result identically. v0.5 M0.5.3 adds the
+    optional next_server kwarg: when set, the receiving worker pushes its
+    output to that peer and the response comes from the END of the chain."""
     step = pb.InferenceStep(
         session_id=session_id,
         step_id=f"step-{step_idx}",
@@ -132,6 +137,8 @@ def call_inference_step(streamer, payload, n_tokens, has_token_ids,
         step.hidden_state.raw = payload
         step.hidden_state.batch = 1
         step.hidden_state.n_tokens = n_tokens
+    if next_server is not None:
+        step.next_server.CopyFrom(next_server)
 
     t0 = time.time()
     try:
@@ -313,7 +320,17 @@ def main():
                          "of per-step Forward calls. One bidi stream per worker "
                          "for the entire session; KV state lives in the stream. "
                          "Output must be identical to the non-streaming path.")
+    ap.add_argument("--use-streaming-push", action="store_true",
+                    help="v0.5 M0.5.3: server-to-server push mode. Implies "
+                         "--use-streaming. Client opens ONE stream to the first "
+                         "worker; each step carries next_server pointing at the "
+                         "next worker. Workers chain via peer connections; the "
+                         "response unwinds back. v1 supports 2-worker chains; "
+                         "longer chains need v2 (multi-hop next_server).")
     args = ap.parse_args()
+    # --use-streaming-push implies --use-streaming
+    if args.use_streaming_push:
+        args.use_streaming = True
 
     if args.registry:
         if not args.model_id:
@@ -376,12 +393,46 @@ def main():
     session_id = ""
     if args.use_streaming:
         session_id = uuid.uuid4().hex
-        for w, stub, _ in sorted_stubs:
-            streamers.append(InferenceStream(stub, w["id"]))
-        print(f"[chain] streaming mode: {len(streamers)} bidi streams open  session_id={session_id[:8]}…")
+        # In push mode, client only opens a stream to the FIRST worker; the
+        # chain unwinds via worker-to-worker peer streams. In non-push streaming
+        # mode, client maintains a stream to every worker like before.
+        if args.use_streaming_push:
+            if len(sorted_stubs) > 2:
+                print(f"[chain] WARNING: --use-streaming-push v1 only supports "
+                      f"2-worker chains; this chain has {len(sorted_stubs)} workers. "
+                      f"Worker {sorted_stubs[1][0]['id']} won't know who to forward to "
+                      f"after worker 0 pushes to it. Expect a hung step at worker 1.",
+                      file=sys.stderr)
+            first_w, first_stub, _ = sorted_stubs[0]
+            streamers.append(InferenceStream(first_stub, first_w["id"]))
+            print(f"[chain] streaming-push mode: 1 stream to {first_w['id']}; "
+                  f"{len(sorted_stubs)-1} workers chained via peer push  "
+                  f"session_id={session_id[:8]}…")
+        else:
+            for w, stub, _ in sorted_stubs:
+                streamers.append(InferenceStream(stub, w["id"]))
+            print(f"[chain] streaming mode: {len(streamers)} bidi streams open  session_id={session_id[:8]}…")
+
+    def _next_server_for(idx):
+        """Return a NextServer proto pointing at the worker AFTER idx, or None
+        if idx is the last worker. v0.5 M0.5.3."""
+        if idx + 1 >= len(sorted_stubs):
+            return None
+        nxt_w = sorted_stubs[idx + 1][0]
+        return pb.NextServer(address=f"{nxt_w['address']}:{nxt_w['port']}",
+                              session_id=session_id)
 
     def _step_call(idx, stub_tup, payload, n, has_tok, keep_kv, prefix_length):
         w = stub_tup[0]
+        if args.use_streaming_push:
+            # Only the first worker is contacted directly. We set next_server
+            # on each step so worker 0 knows where to forward. The response
+            # we receive on our single stream IS the last worker's token_id.
+            ns = _next_server_for(0)
+            return call_inference_step(streamers[0], payload, n, has_tok,
+                                       session_id=session_id, step_idx=step,
+                                       prefix_length=prefix_length, timing=timing,
+                                       next_server=ns)
         if args.use_streaming:
             return call_inference_step(streamers[idx], payload, n, has_tok,
                                        session_id=session_id, step_idx=step,
@@ -401,28 +452,39 @@ def main():
                 keep_kv = True
             n_step = len(input_tokens)
 
-            # Step 1: tokens → first worker → hidden
+            # v0.5 M0.5.3 push mode: client only contacts the FIRST worker.
+            # The response we receive comes from the last worker (via the chain
+            # of peer pushes); it's a token id, not a hidden state.
             token_payload = struct.pack(f"<{n_step}i", *input_tokens)
-            hidden = _step_call(0, sorted_stubs[0], token_payload, n_step, True,
-                                keep_kv, prefix_length)
-            if len(hidden) != n_step * n_embd * 4:
-                sys.exit(f"[chain] first worker {sorted_stubs[0][0]['id']!r} returned {len(hidden)} bytes, expected {n_step*n_embd*4}")
-
-            # Steps 2..N-1: middle workers
-            for idx, stub_tup in enumerate(sorted_stubs[1:-1], start=1):
-                hidden = _step_call(idx, stub_tup, hidden, n_step, False,
+            if args.use_streaming_push:
+                last_resp = _step_call(0, sorted_stubs[0], token_payload, n_step, True,
+                                       keep_kv, prefix_length)
+                if len(last_resp) != 4:
+                    sys.exit(f"[chain] push mode: expected 4-byte token id from chain, got {len(last_resp)} bytes")
+                next_id = struct.unpack("<i", last_resp)[0]
+                generated.append(next_id)
+            else:
+                # Step 1: tokens → first worker → hidden
+                hidden = _step_call(0, sorted_stubs[0], token_payload, n_step, True,
                                     keep_kv, prefix_length)
                 if len(hidden) != n_step * n_embd * 4:
-                    sys.exit(f"[chain] middle worker {stub_tup[0]['id']!r} returned {len(hidden)} bytes")
+                    sys.exit(f"[chain] first worker {sorted_stubs[0][0]['id']!r} returned {len(hidden)} bytes, expected {n_step*n_embd*4}")
 
-            # Step N: last worker → token id
-            last_idx = len(sorted_stubs) - 1
-            last_resp = _step_call(last_idx, sorted_stubs[last_idx], hidden, n_step, False,
-                                   keep_kv, prefix_length)
-            if len(last_resp) != 4:
-                sys.exit(f"[chain] last worker {sorted_stubs[last_idx][0]['id']!r} returned {len(last_resp)} bytes, expected 4")
-            next_id = struct.unpack("<i", last_resp)[0]
-            generated.append(next_id)
+                # Steps 2..N-1: middle workers
+                for idx, stub_tup in enumerate(sorted_stubs[1:-1], start=1):
+                    hidden = _step_call(idx, stub_tup, hidden, n_step, False,
+                                        keep_kv, prefix_length)
+                    if len(hidden) != n_step * n_embd * 4:
+                        sys.exit(f"[chain] middle worker {stub_tup[0]['id']!r} returned {len(hidden)} bytes")
+
+                # Step N: last worker → token id
+                last_idx = len(sorted_stubs) - 1
+                last_resp = _step_call(last_idx, sorted_stubs[last_idx], hidden, n_step, False,
+                                       keep_kv, prefix_length)
+                if len(last_resp) != 4:
+                    sys.exit(f"[chain] last worker {sorted_stubs[last_idx][0]['id']!r} returned {len(last_resp)} bytes, expected 4")
+                next_id = struct.unpack("<i", last_resp)[0]
+                generated.append(next_id)
             prefix_length += n_step
 
             if next_id in LLAMA3_EOS_IDS:
