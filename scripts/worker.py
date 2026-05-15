@@ -32,6 +32,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from concurrent import futures
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
@@ -558,6 +559,130 @@ def heartbeat_loop(pillar_url: str, payload: dict, interval: float = 30.0,
 _FILE_SERVER_DIR = ""
 _HEALTH_STATE: dict = {}
 
+# Sthambha planner Step 4: slice task registry. Worker accepts long-running
+# partial_gguf.py jobs via POST /slice, returns a task_id, runs the cut
+# in a background thread, exposes status via GET /slice/<task_id>. Output
+# lands in _FILE_SERVER_DIR so Phase-4 auto-fetch can serve it as soon as
+# the slice finishes. Transport choice (HTTP, not the gRPC the planner doc
+# §7 Q2 originally recommended) recorded in trisul ADR 0003 — minimises
+# coupling between L2 (this worker) and L3 (sthambha pillar) ahead of the
+# fabric work that will eventually subsume both transports.
+_SLICE_TASKS: dict = {}
+_SLICE_LOCK = threading.Lock()
+_SLICE_MAX_HISTORY = 64   # ring-buffer cap on completed task entries
+_PARTIAL_GGUF_PATH = ""   # resolved at file-server start, see start_file_server()
+
+
+def _slug_for_filename(s: str) -> str:
+    """Sanitize a string for use as a filename component.
+
+    Keeps alphanumerics, dots, dashes, underscores; collapses everything else
+    to a single dash. Then strips traversal sequences ("..", leading dots)
+    so the result is safe to concatenate with a directory path.
+    """
+    out = []
+    prev_dash = False
+    for ch in s:
+        if ch.isalnum() or ch in "._-":
+            out.append(ch)
+            prev_dash = False
+        elif not prev_dash:
+            out.append("-")
+            prev_dash = True
+    slug = "".join(out).strip("-").lstrip(".")
+    # Collapse any ".." traversal sequences. Single dots between alnum runs
+    # (e.g. "llama-3.3-70b") stay; consecutive dots become a single dot.
+    while ".." in slug:
+        slug = slug.replace("..", ".")
+    return slug.strip("-.") or "model"
+
+
+def _slice_output_filename(model_id: str, layer_start: int, layer_end: int) -> str:
+    """Pillar-derived (not client-supplied) — no path injection.
+
+    Convention matches what Phase-4 auto-fetch already scans for: a basename
+    in _FILE_SERVER_DIR carrying `nakshatra.layer_range_start/end` metadata.
+    partial_gguf.py writes those KVs (see experiments/v0.0/partial_gguf.py).
+    """
+    return f"{_slug_for_filename(model_id)}.l{layer_start}-{layer_end}.gguf"
+
+
+def _slice_task_snapshot(task_id: str) -> dict:
+    """Return a JSON-serialisable view of a task's current state."""
+    with _SLICE_LOCK:
+        t = _SLICE_TASKS.get(task_id)
+        if t is None:
+            return {}
+        return {
+            "task_id": task_id,
+            "status": t["status"],
+            "model_id": t["model_id"],
+            "layer_start": t["layer_start"],
+            "layer_end": t["layer_end"],
+            "output_filename": t["output_filename"],
+            "started_at": t.get("started_at"),
+            "finished_at": t.get("finished_at"),
+            "sha256": t.get("sha256"),
+            "size_bytes": t.get("size_bytes"),
+            "error": t.get("error"),
+        }
+
+
+def _slice_update(task_id: str, **fields):
+    """Update a task entry if it still exists; no-op if evicted/cleared.
+
+    The ring-buffer cap can evict an old terminal entry to make room for
+    a new task, but the worker thread for the still-running slice keeps a
+    reference to its task_id. If the registry no longer holds the entry,
+    the update is silently dropped — the subprocess work is done, just
+    nothing to record.
+    """
+    with _SLICE_LOCK:
+        entry = _SLICE_TASKS.get(task_id)
+        if entry is not None:
+            entry.update(fields)
+
+
+def _run_slice_task(task_id: str, model_id: str, src: str, dst: str,
+                    layer_start: int, layer_end: int,
+                    force_keep_token_embd: bool, force_keep_output: bool):
+    """Worker thread body. Runs partial_gguf.py and updates the registry."""
+    try:
+        cmd = [
+            sys.executable, _PARTIAL_GGUF_PATH, src, dst,
+            "--start", str(layer_start),
+            "--end", str(layer_end),
+        ]
+        if force_keep_token_embd:
+            cmd.append("--keep-token-embd")
+        if force_keep_output:
+            cmd.append("--keep-output")
+        proc = subprocess.run(cmd, capture_output=True, timeout=3600)
+        if proc.returncode != 0:
+            err = proc.stderr.decode("utf-8", errors="replace")[-2000:]
+            _slice_update(task_id, status="failed", finished_at=time.time(),
+                           error=f"partial_gguf exit {proc.returncode}: {err.strip()}")
+            return
+        if not os.path.isfile(dst):
+            _slice_update(task_id, status="failed", finished_at=time.time(),
+                           error=f"partial_gguf returned 0 but {dst!r} not present")
+            return
+        sha = sha256_of_file(dst)
+        # Write the sha256 sidecar Phase-4 cache-scan reads to skip re-hashing.
+        try:
+            with open(dst + ".sha256", "w") as f:
+                f.write(sha + "\n")
+        except Exception:
+            pass
+        _slice_update(task_id, status="completed", finished_at=time.time(),
+                       sha256=sha, size_bytes=os.path.getsize(dst))
+    except subprocess.TimeoutExpired:
+        _slice_update(task_id, status="failed", finished_at=time.time(),
+                       error="partial_gguf timed out after 3600s")
+    except Exception as e:
+        _slice_update(task_id, status="failed", finished_at=time.time(),
+                       error=f"slice worker crashed: {e}")
+
 
 def detect_gpus() -> list:
     """Best-effort enumeration of physical GPUs on the host (iGPU + dGPU).
@@ -717,6 +842,21 @@ class FileServerHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
 
+        if self.path.startswith("/slice/"):
+            task_id = self.path[len("/slice/"):]
+            snap = _slice_task_snapshot(task_id)
+            if not snap:
+                self.send_error(404, "task not found")
+                return
+            body = json.dumps(snap).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
         if not self.path.startswith("/file/"):
             self.send_error(404, "not found")
             return
@@ -774,6 +914,91 @@ class FileServerHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
+    def do_POST(self):
+        if self.path != "/slice":
+            self.send_error(404, "not found")
+            return
+        if not _PARTIAL_GGUF_PATH or not os.path.isfile(_PARTIAL_GGUF_PATH):
+            self.send_error(503, "slicer not configured on this worker")
+            return
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        if length <= 0 or length > 64 * 1024:
+            self.send_error(400, "body required (<= 64KB)")
+            return
+        try:
+            body = json.loads(self.rfile.read(length))
+        except Exception as e:
+            self.send_error(400, f"bad json: {e}")
+            return
+
+        model_id = (body.get("model_id") or "").strip()
+        full_gguf_path = (body.get("full_gguf_path") or "").strip()
+        try:
+            layer_start = int(body.get("layer_start"))
+            layer_end = int(body.get("layer_end"))
+        except (TypeError, ValueError):
+            self.send_error(400, "layer_start and layer_end must be integers")
+            return
+        force_keep_token_embd = bool(body.get("force_keep_token_embd", False))
+        force_keep_output = bool(body.get("force_keep_output", False))
+
+        if not model_id:
+            self.send_error(400, "model_id required")
+            return
+        if not full_gguf_path or not os.path.isfile(full_gguf_path):
+            self.send_error(400, f"full_gguf_path not found: {full_gguf_path!r}")
+            return
+        if layer_end <= layer_start or layer_start < 0:
+            self.send_error(400, "layer_end must be > layer_start >= 0")
+            return
+
+        output_filename = _slice_output_filename(model_id, layer_start, layer_end)
+        output_path = os.path.join(_FILE_SERVER_DIR, output_filename)
+        task_id = uuid.uuid4().hex
+        with _SLICE_LOCK:
+            # Cheap ring-buffer: drop oldest COMPLETED/FAILED if we're at cap.
+            # Never drop a running task.
+            if len(_SLICE_TASKS) >= _SLICE_MAX_HISTORY:
+                terminal = [
+                    (tid, t) for tid, t in _SLICE_TASKS.items()
+                    if t["status"] in ("completed", "failed")
+                ]
+                if terminal:
+                    terminal.sort(key=lambda kv: kv[1].get("finished_at") or 0.0)
+                    del _SLICE_TASKS[terminal[0][0]]
+            _SLICE_TASKS[task_id] = {
+                "status": "running",
+                "model_id": model_id,
+                "layer_start": layer_start,
+                "layer_end": layer_end,
+                "output_filename": output_filename,
+                "output_path": output_path,
+                "started_at": time.time(),
+                "finished_at": None,
+                "sha256": None,
+                "size_bytes": None,
+                "error": None,
+            }
+        threading.Thread(
+            target=_run_slice_task,
+            args=(task_id, model_id, full_gguf_path, output_path,
+                  layer_start, layer_end, force_keep_token_embd, force_keep_output),
+            daemon=True,
+        ).start()
+
+        resp = json.dumps({
+            "task_id": task_id,
+            "status": "running",
+            "output_filename": output_filename,
+            "poll_url": f"/slice/{task_id}",
+        }).encode("utf-8")
+        self.send_response(202)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(resp)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(resp)
+
 
 class _ThreadingHTTPServer(HTTPServer):
     """Allow multiple concurrent fetches (without this, parallel byte-range
@@ -795,12 +1020,25 @@ class _ThreadingHTTPServer(HTTPServer):
 
 
 def start_file_server(serving_dir: str, port: int):
-    """Start the Phase-4 file server in a background thread."""
-    global _FILE_SERVER_DIR
+    """Start the Phase-4 file server in a background thread.
+
+    Also resolves _PARTIAL_GGUF_PATH so POST /slice has a slicer to invoke.
+    Override via env var NAKSHATRA_PARTIAL_GGUF; default: discover relative
+    to this script at ../experiments/v0.0/partial_gguf.py.
+    """
+    global _FILE_SERVER_DIR, _PARTIAL_GGUF_PATH
     _FILE_SERVER_DIR = str(Path(serving_dir).resolve())
+    env_path = os.environ.get("NAKSHATRA_PARTIAL_GGUF", "").strip()
+    if env_path:
+        _PARTIAL_GGUF_PATH = str(Path(env_path).resolve())
+    else:
+        default_path = Path(__file__).resolve().parent.parent / "experiments" / "v0.0" / "partial_gguf.py"
+        _PARTIAL_GGUF_PATH = str(default_path) if default_path.is_file() else ""
     server = _ThreadingHTTPServer(("0.0.0.0", port), FileServerHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
+    slicer_status = _PARTIAL_GGUF_PATH or "DISABLED (partial_gguf.py not found)"
     print(f"[fileserver] listening on :{port}, serving from {_FILE_SERVER_DIR}", flush=True)
+    print(f"[fileserver] slicer: {slicer_status}", flush=True)
 
 
 def fetch_sub_gguf_from_peer(pillar_url: str, model_id: str,
