@@ -1,6 +1,22 @@
 #!/usr/bin/env bash
 # Start the 5-worker Nakshatra cluster (matches scripts/cluster_5worker.yaml).
 #
+# This is the *manual* bring-up path. You pre-cut sub-GGUFs with
+# partial_gguf.py, scp them to each worker's /tmp/, then this script
+# launches the workers in parallel.
+#
+# Alternative (Sthambha planner, shipped 2026-05-14):
+#   sthambha-cli plan create --model <id> --num-layers N --model-bytes <bytes> --hub <peer>
+#   sthambha-cli plan execute <plan_id> --wait-cached
+# That path queries the live pillar registry, picks a vendor-grouped chain,
+# runs partial_gguf.py on a designated hub peer via POST /slice on the
+# worker's file-server port, and lets Phase-4 auto-fetch distribute slices
+# to recipient workers. Reach for the YAML flow when you want a
+# deterministic, fixed cluster shape (drift testing, regression repro,
+# Nakshatra-engine debugging); for everything else the planner removes
+# the hand-edited config + scp step. Full split in
+# ~/sthambha/docs/layer-split-planner.md §10.
+#
 # Pre-requisite on the Linux home PC (one-time, no sudo needed):
 #   loginctl enable-linger prithvi
 # Without lingering, systemd-logind kills user processes when the SSH
