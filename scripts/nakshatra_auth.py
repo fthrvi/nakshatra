@@ -174,6 +174,11 @@ def build_pillar_ssl_context(
 ) -> ssl.SSLContext:
     """Build a TLS client context for pillar HTTPS connections.
 
+    Phase I2 (2026-05-19): TLS 1.3 minimum by default. Workers running
+    against legacy pillars can opt in to TLS 1.2 via
+    STHAMBHA_TLS_ALLOW_1_2=true; the pillar must have the matching opt-
+    in for the handshake to succeed.
+
     When ``expected_spki_hash`` is provided, the caller MUST follow the
     HTTPS handshake with ``verify_pillar_cert_spki(ssock.getpeercert(
     binary_form=True), expected_spki_hash)``. This context turns off
@@ -185,7 +190,13 @@ def build_pillar_ssl_context(
     self-signed certs through but provides no identity check — useful
     for development. The worker should WARN in this mode.
     """
+    import os
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    if os.environ.get("STHAMBHA_TLS_ALLOW_1_2", "").strip().lower() in (
+            "true", "1", "yes"):
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    else:
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_3
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
     return ctx

@@ -27,6 +27,7 @@ inside a Linux VM / Docker Desktop to get Mode-C compliance.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import platform
@@ -479,6 +480,59 @@ def validate_against_runtime(spec: dict,
 
 # ── Compliance summary for the /peer body (G5 hook) ──────────────────
 
+# Phase I8: soft remote attestation. Worker computes a hash of its
+# observed runtime fingerprint (cgroup state, seccomp mode, capability
+# set, namespace inodes, container marker) and signs H(nonce || fingerprint)
+# with its Ed25519 key. The whole /peer body is already signed at the
+# auth layer; this is an INNER attestation binding the worker's identity
+# to its claimed runtime. Not TPM-grade — an attacker who patched the
+# worker can lie about the fingerprint. The protocol shape is forward-
+# compatible with hardware attestation (drop in a TPM-quote signer to
+# replace the Ed25519 path).
+
+def build_runtime_fingerprint_hash(facts: Optional[RuntimeFacts] = None) -> str:
+    """Hash a stable representation of the worker's runtime. Same
+    inputs produce the same hash, so operators can compare across
+    reboots to detect drift (the attestation log on the pillar records
+    each observation and audit-flags fingerprint changes)."""
+    if facts is None:
+        facts = collect_runtime_facts()
+    canonical = "|".join((
+        f"os={facts.os_kernel}",
+        f"in_container={facts.in_container}",
+        f"runtime={facts.container_runtime}",
+        f"cpu_limit={facts.cpu_threads_limit}",
+        f"ram_limit_gb={facts.ram_limit_gb}",
+        f"seccomp={facts.seccomp_mode}",
+        f"ptrace={facts.can_ptrace}",
+        f"netns={facts.network_namespaced}",
+    ))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def build_attestation_blob(nonce_hex: str,
+                            facts: Optional[RuntimeFacts] = None
+                            ) -> dict:
+    """The ``attestation`` field the worker includes in /peer body.
+    nonce_hex was issued by the pillar on the previous /peer response;
+    on first contact it's empty (the pillar accepts an empty nonce as
+    "no attestation yet" and returns a fresh nonce the worker uses on
+    the next heartbeat)."""
+    return {
+        "nonce_hex": nonce_hex or "",
+        "fingerprint_hash": build_runtime_fingerprint_hash(facts),
+    }
+
+
+# Phase I5: report version on the wire shape. Bump when adding fields
+# the pillar's Phase-G planner gate cannot ignore (the gate today reads
+# is_mode_c_compliant only; any future filter additions go through a
+# version-aware codepath). Workers always emit the current version;
+# pillars accept any version they recognize and treat unknown versions
+# as "report present but undecodable" → same effect as legacy empty.
+REPORT_VERSION = 1
+
+
 def compliance_summary_for_peer_body(report: SandboxComplianceReport) -> dict:
     """The compact summary the worker includes in /peer registration
     so the pillar can surface ``sandbox_compliance`` on PeerStatus.
@@ -486,11 +540,16 @@ def compliance_summary_for_peer_body(report: SandboxComplianceReport) -> dict:
 
     We deliberately don't include the full per-field detail in /peer
     bodies — that would balloon every heartbeat. Operators query the
-    worker directly (or check its logs) for the verbose report."""
+    worker directly (or check its logs) for the verbose report.
+
+    Phase I5: includes ``report_version: int`` so future shape evolution
+    is detectable. Pillars treat unknown versions as legacy-equivalent.
+    """
     non_compliant_fields = [
         c.field_name for c in report.checks if c.status == "non_compliant"
     ]
     return {
+        "report_version": REPORT_VERSION,
         "is_mode_c_compliant": report.is_mode_c_compliant(),
         "is_fully_compliant": report.is_fully_compliant,
         "non_compliant_fields": non_compliant_fields,

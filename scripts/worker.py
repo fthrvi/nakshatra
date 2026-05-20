@@ -540,6 +540,13 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
             return
 
 
+# Phase I8: persistent nonce slot for soft-attestation. Pillar issues a
+# fresh nonce in each /peer response; we stash it here so the next
+# heartbeat includes the matching signed attestation. Empty string on
+# first contact — pillar accepts and returns a starter nonce.
+_attestation_nonce: str = ""
+
+
 def register_with_pillar(pillar_url: str, payload: dict, log_prefix: str = "[worker]",
                           priv_key: Optional[bytes] = None,
                           node_id: Optional[str] = None,
@@ -553,7 +560,20 @@ def register_with_pillar(pillar_url: str, payload: dict, log_prefix: str = "[wor
 
     Phase F3: when ``spki_hash`` is provided and the URL is HTTPS, the
     pillar's TLS cert SPKI is verified against it. Mismatch → refusal.
+
+    Phase I8: includes a soft-attestation blob bound to the pillar-issued
+    nonce. Pillar audits hash changes across observations.
     """
+    global _attestation_nonce
+    # Phase I8: build the attestation blob if the sandbox module is
+    # available. nonce_hex is empty on first contact; pillar tolerates.
+    if _SANDBOX_AVAILABLE:
+        try:
+            payload = dict(payload)  # don't mutate caller's dict
+            payload["attestation"] = _wsandbox.build_attestation_blob(
+                _attestation_nonce)
+        except Exception as e:
+            print(f"{log_prefix} attestation build failed: {e}", flush=True)
     body_bytes = json.dumps(payload).encode()
     path = "/peer"
     headers = {"Content-Type": "application/json"}
@@ -590,6 +610,15 @@ def register_with_pillar(pillar_url: str, payload: dict, log_prefix: str = "[wor
                         print(f"{log_prefix} REFUSED: {e}", flush=True)
                         return False
             body = resp.read().decode()
+            # Phase I8: stash the fresh nonce for the next heartbeat.
+            try:
+                parsed = json.loads(body)
+                if isinstance(parsed, dict):
+                    new_nonce = str(parsed.get("attestation_nonce_hex", ""))
+                    if new_nonce:
+                        _attestation_nonce = new_nonce
+            except json.JSONDecodeError:
+                pass
             print(f"{log_prefix} registered with pillar: {body}", flush=True)
             return True
     except (urlerror.URLError, OSError, TimeoutError) as e:
