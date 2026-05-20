@@ -510,6 +510,13 @@ def build_runtime_fingerprint_hash(facts: Optional[RuntimeFacts] = None) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+# Phase J2: attestation blob shape version. Bump when adding fields the
+# pillar can't safely ignore (e.g. a future TEE-quote bytes alongside
+# the fingerprint hash). Pillar accepts known versions and audits
+# unknown versions for visibility — see observe_attestation.
+ATTESTATION_VERSION = 1
+
+
 def build_attestation_blob(nonce_hex: str,
                             facts: Optional[RuntimeFacts] = None
                             ) -> dict:
@@ -517,8 +524,13 @@ def build_attestation_blob(nonce_hex: str,
     nonce_hex was issued by the pillar on the previous /peer response;
     on first contact it's empty (the pillar accepts an empty nonce as
     "no attestation yet" and returns a fresh nonce the worker uses on
-    the next heartbeat)."""
+    the next heartbeat).
+
+    Phase J2: ``attestation_version`` lets the pillar tell post-J2
+    workers apart from pre-J2 (legacy implicit-v0). Future TEE quote
+    extensions bump the version."""
     return {
+        "attestation_version": ATTESTATION_VERSION,
         "nonce_hex": nonce_hex or "",
         "fingerprint_hash": build_runtime_fingerprint_hash(facts),
     }

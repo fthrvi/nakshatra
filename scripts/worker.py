@@ -611,12 +611,27 @@ def register_with_pillar(pillar_url: str, payload: dict, log_prefix: str = "[wor
                         return False
             body = resp.read().decode()
             # Phase I8: stash the fresh nonce for the next heartbeat.
+            # Phase J1: when we SENT an attestation but the pillar
+            # didn't observe it (nonce stale, fingerprint malformed),
+            # WARN loudly so operators see the silent-broken state
+            # rather than relying on attestation that doesn't actually
+            # work.
             try:
                 parsed = json.loads(body)
                 if isinstance(parsed, dict):
                     new_nonce = str(parsed.get("attestation_nonce_hex", ""))
                     if new_nonce:
                         _attestation_nonce = new_nonce
+                    observed = parsed.get("attestation_observed", None)
+                    sent_attestation = "attestation" in payload
+                    if sent_attestation and observed is False:
+                        print(f"{log_prefix} WARN: pillar did not observe "
+                              f"our attestation. Likely stale nonce "
+                              f"(retry next heartbeat) or fingerprint "
+                              f"malformed. Pillar audit log records "
+                              f"attestation_nonce_mismatch or "
+                              f"attestation_fingerprint_too_long.",
+                              flush=True)
             except json.JSONDecodeError:
                 pass
             print(f"{log_prefix} registered with pillar: {body}", flush=True)
