@@ -1,7 +1,7 @@
 # Nakshatra worker threat model
 
 **Status:** Living document, updated as phases ship.
-**Last updated:** 2026-05-20 (Phase C shipped — HTTP tier model + path sanitization + operator key).
+**Last updated:** 2026-05-20 (Phase D shipped — strict-type sweep + audit log + heartbeat backoff).
 
 This file is the worker-side companion to `sthambha/docs/THREAT_MODEL.md`.
 Sthambha's threat model covers the pillar (control plane); this one covers
@@ -79,14 +79,15 @@ identify audit gaps the plan addresses.
 | Worker happily starts unsigned by default; only WARNs | `STHAMBHA_REFUSE_UNSIGNED=true` + pillar URL set + no key → exit 2 via `should_refuse_unsigned_startup` | **A5** (2026-05-20) |
 | `recent_rpc_ms` can contain NaN/Inf if clock skews backwards | `safe_rpc_ms` (`math.isfinite` + negative reject) at both append (DaemonClient.call) and emit (heartbeat_loop) sites | **A6** (2026-05-20) |
 | Pillar omits `model_sha256` from `/files`; worker fetches without verification | `should_refuse_unverified_fetch` filters candidates lacking `model_sha256`; default true; `STHAMBHA_REFUSE_UNVERIFIED_FETCH=false` opts out for Mode A/B | **A7** (2026-05-20) |
-| `/slice` body `force_keep_token_embd = bool(value)` — lenient bool coercion (same shape as L4 on Sthambha side) | PENDING — `as_strict_bool` helper | D |
+| `/slice` body `force_keep_token_embd = bool(value)` — lenient bool coercion (same shape as L4 on Sthambha side) | `as_strict_bool` accepts only literal True/False; "false" string → False (default) | **D2** (2026-05-20) |
 | `/slice` `full_gguf_path` accepts arbitrary paths (`/etc/passwd` probe via subprocess error messages) | `validate_slice_path` resolves symlinks, refuses paths outside `NAKSHATRA_SLICE_ROOT` (default = file-server dir), refuses NUL + dangerous Unicode (bidi/zero-width/Math-Alphanumeric/BOM/variation-selectors/C0/C1 ranges; mirror Sthambha L2/M3) | **C4** (2026-05-20) |
-| No audit log for slice spawns, register events, fetch attempts | PENDING — `~/.nakshatra/audit.jsonl` | D |
-| Heartbeat thread blocks 5s on each `urlopen`; no backoff on repeated failures | PENDING — exponential backoff + jitter | D |
-| `attestation_nonce_hex` from pillar accepted as `str(...)` — unbounded, non-hex | PENDING — strict hex validation, length cap | D |
-| `_attestation_nonce` echoed back blindly in next signed envelope | PENDING — re-validate before send | D |
-| `step.prefix_length` from gRPC accepted without bounds check | PENDING — `as_safe_int` helper at parse boundary | D |
-| `step.next_server.address` / `step.chain[].address` unbounded length | PENDING — 256-byte cap (mirror Sthambha O3) | D |
+| No audit log for slice spawns, register events, fetch attempts | `nakshatra_audit.AuditLogger` at `~/.nakshatra/audit.jsonl`; events: `worker_started`, `slice_spawned`/`_completed`/`_failed`, `register_success`/`_failed`, `attestation_observed_false`, `fetch_started`/`_completed`/`_failed`, `auth_failure_grpc`, `auth_failure_http`. Size-bounded rotation at 256 MiB to `audit.jsonl.1`. | **D5** (2026-05-20) |
+| Heartbeat thread blocks 5s on each `urlopen`; no backoff on repeated failures | Exponential backoff via `_next_heartbeat_interval`: 30s base, doubles per consecutive failure, cap 600s, ±25% jitter. Resets on success. | **D6** (2026-05-20) |
+| `attestation_nonce_hex` from pillar accepted as `str(...)` — unbounded, non-hex | `as_bounded_hex(value, max_chars=64)` in `register_with_pillar`: non-hex / oversized / non-string → empty string (don't echo back) | **D4** (2026-05-20) |
+| `_attestation_nonce` echoed back blindly in next signed envelope | Closed at ingest by D4 above — only validated-hex values are stored as `_attestation_nonce` | **D4** (2026-05-20) |
+| `step.prefix_length` from gRPC accepted without bounds check | `as_safe_int(value, lo=0, hi=1<<20)` clamps prefix_length before passing to daemon | **D3** (2026-05-20) |
+| `step.next_server.address` / `step.chain[].address` unbounded length | `as_bounded_str(addr, 256)` at parse layer; oversized → empty (push step elided) | **D3** (2026-05-20) |
+| Auth-failure events flood the audit log under recon storm | `(event, ip, reason)` LRU dedup window (60s default, 8192 entries cap). Repeat failures suppressed in file but counted in `dedup_suppressed` stat. Mirror Sthambha L1. | **D7** (2026-05-20) |
 | `/healthz` discloses GPU model, RAM, idem cache stats, push stats, latency averages → fingerprinting + latency side-channel | `/healthz` anonymous minimal body (`status`, `mode`, `layer_start/end`, `uptime_seconds`, `protocol_version`). Verbose body moves to `/healthz/full` behind AUTHENTICATED tier. | **C5** (2026-05-20) |
 
 ## What's NOT defended
@@ -175,6 +176,7 @@ Phases A-D are planned in `~/trisul/plans/2026-05-20-nakshatra-worker-hardening-
 - **Phase B-auth (2026-05-20)** — gRPC Ed25519 verification + SSRF defense. New module `scripts/nakshatra_grpc_auth.py`: `verify_grpc_call`, `build_grpc_auth_header`, `parse_auth_header`, `resolve_auth_required`, `PillarPeerKeyResolver` (background-refreshed cache of pillar's `/peers` projection; stale-deadline 5min). `WorkerServicer` wires auth check on `Forward` (unary) + `Inference` first-frame (streaming); SSRF check on push to `chain[].address`. New envs: `NAKSHATRA_AUTH_REQUIRED` (default secure when pillar configured), `NAKSHATRA_REFUSE_UNREGISTERED_PEERS` (default true), `NAKSHATRA_PEER_REFRESH_INTERVAL` (default 60s). Canonical-string method tokens `POST` (unary) / `STREAM` (streaming) prevent HTTP↔gRPC and stream↔unary signature replay. Cross-repo wire-contract test confirms byte-identical signatures with `nakshatra_auth.sign_request`. 29 new tests added; 95 total worker-side tests passing.
 - **Phase B-tls (deferred)** — TLS on the gRPC server + cross-worker SPKI pinning. Out of scope for the auth-core ship; gRPC auth is the substantive Mode-C close. TLS adds defense-in-depth against on-path attackers who can still spoof a peer address (within the SSRF allowlist) — material once Sthambha's `/peers` projection exposes `peer_spki_hash` (B-spki, also deferred).
 - **Phase C (2026-05-20)** — HTTP file-server tier model + path sanitization + operator-key handling. Three tiers (`TIER_ANONYMOUS`, `TIER_AUTHENTICATED`, `TIER_OPERATOR`); `_check_tier` middleware on `FileServerHandler`; `/healthz` minimal/full split; `validate_slice_path` root-bounds + Unicode-safe; operator pubkey loaded from `~/.nakshatra/keys/operator.pub.hex`. 29 new tests added; 124 total worker-side tests passing.
+- **Phase D (2026-05-20)** — strict-type sweep + audit log + heartbeat backoff. New modules: `scripts/nakshatra_validation.py` (`as_strict_bool`, `as_safe_int`, `as_safe_float`, `as_str_enum`, `as_bounded_hex`, `as_bounded_str`, `as_str_list` — mirror Sthambha N helpers), `scripts/nakshatra_audit.py` (append-only JSONL, 256 MiB rotation, `(event, ip, reason)` 60s dedup window). Wired at /slice body parse (D2), Inference step parse (D3), pillar response parse (D4). Audit events emitted at worker start, slice lifecycle, register, fetch, auth failures. Heartbeat exponential backoff 30s→600s with ±25% jitter (D6). 50 new tests added; 174 total worker-side tests passing.
 
 ## Operator-key install
 

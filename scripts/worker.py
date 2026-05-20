@@ -77,6 +77,33 @@ except ImportError as _e:
     _GRPC_AUTH_AVAILABLE = False
     _GRPC_AUTH_IMPORT_ERR = _e
 
+# Phase D (worker hardening sprint, 2026-05-20): strict-type helpers +
+# audit log. Failure-soft so degraded bringup still works.
+try:
+    import nakshatra_validation as _wval
+    _VALIDATION_AVAILABLE = True
+except ImportError as _e:
+    _VALIDATION_AVAILABLE = False
+    _VALIDATION_IMPORT_ERR = _e
+
+try:
+    import nakshatra_audit as _waudit
+    _AUDIT_AVAILABLE = True
+except ImportError as _e:
+    _AUDIT_AVAILABLE = False
+    _AUDIT_IMPORT_ERR = _e
+
+
+def _audit(event: str, **payload):
+    """Phase D5 — fire-and-forget audit log emission. No-op when the
+    audit module isn't importable. Centralised here so callers don't
+    have to guard each call site."""
+    if _AUDIT_AVAILABLE:
+        try:
+            _waudit.audit(event, **payload)
+        except Exception:
+            pass  # never let audit failure crash the worker
+
 
 CMD_TOKEN_DECODE = 1
 CMD_EMBD_DECODE  = 2
@@ -755,6 +782,13 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
             return keyid
         except _wgrpcauth.AuthError as e:
             self._authz_rejections += 1
+            peer = "?"
+            try:
+                peer = context.peer()
+            except Exception:
+                pass
+            _audit("auth_failure_grpc", ip=peer, reason=str(e),
+                   method_path=method_path, is_streaming=is_streaming)
             context.abort(
                 grpc.StatusCode.UNAUTHENTICATED, f"authz failed: {e}"
             )
@@ -898,9 +932,19 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
 
                 flags = 0x0 if first_step else 0x1
                 first_step = False
+                # Phase D3 (2026-05-20): bound prefix_length. Proto
+                # already enforces int type, but unbounded value
+                # propagates to the daemon which may panic or wedge.
+                # n_ctx is the worker's context cap; clamp to it.
+                if _VALIDATION_AVAILABLE:
+                    bounded_prefix = _wval.as_safe_int(
+                        step.prefix_length, default=0, lo=0, hi=1 << 20
+                    )
+                else:
+                    bounded_prefix = max(0, min(int(step.prefix_length), 1 << 20))
                 status, resp = self.daemon.call(
                     cmd, n_tokens, input_bytes,
-                    start_pos=int(step.prefix_length), flags=flags,
+                    start_pos=bounded_prefix, flags=flags,
                 )
                 if status != 0 or len(resp) < 4:
                     yield pb.InferenceStep(
@@ -936,12 +980,26 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                 next_addr = ""
                 next_session = ""
                 remaining_chain = []
+                # Phase D3 (2026-05-20): address-length cap (256 bytes).
+                # Without this, unbounded address strings can balloon
+                # _peer_streams (already LRU-capped per A3, but the
+                # individual entry size also matters). Mirror Sthambha
+                # O3 MAX_PEER_ADDRESS_BYTES.
+                _ADDR_MAX = 256
                 if step.chain:
-                    next_addr = step.chain[0].address
+                    raw_addr = step.chain[0].address
+                    if _VALIDATION_AVAILABLE:
+                        next_addr = _wval.as_bounded_str(raw_addr, _ADDR_MAX, default="")
+                    else:
+                        next_addr = raw_addr if len(raw_addr.encode()) <= _ADDR_MAX else ""
                     next_session = step.chain[0].session_id
                     remaining_chain = list(step.chain[1:])
                 elif step.next_server.address:
-                    next_addr = step.next_server.address
+                    raw_addr = step.next_server.address
+                    if _VALIDATION_AVAILABLE:
+                        next_addr = _wval.as_bounded_str(raw_addr, _ADDR_MAX, default="")
+                    else:
+                        next_addr = raw_addr if len(raw_addr.encode()) <= _ADDR_MAX else ""
                     next_session = step.next_server.session_id
                 if next_addr and self.mode != "last":
                     # Phase B5 (2026-05-20): SSRF defense. Worker pushes
@@ -1121,7 +1179,20 @@ def register_with_pillar(pillar_url: str, payload: dict, log_prefix: str = "[wor
             try:
                 parsed = json.loads(body)
                 if isinstance(parsed, dict):
-                    new_nonce = str(parsed.get("attestation_nonce_hex", ""))
+                    # Phase D4 (2026-05-20): strict-hex + length cap on
+                    # the pillar-supplied nonce. A malicious pillar
+                    # could send a non-hex or oversized blob; we echo
+                    # this back in the next signed envelope, so
+                    # bound-validate at ingest.
+                    raw_nonce = parsed.get("attestation_nonce_hex", "")
+                    if _VALIDATION_AVAILABLE:
+                        new_nonce = _wval.as_bounded_hex(
+                            raw_nonce, max_chars=64, default=""
+                        )
+                    else:
+                        new_nonce = str(raw_nonce) if isinstance(raw_nonce, str) else ""
+                        if len(new_nonce) > 64:
+                            new_nonce = ""
                     if new_nonce:
                         _attestation_nonce = new_nonce
                     observed = parsed.get("attestation_observed", None)
@@ -1134,13 +1205,46 @@ def register_with_pillar(pillar_url: str, payload: dict, log_prefix: str = "[wor
                               f"attestation_nonce_mismatch or "
                               f"attestation_fingerprint_too_long.",
                               flush=True)
+                        _audit("attestation_observed_false",
+                               url=pillar_url, log_prefix=log_prefix)
             except json.JSONDecodeError:
                 pass
             print(f"{log_prefix} registered with pillar: {body}", flush=True)
+            _audit("register_success", url=pillar_url, log_prefix=log_prefix)
             return True
     except (urlerror.URLError, OSError, TimeoutError) as e:
         print(f"{log_prefix} pillar registration failed ({pillar_url}): {e}", flush=True)
+        _audit("register_failed", url=pillar_url, error=str(e),
+               log_prefix=log_prefix)
         return False
+
+
+HEARTBEAT_INITIAL_INTERVAL_S = 30.0
+HEARTBEAT_MAX_INTERVAL_S = 600.0   # 10 minutes
+HEARTBEAT_BACKOFF_FACTOR = 2.0
+HEARTBEAT_JITTER_FRACTION = 0.25  # ±25%
+
+
+def _next_heartbeat_interval(
+    base: float, consecutive_failures: int, *, rng=None,
+) -> float:
+    """Phase D6 (2026-05-20) — exponential backoff + jitter.
+
+    On consecutive_failures=0, returns base (no backoff).
+    On N failures, returns min(base * factor^N, MAX) with ±25% jitter.
+    Pure function so the tests can pin rng to verify the formula.
+    """
+    import random
+    rng = rng or random
+    if consecutive_failures <= 0:
+        delay = base
+    else:
+        delay = min(
+            base * (HEARTBEAT_BACKOFF_FACTOR ** consecutive_failures),
+            HEARTBEAT_MAX_INTERVAL_S,
+        )
+    jitter = 1.0 + (rng.random() * 2 - 1) * HEARTBEAT_JITTER_FRACTION
+    return max(1.0, delay * jitter)
 
 
 def heartbeat_loop(pillar_url: str, payload: dict, interval: float = 30.0,
@@ -1161,10 +1265,20 @@ def heartbeat_loop(pillar_url: str, payload: dict, interval: float = 30.0,
     pinned. Heartbeat payloads omit ``public_key_hex`` after the first
     successful registration — the pillar's TOFU lock already remembers
     the key.
+
+    Phase D6 (2026-05-20): exponential backoff on repeated failures.
+    Successful heartbeats reset the counter; the loop converges on
+    ``interval`` when the pillar is healthy. With a pillar in outage
+    the worker stops hammering: 30s → 60s → 120s → ... up to 600s.
+    Jitter ±25% staggers re-attempts across a cluster restart.
     """
     stop_event = stop_event or threading.Event()
+    consecutive_failures = 0
     while not stop_event.is_set():
-        if stop_event.wait(timeout=interval):
+        next_interval = _next_heartbeat_interval(
+            interval, consecutive_failures
+        )
+        if stop_event.wait(timeout=next_interval):
             break
         if daemon_for_timing is not None and daemon_for_timing.recent_rpc_ms:
             avg = sum(daemon_for_timing.recent_rpc_ms) / len(daemon_for_timing.recent_rpc_ms)
@@ -1173,9 +1287,14 @@ def heartbeat_loop(pillar_url: str, payload: dict, interval: float = 30.0,
             avg_clean = safe_rpc_ms(avg)
             if avg_clean is not None:
                 payload["recent_rpc_ms"] = avg_clean
-        register_with_pillar(pillar_url, payload, log_prefix="[heartbeat]",
-                              priv_key=priv_key, node_id=node_id,
-                              spki_hash=spki_hash)
+        ok = register_with_pillar(
+            pillar_url, payload, log_prefix="[heartbeat]",
+            priv_key=priv_key, node_id=node_id, spki_hash=spki_hash,
+        )
+        if ok:
+            consecutive_failures = 0
+        else:
+            consecutive_failures += 1
 
 
 _FILE_SERVER_DIR = ""
@@ -1269,6 +1388,9 @@ def _run_slice_task(task_id: str, model_id: str, src: str, dst: str,
                     layer_start: int, layer_end: int,
                     force_keep_token_embd: bool, force_keep_output: bool):
     """Worker thread body. Runs partial_gguf.py and updates the registry."""
+    _audit("slice_spawned", task_id=task_id, model_id=model_id,
+           src=src, dst=dst,
+           layer_start=layer_start, layer_end=layer_end)
     try:
         cmd = [
             sys.executable, _PARTIAL_GGUF_PATH, src, dst,
@@ -1300,12 +1422,17 @@ def _run_slice_task(task_id: str, model_id: str, src: str, dst: str,
             pass
         _slice_update(task_id, status="completed", finished_at=time.time(),
                        sha256=sha, size_bytes=os.path.getsize(dst))
+        _audit("slice_completed", task_id=task_id, sha256=sha,
+               size_bytes=os.path.getsize(dst))
     except subprocess.TimeoutExpired:
         _slice_update(task_id, status="failed", finished_at=time.time(),
                        error=f"partial_gguf timed out after {SLICE_SUBPROCESS_TIMEOUT_S}s")
+        _audit("slice_failed", task_id=task_id, error="timeout",
+               timeout_s=SLICE_SUBPROCESS_TIMEOUT_S)
     except Exception as e:
         _slice_update(task_id, status="failed", finished_at=time.time(),
                        error=f"slice worker crashed: {e}")
+        _audit("slice_failed", task_id=task_id, error=str(e))
 
 
 def detect_gpus() -> list:
@@ -1450,6 +1577,9 @@ class FileServerHandler(BaseHTTPRequestHandler):
             return True
         except ValueError as e:
             status = 401 if tier == TIER_AUTHENTICATED else 403
+            ip = self.client_address[0] if self.client_address else "?"
+            _audit("auth_failure_http", ip=ip, reason=str(e),
+                   tier=tier, method=self.command, path=self.path)
             self.send_error(status, f"{tier}: {e}")
             return False
 
@@ -1648,8 +1778,19 @@ class FileServerHandler(BaseHTTPRequestHandler):
         except (TypeError, ValueError):
             self.send_error(400, "layer_start and layer_end must be integers")
             return
-        force_keep_token_embd = bool(body.get("force_keep_token_embd", False))
-        force_keep_output = bool(body.get("force_keep_output", False))
+        # Phase D2 (2026-05-20): strict-bool. `bool("false")` is truthy
+        # so the prior coercion silently treated "false" as True. The
+        # strict helper accepts only literal True/False.
+        if _VALIDATION_AVAILABLE:
+            force_keep_token_embd = _wval.as_strict_bool(
+                body.get("force_keep_token_embd"), default=False
+            )
+            force_keep_output = _wval.as_strict_bool(
+                body.get("force_keep_output"), default=False
+            )
+        else:
+            force_keep_token_embd = body.get("force_keep_token_embd") is True
+            force_keep_output = body.get("force_keep_output") is True
 
         if not model_id:
             self.send_error(400, "model_id required")
@@ -1781,6 +1922,9 @@ def fetch_sub_gguf_from_peer(pillar_url: str, model_id: str,
     from yourself). Retries the next candidate on connection failure
     so a stale-but-still-listed peer doesn't block the bootstrap.
     """
+    _audit("fetch_started", model_id=model_id,
+           layer_start=layer_start, layer_end=layer_end,
+           dest_path=dest_path)
     # 1. Ask the pillar for the file index
     files_url = f"{pillar_url.rstrip('/')}/files?model={model_id}"
     try:
@@ -1881,8 +2025,14 @@ def fetch_sub_gguf_from_peer(pillar_url: str, model_id: str,
         elapsed = time.time() - t0
         print(f"[fetch] saved {dest_path} ({bytes_received:,} bytes, sha={actual_sha[:12]}..., "
               f"{elapsed:.1f}s, {(bytes_received/1e6)/max(elapsed,0.001):.1f} MB/s) from {chosen.get('node_id')}", flush=True)
+        _audit("fetch_completed", dest=dest_path, bytes_received=bytes_received,
+               sha=actual_sha, elapsed_s=round(elapsed, 2),
+               source_node_id=chosen.get("node_id"))
         return dest_path
 
+    _audit("fetch_failed", model_id=model_id,
+           layer_start=layer_start, layer_end=layer_end,
+           last_error=last_error)
     raise RuntimeError(f"all {len(candidates)} candidate peers failed; last error: {last_error}")
 
 
@@ -2141,6 +2291,21 @@ def main():
     ap.add_argument("--idempotency-cache-ttl", type=float, default=60.0,
                     help="Idempotency cache per-session TTL in seconds (default 60).")
     args = ap.parse_args()
+
+    # Phase D5 (2026-05-20): initialise the audit log singleton early so
+    # every event in main() (start, fetch, slice, register, auth fail)
+    # has a place to land. Failure-soft: missing directory or permission
+    # error leaves the worker running without forensic trail.
+    if _AUDIT_AVAILABLE:
+        try:
+            _waudit.init_audit()
+            _audit("worker_started",
+                   model_id=args.model_id, mode=args.mode,
+                   layer_start=args.layer_start, layer_end=args.layer_end,
+                   port=args.port, pillar_url=args.pillar_url)
+        except Exception as e:
+            print(f"[worker] audit init failed (continuing without forensic log): {e}",
+                  flush=True)
 
     # Phase 4: if sub-GGUF is missing AND we have a pillar to ask, fetch it
     # before doing anything else. This is what lets a fresh machine bootstrap
