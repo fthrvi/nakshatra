@@ -67,6 +67,16 @@ except ImportError as _e:
     _SANDBOX_AVAILABLE = False
     _SANDBOX_IMPORT_ERR = _e
 
+# Phase B (worker hardening sprint, 2026-05-20): gRPC Ed25519 auth +
+# SSRF defense via pillar's /peers projection. Failure-soft import so
+# the worker can still start in legacy Mode A without the module.
+try:
+    import nakshatra_grpc_auth as _wgrpcauth
+    _GRPC_AUTH_AVAILABLE = True
+except ImportError as _e:
+    _GRPC_AUTH_AVAILABLE = False
+    _GRPC_AUTH_IMPORT_ERR = _e
+
 
 CMD_TOKEN_DECODE = 1
 CMD_EMBD_DECODE  = 2
@@ -355,12 +365,23 @@ IDEM_BYTES_PER_ENTRY = 10 * 1024
 
 class WorkerServicer(pb_grpc.NakshatraServicer):
     def __init__(self, daemon: DaemonClient, mode: str, layer_start: int, layer_end: int, model_id: str,
-                 idem_max_entries: int = 6400, idem_ttl_seconds: float = 60.0):
+                 idem_max_entries: int = 6400, idem_ttl_seconds: float = 60.0,
+                 peer_resolver=None, auth_required: bool = False,
+                 refuse_unregistered_peers: bool = True):
         self.daemon = daemon
         self.mode = mode
         self.layer_start = layer_start
         self.layer_end = layer_end
         self.model_id = model_id
+        # Phase B (2026-05-20): peer-key resolver caches pillar's /peers
+        # projection. When auth_required is True, every non-Info gRPC
+        # call must present a Sthambha-Ed25519 signature whose keyid
+        # resolves through this resolver.
+        self.peer_resolver = peer_resolver
+        self.auth_required = auth_required
+        self.refuse_unregistered_peers = refuse_unregistered_peers
+        self._authz_rejections = 0
+        self._ssrf_rejections = 0
         self.daemon_info = daemon.info()
         print(f"[worker] daemon info: {self.daemon_info}", flush=True)
         self.n_embd = self.daemon_info["n_embd"]
@@ -478,6 +499,60 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                 "evictions": self._peer_evictions,
             }
 
+    def auth_stats(self) -> dict:
+        """Phase B (2026-05-20): expose gRPC auth + SSRF defense counters
+        for the /healthz endpoint. Useful for operators tracking attacker
+        probes against a Mode-C deployment."""
+        return {
+            "auth_required": bool(self.auth_required),
+            "authz_rejections": self._authz_rejections,
+            "ssrf_rejections": self._ssrf_rejections,
+            "resolver": (
+                self.peer_resolver.stats() if self.peer_resolver else None
+            ),
+        }
+
+    def _check_grpc_auth(self, context, body_bytes: bytes, *,
+                          method_path: str, is_streaming: bool) -> Optional[str]:
+        """Phase B (2026-05-20): verify the gRPC call's authorization.
+
+        Returns the verified keyid on success, or None when auth is not
+        required (legacy Mode A bringup). Aborts the call with
+        UNAUTHENTICATED on any failure — caller will not see a normal
+        return when auth fails.
+        """
+        if not self.auth_required:
+            return None
+        if not _GRPC_AUTH_AVAILABLE:
+            self._authz_rejections += 1
+            context.abort(
+                grpc.StatusCode.UNAUTHENTICATED,
+                "auth required but nakshatra_grpc_auth module unavailable",
+            )
+            return None  # unreachable; abort raises
+        if self.peer_resolver is None:
+            self._authz_rejections += 1
+            context.abort(
+                grpc.StatusCode.UNAUTHENTICATED,
+                "auth required but no peer resolver configured",
+            )
+            return None
+        metadata = dict(context.invocation_metadata() or [])
+        auth_header = metadata.get("authorization", "")
+        try:
+            keyid = _wgrpcauth.verify_grpc_call(
+                method_path, auth_header, body_bytes,
+                pubkey_resolver=self.peer_resolver.resolve,
+                is_streaming=is_streaming,
+            )
+            return keyid
+        except _wgrpcauth.AuthError as e:
+            self._authz_rejections += 1
+            context.abort(
+                grpc.StatusCode.UNAUTHENTICATED, f"authz failed: {e}"
+            )
+            return None  # unreachable
+
     def Info(self, request, context):
         return pb.InfoResponse(
             protocol_version="0.1.0",
@@ -502,6 +577,14 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
         )
 
     def Forward(self, request, context):
+        # Phase B (2026-05-20): authenticate the unary call. The signed
+        # body is the serialized request — same canonical-string shape
+        # as the HTTP side, just with method=POST + path=gRPC method name.
+        self._check_grpc_auth(
+            context, request.SerializeToString(),
+            method_path="/nakshatra.Nakshatra/Forward",
+            is_streaming=False,
+        )
         n = request.n_tokens
         flags = 0x1 if request.keep_kv else 0x0
         start_pos = int(request.start_pos)
@@ -554,6 +637,16 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
             for step in _iter_with_idle_timeout(
                 request_iterator, INFERENCE_STREAM_IDLE_TIMEOUT_S
             ):
+                # Phase B (2026-05-20): authenticate the first frame.
+                # Once the first frame's signature is accepted, gRPC
+                # stream identity binds subsequent frames to the same
+                # authenticated peer — no per-frame check needed.
+                if first_step:
+                    self._check_grpc_auth(
+                        context, step.SerializeToString(),
+                        method_path="/nakshatra.Nakshatra/Inference",
+                        is_streaming=True,
+                    )
                 # v0.5 M0.5.2: idempotency cache. If this (session_id, step_id) has
                 # been served before, return the cached response without touching
                 # the daemon. Note: a cache hit advances first_step too — the
@@ -644,6 +737,27 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                     next_addr = step.next_server.address
                     next_session = step.next_server.session_id
                 if next_addr and self.mode != "last":
+                    # Phase B5 (2026-05-20): SSRF defense. Worker pushes
+                    # only to peers the pillar has registered. An attacker-
+                    # supplied next_addr to internal-only endpoints (e.g.
+                    # "127.0.0.1:22") would otherwise turn the worker into
+                    # a probe. refuse_unregistered_peers=False keeps the
+                    # legacy behavior for Mode-A clusters with no pillar.
+                    if (self.refuse_unregistered_peers
+                            and self.peer_resolver is not None
+                            and not self.peer_resolver.is_registered_address(next_addr)):
+                        self._ssrf_rejections += 1
+                        err_msg = (
+                            f"push_failed: refusing unregistered peer "
+                            f"address {next_addr!r} (Mode-C SSRF defense; "
+                            f"set NAKSHATRA_REFUSE_UNREGISTERED_PEERS=false "
+                            f"to disable)"
+                        ).encode()
+                        yield pb.InferenceStep(
+                            session_id=step.session_id, step_id=step.step_id,
+                            error=err_msg,
+                        )
+                        continue
                     # The next worker processes the SAME token positions we
                     # just did — it's running a different layer range over the
                     # same sequence. So pushed prefix_length is our INPUT
@@ -1130,6 +1244,8 @@ class FileServerHandler(BaseHTTPRequestHandler):
                            if _HEALTH_STATE.get("servicer") is not None else None),
             "rpc_push": (_HEALTH_STATE["servicer"].push_stats()
                          if _HEALTH_STATE.get("servicer") is not None else None),
+            "auth": (_HEALTH_STATE["servicer"].auth_stats()
+                     if _HEALTH_STATE.get("servicer") is not None else None),
             "protocol_version": "0.1.0",
         }
 
@@ -1763,9 +1879,26 @@ def main():
         ],
     )
     idem_max_entries = max(1, (args.idempotency_cache_mb * 1024 * 1024) // IDEM_BYTES_PER_ENTRY)
+
+    # Phase B (2026-05-20): resolve NAKSHATRA_AUTH_REQUIRED + decide
+    # whether to refuse SSRF pushes to unregistered peers. The peer
+    # resolver itself is constructed below once we know the worker key.
+    auth_required = (
+        _GRPC_AUTH_AVAILABLE
+        and _wgrpcauth.resolve_auth_required(
+            os.environ.get("NAKSHATRA_AUTH_REQUIRED"), args.pillar_url
+        )
+    )
+    refuse_unregistered_peers = (
+        os.environ.get("NAKSHATRA_REFUSE_UNREGISTERED_PEERS", "true")
+        .strip().lower() in ("true", "1", "yes")
+    )
+
     servicer = WorkerServicer(daemon, args.mode, args.layer_start, args.layer_end, args.model_id,
                               idem_max_entries=idem_max_entries,
-                              idem_ttl_seconds=args.idempotency_cache_ttl)
+                              idem_ttl_seconds=args.idempotency_cache_ttl,
+                              auth_required=auth_required,
+                              refuse_unregistered_peers=refuse_unregistered_peers)
     print(f"[worker] idempotency cache: {args.idempotency_cache_mb} MB "
           f"(~{idem_max_entries} entries @ {IDEM_BYTES_PER_ENTRY//1024} KB), "
           f"ttl={args.idempotency_cache_ttl}s", flush=True)
@@ -2042,6 +2175,40 @@ def main():
         register_with_pillar(args.pillar_url, register_payload,
                              priv_key=worker_priv, node_id=node_id,
                              spki_hash=spki_hash)
+
+        # Phase B (2026-05-20): start the peer-key resolver in the
+        # background. The resolver caches the pillar's /peers projection
+        # so the gRPC auth check can map an authenticated request's
+        # keyid to its registered Ed25519 public key. Without this the
+        # worker has nothing to verify against.
+        peer_refresh_interval = float(
+            os.environ.get("NAKSHATRA_PEER_REFRESH_INTERVAL", "60.0")
+        )
+        if (_GRPC_AUTH_AVAILABLE and (auth_required or refuse_unregistered_peers)
+                and args.pillar_url):
+            resolver = _wgrpcauth.PillarPeerKeyResolver(
+                args.pillar_url,
+                refresh_interval_s=peer_refresh_interval,
+                priv_key=worker_priv, own_node_id=node_id,
+                spki_hash=spki_hash,
+            )
+            resolver.start_background_refresh()
+            servicer.peer_resolver = resolver
+            print(
+                f"[worker] gRPC peer-key resolver started "
+                f"(refresh every {peer_refresh_interval:.0f}s; "
+                f"auth_required={auth_required}, "
+                f"refuse_unregistered_peers={refuse_unregistered_peers})",
+                flush=True,
+            )
+        elif auth_required:
+            print(
+                "[worker] WARN: NAKSHATRA_AUTH_REQUIRED=true but no "
+                "--pillar-url is set; auth will reject every gRPC call "
+                "since there's no resolver. Did you forget --pillar-url?",
+                flush=True,
+            )
+
         # Heartbeat payload omits public_key_hex after the first call —
         # the pillar's TOFU lock remembers it.
         heartbeat_payload = {k: v for k, v in register_payload.items()

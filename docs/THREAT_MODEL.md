@@ -1,7 +1,7 @@
 # Nakshatra worker threat model
 
 **Status:** Living document, updated as phases ship.
-**Last updated:** 2026-05-20 (Phase A shipped — 8 cheap-win defensive limits).
+**Last updated:** 2026-05-20 (Phase B-auth shipped — gRPC Ed25519 auth + SSRF defense; TLS deferred to B-tls).
 
 This file is the worker-side companion to `sthambha/docs/THREAT_MODEL.md`.
 Sthambha's threat model covers the pillar (control plane); this one covers
@@ -64,11 +64,13 @@ identify audit gaps the plan addresses.
 
 | Threat | Defense | Phase |
 |---|---|---|
-| gRPC `Forward` / `Inference` accepts unauthenticated calls | PENDING — gRPC Ed25519 auth + TLS, tier model | B |
-| `Info` exposed publicly | INTENTIONAL — anonymous tier (peer discovery requires this) | B |
+| gRPC `Forward` / `Inference` accepts unauthenticated calls | Ed25519 signature in `authorization` metadata; `verify_grpc_call` parses + verifies against `PillarPeerKeyResolver`-cached pubkeys; tier model: `Info` ANONYMOUS, `Forward`/`Inference` AUTHENTICATED. `NAKSHATRA_AUTH_REQUIRED` env: default true when `--pillar-url` set, false otherwise (legacy Mode A) | **B-auth** (2026-05-20) |
+| `Info` exposed publicly | INTENTIONAL — `ANONYMOUS_GRPC_METHODS` includes only `/nakshatra.Nakshatra/Info` for peer discovery / capability negotiation | **B-auth** (2026-05-20) |
 | HTTP `/file/<basename>` leaks model weights to anyone | PENDING — AUTHENTICATED tier against pillar-registered peers | C |
 | HTTP `POST /slice` spawns subprocess for any caller | PENDING — OPERATOR tier (operator key required) | C |
-| `Inference.chain[].address` lets attacker pivot worker to any gRPC endpoint (SSRF) | PENDING — accept only addresses for peers the pillar has registered | B |
+| `Inference.chain[].address` lets attacker pivot worker to any gRPC endpoint (SSRF) | `PillarPeerKeyResolver.is_registered_address` allowlist gates push targets. `NAKSHATRA_REFUSE_UNREGISTERED_PEERS=true` (default); refusals emit `push_failed:` so the client downgrades to client-relay. Stale cache (> 5min) returns False for every check — refuse beats push to attacker-supplied endpoint. | **B-ssrf** (2026-05-20) |
+| TLS on the gRPC server (worker → worker / client → worker MITM defense) | PENDING — self-signed cert at startup + SPKI hash log | B-tls (deferred) |
+| Pillar `/peers` projection doesn't expose `peer_spki_hash` for inter-worker pinning | PENDING — Sthambha-side schema extension | B-spki (deferred; needs cross-repo change) |
 | `_peer_streams` cache grows unbounded with attacker-supplied addresses | `OrderedDict` + LRU cap (`MAX_PEER_STREAMS=64`); oldest evicted with `_peer_evictions` counter | **A3** (2026-05-20) |
 | `Inference` stream held open indefinitely by slow client → ThreadPoolExecutor exhaustion | `_iter_with_idle_timeout` wraps request iterator; `DEADLINE_EXCEEDED` after `INFERENCE_STREAM_IDLE_TIMEOUT_S=60s` | **A2** (2026-05-20) |
 | gRPC message-size cap not set explicitly (default 4 MiB; should be intentional) | Explicit `WORKER_GRPC_MAX_MESSAGE_BYTES=16 MiB` set on both `max_receive_message_length` and `max_send_message_length` | **A1** (2026-05-20) |
@@ -170,6 +172,8 @@ shifts worth ratifying).
 Phases A-D are planned in `~/trisul/plans/2026-05-20-nakshatra-worker-hardening-sprint.md`.
 
 - **Phase A (2026-05-20)** — 8 cheap-win defensive limits: explicit gRPC message-size cap (A1), `Inference` stream idle timeout (A2), `_peer_streams` LRU cap (A3), `STHAMBHA_PILLAR_SPKI_SHA256` strict validation (A4), `STHAMBHA_REFUSE_UNSIGNED` startup gate (A5), `safe_rpc_ms` NaN/Inf guard (A6), `STHAMBHA_REFUSE_UNVERIFIED_FETCH` (default true) on `fetch_sub_gguf_from_peer` (A7), `MAX_CONCURRENT_SLICES=1` + reduced subprocess timeout (A8). 30 new tests added; 66 total worker-side tests passing.
+- **Phase B-auth (2026-05-20)** — gRPC Ed25519 verification + SSRF defense. New module `scripts/nakshatra_grpc_auth.py`: `verify_grpc_call`, `build_grpc_auth_header`, `parse_auth_header`, `resolve_auth_required`, `PillarPeerKeyResolver` (background-refreshed cache of pillar's `/peers` projection; stale-deadline 5min). `WorkerServicer` wires auth check on `Forward` (unary) + `Inference` first-frame (streaming); SSRF check on push to `chain[].address`. New envs: `NAKSHATRA_AUTH_REQUIRED` (default secure when pillar configured), `NAKSHATRA_REFUSE_UNREGISTERED_PEERS` (default true), `NAKSHATRA_PEER_REFRESH_INTERVAL` (default 60s). Canonical-string method tokens `POST` (unary) / `STREAM` (streaming) prevent HTTP↔gRPC and stream↔unary signature replay. Cross-repo wire-contract test confirms byte-identical signatures with `nakshatra_auth.sign_request`. 29 new tests added; 95 total worker-side tests passing.
+- **Phase B-tls (deferred)** — TLS on the gRPC server + cross-worker SPKI pinning. Out of scope for the auth-core ship; gRPC auth is the substantive Mode-C close. TLS adds defense-in-depth against on-path attackers who can still spoof a peer address (within the SSRF allowlist) — material once Sthambha's `/peers` projection exposes `peer_spki_hash` (B-spki, also deferred).
 
 ## Related
 
