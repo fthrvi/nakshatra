@@ -55,6 +55,17 @@ except ImportError as _e:
     _AUTH_AVAILABLE = False
     _AUTH_IMPORT_ERR = _e
 
+# Phase G (sandbox enforcement, 2026-05-19): worker verifies its
+# runtime matches the SandboxSpec from /join. Failure-soft import for
+# the same reason as nakshatra_auth — the worker can start without
+# the module, but Mode-C operators need it.
+try:
+    import nakshatra_sandbox as _wsandbox
+    _SANDBOX_AVAILABLE = True
+except ImportError as _e:
+    _SANDBOX_AVAILABLE = False
+    _SANDBOX_IMPORT_ERR = _e
+
 
 CMD_TOKEN_DECODE = 1
 CMD_EMBD_DECODE  = 2
@@ -1670,6 +1681,48 @@ def main():
             "cached_files": cached_files,
             "recent_rpc_ms": 0.0,  # Phase H — populated by heartbeat as data accrues
         }
+        # (sandbox_compliance is filled in below once we run the
+        # startup compliance check; see Phase G integration just below.)
+        # Phase G: snapshot the worker's runtime sandbox compliance at
+        # startup. We don't have a SandboxSpec yet (that comes from a
+        # /join with a live plan), so we validate against a generic
+        # "is this thing containerized at all" check. The full per-plan
+        # validation runs later when /join lands.
+        sandbox_summary: dict = {}
+        sandbox_facts = None
+        if _SANDBOX_AVAILABLE:
+            sandbox_facts = _wsandbox.collect_runtime_facts()
+            generic_spec = {
+                "seccomp_profile": "any",
+                "cpu_threads_limit": 0,
+                "ram_limit_gb": 0,
+                "mode_c_compatible": True,
+            }
+            startup_report = _wsandbox.validate_against_runtime(
+                generic_spec, sandbox_facts)
+            sandbox_summary = _wsandbox.compliance_summary_for_peer_body(
+                startup_report)
+            print(f"[worker] {startup_report.format_human()}", flush=True)
+            # Operator-controlled Mode-C gate (Phase G3).
+            refuse_noncompliant = (
+                os.environ.get("STHAMBHA_REFUSE_NONCOMPLIANT_SANDBOX", "")
+                .strip().lower() in ("true", "1", "yes")
+            )
+            if refuse_noncompliant and not startup_report.is_mode_c_compliant():
+                print(f"[worker] REFUSING TO START: "
+                      f"STHAMBHA_REFUSE_NONCOMPLIANT_SANDBOX=true and "
+                      f"runtime is not Mode-C compliant. Run inside a "
+                      f"container that satisfies the SandboxSpec — see "
+                      f"docs/SANDBOX-EXAMPLES/ on the sthambha repo.",
+                      flush=True)
+                sys.exit(2)
+        else:
+            print(f"[worker] WARN: nakshatra_sandbox import failed "
+                  f"({_SANDBOX_IMPORT_ERR}); skipping sandbox compliance check",
+                  flush=True)
+        if sandbox_summary:
+            register_payload["sandbox_compliance"] = sandbox_summary
+
         # Phase F2: load or create the worker's persistent Ed25519
         # keypair; include public_key_hex in the FIRST registration so
         # the pillar locks it via TOFU. Subsequent heartbeats sign with
