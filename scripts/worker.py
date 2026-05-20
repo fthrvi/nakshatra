@@ -20,6 +20,7 @@ import argparse
 import collections
 import hashlib
 import json
+import math
 import os
 import platform
 import plistlib
@@ -70,6 +71,151 @@ except ImportError as _e:
 CMD_TOKEN_DECODE = 1
 CMD_EMBD_DECODE  = 2
 CMD_INFO         = 3
+
+
+# ── Phase A (worker hardening sprint, 2026-05-20) ─────────────────────
+# Defensive limits + bounded state. Mirror of Sthambha A1-A8 on the
+# worker side. See ~/trisul/plans/2026-05-20-nakshatra-worker-hardening-
+# sprint.md for the design context.
+
+WORKER_GRPC_MAX_MESSAGE_BYTES = 16 * 1024 * 1024     # A1: explicit cap
+INFERENCE_STREAM_IDLE_TIMEOUT_S = 60.0                # A2: bound slow clients
+MAX_PEER_STREAMS = 64                                 # A3: LRU cap
+SPKI_HASH_LENGTH = 64                                 # A4: sha256 hex
+MAX_CONCURRENT_SLICES = 1                             # A8: cap subprocess fan-out
+SLICE_SUBPROCESS_TIMEOUT_S = 1800                     # A8: was 3600
+
+
+def validate_spki_hash_env(value: Optional[str]) -> Optional[str]:
+    """Phase A4 — validate the STHAMBHA_PILLAR_SPKI_SHA256 env value.
+
+    Catches the silent-disable-by-typo case: an operator sets the env
+    to "abc" and pinning silently turns off because the empty-string
+    coalesce treats it as set-but-invalid. Returns the canonicalised
+    lowercase hash, or None if unset. Raises ValueError if set but
+    malformed — startup should refuse rather than proceed with broken
+    pinning.
+    """
+    s = (value or "").strip().lower()
+    if not s:
+        return None
+    if len(s) != SPKI_HASH_LENGTH:
+        raise ValueError(
+            f"STHAMBHA_PILLAR_SPKI_SHA256 must be {SPKI_HASH_LENGTH} hex "
+            f"chars (sha256); got {len(s)} chars"
+        )
+    try:
+        bytes.fromhex(s)
+    except ValueError:
+        raise ValueError(
+            f"STHAMBHA_PILLAR_SPKI_SHA256 must be hex; got non-hex chars"
+        )
+    return s
+
+
+def should_refuse_unsigned_startup(
+    refuse_env: Optional[str],
+    auth_available: bool,
+    has_worker_key: bool,
+    pillar_url: str,
+) -> bool:
+    """Phase A5 — STHAMBHA_REFUSE_UNSIGNED gate.
+
+    Returns True when the operator opted into refuse-unsigned AND the
+    worker would in fact send unsigned requests to a pillar. The caller
+    is expected to sys.exit(2) on True. Mode A/B operators can leave
+    the env unset (default false) for legacy unsigned bringup.
+    """
+    val = (refuse_env or "").strip().lower()
+    if val not in ("true", "1", "yes"):
+        return False
+    if not pillar_url:
+        return False  # no pillar = nothing to sign
+    return (not auth_available) or (not has_worker_key)
+
+
+def safe_rpc_ms(ms: float) -> Optional[float]:
+    """Phase A6 — NaN/Inf guard on recent_rpc_ms.
+
+    DaemonClient.recent_rpc_ms is sourced from (time.time() - t0) * 1000.
+    A backward clock jump or corrupted t0 can produce non-finite or
+    negative values; the heartbeat shouldn't ship those to the pillar.
+    Mirror of Sthambha O5 `as_safe_float`.
+    """
+    try:
+        m = float(ms)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(m):
+        return None
+    if m < 0:
+        return None
+    return m
+
+
+def should_refuse_unverified_fetch(
+    refuse_env: Optional[str], expected_sha: Optional[str]
+) -> bool:
+    """Phase A7 — STHAMBHA_REFUSE_UNVERIFIED_FETCH gate.
+
+    Default true (refuse when pillar omits model_sha256). A malicious
+    pillar can serve poisoned weights by omitting the hash. Mode A/B
+    operators can opt out with STHAMBHA_REFUSE_UNVERIFIED_FETCH=false.
+    """
+    val = (refuse_env if refuse_env is not None else "true").strip().lower()
+    refuse = val in ("true", "1", "yes")
+    return refuse and not (expected_sha or "").strip()
+
+
+def _iter_with_idle_timeout(it, idle_seconds: float):
+    """Phase A2 — wrap a blocking iterator with a per-step idle deadline.
+
+    Each next() yields the iterator's next item, or raises TimeoutError
+    when no item arrives in idle_seconds. Used to bound how long a slow
+    or malicious gRPC client can hold a server thread.
+
+    Implementation: a pump thread reads the iterator and pushes onto a
+    queue; the caller blocks on queue.get(timeout). Sentinel marks normal
+    end; error tuple ("__error__", exc) propagates exceptions.
+    """
+    q: queue.Queue = queue.Queue()
+    sentinel = object()
+    err_tag = "__error__"
+
+    def pump():
+        try:
+            for item in it:
+                q.put(item)
+        except Exception as e:
+            q.put((err_tag, e))
+            return
+        q.put(sentinel)
+
+    threading.Thread(target=pump, daemon=True).start()
+
+    while True:
+        try:
+            item = q.get(timeout=idle_seconds)
+        except queue.Empty:
+            raise TimeoutError(
+                f"no step received in {idle_seconds}s (idle timeout)"
+            )
+        if item is sentinel:
+            return
+        if isinstance(item, tuple) and len(item) == 2 and item[0] == err_tag:
+            raise item[1]
+        yield item
+
+
+def _running_slice_count() -> int:
+    """Phase A8 — number of slice tasks currently in 'running' status.
+
+    Caller must NOT hold _SLICE_LOCK; this function acquires it.
+    """
+    with _SLICE_LOCK:
+        return sum(
+            1 for t in _SLICE_TASKS.values() if t.get("status") == "running"
+        )
 
 
 class DaemonClient:
@@ -176,8 +322,13 @@ class DaemonClient:
             data = self.proc.stdout.read(plen) if plen else b""
             # Phase H: track per-call timing for latency-aware chain builds.
             # Skip cmd=3 (INFO) — those don't reflect inference latency.
+            # Phase A6 (2026-05-20): NaN/Inf guard. Clock skews backward
+            # or t0 corruption can produce non-finite or negative values
+            # — drop those before they pollute the heartbeat payload.
             if cmd != CMD_INFO:
-                self.recent_rpc_ms.append((time.time() - t0) * 1000.0)
+                clean = safe_rpc_ms((time.time() - t0) * 1000.0)
+                if clean is not None:
+                    self.recent_rpc_ms.append(clean)
             return status, data
 
     def info(self):
@@ -226,10 +377,14 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
         # v0.5 M0.5.3: peer-stream cache for rpc_push. One persistent bidi
         # Inference stream per next-hop peer address, reused across sessions.
         # Map: address (str) -> (grpc.Channel, queue.Queue request side, response iterator)
+        # Phase A3 (2026-05-20): OrderedDict + LRU cap. An attacker who
+        # repeatedly pushes to fresh addresses can no longer balloon
+        # this dict; oldest stream is evicted on overflow.
         self._peer_lock = threading.Lock()
-        self._peer_streams: dict = {}
+        self._peer_streams: "collections.OrderedDict" = collections.OrderedDict()
         self._push_count = 0
         self._push_errors = 0
+        self._peer_evictions = 0
 
     def _idem_evict(self, now: float):
         """Drop expired sessions, then cap total entries. Caller holds _idem_lock."""
@@ -274,12 +429,17 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
         """Open or reuse a bidi Inference stream to a peer worker.
 
         v0.5 M0.5.3 — server-to-server push. Returns (req_queue, response_iterator).
-        Sending None to the queue closes the stream. We never close in normal
-        operation; streams persist across all sessions until process exit.
+        Sending None to the queue closes the stream.
+
+        Phase A3 (2026-05-20): bounded by MAX_PEER_STREAMS via LRU
+        eviction. Re-touching an existing entry refreshes it (move to
+        end); opening a fresh stream may evict the oldest. Eviction
+        closes the request side (None sentinel) and the channel.
         """
         with self._peer_lock:
             cached = self._peer_streams.get(address)
             if cached is not None:
+                self._peer_streams.move_to_end(address)
                 return cached[1], cached[2]
             channel = grpc.insecure_channel(address)
             stub = pb_grpc.NakshatraStub(channel)
@@ -294,6 +454,19 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
 
             resp_iter = stub.Inference(request_gen())
             self._peer_streams[address] = (channel, req_q, resp_iter)
+            while len(self._peer_streams) > MAX_PEER_STREAMS:
+                old_addr, (old_ch, old_q, _old_iter) = (
+                    self._peer_streams.popitem(last=False)
+                )
+                self._peer_evictions += 1
+                try: old_q.put(None)
+                except Exception: pass
+                try: old_ch.close()
+                except Exception: pass
+                sys.stderr.write(
+                    f"[peer-streams] evicted oldest {old_addr!r} "
+                    f"(cap={MAX_PEER_STREAMS})\n"
+                )
             return req_q, resp_iter
 
     def push_stats(self) -> dict:
@@ -302,6 +475,7 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                 "active_peers": len(self._peer_streams),
                 "push_count": self._push_count,
                 "push_errors": self._push_errors,
+                "evictions": self._peer_evictions,
             }
 
     def Info(self, request, context):
@@ -377,7 +551,9 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
         """
         first_step = True
         try:
-            for step in request_iterator:
+            for step in _iter_with_idle_timeout(
+                request_iterator, INFERENCE_STREAM_IDLE_TIMEOUT_S
+            ):
                 # v0.5 M0.5.2: idempotency cache. If this (session_id, step_id) has
                 # been served before, return the cached response without touching
                 # the daemon. Note: a cache hit advances first_step too — the
@@ -533,6 +709,11 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                 # whole point of failure, replays should retry).
                 self._idem_put(step.session_id, step.step_id, out)
                 yield out
+        except TimeoutError as e:
+            sys.stderr.write(f"[inference] idle timeout: {e}\n")
+            context.set_code(grpc.StatusCode.DEADLINE_EXCEEDED)
+            context.set_details(str(e))
+            return
         except Exception as e:
             sys.stderr.write(f"[inference] stream aborted: {e}\n")
             context.set_code(grpc.StatusCode.INTERNAL)
@@ -666,7 +847,11 @@ def heartbeat_loop(pillar_url: str, payload: dict, interval: float = 30.0,
             break
         if daemon_for_timing is not None and daemon_for_timing.recent_rpc_ms:
             avg = sum(daemon_for_timing.recent_rpc_ms) / len(daemon_for_timing.recent_rpc_ms)
-            payload["recent_rpc_ms"] = avg
+            # Phase A6: belt-and-suspenders — avg of all-finite values
+            # is finite, but guard against deque mutation races.
+            avg_clean = safe_rpc_ms(avg)
+            if avg_clean is not None:
+                payload["recent_rpc_ms"] = avg_clean
         register_with_pillar(pillar_url, payload, log_prefix="[heartbeat]",
                               priv_key=priv_key, node_id=node_id,
                               spki_hash=spki_hash)
@@ -773,7 +958,9 @@ def _run_slice_task(task_id: str, model_id: str, src: str, dst: str,
             cmd.append("--keep-token-embd")
         if force_keep_output:
             cmd.append("--keep-output")
-        proc = subprocess.run(cmd, capture_output=True, timeout=3600)
+        proc = subprocess.run(
+            cmd, capture_output=True, timeout=SLICE_SUBPROCESS_TIMEOUT_S,
+        )
         if proc.returncode != 0:
             err = proc.stderr.decode("utf-8", errors="replace")[-2000:]
             _slice_update(task_id, status="failed", finished_at=time.time(),
@@ -794,7 +981,7 @@ def _run_slice_task(task_id: str, model_id: str, src: str, dst: str,
                        sha256=sha, size_bytes=os.path.getsize(dst))
     except subprocess.TimeoutExpired:
         _slice_update(task_id, status="failed", finished_at=time.time(),
-                       error="partial_gguf timed out after 3600s")
+                       error=f"partial_gguf timed out after {SLICE_SUBPROCESS_TIMEOUT_S}s")
     except Exception as e:
         _slice_update(task_id, status="failed", finished_at=time.time(),
                        error=f"slice worker crashed: {e}")
@@ -1068,6 +1255,16 @@ class FileServerHandler(BaseHTTPRequestHandler):
             self.send_error(400, "layer_end must be > layer_start >= 0")
             return
 
+        # Phase A8 (2026-05-20): cap concurrent slice subprocesses. Each
+        # spawn can run for SLICE_SUBPROCESS_TIMEOUT_S seconds eating CPU;
+        # unbounded fan-out is a DoS amplifier.
+        if _running_slice_count() >= MAX_CONCURRENT_SLICES:
+            self.send_error(
+                429,
+                f"too many concurrent slices (cap={MAX_CONCURRENT_SLICES})",
+            )
+            return
+
         output_filename = _slice_output_filename(model_id, layer_start, layer_end)
         output_path = os.path.join(_FILE_SERVER_DIR, output_filename)
         task_id = uuid.uuid4().hex
@@ -1192,6 +1389,24 @@ def fetch_sub_gguf_from_peer(pillar_url: str, model_id: str,
             f"no online peer holds {model_id} layers [{layer_start},{layer_end})"
             f" — file not available on the network"
         )
+
+    # Phase A7 (2026-05-20): refuse unverified fetch when the pillar
+    # omits model_sha256. A malicious pillar can serve poisoned weights
+    # by simply not declaring a hash. Default behaviour is to refuse;
+    # Mode A/B operators can opt out with the env var.
+    refuse_env = os.environ.get("STHAMBHA_REFUSE_UNVERIFIED_FETCH")
+    verified_candidates = [
+        c for c in candidates
+        if not should_refuse_unverified_fetch(refuse_env, c.get("model_sha256", ""))
+    ]
+    if not verified_candidates:
+        raise RuntimeError(
+            f"refusing to fetch {model_id} layers [{layer_start},{layer_end})"
+            f": no candidate peer has a pillar-attested model_sha256"
+            f" (set STHAMBHA_REFUSE_UNVERIFIED_FETCH=false to allow"
+            f" unverified Mode-A/B fetch)"
+        )
+    candidates = verified_candidates
 
     # 3. Try each candidate in order; on connection failure, fall through
     last_error = None
@@ -1536,7 +1751,17 @@ def main():
     print(f"[worker] spawning daemon: {args.daemon_bin} {args.sub_gguf} {args.mode} {args.n_ctx} threads={args.n_threads} gpu_layers={args.n_gpu_layers}", flush=True)
     daemon = DaemonClient(args.daemon_bin, args.sub_gguf, args.mode, args.n_ctx, args.n_threads, args.n_gpu_layers)
 
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
+    # Phase A1 (2026-05-20): explicit gRPC message-size cap. Default is
+    # 4 MiB; we set the explicit cap to WORKER_GRPC_MAX_MESSAGE_BYTES so
+    # operators can grep the constant + adjust without spelunking gRPC
+    # defaults. 16 MiB covers our largest hidden_state batches with room.
+    server = grpc.server(
+        futures.ThreadPoolExecutor(max_workers=4),
+        options=[
+            ("grpc.max_receive_message_length", WORKER_GRPC_MAX_MESSAGE_BYTES),
+            ("grpc.max_send_message_length", WORKER_GRPC_MAX_MESSAGE_BYTES),
+        ],
+    )
     idem_max_entries = max(1, (args.idempotency_cache_mb * 1024 * 1024) // IDEM_BYTES_PER_ENTRY)
     servicer = WorkerServicer(daemon, args.mode, args.layer_start, args.layer_end, args.model_id,
                               idem_max_entries=idem_max_entries,
@@ -1787,11 +2012,33 @@ def main():
                   f"({_AUTH_IMPORT_ERR}); requests will go unsigned",
                   flush=True)
         # Phase F3: env-pinned pillar SPKI for HTTPS connections.
-        spki_hash = os.environ.get("STHAMBHA_PILLAR_SPKI_SHA256", "").strip() or None
+        # Phase A4 (2026-05-20): strict length + hex validation. Catches
+        # the silent-disable-by-typo case where an operator sets the env
+        # to "abc" and pinning silently turns off.
+        try:
+            spki_hash = validate_spki_hash_env(
+                os.environ.get("STHAMBHA_PILLAR_SPKI_SHA256")
+            )
+        except ValueError as e:
+            sys.exit(f"[worker] startup refused: {e}")
         if args.pillar_url.startswith("https://") and not spki_hash:
             print(f"[worker] WARN: HTTPS pillar URL but no SPKI hash pinned "
                   f"via STHAMBHA_PILLAR_SPKI_SHA256; cert identity NOT verified",
                   flush=True)
+        # Phase A5 (2026-05-20): refuse-unsigned startup gate. Operators
+        # opt in with STHAMBHA_REFUSE_UNSIGNED=true; default keeps the
+        # legacy lenient bringup (worker WARNs and proceeds).
+        if should_refuse_unsigned_startup(
+            os.environ.get("STHAMBHA_REFUSE_UNSIGNED"),
+            _AUTH_AVAILABLE,
+            has_worker_key=bool(worker_priv),
+            pillar_url=args.pillar_url,
+        ):
+            sys.exit(
+                "[worker] startup refused: STHAMBHA_REFUSE_UNSIGNED=true "
+                "but no worker Ed25519 key is available (auth module "
+                "missing or key load failed)."
+            )
         register_with_pillar(args.pillar_url, register_payload,
                              priv_key=worker_priv, node_id=node_id,
                              spki_hash=spki_hash)
