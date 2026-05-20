@@ -1,7 +1,7 @@
 # Nakshatra worker threat model
 
 **Status:** Living document, updated as phases ship.
-**Last updated:** 2026-05-20 (Phase B-auth shipped — gRPC Ed25519 auth + SSRF defense; TLS deferred to B-tls).
+**Last updated:** 2026-05-20 (Phase C shipped — HTTP tier model + path sanitization + operator key).
 
 This file is the worker-side companion to `sthambha/docs/THREAT_MODEL.md`.
 Sthambha's threat model covers the pillar (control plane); this one covers
@@ -66,8 +66,8 @@ identify audit gaps the plan addresses.
 |---|---|---|
 | gRPC `Forward` / `Inference` accepts unauthenticated calls | Ed25519 signature in `authorization` metadata; `verify_grpc_call` parses + verifies against `PillarPeerKeyResolver`-cached pubkeys; tier model: `Info` ANONYMOUS, `Forward`/`Inference` AUTHENTICATED. `NAKSHATRA_AUTH_REQUIRED` env: default true when `--pillar-url` set, false otherwise (legacy Mode A) | **B-auth** (2026-05-20) |
 | `Info` exposed publicly | INTENTIONAL — `ANONYMOUS_GRPC_METHODS` includes only `/nakshatra.Nakshatra/Info` for peer discovery / capability negotiation | **B-auth** (2026-05-20) |
-| HTTP `/file/<basename>` leaks model weights to anyone | PENDING — AUTHENTICATED tier against pillar-registered peers | C |
-| HTTP `POST /slice` spawns subprocess for any caller | PENDING — OPERATOR tier (operator key required) | C |
+| HTTP `/file/<basename>` leaks model weights to anyone | `_check_tier(TIER_AUTHENTICATED)` requires Sthambha-Ed25519 signature whose keyid resolves through `PillarPeerKeyResolver`. Range requests + full fetches both gated. | **C2** (2026-05-20) |
+| HTTP `POST /slice` spawns subprocess for any caller | `_check_tier(TIER_OPERATOR)` requires signature against operator pubkey at `~/.nakshatra/keys/operator.pub.hex` (independent of network auth — rotation is a filesystem operation). No operator pubkey installed → every POST refused. | **C2+C3** (2026-05-20) |
 | `Inference.chain[].address` lets attacker pivot worker to any gRPC endpoint (SSRF) | `PillarPeerKeyResolver.is_registered_address` allowlist gates push targets. `NAKSHATRA_REFUSE_UNREGISTERED_PEERS=true` (default); refusals emit `push_failed:` so the client downgrades to client-relay. Stale cache (> 5min) returns False for every check — refuse beats push to attacker-supplied endpoint. | **B-ssrf** (2026-05-20) |
 | TLS on the gRPC server (worker → worker / client → worker MITM defense) | PENDING — self-signed cert at startup + SPKI hash log | B-tls (deferred) |
 | Pillar `/peers` projection doesn't expose `peer_spki_hash` for inter-worker pinning | PENDING — Sthambha-side schema extension | B-spki (deferred; needs cross-repo change) |
@@ -80,14 +80,14 @@ identify audit gaps the plan addresses.
 | `recent_rpc_ms` can contain NaN/Inf if clock skews backwards | `safe_rpc_ms` (`math.isfinite` + negative reject) at both append (DaemonClient.call) and emit (heartbeat_loop) sites | **A6** (2026-05-20) |
 | Pillar omits `model_sha256` from `/files`; worker fetches without verification | `should_refuse_unverified_fetch` filters candidates lacking `model_sha256`; default true; `STHAMBHA_REFUSE_UNVERIFIED_FETCH=false` opts out for Mode A/B | **A7** (2026-05-20) |
 | `/slice` body `force_keep_token_embd = bool(value)` — lenient bool coercion (same shape as L4 on Sthambha side) | PENDING — `as_strict_bool` helper | D |
-| `/slice` `full_gguf_path` accepts arbitrary paths (`/etc/passwd` probe via subprocess error messages) | PENDING — path sanitization + allowlist root | C |
+| `/slice` `full_gguf_path` accepts arbitrary paths (`/etc/passwd` probe via subprocess error messages) | `validate_slice_path` resolves symlinks, refuses paths outside `NAKSHATRA_SLICE_ROOT` (default = file-server dir), refuses NUL + dangerous Unicode (bidi/zero-width/Math-Alphanumeric/BOM/variation-selectors/C0/C1 ranges; mirror Sthambha L2/M3) | **C4** (2026-05-20) |
 | No audit log for slice spawns, register events, fetch attempts | PENDING — `~/.nakshatra/audit.jsonl` | D |
 | Heartbeat thread blocks 5s on each `urlopen`; no backoff on repeated failures | PENDING — exponential backoff + jitter | D |
 | `attestation_nonce_hex` from pillar accepted as `str(...)` — unbounded, non-hex | PENDING — strict hex validation, length cap | D |
 | `_attestation_nonce` echoed back blindly in next signed envelope | PENDING — re-validate before send | D |
 | `step.prefix_length` from gRPC accepted without bounds check | PENDING — `as_safe_int` helper at parse boundary | D |
 | `step.next_server.address` / `step.chain[].address` unbounded length | PENDING — 256-byte cap (mirror Sthambha O3) | D |
-| `/healthz` discloses GPU model, RAM, idem cache stats, push stats, latency averages → fingerprinting + latency side-channel | PENDING — tiered: `/healthz` minimal, `/healthz/full` AUTHENTICATED | C |
+| `/healthz` discloses GPU model, RAM, idem cache stats, push stats, latency averages → fingerprinting + latency side-channel | `/healthz` anonymous minimal body (`status`, `mode`, `layer_start/end`, `uptime_seconds`, `protocol_version`). Verbose body moves to `/healthz/full` behind AUTHENTICATED tier. | **C5** (2026-05-20) |
 
 ## What's NOT defended
 
@@ -174,6 +174,39 @@ Phases A-D are planned in `~/trisul/plans/2026-05-20-nakshatra-worker-hardening-
 - **Phase A (2026-05-20)** — 8 cheap-win defensive limits: explicit gRPC message-size cap (A1), `Inference` stream idle timeout (A2), `_peer_streams` LRU cap (A3), `STHAMBHA_PILLAR_SPKI_SHA256` strict validation (A4), `STHAMBHA_REFUSE_UNSIGNED` startup gate (A5), `safe_rpc_ms` NaN/Inf guard (A6), `STHAMBHA_REFUSE_UNVERIFIED_FETCH` (default true) on `fetch_sub_gguf_from_peer` (A7), `MAX_CONCURRENT_SLICES=1` + reduced subprocess timeout (A8). 30 new tests added; 66 total worker-side tests passing.
 - **Phase B-auth (2026-05-20)** — gRPC Ed25519 verification + SSRF defense. New module `scripts/nakshatra_grpc_auth.py`: `verify_grpc_call`, `build_grpc_auth_header`, `parse_auth_header`, `resolve_auth_required`, `PillarPeerKeyResolver` (background-refreshed cache of pillar's `/peers` projection; stale-deadline 5min). `WorkerServicer` wires auth check on `Forward` (unary) + `Inference` first-frame (streaming); SSRF check on push to `chain[].address`. New envs: `NAKSHATRA_AUTH_REQUIRED` (default secure when pillar configured), `NAKSHATRA_REFUSE_UNREGISTERED_PEERS` (default true), `NAKSHATRA_PEER_REFRESH_INTERVAL` (default 60s). Canonical-string method tokens `POST` (unary) / `STREAM` (streaming) prevent HTTP↔gRPC and stream↔unary signature replay. Cross-repo wire-contract test confirms byte-identical signatures with `nakshatra_auth.sign_request`. 29 new tests added; 95 total worker-side tests passing.
 - **Phase B-tls (deferred)** — TLS on the gRPC server + cross-worker SPKI pinning. Out of scope for the auth-core ship; gRPC auth is the substantive Mode-C close. TLS adds defense-in-depth against on-path attackers who can still spoof a peer address (within the SSRF allowlist) — material once Sthambha's `/peers` projection exposes `peer_spki_hash` (B-spki, also deferred).
+- **Phase C (2026-05-20)** — HTTP file-server tier model + path sanitization + operator-key handling. Three tiers (`TIER_ANONYMOUS`, `TIER_AUTHENTICATED`, `TIER_OPERATOR`); `_check_tier` middleware on `FileServerHandler`; `/healthz` minimal/full split; `validate_slice_path` root-bounds + Unicode-safe; operator pubkey loaded from `~/.nakshatra/keys/operator.pub.hex`. 29 new tests added; 124 total worker-side tests passing.
+
+## Operator-key install
+
+The operator key gates `POST /slice` (the only route that spawns a
+subprocess). It's intentionally **separate** from the network-auth
+keypair: rotating the operator key is a filesystem operation, not a
+network event, so a compromised pillar can't grant slicer access.
+
+To install on a worker host:
+
+```
+mkdir -p ~/.nakshatra/keys
+echo "<64-char-hex-pubkey>" > ~/.nakshatra/keys/operator.pub.hex
+chmod 600 ~/.nakshatra/keys/operator.pub.hex
+```
+
+The hex value is the Ed25519 public key of whichever keypair the
+operator uses to sign slice requests. Pair the worker-side public key
+with the operator's private key on a separate, controlled machine.
+Future `nakshatra-cli operator install` wraps this; today it's a
+manual write.
+
+Without an installed operator pubkey, every `POST /slice` is refused
+with HTTP 403 — slicer functionality is opt-in.
+
+## `NAKSHATRA_SLICE_ROOT`
+
+`POST /slice` accepts a `full_gguf_path` field naming the source GGUF
+to cut. `validate_slice_path` requires that path (after symlink
+resolution) to live under the directory named by `NAKSHATRA_SLICE_ROOT`.
+Default: the file-server's directory (parent of `--sub-gguf`). Operators
+can set this explicitly to widen or narrow scope.
 
 ## Related
 

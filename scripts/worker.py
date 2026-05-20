@@ -228,6 +228,213 @@ def _running_slice_count() -> int:
         )
 
 
+# ── Phase C (worker hardening sprint, 2026-05-20) ─────────────────────
+# HTTP tier model + path sanitization + operator key.
+#
+# Three tiers (mirror Sthambha's C tier model):
+#
+#   ANONYMOUS    — discoverable without auth; minimal body (peer
+#                  discovery / liveness only).
+#   AUTHENTICATED — Sthambha-Ed25519 signature whose keyid resolves
+#                  through the pillar's /peers projection.
+#   OPERATOR     — signature against a separately-installed operator
+#                  pubkey at OPERATOR_PUBKEY_PATH. Independent of the
+#                  pillar's TOFU lock; rotating an operator key is a
+#                  filesystem operation, not a network one.
+
+TIER_ANONYMOUS = "anonymous"
+TIER_AUTHENTICATED = "authenticated"
+TIER_OPERATOR = "operator"
+
+OPERATOR_PUBKEY_PATH = Path.home() / ".nakshatra" / "keys" / "operator.pub.hex"
+
+# Phase C4 — dangerous Unicode ranges to refuse in `full_gguf_path`.
+# Mirrors Sthambha L2/M3 denylists. UTF-8 letters/digits/punctuation in
+# any script are accepted; ranges below are abuse-only.
+_DANGEROUS_UNICODE_RANGES = [
+    (0x0000, 0x001F),  # C0 controls (TAB allowed separately)
+    (0x007F, 0x009F),  # DEL + C1 controls
+    (0x200B, 0x200F),  # zero-width / bidi controls
+    (0x202A, 0x202E),  # bidi LRE/RLE/PDF/LRO/RLO
+    (0x2060, 0x206F),  # word joiner, invisible separators
+    (0xFE00, 0xFE0F),  # variation selectors
+    (0xFEFF, 0xFEFF),  # BOM
+    (0x1D400, 0x1D7FF),  # Mathematical Alphanumeric Symbols (L2-bypass risk)
+    (0xE0000, 0xE007F),  # tag characters
+    (0xE0100, 0xE01EF),  # variation selectors supplement
+]
+
+
+def _load_operator_pubkey(
+    path: Path = OPERATOR_PUBKEY_PATH,
+) -> Optional[str]:
+    """Phase C3 — read the operator pubkey hex from disk.
+
+    Returns the canonicalised lowercase hex (64 chars), or None if the
+    file is missing / unreadable / malformed. Operators install by
+    writing the 64-character hex to OPERATOR_PUBKEY_PATH with mode 600.
+    A future ``nakshatra-cli operator install`` will wrap this.
+    """
+    try:
+        if not path.is_file():
+            return None
+        raw = path.read_text().strip().lower()
+    except OSError:
+        return None
+    if len(raw) != 64:
+        return None
+    try:
+        bytes.fromhex(raw)
+    except ValueError:
+        return None
+    return raw
+
+
+def _has_dangerous_unicode(s: str) -> bool:
+    """Phase C4 — True if ``s`` contains a codepoint in
+    `_DANGEROUS_UNICODE_RANGES` or a NUL byte."""
+    if "\x00" in s:
+        return True
+    for ch in s:
+        cp = ord(ch)
+        for lo, hi in _DANGEROUS_UNICODE_RANGES:
+            if lo <= cp <= hi:
+                return True
+    return False
+
+
+def validate_slice_path(raw_path: str, root: Path) -> Path:
+    """Phase C4 — sanitize an operator-supplied ``full_gguf_path``.
+
+    Returns the resolved Path on success; raises ValueError on:
+      - empty path
+      - NUL byte or dangerous Unicode
+      - relative path that doesn't resolve under ``root``
+      - symlink escape past ``root``
+      - non-existent / non-file target
+
+    ``root`` is the filesystem root operators have declared via
+    NAKSHATRA_SLICE_ROOT (defaults to the file-server's directory).
+    """
+    if not raw_path or not raw_path.strip():
+        raise ValueError("full_gguf_path must not be empty")
+    if _has_dangerous_unicode(raw_path):
+        raise ValueError("full_gguf_path contains a dangerous Unicode codepoint")
+    try:
+        resolved = Path(raw_path).resolve()
+        root_resolved = root.resolve()
+    except (OSError, RuntimeError) as e:
+        raise ValueError(f"path resolve failed: {e}")
+    # Path.is_relative_to (3.9+) — root-bound check after symlink resolution.
+    try:
+        resolved.relative_to(root_resolved)
+    except ValueError:
+        raise ValueError(
+            f"full_gguf_path must resolve under {root_resolved!r}; "
+            f"got {resolved!r}"
+        )
+    if not resolved.is_file():
+        raise ValueError(f"full_gguf_path is not a regular file: {resolved!r}")
+    return resolved
+
+
+# ── HTTP auth check helpers ──────────────────────────────────────────
+
+
+def _parse_http_auth_header(header: str) -> tuple[str, str, int]:
+    """Parse the Sthambha-Ed25519 HTTP Authorization header.
+
+    Symmetric with `nakshatra_grpc_auth.parse_auth_header`; we keep a
+    separate copy here to avoid a hard dependency from worker.py's HTTP
+    surface on the gRPC module (failure-soft imports keep the file-
+    server runnable even when the gRPC auth deps are absent)."""
+    if not header:
+        raise ValueError("missing authorization header")
+    import re as _re
+    m = _re.fullmatch(
+        r'\s*Sthambha-Ed25519\s+keyid="([^"]*)",sig="([^"]*)",ts="([^"]*)"\s*',
+        header,
+    )
+    if not m:
+        raise ValueError("malformed authorization header")
+    keyid, sig_b64, ts_str = m.groups()
+    if not keyid:
+        raise ValueError("empty keyid")
+    if not sig_b64:
+        raise ValueError("empty signature")
+    try:
+        ts = int(ts_str)
+    except (TypeError, ValueError):
+        raise ValueError("timestamp not an integer")
+    return keyid, sig_b64, ts
+
+
+def verify_http_request(
+    auth_header: str,
+    method: str, path: str, body: bytes,
+    *,
+    operator_pubkey: Optional[str],
+    peer_resolver,  # PillarPeerKeyResolver or None
+    tier: str,
+    now_seconds: Optional[int] = None,
+    window_s: float = 60.0,
+) -> Optional[str]:
+    """Phase C — verify an HTTP request's Sthambha-Ed25519 signature for
+    the given tier. Returns the verified keyid on success; raises
+    ValueError on any failure.
+
+    For TIER_ANONYMOUS this is a no-op (returns None).
+    For TIER_AUTHENTICATED the keyid must resolve through ``peer_resolver``.
+    For TIER_OPERATOR the keyid is irrelevant; the signature must verify
+    against ``operator_pubkey``.
+    """
+    if tier == TIER_ANONYMOUS:
+        return None
+    keyid, sig_b64, ts = _parse_http_auth_header(auth_header)
+    current = now_seconds if now_seconds is not None else int(time.time())
+    if abs(current - ts) > window_s:
+        raise ValueError(f"timestamp out of window (skew={current - ts}s)")
+
+    if tier == TIER_OPERATOR:
+        if not operator_pubkey:
+            raise ValueError(
+                "no operator pubkey installed at ~/.nakshatra/keys/operator.pub.hex"
+            )
+        # Lazy import: avoid pulling nakshatra_auth at module top in case
+        # the auth module is unavailable in a degraded bringup.
+        if not _AUTH_AVAILABLE:
+            raise ValueError("nakshatra_auth unavailable; cannot verify operator signature")
+        if not _wauth.verify_request(
+            operator_pubkey, method, path, body, ts, sig_b64
+        ):
+            raise ValueError("operator signature mismatch")
+        return keyid
+
+    if tier == TIER_AUTHENTICATED:
+        if peer_resolver is None:
+            raise ValueError("no peer resolver configured")
+        pub_hex = peer_resolver.resolve(keyid)
+        if not pub_hex:
+            raise ValueError(f"unknown keyid: {keyid!r}")
+        if not _AUTH_AVAILABLE:
+            raise ValueError("nakshatra_auth unavailable; cannot verify signature")
+        if not _wauth.verify_request(pub_hex, method, path, body, ts, sig_b64):
+            raise ValueError("signature mismatch")
+        return keyid
+
+    raise ValueError(f"unknown tier: {tier!r}")
+
+
+# Module-level state populated by main() so the per-request
+# FileServerHandler can read it without constructor plumbing.
+_HTTP_AUTH_STATE: dict = {
+    "auth_required": False,
+    "operator_pubkey": None,
+    "peer_resolver": None,
+    "slice_root": None,
+}
+
+
 class DaemonClient:
     """Manages a long-lived llama-nakshatra-worker subprocess over stdin/stdout."""
 
@@ -1213,6 +1420,55 @@ class FileServerHandler(BaseHTTPRequestHandler):
         # sys.stderr.write(f"[fileserver] {self.address_string()} {format % args}\n")
         pass
 
+    # Phase C (worker hardening sprint, 2026-05-20) — per-route tier
+    # gate. Returns the verified keyid (or None for anonymous) on
+    # success; emits HTTP 401/403 and returns False on failure.
+    def _check_tier(self, tier: str, *, body: bytes = b"") -> bool:
+        """Verify the call against the declared tier. Sends the error
+        response itself; returns True iff the call should proceed."""
+        if tier == TIER_ANONYMOUS:
+            return True
+        if not _HTTP_AUTH_STATE.get("auth_required"):
+            # Legacy Mode-A bringup: tier checks are skipped for
+            # AUTHENTICATED routes but OPERATOR still requires the
+            # operator pubkey (independent of network auth).
+            if tier == TIER_OPERATOR:
+                pass  # fall through to verify
+            else:
+                return True
+        auth_header = self.headers.get("Authorization", "")
+        try:
+            verify_http_request(
+                auth_header,
+                method=self.command,
+                path=self.path,
+                body=body,
+                operator_pubkey=_HTTP_AUTH_STATE.get("operator_pubkey"),
+                peer_resolver=_HTTP_AUTH_STATE.get("peer_resolver"),
+                tier=tier,
+            )
+            return True
+        except ValueError as e:
+            status = 401 if tier == TIER_AUTHENTICATED else 403
+            self.send_error(status, f"{tier}: {e}")
+            return False
+
+    def _minimal_health_payload(self):
+        """Phase C5 — anonymous tier payload. Operators / clients
+        verify liveness + basic identity without leaking GPU/RAM/idem
+        cache stats (those go on /healthz/full)."""
+        daemon = _HEALTH_STATE.get("daemon")
+        daemon_alive = daemon is not None and daemon.proc.poll() is None
+        started_at = _HEALTH_STATE.get("started_at", time.time())
+        return {
+            "status": "ok" if daemon_alive else "down",
+            "mode": _HEALTH_STATE.get("mode", ""),
+            "layer_start": _HEALTH_STATE.get("layer_start", -1),
+            "layer_end": _HEALTH_STATE.get("layer_end", -1),
+            "uptime_seconds": round(time.time() - started_at, 1),
+            "protocol_version": "0.1.0",
+        }
+
     def _health_payload(self):
         daemon = _HEALTH_STATE.get("daemon")
         daemon_alive = daemon is not None and daemon.proc.poll() is None
@@ -1250,7 +1506,28 @@ class FileServerHandler(BaseHTTPRequestHandler):
         }
 
     def do_GET(self):
+        # Phase C5: minimal anonymous /healthz, verbose /healthz/full
+        # behind AUTHENTICATED. Anonymous body discloses only liveness +
+        # mode + layer range + uptime; everything else is on the
+        # authenticated path.
         if self.path in ("/", "/health", "/healthz"):
+            if not self._check_tier(TIER_ANONYMOUS):
+                return
+            payload = self._minimal_health_payload()
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(
+                200 if payload["status"] == "ok" else 503
+            )
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        if self.path == "/healthz/full":
+            if not self._check_tier(TIER_AUTHENTICATED):
+                return
             payload = self._health_payload()
             body = json.dumps(payload).encode("utf-8")
             self.send_response(200 if payload["daemon_alive"] else 503)
@@ -1262,6 +1539,8 @@ class FileServerHandler(BaseHTTPRequestHandler):
             return
 
         if self.path.startswith("/slice/"):
+            if not self._check_tier(TIER_AUTHENTICATED):
+                return
             task_id = self.path[len("/slice/"):]
             snap = _slice_task_snapshot(task_id)
             if not snap:
@@ -1278,6 +1557,11 @@ class FileServerHandler(BaseHTTPRequestHandler):
 
         if not self.path.startswith("/file/"):
             self.send_error(404, "not found")
+            return
+
+        # Phase C2: /file/<basename> is AUTHENTICATED — model weights
+        # are not public artefacts on a Mode-C deployment.
+        if not self._check_tier(TIER_AUTHENTICATED):
             return
 
         # Sanitize: only allow simple basenames, no traversal
@@ -1344,8 +1628,14 @@ class FileServerHandler(BaseHTTPRequestHandler):
         if length <= 0 or length > 64 * 1024:
             self.send_error(400, "body required (<= 64KB)")
             return
+        raw_body = self.rfile.read(length)
+        # Phase C2: OPERATOR tier — slicing spawns subprocess; only the
+        # operator key (filesystem-scoped, not network-resolved) can
+        # authorise. Signature covers the raw body bytes.
+        if not self._check_tier(TIER_OPERATOR, body=raw_body):
+            return
         try:
-            body = json.loads(self.rfile.read(length))
+            body = json.loads(raw_body)
         except Exception as e:
             self.send_error(400, f"bad json: {e}")
             return
@@ -1364,9 +1654,17 @@ class FileServerHandler(BaseHTTPRequestHandler):
         if not model_id:
             self.send_error(400, "model_id required")
             return
-        if not full_gguf_path or not os.path.isfile(full_gguf_path):
-            self.send_error(400, f"full_gguf_path not found: {full_gguf_path!r}")
+        # Phase C4: root-bound + unicode-safe path validation. Replaces
+        # the prior `os.path.isfile()` check that accepted ANY readable
+        # path — attacker could pass /etc/passwd to probe filesystem
+        # via subprocess error messages.
+        slice_root = _HTTP_AUTH_STATE.get("slice_root") or Path(_FILE_SERVER_DIR)
+        try:
+            resolved_gguf = validate_slice_path(full_gguf_path, slice_root)
+        except ValueError as e:
+            self.send_error(400, f"full_gguf_path: {e}")
             return
+        full_gguf_path = str(resolved_gguf)
         if layer_end <= layer_start or layer_start < 0:
             self.send_error(400, "layer_end must be > layer_start >= 0")
             return
@@ -2184,6 +2482,7 @@ def main():
         peer_refresh_interval = float(
             os.environ.get("NAKSHATRA_PEER_REFRESH_INTERVAL", "60.0")
         )
+        resolver = None
         if (_GRPC_AUTH_AVAILABLE and (auth_required or refuse_unregistered_peers)
                 and args.pillar_url):
             resolver = _wgrpcauth.PillarPeerKeyResolver(
@@ -2206,6 +2505,37 @@ def main():
                 "[worker] WARN: NAKSHATRA_AUTH_REQUIRED=true but no "
                 "--pillar-url is set; auth will reject every gRPC call "
                 "since there's no resolver. Did you forget --pillar-url?",
+                flush=True,
+            )
+
+        # Phase C (2026-05-20): populate the HTTP auth state read by
+        # FileServerHandler. Same resolver as gRPC auth (shared cache).
+        # Operator pubkey is loaded once at startup; rotation requires
+        # restart (good — operator key rotations are infrequent and
+        # serious enough that a planned restart is fine).
+        operator_pubkey = _load_operator_pubkey()
+        slice_root = Path(
+            os.environ.get("NAKSHATRA_SLICE_ROOT", "").strip()
+            or str(Path(args.sub_gguf).resolve().parent)
+        )
+        _HTTP_AUTH_STATE.update({
+            "auth_required": auth_required,
+            "operator_pubkey": operator_pubkey,
+            "peer_resolver": resolver,
+            "slice_root": slice_root,
+        })
+        if operator_pubkey:
+            print(
+                f"[worker] operator pubkey installed: "
+                f"{operator_pubkey[:16]}… (POST /slice gated by signature "
+                f"against this key)",
+                flush=True,
+            )
+        else:
+            print(
+                f"[worker] no operator pubkey at {OPERATOR_PUBKEY_PATH}; "
+                f"POST /slice will refuse all callers. Install with: "
+                f"echo '<hex>' > {OPERATOR_PUBKEY_PATH} && chmod 600 {OPERATOR_PUBKEY_PATH}",
                 flush=True,
             )
 
