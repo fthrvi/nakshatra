@@ -36,6 +36,7 @@ import uuid
 from concurrent import futures
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
+from typing import Optional
 from urllib import request as urlrequest, error as urlerror
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -43,6 +44,16 @@ sys.path.insert(0, str(Path(__file__).parent))
 import grpc
 import nakshatra_pb2 as pb
 import nakshatra_pb2_grpc as pb_grpc
+
+# Phase F (worker hardening sprint, 2026-05-19): Ed25519-signed pillar
+# requests + optional TLS SPKI pinning. cryptography is a runtime dep
+# pinned in setup.cfg to match Sthambha's range.
+try:
+    import nakshatra_auth as _wauth
+    _AUTH_AVAILABLE = True
+except ImportError as _e:
+    _AUTH_AVAILABLE = False
+    _AUTH_IMPORT_ERR = _e
 
 
 CMD_TOKEN_DECODE = 1
@@ -518,16 +529,55 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
             return
 
 
-def register_with_pillar(pillar_url: str, payload: dict, log_prefix: str = "[worker]"):
-    """POST to <pillar_url>/peer. Best-effort: log on failure, never raise."""
+def register_with_pillar(pillar_url: str, payload: dict, log_prefix: str = "[worker]",
+                          priv_key: Optional[bytes] = None,
+                          node_id: Optional[str] = None,
+                          spki_hash: Optional[str] = None):
+    """POST to <pillar_url>/peer. Best-effort: log on failure, never raise.
+
+    Phase F2: when ``priv_key`` + ``node_id`` are provided, the request
+    gets a signed Authorization header. TOFU first-registration includes
+    ``public_key_hex`` in the body (worker_auth helper handles that
+    upstream by inserting the field into ``payload`` before this call).
+
+    Phase F3: when ``spki_hash`` is provided and the URL is HTTPS, the
+    pillar's TLS cert SPKI is verified against it. Mismatch → refusal.
+    """
+    body_bytes = json.dumps(payload).encode()
+    path = "/peer"
+    headers = {"Content-Type": "application/json"}
+    if _AUTH_AVAILABLE and priv_key and node_id:
+        header_val, _ts = _wauth.build_signed_envelope(
+            priv_key, node_id, "POST", path, body_bytes)
+        headers["Authorization"] = header_val
+
+    full_url = f"{pillar_url.rstrip('/')}{path}"
     try:
         req = urlrequest.Request(
-            f"{pillar_url.rstrip('/')}/peer",
-            data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"},
-            method="POST",
+            full_url, data=body_bytes, headers=headers, method="POST",
         )
-        with urlrequest.urlopen(req, timeout=5) as resp:
+        context = None
+        if full_url.startswith("https://"):
+            if not _AUTH_AVAILABLE:
+                print(f"{log_prefix} HTTPS pillar URL but auth module missing; "
+                      f"refusing connection", flush=True)
+                return False
+            context = _wauth.build_pillar_ssl_context(spki_hash)
+        with urlrequest.urlopen(req, timeout=5, context=context) as resp:
+            # SPKI pinning happens *after* the handshake. If the pillar
+            # served a cert whose SPKI doesn't match expected_hash, the
+            # connection still succeeded at TCP/TLS but we refuse before
+            # consuming the response.
+            if (full_url.startswith("https://") and spki_hash
+                    and _AUTH_AVAILABLE):
+                sock = resp.fp.raw._sock if hasattr(resp.fp, "raw") else None
+                if sock is not None and hasattr(sock, "getpeercert"):
+                    der = sock.getpeercert(binary_form=True)
+                    try:
+                        _wauth.verify_pillar_cert_spki(der, spki_hash)
+                    except _wauth.PillarSpkiMismatch as e:
+                        print(f"{log_prefix} REFUSED: {e}", flush=True)
+                        return False
             body = resp.read().decode()
             print(f"{log_prefix} registered with pillar: {body}", flush=True)
             return True
@@ -538,13 +588,22 @@ def register_with_pillar(pillar_url: str, payload: dict, log_prefix: str = "[wor
 
 def heartbeat_loop(pillar_url: str, payload: dict, interval: float = 30.0,
                    stop_event: threading.Event = None,
-                   daemon_for_timing=None):
+                   daemon_for_timing=None,
+                   priv_key: Optional[bytes] = None,
+                   node_id: Optional[str] = None,
+                   spki_hash: Optional[str] = None):
     """Re-register with pillar every `interval` seconds. Run as daemon thread.
 
     Phase H: if `daemon_for_timing` is supplied, refresh the heartbeat
     payload's `recent_rpc_ms` field with the average of the daemon's
     last N call timings. The pillar then has up-to-date latency data
     for peer-ranking.
+
+    Phase F2: ``priv_key`` + ``node_id`` + ``spki_hash`` are plumbed
+    through to register_with_pillar so heartbeats stay signed + cert-
+    pinned. Heartbeat payloads omit ``public_key_hex`` after the first
+    successful registration — the pillar's TOFU lock already remembers
+    the key.
     """
     stop_event = stop_event or threading.Event()
     while not stop_event.is_set():
@@ -553,7 +612,9 @@ def heartbeat_loop(pillar_url: str, payload: dict, interval: float = 30.0,
         if daemon_for_timing is not None and daemon_for_timing.recent_rpc_ms:
             avg = sum(daemon_for_timing.recent_rpc_ms) / len(daemon_for_timing.recent_rpc_ms)
             payload["recent_rpc_ms"] = avg
-        register_with_pillar(pillar_url, payload, log_prefix="[heartbeat]")
+        register_with_pillar(pillar_url, payload, log_prefix="[heartbeat]",
+                              priv_key=priv_key, node_id=node_id,
+                              spki_hash=spki_hash)
 
 
 _FILE_SERVER_DIR = ""
@@ -1609,15 +1670,50 @@ def main():
             "cached_files": cached_files,
             "recent_rpc_ms": 0.0,  # Phase H — populated by heartbeat as data accrues
         }
-        register_with_pillar(args.pillar_url, register_payload)
+        # Phase F2: load or create the worker's persistent Ed25519
+        # keypair; include public_key_hex in the FIRST registration so
+        # the pillar locks it via TOFU. Subsequent heartbeats sign with
+        # the same key but omit public_key_hex from the body.
+        worker_priv: Optional[bytes] = None
+        worker_pub_hex = ""
+        if _AUTH_AVAILABLE:
+            try:
+                worker_priv, worker_pub_hex = _wauth.load_or_create_worker_key()
+                register_payload["public_key_hex"] = worker_pub_hex
+            except Exception as e:
+                print(f"[worker] WARN: could not load worker key ({e}); "
+                      f"requests will go unsigned. This will fail against "
+                      f"any pillar with STHAMBHA_AUTH_REQUIRED=true.",
+                      flush=True)
+        else:
+            print(f"[worker] WARN: nakshatra_auth import failed "
+                  f"({_AUTH_IMPORT_ERR}); requests will go unsigned",
+                  flush=True)
+        # Phase F3: env-pinned pillar SPKI for HTTPS connections.
+        spki_hash = os.environ.get("STHAMBHA_PILLAR_SPKI_SHA256", "").strip() or None
+        if args.pillar_url.startswith("https://") and not spki_hash:
+            print(f"[worker] WARN: HTTPS pillar URL but no SPKI hash pinned "
+                  f"via STHAMBHA_PILLAR_SPKI_SHA256; cert identity NOT verified",
+                  flush=True)
+        register_with_pillar(args.pillar_url, register_payload,
+                             priv_key=worker_priv, node_id=node_id,
+                             spki_hash=spki_hash)
+        # Heartbeat payload omits public_key_hex after the first call —
+        # the pillar's TOFU lock remembers it.
+        heartbeat_payload = {k: v for k, v in register_payload.items()
+                             if k != "public_key_hex"}
         heartbeat_thread = threading.Thread(
             target=heartbeat_loop,
-            args=(args.pillar_url, register_payload, 30.0, stop_event),
-            kwargs={"daemon_for_timing": daemon},
+            args=(args.pillar_url, heartbeat_payload, 30.0, stop_event),
+            kwargs={"daemon_for_timing": daemon,
+                    "priv_key": worker_priv, "node_id": node_id,
+                    "spki_hash": spki_hash},
             daemon=True,
         )
         heartbeat_thread.start()
-        print(f"[worker] heartbeat → {args.pillar_url} every 30s as {node_id} @ {public_addr}", flush=True)
+        print(f"[worker] heartbeat → {args.pillar_url} every 30s as {node_id} @ {public_addr}"
+              + (f" (signed; pubkey={worker_pub_hex[:16]}…)" if worker_pub_hex else " (UNSIGNED)"),
+              flush=True)
 
     try:
         server.wait_for_termination()
