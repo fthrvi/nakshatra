@@ -194,19 +194,30 @@ subprocess). It's intentionally **separate** from the network-auth
 keypair: rotating the operator key is a filesystem operation, not a
 network event, so a compromised pillar can't grant slicer access.
 
-To install on a worker host:
+To install on a worker host (recommended via CLI):
+
+```
+nakshatra-cli operator install --pubkey <64-char-hex-pubkey>
+```
+
+The hex value is the Ed25519 public key of whichever keypair the
+operator uses to sign slice requests. Pair the worker-side public key
+with the operator's private key on a separate, controlled machine.
+
+The CLI writes `~/.nakshatra/keys/operator.pub.hex` (mode 0o600,
+atomic via `.tmp` + `os.replace`) and validates that the hex is the
+right shape before writing. If the operator's keypair lives on this
+machine too (uncommon — the whole point of separation is that it
+shouldn't), `nakshatra-cli operator install --from-key <name>` reads
+the pubkey from `~/.nakshatra/keys/<name>.ed25519` directly.
+
+Manual install (equivalent, for environments without the CLI):
 
 ```
 mkdir -p ~/.nakshatra/keys
 echo "<64-char-hex-pubkey>" > ~/.nakshatra/keys/operator.pub.hex
 chmod 600 ~/.nakshatra/keys/operator.pub.hex
 ```
-
-The hex value is the Ed25519 public key of whichever keypair the
-operator uses to sign slice requests. Pair the worker-side public key
-with the operator's private key on a separate, controlled machine.
-Future `nakshatra-cli operator install` wraps this; today it's a
-manual write.
 
 Without an installed operator pubkey, every `POST /slice` is refused
 with HTTP 403 — slicer functionality is opt-in.
