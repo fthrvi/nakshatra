@@ -80,7 +80,9 @@ def generate_self_signed_cert(
         x509.NameAttribute(NameOID.COMMON_NAME, hostname),
         x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Nakshatra"),
     ])
-    now = datetime.datetime.now(datetime.UTC)
+    # datetime.UTC was added in Python 3.11; use timezone.utc for back-
+    # compat with the 3.9-era venvs on some cluster machines.
+    now = datetime.datetime.now(datetime.timezone.utc)
     cert = (
         x509.CertificateBuilder()
         .subject_name(subject)
