@@ -1,0 +1,29 @@
+# Full inference-chain cluster smoke — exercises B-auth + Phase 3 SPKI pin
+# end-to-end with real workers on home-pc + node-e.
+#
+#   w0:    node-a (Linux/CPU), layers [0,14)  port 5560
+#   wlast: node-e (Mac/CPU), layers [14,28)                        port 5561
+#
+# Different ports (5560/5561) from the always-running v0.1 70B cluster
+# (5530-5534) so this smoke doesn't disturb the existing setup.
+#
+# Pillar lives on home-pc:7778 (set via env, not in this file).
+model:
+  id: "prithvi-q8"
+  hidden_size: 3072
+  num_blocks: 28
+  wire_dtype: f32
+
+workers:
+  - id: smoke-first
+    address: 203.0.113.10      # node-a
+    port: 5560
+    layer_range: [0, 14]
+    sub_gguf_path: /tmp/cuts-smoke/w0_v2.gguf
+    mode: first
+  - id: smoke-last
+    address: 203.0.113.11      # node-e (lab Mac)
+    port: 5561
+    layer_range: [14, 28]
+    sub_gguf_path: /tmp/wlast_v2.gguf
+    mode: last
