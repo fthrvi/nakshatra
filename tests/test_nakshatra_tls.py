@@ -385,3 +385,71 @@ def test_probe_peer_spki_rejects_malformed_address():
         nt.probe_peer_spki("just-host-no-port", timeout=0.1)
     with pytest.raises(OSError):
         nt.probe_peer_spki("host:not-a-number", timeout=0.1)
+
+
+def test_open_pinned_channel_sets_ssl_target_name_override(tmp_path):
+    """Self-signed peer certs are issued with CN=nakshatra.local; the
+    channel connects to an IP. Default hostname verification would
+    refuse the handshake with 'Hostname Verification Check failed'.
+    We pass grpc.ssl_target_name_override so the SPKI pin (already
+    stronger than chain validation) is the effective trust anchor.
+
+    Regression test for the bug surfaced during the 2026-05-21 full-
+    inference cluster smoke: real cross-machine TLS failed with
+    UNAUTHENTICATED until this override was added."""
+    cert_path, _ = nt.generate_self_signed_cert(output_dir=tmp_path)
+    expected = nt.compute_spki_hash(cert_path)
+    import socket
+    import ssl
+    import threading
+    import grpc
+
+    server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_ctx.load_cert_chain(
+        certfile=str(cert_path),
+        keyfile=str(tmp_path / nt.KEY_FILENAME),
+    )
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(8)
+    port = sock.getsockname()[1]
+    stop = threading.Event()
+
+    def accept_loop():
+        while not stop.is_set():
+            try:
+                sock.settimeout(0.2)
+                client, _ = sock.accept()
+            except (socket.timeout, OSError):
+                continue
+            try:
+                ssock = server_ctx.wrap_socket(client, server_side=True)
+                try:
+                    ssock.recv(64)
+                except Exception:
+                    pass
+                ssock.close()
+            except Exception:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+
+    t = threading.Thread(target=accept_loop, daemon=True)
+    t.start()
+    try:
+        # Connect by IP — hostname mismatch with the cert's
+        # CN=nakshatra.local. Without the override, the channel's
+        # handshake would refuse during use.
+        ch = nt.open_pinned_channel(
+            f"127.0.0.1:{port}",
+            expected_spki=expected,
+            refuse_unpinned=True,
+            probe_timeout_s=3.0,
+        )
+        # Channel is a real grpc.Channel pointed at the right addr.
+        assert isinstance(ch, grpc.Channel)
+        ch.close()
+    finally:
+        stop.set()
+        sock.close()

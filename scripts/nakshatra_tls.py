@@ -360,5 +360,16 @@ def open_pinned_channel(
             expected=expected_spki,
             actual=actual_spki,
         )
+    # Self-signed peer certs are issued with CN=nakshatra.local (per
+    # generate_self_signed_cert). The gRPC channel connects to an IP
+    # (e.g. 203.0.113.11:5561) so the default hostname-verification
+    # check would refuse the handshake. We're already pinning the SPKI
+    # (RFC 7469 cert-pinning is stricter than hostname check + chain
+    # validation combined), so override the expected server name to
+    # the cert's documented CN. Mismatches in EITHER direction would
+    # have failed the SPKI compare above.
     creds = grpc.ssl_channel_credentials(root_certificates=cert_pem)
-    return grpc.secure_channel(address, creds)
+    return grpc.secure_channel(
+        address, creds,
+        options=[("grpc.ssl_target_name_override", "nakshatra.local")],
+    )
