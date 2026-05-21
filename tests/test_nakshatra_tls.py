@@ -231,3 +231,157 @@ def test_resolve_tls_required_unset_with_pillar_is_true():
     assert nt.resolve_tls_required(None, "http://pillar:5530") is True
     assert nt.resolve_tls_required("", "http://pillar:5530") is True
     assert nt.resolve_tls_required("   ", "https://pillar:5531") is True
+
+
+# ── 2026-05-21 SPKI Phase 3.3+3.4 — open_pinned_channel ──────────────
+
+
+import grpc  # noqa: E402  — needed for type assertions below
+
+
+def test_pin_error_str_for_spki_mismatch():
+    """The PinError __str__ produces the operator-readable reason
+    that the worker's push_failed: emit consumes verbatim. If the
+    format drifts, the v0.5 §9.5 error contract degrades to a less
+    parseable shape."""
+    e = nt.PinError("spki_mismatch", address="mac3:5500",
+                    expected="a" * 64, actual="b" * 64)
+    s = str(e)
+    assert "spki_mismatch" in s
+    assert "mac3:5500" in s
+    # Hashes are abbreviated for log readability.
+    assert "a" * 8 in s
+    assert "b" * 8 in s
+
+
+def test_pin_error_str_for_unpinned():
+    e = nt.PinError("unpinned_peer", address="node-d:5500")
+    s = str(e)
+    assert "unpinned_peer" in s
+    assert "node-d:5500" in s
+
+
+def test_pin_error_str_for_probe_failed():
+    e = nt.PinError("probe_failed", address="dead:5500", error="connection refused")
+    s = str(e)
+    assert "probe_failed" in s
+    assert "dead:5500" in s
+    assert "connection refused" in s
+
+
+def test_open_pinned_channel_no_expected_no_refuse_returns_insecure():
+    """Legacy Mode-A bringup: NAKSHATRA_REFUSE_UNPINNED_PEERS=false
+    + no SPKI → open insecure channel without probing the peer."""
+    ch = nt.open_pinned_channel(
+        "any-host:5500", expected_spki=None, refuse_unpinned=False,
+    )
+    assert isinstance(ch, grpc.Channel)
+    ch.close()
+
+
+def test_open_pinned_channel_unpinned_refuses():
+    """Default Mode-C path: no expected SPKI + refuse_unpinned=True
+    raises PinError("unpinned_peer") without making a network call."""
+    with pytest.raises(nt.PinError) as exc:
+        nt.open_pinned_channel(
+            "any-host:5500", expected_spki=None, refuse_unpinned=True,
+        )
+    assert exc.value.reason == "unpinned_peer"
+    assert exc.value.details["address"] == "any-host:5500"
+
+
+def test_open_pinned_channel_probe_failed_unreachable():
+    """Probe failure (unreachable host) surfaces as
+    PinError("probe_failed") so the caller can emit push_failed and
+    let the client downgrade to client-relay."""
+    # Address that should refuse connection — use a port nothing's
+    # listening on within the short probe timeout window.
+    with pytest.raises(nt.PinError) as exc:
+        nt.open_pinned_channel(
+            "127.0.0.1:1", expected_spki="a" * 64,
+            refuse_unpinned=True, probe_timeout_s=0.3,
+        )
+    assert exc.value.reason == "probe_failed"
+
+
+def test_open_pinned_channel_matches_against_live_server(tmp_path):
+    """End-to-end: stand up a real TLS server with our self-signed
+    cert, then verify open_pinned_channel succeeds with the matching
+    SPKI and refuses with a deliberately-wrong SPKI. This is the
+    single test that exercises the probe → match → secure_channel
+    path without mocking out ssl."""
+    import socket
+    import ssl
+    import threading
+
+    cert_path, key_path = nt.generate_self_signed_cert(output_dir=tmp_path)
+    expected = nt.compute_spki_hash(cert_path)
+    wrong_spki = "0" * 64
+
+    # Stand up a minimal TLS server on a random port. It just accepts
+    # one TLS connection per session (the probe call) and closes.
+    server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_ctx.load_cert_chain(certfile=str(cert_path), keyfile=str(key_path))
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(8)
+    port = sock.getsockname()[1]
+
+    stop = threading.Event()
+
+    def accept_loop():
+        while not stop.is_set():
+            try:
+                sock.settimeout(0.2)
+                client, _ = sock.accept()
+            except (socket.timeout, OSError):
+                continue
+            try:
+                ssock = server_ctx.wrap_socket(client, server_side=True)
+                # Read whatever / nothing; the probe just wants the cert.
+                try:
+                    ssock.recv(64)
+                except Exception:
+                    pass
+                ssock.close()
+            except Exception:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+
+    t = threading.Thread(target=accept_loop, daemon=True)
+    t.start()
+    try:
+        # Match: probe sees the same cert we wrote.
+        ch = nt.open_pinned_channel(
+            f"127.0.0.1:{port}",
+            expected_spki=expected,
+            refuse_unpinned=True,
+            probe_timeout_s=3.0,
+        )
+        assert isinstance(ch, grpc.Channel)
+        ch.close()
+        # Mismatch: same cert, different expected → spki_mismatch.
+        with pytest.raises(nt.PinError) as exc:
+            nt.open_pinned_channel(
+                f"127.0.0.1:{port}",
+                expected_spki=wrong_spki,
+                refuse_unpinned=True,
+                probe_timeout_s=3.0,
+            )
+        assert exc.value.reason == "spki_mismatch"
+        assert exc.value.details["expected"] == wrong_spki
+        assert exc.value.details["actual"] == expected
+    finally:
+        stop.set()
+        sock.close()
+
+
+def test_probe_peer_spki_rejects_malformed_address():
+    """Defensive: an address missing ':port' surfaces as OSError so
+    open_pinned_channel can translate it to probe_failed cleanly."""
+    with pytest.raises(OSError):
+        nt.probe_peer_spki("just-host-no-port", timeout=0.1)
+    with pytest.raises(OSError):
+        nt.probe_peer_spki("host:not-a-number", timeout=0.1)

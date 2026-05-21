@@ -243,3 +243,120 @@ def build_grpc_server_credentials(cert_path: Path | str,
     with open(key_path, "rb") as f:
         key_pem = f.read()
     return grpc.ssl_server_credentials([(key_pem, cert_pem)])
+
+
+# ── 2026-05-21 SPKI Phase 3 — outbound channel pinning ───────────────
+
+
+PROBE_TIMEOUT_S = 5.0
+
+
+class PinError(Exception):
+    """Raised by :func:`open_pinned_channel` when SPKI pinning refuses
+    to complete the channel.
+
+    The ``reason`` field carries one of:
+      - ``"unpinned_peer"`` — no expected SPKI available + refuse_unpinned
+      - ``"probe_failed"`` — TLS probe to the peer's port failed
+      - ``"spki_mismatch"`` — observed SPKI doesn't match expected
+
+    ``details`` carries operator-readable specifics (address, expected
+    hash, observed hash, underlying error) for the audit log.
+    """
+
+    def __init__(self, reason: str, **details):
+        super().__init__(reason)
+        self.reason = reason
+        self.details = details
+
+    def __str__(self) -> str:
+        if self.reason == "spki_mismatch":
+            return (f"spki_mismatch peer={self.details.get('address')} "
+                    f"expected={self.details.get('expected', '')[:8]}… "
+                    f"actual={self.details.get('actual', '')[:8]}…")
+        if self.reason == "unpinned_peer":
+            return f"unpinned_peer peer={self.details.get('address')}"
+        if self.reason == "probe_failed":
+            return (f"probe_failed peer={self.details.get('address')} "
+                    f"error={self.details.get('error')}")
+        return self.reason
+
+
+def probe_peer_spki(
+    address: str,
+    *,
+    timeout: float = PROBE_TIMEOUT_S,
+) -> tuple[str, bytes]:
+    """TLS-probe ``address`` (host:port), fetch the server's leaf
+    certificate, and return ``(spki_hash_hex, cert_pem_bytes)``.
+
+    Uses ``ssl.CERT_NONE`` because the peer's cert is self-signed —
+    chain validation would always fail. The actual identity check is
+    the SPKI hash comparison performed by the caller. The cert PEM
+    we fetch here is then used as the trust anchor for the real gRPC
+    handshake, so a man-in-the-middle that substitutes a different
+    cert between the probe and the gRPC connection still fails the
+    second handshake (gRPC sees a cert that doesn't match the root
+    it was given).
+    """
+    import socket
+    import ssl
+    if ":" not in address:
+        raise OSError(f"address {address!r} missing :port suffix")
+    host, port_s = address.rsplit(":", 1)
+    try:
+        port = int(port_s)
+    except ValueError as e:
+        raise OSError(f"address {address!r}: port not int: {e}")
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    with socket.create_connection((host, port), timeout=timeout) as sock:
+        with ctx.wrap_socket(sock, server_hostname=host) as ssock:
+            cert_der = ssock.getpeercert(binary_form=True)
+    if not cert_der:
+        raise OSError(f"peer {address!r} did not present a certificate")
+    cert_pem = ssl.DER_cert_to_PEM_cert(cert_der).encode()
+    return compute_spki_hash_from_pem(cert_pem), cert_pem
+
+
+def open_pinned_channel(
+    address: str,
+    expected_spki: str | None,
+    *,
+    refuse_unpinned: bool = True,
+    probe_timeout_s: float = PROBE_TIMEOUT_S,
+):
+    """Open a gRPC channel to ``address`` with SPKI pinning.
+
+    - ``expected_spki=None`` + ``refuse_unpinned=True`` raises
+      :class:`PinError` ``unpinned_peer``. (Phase 3 default.)
+    - ``expected_spki=None`` + ``refuse_unpinned=False`` opens an
+      insecure channel — legacy Mode-A bringup.
+    - ``expected_spki=<hex>``: TLS-probe the peer, compare the
+      observed SPKI hash to the expected one. Mismatch raises
+      ``spki_mismatch``. Probe failure raises ``probe_failed``.
+      Match returns a ``grpc.Channel`` whose underlying TLS handshake
+      uses the just-fetched cert as its trust anchor.
+
+    The caller is responsible for closing the returned channel.
+    """
+    import grpc
+    if expected_spki is None:
+        if refuse_unpinned:
+            raise PinError("unpinned_peer", address=address)
+        return grpc.insecure_channel(address)
+    try:
+        actual_spki, cert_pem = probe_peer_spki(
+            address, timeout=probe_timeout_s)
+    except OSError as e:
+        raise PinError("probe_failed", address=address, error=str(e))
+    if actual_spki != expected_spki:
+        raise PinError(
+            "spki_mismatch",
+            address=address,
+            expected=expected_spki,
+            actual=actual_spki,
+        )
+    creds = grpc.ssl_channel_credentials(root_certificates=cert_pem)
+    return grpc.secure_channel(address, creds)

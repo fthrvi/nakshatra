@@ -301,3 +301,168 @@ def test_stats_includes_spki_pin_counts():
     s = r.stats()
     assert s["cached_spki_pins"] == 2
     assert s["cached_spki_total"] == 3
+
+
+# ── 3.3 + 3.5 — WorkerServicer.open_outbound_channel ─────────────────
+
+
+import worker  # noqa: E402  — at the bottom so the resolver tests
+                # above don't pull in the heavy worker.py imports
+                # unless needed.
+
+
+class _StubDaemon:
+    """Smallest viable DaemonClient stand-in for WorkerServicer
+    construction. Real DaemonClient spawns a subprocess; we only need
+    info() to return n_embd for the constructor."""
+
+    def info(self):
+        return {"n_embd": 4096, "n_layers": 64, "gpu_offload_status": {}}
+
+    def gpu_offload_status(self):
+        return {"uses_gpu": False, "n_offloaded": 0,
+                "total_layers": 64, "backend_hints": []}
+
+
+def _build_servicer(*, peer_resolver=None,
+                    refuse_unpinned_peers=True):
+    return worker.WorkerServicer(
+        daemon=_StubDaemon(), mode="middle", layer_start=0, layer_end=8,
+        model_id="test-model", idem_max_entries=8, idem_ttl_seconds=10.0,
+        peer_resolver=peer_resolver,
+        auth_required=False,
+        refuse_unregistered_peers=False,
+        refuse_unpinned_peers=refuse_unpinned_peers,
+    )
+
+
+def test_3_3_open_outbound_channel_refuses_unpinned_by_default(capsys):
+    """No resolver attached + refuse_unpinned_peers=True → PinError
+    on the unpinned-peer path. Counter increments + audit emit."""
+    s = _build_servicer(peer_resolver=None, refuse_unpinned_peers=True)
+    import nakshatra_tls as nt
+    with pytest.raises(nt.PinError) as exc:
+        s._open_outbound_channel("any-peer:5500")
+    assert exc.value.reason == "unpinned_peer"
+    assert s._spki_unpinned_refusals == 1
+
+
+def test_3_3_open_outbound_channel_falls_through_when_policy_off():
+    """refuse_unpinned_peers=False → no pin check; legacy insecure
+    channel returned. Counter does NOT increment (no refusal)."""
+    s = _build_servicer(peer_resolver=None, refuse_unpinned_peers=False)
+    import grpc
+    ch = s._open_outbound_channel("any-peer:5500")
+    assert isinstance(ch, grpc.Channel)
+    assert s._spki_unpinned_refusals == 0
+    ch.close()
+
+
+def test_3_3_open_outbound_channel_uses_resolver_lookup():
+    """With a resolver attached and a peer_spki_hash on file, the
+    channel-open path calls open_pinned_channel with the matching
+    expected hash. Verify the wiring by mocking open_pinned_channel."""
+    resolver = _refresh_with([
+        {"node_id": "alpha", "public_key_hex": "ab" * 32,
+         "address": "alpha-host:5500", "peer_spki_hash": VALID_SPKI_A},
+    ])
+    s = _build_servicer(peer_resolver=resolver, refuse_unpinned_peers=True)
+    import nakshatra_tls as nt
+    seen = {}
+
+    def fake_open(address, expected_spki, *, refuse_unpinned,
+                  probe_timeout_s=5.0):
+        seen["address"] = address
+        seen["expected"] = expected_spki
+        seen["refuse_unpinned"] = refuse_unpinned
+        # Return a sentinel — caller treats it as a channel object.
+        return "mock-channel"
+
+    with patch.object(nt, "open_pinned_channel", side_effect=fake_open):
+        result = s._open_outbound_channel("alpha-host:5500")
+    assert result == "mock-channel"
+    assert seen == {
+        "address": "alpha-host:5500",
+        "expected": VALID_SPKI_A,
+        "refuse_unpinned": True,
+    }
+
+
+def test_3_5_spki_mismatch_emits_audit_and_counts():
+    """On spki_mismatch the worker:
+      - increments _spki_mismatch_refusals
+      - emits an spki_pin_mismatch audit event with both hashes
+      - propagates the PinError so the caller emits push_failed.
+    """
+    resolver = _refresh_with([
+        {"node_id": "alpha", "public_key_hex": "ab" * 32,
+         "address": "alpha-host:5500", "peer_spki_hash": VALID_SPKI_A},
+    ])
+    s = _build_servicer(peer_resolver=resolver, refuse_unpinned_peers=True)
+    import nakshatra_tls as nt
+
+    def fake_open(address, expected_spki, **kwargs):
+        raise nt.PinError(
+            "spki_mismatch",
+            address=address,
+            expected=expected_spki,
+            actual=VALID_SPKI_B,
+        )
+
+    audited = []
+
+    def fake_audit(event, **payload):
+        audited.append((event, payload))
+
+    with patch.object(nt, "open_pinned_channel", side_effect=fake_open):
+        with patch.object(worker, "_audit", side_effect=fake_audit):
+            with pytest.raises(nt.PinError):
+                s._open_outbound_channel("alpha-host:5500")
+    assert s._spki_mismatch_refusals == 1
+    # Exactly one audit event for the operator forensics path.
+    mismatch_events = [a for a in audited if a[0] == "spki_pin_mismatch"]
+    assert len(mismatch_events) == 1
+    payload = mismatch_events[0][1]
+    assert payload["peer"] == "alpha-host:5500"
+    assert payload["expected"] == VALID_SPKI_A
+    assert payload["actual"] == VALID_SPKI_B
+
+
+def test_3_3_probe_failed_increments_counter_and_audits():
+    """A peer that's down or refuses TLS surfaces as probe_failed;
+    the worker counts it separately so operators can distinguish
+    'peer unreachable' from 'peer has wrong cert'."""
+    resolver = _refresh_with([
+        {"node_id": "alpha", "public_key_hex": "ab" * 32,
+         "address": "alpha-host:5500", "peer_spki_hash": VALID_SPKI_A},
+    ])
+    s = _build_servicer(peer_resolver=resolver, refuse_unpinned_peers=True)
+    import nakshatra_tls as nt
+
+    def fake_open(address, expected_spki, **kwargs):
+        raise nt.PinError("probe_failed",
+                          address=address, error="connection refused")
+
+    audited = []
+    with patch.object(nt, "open_pinned_channel", side_effect=fake_open):
+        with patch.object(worker, "_audit",
+                          side_effect=lambda e, **p: audited.append((e, p))):
+            with pytest.raises(nt.PinError):
+                s._open_outbound_channel("alpha-host:5500")
+    assert s._spki_probe_failures == 1
+    assert any(a[0] == "spki_probe_failed" for a in audited)
+
+
+def test_auth_stats_surfaces_spki_counters():
+    """Operators reading /healthz see the three SPKI counters alongside
+    auth + ssrf counters. Each represents a different attacker class —
+    the breakdown is operator-actionable."""
+    s = _build_servicer(refuse_unpinned_peers=True)
+    s._spki_unpinned_refusals = 3
+    s._spki_mismatch_refusals = 1
+    s._spki_probe_failures = 7
+    stats = s.auth_stats()
+    assert stats["refuse_unpinned_peers"] is True
+    assert stats["spki_unpinned_refusals"] == 3
+    assert stats["spki_mismatch_refusals"] == 1
+    assert stats["spki_probe_failures"] == 7

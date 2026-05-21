@@ -612,7 +612,8 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
     def __init__(self, daemon: DaemonClient, mode: str, layer_start: int, layer_end: int, model_id: str,
                  idem_max_entries: int = 6400, idem_ttl_seconds: float = 60.0,
                  peer_resolver=None, auth_required: bool = False,
-                 refuse_unregistered_peers: bool = True):
+                 refuse_unregistered_peers: bool = True,
+                 refuse_unpinned_peers: bool = True):
         self.daemon = daemon
         self.mode = mode
         self.layer_start = layer_start
@@ -625,8 +626,19 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
         self.peer_resolver = peer_resolver
         self.auth_required = auth_required
         self.refuse_unregistered_peers = refuse_unregistered_peers
+        # 2026-05-21 SPKI Phase 3.3: refuse outbound channels to peers
+        # for which the pillar has not (yet) distributed a SPKI hash.
+        # Default true closes the cross-worker MITM gap; operators with
+        # legacy Mode-A clusters set NAKSHATRA_REFUSE_UNPINNED_PEERS=false
+        # and accept plaintext outbound.
+        self.refuse_unpinned_peers = refuse_unpinned_peers
         self._authz_rejections = 0
         self._ssrf_rejections = 0
+        # 2026-05-21 SPKI Phase 3.3+3.5: per-reason counters for the
+        # outbound pin check, surfaced in /healthz.
+        self._spki_unpinned_refusals = 0
+        self._spki_mismatch_refusals = 0
+        self._spki_probe_failures = 0
         self.daemon_info = daemon.info()
         print(f"[worker] daemon info: {self.daemon_info}", flush=True)
         self.n_embd = self.daemon_info["n_embd"]
@@ -691,6 +703,59 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                 "max_entries": self._idem_max, "ttl_seconds": self._idem_ttl,
             }
 
+    def _open_outbound_channel(self, address: str):
+        """2026-05-21 SPKI Phase 3 — open a gRPC channel for outbound
+        push, pinned against the SPKI hash the pillar attests for the
+        destination peer.
+
+        Three refusal arms:
+        - ``unpinned_peer`` — pillar has no SPKI on file for this
+          address (peer is pre-Phase-2 or the cache hasn't seen it
+          yet) and ``refuse_unpinned_peers`` is True.
+        - ``spki_mismatch`` — observed cert SPKI doesn't match the
+          attested one. Audit-emits ``spki_pin_mismatch`` for
+          operator forensics; the worker can detect a substituted
+          peer cert (operator swap without re-registering, or MITM).
+        - ``probe_failed`` — TLS probe to the peer's port failed
+          (peer down, TLS-disabled, wrong port). Surfaces as
+          push_failed; client downgrades to client-relay.
+
+        Returns a ``grpc.Channel`` on success. Caller is responsible
+        for closing it (LRU eviction in ``_get_peer_stream``).
+        """
+        if not _TLS_AVAILABLE:
+            # No TLS module — legacy Mode-A bringup. The Phase 2 boot
+            # path already emitted a WARN; just open insecure.
+            return grpc.insecure_channel(address)
+        expected = (self.peer_resolver.expected_spki(address)
+                    if self.peer_resolver is not None else None)
+        try:
+            return _wtls.open_pinned_channel(
+                address, expected,
+                refuse_unpinned=self.refuse_unpinned_peers,
+            )
+        except _wtls.PinError as e:
+            if e.reason == "unpinned_peer":
+                self._spki_unpinned_refusals += 1
+                _audit("spki_pin_unpinned", peer=address)
+            elif e.reason == "spki_mismatch":
+                self._spki_mismatch_refusals += 1
+                # 3.5 — operator-facing forensic event. Includes the
+                # full expected + actual hashes so the operator can
+                # tell whether they rotated a cert without
+                # re-registering, or whether something more sinister
+                # is going on.
+                _audit("spki_pin_mismatch",
+                       peer=address,
+                       expected=e.details.get("expected"),
+                       actual=e.details.get("actual"))
+            elif e.reason == "probe_failed":
+                self._spki_probe_failures += 1
+                _audit("spki_probe_failed",
+                       peer=address,
+                       error=e.details.get("error"))
+            raise
+
     def _get_peer_stream(self, address: str):
         """Open or reuse a bidi Inference stream to a peer worker.
 
@@ -707,7 +772,16 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
             if cached is not None:
                 self._peer_streams.move_to_end(address)
                 return cached[1], cached[2]
-            channel = grpc.insecure_channel(address)
+            # 2026-05-21 SPKI Phase 3.3 + 3.4 + 3.5: pin the outbound
+            # TLS handshake against the SPKI hash the pillar attests
+            # for this peer. _open_outbound_channel raises PinError on
+            # refuse; the calling Inference handler catches Exception
+            # around _get_peer_stream and emits the structured
+            # push_failed: error message that lets the client downgrade
+            # the session. spki_pin_mismatch audit emission lives in
+            # _open_outbound_channel so it fires before the exception
+            # propagates.
+            channel = self._open_outbound_channel(address)
             stub = pb_grpc.NakshatraStub(channel)
             req_q: queue.Queue = queue.Queue()
 
@@ -747,11 +821,19 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
     def auth_stats(self) -> dict:
         """Phase B (2026-05-20): expose gRPC auth + SSRF defense counters
         for the /healthz endpoint. Useful for operators tracking attacker
-        probes against a Mode-C deployment."""
+        probes against a Mode-C deployment.
+
+        2026-05-21 SPKI Phase 3.3+3.5: extended with outbound pin
+        check counters. ``spki_*`` reflect refusals at the channel-
+        open layer (separate from authz/ssrf which are inbound)."""
         return {
             "auth_required": bool(self.auth_required),
             "authz_rejections": self._authz_rejections,
             "ssrf_rejections": self._ssrf_rejections,
+            "refuse_unpinned_peers": bool(self.refuse_unpinned_peers),
+            "spki_unpinned_refusals": self._spki_unpinned_refusals,
+            "spki_mismatch_refusals": self._spki_mismatch_refusals,
+            "spki_probe_failures": self._spki_probe_failures,
             "resolver": (
                 self.peer_resolver.stats() if self.peer_resolver else None
             ),
@@ -2412,12 +2494,22 @@ def main():
         os.environ.get("NAKSHATRA_REFUSE_UNREGISTERED_PEERS", "true")
         .strip().lower() in ("true", "1", "yes")
     )
+    # 2026-05-21 SPKI Phase 3.3: outbound SPKI pin policy. Default
+    # true closes the cross-worker MITM gap; operators with legacy
+    # Mode-A clusters opt out. Independent of refuse_unregistered_peers:
+    # the SSRF allowlist controls WHO you may push to, the pin
+    # controls WHAT IDENTITY they must present.
+    refuse_unpinned_peers = (
+        os.environ.get("NAKSHATRA_REFUSE_UNPINNED_PEERS", "true")
+        .strip().lower() in ("true", "1", "yes")
+    )
 
     servicer = WorkerServicer(daemon, args.mode, args.layer_start, args.layer_end, args.model_id,
                               idem_max_entries=idem_max_entries,
                               idem_ttl_seconds=args.idempotency_cache_ttl,
                               auth_required=auth_required,
-                              refuse_unregistered_peers=refuse_unregistered_peers)
+                              refuse_unregistered_peers=refuse_unregistered_peers,
+                              refuse_unpinned_peers=refuse_unpinned_peers)
     print(f"[worker] idempotency cache: {args.idempotency_cache_mb} MB "
           f"(~{idem_max_entries} entries @ {IDEM_BYTES_PER_ENTRY//1024} KB), "
           f"ttl={args.idempotency_cache_ttl}s", flush=True)
