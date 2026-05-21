@@ -215,6 +215,17 @@ class PillarPeerKeyResolver:
         self._lock = threading.Lock()
         self._cache: dict[str, str] = {}
         self._addresses: set[str] = set()
+        # 2026-05-21 SPKI Phase 3.1: node_id → peer_spki_hash projection
+        # from /peers. Empty value = peer has not declared a hash
+        # (legacy / pre-Phase-2 worker). Phase 3 pinning treats empty
+        # the same as unknown — refuse outbound when policy says so.
+        self._spki_cache: dict[str, str] = {}
+        # 2026-05-21 SPKI Phase 3.2: address → node_id reverse index so
+        # expected_spki(address) can lookup the hash by the worker's
+        # configured push target. Built from the same /peers payload as
+        # _spki_cache; entries with empty address or empty node_id are
+        # dropped (we don't index unidentifiable peers).
+        self._addr_to_node: dict[str, str] = {}
         self._last_refresh: float = 0.0
         self._refresh_failures: int = 0
         self._stop = threading.Event()
@@ -277,12 +288,27 @@ class PillarPeerKeyResolver:
 
         new_cache: dict[str, str] = {}
         new_addrs: set[str] = set()
+        new_spki: dict[str, str] = {}
+        new_addr_to_node: dict[str, str] = {}
         for peer in (data or {}).get("peers", []):
             if not isinstance(peer, dict):
                 continue
             node_id = str(peer.get("node_id") or "").strip()
             pub_hex = str(peer.get("public_key_hex") or "").strip()
             address = str(peer.get("address") or "").strip()
+            # 2026-05-21 SPKI Phase 3.1: extract peer_spki_hash with
+            # the same shape pillar's parse layer enforces (64 lowercase
+            # hex). A pillar that drifted from the contract (or a
+            # malicious /peers projection) could ship malformed values;
+            # we apply the same defensive parse here.
+            spki_in = str(peer.get("peer_spki_hash") or "").strip().lower()
+            if spki_in and len(spki_in) == 64:
+                try:
+                    bytes.fromhex(spki_in)
+                except ValueError:
+                    spki_in = ""
+            else:
+                spki_in = ""
             # SSRF allowlist is independent of pubkey validity. A peer
             # with a malformed pubkey is still a registered peer from
             # the pillar's view — pushes to it stay allowed. Only auth
@@ -296,9 +322,20 @@ class PillarPeerKeyResolver:
                 except ValueError:
                     continue
                 new_cache[node_id] = pub_hex.lower()
+            # SPKI cache + reverse address index: populated for any
+            # peer with a node_id, regardless of pubkey validity.
+            # Address-only or node_id-only entries don't enter the
+            # reverse index — we'd have nothing to return if the
+            # caller looked them up.
+            if node_id:
+                new_spki[node_id] = spki_in
+                if address:
+                    new_addr_to_node[address] = node_id
         with self._lock:
             self._cache = new_cache
             self._addresses = new_addrs
+            self._spki_cache = new_spki
+            self._addr_to_node = new_addr_to_node
             self._last_refresh = time.time()
             self._refresh_failures = 0
 
@@ -323,6 +360,44 @@ class PillarPeerKeyResolver:
                 return False
             return address in self._addresses
 
+    def expected_spki(self, address: str) -> Optional[str]:
+        """2026-05-21 SPKI Phase 3.2 — return the SPKI hash the pillar
+        has registered for the peer at ``address``, or ``None`` if:
+
+        - the cache is stale (refuse-beats-stale: stale rosters may
+          have missed a cert rotation; treating them as authoritative
+          could pin against a hash the peer no longer serves)
+        - the address is not in the pillar roster at all
+        - the peer is in the roster but declared no SPKI (legacy /
+          pre-Phase-2 worker; the caller's NAKSHATRA_REFUSE_UNPINNED_PEERS
+          policy decides whether to refuse or fall through to plaintext)
+
+        These three None cases are deliberately conflated at this
+        level — every caller refuses, just under different policy
+        names. Callers that need the distinction can read
+        ``cache_age_seconds()`` and ``is_registered_address()``
+        separately.
+        """
+        with self._lock:
+            if self._is_stale_locked():
+                return None
+            node_id = self._addr_to_node.get(address)
+            if not node_id:
+                return None
+            hex_hash = self._spki_cache.get(node_id, "")
+            return hex_hash or None
+
+    def expected_spki_for_node_id(self, node_id: str) -> Optional[str]:
+        """Lookup variant indexed by node_id instead of address. Same
+        None semantics as :meth:`expected_spki`. Convenient when the
+        caller has the node_id directly (e.g. from an authenticated
+        inbound stream context) rather than the push address."""
+        with self._lock:
+            if self._is_stale_locked():
+                return None
+            hex_hash = self._spki_cache.get(node_id, "")
+            return hex_hash or None
+
     def known_node_ids(self) -> set[str]:
         with self._lock:
             return set(self._cache.keys())
@@ -343,6 +418,13 @@ class PillarPeerKeyResolver:
             return {
                 "cached_node_ids": len(self._cache),
                 "cached_addresses": len(self._addresses),
+                # 2026-05-21 SPKI Phase 3.1: surfaces in /healthz for
+                # operator observability — "how many peers in the
+                # roster have declared a SPKI hash" is the rollout
+                # signal during Phase 2 → Phase 3 migration.
+                "cached_spki_pins": sum(
+                    1 for v in self._spki_cache.values() if v),
+                "cached_spki_total": len(self._spki_cache),
                 "last_refresh_unix": self._last_refresh,
                 "cache_age_seconds": (
                     time.time() - self._last_refresh
