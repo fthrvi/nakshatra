@@ -114,6 +114,12 @@ def main() -> int:
     ap.add_argument("--rotate-cert", action="store_true",
                     help="Force-regenerate cert before starting "
                          "(simulates operator cert rotation)")
+    ap.add_argument("--skip-register", action="store_true",
+                    help="Generate/load cert and start the TLS listener, "
+                         "but do NOT register with the pillar. Used to "
+                         "simulate the operator-rotated-cert-without-"
+                         "re-registering attack: pillar still has the "
+                         "prior SPKI; peer now serves a new one.")
     args = ap.parse_args()
 
     tls_dir = Path(args.tls_dir).expanduser()
@@ -165,13 +171,19 @@ def main() -> int:
     )
     t.start()
 
-    # Register with pillar
-    _register_with_pillar(
-        args.pillar_url, args.node_id, args.public_address,
-        pub_hex, spki_hash, priv_bytes,
-    )
-    print(f"[smoke] registered with {args.pillar_url} as {args.node_id}",
-          flush=True)
+    # Register with pillar (unless skipped to simulate the
+    # rotate-without-re-register attack model).
+    if args.skip_register:
+        print(f"[smoke] SKIP register — peer serves spki={spki_hash[:8]}… "
+              f"but pillar roster will retain the prior value",
+              flush=True)
+    else:
+        _register_with_pillar(
+            args.pillar_url, args.node_id, args.public_address,
+            pub_hex, spki_hash, priv_bytes,
+        )
+        print(f"[smoke] registered with {args.pillar_url} as {args.node_id}",
+              flush=True)
 
     # Idle so peers can probe
     try:

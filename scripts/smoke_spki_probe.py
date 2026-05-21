@@ -73,10 +73,21 @@ def main() -> int:
     ap.add_argument("--probe-timeout", type=float, default=5.0)
     args = ap.parse_args()
 
-    # Identity for the probe client (so the pillar accepts our /peers GET).
-    # We don't register ourselves — just sign with a fresh ephemeral key
-    # if the pillar requires auth on /peers, or skip if it doesn't.
-    priv_bytes, pub_hex = auth.generate_keypair()
+    # Identity for the probe client. Persist across runs so the pillar
+    # doesn't 403 us on the second invocation (TOFU-lock honours the
+    # first key seen for a given node_id).
+    keys_dir = Path.home() / ".nakshatra" / "keys"
+    keys_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    probe_priv_path = keys_dir / "smoke-probe.ed25519"
+    probe_pub_path = keys_dir / "smoke-probe.pub.hex"
+    if probe_priv_path.exists():
+        priv_bytes = probe_priv_path.read_bytes()
+        pub_hex = probe_pub_path.read_text().strip()
+    else:
+        priv_bytes, pub_hex = auth.generate_keypair()
+        probe_priv_path.write_bytes(priv_bytes)
+        probe_priv_path.chmod(0o600)
+        probe_pub_path.write_text(pub_hex)
     probe_node_id = "smoke-probe-client"
 
     # First, register the probe client so the pillar accepts authenticated
@@ -204,6 +215,10 @@ def main() -> int:
 
     # ── Check 4: refuse-on-stale-cache ───────────────────────────────
     print("[check 4] refuse-on-stale-cache (cache age past deadline)")
+    # Sleep past the pillar's replay window (the prior GET /peers
+    # within the same second would replay on a fresh resolver) so the
+    # signed envelope's timestamp ticks forward.
+    time.sleep(1.5)
     stale_resolver = ga.PillarPeerKeyResolver(
         args.pillar_url,
         refresh_interval_s=10.0,
