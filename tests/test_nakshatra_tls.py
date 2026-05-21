@@ -198,3 +198,36 @@ def test_build_grpc_server_credentials_returns_server_credentials(tmp_path):
     creds = nt.build_grpc_server_credentials(cert_path, key_path)
     import grpc
     assert isinstance(creds, grpc.ServerCredentials)
+
+
+# ── resolve_tls_required (the boot-time env decoder) ─────────────────
+
+
+def test_resolve_tls_required_explicit_true():
+    assert nt.resolve_tls_required("true", "") is True
+    assert nt.resolve_tls_required("1", "") is True
+    assert nt.resolve_tls_required("yes", "") is True
+    assert nt.resolve_tls_required("TRUE", "") is True  # case-insensitive
+
+
+def test_resolve_tls_required_explicit_false_with_pillar():
+    """Operator opt-out overrides the pillar-default-on. This is the
+    Mode-A bringup path; the worker boot should emit a WARN when this
+    happens (handled by the caller, not this function)."""
+    assert nt.resolve_tls_required("false", "http://pillar:5530") is False
+    assert nt.resolve_tls_required("0", "http://pillar:5530") is False
+    assert nt.resolve_tls_required("no", "http://pillar:5530") is False
+
+
+def test_resolve_tls_required_unset_no_pillar_is_false():
+    """Mode A legacy bringup: no pillar, no TLS."""
+    assert nt.resolve_tls_required(None, "") is False
+    assert nt.resolve_tls_required("", "") is False
+    assert nt.resolve_tls_required("   ", "  ") is False
+
+
+def test_resolve_tls_required_unset_with_pillar_is_true():
+    """Mode B/C default: pillar configured → TLS on."""
+    assert nt.resolve_tls_required(None, "http://pillar:5530") is True
+    assert nt.resolve_tls_required("", "http://pillar:5530") is True
+    assert nt.resolve_tls_required("   ", "https://pillar:5531") is True

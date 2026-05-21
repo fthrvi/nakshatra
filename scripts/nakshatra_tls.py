@@ -198,6 +198,33 @@ def ensure_cert(
     return cert_path, key_path, spki
 
 
+def resolve_tls_required(env_value: str | None, pillar_url: str) -> bool:
+    """Decide whether the worker should serve gRPC over TLS, given the
+    env value and the configured pillar URL. Same truth-table shape as
+    ``nakshatra_grpc_auth.resolve_auth_required``:
+
+    ============ =========== ============================
+    env_value    pillar_url  resolved
+    ============ =========== ============================
+    "true"       any         True
+    "false"      any         False  (Mode A legacy / explicit opt-out)
+    None/""      ""          False  (Mode A: no pillar, plaintext)
+    None/""      set         True   (Mode B/C default: TLS on)
+    ============ =========== ============================
+
+    When a pillar is configured, TLS defaults ON because that's the
+    Mode-C target. Operators with a legacy cluster set
+    ``NAKSHATRA_TLS_REQUIRED=false`` explicitly and accept the boot
+    WARN (parallel to Sthambha's STHAMBHA_AUTH_REQUIRED escape hatch).
+    """
+    val = (env_value or "").strip().lower()
+    if val in ("true", "1", "yes"):
+        return True
+    if val in ("false", "0", "no"):
+        return False
+    return bool((pillar_url or "").strip())
+
+
 def build_grpc_server_credentials(cert_path: Path | str,
                                    key_path: Path | str):
     """Build a ``grpc.ServerCredentials`` bound to the cert+key pair.
