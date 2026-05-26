@@ -250,7 +250,28 @@ def build_grpc_server_credentials(cert_path: Path | str,
 # ── 2026-05-21 SPKI Phase 3 — outbound channel pinning ───────────────
 
 
-PROBE_TIMEOUT_S = 5.0
+def _probe_timeout_from_env(default: float = 5.0) -> float:
+    """Read ``NAKSHATRA_TLS_PROBE_TIMEOUT_S`` from the environment.
+    Returns ``default`` when unset, empty, or unparseable — the SPKI
+    probe should never refuse to run because of a typoed env var, only
+    because of a genuine network problem.
+
+    Values <= 0 are also rejected (a zero-timeout TLS probe would always
+    raise ``probe_failed`` and silently degrade the chain to whatever
+    --tls-mode policy says about unreachable peers)."""
+    raw = os.environ.get("NAKSHATRA_TLS_PROBE_TIMEOUT_S", "").strip()
+    if not raw:
+        return default
+    try:
+        v = float(raw)
+    except ValueError:
+        return default
+    if v <= 0:
+        return default
+    return v
+
+
+PROBE_TIMEOUT_S = _probe_timeout_from_env()
 
 
 class PinError(Exception):

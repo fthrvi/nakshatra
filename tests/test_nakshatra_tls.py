@@ -453,3 +453,60 @@ def test_open_pinned_channel_sets_ssl_target_name_override(tmp_path):
     finally:
         stop.set()
         sock.close()
+
+
+# ── 2026-05-26 drive-by — NAKSHATRA_TLS_PROBE_TIMEOUT_S env override ─
+
+
+def test_probe_timeout_env_unset_returns_default(monkeypatch):
+    monkeypatch.delenv("NAKSHATRA_TLS_PROBE_TIMEOUT_S", raising=False)
+    assert nt._probe_timeout_from_env(default=5.0) == 5.0
+
+
+def test_probe_timeout_env_empty_returns_default(monkeypatch):
+    """Empty / whitespace-only must not crash + must not be parsed as
+    zero (which would then be rejected as <= 0)."""
+    monkeypatch.setenv("NAKSHATRA_TLS_PROBE_TIMEOUT_S", "")
+    assert nt._probe_timeout_from_env(default=5.0) == 5.0
+    monkeypatch.setenv("NAKSHATRA_TLS_PROBE_TIMEOUT_S", "   ")
+    assert nt._probe_timeout_from_env(default=5.0) == 5.0
+
+
+def test_probe_timeout_env_overrides_default(monkeypatch):
+    monkeypatch.setenv("NAKSHATRA_TLS_PROBE_TIMEOUT_S", "12.5")
+    assert nt._probe_timeout_from_env(default=5.0) == 12.5
+
+
+def test_probe_timeout_env_int_string_parses(monkeypatch):
+    """Operators often type whole seconds. The float() parse handles
+    integer strings transparently — assert it explicitly so the
+    contract doesn't drift."""
+    monkeypatch.setenv("NAKSHATRA_TLS_PROBE_TIMEOUT_S", "30")
+    assert nt._probe_timeout_from_env(default=5.0) == 30.0
+
+
+def test_probe_timeout_env_garbage_returns_default(monkeypatch):
+    """A typoed value (e.g. '5s', 'fast', 'NaN-ish') must not crash
+    nor disable the timeout — fall back to default and let the chain
+    continue. Validates the safety net for operator typos."""
+    for bad in ("5s", "fast", "abc", "1e", "--", "1,5"):
+        monkeypatch.setenv("NAKSHATRA_TLS_PROBE_TIMEOUT_S", bad)
+        assert nt._probe_timeout_from_env(default=5.0) == 5.0
+
+
+def test_probe_timeout_env_zero_or_negative_returns_default(monkeypatch):
+    """A zero-timeout probe would always raise probe_failed and silently
+    degrade every chain to whatever --tls-mode policy says about
+    unreachable peers. Reject and fall back to default."""
+    for bad in ("0", "0.0", "-1", "-5.5"):
+        monkeypatch.setenv("NAKSHATRA_TLS_PROBE_TIMEOUT_S", bad)
+        assert nt._probe_timeout_from_env(default=5.0) == 5.0
+
+
+def test_probe_timeout_module_constant_reflects_env_at_import_time():
+    """Sanity: the PROBE_TIMEOUT_S module constant was computed once at
+    import via _probe_timeout_from_env(), so it's a float in the
+    default-or-overridden value range. Callers that pass the constant
+    as a default keep working regardless of env state."""
+    assert isinstance(nt.PROBE_TIMEOUT_S, float)
+    assert nt.PROBE_TIMEOUT_S > 0
