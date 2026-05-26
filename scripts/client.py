@@ -35,6 +35,16 @@ import yaml
 import nakshatra_pb2 as pb
 import nakshatra_pb2_grpc as pb_grpc
 
+# 2026-05-26: SPKI-pinned outbound channels. Lazy-imported so the client
+# still runs on a checkout that pre-dates the Phase 2 TLS module (in which
+# case --tls-mode falls back to insecure regardless of the flag value).
+try:
+    import nakshatra_tls as _wtls
+    _TLS_AVAILABLE = True
+except ImportError:
+    _wtls = None
+    _TLS_AVAILABLE = False
+
 
 LLAMA3_EOS_IDS = {128001, 128008, 128009}
 
@@ -44,6 +54,40 @@ class PushFailure(RuntimeError):
     Caught by the recovery loop to downgrade the session to streaming-only
     (client-relay) mode without swapping workers — the broken link is between
     the two peer workers, not in either worker itself."""
+
+
+def _open_chain_channel(address: str, expected_spki: str | None,
+                        tls_mode: str):
+    """2026-05-26 — open a gRPC channel to one chain worker, mirroring the
+    shape of worker.py:_open_outbound_channel so client.py can talk to
+    workers that have flipped to TLS-only after the 2026-05-21 SPKI sprint.
+
+    ``tls_mode`` is the operator policy knob:
+
+    - ``"off"``    — force ``grpc.insecure_channel``. Escape hatch for
+      bringup or for legacy pre-Phase-2 chains the operator knows are
+      plaintext-only.
+    - ``"auto"``   — pin against ``expected_spki`` when one is available;
+      fall through to insecure when the hash is missing. Back-compat with
+      the existing v0.1 70B cluster on home-pc:5530, which hasn't been
+      Phase-2'd.
+    - ``"required"`` — refuse anything that isn't an SPKI-pinned channel.
+      Operator-strict mode for Prithvi-style production use.
+
+    PinError is surfaced via ``sys.exit`` because the chain is unusable
+    if any single worker fails the handshake — there's no per-worker
+    recovery story at preflight time (alternate-cursor recovery starts
+    later, after _setup_chain returns).
+    """
+    if tls_mode == "off" or not _TLS_AVAILABLE:
+        return grpc.insecure_channel(address)
+    try:
+        return _wtls.open_pinned_channel(
+            address, expected_spki,
+            refuse_unpinned=(tls_mode == "required"),
+        )
+    except _wtls.PinError as e:
+        sys.exit(f"[chain] TLS pin failure for {address}: {e}")
 
 
 def tokenize_local(model_path, prompt):
@@ -204,6 +248,55 @@ def _peer_chain_score(peer: dict) -> int:
     return 1          # declared GPU but didn't actually offload → CPU
 
 
+def _sanitize_spki(raw) -> str:
+    """Normalize a ``peer_spki_hash`` field from arbitrary input.
+    Returns 64-lowercase-hex or ``""``. Same shape PillarPeerKeyResolver
+    enforces on the worker side."""
+    spki = str(raw or "").strip().lower()
+    if len(spki) != 64:
+        return ""
+    try:
+        bytes.fromhex(spki)
+    except ValueError:
+        return ""
+    return spki
+
+
+def _fetch_spki_index(registry_url: str) -> dict[str, str]:
+    """2026-05-26 SPKI — query the pillar's /peers projection once and
+    build an ``address → peer_spki_hash`` index.
+
+    The pillar's /chain endpoint doesn't include peer_spki_hash in its
+    chain entries (that's a sthambha-side extension we haven't shipped
+    yet), so we get the hashes the same way :class:`PillarPeerKeyResolver`
+    does on the worker side — a separate /peers fetch. The map is keyed
+    by the same ``"host:port"`` string the chain entries carry, so the
+    caller can do a flat lookup.
+
+    Returns ``{}`` on failure or missing fields rather than raising —
+    --tls-mode=auto then transparently degrades to plaintext for any
+    worker whose hash we couldn't recover, while --tls-mode=required
+    will surface a clear PinError("unpinned_peer") at _setup_chain time.
+    """
+    url = f"{registry_url.rstrip('/')}/peers"
+    try:
+        with urlrequest.urlopen(url, timeout=10) as resp:
+            data = json.loads(resp.read())
+    except Exception as e:
+        print(f"[chain] WARNING: SPKI index fetch failed ({e}); chain "
+              f"will run unpinned in --tls-mode=auto.", file=sys.stderr)
+        return {}
+    index: dict[str, str] = {}
+    for peer in (data or {}).get("peers", []):
+        if not isinstance(peer, dict):
+            continue
+        address = str(peer.get("address") or "").strip()
+        spki = _sanitize_spki(peer.get("peer_spki_hash"))
+        if address and spki:
+            index[address] = spki
+    return index
+
+
 def _try_pillar_chain(registry_url: str, model_id: str) -> list | None:
     """Phase I: ask the pillar to assemble the chain itself.
 
@@ -238,6 +331,9 @@ def _try_pillar_chain(registry_url: str, model_id: str) -> list | None:
             "port": int(port),
             "layer_start": int(c["layer_start"]),
             "layer_end": int(c["layer_end"]),
+            # 2026-05-26 SPKI: filled in by main() via _fetch_spki_index;
+            # pillar's /chain endpoint doesn't carry the hash today.
+            "peer_spki_hash": "",
         })
     return workers
 
@@ -312,6 +408,10 @@ def build_chain_from_registry(registry_url: str, model_id: str) -> list:
                 "port": int(port),
                 "layer_start": offering["layer_start"],
                 "layer_end": offering["layer_end"],
+                # 2026-05-26 SPKI: take it straight from the /peers
+                # payload we already loaded. defensive parse mirrors
+                # _fetch_spki_index for the pillar-served chain path.
+                "peer_spki_hash": _sanitize_spki(peer.get("peer_spki_hash")),
             })
             used_node_ids.add(peer["node_id"])
             cursor = offering["layer_end"]
@@ -355,10 +455,25 @@ def main():
     ap.add_argument("--max-recovery-attempts", type=int, default=3,
                     help="v0.5 M0.5.4 v0: how many times the client retries via "
                          "recovery before surfacing failure to the caller.")
+    ap.add_argument("--tls-mode", choices=("off", "auto", "required"),
+                    default="auto",
+                    help="2026-05-26 SPKI: outbound TLS policy. 'auto' "
+                         "(default): pin against peer_spki_hash when one is "
+                         "available, else fall through to plaintext (back-"
+                         "compat with pre-Phase-2 workers + the existing "
+                         "v0.1 70B cluster). 'required': refuse to talk to "
+                         "any worker without a declared SPKI hash. 'off': "
+                         "force plaintext channels (escape hatch).")
     args = ap.parse_args()
     # --use-streaming-push implies --use-streaming
     if args.use_streaming_push:
         args.use_streaming = True
+    # --tls-mode=required is only meaningful if the TLS module is importable.
+    # Fail loud rather than silently downgrading to insecure.
+    if args.tls_mode == "required" and not _TLS_AVAILABLE:
+        sys.exit("--tls-mode=required but nakshatra_tls module is not "
+                 "importable; cannot pin channels. Install the Phase 2 TLS "
+                 "module or drop the flag.")
 
     if args.registry:
         if not args.model_id:
@@ -366,19 +481,49 @@ def main():
         print(f"[chain] querying Sthambha registry: {args.registry} (model={args.model_id})")
         workers = build_chain_from_registry(args.registry, args.model_id)
         print(f"[chain] registry returned a chain of {len(workers)} workers covering layers [0,{workers[-1]['layer_end']})")
+        # 2026-05-26 SPKI: backfill peer_spki_hash on every chain entry.
+        # The pillar-served /chain endpoint doesn't carry the hash today,
+        # and even build_chain_from_registry's local fallback can be
+        # stricter than the on-the-wire payload (e.g. malformed hashes
+        # silently dropped). One /peers fetch reconciles both paths.
+        spki_index = _fetch_spki_index(args.registry)
+        for w in workers:
+            addr = f"{w['address']}:{w['port']}"
+            from_index = spki_index.get(addr, "")
+            # Don't clobber a hash the local fallback already populated
+            # with one that disagrees — surface it so the operator sees
+            # something is wrong. Equal values are fine; missing-in-index
+            # is fine (leave whatever's there).
+            existing = w.get("peer_spki_hash") or ""
+            if existing and from_index and existing != from_index:
+                print(f"[chain] WARNING: SPKI for {addr} disagrees: "
+                      f"chain={existing[:8]}… /peers={from_index[:8]}…; "
+                      f"using chain value.", file=sys.stderr)
+            elif from_index and not existing:
+                w["peer_spki_hash"] = from_index
     else:
         cfg = yaml.safe_load(Path(args.config).read_text())
         workers = cfg["workers"]
         print(f"[chain] {len(workers)} workers in config")
+        # Normalize whatever the YAML carried into the same shape the
+        # registry path emits — defensive parse rejects malformed hex.
+        for w in workers:
+            w["peer_spki_hash"] = _sanitize_spki(w.get("peer_spki_hash"))
 
     # v0.5 M0.5.4 v1: alternate-worker recovery. Each worker has a list of
     # candidates: primary first, then optional alternates from yaml. A
     # per-worker cursor selects the active candidate. On failure, the
     # recovery handler advances cursors and rebuilds the chain.
     for w in workers:
-        primary = {k: w[k] for k in ("id", "address", "port", "layer_range", "mode")
+        primary = {k: w[k] for k in ("id", "address", "port", "layer_range",
+                                       "mode", "peer_spki_hash")
                    if k in w}
         primary["sub_gguf_path"] = w.get("sub_gguf_path", "")
+        # Normalize per-candidate hashes too: alternates may omit the
+        # field, in which case --tls-mode=required will refuse the
+        # downgrade rather than silently switching to plaintext.
+        for alt in list(w.get("alternates") or []):
+            alt["peer_spki_hash"] = _sanitize_spki(alt.get("peer_spki_hash"))
         w["candidates"] = [primary] + list(w.get("alternates") or [])
         w["cursor"] = 0
 
@@ -393,7 +538,13 @@ def main():
         for w in workers:
             spec = _spec(w)
             addr = f"{spec['address']}:{spec['port']}"
-            ch = grpc.insecure_channel(addr)
+            # 2026-05-26 SPKI: build a TLS-pinned channel when we have a
+            # hash, falling back per --tls-mode policy. Same channel is
+            # reused by every later Forward / Inference RPC, so fixing
+            # this single call site lights up the whole chain.
+            ch = _open_chain_channel(
+                addr, spec.get("peer_spki_hash") or None, args.tls_mode,
+            )
             stub = pb_grpc.NakshatraStub(ch)
             info = stub.Info(pb.InfoRequest(), timeout=10.0)
             caps = list(info.protocol_capabilities)

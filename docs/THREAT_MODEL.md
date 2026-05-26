@@ -1,7 +1,7 @@
 # Nakshatra worker threat model
 
 **Status:** Living document, updated as phases ship.
-**Last updated:** 2026-05-20 (Phase D shipped — strict-type sweep + audit log + heartbeat backoff).
+**Last updated:** 2026-05-26 (SPKI federation Phase 4 shipped — `client.py` TLS-aware).
 
 This file is the worker-side companion to `sthambha/docs/THREAT_MODEL.md`.
 Sthambha's threat model covers the pillar (control plane); this one covers
@@ -186,6 +186,7 @@ Closes the cross-worker MITM gap by adding TLS at the transport layer + SPKI pin
 - **Phase 1 (sthambha, 2026-05-21, commits `cf6323e` + `f8ff30f` + `0ceece5`)** — `peer_spki_hash` field on `PeerStatus`; `as_bounded_hex(64)` parse layer at `POST /peer`; `/peers` + new `GET /peers/<id>` projections; cross-repo wire test asserts round-trip through register → persistence → projection.
 - **Phase 2 (nakshatra, 2026-05-21, commits `3824b50` + `34b96a2` + `cb78da8`)** — `scripts/nakshatra_tls.py` mirrors sthambha/tls.py with worker-cert defaults at `~/.nakshatra/tls/`. `ensure_cert` is idempotent + refuses half-rotated state. Worker boot wraps `grpc.server.add_secure_port` (instead of `add_insecure_port`) when `NAKSHATRA_TLS_REQUIRED=true` (default when pillar configured). Boot WARN on explicit-disable-with-pillar. Worker declares `peer_spki_hash` on every `/peer` registration. `nakshatra-cli tls fingerprint` operator parity. 25 new tests; 199 worker-side tests passing.
 - **Phase 3 (nakshatra, 2026-05-21, commits `6833bd2` + `84a13cd`)** — `PillarPeerKeyResolver` extended with `_spki_cache` + `expected_spki(address)` populated from the `/peers` projection. `_open_outbound_channel` TLS-probes the peer, compares SPKI, refuses on mismatch via `PinError`. `NAKSHATRA_REFUSE_UNPINNED_PEERS=true` (default) refuses outbound to peers the pillar has no hash for. `spki_pin_mismatch` audit event for operator forensics. Per-reason counters in `auth_stats`. 26 new tests; 225 worker-side tests passing.
+- **Phase 4 (nakshatra, 2026-05-26)** — `scripts/client.py` SPKI-aware. New `_open_chain_channel` helper mirrors `_open_outbound_channel`'s shape. New `--tls-mode {off,auto,required}` flag (default `auto`: pin when a hash is available, else fall through to plaintext for back-compat with pre-Phase-2 workers + the v0.1 70B cluster). New optional `peer_spki_hash` per worker entry in cluster YAML; `--registry` mode auto-fetches hashes from `/peers` and merges them onto chain entries from `_try_pillar_chain` + `build_chain_from_registry`. `PinError` translates to structured `[chain] TLS pin failure` exit message. Closes the prior-smoke temp-patch where client.py synthesized Info() from YAML because it preflighted via `grpc.insecure_channel`. 20 new unit tests + `scripts/smoke_client_tls.py` end-to-end (real cert, real TLS handshake, real subprocessed client).
 
 ## Operator-key install
 
