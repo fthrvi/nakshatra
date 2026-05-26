@@ -237,6 +237,70 @@ def test_fetch_spki_index_empty_payload_returns_empty():
     assert idx == {}
 
 
+# ── _try_pillar_chain consumes inline peer_spki_hash (Phase 4) ─────────
+
+
+def test_try_pillar_chain_reads_inline_spki_hash():
+    """2026-05-26 SPKI Phase 4: pillar's /chain projection ships
+    peer_spki_hash inline. _try_pillar_chain must pass it through so
+    main() can skip the backfill /peers fetch on the happy path."""
+    payload = {
+        "chain": [
+            {"node_id": "p0" * 7, "address": "h1:1",
+             "layer_start": 0, "layer_end": 14,
+             "peer_spki_hash": "a" * 64},
+            {"node_id": "p1" * 7, "address": "h2:2",
+             "layer_start": 14, "layer_end": 28,
+             "peer_spki_hash": "b" * 64},
+        ],
+    }
+    with patch.object(cli.urlrequest, "urlopen",
+                       return_value=_mock_urlopen(payload)):
+        workers = cli._try_pillar_chain("http://pillar", "m")
+    assert workers is not None
+    assert workers[0]["peer_spki_hash"] == "a" * 64
+    assert workers[1]["peer_spki_hash"] == "b" * 64
+
+
+def test_try_pillar_chain_handles_legacy_pillar_without_hash():
+    """A pre-Phase-4 pillar omits peer_spki_hash. _try_pillar_chain
+    must still return a chain — the field defaults to "" and main()
+    falls back to the /peers backfill."""
+    payload = {
+        "chain": [
+            {"node_id": "p0" * 7, "address": "h1:1",
+             "layer_start": 0, "layer_end": 14},
+            # No peer_spki_hash field at all.
+        ],
+    }
+    with patch.object(cli.urlrequest, "urlopen",
+                       return_value=_mock_urlopen(payload)):
+        workers = cli._try_pillar_chain("http://pillar", "m")
+    assert workers is not None
+    assert workers[0]["peer_spki_hash"] == ""
+
+
+def test_try_pillar_chain_drops_malformed_inline_hash():
+    """A pillar that ships a malformed hash (rare — its own parse layer
+    rejects them at /peer ingest, but defense-in-depth) still gives us
+    a usable chain entry with an empty hash."""
+    payload = {
+        "chain": [
+            {"node_id": "p0" * 7, "address": "h1:1",
+             "layer_start": 0, "layer_end": 14,
+             "peer_spki_hash": "ZZ" * 32},  # non-hex
+        ],
+    }
+    with patch.object(cli.urlrequest, "urlopen",
+                       return_value=_mock_urlopen(payload)):
+        workers = cli._try_pillar_chain("http://pillar", "m")
+    assert workers is not None
+    assert workers[0]["peer_spki_hash"] == ""
+
+
+# ── _fetch_spki_index (continued) ──────────────────────────────────────
+
+
 def test_fetch_spki_index_non_dict_peer_skipped():
     """A pillar that ships malformed peer entries (e.g. strings or
     nulls instead of dicts) shouldn't crash the client — skip them."""

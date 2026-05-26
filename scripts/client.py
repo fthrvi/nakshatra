@@ -331,9 +331,13 @@ def _try_pillar_chain(registry_url: str, model_id: str) -> list | None:
             "port": int(port),
             "layer_start": int(c["layer_start"]),
             "layer_end": int(c["layer_end"]),
-            # 2026-05-26 SPKI: filled in by main() via _fetch_spki_index;
-            # pillar's /chain endpoint doesn't carry the hash today.
-            "peer_spki_hash": "",
+            # 2026-05-26 SPKI Phase 4 — pillar's /chain projection ships
+            # peer_spki_hash inline (sthambha commit added the field
+            # alongside this one). Older pillars omit it; that's still
+            # safe — _sanitize_spki returns "" for missing/malformed,
+            # and main()'s registry-side merge then backfills from a
+            # /peers fetch as a fallback.
+            "peer_spki_hash": _sanitize_spki(c.get("peer_spki_hash")),
         })
     return workers
 
@@ -481,26 +485,30 @@ def main():
         print(f"[chain] querying Sthambha registry: {args.registry} (model={args.model_id})")
         workers = build_chain_from_registry(args.registry, args.model_id)
         print(f"[chain] registry returned a chain of {len(workers)} workers covering layers [0,{workers[-1]['layer_end']})")
-        # 2026-05-26 SPKI: backfill peer_spki_hash on every chain entry.
-        # The pillar-served /chain endpoint doesn't carry the hash today,
-        # and even build_chain_from_registry's local fallback can be
-        # stricter than the on-the-wire payload (e.g. malformed hashes
-        # silently dropped). One /peers fetch reconciles both paths.
-        spki_index = _fetch_spki_index(args.registry)
-        for w in workers:
-            addr = f"{w['address']}:{w['port']}"
-            from_index = spki_index.get(addr, "")
-            # Don't clobber a hash the local fallback already populated
-            # with one that disagrees — surface it so the operator sees
-            # something is wrong. Equal values are fine; missing-in-index
-            # is fine (leave whatever's there).
-            existing = w.get("peer_spki_hash") or ""
-            if existing and from_index and existing != from_index:
-                print(f"[chain] WARNING: SPKI for {addr} disagrees: "
-                      f"chain={existing[:8]}… /peers={from_index[:8]}…; "
-                      f"using chain value.", file=sys.stderr)
-            elif from_index and not existing:
-                w["peer_spki_hash"] = from_index
+        # 2026-05-26 SPKI Phase 4 — happy path: a Phase-4-or-newer
+        # pillar ships peer_spki_hash inline on every /chain entry,
+        # so we skip the second /peers fetch entirely. The backfill
+        # below only runs when some entry is missing a hash, which
+        # means we're talking to an older pillar OR a Phase-2 worker
+        # that doesn't run TLS yet. Avoids an HTTP roundtrip on every
+        # chain build in the common case.
+        if any(not (w.get("peer_spki_hash") or "") for w in workers):
+            spki_index = _fetch_spki_index(args.registry)
+            for w in workers:
+                addr = f"{w['address']}:{w['port']}"
+                from_index = spki_index.get(addr, "")
+                # Don't clobber a hash the chain entry already
+                # populated with one that disagrees — surface it so
+                # the operator sees something is wrong. Equal values
+                # are fine; missing-in-index is fine (leave whatever's
+                # there).
+                existing = w.get("peer_spki_hash") or ""
+                if existing and from_index and existing != from_index:
+                    print(f"[chain] WARNING: SPKI for {addr} disagrees: "
+                          f"chain={existing[:8]}… /peers={from_index[:8]}…; "
+                          f"using chain value.", file=sys.stderr)
+                elif from_index and not existing:
+                    w["peer_spki_hash"] = from_index
     else:
         cfg = yaml.safe_load(Path(args.config).read_text())
         workers = cfg["workers"]
