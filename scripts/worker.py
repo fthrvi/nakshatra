@@ -37,7 +37,7 @@ import uuid
 from concurrent import futures
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
-from typing import Optional
+from typing import NamedTuple, Optional
 from urllib import request as urlrequest, error as urlerror
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -114,6 +114,72 @@ def _audit(event: str, **payload):
             _waudit.audit(event, **payload)
         except Exception:
             pass  # never let audit failure crash the worker
+
+
+class TlsBoot(NamedTuple):
+    """Outcome of :func:`setup_tls`. Carries the four values the
+    boot path downstream actually consumes:
+
+    - ``required``: whether the gRPC server should bind a secure port
+    - ``cert_path`` / ``key_path``: PEM paths for ``add_secure_port``
+      (None when ``required`` is False)
+    - ``spki_hash``: hex hash to declare on ``/peer`` registration
+      (empty string when no cert was prepared)
+    """
+    required: bool
+    cert_path: Optional[Path]
+    key_path: Optional[Path]
+    spki_hash: str
+
+
+def setup_tls(args) -> TlsBoot:
+    """2026-05-26 drive-by — factor the worker boot's TLS init block
+    into one place. Same behavior as the inline block it replaced
+    (commit predating this one): resolve TLS-required policy, generate
+    or load the cert via ``ensure_cert``, surface the SPKI hash for
+    /peer registration, sys.exit on partial-cert state or generation
+    failure, WARN-but-continue when TLS is explicitly disabled despite
+    a configured pillar.
+
+    Defined here at module scope (not nested in main) so unit tests can
+    construct a fake ``args`` namespace and call it directly without
+    invoking the rest of the boot pipeline."""
+    required = (
+        _TLS_AVAILABLE
+        and _wtls.resolve_tls_required(
+            os.environ.get("NAKSHATRA_TLS_REQUIRED"), args.pillar_url
+        )
+    )
+    if required:
+        try:
+            cert_path, key_path, spki_hash = _wtls.ensure_cert()
+            print(f"[worker] TLS cert: {cert_path} "
+                  f"(spki_sha256={spki_hash})", flush=True)
+            _audit("tls_cert_ready",
+                   cert_path=str(cert_path),
+                   spki_sha256=spki_hash)
+            return TlsBoot(True, cert_path, key_path, spki_hash)
+        except FileExistsError as e:
+            # Partial cert state — surface explicitly rather than
+            # rotating one side and breaking pinned peers.
+            sys.exit(f"[worker] TLS bringup refused: {e}")
+        except Exception as e:
+            sys.exit(f"[worker] TLS bringup failed: {e}")
+    if args.pillar_url:
+        # Pillar configured but TLS explicitly disabled — Mode-A
+        # bringup. The WARN matches Sthambha's escape-hatch shape;
+        # operators see it once at boot, not buried in audit.
+        print(f"[worker] WARN: NAKSHATRA_TLS_REQUIRED is off but a "
+              f"pillar is configured. gRPC server will speak plaintext; "
+              f"peers that pin this worker's SPKI will refuse outbound "
+              f"connections (Phase 3 pin check).",
+              flush=True)
+        _audit("tls_disabled_with_pillar", pillar_url=args.pillar_url)
+    elif not _TLS_AVAILABLE:
+        print(f"[worker] WARN: nakshatra_tls import failed "
+              f"({_TLS_IMPORT_ERR}); gRPC server will be plaintext",
+              flush=True)
+    return TlsBoot(False, None, None, "")
 
 
 CMD_TOKEN_DECODE = 1
@@ -2423,50 +2489,10 @@ def main():
     print(f"[worker] spawning daemon: {args.daemon_bin} {args.sub_gguf} {args.mode} {args.n_ctx} threads={args.n_threads} gpu_layers={args.n_gpu_layers}", flush=True)
     daemon = DaemonClient(args.daemon_bin, args.sub_gguf, args.mode, args.n_ctx, args.n_threads, args.n_gpu_layers)
 
-    # 2026-05-21 SPKI Phase 2.2 + 2.5 + 2.7: self-signed TLS cert for
-    # the gRPC server. ensure_cert is idempotent — reads existing
-    # cert/key from ~/.nakshatra/tls/ if present, generates if missing.
-    # NAKSHATRA_TLS_REQUIRED defaults true when a pillar is configured;
-    # explicit "false" + pillar means Mode-A bringup and emits a WARN
-    # (the lesson from Sthambha Phase O — ship the WARN this time).
-    tls_required = (
-        _TLS_AVAILABLE
-        and _wtls.resolve_tls_required(
-            os.environ.get("NAKSHATRA_TLS_REQUIRED"), args.pillar_url
-        )
-    )
-    worker_cert_path: Optional[Path] = None
-    worker_key_path: Optional[Path] = None
-    worker_spki_hash: str = ""
-    if tls_required:
-        try:
-            worker_cert_path, worker_key_path, worker_spki_hash = \
-                _wtls.ensure_cert()
-            print(f"[worker] TLS cert: {worker_cert_path} "
-                  f"(spki_sha256={worker_spki_hash})", flush=True)
-            _audit("tls_cert_ready",
-                   cert_path=str(worker_cert_path),
-                   spki_sha256=worker_spki_hash)
-        except FileExistsError as e:
-            # Partial cert state — surface explicitly rather than
-            # rotating one side and breaking pinned peers.
-            sys.exit(f"[worker] TLS bringup refused: {e}")
-        except Exception as e:
-            sys.exit(f"[worker] TLS bringup failed: {e}")
-    elif args.pillar_url:
-        # Pillar configured but TLS explicitly disabled — Mode-A
-        # bringup. The WARN matches Sthambha's escape-hatch shape;
-        # operators see it once at boot, not buried in audit.
-        print(f"[worker] WARN: NAKSHATRA_TLS_REQUIRED is off but a "
-              f"pillar is configured. gRPC server will speak plaintext; "
-              f"peers that pin this worker's SPKI will refuse outbound "
-              f"connections (Phase 3 pin check).",
-              flush=True)
-        _audit("tls_disabled_with_pillar", pillar_url=args.pillar_url)
-    elif not _TLS_AVAILABLE:
-        print(f"[worker] WARN: nakshatra_tls import failed "
-              f"({_TLS_IMPORT_ERR}); gRPC server will be plaintext",
-              flush=True)
+    # 2026-05-26 drive-by — TLS bringup factored into setup_tls(args).
+    # Same behavior (resolve policy, ensure_cert, WARN on Mode-A
+    # downgrade), just out of main()'s critical path.
+    tls = setup_tls(args)
 
     # Phase A1 (2026-05-20): explicit gRPC message-size cap. Default is
     # 4 MiB; we set the explicit cap to WORKER_GRPC_MAX_MESSAGE_BYTES so
@@ -2516,9 +2542,9 @@ def main():
     pb_grpc.add_NakshatraServicer_to_server(servicer, server)
     # 2026-05-21 SPKI Phase 2.4: bind TLS port when cert was prepared
     # above; otherwise legacy insecure path.
-    if tls_required and worker_cert_path and worker_key_path:
+    if tls.required and tls.cert_path and tls.key_path:
         creds = _wtls.build_grpc_server_credentials(
-            worker_cert_path, worker_key_path)
+            tls.cert_path, tls.key_path)
         server.add_secure_port(f"[::]:{args.port}", creds)
         listen_proto = "TLS"
     else:
@@ -2712,8 +2738,8 @@ def main():
         # store "" and Phase 3 pinning refuses outbound to such peers
         # when NAKSHATRA_REFUSE_UNPINNED_PEERS=true (also a Phase 3
         # default).
-        if worker_spki_hash:
-            register_payload["peer_spki_hash"] = worker_spki_hash
+        if tls.spki_hash:
+            register_payload["peer_spki_hash"] = tls.spki_hash
         # (sandbox_compliance is filled in below once we run the
         # startup compliance check; see Phase G integration just below.)
         # Phase G: snapshot the worker's runtime sandbox compliance at
