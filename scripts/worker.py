@@ -281,12 +281,33 @@ def setup_fabric(args, forward_fn, n_embd, *, worker_priv, node_id):
 
     # backward neighbor is the inbound link (we receive FORWARD from
     # the previous worker); forward neighbor is where we send onward.
+    inbound_link = _link_for(resp.backward)
+    forward_link = _link_for(resp.forward)
+
+    # 2026-05-29 fabric Phase F — feedback link wiring.
+    # 2-worker-chain shortcut: the feedback wormhole runs between
+    # last → first, which is the SAME peer-pair the existing forward
+    # / inbound links already address. Reuse them:
+    #   - mode=first: feedback comes back FROM the last worker, who
+    #     is this worker's forward neighbor. forward_link already
+    #     has peer_addr=last + the right per-pair key.
+    #   - mode=last: feedback ships TO the first worker, who is this
+    #     worker's backward neighbor. inbound_link already has
+    #     peer_addr=first + the right key.
+    # Chains > 2 workers need a dedicated first↔last keying path
+    # (the pillar's keyring is per-chain-edge only); v0 prototype
+    # explicitly targets 2-worker chains and the localhost smoke
+    # exercises exactly that shape.
+    feedback_link = None
+    if args.mode == "first":
+        feedback_link = forward_link
+    elif args.mode == "last":
+        feedback_link = inbound_link
+
     backend.set_links(
-        inbound=_link_for(resp.backward),
-        forward=_link_for(resp.forward),
-        # Last worker's feedback link to the first worker is wired in
-        # Phase F when the chain head's address is resolved; the
-        # backend guards on a missing feedback link.
+        inbound=inbound_link,
+        forward=forward_link,
+        feedback=feedback_link,
     )
     print(f"[worker] fabric data plane up: plan={resp.plan_id} "
           f"local_udp=:{local_port} mode={args.mode} "
@@ -844,6 +865,14 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
         self.refuse_unpinned_peers = refuse_unpinned_peers
         self._authz_rejections = 0
         self._ssrf_rejections = 0
+        # 2026-05-29 fabric Phase F — first-worker gRPC→fabric bridge
+        # (sprint OQ8). main() sets this when args.transport=fabric AND
+        # mode=first, pointing at FabricBackend.first_worker_round_trip.
+        # Forward then ships the decoded hidden_state via fabric +
+        # blocks waiting for the last worker's token via the feedback
+        # wormhole, returning the token in the gRPC reply. When None
+        # (gRPC mode or non-first mode), Forward behaves as before.
+        self.fabric_first_worker_bridge = None
         # 2026-05-21 SPKI Phase 3.3+3.5: per-reason counters for the
         # outbound pin check, surfaced in /healthz.
         self._spki_unpinned_refusals = 0
@@ -1181,6 +1210,24 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                 else grpc.StatusCode.INTERNAL)
             context.set_details(result.error)
             return pb.ForwardResponse()
+        # 2026-05-29 fabric Phase F — first-worker gRPC→fabric bridge.
+        # When the bridge is wired (mode=first + --transport=fabric),
+        # the gRPC reply carries the chain's FINAL token (after the
+        # fabric round-trip through mid + last workers) instead of
+        # this worker's intermediate hidden_state. Mid/last workers
+        # never have the bridge wired and keep returning hidden_state
+        # / token directly per the legacy path.
+        if self.fabric_first_worker_bridge is not None:
+            token_bytes = self.fabric_first_worker_bridge(
+                result.payload, step_id=int(request.start_pos),
+                layer_idx=self.layer_end,
+            )
+            if token_bytes is None:
+                context.set_code(grpc.StatusCode.DEADLINE_EXCEEDED)
+                context.set_details(
+                    "fabric chain timed out before FEEDBACK arrived")
+                return pb.ForwardResponse()
+            return pb.ForwardResponse(hidden_out=token_bytes)
         return pb.ForwardResponse(hidden_out=result.payload)
 
     def Inference(self, request_iterator, context):
@@ -3117,13 +3164,18 @@ def main():
             )
             fabric_thread.start()
             print("[worker] fabric serve loop started", flush=True)
-        else:
-            # First worker has no inbound fabric link (its input is the
-            # client's gRPC Forward). It still sends onward via the
-            # forward link, driven from the gRPC handler bridge — which
-            # is Phase F wiring. For now it just logs.
-            print("[worker] fabric: no inbound link (first worker); "
-                  "client-bridge send path lands in Phase F", flush=True)
+        if args.mode == "first" and fabric_backend.forward_link is not None:
+            # 2026-05-29 fabric Phase F — wire the gRPC→fabric bridge.
+            # Forward will ship hidden_state via fabric + wait for
+            # FEEDBACK at the feedback_link, then return the token in
+            # the gRPC reply. Requires both forward + feedback links;
+            # setup_fabric builds forward from the /join response, the
+            # feedback link comes from the chain-head/tail resolution
+            # done in setup_fabric (Phase F).
+            servicer.fabric_first_worker_bridge = (
+                fabric_backend.first_worker_round_trip)
+            print("[worker] fabric: first-worker gRPC→fabric bridge wired",
+                  flush=True)
 
     try:
         server.wait_for_termination()

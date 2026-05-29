@@ -326,3 +326,129 @@ def test_send_onward_drops_when_link_missing():
     be._send_onward(_header(), fp.PACKET_TYPE_FEEDBACK, b"\x00\x00\x00\x00")
     be2 = fb.FabricBackend(_echo_fn(), "middle", N_EMBD)
     be2._send_onward(_header(), fp.PACKET_TYPE_FORWARD, b"\x00" * ELEM_BYTES)
+
+
+# ── 6. first_worker_round_trip — gRPC↔fabric bridge ─────────────────
+
+
+def test_first_worker_round_trip_ships_forward_and_returns_feedback():
+    """The OQ8 path: first worker decodes locally, ships hidden via
+    forward_link, blocks on feedback_link.recv until a FEEDBACK with
+    matching step_id arrives. Returns the 4-byte token bytes.
+
+    Topology (2-worker-chain shape):
+        [first worker] --FORWARD--> last_link (sim. last worker)
+                       <--FEEDBACK--
+    """
+    backend_sock = _udp_sock()
+    last_sock = _udp_sock()
+    backend_addr = backend_sock.getsockname()
+    last_addr = last_sock.getsockname()
+
+    # First worker's forward + feedback both target the last worker
+    # (peer_addr=last). Same link instance used for both directions,
+    # mirroring the 2-worker-chain setup_fabric shortcut.
+    forward = FabricLink(backend_sock, last_addr, KEY, CHAIN)
+    last_link = FabricLink(last_sock, backend_addr, KEY, CHAIN)
+
+    be = fb.FabricBackend(_echo_fn(), "first", N_EMBD)
+    be.set_links(forward=forward, feedback=forward)
+
+    # Stand up a tiny "last worker" thread that recvs FORWARD and
+    # echoes back FEEDBACK with a known token.
+    def fake_last():
+        got = last_link.recv(timeout=2.0)
+        assert got is not None
+        header, payload = got
+        # Send FEEDBACK back with the same step_id so the bridge
+        # accepts it as the response to its own outbound packet.
+        last_link.send(
+            b"\x2a\x00\x00\x00",
+            packet_type=fp.PACKET_TYPE_FEEDBACK,
+            step_id=header.step_id,
+            layer_idx=fp.LAYER_IDX_FEEDBACK,
+        )
+
+    t = threading.Thread(target=fake_last, daemon=True)
+    t.start()
+    try:
+        out = be.first_worker_round_trip(
+            b"\xAB" * ELEM_BYTES, step_id=7, layer_idx=14,
+            timeout_s=2.0,
+        )
+        assert out == b"\x2a\x00\x00\x00"            # token 42
+    finally:
+        t.join(timeout=2.0)
+        backend_sock.close()
+        last_sock.close()
+
+
+def test_first_worker_round_trip_times_out_when_no_feedback():
+    """A chain stall (last worker wedged, link dropped) surfaces as
+    None within timeout_s. The gRPC Forward handler then maps to
+    DEADLINE_EXCEEDED — the client sees a clean error rather than a
+    hung connection."""
+    backend_sock = _udp_sock()
+    void_sock = _udp_sock()                            # nothing recvs from us
+    forward = FabricLink(backend_sock, void_sock.getsockname(), KEY, CHAIN)
+    be = fb.FabricBackend(_echo_fn(), "first", N_EMBD)
+    be.set_links(forward=forward, feedback=forward)
+    try:
+        out = be.first_worker_round_trip(
+            b"\x00" * ELEM_BYTES, timeout_s=0.3)
+        assert out is None
+    finally:
+        backend_sock.close()
+        void_sock.close()
+
+
+def test_first_worker_round_trip_returns_none_when_links_missing():
+    """A misconfigured first worker (forward or feedback not set) gets
+    None — the gRPC handler then degrades to its plain hidden_state
+    reply rather than wedging."""
+    be = fb.FabricBackend(_echo_fn(), "first", N_EMBD)
+    # No links wired at all
+    assert be.first_worker_round_trip(b"\x00" * ELEM_BYTES,
+                                        timeout_s=0.1) is None
+
+
+def test_first_worker_round_trip_skips_stale_step_packets():
+    """If an earlier-step FEEDBACK is still in flight when we send
+    step k, the bridge should drop the straggler and wait for the
+    real reply. Otherwise the client could get a token from the
+    previous generation step."""
+    backend_sock = _udp_sock()
+    last_sock = _udp_sock()
+    forward = FabricLink(backend_sock, last_sock.getsockname(), KEY, CHAIN)
+    last_link = FabricLink(last_sock, backend_sock.getsockname(), KEY, CHAIN)
+    be = fb.FabricBackend(_echo_fn(), "first", N_EMBD)
+    be.set_links(forward=forward, feedback=forward)
+
+    def fake_last_two_packets():
+        got = last_link.recv(timeout=2.0)
+        assert got is not None
+        header, _ = got
+        # Send a STALE feedback first (wrong step_id), then the real one.
+        last_link.send(
+            b"\x99\x00\x00\x00",                        # stale token 153
+            packet_type=fp.PACKET_TYPE_FEEDBACK,
+            step_id=header.step_id - 1,                # stale
+            layer_idx=fp.LAYER_IDX_FEEDBACK,
+        )
+        last_link.send(
+            b"\x2a\x00\x00\x00",                        # real token 42
+            packet_type=fp.PACKET_TYPE_FEEDBACK,
+            step_id=header.step_id,
+            layer_idx=fp.LAYER_IDX_FEEDBACK,
+        )
+
+    t = threading.Thread(target=fake_last_two_packets, daemon=True)
+    t.start()
+    try:
+        out = be.first_worker_round_trip(
+            b"\x00" * ELEM_BYTES, step_id=5, timeout_s=2.0)
+        assert out == b"\x2a\x00\x00\x00"               # not the stale one
+    finally:
+        t.join(timeout=2.0)
+        backend_sock.close()
+        last_sock.close()

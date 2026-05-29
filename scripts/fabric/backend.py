@@ -35,8 +35,15 @@ from __future__ import annotations
 import struct
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Callable, Optional, Protocol
+
+
+# Indirection so tests can monkey-patch the clock if they ever need to
+# without a global ``time.time`` patch leaking into other suites.
+def _now() -> float:
+    return time.monotonic()
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -271,3 +278,68 @@ class FabricBackend:
         """Signal the serve loop to exit at the next recv timeout.
         Idempotent + non-blocking."""
         self._stop.set()
+
+    # ── First-worker bridge (gRPC Forward ↔ fabric round-trip) ────
+
+    def first_worker_round_trip(
+        self,
+        hidden: bytes,
+        *,
+        step_id: int = 0,
+        layer_idx: int = 0,
+        timeout_s: float = 30.0,
+    ) -> Optional[bytes]:
+        """Sprint open question 8 implementation. Called from
+        ``WorkerServicer.Forward`` when ``mode == "first"`` and
+        ``--transport=fabric``: ship the just-decoded hidden state down
+        the fabric chain via ``forward_link``, block waiting for the
+        last worker's sampled token to come back via ``feedback_link``,
+        and return the token bytes for the gRPC reply.
+
+        ``timeout_s`` caps the entire round trip — chain stalls
+        propagate up to the gRPC client as a clean timeout rather than
+        wedging the worker.
+
+        Returns the 4-byte token id on success, ``None`` on timeout or
+        when ``feedback_link`` isn't wired (misconfigured bringup —
+        the gRPC Forward path can then degrade to its plain
+        hidden_state reply, matching how a chain-end worker would
+        behave without fabric).
+
+        Per-chain KV state is the receiving worker's concern; the
+        first worker tracks its own ``_ChainState`` via the same
+        ``handle_forward_packet`` path that mid-chain workers use,
+        but it's exercised on the LOCAL decode (in worker.py) rather
+        than on incoming fabric packets (which the first worker
+        doesn't receive — its input is gRPC)."""
+        if self.forward_link is None:
+            return None
+        if self.feedback_link is None:
+            return None
+
+        self.forward_link.send(
+            hidden,
+            packet_type=fp.PACKET_TYPE_FORWARD,
+            step_id=step_id,
+            layer_idx=layer_idx,
+            dtype=self.dtype,
+        )
+
+        # Drain the feedback link until we see a FEEDBACK matching
+        # this step_id. Earlier-step stragglers are dropped (the chain
+        # has moved on); later-step packets shouldn't be possible
+        # since we just sent step_id, but they're treated as stale.
+        deadline = _now() + timeout_s
+        while True:
+            remaining = deadline - _now()
+            if remaining <= 0:
+                return None
+            got = self.feedback_link.recv(timeout=remaining)
+            if got is None:
+                return None
+            header, payload = got
+            if header.packet_type != fp.PACKET_TYPE_FEEDBACK:
+                continue                                   # stray
+            if header.step_id != step_id:
+                continue                                   # stale step
+            return payload
