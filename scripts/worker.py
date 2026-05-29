@@ -104,6 +104,18 @@ except ImportError as _e:
     _TLS_AVAILABLE = False
     _TLS_IMPORT_ERR = _e
 
+# 2026-05-29 fabric Phase D — network-fabric data plane. Failure-soft
+# import so a worker missing the fabric package can still boot in gRPC
+# mode (the default); only --transport=fabric needs these.
+try:
+    from fabric.join import JoinClient, NoPlanError, JoinError
+    from fabric.backend import FabricBackend
+    from fabric.transport import FabricLink
+    _FABRIC_AVAILABLE = True
+except ImportError as _fe:
+    _FABRIC_AVAILABLE = False
+    _FABRIC_IMPORT_ERR = _fe
+
 
 def _audit(event: str, **payload):
     """Phase D5 — fire-and-forget audit log emission. No-op when the
@@ -182,9 +194,141 @@ def setup_tls(args) -> TlsBoot:
     return TlsBoot(False, None, None, "")
 
 
+# Convention: fabric UDP port = gRPC port + this offset, unless the
+# operator overrides via --fabric-port. Keeps the data plane off the
+# control port without a separate discovery step in the prototype.
+# Phase F may replace this with an explicit fabric endpoint in the
+# capability declaration.
+FABRIC_PORT_OFFSET = 100
+
+
+def _neighbor_fabric_addr(neighbor_address: str) -> tuple[str, int]:
+    """Derive a neighbor's fabric UDP (host, port) from the gRPC
+    ``host:port`` address the pillar served in the /join neighbor
+    block. Prototype convention — fabric port = gRPC port +
+    FABRIC_PORT_OFFSET. Raises ValueError on a malformed address so
+    the caller refuses boot rather than dialing a bogus endpoint."""
+    host, _, port_s = neighbor_address.rpartition(":")
+    if not host or not port_s:
+        raise ValueError(
+            f"neighbor address {neighbor_address!r} not host:port")
+    return host, int(port_s) + FABRIC_PORT_OFFSET
+
+
+def setup_fabric(args, forward_fn, n_embd, *, worker_priv, node_id):
+    """2026-05-29 fabric Phase D — bring up the network-fabric data
+    plane for ``--transport=fabric``. Returns ``(backend, join_client)``
+    with the FabricBackend's links wired and ready to ``serve()``, or
+    ``sys.exit``s on a fatal prerequisite (no fabric module, no pillar,
+    no plan covering this peer).
+
+    Refuse-boot policy (sprint open question 2): ``--transport=fabric``
+    is an explicit opt-in; if the prerequisites aren't met we exit loud
+    rather than silently degrading to gRPC. The operator who passed the
+    flag meant it.
+
+    Defined at module scope (not nested in main) so it's unit-testable
+    with a fake ``forward_fn`` + a mocked JoinClient, mirroring how
+    :func:`setup_tls` is tested."""
+    if not _FABRIC_AVAILABLE:
+        sys.exit(
+            f"[worker] --transport=fabric but the fabric package failed "
+            f"to import ({_FABRIC_IMPORT_ERR}); cannot start.")
+    if not args.pillar_url:
+        sys.exit("[worker] --transport=fabric requires --pillar-url "
+                 "(the fabric data plane is keyed off the pillar's /join).")
+    if not worker_priv or not node_id:
+        sys.exit("[worker] --transport=fabric requires a worker Ed25519 "
+                 "key + node_id to sign the OWNER-tier /join request.")
+
+    local_port = args.fabric_port or (args.port + FABRIC_PORT_OFFSET)
+    capability = {
+        "node_id": node_id,
+        "address": args.public_address or f"0.0.0.0:{args.port}",
+        "public_key_hex": _wauth.public_key_hex_from_private(worker_priv)
+        if _AUTH_AVAILABLE else "",
+    }
+    jc = JoinClient(
+        args.pillar_url, node_id, worker_priv, capability,
+    )
+    try:
+        resp = jc.join()
+    except NoPlanError as e:
+        sys.exit(
+            f"[worker] --transport=fabric refused: no chain plan covers "
+            f"this peer yet ({e}). Create + execute a plan via "
+            f"sthambha-cli first, then start the fabric worker.")
+    except JoinError as e:
+        sys.exit(f"[worker] /join failed: {e}")
+
+    keyring = jc.keyring()
+    backend = FabricBackend(forward_fn, args.mode, n_embd)
+
+    # Bind one local UDP socket and reuse it for every directional
+    # link — UDP is connectionless, so one socket serves all peers.
+    import socket as _socket
+    sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+    sock.bind(("0.0.0.0", local_port))
+
+    def _link_for(nb):
+        if nb is None or not nb.peer_id:
+            return None
+        key = keyring.get((node_id, nb.peer_id))
+        if key is None:
+            return None  # no key → can't pin; neighbor stays unwired
+        peer_addr = _neighbor_fabric_addr(nb.address)
+        return FabricLink(sock, peer_addr, key, _chain_id_from(resp.plan_id))
+
+    # backward neighbor is the inbound link (we receive FORWARD from
+    # the previous worker); forward neighbor is where we send onward.
+    backend.set_links(
+        inbound=_link_for(resp.backward),
+        forward=_link_for(resp.forward),
+        # Last worker's feedback link to the first worker is wired in
+        # Phase F when the chain head's address is resolved; the
+        # backend guards on a missing feedback link.
+    )
+    print(f"[worker] fabric data plane up: plan={resp.plan_id} "
+          f"local_udp=:{local_port} mode={args.mode} "
+          f"inbound={'yes' if backend.inbound_link else 'no'} "
+          f"forward={'yes' if backend.forward_link else 'no'}",
+          flush=True)
+    _audit("fabric_data_plane_up",
+           node_id=node_id, plan_id=resp.plan_id, local_udp_port=local_port)
+    return backend, jc
+
+
+def _chain_id_from(plan_id: str) -> int:
+    """Map the pillar's string plan_id to the u64 chain_id the packet
+    schema carries. Prototype: stable hash of the plan_id into 64 bits.
+    Phase F may switch to a pillar-assigned numeric chain_id if the
+    plan store grows one; for now both sides of a link derive the same
+    value from the same plan_id string deterministically."""
+    import hashlib
+    h = hashlib.blake2b(plan_id.encode(), digest_size=8).digest()
+    return int.from_bytes(h, "little")
+
+
 CMD_TOKEN_DECODE = 1
 CMD_EMBD_DECODE  = 2
 CMD_INFO         = 3
+
+
+class ForwardResult(NamedTuple):
+    """2026-05-29 — result of the shared daemon decode path used by both
+    the gRPC ``Forward`` RPC and the fabric backend (Phase D). Carries
+    the transport-neutral outcome; each caller maps it to its own
+    response type (gRPC status codes vs fabric drop counters).
+
+    - ``ok`` True: ``payload`` holds the stripped hidden_state OR int32
+      token-id bytes (rtype prefix already removed).
+    - ``ok`` False: ``error`` is operator-readable; ``client_error``
+      distinguishes a bad-input case (gRPC INVALID_ARGUMENT) from a
+      daemon failure (gRPC INTERNAL)."""
+    ok: bool
+    payload: bytes
+    error: str
+    client_error: bool
 
 
 # ── Phase A (worker hardening sprint, 2026-05-20) ─────────────────────
@@ -976,6 +1120,48 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
             ],
         )
 
+    def _run_forward(self, hidden_in: bytes, n_tokens: int,
+                     has_token_ids: bool, keep_kv: bool,
+                     start_pos: int) -> "ForwardResult":
+        """Shared daemon decode path — the transport-neutral core of a
+        single forward step. Both the gRPC ``Forward`` RPC and the
+        fabric backend (Phase D) call this so the two transports can
+        never drift in their daemon-call semantics (cmd selection,
+        size validation, rtype-prefix stripping).
+
+        Returns a :class:`ForwardResult`. Does NOT touch gRPC context
+        or fabric counters — the caller maps the result to its own
+        transport's error reporting. KV semantics are the caller's to
+        decide: it passes ``keep_kv`` + ``start_pos`` derived from the
+        protobuf fields (gRPC) or the fabric header + per-chain state
+        (fabric)."""
+        flags = 0x1 if keep_kv else 0x0
+        if has_token_ids:
+            if len(hidden_in) != n_tokens * 4:
+                return ForwardResult(
+                    False, b"", "hidden_in size mismatch for token_ids mode",
+                    client_error=True)
+            cmd = CMD_TOKEN_DECODE
+        else:
+            expected = n_tokens * self.n_embd * 4
+            if len(hidden_in) != expected:
+                return ForwardResult(
+                    False, b"",
+                    f"hidden_in size mismatch: got {len(hidden_in)}, "
+                    f"expected {expected}",
+                    client_error=True)
+            cmd = CMD_EMBD_DECODE
+        status, resp = self.daemon.call(
+            cmd, n_tokens, hidden_in, start_pos=start_pos, flags=flags)
+        if status != 0 or len(resp) < 4:
+            return ForwardResult(
+                False, b"",
+                f"daemon decode failed status={status} resp_len={len(resp)}",
+                client_error=False)
+        # Strip the 4-byte rtype prefix; payload is hidden_state OR
+        # int32 token id. Caller knows this worker's mode via Info.
+        return ForwardResult(True, resp[4:], "", client_error=False)
+
     def Forward(self, request, context):
         # Phase B (2026-05-20): authenticate the unary call. The signed
         # body is the serialized request — same canonical-string shape
@@ -985,36 +1171,17 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
             method_path="/nakshatra.Nakshatra/Forward",
             is_streaming=False,
         )
-        n = request.n_tokens
-        flags = 0x1 if request.keep_kv else 0x0
-        start_pos = int(request.start_pos)
-        if request.has_token_ids:
-            if len(request.hidden_in) != n * 4:
-                context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
-                context.set_details(f"hidden_in size mismatch for token_ids mode")
-                return pb.ForwardResponse()
-            status, resp = self.daemon.call(CMD_TOKEN_DECODE, n, request.hidden_in,
-                                             start_pos=start_pos, flags=flags)
-        else:
-            expected = n * self.n_embd * 4
-            if len(request.hidden_in) != expected:
-                context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
-                context.set_details(f"hidden_in size mismatch: got {len(request.hidden_in)}, expected {expected}")
-                return pb.ForwardResponse()
-            status, resp = self.daemon.call(CMD_EMBD_DECODE, n, request.hidden_in,
-                                             start_pos=start_pos, flags=flags)
-
-        if status != 0 or len(resp) < 4:
-            context.set_code(grpc.StatusCode.INTERNAL)
-            context.set_details(f"daemon decode failed status={status} resp_len={len(resp)}")
+        result = self._run_forward(
+            request.hidden_in, request.n_tokens, request.has_token_ids,
+            request.keep_kv, int(request.start_pos),
+        )
+        if not result.ok:
+            context.set_code(
+                grpc.StatusCode.INVALID_ARGUMENT if result.client_error
+                else grpc.StatusCode.INTERNAL)
+            context.set_details(result.error)
             return pb.ForwardResponse()
-
-        # Strip the 4-byte rtype prefix; payload is hidden_state OR int32 token id.
-        rtype = struct.unpack("<I", resp[:4])[0]
-        payload = resp[4:]
-        # Caller (chain client) knows what mode this worker is in via Info; the
-        # bytes returned are either hidden state or a single int32 token id.
-        return pb.ForwardResponse(hidden_out=payload)
+        return pb.ForwardResponse(hidden_out=result.payload)
 
     def Inference(self, request_iterator, context):
         """v0.5 M0.5.1 — streaming inference RPC.
@@ -2385,6 +2552,23 @@ def main():
     ap.add_argument("--port", type=int, default=5500)
     ap.add_argument("--sub-gguf", type=str, required=True)
     ap.add_argument("--mode", type=str, choices=["first", "middle", "last"], required=True)
+    # 2026-05-29 fabric Phase D — transport selector. Default grpc keeps
+    # the existing v0.1 70B cluster (home-pc:5530) unchanged. fabric
+    # opts into the network-fabric data plane: the worker calls /join,
+    # builds per-pair UDP links, and serves worker↔worker hops over the
+    # fabric packet schema. gRPC stays up for Info + the client bridge
+    # (sprint open question 8) — fabric isn't a full gRPC replacement
+    # in the v0 prototype.
+    ap.add_argument("--transport", type=str, choices=["grpc", "fabric"],
+                    default="grpc",
+                    help="data-plane transport. grpc (default): today's "
+                         "path. fabric: network-fabric UDP data plane "
+                         "(requires a live chain plan covering this peer; "
+                         "refuses boot otherwise).")
+    ap.add_argument("--fabric-port", type=int, default=0,
+                    help="UDP port for the fabric data plane when "
+                         "--transport=fabric. 0 (default) means grpc "
+                         "port + 100.")
     ap.add_argument("--layer-start", type=int, required=True)
     ap.add_argument("--layer-end", type=int, required=True)
     ap.add_argument("--model-id", type=str, default="nakshatra-v0.1")
@@ -2915,10 +3099,38 @@ def main():
               + (f" (signed; pubkey={worker_pub_hex[:16]}…)" if worker_pub_hex else " (UNSIGNED)"),
               flush=True)
 
+    # 2026-05-29 fabric Phase D — bring up the fabric data plane when
+    # --transport=fabric. gRPC server above stays up for Info + the
+    # client→first-worker bridge (sprint open question 8); the fabric
+    # backend handles worker↔worker FORWARD/FEEDBACK hops. setup_fabric
+    # refuses boot (sys.exit) if no chain plan covers this peer yet.
+    fabric_backend = None
+    if args.transport == "fabric":
+        fabric_backend, _fabric_join = setup_fabric(
+            args, servicer._run_forward, servicer.n_embd,
+            worker_priv=worker_priv, node_id=node_id,
+        )
+        if fabric_backend.inbound_link is not None:
+            fabric_thread = threading.Thread(
+                target=fabric_backend.serve, daemon=True,
+                name="fabric-serve",
+            )
+            fabric_thread.start()
+            print("[worker] fabric serve loop started", flush=True)
+        else:
+            # First worker has no inbound fabric link (its input is the
+            # client's gRPC Forward). It still sends onward via the
+            # forward link, driven from the gRPC handler bridge — which
+            # is Phase F wiring. For now it just logs.
+            print("[worker] fabric: no inbound link (first worker); "
+                  "client-bridge send path lands in Phase F", flush=True)
+
     try:
         server.wait_for_termination()
     finally:
         stop_event.set()
+        if fabric_backend is not None:
+            fabric_backend.stop()
         daemon.close()
 
 
