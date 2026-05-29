@@ -1328,6 +1328,39 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                 # Daemon prefixes payload with rtype; Forward drops it, we do too.
                 payload = resp[4:]
 
+                # 2026-05-29 fabric: streaming-mode bridge for the
+                # first worker. Same OQ8 shape as the unary Forward
+                # bridge (see WorkerServicer.Forward) — when wired
+                # AND mode=first, ship the local decode's hidden via
+                # fabric, block for the chain's final token to come
+                # back via FEEDBACK, and yield it on the gRPC stream
+                # as token_ids. Skips the next_server / chain push
+                # path below (fabric owns worker↔worker now).
+                if (self.mode == "first"
+                        and self.fabric_first_worker_bridge is not None):
+                    token_bytes = self.fabric_first_worker_bridge(
+                        payload, step_id=step.step_id,
+                        layer_idx=self.layer_end,
+                    )
+                    if token_bytes is None:
+                        yield pb.InferenceStep(
+                            session_id=step.session_id,
+                            step_id=step.step_id,
+                            error=b"fabric chain timed out before "
+                                  b"FEEDBACK arrived",
+                        )
+                        return
+                    token_id = struct.unpack("<i", token_bytes[:4])[0]
+                    out = pb.InferenceStep(
+                        session_id=step.session_id,
+                        step_id=step.step_id,
+                        prefix_length=step.prefix_length + n_tokens,
+                    )
+                    out.token_ids.ids.append(token_id)
+                    self._idem_put(step.session_id, step.step_id, out)
+                    yield out
+                    continue
+
                 out = pb.InferenceStep(
                     session_id=step.session_id,
                     step_id=step.step_id,
