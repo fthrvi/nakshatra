@@ -36,8 +36,18 @@ import struct
 import sys
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Callable, Optional, Protocol
+
+
+# Schema §9 lists rtt_ns_p50 / rtt_ns_p99 as feedback-wormhole-only
+# metrics; we keep the last N round-trip samples on the first worker
+# (the only side that observes the full FORWARD→FEEDBACK cycle) and
+# recompute the percentiles on every successful round-trip. N=64
+# keeps the sort cost negligible vs the round-trip itself; larger
+# windows trade smoother percentiles for staler samples.
+_RTT_SAMPLE_WINDOW = 64
 
 
 # Indirection so tests can monkey-patch the clock if they ever need to
@@ -140,6 +150,12 @@ class FabricBackend:
 
         self._chains: dict[int, _ChainState] = {}
         self._stop = threading.Event()
+        # 2026-05-29 RTT measurement. Only populated on the first
+        # worker (the only side that observes the full forward→feedback
+        # cycle). Each successful first_worker_round_trip pushes one
+        # sample; _refresh_rtt_counters writes the latest p50/p99 into
+        # forward_link.counters where LinkStatsReporter snapshots from.
+        self._rtt_samples: deque[int] = deque(maxlen=_RTT_SAMPLE_WINDOW)
 
     # ── Link wiring ────────────────────────────────────────────────
 
@@ -317,6 +333,11 @@ class FabricBackend:
         if self.feedback_link is None:
             return None
 
+        # RTT clock starts right before we hand the FORWARD to the
+        # kernel — kernel buffer + NIC overhead is part of the round
+        # trip we want operators to see.
+        t_send = _now()
+
         self.forward_link.send(
             hidden,
             packet_type=fp.PACKET_TYPE_FORWARD,
@@ -329,7 +350,7 @@ class FabricBackend:
         # this step_id. Earlier-step stragglers are dropped (the chain
         # has moved on); later-step packets shouldn't be possible
         # since we just sent step_id, but they're treated as stale.
-        deadline = _now() + timeout_s
+        deadline = t_send + timeout_s
         while True:
             remaining = deadline - _now()
             if remaining <= 0:
@@ -342,4 +363,27 @@ class FabricBackend:
                 continue                                   # stray
             if header.step_id != step_id:
                 continue                                   # stale step
+            # Successful round-trip — record RTT sample and refresh
+            # the link counters so the next LinkStatsReporter snapshot
+            # carries the latest percentiles.
+            rtt_ns = int((_now() - t_send) * 1_000_000_000)
+            self._rtt_samples.append(rtt_ns)
+            self._refresh_rtt_counters()
             return payload
+
+    def _refresh_rtt_counters(self) -> None:
+        """Recompute p50 + p99 over the current sample ring and write
+        them into ``forward_link.counters`` so the next
+        ``LinkStatsReporter`` snapshot picks them up automatically
+        (schema §9 RTT fields are link-keyed). Cheap: at N=64 the
+        sort cost is dwarfed by the round trip itself."""
+        if self.forward_link is None or not self._rtt_samples:
+            return
+        sorted_samples = sorted(self._rtt_samples)
+        n = len(sorted_samples)
+        # Nearest-rank percentile — matches the typical operator
+        # intuition ("the slowest 1% of round trips are above p99").
+        p50_idx = max(0, min(n - 1, int(n * 0.5)))
+        p99_idx = max(0, min(n - 1, int(n * 0.99)))
+        self.forward_link.counters["rtt_ns_p50"] = sorted_samples[p50_idx]
+        self.forward_link.counters["rtt_ns_p99"] = sorted_samples[p99_idx]

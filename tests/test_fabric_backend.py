@@ -412,6 +412,113 @@ def test_first_worker_round_trip_returns_none_when_links_missing():
                                         timeout_s=0.1) is None
 
 
+def test_round_trip_records_rtt_sample_in_link_counters():
+    """A successful round-trip pushes one RTT sample and updates
+    the forward_link's rtt_ns_p50 / rtt_ns_p99 counters so the next
+    LinkStatsReporter snapshot carries non-zero values (schema §9
+    rtt fields)."""
+    backend_sock = _udp_sock()
+    last_sock = _udp_sock()
+    forward = FabricLink(backend_sock, last_sock.getsockname(), KEY, CHAIN)
+    last_link = FabricLink(last_sock, backend_sock.getsockname(), KEY, CHAIN)
+    be = fb.FabricBackend(_echo_fn(), "first", N_EMBD)
+    be.set_links(forward=forward, feedback=forward)
+
+    def fake_last():
+        got = last_link.recv(timeout=2.0)
+        assert got is not None
+        last_link.send(b"\x01\x00\x00\x00",
+                       packet_type=fp.PACKET_TYPE_FEEDBACK,
+                       step_id=got[0].step_id,
+                       layer_idx=fp.LAYER_IDX_FEEDBACK)
+
+    t = threading.Thread(target=fake_last, daemon=True)
+    t.start()
+    try:
+        # Initial state — counters at zero, no samples recorded yet.
+        assert forward.counters["rtt_ns_p50"] == 0
+        assert forward.counters["rtt_ns_p99"] == 0
+        out = be.first_worker_round_trip(b"\x00" * ELEM_BYTES,
+                                           step_id=0, timeout_s=2.0)
+        assert out is not None
+        # Ring buffer captured the sample; counters reflect it.
+        assert len(be._rtt_samples) == 1
+        assert forward.counters["rtt_ns_p50"] > 0
+        assert forward.counters["rtt_ns_p99"] > 0
+        # On a single-sample window p50 == p99 (nearest-rank).
+        assert forward.counters["rtt_ns_p50"] == forward.counters["rtt_ns_p99"]
+    finally:
+        t.join(timeout=2.0)
+        backend_sock.close()
+        last_sock.close()
+
+
+def test_failed_round_trip_does_not_pollute_rtt_samples():
+    """A timeout (no FEEDBACK arrived) MUST NOT push a sample —
+    otherwise the rtt metric drifts toward timeout_s × N and becomes
+    operationally useless. Operators expect RTT to reflect successful
+    round trips only."""
+    backend_sock = _udp_sock()
+    void_sock = _udp_sock()
+    forward = FabricLink(backend_sock, void_sock.getsockname(), KEY, CHAIN)
+    be = fb.FabricBackend(_echo_fn(), "first", N_EMBD)
+    be.set_links(forward=forward, feedback=forward)
+    try:
+        out = be.first_worker_round_trip(b"\x00" * ELEM_BYTES, timeout_s=0.2)
+        assert out is None
+        assert len(be._rtt_samples) == 0
+        assert forward.counters["rtt_ns_p50"] == 0
+        assert forward.counters["rtt_ns_p99"] == 0
+    finally:
+        backend_sock.close()
+        void_sock.close()
+
+
+def test_refresh_rtt_counters_percentile_computation():
+    """Direct test of the nearest-rank percentile math. Feed a known
+    distribution sized to fit the window so all samples survive,
+    then verify p50 / p99 land where operators expect — closes the
+    contract that operators reading /fabric/links see "the slow 1%
+    of round trips" via rtt_ns_p99."""
+    forward = FabricLink(_udp_sock(), ("127.0.0.1", 1), KEY, CHAIN)
+    be = fb.FabricBackend(_echo_fn(), "first", N_EMBD)
+    be.set_links(forward=forward)
+    try:
+        # Exactly window-sized so nothing gets evicted: 1..N.
+        n = fb._RTT_SAMPLE_WINDOW
+        for v in range(1, n + 1):
+            be._rtt_samples.append(v)
+        be._refresh_rtt_counters()
+        # Nearest-rank with int(n * percentile) index on a sorted list
+        # [1, 2, ..., n] where sorted[i] = i + 1.
+        expect_p50 = int(n * 0.5) + 1
+        expect_p99 = int(n * 0.99) + 1
+        assert forward.counters["rtt_ns_p50"] == expect_p50
+        assert forward.counters["rtt_ns_p99"] == expect_p99
+    finally:
+        forward.sock.close()
+
+
+def test_rtt_sample_window_caps_at_64():
+    """Window is bounded so a long-running worker doesn't accumulate
+    state forever and percentiles reflect RECENT health, not lifetime
+    health (operators wouldn't notice a recent regression if old fast
+    samples dominated)."""
+    forward = FabricLink(_udp_sock(), ("127.0.0.1", 1), KEY, CHAIN)
+    be = fb.FabricBackend(_echo_fn(), "first", N_EMBD)
+    be.set_links(forward=forward)
+    try:
+        for v in range(200):
+            be._rtt_samples.append(v)
+        assert len(be._rtt_samples) == fb._RTT_SAMPLE_WINDOW
+        # The deque kept the LAST 64 values (136..199), so p50/p99
+        # reflect recent samples, not the early ones.
+        be._refresh_rtt_counters()
+        assert forward.counters["rtt_ns_p50"] >= 136
+    finally:
+        forward.sock.close()
+
+
 def test_first_worker_round_trip_skips_stale_step_packets():
     """If an earlier-step FEEDBACK is still in flight when we send
     step k, the bridge should drop the straggler and wait for the

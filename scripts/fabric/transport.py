@@ -77,6 +77,13 @@ _COUNTER_NAMES = (
     "recv_gaps",
     "recv_dropped_alloc",
     "recv_dropped_dtype",
+    # Schema §9 — RTT fields. Populated by FabricBackend's RTT ring
+    # buffer on the first worker (the only side that observes the
+    # full forward→feedback round trip); zero on every other link.
+    # Default-initialised to 0 here so callers can read the keys
+    # without a .get fallback even before the first round trip.
+    "rtt_ns_p50",
+    "rtt_ns_p99",
     # Magic + version drops aren't in the schema's prescribed set
     # (those are "garbage UDP found the port" cases that the schema
     # treats as silent drops). Track them privately for operator
