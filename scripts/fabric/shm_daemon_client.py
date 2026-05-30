@@ -267,13 +267,18 @@ class ShmDaemonClient:
                     f"daemon response payload length mismatch: "
                     f"declared {plen}, got {len(data)}"
                 )
-            # Timing accounting — same shape as DaemonClient.
+            # Timing accounting — same shape as DaemonClient. Inline
+            # the NaN/Inf guard rather than late-importing worker.py;
+            # ShmDaemonClient gets deployed standalone (Phase A.3
+            # cluster smokes don't ship worker.py).
             if cmd != CMD_INFO and not _internal_ready_probe:
-                from worker import safe_rpc_ms        # late import — avoid cycle
-                clean = safe_rpc_ms(
-                    (time.monotonic() - t0) * 1000.0)
-                if clean is not None:
-                    self.recent_rpc_ms.append(clean)
+                raw = (time.monotonic() - t0) * 1000.0
+                try:
+                    clean = float(raw)
+                    if clean == clean and -1e9 < clean < 1e9 and clean >= 0:
+                        self.recent_rpc_ms.append(clean)
+                except (ValueError, TypeError):
+                    pass
             return status, data
 
     # ── Mirror worker.DaemonClient.info() ────────────────────────

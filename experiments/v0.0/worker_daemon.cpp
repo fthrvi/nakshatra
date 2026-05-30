@@ -8,6 +8,12 @@
 //   request:  u32 cmd | u32 n_tokens | u32 start_pos | u32 flags | u32 payload_bytes | bytes payload
 //   response: u32 status | u32 payload_bytes | bytes payload
 //
+// 2026-05-30 fabric C++ Phase A.3 — alternate shm transport. Same wire
+// envelope as stdio; the request/response bytes ride two SPSC shared-memory
+// rings instead of stdin/stdout. Activated when both --fabric-shm-req <path>
+// and --fabric-shm-resp <path> are passed on argv (after the positional
+// args). Stdio path stays the default; existing callers unchanged.
+//
 // Flags:
 //   bit 0 (0x1) = keep_kv. If set, daemon skips llama_memory_clear before
 //                 decode (streaming generation). Tokens are placed in KV
@@ -33,6 +39,8 @@
 #include "common.h"
 #include "llama.h"
 
+#include "shm_ring.hpp"
+
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
@@ -41,6 +49,14 @@
 #include <string>
 #include <vector>
 #include <unistd.h>
+
+// ── Transport: stdio (default) or shm (--fabric-shm-{req,resp}) ────
+
+// When non-null, daemon uses shm transport instead of stdio. Owned by
+// main() — globals here are fine because there's exactly one daemon
+// process per worker and the transport choice is set once at startup.
+static nakshatra::fabric::ShmRing* g_shm_req = nullptr;
+static nakshatra::fabric::ShmRing* g_shm_resp = nullptr;
 
 static int read_all_fd(int fd, void* buf, size_t n) {
     char* p = (char*)buf;
@@ -66,19 +82,81 @@ static int write_all_fd(int fd, const void* buf, size_t n) {
     return 0;
 }
 
-static int read_u32(uint32_t* v) { return read_all_fd(0, v, 4); }
-static int write_u32(uint32_t v) { return write_all_fd(1, &v, 4); }
+// Read one full request frame. In stdio mode: 5 u32 header reads
+// followed by a payload read. In shm mode: one framed read off the
+// request ring. Returns 0 on success, -1 on EOF / error.
+static int read_request(uint32_t& cmd, uint32_t& n_tokens,
+                          uint32_t& start_pos, uint32_t& flags,
+                          std::vector<uint8_t>& payload) {
+    if (g_shm_req) {
+        std::vector<uint8_t> frame;
+        try {
+            g_shm_req->read_message_blocking(frame);
+        } catch (const nakshatra::fabric::ShmRingError& e) {
+            fprintf(stderr, "[daemon] shm req error: %s\n", e.what());
+            return -1;
+        }
+        if (frame.size() < 20) {
+            fprintf(stderr, "[daemon] shm request frame too short: %zu\n", frame.size());
+            return -1;
+        }
+        std::memcpy(&cmd,       frame.data() + 0,  4);
+        std::memcpy(&n_tokens,  frame.data() + 4,  4);
+        std::memcpy(&start_pos, frame.data() + 8,  4);
+        std::memcpy(&flags,     frame.data() + 12, 4);
+        uint32_t payload_bytes;
+        std::memcpy(&payload_bytes, frame.data() + 16, 4);
+        if (frame.size() != 20 + (size_t)payload_bytes) {
+            fprintf(stderr, "[daemon] shm request payload size mismatch: "
+                            "declared %u, frame has %zu\n",
+                    payload_bytes, frame.size() - 20);
+            return -1;
+        }
+        payload.assign(frame.begin() + 20, frame.end());
+        return 0;
+    }
+    // Stdio path — unchanged from the pre-A.3 daemon.
+    uint32_t payload_bytes;
+    if (read_all_fd(0, &cmd,           4) != 0) return -1;
+    if (read_all_fd(0, &n_tokens,      4) != 0) return -1;
+    if (read_all_fd(0, &start_pos,     4) != 0) return -1;
+    if (read_all_fd(0, &flags,         4) != 0) return -1;
+    if (read_all_fd(0, &payload_bytes, 4) != 0) return -1;
+    payload.resize(payload_bytes);
+    if (payload_bytes > 0 &&
+        read_all_fd(0, payload.data(), payload_bytes) != 0) {
+        return -1;
+    }
+    return 0;
+}
 
-static void send_response(uint32_t status, const void* payload, uint32_t payload_bytes) {
-    write_u32(status);
-    write_u32(payload_bytes);
+static void send_response(uint32_t status, const void* payload,
+                            uint32_t payload_bytes) {
+    if (g_shm_resp) {
+        // Build the response frame (8-byte header + payload) and
+        // ship it as ONE framed shm message. The ring's own length
+        // prefix wraps the daemon's wire envelope; the wire bytes
+        // stay byte-identical to the stdio path so a Python consumer
+        // can parse them the same way.
+        std::vector<uint8_t> frame(8 + payload_bytes);
+        std::memcpy(frame.data() + 0, &status,        4);
+        std::memcpy(frame.data() + 4, &payload_bytes, 4);
+        if (payload_bytes > 0) {
+            std::memcpy(frame.data() + 8, payload, payload_bytes);
+        }
+        g_shm_resp->write_message_blocking(frame.data(), frame.size());
+        return;
+    }
+    // Stdio path — unchanged.
+    write_all_fd(1, &status,        4);
+    write_all_fd(1, &payload_bytes, 4);
     if (payload_bytes > 0) write_all_fd(1, payload, payload_bytes);
     fflush(stdout);
 }
 
 int main(int argc, char ** argv) {
     if (argc < 3) {
-        fprintf(stderr, "usage: %s <sub_gguf_path> <mode: first|middle|last> [n_ctx] [n_threads] [n_gpu_layers]\n", argv[0]);
+        fprintf(stderr, "usage: %s <sub_gguf_path> <mode: first|middle|last> [n_ctx] [n_threads] [n_gpu_layers] [--fabric-shm-req <path> --fabric-shm-resp <path>]\n", argv[0]);
         return 1;
     }
     std::string sub_gguf = argv[1];
@@ -93,6 +171,36 @@ int main(int argc, char ** argv) {
     int n_ctx        = argc > 3 ? atoi(argv[3]) : 256;
     int n_threads    = argc > 4 ? atoi(argv[4]) : 0;  // 0 = leave llama.cpp's default
     int n_gpu_layers = argc > 5 ? atoi(argv[5]) : 0;  // 0 = CPU only; 99 = all GPU
+
+    // 2026-05-30 Phase A.3 — parse the optional shm transport flags.
+    // They appear after the positional args. When both are present,
+    // attach both rings + flip into shm mode. Absent → stdio (legacy).
+    std::string shm_req_path, shm_resp_path;
+    for (int i = 6; i < argc; i++) {
+        if (strcmp(argv[i], "--fabric-shm-req") == 0 && i + 1 < argc) {
+            shm_req_path = argv[++i];
+        } else if (strcmp(argv[i], "--fabric-shm-resp") == 0 && i + 1 < argc) {
+            shm_resp_path = argv[++i];
+        }
+    }
+    bool shm_mode = !shm_req_path.empty() && !shm_resp_path.empty();
+    if (shm_mode) {
+        try {
+            // Heap-allocate so global pointers can outlive the local
+            // attach() return values via move construction.
+            g_shm_req  = new nakshatra::fabric::ShmRing(
+                nakshatra::fabric::ShmRing::attach(shm_req_path));
+            g_shm_resp = new nakshatra::fabric::ShmRing(
+                nakshatra::fabric::ShmRing::attach(shm_resp_path));
+            fprintf(stderr, "[daemon] shm transport attached: req=%s resp=%s "
+                            "capacity=%zu\n",
+                    shm_req_path.c_str(), shm_resp_path.c_str(),
+                    g_shm_req->capacity());
+        } catch (const std::exception& e) {
+            fprintf(stderr, "[daemon] shm attach failed: %s\n", e.what());
+            return 4;
+        }
+    }
 
     common_init();
     llama_backend_init();
@@ -129,20 +237,16 @@ int main(int argc, char ** argv) {
     // layers correctly, and we trust the cluster config rather than
     // round-tripping the metadata. The INFO response surfaces what we know.
 
-    fprintf(stderr, "[daemon] ready: %s n_embd=%d n_layer=%d n_vocab=%d n_ctx=%d n_gpu_layers=%d\n",
-            sub_gguf.c_str(), n_embd, n_layer, n_vocab, n_ctx, n_gpu_layers);
+    fprintf(stderr, "[daemon] ready: %s n_embd=%d n_layer=%d n_vocab=%d n_ctx=%d n_gpu_layers=%d transport=%s\n",
+            sub_gguf.c_str(), n_embd, n_layer, n_vocab, n_ctx, n_gpu_layers,
+            shm_mode ? "shm" : "stdio");
 
     // Main message loop
     while (true) {
-        uint32_t cmd, n_tokens, start_pos, flags, payload_bytes;
-        if (read_u32(&cmd) != 0) break;
-        if (read_u32(&n_tokens) != 0) break;
-        if (read_u32(&start_pos) != 0) break;
-        if (read_u32(&flags) != 0) break;
-        if (read_u32(&payload_bytes) != 0) break;
-
-        std::vector<uint8_t> payload(payload_bytes);
-        if (payload_bytes > 0 && read_all_fd(0, payload.data(), payload_bytes) != 0) break;
+        uint32_t cmd, n_tokens, start_pos, flags;
+        std::vector<uint8_t> payload;
+        if (read_request(cmd, n_tokens, start_pos, flags, payload) != 0) break;
+        uint32_t payload_bytes = (uint32_t)payload.size();
 
         const bool keep_kv = (flags & 0x1) != 0;
 
@@ -237,6 +341,8 @@ int main(int argc, char ** argv) {
     }
 
     fprintf(stderr, "[daemon] eof, shutting down\n");
+    if (g_shm_req)  { delete g_shm_req;  g_shm_req  = nullptr; }
+    if (g_shm_resp) { delete g_shm_resp; g_shm_resp = nullptr; }
     llama_free(ctx);
     llama_model_free(model);
     llama_backend_free();
