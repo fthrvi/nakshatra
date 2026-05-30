@@ -29,10 +29,54 @@ multiplexing-with-grpc concern at this layer.
 """
 from __future__ import annotations
 
+import os
 import socket
+import time
 from typing import Optional
 
 from fabric import packet as fp
+
+
+# 2026-05-29 transport hardening — env-tunable knobs surfaced after the
+# Phase F.3 cluster smoke found ~75% chunk loss when 12-chunk activations
+# fired back-to-back over Tailscale. Wire schema is fine (every arrival
+# parses + AES-GCM-verifies); the loss is at the receiver's UDP socket
+# buffer drainage rate. Two knobs:
+#
+#   1. SO_RCVBUF bump: absorbs the burst kernel-side without slowing the
+#      sender. macOS default ~200 KB; bumping to 4 MB swallows a 12-chunk
+#      (~18 KB) burst trivially with room for many concurrent assemblies.
+#   2. Sender pacing: a tunable inter-chunk sleep. Trades sender latency
+#      for delivery rate when the receiver buffer route isn't enough.
+#
+# Both default OFF (0) so localhost smoke + unit tests are unchanged
+# and the same-LAN Mode A path doesn't pay a latency cost it doesn't need.
+ENV_RECV_BUF_BYTES = "NAKSHATRA_FABRIC_RECV_BUF_BYTES"
+ENV_SEND_PACE_S = "NAKSHATRA_FABRIC_SEND_PACE_S"
+
+
+def _env_int(name: str, default: int = 0) -> int:
+    """Typo-safe env int reader. Same fallback stance as
+    nakshatra_tls._probe_timeout_from_env."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        v = int(raw)
+    except ValueError:
+        return default
+    return max(0, v)
+
+
+def _env_float(name: str, default: float = 0.0) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        v = float(raw)
+    except ValueError:
+        return default
+    return max(0.0, v)
 
 
 # ── MTU math ────────────────────────────────────────────────────────
@@ -204,6 +248,8 @@ class FabricLink:
         mtu: int = 1500,
         max_slot_bytes: int = DEFAULT_MAX_SLOT_BYTES,
         max_slots: int = DEFAULT_MAX_SLOTS,
+        recv_buf_bytes: Optional[int] = None,
+        send_pace_s: Optional[float] = None,
     ):
         if len(key) != 16:
             raise ValueError(
@@ -217,6 +263,24 @@ class FabricLink:
         self.chunk_payload_max = max_chunk_payload_for_mtu(mtu)
         self.max_slot_bytes = max_slot_bytes
         self.max_slots = max_slots
+        # 2026-05-29 transport hardening (see ENV_* docs above). Default
+        # OFF — explicit constructor arg overrides env; both off is the
+        # zero-overhead loopback path the unit tests + same-LAN
+        # production rely on.
+        self.send_pace_s = (
+            send_pace_s if send_pace_s is not None
+            else _env_float(ENV_SEND_PACE_S)
+        )
+        rcv = (recv_buf_bytes if recv_buf_bytes is not None
+               else _env_int(ENV_RECV_BUF_BYTES))
+        if rcv > 0:
+            # Best-effort — the kernel may cap below the request
+            # (sysctl net.core.rmem_max on Linux, kern.ipc.maxsockbuf
+            # on macOS). setsockopt itself doesn't raise on cap;
+            # the resulting effective buffer is whatever the OS gave.
+            self.sock.setsockopt(
+                socket.SOL_SOCKET, socket.SO_RCVBUF, rcv)
+        self.recv_buf_bytes_requested = rcv
         self.send_seq: int = 0
         # Sentinel — no packets received yet, so the first packet
         # establishes the baseline without firing a spurious gap.
@@ -308,7 +372,13 @@ class FabricLink:
             payload, packet_type=packet_type, step_id=step_id,
             layer_idx=layer_idx, dtype=dtype,
         )
-        for c in chunks:
+        for idx, c in enumerate(chunks):
+            # Inter-chunk pacing (Phase F.3 burst-loss mitigation —
+            # see fabric_burst_loss_finding memory). Only sleeps when
+            # send_pace_s > 0 AND there's another chunk after this
+            # one, so single-datagram sends pay no cost.
+            if idx > 0 and self.send_pace_s > 0:
+                time.sleep(self.send_pace_s)
             self.sock.sendto(c, self.peer_addr)
             self.counters["sent_packets"] += 1
             self.counters["sent_bytes"] += len(c)

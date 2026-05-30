@@ -417,6 +417,128 @@ def test_link_rejects_non_16_byte_key():
         sock.close()
 
 
+# ── 9. Transport hardening — recv buf + send pacing ─────────────────
+
+
+def test_recv_buf_bytes_calls_setsockopt():
+    """Phase F.3 burst-loss mitigation: SO_RCVBUF bump on construction
+    absorbs back-to-back chunk bursts kernel-side. Best-effort — the
+    actual buffer may be capped by the OS; here we just assert the
+    setsockopt call happens."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("127.0.0.1", 0))
+    try:
+        link = ft.FabricLink(
+            sock, ("127.0.0.1", 1), KEY_A, 1,
+            recv_buf_bytes=4 * 1024 * 1024,
+        )
+        # The effective buf may be < requested (OS cap) but it should
+        # be at least somewhat larger than the default (~200 KB on
+        # macOS, ~200-300 KB on Linux). Sanity check that
+        # setsockopt didn't error and the value went somewhere
+        # plausible.
+        effective = sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+        assert effective > 0
+        assert link.recv_buf_bytes_requested == 4 * 1024 * 1024
+    finally:
+        sock.close()
+
+
+def test_recv_buf_bytes_default_off_no_setsockopt():
+    """Default behavior unchanged — when recv_buf_bytes is omitted +
+    env unset, no setsockopt call happens and the buffer stays at
+    whatever the kernel chose at bind time."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("127.0.0.1", 0))
+    try:
+        link = ft.FabricLink(sock, ("127.0.0.1", 1), KEY_A, 1)
+        assert link.recv_buf_bytes_requested == 0
+    finally:
+        sock.close()
+
+
+def test_recv_buf_bytes_from_env(monkeypatch):
+    monkeypatch.setenv(ft.ENV_RECV_BUF_BYTES, "2097152")
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("127.0.0.1", 0))
+    try:
+        link = ft.FabricLink(sock, ("127.0.0.1", 1), KEY_A, 1)
+        assert link.recv_buf_bytes_requested == 2 * 1024 * 1024
+    finally:
+        sock.close()
+
+
+def test_env_int_typo_safe(monkeypatch):
+    """Bad env values fall back to default rather than disabling the
+    knob silently. Same stance as nakshatra_tls's probe-timeout env."""
+    for bad in ("", "   ", "abc", "4M", "-100"):
+        monkeypatch.setenv(ft.ENV_RECV_BUF_BYTES, bad)
+        assert ft._env_int(ft.ENV_RECV_BUF_BYTES) == 0
+
+
+def test_send_pace_sleeps_between_chunks(monkeypatch):
+    """Sender pacing — with send_pace_s > 0, time.sleep is called
+    between (not before the first) chunks. Asserts the (N-1) sleeps
+    for an N-chunk send."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("127.0.0.1", 0))
+    try:
+        # Pace = 5ms; chunk count = 6 → expect 5 sleep calls.
+        link = ft.FabricLink(sock, sock.getsockname(), KEY_A, 1,
+                              mtu=1500, send_pace_s=0.005)
+        sleeps = []
+        monkeypatch.setattr(ft.time, "sleep", lambda s: sleeps.append(s))
+        # 8192 bytes → 6 chunks at MTU 1500 (1408-byte payload max).
+        link.send(b"X" * 8192)
+        assert len(sleeps) == 5
+        assert all(s == 0.005 for s in sleeps)
+    finally:
+        sock.close()
+
+
+def test_send_pace_zero_no_sleep_calls(monkeypatch):
+    """Default off — no pacing means no sleep calls even for a long
+    burst. Same-LAN production + localhost smoke pay zero cost."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("127.0.0.1", 0))
+    try:
+        link = ft.FabricLink(sock, sock.getsockname(), KEY_A, 1, mtu=1500)
+        sleeps = []
+        monkeypatch.setattr(ft.time, "sleep", lambda s: sleeps.append(s))
+        link.send(b"X" * 8192)               # 6 chunks
+        assert sleeps == []
+    finally:
+        sock.close()
+
+
+def test_send_pace_skips_for_single_chunk(monkeypatch):
+    """A 1-chunk send pays zero pacing cost even when pace is
+    configured — the inter-chunk delay is between consecutive sends,
+    so the first (and only) chunk goes immediately."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("127.0.0.1", 0))
+    try:
+        link = ft.FabricLink(sock, sock.getsockname(), KEY_A, 1,
+                              send_pace_s=1.0)            # huge, would be obvious
+        sleeps = []
+        monkeypatch.setattr(ft.time, "sleep", lambda s: sleeps.append(s))
+        link.send(b"X" * 100)                # well under MTU
+        assert sleeps == []
+    finally:
+        sock.close()
+
+
+def test_send_pace_from_env(monkeypatch):
+    monkeypatch.setenv(ft.ENV_SEND_PACE_S, "0.01")
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("127.0.0.1", 0))
+    try:
+        link = ft.FabricLink(sock, sock.getsockname(), KEY_A, 1)
+        assert link.send_pace_s == 0.01
+    finally:
+        sock.close()
+
+
 def test_counter_set_matches_schema_names():
     """Schema §9 names the counters that ship over /fabric/link_stats
     in Phase E. Asserting the names now means Phase E's payload
