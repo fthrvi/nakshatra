@@ -372,6 +372,21 @@ int main(int argc, char ** argv) {
         // Response payload: first 4 bytes = result_type (0=hidden, 1=token).
         // C.1 timing — split post_send into get_embeddings + memcpy +
         // shm-write to identify which dominates on GPU mode.
+        // D.1 hypothesis test — force a llama_synchronize BEFORE
+        // get_embeddings so the timing splits "GPU pipeline wait"
+        // from "DMA + host alloc". Enabled by env NAKSHATRA_FABRIC_
+        // PROBE_SYNC=1; off by default so production decodes are
+        // unchanged.
+        static const bool probe_sync_enabled = []() {
+            const char* v = getenv("NAKSHATRA_FABRIC_PROBE_SYNC");
+            return v && (v[0] == '1' || v[0] == 't' || v[0] == 'T');
+        }();
+        uint64_t t_sync_start = 0, t_sync_done = 0;
+        if (probe_sync_enabled) {
+            t_sync_start = now_ns();
+            llama_synchronize(ctx);
+            t_sync_done = now_ns();
+        }
         uint64_t t_get_embd_start = timing_on ? now_ns() : 0;
         uint64_t t_get_embd_done = 0, t_memcpy_done = 0;
         if (mode_last) {
@@ -418,17 +433,21 @@ int main(int argc, char ** argv) {
                                     ? t_memcpy_done - t_get_embd_done : 0;
             uint64_t shm_send_ns = (t_send_done && t_memcpy_done)
                                     ? t_send_done - t_memcpy_done : 0;
+            uint64_t sync_ns = (t_sync_done && t_sync_start)
+                                ? t_sync_done - t_sync_start : 0;
             fprintf(stderr,
                     "[timing] cmd=%u n=%u total=%.3fms "
                     "recv_wait=%.3fms pre_decode=%.3fms "
                     "decode=%.3fms post_send=%.3fms "
-                    "[get_embd=%.3fms memcpy=%.3fms shm_send=%.3fms]\n",
+                    "[sync=%.3fms get_embd=%.3fms memcpy=%.3fms "
+                    "shm_send=%.3fms]\n",
                     cmd, n_tokens,
                     total_ns / 1e6,
                     recv_wait_ns / 1e6,
                     pre_decode_ns / 1e6,
                     decode_ns / 1e6,
                     post_decode_send_ns / 1e6,
+                    sync_ns / 1e6,
                     get_embd_ns / 1e6,
                     memcpy_ns / 1e6,
                     shm_send_ns / 1e6);
