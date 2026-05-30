@@ -154,9 +154,32 @@ static void send_response(uint32_t status, const void* payload,
     fflush(stdout);
 }
 
+// 2026-05-30 Phase B — compile-time version stamping for cluster-wide
+// version-lock. CMake passes -DNAKSHATRA_FABRIC_SHA + -D...BUILD_HOST
+// at build time; daemon prints them on --version. scripts/smoke_
+// daemon_version.py SSH's each cluster machine + asserts the SHAs
+// match — closes the long-standing daemon-skew finding from 2026-05-21.
+#ifndef NAKSHATRA_FABRIC_SHA
+#define NAKSHATRA_FABRIC_SHA "unknown"
+#endif
+#ifndef NAKSHATRA_FABRIC_BUILD_HOST
+#define NAKSHATRA_FABRIC_BUILD_HOST "unknown"
+#endif
+
 int main(int argc, char ** argv) {
+    // --version short-circuits before any model loading / arg
+    // validation, so the version-lock smoke can probe a binary
+    // without needing a model file on hand.
+    if (argc == 2 && strcmp(argv[1], "--version") == 0) {
+        printf("nakshatra-fabric-worker\n");
+        printf("  sha        %s\n", NAKSHATRA_FABRIC_SHA);
+        printf("  built_on   %s\n", NAKSHATRA_FABRIC_BUILD_HOST);
+        printf("  built_at   %s %s\n", __DATE__, __TIME__);
+        return 0;
+    }
     if (argc < 3) {
         fprintf(stderr, "usage: %s <sub_gguf_path> <mode: first|middle|last> [n_ctx] [n_threads] [n_gpu_layers] [--fabric-shm-req <path> --fabric-shm-resp <path>]\n", argv[0]);
+        fprintf(stderr, "       %s --version\n", argv[0]);
         return 1;
     }
     std::string sub_gguf = argv[1];

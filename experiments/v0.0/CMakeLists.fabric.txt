@@ -1,0 +1,64 @@
+# 2026-05-30 fabric C++ Phase B — drop-in CMakeLists for the
+# llama.cpp examples/nakshatra-spike/ dir. Appends a new sibling
+# target `llama-nakshatra-worker-fabric` alongside the existing
+# spike / m4_chain / nakshatra-worker targets WITHOUT touching them,
+# so the production binary on each cluster machine stays the same
+# bit-for-bit (live :5530 v0.1 70B cluster, daemon skew workarounds
+# still in place, etc.).
+#
+# Compile-time version stamps drive scripts/smoke_daemon_version.py:
+#
+#   cmake -S . -B build \
+#       -DNAKSHATRA_FABRIC_SHA=<git sha from nakshatra repo> \
+#       -DNAKSHATRA_FABRIC_BUILD_HOST=<hostname>
+#   cmake --build build --target llama-nakshatra-worker-fabric
+#   ./build/.../llama-nakshatra-worker-fabric --version
+#       sha        <git sha>
+#       built_on   <hostname>
+#       built_at   <__DATE__> <__TIME__>
+#
+# Defaults to "unknown" when the defines aren't passed (e.g. a manual
+# cmake --build without --reconfigure) — the smoke catches that as a
+# loud failure.
+
+set(TARGET llama-nakshatra-spike)
+add_executable(${TARGET} spike.cpp)
+install(TARGETS ${TARGET} RUNTIME)
+target_link_libraries(${TARGET} PRIVATE common llama ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
+set(TARGET2 llama-m4-chain)
+add_executable(${TARGET2} m4_chain.cpp)
+install(TARGETS ${TARGET2} RUNTIME)
+target_link_libraries(${TARGET2} PRIVATE common llama ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(${TARGET2} PRIVATE cxx_std_17)
+
+set(TARGET3 llama-nakshatra-worker)
+add_executable(${TARGET3} worker_daemon.cpp)
+install(TARGETS ${TARGET3} RUNTIME)
+target_link_libraries(${TARGET3} PRIVATE common llama ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(${TARGET3} PRIVATE cxx_std_17)
+
+# 2026-05-30 fabric C++ Phase A.3 / B — sibling target so the original
+# llama-nakshatra-worker binary (used by the live v0.1 70B cluster on
+# :5530) stays untouched. Same source file with --fabric-shm-req +
+# --fabric-shm-resp argv flags; falls back to stdio when absent.
+set(TARGET4 llama-nakshatra-worker-fabric)
+add_executable(${TARGET4} worker_daemon.cpp)
+install(TARGETS ${TARGET4} RUNTIME)
+target_link_libraries(${TARGET4} PRIVATE common llama ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(${TARGET4} PRIVATE cxx_std_17)
+
+# Compile-time version stamp — empty string defaults trigger the
+# "unknown" fallback in worker_daemon.cpp so a build that forgot the
+# -D defines surfaces loudly via --version (smoke catches it).
+if(NOT DEFINED NAKSHATRA_FABRIC_SHA)
+    set(NAKSHATRA_FABRIC_SHA "")
+endif()
+if(NOT DEFINED NAKSHATRA_FABRIC_BUILD_HOST)
+    set(NAKSHATRA_FABRIC_BUILD_HOST "")
+endif()
+target_compile_definitions(${TARGET4} PRIVATE
+    NAKSHATRA_FABRIC_SHA="${NAKSHATRA_FABRIC_SHA}"
+    NAKSHATRA_FABRIC_BUILD_HOST="${NAKSHATRA_FABRIC_BUILD_HOST}"
+)
