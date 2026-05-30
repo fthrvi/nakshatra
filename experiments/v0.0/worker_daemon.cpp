@@ -46,9 +46,24 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <string>
 #include <vector>
 #include <unistd.h>
+
+// 2026-05-30 fabric C++ Phase C.1 — timing instrumentation. Set
+// NAKSHATRA_FABRIC_TIMING=1 in the daemon's environment to print
+// per-decode wall-time breakdown to stderr. Off by default —
+// production decodes pay no overhead.
+static inline uint64_t now_ns() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+static bool fabric_timing_enabled() {
+    const char* v = getenv("NAKSHATRA_FABRIC_TIMING");
+    return v && (v[0] == '1' || v[0] == 't' || v[0] == 'T');
+}
 
 // ── Transport: stdio (default) or shm (--fabric-shm-{req,resp}) ────
 
@@ -264,11 +279,19 @@ int main(int argc, char ** argv) {
             sub_gguf.c_str(), n_embd, n_layer, n_vocab, n_ctx, n_gpu_layers,
             shm_mode ? "shm" : "stdio");
 
+    bool timing_on = fabric_timing_enabled();
+    if (timing_on) {
+        fprintf(stderr, "[daemon] timing instrumentation enabled "
+                        "(NAKSHATRA_FABRIC_TIMING=1)\n");
+    }
+
     // Main message loop
     while (true) {
         uint32_t cmd, n_tokens, start_pos, flags;
         std::vector<uint8_t> payload;
+        uint64_t t_recv_start = timing_on ? now_ns() : 0;
         if (read_request(cmd, n_tokens, start_pos, flags, payload) != 0) break;
+        uint64_t t_recv_done = timing_on ? now_ns() : 0;
         uint32_t payload_bytes = (uint32_t)payload.size();
 
         const bool keep_kv = (flags & 0x1) != 0;
@@ -295,6 +318,7 @@ int main(int argc, char ** argv) {
             llama_memory_clear(llama_get_memory(ctx), true);
         }
 
+        uint64_t t_decode_start = 0, t_decode_done = 0;
         if (cmd == 1) {
             // TOKEN_DECODE — use llama_batch_init so we can set explicit
             // positions (start_pos + i) instead of relying on the auto-zeroed
@@ -312,7 +336,9 @@ int main(int argc, char ** argv) {
                 batch.seq_id[i][0] = 0;
                 batch.logits[i] = (i == n_tokens - 1) ? 1 : 0;
             }
+            if (timing_on) t_decode_start = now_ns();
             rc = llama_decode(ctx, batch);
+            if (timing_on) t_decode_done = now_ns();
             llama_batch_free(batch);
         } else if (cmd == 2) {
             // EMBD_DECODE
@@ -328,7 +354,9 @@ int main(int argc, char ** argv) {
                 batch.seq_id[i][0] = 0;
                 batch.logits[i] = (i == n_tokens - 1) ? 1 : 0;
             }
+            if (timing_on) t_decode_start = now_ns();
             rc = llama_decode(ctx, batch);
+            if (timing_on) t_decode_done = now_ns();
             llama_batch_free(batch);
         } else {
             send_response(2, nullptr, 0);
@@ -342,6 +370,10 @@ int main(int argc, char ** argv) {
 
         // Caller specified mode at startup; respect it.
         // Response payload: first 4 bytes = result_type (0=hidden, 1=token).
+        // C.1 timing — split post_send into get_embeddings + memcpy +
+        // shm-write to identify which dominates on GPU mode.
+        uint64_t t_get_embd_start = timing_on ? now_ns() : 0;
+        uint64_t t_get_embd_done = 0, t_memcpy_done = 0;
         if (mode_last) {
             float* logits = llama_get_logits_ith(ctx, -1);
             if (!logits) { send_response(1, nullptr, 0); continue; }
@@ -354,12 +386,52 @@ int main(int argc, char ** argv) {
         } else {
             // first/middle: return hidden state
             float* hidden = llama_get_embeddings(ctx);
+            if (timing_on) t_get_embd_done = now_ns();
             if (!hidden) { send_response(1, nullptr, 0); continue; }
             size_t hbytes = (size_t)n_tokens * (size_t)n_embd * sizeof(float);
             std::vector<uint8_t> out(4 + hbytes);
             *(uint32_t*)out.data() = 0;     // result_type = hidden
             memcpy(out.data() + 4, hidden, hbytes);
+            if (timing_on) t_memcpy_done = now_ns();
             send_response(0, out.data(), (uint32_t)out.size());
+        }
+        if (timing_on) {
+            uint64_t t_send_done = now_ns();
+            // recv_wait: time blocked in read_message_blocking
+            //            (request poll latency)
+            // pre_decode: time after request arrived, before
+            //             llama_decode entry (batch setup, KV clear)
+            // decode:     time inside llama_decode
+            // post_decode_send: time after decode, including
+            //                   response packing + shm write
+            uint64_t recv_wait_ns        = t_recv_done - t_recv_start;
+            uint64_t pre_decode_ns       = t_decode_start - t_recv_done;
+            uint64_t decode_ns           = t_decode_done - t_decode_start;
+            uint64_t post_decode_send_ns = t_send_done - t_decode_done;
+            uint64_t total_ns            = t_send_done - t_recv_start;
+            // Sub-timings for the post-decode phase. Only populated
+            // on mode != last (hidden-state return path); zero on
+            // mode_last (which goes through the logits→token path).
+            uint64_t get_embd_ns = (t_get_embd_done && t_get_embd_start)
+                                    ? t_get_embd_done - t_get_embd_start : 0;
+            uint64_t memcpy_ns   = (t_memcpy_done && t_get_embd_done)
+                                    ? t_memcpy_done - t_get_embd_done : 0;
+            uint64_t shm_send_ns = (t_send_done && t_memcpy_done)
+                                    ? t_send_done - t_memcpy_done : 0;
+            fprintf(stderr,
+                    "[timing] cmd=%u n=%u total=%.3fms "
+                    "recv_wait=%.3fms pre_decode=%.3fms "
+                    "decode=%.3fms post_send=%.3fms "
+                    "[get_embd=%.3fms memcpy=%.3fms shm_send=%.3fms]\n",
+                    cmd, n_tokens,
+                    total_ns / 1e6,
+                    recv_wait_ns / 1e6,
+                    pre_decode_ns / 1e6,
+                    decode_ns / 1e6,
+                    post_decode_send_ns / 1e6,
+                    get_embd_ns / 1e6,
+                    memcpy_ns / 1e6,
+                    shm_send_ns / 1e6);
         }
     }
 

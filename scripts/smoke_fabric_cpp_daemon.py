@@ -72,7 +72,7 @@ def main() -> int:
         mode=args.mode,
         n_ctx=args.n_ctx,
         n_threads=0,
-        n_gpu_layers=0,                  # CPU only — deterministic
+        n_gpu_layers=99,                 # all GPU (RX 9070 XT)
         ring_dir=Path(args.ring_dir),
         ready_timeout_s=args.ready_timeout_s,
     )
