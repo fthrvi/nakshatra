@@ -77,6 +77,6 @@ The integration is real the day a Prithvi instance is killed on one machine, bro
 
 - **Read** — the [technical report](paper-draft.md) for experiments and numbers; the [architecture](petals-architecture.md) for the v0.1 contract; the [north star](north-star.md) for the long vision.
 - **Run** — the README walkthrough takes under an hour from "Python + a GGUF" to "the right token comes back."
-- **Push back** — issues at https://github.com/fthrvi/nakshatra/issues, email at maintainers@example.invalid, or community-staked conviction at [pnl.market](https://pnl.market).
+- **Push back** — issues at https://github.com/fthrvi/nakshatra/issues, email at the fthrvi maintainers, or community-staked conviction at [pnl.market](https://pnl.market).
 
 The dream is big. The architecture is small. The work is the work.

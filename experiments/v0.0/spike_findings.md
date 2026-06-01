@@ -11,7 +11,7 @@ Operationalises the v0.0 spike from [`docs/v0.0-validation-plan.md`](../../docs/
 
 | | Value |
 |---|---|
-| Host | `prithvi@node-a` (Linux home PC, no Metal) |
+| Host | `operator@node-a` (Linux home PC, no Metal) |
 | Hardware | AMD Radeon RX 9070 XT (CPU-only for spike), 32 GB RAM |
 | Model | `~/prithvi/training/prithvi-merged/prithvi-q8.gguf` (Llama-3.2-3B fine-tune, 28 blocks, Q8_0) |
 | Source | [`spike.cpp`](spike.cpp), built via `cmake --build . --target llama-nakshatra-spike` |
@@ -96,7 +96,7 @@ The next step is the v0.1 implementation plan — a separate doc that scopes the
 ## Reproducibility
 
 ```bash
-ssh prithvi@node-a
+ssh operator@node-a
 cd ~/llama.cpp
 # spike.cpp is at examples/nakshatra-spike/spike.cpp; build with:
 cmake --build build --target llama-nakshatra-spike -j 4

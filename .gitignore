@@ -131,3 +131,7 @@ dmypy.json
 
 # Track experiment artifacts (the empirical record), even though *.log is otherwise ignored.
 !experiments/**/*.log
+
+# personal / local artifacts (rsync-backed, not git)
+nysa.md
+*.log
