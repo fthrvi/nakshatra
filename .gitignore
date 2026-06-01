@@ -135,3 +135,6 @@ dmypy.json
 # personal / local artifacts (rsync-backed, not git)
 nysa.md
 *.log
+
+# rendered docs are build artifacts (regenerate from .md via docs/md_to_pdf.py) — keep PDFs out of git
+*.pdf
