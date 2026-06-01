@@ -4,7 +4,7 @@
 **Project repository:** https://github.com/fthrvi/nakshatra
 **Companion repository:** https://github.com/fthrvi/sthambha (L3 substrate)
 **Status:** v0.1 functionally alive (2026-05-06); 5-machine federation (v0.3) in progress.
-**Author:** the operator (fthrvi). Correspondence: maintainers@example.invalid.
+**Author:** the fthrvi project. Correspondence: the fthrvi maintainers.
 **Where this is being shared:** GitHub (above), and as a community-staked market on **[pnl.market](https://pnl.market)** — see §12.
 
 ---
@@ -528,7 +528,7 @@ This draft is circulated to researchers and engineers working in adjacent areas 
 
 **Channels.**
 
-- **GitHub.** Open an issue at https://github.com/fthrvi/nakshatra/issues or email maintainers@example.invalid.
+- **GitHub.** Open an issue at https://github.com/fthrvi/nakshatra/issues or email the fthrvi maintainers.
 - **pnl.market.** In parallel with the academic-style review, the project is being proposed as a community-staked market on [pnl.market](https://pnl.market) — a Solana-based prediction-and-launch platform where the crowd stakes SOL on whether an idea should exist (believers) or won't work (critics). The pnl.market posting is **not** a token sale and **not** a substitute for technical review; it is a way to surface honest conviction from people who have to put SOL behind their opinion. Both signals — researcher critique and staked conviction — are useful for different reasons, and the project welcomes both.
 
 ---

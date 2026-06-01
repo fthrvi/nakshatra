@@ -10,7 +10,7 @@ model:
 
 workers:
   - id: home-pc
-    address: 203.0.113.10    # prithvi@node-a (Linux/CPU)
+    address: 203.0.113.10    # operator@node-a (Linux/CPU)
     port: 5530
     layer_range: [0, 6]
     sub_gguf_path: /tmp/cuts5/w0.gguf

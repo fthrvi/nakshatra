@@ -85,7 +85,7 @@ Run `last`-mode workers on **CPU**: `--gpu-backend cpu --n-gpu-layers 0`. This i
 ## Repro
 
 1. Cold-boot prithvi (or any host without the wedged-daemon prior state).
-2. Start workers per `scripts/cluster_l3370b_5machine.yaml`. the operator-5534 must be launched with `--gpu-backend metal --n-gpu-layers 99`.
+2. Start workers per `scripts/cluster_l3370b_5machine.yaml`. node-e-5534 must be launched with `--gpu-backend metal --n-gpu-layers 99`.
 3. From any client host with `~/models/llama-3.3-70b/Llama-3.3-70B-Instruct-Q4_K_M.gguf`:
    ```
    python3 scripts/client.py --config scripts/cluster_l3370b_5machine.yaml \
@@ -98,5 +98,5 @@ Run `last`-mode workers on **CPU**: `--gpu-backend cpu --n-gpu-layers 0`. This i
 ## Cluster state at time of writing
 
 - Prithvi `:5530` worker still running, healthy (advertises full v0.5 capabilities — first machine to do so cluster-wide).
-- the operator `:5534` worker killed; daemon binary on node-e is reverted to upstream `cp.embeddings = true`.
+- node-e `:5534` worker killed; daemon binary on node-e is reverted to upstream `cp.embeddings = true`.
 - All 4 Mac `~/nakshatra-v0/` worker.py files are still on the intermediate (pre-§9.1/§9.5) revision. Updating them is independent of this finding.
