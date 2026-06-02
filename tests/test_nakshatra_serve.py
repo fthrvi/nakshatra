@@ -531,3 +531,34 @@ def test_render_prompt_llama_format():
     assert p.startswith("<|begin_of_text|>")
     assert "<|start_header_id|>system<|end_header_id|>\n\nbe brief<|eot_id|>" in p
     assert p.endswith("<|start_header_id|>assistant<|end_header_id|>\n\n")
+
+
+# ── Phase E: per-family chat templates ──────────────────────────────
+
+
+def test_render_prompt_gemma_format():
+    entry = ns.ModelEntry(name="g", tokenizer_gguf="t", chain_yaml="c",
+                          details={"family": "gemma"})
+    p = ns._render_prompt(
+        [{"role": "system", "content": "be brief"},
+         {"role": "user", "content": "hi"}], entry)
+    assert p.startswith("<bos>")
+    # Gemma has no system role — the system message folds into user turn 1.
+    assert "<start_of_turn>user\nbe brief\n\nhi<end_of_turn>" in p
+    assert "<start_of_turn>system" not in p
+    assert p.endswith("<start_of_turn>model\n")
+
+
+def test_render_gemma_maps_assistant_to_model():
+    p = ns._render_gemma([{"role": "user", "content": "hi"},
+                          {"role": "assistant", "content": "hello"},
+                          {"role": "user", "content": "more"}])
+    assert "<start_of_turn>model\nhello<end_of_turn>" in p
+    assert "<start_of_turn>assistant" not in p
+
+
+def test_render_prompt_unknown_family_defaults_to_llama():
+    entry = ns.ModelEntry(name="x", tokenizer_gguf="t", chain_yaml="c",
+                          details={"family": "qwen"})
+    out = ns._render_prompt([{"role": "user", "content": "hi"}], entry)
+    assert out.startswith("<|begin_of_text|>")

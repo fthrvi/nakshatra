@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Nakshatra serving frontend — Ollama-compatible HTTP gateway.
 
-Phase D of the 2026-05-30 Ollama-gateway sprint. Ships the HTTP scaffold
+Phase E of the 2026-05-30 Ollama-gateway sprint. Ships the HTTP scaffold
 + `/api/version` + `/health` (A), the model registry + `/api/tags` +
-`/api/show` (B), non-streaming `/api/chat` (C), and streaming `/api/chat`
-(stream:true → newline-delimited JSON, D). Remaining: per-model GGUF chat
-templates (E) and the live cluster smoke (F). The plan lives at
-`~/trisul/plans/2026-05-30-nakshatra-ollama-gateway-sprint.md`.
+`/api/show` (B), non-streaming `/api/chat` (C), streaming `/api/chat`
+(stream:true → newline-delimited JSON, D), and per-family chat templates
+— Llama-3 + Gemma (E). Remaining: the live cluster smoke (F). The plan lives
+at `~/trisul/plans/2026-05-30-nakshatra-ollama-gateway-sprint.md`.
 
 **Why this exists:** Prithvi's live gateway
 (http://203.0.113.10:8080) speaks OpenAI to users and calls its
@@ -306,23 +306,51 @@ class ChainChatBackend(ChatBackend):
             raise ChainBackendError(f"client.py exited {rc}: {err.strip()[-400:]}")
 
 
+def _render_llama3(messages: list) -> str:
+    """Llama-3 chat format: ``<|start_header_id|>role<|end_header_id|>`` turns
+    terminated by ``<|eot_id|>``, ending with an open assistant header."""
+    parts = ["<|begin_of_text|>"]
+    for m in messages:
+        parts.append(f"<|start_header_id|>{m.get('role', 'user')}<|end_header_id|>"
+                     f"\n\n{m.get('content', '')}<|eot_id|>")
+    parts.append("<|start_header_id|>assistant<|end_header_id|>\n\n")
+    return "".join(parts)
+
+
+def _render_gemma(messages: list) -> str:
+    """Gemma chat format: ``<start_of_turn>role`` / ``<end_of_turn>`` turns,
+    ending with an open ``model`` turn. Gemma has no system role and uses
+    ``user``/``model`` (not ``assistant``) — fold any leading system message
+    into the first user turn, and map ``assistant`` → ``model``."""
+    msgs = list(messages)
+    system = ""
+    if msgs and msgs[0].get("role") == "system":
+        system = (msgs[0].get("content") or "").strip()
+        msgs = msgs[1:]
+    out = ["<bos>"]
+    for m in msgs:
+        grole = "model" if m.get("role") == "assistant" else "user"
+        content = m.get("content", "")
+        if grole == "user" and system:        # prepend folded system once
+            content = f"{system}\n\n{content}"
+            system = ""
+        out.append(f"<start_of_turn>{grole}\n{content}<end_of_turn>\n")
+    out.append("<start_of_turn>model\n")
+    return "".join(out)
+
+
 def _render_prompt(messages: list, entry: ModelEntry) -> str:
-    """Render Ollama ``messages`` into one prompt string. Phase C ships a
-    minimal Llama-3 chat template (the primary 70B model's family) with a
-    generic ``role: content`` fallback; Phase E replaces this with per-model
-    templates read from the GGUF (``tokenizer.chat_template``)."""
+    """Render Ollama ``messages`` into one prompt string, dispatching by model
+    family (Phase E). Llama-3 and Gemma — the two families actually in play
+    (the 70B chain and Prithvi's conscious gemma3) — have hand-written
+    templates; unknown families default to Llama-3. The fully general path
+    (apply the GGUF's embedded ``tokenizer.chat_template`` via llama_cpp) is a
+    box-side follow-on; it needs the GGUF + llama_cpp, so it can't be unit-
+    tested on the gateway host."""
     family = (entry.details.get("family") or "").lower()
-    if not family or "llama" in family:
-        parts = ["<|begin_of_text|>"]
-        for m in messages:
-            role = m.get("role", "user")
-            parts.append(f"<|start_header_id|>{role}<|end_header_id|>\n\n"
-                         f"{m.get('content', '')}<|eot_id|>")
-        parts.append("<|start_header_id|>assistant<|end_header_id|>\n\n")
-        return "".join(parts)
-    lines = [f"{m.get('role', 'user')}: {m.get('content', '')}" for m in messages]
-    lines.append("assistant:")
-    return "\n".join(lines)
+    if "gemma" in family:
+        return _render_gemma(messages)
+    return _render_llama3(messages)
 
 
 # ── HTTP handler ────────────────────────────────────────────────────
@@ -600,8 +628,9 @@ def _setup_logging(verbose: bool) -> None:
 def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(
         description="Nakshatra Ollama-compat HTTP serving frontend "
-                    "(Phase D — registry + /api/tags + /api/show + "
-                    "/api/chat streaming & non-streaming).",
+                    "(Phase E — registry + /api/tags + /api/show + "
+                    "/api/chat streaming & non-streaming + Llama-3/Gemma "
+                    "templates).",
     )
     ap.add_argument("--port", type=int, default=DEFAULT_PORT,
                     help=f"port to bind (default {DEFAULT_PORT}, "
