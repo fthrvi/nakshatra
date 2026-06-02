@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Nakshatra serving frontend — Ollama-compatible HTTP gateway.
 
-Phase C of the 2026-05-30 Ollama-gateway sprint. Ships the HTTP scaffold
+Phase D of the 2026-05-30 Ollama-gateway sprint. Ships the HTTP scaffold
 + `/api/version` + `/health` (A), the model registry + `/api/tags` +
-`/api/show` (B), and non-streaming `/api/chat` (C). Streaming `/api/chat`
-(stream:true) is Phase D. The plan lives at
+`/api/show` (B), non-streaming `/api/chat` (C), and streaming `/api/chat`
+(stream:true → newline-delimited JSON, D). Remaining: per-model GGUF chat
+templates (E) and the live cluster smoke (F). The plan lives at
 `~/trisul/plans/2026-05-30-nakshatra-ollama-gateway-sprint.md`.
 
 **Why this exists:** Prithvi's live gateway
@@ -27,6 +28,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass, field
@@ -183,6 +185,13 @@ class ChatBackend:
                  max_tokens: int, options: dict) -> GenerationResult:
         raise NotImplementedError
 
+    def generate_stream(self, entry: ModelEntry, prompt: str,
+                        max_tokens: int, options: dict):
+        """Yield assistant-text deltas as they're produced. Default: emit the
+        full non-streaming reply as a single delta, so any backend streams
+        (degenerately). Backends that can emit token-by-token override this."""
+        yield self.generate(entry, prompt, max_tokens, options).text
+
 
 class StubChatBackend(ChatBackend):
     """Deterministic backend for tests + local wire-smoke — point Prithvi at
@@ -198,6 +207,12 @@ class StubChatBackend(ChatBackend):
             eval_count=len(self._reply.split()),
             prompt_eval_count=len(prompt.split()),
         )
+
+    def generate_stream(self, entry, prompt, max_tokens, options):
+        # Per-word deltas so streaming consumers see N>1 chunks whose
+        # concatenation equals the full reply.
+        for i, word in enumerate(self._reply.split()):
+            yield word if i == 0 else " " + word
 
 
 def _parse_client_output(stdout: str) -> str:
@@ -234,13 +249,16 @@ class ChainChatBackend(ChatBackend):
     template render are unit-tested without it (Phase F does the live smoke).
     """
 
+    # client.py prints `[chain] step N: id=<id> '<text>'` per generated
+    # token (flushed) — the streaming hook below parses the quoted text.
+    _STEP_RE = re.compile(r"\[chain\] step \d+: id=\S+ '(.*)'\s*$")
+
     def __init__(self, scripts_dir: Optional[str] = None,
                  timeout_s: float = 1800.0):
         self._scripts = scripts_dir or os.path.dirname(os.path.abspath(__file__))
         self._timeout = timeout_s
 
-    def generate(self, entry, prompt, max_tokens, options):
-        import subprocess
+    def _cmd(self, entry, prompt, max_tokens) -> list:
         cmd = [sys.executable, os.path.join(self._scripts, "client.py"),
                "--model-path", entry.tokenizer_gguf,
                "--prompt", prompt, "--max-tokens", str(max_tokens),
@@ -249,8 +267,13 @@ class ChainChatBackend(ChatBackend):
             cmd += ["--config", entry.chain_yaml]
         else:
             cmd += ["--registry", entry.registry_url or "", "--model-id", entry.name]
+        return cmd
+
+    def generate(self, entry, prompt, max_tokens, options):
+        import subprocess
         try:
-            out = subprocess.run(cmd, capture_output=True, text=True,
+            out = subprocess.run(self._cmd(entry, prompt, max_tokens),
+                                 capture_output=True, text=True,
                                  timeout=self._timeout)
         except subprocess.TimeoutExpired:
             raise ChainBackendError(
@@ -259,6 +282,28 @@ class ChainChatBackend(ChatBackend):
             raise ChainBackendError(
                 f"client.py exited {out.returncode}: {out.stderr.strip()[-400:]}")
         return GenerationResult(text=_parse_client_output(out.stdout))
+
+    def generate_stream(self, entry, prompt, max_tokens, options):
+        """Stream tokens as client.py emits them: spawn it with Popen, parse
+        each flushed `[chain] step ...` line, yield the detokenized text.
+        Best-effort single-quote parse (a token with a literal quote is rare);
+        box-smoked in Phase F."""
+        import subprocess
+        proc = subprocess.Popen(self._cmd(entry, prompt, max_tokens),
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True)
+        try:
+            for line in proc.stdout:
+                m = self._STEP_RE.search(line.rstrip("\n"))
+                if m:
+                    yield m.group(1)
+        finally:
+            proc.stdout.close()
+            rc = proc.wait()
+            err = proc.stderr.read()
+            proc.stderr.close()
+        if rc != 0:
+            raise ChainBackendError(f"client.py exited {rc}: {err.strip()[-400:]}")
 
 
 def _render_prompt(messages: list, entry: ModelEntry) -> str:
@@ -425,9 +470,9 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
         return 200
 
     def _handle_chat(self) -> int:
-        """Ollama ``/api/chat`` non-streaming (Phase C). Validates the model,
-        renders the prompt, drives the backend, and returns an Ollama-shaped
-        reply. ``stream: true`` is rejected until Phase D."""
+        """Ollama ``/api/chat``. Validates the model + messages, renders the
+        prompt, then returns either one Ollama-shaped JSON reply (Phase C) or
+        a newline-delimited JSON stream (Phase D) depending on ``stream``."""
         try:
             req = self._read_json_body()
         except ValueError:
@@ -438,10 +483,6 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
         if entry is None:
             self._json_error(HTTPStatus.NOT_FOUND, f"model {name!r} not found")
             return 404
-        if req.get("stream"):
-            self._json_error(HTTPStatus.BAD_REQUEST,
-                             "streaming responses land in Phase D; send stream:false")
-            return 400
         messages = req.get("messages")
         if not isinstance(messages, list) or not messages:
             self._json_error(HTTPStatus.BAD_REQUEST,
@@ -455,6 +496,10 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
         options = req.get("options") or {}
         max_tokens = int(options.get("num_predict") or DEFAULT_NUM_PREDICT)
         prompt = _render_prompt(messages, entry)
+
+        if req.get("stream"):
+            return self._stream_chat(entry, prompt, max_tokens, options, backend)
+
         t0 = time.monotonic()
         try:
             result = backend.generate(entry, prompt, max_tokens, options)
@@ -473,6 +518,46 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
             "prompt_eval_count": result.prompt_eval_count,
             "eval_count": result.eval_count,
         })
+        return 200
+
+    def _stream_chat(self, entry, prompt, max_tokens, options, backend) -> int:
+        """Ollama streaming /api/chat (Phase D): newline-delimited JSON — N
+        ``{done:false}`` content chunks then one ``{done:true}`` with summary
+        stats. The body is delimited by connection close (HTTP/1.0 default);
+        standard streaming clients (incl. Prithvi's line-reading
+        ``_call_ollama``) consume it incrementally. Headers are already sent
+        once the first chunk goes out, so a mid-stream failure can only emit a
+        terminal error chunk — not change the status code."""
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/x-ndjson")
+        self.end_headers()
+        created = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        t0 = time.monotonic()
+        eval_count = 0
+
+        def _write(obj: dict) -> None:
+            self.wfile.write((json.dumps(obj) + "\n").encode("utf-8"))
+            self.wfile.flush()
+
+        try:
+            for delta in backend.generate_stream(entry, prompt, max_tokens, options):
+                _write({"model": entry.name, "created_at": created,
+                        "message": {"role": "assistant", "content": delta},
+                        "done": False})
+                eval_count += 1
+        except ChainBackendError as e:
+            log.error("stream backend error: %s", e)
+            try:
+                _write({"model": entry.name,
+                        "error": "chain generation failed", "done": True})
+            except Exception:
+                pass  # client already gone
+            return 502
+        _write({"model": entry.name, "created_at": created,
+                "message": {"role": "assistant", "content": ""},
+                "done": True, "done_reason": "stop",
+                "total_duration": int((time.monotonic() - t0) * 1e9),
+                "eval_count": eval_count})
         return 200
 
 
@@ -515,8 +600,8 @@ def _setup_logging(verbose: bool) -> None:
 def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(
         description="Nakshatra Ollama-compat HTTP serving frontend "
-                    "(Phase C — registry + /api/tags + /api/show + "
-                    "non-streaming /api/chat).",
+                    "(Phase D — registry + /api/tags + /api/show + "
+                    "/api/chat streaming & non-streaming).",
     )
     ap.add_argument("--port", type=int, default=DEFAULT_PORT,
                     help=f"port to bind (default {DEFAULT_PORT}, "
