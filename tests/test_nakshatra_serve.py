@@ -441,12 +441,47 @@ def test_chat_unknown_model_404(tmp_path):
     assert status == 404 and "not found" in body["error"]
 
 
-def test_chat_stream_true_rejected_until_phase_d(tmp_path):
-    with _running_chat(_chat_models(tmp_path), _CapturingBackend()) as port:
-        status, body = _post(port, "/api/chat", {
+def _post_lines(port: int, path: str, payload: dict,
+                timeout: float = 2.0) -> list:
+    """POST + read a newline-delimited JSON stream into a list of objects.
+    HTTP/1.0 connection-close delimits the body, so urlopen().read() returns
+    the whole stream once it ends."""
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}{path}",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        body = resp.read().decode("utf-8")
+    return [json.loads(ln) for ln in body.splitlines() if ln.strip()]
+
+
+def test_chat_streaming_ndjson(tmp_path):
+    backend = ns.StubChatBackend("Paris is the capital")
+    with _running_chat(_chat_models(tmp_path), backend) as port:
+        chunks = _post_lines(port, "/api/chat", {
             "model": "llama-3.3-70b", "stream": True,
             "messages": [{"role": "user", "content": "hi"}]})
-    assert status == 400 and "Phase D" in body["error"]
+    # N content chunks (done:false) then exactly one terminal done:true.
+    assert len(chunks) >= 2
+    assert all(c["done"] is False for c in chunks[:-1])
+    assert chunks[-1]["done"] is True
+    assert chunks[-1]["done_reason"] == "stop" and chunks[-1]["eval_count"] >= 1
+    # concatenated content reconstructs the full reply (Phase D check).
+    assert "".join(c["message"]["content"] for c in chunks) == "Paris is the capital"
+    assert all(c["model"] == "llama-3.3-70b" for c in chunks)
+
+
+def test_chat_streaming_backend_error_emits_terminal_chunk(tmp_path):
+    class _Boom(ns.ChatBackend):
+        def generate_stream(self, *a, **k):
+            yield "part"            # one good chunk...
+            raise ns.ChainBackendError("worker died mid-stream")
+    with _running_chat(_chat_models(tmp_path), _Boom()) as port:
+        chunks = _post_lines(port, "/api/chat", {
+            "model": "llama-3.3-70b", "stream": True,
+            "messages": [{"role": "user", "content": "hi"}]})
+    assert chunks[0]["message"]["content"] == "part"
+    assert chunks[-1]["done"] is True and "error" in chunks[-1]
 
 
 def test_chat_missing_messages_400(tmp_path):
