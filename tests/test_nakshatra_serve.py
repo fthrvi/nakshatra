@@ -640,3 +640,21 @@ def test_v1_chat_completions_max_tokens_param(tmp_path):
             "model": "llama-3.3-70b", "max_tokens": 8,
             "messages": [{"role": "user", "content": "hi"}]})
     assert backend.calls[0]["max_tokens"] == 8
+
+
+# ── CORS (browser clients) ──────────────────────────────────────────
+
+
+def test_cors_on_responses_and_preflight():
+    with _running_server() as port:
+        # normal responses carry Access-Control-Allow-Origin
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/health") as r:
+            assert r.headers.get("Access-Control-Allow-Origin") == "*"
+        # OPTIONS preflight -> 204 + allowed methods/headers
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/v1/chat/completions", method="OPTIONS")
+        with urllib.request.urlopen(req) as r:
+            assert r.status == 204
+            assert r.headers.get("Access-Control-Allow-Origin") == "*"
+            assert "POST" in r.headers.get("Access-Control-Allow-Methods", "")
+            assert "Content-Type" in r.headers.get("Access-Control-Allow-Headers", "")

@@ -384,13 +384,28 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
 
     # ── Response helpers ──────────────────────────────────────────
 
+    def _cors(self) -> None:
+        """Permissive CORS so browser clients (Open WebUI, etc.) can call the
+        OpenAI/Ollama surface. Safe here: the gateway is reachable only on the
+        single-tenant tailnet and already runs no-auth (matches Prithvi)."""
+        self.send_header("Access-Control-Allow-Origin", "*")
+
     def _json(self, status: int, body: dict) -> None:
         encoded = json.dumps(body).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(encoded)))
+        self._cors()
         self.end_headers()
         self.wfile.write(encoded)
+
+    def do_OPTIONS(self):
+        """CORS preflight — answer with the allowed methods/headers."""
+        self.send_response(HTTPStatus.NO_CONTENT)
+        self._cors()
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        self.end_headers()
 
     def _json_error(self, status: int, message: str) -> None:
         self._json(status, {"error": message})
@@ -571,6 +586,7 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
         terminal error chunk — not change the status code."""
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "application/x-ndjson")
+        self._cors()
         self.end_headers()
         created = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         t0 = time.monotonic()
@@ -682,6 +698,7 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
+        self._cors()
         self.end_headers()
 
         def _chunk(delta: dict, finish=None) -> dict:
