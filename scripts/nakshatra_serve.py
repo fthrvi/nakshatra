@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Nakshatra serving frontend — Ollama-compatible HTTP gateway.
 
-Phase B of the 2026-05-30 Ollama-gateway sprint. Ships the HTTP scaffold
-+ `/api/version` + `/health` (Phase A) AND the model registry + `/api/tags`
-+ `/api/show` (Phase B). `/api/chat` (the actual chain walk) is Phase C+D.
-The plan lives at `~/trisul/plans/2026-05-30-nakshatra-ollama-gateway-sprint.md`.
+Phase C of the 2026-05-30 Ollama-gateway sprint. Ships the HTTP scaffold
++ `/api/version` + `/health` (A), the model registry + `/api/tags` +
+`/api/show` (B), and non-streaming `/api/chat` (C). Streaming `/api/chat`
+(stream:true) is Phase D. The plan lives at
+`~/trisul/plans/2026-05-30-nakshatra-ollama-gateway-sprint.md`.
 
 **Why this exists:** Prithvi's live gateway
 (http://203.0.113.10:8080) speaks OpenAI to users and calls its
@@ -151,6 +152,134 @@ def _ollama_tag(entry: ModelEntry) -> dict:
             "digest": digest, "details": details}
 
 
+# ── Chat generation backends (Phase C) ──────────────────────────────
+
+
+# Default reply length when a request omits options.num_predict.
+DEFAULT_NUM_PREDICT = 256
+
+
+class ChainBackendError(RuntimeError):
+    """The chain failed to produce a reply (subprocess error, timeout, or
+    unparseable output). Mapped to a 502 at the HTTP layer."""
+
+
+@dataclass
+class GenerationResult:
+    """What a backend returns for one /api/chat turn."""
+    text: str
+    eval_count: int = 0          # tokens generated
+    prompt_eval_count: int = 0   # prompt tokens
+    done_reason: str = "stop"
+
+
+class ChatBackend:
+    """Turns (model, rendered prompt) into an assistant reply. Injected into
+    the server so the HTTP/format layer is testable without a live chain
+    (StubChatBackend) while the real chain wiring (ChainChatBackend) stays
+    swappable."""
+
+    def generate(self, entry: ModelEntry, prompt: str,
+                 max_tokens: int, options: dict) -> GenerationResult:
+        raise NotImplementedError
+
+
+class StubChatBackend(ChatBackend):
+    """Deterministic backend for tests + local wire-smoke — point Prithvi at
+    it to verify the Ollama plumbing end-to-end before the cluster is up.
+    Returns a canned reply; never touches the chain."""
+
+    def __init__(self, reply: str = "ok"):
+        self._reply = reply
+
+    def generate(self, entry, prompt, max_tokens, options):
+        return GenerationResult(
+            text=self._reply,
+            eval_count=len(self._reply.split()),
+            prompt_eval_count=len(prompt.split()),
+        )
+
+
+def _parse_client_output(stdout: str) -> str:
+    """Recover the generated text from scripts/client.py's stdout. client.py
+    prints ``[chain] gen:  '<repr>'``; we literal-eval the repr to get the
+    exact string back (handles embedded quotes / escaped newlines). Takes the
+    LAST such line (a failure-recovery replay can print more than one)."""
+    import ast
+    captured = None
+    for line in stdout.splitlines():
+        if line.startswith("[chain] gen:"):
+            captured = line[len("[chain] gen:"):].strip()
+    if captured is None:
+        raise ChainBackendError("client.py produced no '[chain] gen:' line")
+    try:
+        text = ast.literal_eval(captured)
+    except (ValueError, SyntaxError) as e:
+        raise ChainBackendError(f"unparseable generated text: {e}")
+    if not isinstance(text, str):
+        raise ChainBackendError("generated text was not a string")
+    return text
+
+
+class ChainChatBackend(ChatBackend):
+    """Real backend: drives the live chain by invoking ``scripts/client.py``
+    as a subprocess — deliberately NON-INVASIVE, so client.py's tangled,
+    cluster-load-bearing ``main()`` stays untouched. The gateway renders the
+    chat template; client.py tokenizes + walks the chain + detokenizes; we
+    parse its generated text. Per-request subprocess spawn is fine at v0.1
+    single-user latencies (one 70B chain step dwarfs the ~100ms python
+    spawn); an in-process refactor is a later optimization.
+
+    End-to-end is box-only (needs the chain up); the gateway-side parser and
+    template render are unit-tested without it (Phase F does the live smoke).
+    """
+
+    def __init__(self, scripts_dir: Optional[str] = None,
+                 timeout_s: float = 1800.0):
+        self._scripts = scripts_dir or os.path.dirname(os.path.abspath(__file__))
+        self._timeout = timeout_s
+
+    def generate(self, entry, prompt, max_tokens, options):
+        import subprocess
+        cmd = [sys.executable, os.path.join(self._scripts, "client.py"),
+               "--model-path", entry.tokenizer_gguf,
+               "--prompt", prompt, "--max-tokens", str(max_tokens),
+               "--use-streaming"]
+        if entry.chain_yaml:
+            cmd += ["--config", entry.chain_yaml]
+        else:
+            cmd += ["--registry", entry.registry_url or "", "--model-id", entry.name]
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True,
+                                 timeout=self._timeout)
+        except subprocess.TimeoutExpired:
+            raise ChainBackendError(
+                f"chain generation timed out after {self._timeout}s")
+        if out.returncode != 0:
+            raise ChainBackendError(
+                f"client.py exited {out.returncode}: {out.stderr.strip()[-400:]}")
+        return GenerationResult(text=_parse_client_output(out.stdout))
+
+
+def _render_prompt(messages: list, entry: ModelEntry) -> str:
+    """Render Ollama ``messages`` into one prompt string. Phase C ships a
+    minimal Llama-3 chat template (the primary 70B model's family) with a
+    generic ``role: content`` fallback; Phase E replaces this with per-model
+    templates read from the GGUF (``tokenizer.chat_template``)."""
+    family = (entry.details.get("family") or "").lower()
+    if not family or "llama" in family:
+        parts = ["<|begin_of_text|>"]
+        for m in messages:
+            role = m.get("role", "user")
+            parts.append(f"<|start_header_id|>{role}<|end_header_id|>\n\n"
+                         f"{m.get('content', '')}<|eot_id|>")
+        parts.append("<|start_header_id|>assistant<|end_header_id|>\n\n")
+        return "".join(parts)
+    lines = [f"{m.get('role', 'user')}: {m.get('content', '')}" for m in messages]
+    lines.append("assistant:")
+    return "\n".join(lines)
+
+
 # ── HTTP handler ────────────────────────────────────────────────────
 
 
@@ -259,7 +388,9 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         if path == "/api/show":
             return self._handle_show()
-        # Phase C+ (/api/chat) lands here.
+        if path == "/api/chat":
+            return self._handle_chat()
+        # Phase D adds streaming on the same /api/chat path (stream:true).
         self._json_error(
             HTTPStatus.NOT_FOUND,
             f"unsupported endpoint: POST {path}",
@@ -293,17 +424,72 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
         })
         return 200
 
+    def _handle_chat(self) -> int:
+        """Ollama ``/api/chat`` non-streaming (Phase C). Validates the model,
+        renders the prompt, drives the backend, and returns an Ollama-shaped
+        reply. ``stream: true`` is rejected until Phase D."""
+        try:
+            req = self._read_json_body()
+        except ValueError:
+            self._json_error(HTTPStatus.BAD_REQUEST, "invalid JSON body")
+            return 400
+        name = req.get("model")
+        entry = self._models.get(name) if name else None
+        if entry is None:
+            self._json_error(HTTPStatus.NOT_FOUND, f"model {name!r} not found")
+            return 404
+        if req.get("stream"):
+            self._json_error(HTTPStatus.BAD_REQUEST,
+                             "streaming responses land in Phase D; send stream:false")
+            return 400
+        messages = req.get("messages")
+        if not isinstance(messages, list) or not messages:
+            self._json_error(HTTPStatus.BAD_REQUEST,
+                             "'messages' must be a non-empty list")
+            return 400
+        backend = getattr(self.server, "chat_backend", None)
+        if backend is None:
+            self._json_error(HTTPStatus.SERVICE_UNAVAILABLE,
+                             "no chat backend configured")
+            return 503
+        options = req.get("options") or {}
+        max_tokens = int(options.get("num_predict") or DEFAULT_NUM_PREDICT)
+        prompt = _render_prompt(messages, entry)
+        t0 = time.monotonic()
+        try:
+            result = backend.generate(entry, prompt, max_tokens, options)
+        except ChainBackendError as e:
+            log.error("chain backend error: %s", e)
+            self._json_error(HTTPStatus.BAD_GATEWAY, "chain generation failed")
+            return 502
+        total_ns = int((time.monotonic() - t0) * 1e9)
+        self._json(HTTPStatus.OK, {
+            "model": entry.name,
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "message": {"role": "assistant", "content": result.text},
+            "done": True,
+            "done_reason": result.done_reason,
+            "total_duration": total_ns,
+            "prompt_eval_count": result.prompt_eval_count,
+            "eval_count": result.eval_count,
+        })
+        return 200
+
 
 # ── Server lifecycle ────────────────────────────────────────────────
 
 
 def build_server(bind: str, port: int,
-                 models: Optional[dict] = None) -> ThreadingHTTPServer:
+                 models: Optional[dict] = None,
+                 chat_backend: "Optional[ChatBackend]" = None
+                 ) -> ThreadingHTTPServer:
     """Construct + return a ThreadingHTTPServer bound to (bind, port).
 
     ``models`` is the registry from :func:`_load_models` (``{}`` if no
-    ``--models`` was given); it's attached to the server so per-request
-    handlers can read it via ``self.server.models``.
+    ``--models`` was given); ``chat_backend`` drives ``/api/chat`` (a
+    :class:`ChainChatBackend` in production, a :class:`StubChatBackend` in
+    tests). Both are attached to the server so per-request handlers read
+    them via ``self.server.models`` / ``self.server.chat_backend``.
 
     Caller is responsible for ``server.serve_forever()`` /
     ``server.shutdown()`` + ``server.server_close()``. Returning the
@@ -311,6 +497,7 @@ def build_server(bind: str, port: int,
     an ephemeral port without process-level setup."""
     server = ThreadingHTTPServer((bind, port), NakshatraServeHandler)
     server.models = models or {}
+    server.chat_backend = chat_backend
     return server
 
 
@@ -328,7 +515,8 @@ def _setup_logging(verbose: bool) -> None:
 def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(
         description="Nakshatra Ollama-compat HTTP serving frontend "
-                    "(Phase B — registry + /api/tags + /api/show).",
+                    "(Phase C — registry + /api/tags + /api/show + "
+                    "non-streaming /api/chat).",
     )
     ap.add_argument("--port", type=int, default=DEFAULT_PORT,
                     help=f"port to bind (default {DEFAULT_PORT}, "
@@ -352,7 +540,11 @@ def main(argv: Optional[list[str]] = None) -> int:
             log.error("model config error: %s", e)
             return 2
 
-    server = build_server(args.bind, args.port, models)
+    # Real chain backend whenever we have models to serve; the per-request
+    # subprocess into client.py needs no construction-time deps, so this is
+    # cheap even when the cluster is down (errors surface at request time).
+    chat_backend = ChainChatBackend() if models else None
+    server = build_server(args.bind, args.port, models, chat_backend)
     log.info("nakshatra_serve listening on %s:%d (version=%s, %d model(s): %s)",
              args.bind, args.port, VERSION_STRING, len(models),
              ", ".join(models) or "none")

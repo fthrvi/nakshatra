@@ -150,13 +150,13 @@ def test_unknown_get_returns_404_with_json_error():
 
 
 def test_unknown_post_returns_404_with_json_error():
-    """Same for POSTs. Phase C+ adds /api/chat here; until then,
-    POSTs all 404."""
+    """Same for POSTs. /api/chat + /api/show are real routes now (B/C);
+    an unimplemented endpoint like /api/embeddings still 404s clearly."""
     with _running_server() as port:
-        status, body = _post(port, "/api/chat", {"foo": "bar"})
+        status, body = _post(port, "/api/embeddings", {"foo": "bar"})
     assert status == 404
     assert "error" in body
-    assert "POST /api/chat" in body["error"]
+    assert "POST /api/embeddings" in body["error"]
 
 
 def test_query_string_stripped_when_routing():
@@ -364,3 +364,135 @@ def test_invalid_config_rejected(tmp_path, bad):
 def test_main_exits_nonzero_on_bad_config(tmp_path):
     rc = ns.main(["--models", str(tmp_path / "missing.yaml"), "--port", "0"])
     assert rc == 2
+
+
+# ── Phase C: /api/chat non-streaming ────────────────────────────────
+
+
+class _CapturingBackend(ns.ChatBackend):
+    """Records what the handler passed it, returns a fixed reply."""
+    def __init__(self, reply="hello from the chain"):
+        self.reply = reply
+        self.calls = []
+
+    def generate(self, entry, prompt, max_tokens, options):
+        self.calls.append({"name": entry.name, "prompt": prompt,
+                           "max_tokens": max_tokens, "options": options})
+        return ns.GenerationResult(text=self.reply, eval_count=4,
+                                   prompt_eval_count=7)
+
+
+@contextmanager
+def _running_chat(models, backend) -> Iterator[int]:
+    port = _free_port()
+    server = ns.build_server("127.0.0.1", port, models, backend)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    time.sleep(0.05)
+    try:
+        yield port
+    finally:
+        server.shutdown()
+        server.server_close()
+        t.join(timeout=2.0)
+        assert not t.is_alive()
+
+
+def _chat_models(tmp_path):
+    return ns._load_models(_write_models_yaml(tmp_path, _TWO_MODELS))
+
+
+def test_chat_happy_path_ollama_shaped(tmp_path):
+    backend = _CapturingBackend("Paris.")
+    with _running_chat(_chat_models(tmp_path), backend) as port:
+        status, body = _post(port, "/api/chat", {
+            "model": "llama-3.3-70b",
+            "messages": [{"role": "user", "content": "capital of France?"}],
+            "stream": False,
+        })
+    assert status == 200
+    assert body["model"] == "llama-3.3-70b"
+    assert body["message"] == {"role": "assistant", "content": "Paris."}
+    assert body["done"] is True and body["done_reason"] == "stop"
+    assert body["eval_count"] == 4 and body["prompt_eval_count"] == 7
+    assert "created_at" in body and "total_duration" in body
+    # handler rendered a Llama-3 prompt + passed the default num_predict.
+    call = backend.calls[0]
+    assert "<|start_header_id|>user<|end_header_id|>" in call["prompt"]
+    assert "capital of France?" in call["prompt"]
+    assert call["max_tokens"] == ns.DEFAULT_NUM_PREDICT
+
+
+def test_chat_num_predict_passed_through(tmp_path):
+    backend = _CapturingBackend()
+    with _running_chat(_chat_models(tmp_path), backend) as port:
+        _post(port, "/api/chat", {
+            "model": "llama-3.3-70b",
+            "messages": [{"role": "user", "content": "hi"}],
+            "options": {"num_predict": 16},
+        })
+    assert backend.calls[0]["max_tokens"] == 16
+
+
+def test_chat_unknown_model_404(tmp_path):
+    with _running_chat(_chat_models(tmp_path), _CapturingBackend()) as port:
+        status, body = _post(port, "/api/chat", {
+            "model": "ghost", "messages": [{"role": "user", "content": "hi"}]})
+    assert status == 404 and "not found" in body["error"]
+
+
+def test_chat_stream_true_rejected_until_phase_d(tmp_path):
+    with _running_chat(_chat_models(tmp_path), _CapturingBackend()) as port:
+        status, body = _post(port, "/api/chat", {
+            "model": "llama-3.3-70b", "stream": True,
+            "messages": [{"role": "user", "content": "hi"}]})
+    assert status == 400 and "Phase D" in body["error"]
+
+
+def test_chat_missing_messages_400(tmp_path):
+    with _running_chat(_chat_models(tmp_path), _CapturingBackend()) as port:
+        status, _ = _post(port, "/api/chat", {"model": "llama-3.3-70b"})
+    assert status == 400
+
+
+def test_chat_backend_error_maps_to_502(tmp_path):
+    class _Boom(ns.ChatBackend):
+        def generate(self, *a, **k):
+            raise ns.ChainBackendError("worker unreachable")
+    with _running_chat(_chat_models(tmp_path), _Boom()) as port:
+        status, _ = _post(port, "/api/chat", {
+            "model": "llama-3.3-70b",
+            "messages": [{"role": "user", "content": "hi"}]})
+    assert status == 502
+
+
+# ── Phase C units: client.py output parser + prompt render ──────────
+
+_SAMPLE_CLIENT_STDOUT = """\
+[chain] 5 workers in config
+[chain] step 1: id=12 'Paris'
+[chain] generated 3 tokens in 14.20s  (0.21 tok/s)
+[chain] full: 'capital of France? Paris is the capital'
+[chain] gen:  'Paris is the capital'
+TOPTOKS_CHAIN 12 374 9090
+"""
+
+
+def test_parse_client_output_recovers_text():
+    assert ns._parse_client_output(_SAMPLE_CLIENT_STDOUT) == "Paris is the capital"
+
+
+def test_parse_client_output_no_gen_line_raises():
+    with pytest.raises(ns.ChainBackendError):
+        ns._parse_client_output("[chain] 5 workers\nTOPTOKS_CHAIN 1 2 3\n")
+
+
+def test_render_prompt_llama_format():
+    entry = ns.ModelEntry(name="m", tokenizer_gguf="t", chain_yaml="c",
+                          details={"family": "llama"})
+    p = ns._render_prompt(
+        [{"role": "system", "content": "be brief"},
+         {"role": "user", "content": "hi"}], entry)
+    assert p.startswith("<|begin_of_text|>")
+    assert "<|start_header_id|>system<|end_header_id|>\n\nbe brief<|eot_id|>" in p
+    assert p.endswith("<|start_header_id|>assistant<|end_header_id|>\n\n")
