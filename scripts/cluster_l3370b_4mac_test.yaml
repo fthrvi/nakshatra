@@ -1,6 +1,6 @@
 # Llama-3.3-70B 4-Mac chain (no prithvi) — v0.5 M0.5.1 verification target.
 #   w0:  node-b  (Metal, 5700 XT)        layers [0,20)   has token_embd
-#   w1:  mentorings (CPU, Vega 56 drift) layers [20,40)
+#   w1:  node-f (CPU, Vega 56 drift) layers [20,40)
 #   w2:  node-d    (Metal, 5700 XT)        layers [40,60)
 #   w3:  node-e  (Metal, 5700 XT)        layers [60,80)  has lm_head
 #
@@ -19,7 +19,7 @@ workers:
     layer_range: [0, 20]
     sub_gguf_path: /tmp/l3370b_w0.gguf
     mode: first
-  - id: mentorings-test
+  - id: node-f-test
     address: 203.0.113.13
     port: 5561
     layer_range: [20, 40]

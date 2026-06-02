@@ -21,7 +21,7 @@ workers:
     layer_range: [6, 12]
     sub_gguf_path: /tmp/w1.gguf
     mode: middle
-  - id: mentorings
+  - id: node-f
     address: 203.0.113.13     # operator@node-c (Vega 56)
     port: 5532
     layer_range: [12, 17]

@@ -1,4 +1,4 @@
-# 3-worker cluster across home PC + mentorings + node-e.
+# 3-worker cluster across home PC + node-f + node-e.
 # Hidden state per token: 3072 fp32 = 12 KB; 6 prompt tokens × 2 hops = 144 KB.
 model:
   id: "prithvi-q8"
@@ -13,7 +13,7 @@ workers:
     layer_range: [0, 10]
     sub_gguf_path: /tmp/cuts3/w0.gguf
     mode: first
-  - id: mentorings
+  - id: node-f
     address: 203.0.113.13       # Mac, middle, layers [10,19)
     port: 5532
     layer_range: [10, 19]

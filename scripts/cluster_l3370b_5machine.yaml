@@ -1,7 +1,7 @@
 # Llama-3.3-70B 5-machine chain — v0.5 §7 acceptance target.
 #   w0:  prithvi (ROCm, RX 9070 XT)         layers [0,16)   has token_embd
 #   w1:  node-b  (Metal, 5700 XT)           layers [16,32)
-#   w2:  mentorings (CPU, Vega 56 drift)    layers [32,40)
+#   w2:  node-f (CPU, Vega 56 drift)    layers [32,40)
 #   w3:  node-d    (Metal, 5700 XT)           layers [40,56)
 #   w4:  node-e  (Metal, 5700 XT)           layers [56,80)  has lm_head
 #

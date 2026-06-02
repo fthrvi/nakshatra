@@ -31,7 +31,7 @@ The assertion fires at the very first `EMBD_DECODE` call on a `last`-mode worker
 | Mode    | Backend | Result |
 |---------|---------|--------|
 | first   | Metal   | ✅ works (prithvi-5530 with ROCm, node-b-5531 with Metal) |
-| middle  | Metal   | ✅ works (node-d-5533 with Metal, mentorings-5532 with CPU) |
+| middle  | Metal   | ✅ works (node-d-5533 with Metal, node-f-5532 with CPU) |
 | last    | CPU     | ✅ works (the 4-Mac M0.5.1 chain; node-e-test:5563 cpu mode `last`) |
 | last    | Metal   | ❌ crashes (this finding) |
 
