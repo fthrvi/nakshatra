@@ -642,6 +642,12 @@ def main(argv: Optional[list[str]] = None) -> int:
                     help="path to serve_models.yaml (model registry). "
                          "Omit to run with an empty registry "
                          "(/api/tags returns []).")
+    ap.add_argument("--stub-backend", nargs="?", const="Hello from a stubbed "
+                    "Nakshatra gateway (the chain is not wired — this is a "
+                    "canned reply for wire-smoke).", default=None, metavar="REPLY",
+                    help="serve a canned StubChatBackend reply instead of the "
+                         "real chain — lets you validate the Prithvi OLLAMA_HOST "
+                         "cutover end-to-end BEFORE the cluster is up")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
     _setup_logging(args.verbose)
@@ -654,10 +660,15 @@ def main(argv: Optional[list[str]] = None) -> int:
             log.error("model config error: %s", e)
             return 2
 
-    # Real chain backend whenever we have models to serve; the per-request
-    # subprocess into client.py needs no construction-time deps, so this is
-    # cheap even when the cluster is down (errors surface at request time).
-    chat_backend = ChainChatBackend() if models else None
+    # Backend: an explicit stub (wire-smoke) wins; otherwise the real chain
+    # backend whenever we have models. The per-request subprocess into
+    # client.py needs no construction-time deps, so ChainChatBackend is cheap
+    # even when the cluster is down (errors surface at request time).
+    if args.stub_backend is not None:
+        chat_backend = StubChatBackend(args.stub_backend)
+        log.info("serving STUB backend (no chain): %r", args.stub_backend[:60])
+    else:
+        chat_backend = ChainChatBackend() if models else None
     server = build_server(args.bind, args.port, models, chat_backend)
     log.info("nakshatra_serve listening on %s:%d (version=%s, %d model(s): %s)",
              args.bind, args.port, VERSION_STRING, len(models),
