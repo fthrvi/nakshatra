@@ -562,3 +562,81 @@ def test_render_prompt_unknown_family_defaults_to_llama():
                           details={"family": "qwen"})
     out = ns._render_prompt([{"role": "user", "content": "hi"}], entry)
     assert out.startswith("<|begin_of_text|>")
+
+
+# ── OpenAI-compat surface (/v1) ─────────────────────────────────────
+
+
+def _post_sse(port: int, path: str, payload: dict, timeout: float = 2.0) -> list:
+    """POST + parse a Server-Sent Events stream into a list of JSON chunks
+    (the trailing `data: [DONE]` sentinel is dropped)."""
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}{path}",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        body = resp.read().decode("utf-8")
+    out = []
+    for line in body.splitlines():
+        if line.startswith("data: "):
+            data = line[len("data: "):]
+            if data.strip() == "[DONE]":
+                continue
+            out.append(json.loads(data))
+    return out
+
+
+def test_v1_models_lists(tmp_path):
+    reg = ns._load_models(_write_models_yaml(tmp_path, _TWO_MODELS))
+    with _running_chat(reg, ns.StubChatBackend()) as port:
+        status, body = _get(port, "/v1/models")
+    assert status == 200 and body["object"] == "list"
+    assert {m["id"] for m in body["data"]} == {"llama-3.3-70b", "qwen3-coder-30b"}
+    assert all(m["owned_by"] == "nakshatra" for m in body["data"])
+
+
+def test_v1_chat_completions_nonstream(tmp_path):
+    with _running_chat(_chat_models(tmp_path), ns.StubChatBackend("Paris.")) as port:
+        status, body = _post(port, "/v1/chat/completions", {
+            "model": "llama-3.3-70b",
+            "messages": [{"role": "user", "content": "capital?"}]})
+    assert status == 200
+    assert body["object"] == "chat.completion"
+    assert body["id"].startswith("chatcmpl-")
+    assert body["model"] == "llama-3.3-70b"
+    choice = body["choices"][0]
+    assert choice["message"] == {"role": "assistant", "content": "Paris."}
+    assert choice["finish_reason"] == "stop"
+    assert body["usage"]["total_tokens"] == (
+        body["usage"]["prompt_tokens"] + body["usage"]["completion_tokens"])
+
+
+def test_v1_chat_completions_unknown_model_404_openai_error(tmp_path):
+    with _running_chat(_chat_models(tmp_path), ns.StubChatBackend()) as port:
+        status, body = _post(port, "/v1/chat/completions", {
+            "model": "ghost", "messages": [{"role": "user", "content": "hi"}]})
+    assert status == 404
+    # OpenAI error envelope: error is an object, not a bare string.
+    assert body["error"]["type"] == "model_not_found"
+    assert "not found" in body["error"]["message"]
+
+
+def test_v1_chat_completions_streaming_sse(tmp_path):
+    with _running_chat(_chat_models(tmp_path), ns.StubChatBackend("Paris is here")) as port:
+        chunks = _post_sse(port, "/v1/chat/completions", {
+            "model": "llama-3.3-70b", "stream": True,
+            "messages": [{"role": "user", "content": "hi"}]})
+    assert chunks[0]["choices"][0]["delta"] == {"role": "assistant"}   # role-first
+    assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
+    assert all(c["object"] == "chat.completion.chunk" for c in chunks)
+    content = "".join(c["choices"][0]["delta"].get("content", "") for c in chunks)
+    assert content == "Paris is here"
+
+
+def test_v1_chat_completions_max_tokens_param(tmp_path):
+    backend = _CapturingBackend()
+    with _running_chat(_chat_models(tmp_path), backend) as port:
+        _post(port, "/v1/chat/completions", {
+            "model": "llama-3.3-70b", "max_tokens": 8,
+            "messages": [{"role": "user", "content": "hi"}]})
+    assert backend.calls[0]["max_tokens"] == 8

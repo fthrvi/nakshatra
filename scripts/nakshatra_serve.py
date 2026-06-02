@@ -5,8 +5,11 @@ Phase E of the 2026-05-30 Ollama-gateway sprint. Ships the HTTP scaffold
 + `/api/version` + `/health` (A), the model registry + `/api/tags` +
 `/api/show` (B), non-streaming `/api/chat` (C), streaming `/api/chat`
 (stream:true → newline-delimited JSON, D), and per-family chat templates
-— Llama-3 + Gemma (E). Remaining: the live cluster smoke (F). The plan lives
-at `~/trisul/plans/2026-05-30-nakshatra-ollama-gateway-sprint.md`.
+— Llama-3 + Gemma (E). Also ships an OpenAI-compat surface (`/v1/models` +
+`/v1/chat/completions`, SSE streaming) over the same backend, so non-Prithvi
+consumers (Open WebUI, Cursor, the openai SDK) can use the fleet. Remaining:
+the live cluster smoke (F). The plan lives at
+`~/trisul/plans/2026-05-30-nakshatra-ollama-gateway-sprint.md`.
 
 **Why this exists:** Prithvi's live gateway
 (http://203.0.113.10:8080) speaks OpenAI to users and calls its
@@ -353,6 +356,12 @@ def _render_prompt(messages: list, entry: ModelEntry) -> str:
     return _render_llama3(messages)
 
 
+def _gen_id() -> str:
+    """Short opaque id for OpenAI-style response ids (chatcmpl-<id>)."""
+    import uuid
+    return uuid.uuid4().hex[:24]
+
+
 # ── HTTP handler ────────────────────────────────────────────────────
 
 
@@ -450,6 +459,8 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.OK,
                        {"models": [_ollama_tag(e) for e in self._models.values()]})
             return 200
+        if path == "/v1/models":
+            return self._handle_openai_models()
         # Phase C+ endpoints land here as new branches.
         self._json_error(
             HTTPStatus.NOT_FOUND,
@@ -463,6 +474,8 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
             return self._handle_show()
         if path == "/api/chat":
             return self._handle_chat()
+        if path == "/v1/chat/completions":
+            return self._handle_openai_chat()
         # Phase D adds streaming on the same /api/chat path (stream:true).
         self._json_error(
             HTTPStatus.NOT_FOUND,
@@ -586,6 +599,117 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
                 "done": True, "done_reason": "stop",
                 "total_duration": int((time.monotonic() - t0) * 1e9),
                 "eval_count": eval_count})
+        return 200
+
+    # ── OpenAI-compat surface (/v1) ───────────────────────────────
+    # Same model registry + ChatBackend seam as the Ollama endpoints,
+    # re-dressed in OpenAI's envelope so non-Prithvi consumers (Open
+    # WebUI, Cursor, LangChain, the openai SDK) can use the fleet too.
+
+    def _openai_error(self, status: int, message: str,
+                      err_type: str = "invalid_request_error") -> None:
+        self._json(status, {"error": {"message": message, "type": err_type,
+                                      "code": None}})
+
+    def _handle_openai_models(self) -> int:
+        """GET /v1/models — OpenAI model list."""
+        created = int(time.time())
+        self._json(HTTPStatus.OK, {"object": "list", "data": [
+            {"id": name, "object": "model", "created": created,
+             "owned_by": "nakshatra"} for name in self._models]})
+        return 200
+
+    def _handle_openai_chat(self) -> int:
+        """POST /v1/chat/completions — OpenAI chat, streaming (SSE) or not.
+        Reuses the same registry, prompt render, and backend as /api/chat;
+        only the request params (max_tokens) and response envelope differ."""
+        try:
+            req = self._read_json_body()
+        except ValueError:
+            self._openai_error(HTTPStatus.BAD_REQUEST, "invalid JSON body")
+            return 400
+        name = req.get("model")
+        entry = self._models.get(name) if name else None
+        if entry is None:
+            self._openai_error(HTTPStatus.NOT_FOUND, f"model '{name}' not found",
+                               "model_not_found")
+            return 404
+        messages = req.get("messages")
+        if not isinstance(messages, list) or not messages:
+            self._openai_error(HTTPStatus.BAD_REQUEST,
+                               "'messages' must be a non-empty list")
+            return 400
+        backend = getattr(self.server, "chat_backend", None)
+        if backend is None:
+            self._openai_error(HTTPStatus.SERVICE_UNAVAILABLE,
+                               "no chat backend configured", "server_error")
+            return 503
+        max_tokens = int(req.get("max_tokens") or DEFAULT_NUM_PREDICT)
+        options = {"num_predict": max_tokens}
+        for k in ("temperature", "top_p"):
+            if k in req:
+                options[k] = req[k]
+        prompt = _render_prompt(messages, entry)
+        cid, created = "chatcmpl-" + _gen_id(), int(time.time())
+
+        if req.get("stream"):
+            return self._stream_openai_chat(entry, prompt, max_tokens,
+                                            options, backend, cid, created)
+        try:
+            result = backend.generate(entry, prompt, max_tokens, options)
+        except ChainBackendError as e:
+            log.error("chain backend error: %s", e)
+            self._openai_error(HTTPStatus.BAD_GATEWAY, "chain generation failed",
+                               "server_error")
+            return 502
+        p, c = result.prompt_eval_count, result.eval_count
+        self._json(HTTPStatus.OK, {
+            "id": cid, "object": "chat.completion", "created": created,
+            "model": entry.name,
+            "choices": [{"index": 0,
+                         "message": {"role": "assistant", "content": result.text},
+                         "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": p, "completion_tokens": c,
+                      "total_tokens": p + c},
+        })
+        return 200
+
+    def _stream_openai_chat(self, entry, prompt, max_tokens, options, backend,
+                            cid, created) -> int:
+        """OpenAI streaming: Server-Sent Events — ``data: {chunk}`` lines, a
+        role-first delta, content deltas, a terminal ``finish_reason:stop``
+        chunk, then ``data: [DONE]``."""
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+
+        def _chunk(delta: dict, finish=None) -> dict:
+            return {"id": cid, "object": "chat.completion.chunk",
+                    "created": created, "model": entry.name,
+                    "choices": [{"index": 0, "delta": delta,
+                                 "finish_reason": finish}]}
+
+        def _sse(obj: dict) -> None:
+            self.wfile.write(("data: " + json.dumps(obj) + "\n\n").encode("utf-8"))
+            self.wfile.flush()
+
+        _sse(_chunk({"role": "assistant"}))   # OpenAI's first delta carries the role
+        try:
+            for delta in backend.generate_stream(entry, prompt, max_tokens, options):
+                _sse(_chunk({"content": delta}))
+        except ChainBackendError as e:
+            log.error("stream backend error: %s", e)
+            try:
+                _sse(_chunk({}, finish="stop"))
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+            except Exception:
+                pass
+            return 502
+        _sse(_chunk({}, finish="stop"))
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
         return 200
 
 
