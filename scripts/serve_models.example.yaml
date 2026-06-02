@@ -1,0 +1,19 @@
+# serve_models.yaml — model registry for nakshatra_serve.py (Phase B).
+#
+# Maps the model NAME Prithvi requests (model=<name> over Ollama /api/chat)
+# to its tokenizer GGUF and the chain that serves it. Copy to
+# serve_models.yaml, edit, and pass with --models. Keep the real file LOCAL
+# (it carries on-disk model paths / pillar addresses).
+#
+# Each entry needs: name, tokenizer_gguf, and exactly one chain source —
+# chain_yaml (a static scripts/cluster_*.yaml) OR registry_url (a Sthambha
+# pillar that plans the chain dynamically). `details` is optional Ollama
+# /api/tags metadata (family / parameter_size / quantization_level).
+models:
+  - name: llama-3.3-70b
+    tokenizer_gguf: /models/llama-3.3-70b/llama-3.3-70b-Q4_K_M.gguf
+    chain_yaml: scripts/cluster_5worker.yaml
+    details: {family: llama, parameter_size: "70B", quantization_level: Q4_K_M}
+  # - name: qwen3-coder-30b
+  #   tokenizer_gguf: /models/qwen3-coder-30b/model.gguf
+  #   registry_url: http://node-pi:7777    # pillar-driven dynamic chain (Phase C+)

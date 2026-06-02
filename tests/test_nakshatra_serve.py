@@ -263,3 +263,104 @@ def test_models_arg_accepted_in_phase_a():
     # in the import-level parse).
     # Easier still: check that DEFAULT_PORT is the expected one.
     assert ns.DEFAULT_PORT == 11434
+
+
+# ── Phase B: model registry + /api/tags + /api/show ─────────────────
+
+import textwrap
+
+
+@contextmanager
+def _running_server_models(models) -> Iterator[int]:
+    """Like _running_server but with a model registry attached."""
+    port = _free_port()
+    server = ns.build_server("127.0.0.1", port, models)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    time.sleep(0.05)
+    try:
+        yield port
+    finally:
+        server.shutdown()
+        server.server_close()
+        t.join(timeout=2.0)
+        assert not t.is_alive(), "server thread did not exit"
+
+
+def _write_models_yaml(tmp_path, body: str) -> str:
+    p = tmp_path / "serve_models.yaml"
+    p.write_text(textwrap.dedent(body))
+    return str(p)
+
+
+_TWO_MODELS = """\
+    models:
+      - name: llama-3.3-70b
+        tokenizer_gguf: /models/llama-3.3-70b/m.gguf
+        chain_yaml: scripts/cluster_5worker.yaml
+        details: {family: llama, parameter_size: "70B", quantization_level: Q4_K_M}
+      - name: qwen3-coder-30b
+        tokenizer_gguf: /models/qwen/m.gguf
+        registry_url: http://node-pi:7777
+"""
+
+
+def test_load_models_parses_two(tmp_path):
+    reg = ns._load_models(_write_models_yaml(tmp_path, _TWO_MODELS))
+    assert set(reg) == {"llama-3.3-70b", "qwen3-coder-30b"}
+    assert reg["llama-3.3-70b"].chain_yaml.endswith("cluster_5worker.yaml")
+    assert reg["qwen3-coder-30b"].registry_url == "http://node-pi:7777"
+
+
+def test_api_tags_lists_loaded_models(tmp_path):
+    reg = ns._load_models(_write_models_yaml(tmp_path, _TWO_MODELS))
+    with _running_server_models(reg) as port:
+        status, body = _get(port, "/api/tags")
+    assert status == 200
+    assert [m["name"] for m in body["models"]] == ["llama-3.3-70b", "qwen3-coder-30b"]
+    for m in body["models"]:
+        assert {"name", "model", "modified_at", "size", "digest", "details"} <= set(m)
+        assert m["details"]["format"] == "gguf"
+    llama = next(m for m in body["models"] if m["name"] == "llama-3.3-70b")
+    assert llama["details"]["parameter_size"] == "70B"   # config details propagate
+
+
+def test_api_tags_empty_registry():
+    with _running_server_models({}) as port:
+        status, body = _get(port, "/api/tags")
+    assert status == 200
+    assert body == {"models": []}
+
+
+def test_api_show_known_and_unknown(tmp_path):
+    reg = ns._load_models(_write_models_yaml(tmp_path, _TWO_MODELS))
+    with _running_server_models(reg) as port:
+        ok_status, ok_body = _post(port, "/api/show", {"name": "llama-3.3-70b"})
+        miss_status, miss_body = _post(port, "/api/show", {"name": "nope"})
+    assert ok_status == 200
+    assert ok_body["model_info"]["name"] == "llama-3.3-70b"
+    assert miss_status == 404
+    assert "not found" in miss_body["error"]
+
+
+def test_missing_config_fails_fast(tmp_path):
+    with pytest.raises(ns.ModelConfigError):
+        ns._load_models(str(tmp_path / "does-not-exist.yaml"))
+
+
+@pytest.mark.parametrize("bad", [
+    "models: []",                                                  # empty list
+    "models:\n  - name: x\n    chain_yaml: c.yaml",               # no tokenizer
+    "models:\n  - name: x\n    tokenizer_gguf: t",                # no chain
+    "models:\n  - name: x\n    tokenizer_gguf: t\n    chain_yaml: c\n"
+    "  - name: x\n    tokenizer_gguf: t2\n    chain_yaml: c2",    # dup name
+    "nope: true",                                                 # no models key
+])
+def test_invalid_config_rejected(tmp_path, bad):
+    with pytest.raises(ns.ModelConfigError):
+        ns._load_models(_write_models_yaml(tmp_path, bad))
+
+
+def test_main_exits_nonzero_on_bad_config(tmp_path):
+    rc = ns.main(["--models", str(tmp_path / "missing.yaml"), "--port", "0"])
+    assert rc == 2
