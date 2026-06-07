@@ -119,6 +119,62 @@ Prevent **replay attacks** and **unauthorized request execution** in distributed
 
 ---
 
+## Paper 4: Parallel Gaussian Process Regression with Low-Rank Approximations (arXiv 1305.5826)
+
+**Citation:** Jie Chen, Nannan Cao, Kian Hsiang Low, Ruofei Ouyang, Colin Keng-Yan Tan, Patrick Jaillet (2013). "Parallel Gaussian Process Regression with Low-Rank Covariance Matrix Approximations." [abs](https://arxiv.org/abs/1305.5826)
+
+### Core Problem
+**Gaussian Processes (GP) cannot scale** to large datasets due to cubic time cost $O(n^3)$ in inverting the $n \times n$ covariance matrix. For real-time routing/prediction in distributed systems, we need a scalable approach that:
+1. Reduces computation from $O(n^3)$ to practical time
+2. Distributes the work across parallel machines
+3. Maintains predictive accuracy close to "full" GP trained on all data
+
+### Key Results
+1. **Low-rank covariance approximation:** Replace full $n \times n$ matrix with $n \times m$ approximation using $m$ "landmark" points ($m \ll n$). Reduces local computation from $O(n^3)$ to $O(n \cdot m^2)$.
+2. **Two distributable methods:**
+   - **Fully Distributed GP (FD-GP):** Each machine trains locally on data chunks, coordinator aggregates predictions. Minimal communication, $O(n^3/p^3)$ per machine (where $p$ = number of machines).
+   - **Iterative GP (IG-GP):** Machines collaboratively refine shared landmark points over multiple rounds. Better accuracy than FD-GP, higher communication cost.
+3. **Theoretical guarantee:** Distributed GP predictions are **equivalent to centralized approximate GP**, ensuring no degradation from distribution.
+4. **Empirical validation:** 20-node cluster demonstrates linear speedup (2x nodes ≈ 2x speedup) while maintaining FG-equivalent accuracy on real datasets.
+
+### Relevance to Nakshatra
+
+**Direct:**
+- **Distributed performance prediction:** Each worker can train a local GP from its inference logs (latency, throughput, cache hits) without centralizing data. Coordinator aggregates worker GPs to predict "which worker should handle next token?" without seeing raw logs.
+- **Privacy + scalability:** Workers never share raw telemetry, only compact low-rank GP models (~10s of KB each). Coordinator combines them for system-wide routing decisions.
+- **Adaptive routing:** As workers' performance changes (e.g., one worker gets overloaded), its GP updates locally, changes propagate to coordinator within one aggregation cycle — no sync delays.
+
+**Potential implementation hooks:**
+```python
+# Per worker: train low-rank GP locally
+worker_gp = LowRankGP(
+    X=worker_logs[["queue_depth", "token_pos", "model"]],
+    y=worker_logs["latency_ms"],
+    num_inducing_points=50  # m=50 << n (thousands of logs)
+)
+# Sthambha coordinator: aggregate worker GPs
+def predict_latency(query):
+    predictions = [worker_a_gp.predict(query),
+                   worker_b_gp.predict(query),
+                   worker_c_gp.predict(query)]
+    return aggregate(predictions)  # mean or weighted by trust
+```
+
+- **Phase 1 (v0.2+):** Each worker maintains a lightweight low-rank GP of its own performance.
+- **Phase 2:** Coordinator uses aggregated GPs to drive adaptive layer-fetch routing (predict which peer will respond fastest).
+- **Phase 3:** Workers can use aggregated system GP to predict inter-worker latency for prefetching decisions.
+
+### Status
+**Verdict:** BENEFICIAL (strategic, not critical for v0.1). Solves a real problem (centralized telemetry collection) and gives strong theoretical guarantees. Current v0.1 can use simple heuristics (worker availability + round-robin); parallel GP enables v0.2+ adaptive routing with learned worker models. Implementation effort: medium (requires GP library + aggregation logic).
+
+### Open Questions
+- **Landmark selection:** How do we choose which $m$ points are "most informative"? Paper doesn't fully specify. Greedy maximin distance? K-means? Adaptive (sample high-uncertainty points)?
+- **FD-GP vs IG-GP trade-off:** When is FD-GP sufficient (fast) vs. when do we need IG-GP iterations (slow but accurate)? SLO-driven heuristic needed.
+- **Concept drift:** Workers' performance changes over time (new model version, hardware swap). Do we retrain worker GPs hourly? How do we forget old stale data?
+- **Non-stationary latency:** Network jitter, thermal throttling, background processes — latency isn't stationary. Do we model with heteroscedastic GP (varying noise per region)?
+
+---
+
 ## Meta: Adding Papers
 
 To add a new paper, append a new `## Paper N: ...` section following the template above:
