@@ -175,6 +175,86 @@ def predict_latency(query):
 
 ---
 
+## Paper 5: Dynamic Multi-Level Multi-Agent Simulations (arXiv 1311.5108)
+
+**Citation:** Jean-Baptiste Soyez, Gildas Morvan, Daniel Dupont, Rochdi Merzouki (2013). "A Methodology to Engineer and Validate Dynamic Multi-Level Multi-Agent Based Simulations." [abs](https://arxiv.org/abs/1311.5108)
+
+### Core Problem
+Complex distributed systems (multi-scale, multi-domain) waste compute resources simulating **fine-grained detail that's irrelevant to current queries**. Need a methodology to **dynamically adjust granularity** — use lightweight representations during stable operation, zoom in to fine detail only during anomalies/crises — without losing information fidelity.
+
+### Key Results
+1. **IRM4MLS meta-model:** Generic agent-based framework supporting multi-level hierarchies. Agents can represent different domains or different scales of the same phenomenon.
+2. **Two core mechanisms:**
+   - **Activation/Deactivation:** Subsystems (agents) are turned on/off based on operational state. E.g., disable weather-simulation agents if conditions are stable; activate only when needed.
+   - **Aggregation/Disaggregation:** Agents at the same level can be fused (aggregated) into coarser summaries during normal operation, then split (disaggregated) into fine-grained individuals during critical periods.
+3. **Theoretical guarantee:** Detail level adjustment preserves information fidelity — predictions remain accurate while computation scales with operational need.
+4. **No performance loss:** Switching between levels doesn't degrade system predictive quality, only changes resource footprint.
+
+### Relevance to Nakshatra
+
+**Direct:**
+- **Adaptive simulation granularity:** Nakshatra's 5-worker cluster can operate in two modes:
+  - **Aggregated (normal):** Workers pooled into one "WorkerPool" agent; predict throughput from pool-level statistics (minimal compute).
+  - **Disaggregated (crisis):** Individual worker agents; per-token latency heuristics; routing optimization (full compute).
+
+**Practical hooks:**
+- **Normal operation:** Sthambha tracks aggregate `{throughput_avg, latency_p95, error_rate}` per pool. Coordinator uses simple round-robin routing. Cost: negligible.
+- **Load spike / SLO breach:** Disaggregate → track per-worker `{queue_length, predicted_latency, reliability}`. Activate adaptive routing (Parallel GP from Paper 4). Activate Forgiving Tree monitoring (Paper 1). Cost: scales with urgency.
+- **Node failure:** Immediately disaggregate affected cluster. Activate topology repair. Once healed, re-aggregate if remaining workers are healthy.
+
+**Implementation:**
+```python
+class NakshatraSimulator:
+    def __init__(self):
+        self.detail_level = "aggregated"
+        self.worker_pool = WorkerPool(num_workers=5)
+    
+    def should_disaggregate(self):
+        """Check if we need fine-grained simulation."""
+        return (
+            self.slo_violation_risk() or
+            any_worker_error_spike() or
+            network_latency_spike() or
+            queue_buildup()
+        )
+    
+    def simulate_token_routing(self, token):
+        if self.detail_level == "aggregated":
+            # Fast: pool-level prediction
+            worker = self.worker_pool.suggest_via_aggregate_model()
+        else:
+            # Detailed: per-worker heuristics
+            workers_sorted = sort(
+                [w.predict_latency(token) for w in self.worker_pool.workers]
+            )
+            worker = workers_sorted[0]  # pick fastest
+        
+        result = worker.process(token)
+        
+        # Adapt detail level
+        if self.should_disaggregate() and self.detail_level == "aggregated":
+            self.detail_level = "disaggregated"
+            self.activate_adaptive_routing()
+            self.activate_topology_monitoring()
+        elif self.is_stable() and self.detail_level == "disaggregated":
+            self.detail_level = "aggregated"
+            self.deactivate_adaptive_routing()
+            self.deactivate_topology_monitoring()
+        
+        return result
+```
+
+### Status
+**Verdict:** BENEFICIAL (architectural pattern, medium priority). Solves resource scaling elegantly — Nakshatra stays lean during normal operation (critical for edge deployment), auto-scales observation granularity on demand. Complements Papers 1 (topology) + 4 (adaptive routing) + 3 (session/request dedup). Can be prototyped in v0.2; enables v0.3+ self-adaptive behavior.
+
+### Open Questions
+- **Disaggregation trigger SLO:** What latency/error threshold triggers the switch? Too aggressive = always detailed = no savings. Too lazy = misses problems. Heuristic or learned?
+- **Activation state persistence:** When disaggregating, do we "cold-start" per-worker models (inaccurate) or warm-start from aggregated statistics (biased)? Hybrid initialization strategy?
+- **Multi-granularity stacking:** Can we have 3+ levels (ultra-fine per-token microbenchmarks, medium per-layer, coarse per-model)? How does the framework compose?
+- **Information fidelity metrics:** How do we formally verify that aggregation doesn't lose predictive power? Test suite of synthetic SLO violations?
+
+---
+
 ## Meta: Adding Papers
 
 To add a new paper, append a new `## Paper N: ...` section following the template above:
