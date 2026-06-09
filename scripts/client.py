@@ -30,10 +30,24 @@ from urllib import request as urlrequest
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-import grpc
 import yaml
-import nakshatra_pb2 as pb
-import nakshatra_pb2_grpc as pb_grpc
+
+# grpc + the generated stubs are needed only by the chain-walking / RPC
+# paths, NOT by registry discovery: build_chain_from_registry and its
+# helpers (_peer_chain_score, _try_pillar_chain, _sanitize_spki) are pure
+# urllib + stdlib. Optional-import them — same shape as the nakshatra_tls
+# block below — so the discovery logic stays importable (and unit-testable)
+# on a checkout without the gRPC runtime. The RPC paths NameError only if
+# actually exercised without grpc, which can't happen in a real run (the
+# deps ship together; this only matters for grpc-free unit tests).
+try:
+    import grpc
+    import nakshatra_pb2 as pb
+    import nakshatra_pb2_grpc as pb_grpc
+    _GRPC_AVAILABLE = True
+except ImportError:
+    grpc = pb = pb_grpc = None  # type: ignore[assignment]
+    _GRPC_AVAILABLE = False
 
 # 2026-05-26: SPKI-pinned outbound channels. Lazy-imported so the client
 # still runs on a checkout that pre-dates the Phase 2 TLS module (in which
