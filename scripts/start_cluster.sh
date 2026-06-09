@@ -37,10 +37,23 @@ MODEL_ID="prithvi-q8"
 N_CTX="${N_CTX:-256}"
 N_THREADS="${N_THREADS:-8}"
 
+# Optional: register each worker with a Sthambha pillar on startup so a
+# client can discover the chain via `client.py --registry <pillar>`
+# instead of the static cluster_5worker.yaml. Opt-in — leave PILLAR_URL
+# unset for the current behavior (no registration, identical launch).
+#   PILLAR_URL=http://node-pi.local:7777 ./scripts/start_cluster.sh
+# NOTE: passing --pillar-url also makes each worker use the pillar as its
+# gRPC auth-key resolver (see worker.py), so enable this only when the
+# pillar is reachable from every worker AND the workers have their
+# Ed25519 keys provisioned — otherwise inbound gRPC auth will reject.
+PILLAR_URL="${PILLAR_URL:-}"
+PILLAR_ARG=""
+[ -n "$PILLAR_URL" ] && PILLAR_ARG="--pillar-url $PILLAR_URL"
+
 for w in "${WORKERS[@]}"; do
   read -r host port start end mode sub_gguf daemon_bin <<<"$w"
   echo "[start] $host:$port  mode=$mode  layers=[$start,$end)  sub_gguf=$sub_gguf"
-  ssh "$host" "lsof -ti:$port 2>/dev/null | xargs kill -9 2>/dev/null; sleep 1; rm -f /tmp/worker_$port.log; cd ~/nakshatra-v0 && source venv/bin/activate && nohup python scripts/worker.py --port $port --sub-gguf $sub_gguf --mode $mode --layer-start $start --layer-end $end --model-id $MODEL_ID --daemon-bin $daemon_bin --n-ctx $N_CTX --n-threads $N_THREADS > /tmp/worker_$port.log 2>&1 < /dev/null &
+  ssh "$host" "lsof -ti:$port 2>/dev/null | xargs kill -9 2>/dev/null; sleep 1; rm -f /tmp/worker_$port.log; cd ~/nakshatra-v0 && source venv/bin/activate && nohup python scripts/worker.py --port $port --sub-gguf $sub_gguf --mode $mode --layer-start $start --layer-end $end --model-id $MODEL_ID $PILLAR_ARG --daemon-bin $daemon_bin --n-ctx $N_CTX --n-threads $N_THREADS > /tmp/worker_$port.log 2>&1 < /dev/null &
 for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do grep -q 'M5 listening' /tmp/worker_$port.log 2>/dev/null && break; sleep 1; done
 grep -q 'M5 listening' /tmp/worker_$port.log && echo \"[$host] READY\" || echo \"[$host] NOT_READY\"" &
 done
