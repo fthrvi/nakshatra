@@ -166,7 +166,7 @@ These do not need answers now. They need answers before NakshatraOS-v0 starts im
 | Nakshatra v0.0 | Validation experiments. Decision gate for v0.1. |
 | Nakshatra v0.1 | Two-iMac MVP. LlamaCppBackend Path B-prime. Single model. Trusted operators. (`petals-architecture.md` §7-9) |
 | Nakshatra v0.5 | Dynamic re-routing, server-to-server push. Larger private clusters. |
-| Nakshatra v1.0 | DHT, public-network mode, opt-in verification. |
+| Nakshatra v1.0 | DHT, public-network mode, opt-in verification. (Design: [`v1.0-discovery-and-distribution.md`](v1.0-discovery-and-distribution.md)) |
 | **NakshatraOS v0** | First L3: model registry on top of Nakshatra v1.0. Many models, one network. |
 | NakshatraOS v0.5 | Agent runtime: spawn, migrate, persist. Long-horizon agents become real. |
 | NakshatraOS v1.0 | Developer SDK. Third-party apps. Identity + permissions + IPC. |
