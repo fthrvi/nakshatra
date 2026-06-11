@@ -1141,12 +1141,14 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
             has_lm_head=(self.mode == "last"),
             # v0.5 §9.1 closure — advertised features so the client can
             # negotiate push at session start without runtime probing.
+            # v1.0 §7 — append control/vN tokens so the client can negotiate
+            # the control-protocol version on the same handshake.
             protocol_capabilities=[
                 "streaming",
                 "rpc_push",
                 "idempotency_cache",
                 "recovery_replay",
-            ],
+            ] + _control_version_caps(),
         )
 
     def _run_forward(self, hidden_in: bytes, n_tokens: int,
@@ -2313,6 +2315,22 @@ def start_file_server(serving_dir: str, port: int):
     slicer_status = _PARTIAL_GGUF_PATH or "DISABLED (partial_gguf.py not found)"
     print(f"[fileserver] listening on :{port}, serving from {_FILE_SERVER_DIR}", flush=True)
     print(f"[fileserver] slicer: {slicer_status}", flush=True)
+
+
+_CONTROL_CAPS_CACHE: Optional[list] = None
+
+
+def _control_version_caps() -> list:
+    """v1.0 §7 — control/vN capability tokens for the Info handshake. Failure-soft:
+    returns [] if the wire module can't be imported, so Info never breaks."""
+    global _CONTROL_CAPS_CACHE
+    if _CONTROL_CAPS_CACHE is None:
+        try:
+            from wire.handshake import advertise_capabilities
+            _CONTROL_CAPS_CACHE = advertise_capabilities()
+        except Exception:
+            _CONTROL_CAPS_CACHE = []
+    return _CONTROL_CAPS_CACHE
 
 
 def provision_from_package(package_url: str, layer_start: int, layer_end: int,

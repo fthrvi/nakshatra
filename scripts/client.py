@@ -570,6 +570,17 @@ def main():
             stub = pb_grpc.NakshatraStub(ch)
             info = stub.Info(pb.InfoRequest(), timeout=10.0)
             caps = list(info.protocol_capabilities)
+            # v1.0 §7 — negotiate the control-protocol version on the same
+            # handshake. Refuse to build a chain with a worker we can't speak
+            # to (clean reject, never a silent mixed-version chain).
+            try:
+                from wire.handshake import negotiate_handshake
+                negotiate_handshake(info.protocol_version, caps)
+            except ImportError:
+                pass  # wire module unavailable — fall back to legacy (no check)
+            except Exception as e:
+                sys.exit(f"[chain] {w['id']} @ {addr}: control-version negotiation "
+                         f"failed: {e}")
             cap_tag = f"  caps={caps}" if caps else "  caps=<v0.1>"
             print(f"  {w['id']:12s} {addr:25s}  layers=[{info.layer_start},{info.layer_end})  "
                   f"embd={info.has_token_embd}  lm={info.has_lm_head}  hidden={info.hidden_size}"
