@@ -606,12 +606,24 @@ def main():
     def _advance_one_alternate():
         """Find the first worker with a remaining alternate candidate; advance
         its cursor. Returns the worker dict that was advanced, or None if no
-        alternates remain anywhere."""
-        for w in workers:
-            if w["cursor"] + 1 < len(w["candidates"]):
-                w["cursor"] += 1
-                return w
-        return None
+        alternates remain anywhere.
+
+        v1.1 hardening — DRIFT-CLASS-CONSTRAINED: only fail over onto a
+        same-drift-class (= same engine build) alternate; a different-build peer
+        holding the same layers would silently diverge the generation
+        (docs/cross-machine-validation.md §2a). Drift class travels in the
+        candidate's `drift_class` (Nostr listing, P1 §8.1). Falls back to the
+        legacy any-alternate behaviour if the recovery module is unavailable or
+        no candidate declares a class."""
+        try:
+            from recovery.drift_aware import first_advanceable_worker
+            return first_advanceable_worker(workers)
+        except ImportError:
+            for w in workers:
+                if w["cursor"] + 1 < len(w["candidates"]):
+                    w["cursor"] += 1
+                    return w
+            return None
 
     sorted_stubs, n_embd = _setup_chain()
     print(f"[chain] OK: contiguous coverage of [{sorted_stubs[0][2].layer_start}, {sorted_stubs[-1][2].layer_end})")
