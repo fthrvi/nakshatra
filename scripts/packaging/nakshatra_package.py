@@ -276,7 +276,7 @@ class NakshatraPackage:
             arts = [
                 Artifact(
                     path=a["path"], sha256=a["sha256"], size=int(a["size"]),
-                    kind=a["kind"], layer_idx=a.get("layer_idx"),
+                    kind=a["kind"], layer_idx=a.get("layer_idx"), role=a.get("role"),
                 )
                 for a in obj.get("artifacts", [])
             ]
