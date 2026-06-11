@@ -180,26 +180,98 @@ def nostr_event_to_listing(event: dict) -> NakshatraListing:
 
 
 class NostrRelay(DiscoveryRelay):
-    """Production transport over a public Nostr relay. Gated on secp256k1 Schnorr
-    signing (coincurve) — until that dependency is present, construction raises
-    with an install hint. The event mapping above is dependency-free and tested,
-    so this is a drop-in once the dep lands."""
+    """Production transport over a public Nostr relay (NIP-01 over websocket).
 
-    def __init__(self, relay_url: str, nostr_privkey_hex: Optional[str] = None) -> None:
+    Two keys, two jobs: the secp256k1 Nostr key signs the relay *event* (anti-spam
+    at the relay); the Ed25519 mesh key inside the listing is what *admission*
+    pins against. query() returns only listings that pass BOTH the Nostr event
+    signature AND the inner Ed25519 self-signature — a relay is untrusted, so an
+    unverifiable listing never reaches the ranker.
+
+    Needs `coincurve` (BIP340 Schnorr) + `websocket-client`; __init__ raises a
+    clear install hint if absent. The listing schema, ranking, admission pin, and
+    event mapping all work without it — only this transport needs the dep."""
+
+    def __init__(self, relay_url: str, nostr_privkey_hex: Optional[str] = None,
+                 timeout: float = 10.0) -> None:
         try:
-            import coincurve  # noqa: F401
+            from . import nostr as _nostr
+            import websocket  # noqa: F401  (websocket-client)
         except ImportError as e:
             raise ListingError(
-                "NostrRelay needs secp256k1 Schnorr signatures: "
-                "`pip install coincurve` (+ websocket-client, already present). "
-                "Until then use InMemoryRelay/FileRelay — the listing schema, "
-                "ranking, admission pin, and event mapping are all functional."
+                "NostrRelay needs `pip install coincurve websocket-client`. "
+                "Until then use InMemoryRelay/FileRelay — schema, ranking, "
+                "admission pin, and event mapping are all functional without it."
             ) from e
+        self._nostr = _nostr
         self.relay_url = relay_url
-        self.nostr_privkey_hex = nostr_privkey_hex
+        self.timeout = timeout
+        self.nostr_privkey_hex = nostr_privkey_hex or _nostr.keygen()[0]
 
-    def publish(self, listing: NakshatraListing) -> None:  # pragma: no cover - needs dep
-        raise NotImplementedError("NostrRelay.publish requires the gated secp256k1 wire")
+    def _connect(self):
+        import websocket
+        return websocket.create_connection(self.relay_url, timeout=self.timeout)
 
-    def query(self, mesh_id: Optional[str] = None) -> list[NakshatraListing]:  # pragma: no cover
-        raise NotImplementedError("NostrRelay.query requires the gated secp256k1 wire")
+    def publish(self, listing: NakshatraListing) -> None:
+        _require_signed(listing)
+        import time
+        ev_content = listing_to_nostr_event_content(listing)  # also re-verifies
+        event = self._nostr.build_event(
+            self.nostr_privkey_hex, ev_content["kind"], ev_content["content"],
+            ev_content["tags"], int(time.time()))
+        ws = self._connect()
+        try:
+            ws.send(json.dumps(["EVENT", event]))
+            # best-effort: read the relay's OK/NOTICE (don't hard-fail on quirks)
+            try:
+                resp = json.loads(ws.recv())
+                if resp and resp[0] == "OK" and len(resp) >= 3 and not resp[2]:
+                    raise ListingError(f"relay rejected event: {resp[3:]}")
+            except (ValueError, IndexError):
+                pass
+        finally:
+            ws.close()
+
+    def query(self, mesh_id: Optional[str] = None) -> list[NakshatraListing]:
+        import time
+        sub = "nks-disc"
+        filt: dict = {"kinds": [NOSTR_KIND]}
+        if mesh_id is not None:
+            filt["#mesh_id"] = [mesh_id]
+        ws = self._connect()
+        out: list[NakshatraListing] = []
+        seen: set[str] = set()
+        try:
+            ws.send(json.dumps(["REQ", sub, filt]))
+            deadline = time.time() + self.timeout
+            while time.time() < deadline:
+                try:
+                    msg = json.loads(ws.recv())
+                except (ValueError, OSError):
+                    break
+                if not msg:
+                    continue
+                if msg[0] == "EOSE":
+                    break
+                if msg[0] == "EVENT" and len(msg) >= 3:
+                    event = msg[2]
+                    if event.get("id") in seen:
+                        continue
+                    seen.add(event.get("id"))
+                    # both layers must verify: Nostr event sig + inner Ed25519
+                    if not self._nostr.verify_event(event):
+                        continue
+                    try:
+                        listing = nostr_event_to_listing(event)  # verifies Ed25519
+                    except ListingError:
+                        continue
+                    if mesh_id is not None and listing.mesh_id != mesh_id:
+                        continue
+                    out.append(listing)
+            try:
+                ws.send(json.dumps(["CLOSE", sub]))
+            except OSError:
+                pass
+        finally:
+            ws.close()
+        return out
