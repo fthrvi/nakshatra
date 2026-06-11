@@ -42,13 +42,24 @@ version handshake negotiates as the client reads each worker's `Info`), runs
 sub-GGUFs**.
 
 ### Prerequisites (the gate the script enforces, exit 2 if unmet)
-1. **A venv with the runtime deps** — `pip install -e .` (grpc, gguf, numpy,
-   cryptography, protobuf, …). The trisul GPU box has no such env yet; create one.
-2. **The gRPC worker daemon** — `cmake --build <llama.cpp>/build --target
-   llama-nakshatra-worker`. The box currently only has the *fabric* variant
-   (`llama-nakshatra-worker-fabric`); the plain gRPC chain needs the non-fabric
-   target.
+1. **A venv with the runtime deps.** ✅ Set up on the trisul box at
+   `nakshatra/.venv` — worker.py/client.py need only `grpcio protobuf
+   cryptography numpy<2 gguf pyyaml` (NOT the full torch/hivemind setup.cfg
+   stack). `source .venv/bin/activate`.
+2. **The gRPC worker daemon.** ✅ Built: `cmake --build <llama.cpp>/build
+   --target llama-nakshatra-worker` → `/home/prithvi/llama.cpp/build/bin/
+   llama-nakshatra-worker`. **Verified loading a P2-provisioned sub-GGUF:** it
+   runs the partial-load patch (`nakshatra partial-load: layers [0,8) of 16`) and
+   reports `[daemon] ready`. So package→provision→daemon-load is proven against
+   the real daemon.
 3. **A full-model GGUF** for the reference token.
+
+> **Known blocker on the reference step (this box):** `llama-cli` hangs in
+> interactive mode even with `-no-cnv` on this llama.cpp build (a tooling quirk —
+> same one that pushed the spec-decode bench to `llama-bench`). The reference
+> token capture needs a non-`llama-cli` path (e.g. `llama-simple`, the server, or
+> a token-id dump) before Part B runs unattended. The daemon + chain side is
+> unaffected.
 
 Workers run CPU-only (`--n-gpu-layers 0`) so the run does **not** contend with
 Prithvi's GPU.
