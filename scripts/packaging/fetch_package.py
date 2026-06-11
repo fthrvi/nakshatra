@@ -166,16 +166,31 @@ def _assemble(pkg: NakshatraPackage, local: dict[str, Path], start: int, end: in
     w.add_bool("nakshatra.has_lm_head", has_lm_head)
 
     # Tensors in canonical order: prelude (first worker) → layers → head (last).
+    # Dedup by name so a tied model (token_embd needed by both first AND last on
+    # the same node) never writes a tensor twice.
+    added: set[str] = set()
+
+    def _add(tensors):
+        for t in tensors:
+            if t.name in added:
+                continue
+            w.add_tensor(t.name, np.array(t.data), raw_dtype=t.tensor_type)
+            added.add(t.name)
+
     if has_token_embd:
-        for t in _tensors_from(local[_role_path(pkg, "embeddings")]):
-            w.add_tensor(t.name, np.array(t.data), raw_dtype=t.tensor_type)
+        _add(_tensors_from(local[_role_path(pkg, "embeddings")]))
     for idx in range(start, end):
-        frag = pkg.layer_artifact(idx)
-        for t in _tensors_from(local[frag.path]):
-            w.add_tensor(t.name, np.array(t.data), raw_dtype=t.tensor_type)
+        _add(_tensors_from(local[pkg.layer_artifact(idx).path]))
     if has_lm_head:
-        for t in _tensors_from(local[_role_path(pkg, "head")]):
-            w.add_tensor(t.name, np.array(t.data), raw_dtype=t.tensor_type)
+        _add(_tensors_from(local[_role_path(pkg, "head")]))
+        # Tied output projection lives in token_embd; the last worker pulls it
+        # from the embeddings fragment (fetched for tied models, see
+        # artifacts_for_range) when it wasn't already added as the first worker.
+        if pkg.tied_embeddings and "token_embd.weight" not in added:
+            emb = pkg.shared_by_role("embeddings")
+            if emb and emb.path in local:
+                _add([t for t in _tensors_from(local[emb.path])
+                      if t.name == "token_embd.weight"])
 
     w.write_header_to_file()
     w.write_kv_data_to_file()

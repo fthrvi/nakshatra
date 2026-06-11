@@ -135,7 +135,14 @@ def package_gguf(src: Path, out_dir: Path, model_id: str,
         if i < 2 or i == block_count - 1:
             print(f"[package] wrote {rel} ({len(layers[i])} tensors, {size/1e6:.1f} MB, sha={sha[:12]})", flush=True)
 
-    pkg = new_package(model_id, arch, block_count, artifacts)
+    # Weight tying: a model with no separate output.weight ties its output
+    # projection to token_embd. The last worker then needs the embeddings
+    # fragment too (the daemon falls back to token_embd for the tied output).
+    tied = not any(t.name == "output.weight" for t in r.tensors)
+    if tied:
+        print("[package] weight-tied model (no output.weight) — last worker will "
+              "also fetch the embeddings fragment for the tied output projection", flush=True)
+    pkg = new_package(model_id, arch, block_count, artifacts, tied_embeddings=tied)
     pkg.created_unix = int(time.time())
     if sign_priv is not None:
         pkg.sign(sign_priv)

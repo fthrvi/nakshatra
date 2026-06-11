@@ -108,6 +108,10 @@ class NakshatraPackage:
     artifacts: list[Artifact]
     schema_version: int = SCHEMA_VERSION
     revision: str = ""                  # content-derived; filled by recompute_revision()
+    # True when the model ties output.weight to token_embd.weight (common on small
+    # Llamas: no separate output.weight). The LAST worker then needs token_embd for
+    # the tied output projection, so it must fetch the embeddings fragment too.
+    tied_embeddings: bool = False
     created_unix: int = 0
     # provenance (optional — present once signed)
     signer_pubkey_hex: Optional[str] = None
@@ -145,10 +149,12 @@ class NakshatraPackage:
         if meta is None:
             raise PackageError("manifest is missing the metadata fragment")
         out.append(meta)
-        if start == 0:
+        # The embeddings fragment (token_embd) is needed by the FIRST worker, and
+        # ALSO by the LAST worker when the model ties output to token_embd.
+        if start == 0 or (self.tied_embeddings and end == self.n_layers):
             emb = self.shared_by_role(ROLE_EMBEDDINGS)
             if emb is None:
-                raise PackageError("manifest is missing the embeddings fragment (needed for start==0)")
+                raise PackageError("manifest is missing the embeddings fragment (needed for token_embd)")
             out.append(emb)
         if end == self.n_layers:
             head = self.shared_by_role(ROLE_HEAD)
@@ -177,6 +183,7 @@ class NakshatraPackage:
             "model_id": self.model_id,
             "arch": self.arch,
             "n_layers": self.n_layers,
+            "tied_embeddings": self.tied_embeddings,
             "revision": self.revision,
             "created_unix": self.created_unix,
             "artifacts": arts,
@@ -190,7 +197,7 @@ class NakshatraPackage:
         """Content-derived immutable pin: sha256 over the sorted (path,sha256)
         artifact set + identity. Any fragment change ⇒ new revision."""
         h = hashlib.sha256()
-        h.update(f"{self.schema_version}\n{self.model_id}\n{self.arch}\n{self.n_layers}\n".encode())
+        h.update(f"{self.schema_version}\n{self.model_id}\n{self.arch}\n{self.n_layers}\n{int(self.tied_embeddings)}\n".encode())
         for a in sorted(self.artifacts, key=lambda a: a.path):
             h.update(f"{a.path}\t{a.sha256}\t{a.size}\n".encode())
         self.revision = h.hexdigest()
@@ -249,6 +256,7 @@ class NakshatraPackage:
             recomputed = NakshatraPackage(
                 model_id=self.model_id, arch=self.arch, n_layers=self.n_layers,
                 artifacts=self.artifacts, schema_version=self.schema_version,
+                tied_embeddings=self.tied_embeddings,
             ).recompute_revision()
             if claimed != recomputed:
                 raise PackageError(
@@ -289,6 +297,7 @@ class NakshatraPackage:
             artifacts=arts,
             schema_version=int(obj.get("schema_version", 0)),
             revision=obj.get("revision", ""),
+            tied_embeddings=bool(obj.get("tied_embeddings", False)),
             created_unix=int(obj.get("created_unix", 0)),
             signer_pubkey_hex=obj.get("signer_pubkey_hex"),
             signature_b64=obj.get("signature_b64"),
@@ -297,12 +306,12 @@ class NakshatraPackage:
 
 
 def new_package(model_id: str, arch: str, n_layers: int,
-                artifacts: list[Artifact]) -> NakshatraPackage:
+                artifacts: list[Artifact], tied_embeddings: bool = False) -> NakshatraPackage:
     """Build a package, stamp the content revision, and validate it.
     `created_unix` is left 0 here (Date.now-free); stamp it at call sites that
     have a real clock if provenance time matters."""
     pkg = NakshatraPackage(model_id=model_id, arch=arch, n_layers=n_layers,
-                           artifacts=list(artifacts))
+                           artifacts=list(artifacts), tied_embeddings=tied_embeddings)
     pkg.recompute_revision()
     pkg.validate()
     return pkg
