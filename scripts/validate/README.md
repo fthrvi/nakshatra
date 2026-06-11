@@ -64,14 +64,31 @@ sub-GGUFs**.
 Workers run CPU-only (`--n-gpu-layers 0`) so the run does **not** contend with
 Prithvi's GPU.
 
-## What this run is for
+## §10 — PASSED end-to-end (2026-06-11)
 
-It's the honest gap from PR #1: the worker/client integration paths were
-compile-checked + CI-guarded but never executed live or on two machines. Part A
-closes the control-plane half today; Part B closes the token half the moment a
-Nakshatra runtime (venv + gRPC daemon) is available — on this box or a real
-two-machine cluster.
+Ran the full gate on this box against the 1B (split `[0,8)`+`[8,16)`):
+
 ```
-two machines → discover → pin → negotiate → self-provision → ' Paris'
-   Part A: ✅ here          Part B: ready, needs runtime
+discover → pin → negotiate(control/v1) → self-provision(signed pkg) → ' Paris'
+   Part A: ✅            Part B: ✅
 ```
+
+- **Reference** (`llama-simple`, full model): `The capital of France is Paris. The Eiffel Tower is`
+- **Chain** (2 workers, each self-provisioned its slice from a SIGNED package):
+  `step 1: id=12366 ' Paris'` → `The capital of France is Paris. The Eiffel Tower is`
+- **Byte-identical**, and `12366 ' Paris'` is exactly the v0.1 parity token. The
+  client logged `caps=[… control/v1]` and `OK: contiguous coverage of [0,16)` —
+  P4 negotiation live.
+
+### Bug this run found + fixed (weight-tied models)
+Small Llamas (1B/3B) **tie** `output.weight` to `token_embd.weight` (no separate
+output head). The slice-cutters dropped `token_embd` from non-first slices, so a
+tied model's LAST worker couldn't find its output weights — a latent bug in
+`partial_gguf.py` too, not just P2. Fixed in two places:
+- **packager** (`tied_embeddings` flag → the last worker also fetches the
+  embeddings fragment; assembler dedups so the whole-model slice isn't doubled),
+- **daemon** (`m4_patches/llama-model.cpp.patch`: the tied-output fallback loads
+  `token_embd` for real on a last-only worker instead of aliasing a tensor that
+  was never loaded).
+Larger models (the live 8B/70B cluster) have a real `output.weight` and never hit
+this.
