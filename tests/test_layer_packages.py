@@ -178,6 +178,49 @@ def test_require_signature_refuses_unsigned(package_dir, tmp_path):
                            require_signature=True)
 
 
+def _make_tied_source_gguf(path: Path) -> None:
+    """A weight-TIED model: token_embd present, NO separate output.weight (the
+    output projection is tied to token_embd). Like every small Llama (1B/3B)."""
+    w = GGUFWriter(str(path), arch="llama")
+    w.add_uint32("llama.block_count", N_LAYERS)
+    w.add_tensor("token_embd.weight", np.arange(64, dtype=np.float32).reshape(8, 8).copy())
+    w.add_tensor("output_norm.weight", np.ones(8, dtype=np.float32))   # NO output.weight
+    for i in range(N_LAYERS):
+        w.add_tensor(f"blk.{i}.attn_norm.weight", np.full(8, i + 1, dtype=np.float32))
+    w.write_header_to_file(); w.write_kv_data_to_file(); w.write_tensors_to_file(); w.close()
+
+
+def test_tied_model_last_slice_includes_token_embd(tmp_path):
+    """Regression for the weight-tied bug §10 surfaced: the LAST worker of a tied
+    model needs token_embd (the tied output weights), and the whole-model slice
+    must not duplicate it."""
+    from packaging.package_gguf import package_gguf
+    src = tmp_path / "tied.gguf"
+    _make_tied_source_gguf(src)
+    pkg_dir = tmp_path / "pkg"
+    package_gguf(src, pkg_dir, "tied")
+    pkg = NakshatraPackage.from_json((pkg_dir / "package.json").read_text())
+    assert pkg.tied_embeddings is True
+
+    def names(path):
+        return [t.name for t in GGUFReader(str(path)).tensors]
+
+    # last slice [2,4) (has lm_head, NOT first) must carry token_embd for the tied output
+    last = tmp_path / "last.gguf"
+    fetch_and_assemble(str(pkg_dir), 2, N_LAYERS, str(last))
+    assert "token_embd.weight" in names(last)
+
+    # middle slice [1,3) (neither first nor last) must NOT carry it
+    mid = tmp_path / "mid.gguf"
+    fetch_and_assemble(str(pkg_dir), 1, 3, str(mid))
+    assert "token_embd.weight" not in names(mid)
+
+    # whole model [0,N) carries token_embd exactly ONCE (no duplicate)
+    whole = tmp_path / "whole.gguf"
+    fetch_and_assemble(str(pkg_dir), 0, N_LAYERS, str(whole))
+    assert names(whole).count("token_embd.weight") == 1
+
+
 def test_untrusted_signer_refused(source_gguf, tmp_path):
     from packaging.package_gguf import package_gguf
     priv, pub = generate_keypair()
