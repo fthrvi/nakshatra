@@ -647,6 +647,10 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
         name = req.get("model")
         entry = self._models.get(name) if name else None
         if entry is None:
+            # v1.0 §6 entry-proxy: if a peer serves this model, route instead of
+            # 404. Opt-in (server.entry_proxy must be configured) and fail-safe.
+            if name and not req.get("stream") and self._try_route_openai(name, req):
+                return 200
             self._openai_error(HTTPStatus.NOT_FOUND, f"model '{name}' not found",
                                "model_not_found")
             return 404
@@ -689,6 +693,36 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
                       "total_tokens": p + c},
         })
         return 200
+
+    def _try_route_openai(self, name: str, req: dict) -> bool:
+        """v1.0 §6 — forward a non-local model to a discovered peer that serves
+        it. Returns True iff the request was routed + a response written. No-op
+        (False) when no entry_proxy is configured or no peer serves the model."""
+        proxy = getattr(self.server, "entry_proxy", None)
+        if proxy is None:
+            return False
+        try:
+            from routing.model_router import route_or_local, forward_chat, Decision
+            target = route_or_local(name, list(self._models.keys()), proxy.relay,
+                                    mesh_id=proxy.mesh_id, own_node_id=proxy.node_id)
+            if target.decision is not Decision.ROUTE:
+                return False
+            body = json.dumps(req).encode("utf-8")
+            status, resp, headers = forward_chat(target, body, proxy.priv_bytes,
+                                                 proxy.node_id)
+            log.info("routed model %r → %s (score=%.1f) status=%d",
+                     name, target.peer.node_id if target.peer else "?",
+                     target.score, status)
+            self.send_response(status)
+            self.send_header("Content-Type",
+                             headers.get("Content-Type", "application/json"))
+            self.send_header("Content-Length", str(len(resp)))
+            self.end_headers()
+            self.wfile.write(resp)
+            return True
+        except Exception as e:  # never let routing break the serve path
+            log.warning("entry-proxy route failed for %r: %s", name, e)
+            return False
 
     def _stream_openai_chat(self, entry, prompt, max_tokens, options, backend,
                             cid, created) -> int:
