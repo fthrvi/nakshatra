@@ -49,6 +49,9 @@ class NakshatraListing:
     measured_decode_ms_per_layer: Optional[float] = None
     endpoint_hint: str = ""            # advisory dial hint (still pinned at transport)
     capacity_full: bool = False        # node is at client capacity (de-prioritise)
+    # Control-protocol versions this node speaks (v1.0 §7). Empty ⇒ legacy v1.
+    # Carried so a peer can filter out incompatible nodes before attempting a join.
+    supported_protocol: list[int] = field(default_factory=list)
     created_unix: int = 0
     schema_version: int = SCHEMA_VERSION
     signature_b64: Optional[str] = None
@@ -133,6 +136,7 @@ class NakshatraListing:
             measured_decode_ms_per_layer=o.get("measured_decode_ms_per_layer"),
             endpoint_hint=o.get("endpoint_hint", ""),
             capacity_full=bool(o.get("capacity_full", False)),
+            supported_protocol=list(o.get("supported_protocol", [])),
             created_unix=int(o.get("created_unix", 0)),
             schema_version=int(o.get("schema_version", 0)),
             signature_b64=o.get("signature_b64"),

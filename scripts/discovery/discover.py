@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from nakshatra_auth import load_or_create_worker_key  # noqa: E402
 from discovery.nakshatra_listing import NakshatraListing, rank_listings  # noqa: E402
 from discovery.relay import FileRelay, pin_from_listing  # noqa: E402
+from wire.version import SUPPORTED_CONTROL_VERSIONS  # noqa: E402
 
 
 def _node_id(pub_hex: str) -> str:
@@ -46,6 +47,7 @@ def cmd_publish(args: argparse.Namespace) -> int:
         measured_decode_ms_per_layer=args.decode_ms_per_layer,
         endpoint_hint=args.endpoint or "",
         capacity_full=args.capacity_full,
+        supported_protocol=list(SUPPORTED_CONTROL_VERSIONS),
         created_unix=int(time.time()),
     )
     listing.sign(priv)

@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from nakshatra_auth import build_signed_envelope  # noqa: E402
 from discovery.nakshatra_listing import rank_listings  # noqa: E402
 from discovery.relay import DiscoveryRelay, PinnedIdentity, pin_from_listing  # noqa: E402
+from wire.version import is_compatible  # noqa: E402
 
 
 @dataclass
@@ -62,7 +63,10 @@ def resolve_serving_peer(relay: DiscoveryRelay, model: str, *,
 
     Only verified listings whose `serving` includes the model are considered;
     rank_listings already drops unsigned/unverifiable ones and self."""
-    listings = [l for l in relay.query(mesh_id=mesh_id) if model in l.serving]
+    # §7: drop peers we can't speak to BEFORE pinning/forwarding — a clean
+    # pre-join reject, never a silent attempt against an incompatible wire.
+    listings = [l for l in relay.query(mesh_id=mesh_id)
+                if model in l.serving and is_compatible(l.supported_protocol)]
     ranked = rank_listings(listings, exclude_node_id=exclude_node_id,
                            want_mesh_id=mesh_id, want_model=model)
     for listing, score in ranked:
