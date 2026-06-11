@@ -1141,12 +1141,14 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
             has_lm_head=(self.mode == "last"),
             # v0.5 §9.1 closure — advertised features so the client can
             # negotiate push at session start without runtime probing.
+            # v1.0 §7 — append control/vN tokens so the client can negotiate
+            # the control-protocol version on the same handshake.
             protocol_capabilities=[
                 "streaming",
                 "rpc_push",
                 "idempotency_cache",
                 "recovery_replay",
-            ],
+            ] + _control_version_caps(),
         )
 
     def _run_forward(self, hidden_in: bytes, n_tokens: int,
@@ -2315,6 +2317,49 @@ def start_file_server(serving_dir: str, port: int):
     print(f"[fileserver] slicer: {slicer_status}", flush=True)
 
 
+_CONTROL_CAPS_CACHE: Optional[list] = None
+
+
+def _control_version_caps() -> list:
+    """v1.0 §7 — control/vN capability tokens for the Info handshake. Failure-soft:
+    returns [] if the wire module can't be imported, so Info never breaks."""
+    global _CONTROL_CAPS_CACHE
+    if _CONTROL_CAPS_CACHE is None:
+        try:
+            from wire.handshake import advertise_capabilities
+            _CONTROL_CAPS_CACHE = advertise_capabilities()
+        except Exception:
+            _CONTROL_CAPS_CACHE = []
+    return _CONTROL_CAPS_CACHE
+
+
+def provision_from_package(package_url: str, layer_start: int, layer_end: int,
+                           dest_path: str, *, require_signature: bool = False,
+                           trusted_pubkeys: Optional[set] = None) -> str:
+    """v1.0 §5 (P2) — provision this worker's assigned layer range from a
+    content-addressed layer package instead of fetching a whole pre-cut sub-GGUF
+    from a peer.
+
+    Fetches ONLY this position's fragments (metadata + embeddings iff start==0 +
+    head iff end==n_layers + layers[start,end)), verifies each SHA-256
+    **fail-closed**, and assembles a loader-ready sub-GGUF at dest_path carrying
+    the same nakshatra.layer_range_* metadata a peer-fetched sub-GGUF would — so
+    the daemon, cache-scan advertising, and peer-fetch path all work unchanged.
+
+    Unlike fetch_sub_gguf_from_peer this needs no peer holding the exact pre-cut
+    range — a freshly discovered node can self-provision any range from a package
+    (docs/v1.0-discovery-and-distribution.md §5.3). `package_url` is a local dir,
+    a package.json path, or an http(s) base."""
+    _audit("package_provision_started", package_url=package_url,
+           layer_start=layer_start, layer_end=layer_end, dest_path=dest_path)
+    from packaging.fetch_package import fetch_and_assemble
+    fetch_and_assemble(package_url, layer_start, layer_end, dest_path,
+                       require_signature=require_signature,
+                       trusted_pubkeys=trusted_pubkeys)
+    _audit("package_provision_completed", dest=dest_path)
+    return dest_path
+
+
 def fetch_sub_gguf_from_peer(pillar_url: str, model_id: str,
                               layer_start: int, layer_end: int,
                               dest_path: str,
@@ -2702,6 +2747,19 @@ def main():
                          "found here in cached_files (Phase 4a redundancy).")
     ap.add_argument("--no-cache-scan", action="store_true",
                     help="Disable cache-dir scan; only advertise --sub-gguf.")
+    # v1.0 §5 (P2) — provision from a content-addressed layer package.
+    ap.add_argument("--package-url", type=str, default="",
+                    help="v1.0 §5: if --sub-gguf is missing, provision the assigned "
+                         "[layer-start,layer-end) range from a layer package (a dir, "
+                         "package.json path, or http(s) base) — fetch only this "
+                         "position's fragments, verify each SHA-256 fail-closed, and "
+                         "assemble the sub-GGUF. Needs no peer holding the exact range. "
+                         "Takes precedence over --auto-fetch.")
+    ap.add_argument("--package-require-signature", action="store_true",
+                    help="Refuse an unsigned package manifest (use with --package-url).")
+    ap.add_argument("--package-trusted-pubkey", action="append", default=None,
+                    help="Only accept a package manifest signed by this Ed25519 hex "
+                         "pubkey (repeatable; use with --package-url).")
     ap.add_argument("--no-vram-autodetect", action="store_true",
                     help="Disable Phase-B auto-detection of free VRAM via "
                          "rocm-smi/nvidia-smi. Use the declared --vram-offered-gb "
@@ -2734,7 +2792,21 @@ def main():
     # before doing anything else. This is what lets a fresh machine bootstrap
     # without manual scp.
     if not os.path.exists(args.sub_gguf):
-        if args.auto_fetch and args.pillar_url:
+        if args.package_url:
+            print(f"[worker] sub-gguf missing at {args.sub_gguf}; provisioning layers "
+                  f"[{args.layer_start},{args.layer_end}) from package {args.package_url}",
+                  flush=True)
+            trusted = (set(args.package_trusted_pubkey)
+                       if args.package_trusted_pubkey else None)
+            try:
+                provision_from_package(
+                    args.package_url, args.layer_start, args.layer_end, args.sub_gguf,
+                    require_signature=args.package_require_signature,
+                    trusted_pubkeys=trusted,
+                )
+            except Exception as e:
+                sys.exit(f"[worker] package provisioning failed: {e}")
+        elif args.auto_fetch and args.pillar_url:
             print(f"[worker] sub-gguf missing at {args.sub_gguf}; auto-fetching from peer", flush=True)
             own_node_id = args.node_id or f"{socket.gethostname()}-{args.port}"
             try:
@@ -2748,7 +2820,8 @@ def main():
                 sys.exit(f"[worker] auto-fetch failed: {e}")
         else:
             sys.exit(f"[worker] sub-gguf does not exist: {args.sub_gguf} "
-                     f"(use --auto-fetch with --pillar-url to bootstrap from a peer)")
+                     f"(use --package-url to provision from a layer package, or "
+                     f"--auto-fetch with --pillar-url to bootstrap from a peer)")
 
     print(f"[worker] spawning daemon: {args.daemon_bin} {args.sub_gguf} {args.mode} {args.n_ctx} threads={args.n_threads} gpu_layers={args.n_gpu_layers}", flush=True)
     daemon = DaemonClient(args.daemon_bin, args.sub_gguf, args.mode, args.n_ctx, args.n_threads, args.n_gpu_layers)
