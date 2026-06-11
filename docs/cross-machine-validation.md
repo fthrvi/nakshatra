@@ -54,18 +54,39 @@ It diverges at token 4 (`Eiffel` vs `capital`). Crucially:
 - The slices are **byte-identical** (SHA-verified fragments) → the **weights are
   the same**. This is not a data bug.
 - Node B produces **coherent** text, not garbage → it is computing **correctly**.
-- The divergence is **floating-point rounding drift** between Mac4's x86 build and
-  this box's — different SIMD / compiler / math paths round matmuls and softmax
-  slightly differently, and on a close-call token the **argmax flips**.
+- The divergence is **floating-point rounding drift** — on a close-call token the
+  **argmax flips**.
+
+### 2a. The gauge corrected the cause: it's the engine *build*, not the silicon
+
+A follow-up with the **drift-class gauge** (§4, `scripts/discovery/drift_gauge.py`)
+sharpened this. Running the *canonical full-model probe* on each machine via **the
+same llama-cpp-python engine (CPU)** produced the **identical** 16-token
+fingerprint on both:
+
+```
+PRITHVI (Linux x86)  →  0c56d05dbc19…   ┐
+MAC4    (Intel x86)  →  0c56d05dbc19…   ┘  same fingerprint ⇒ SAME drift class
+```
+
+So the two machines' base CPU numerics **agree perfectly** — Linux-vs-Mac x86 is
+*not* an inherent incompatibility. The chain divergence above is therefore **not**
+a hardware-vendor effect; it traces to the **split path**: the two nakshatra
+daemons were **different builds** (this box's HIP-configured llama.cpp vs Mac4's
+Metal-configured one, compiled by different toolchains). Evidence: same-build
+daemons agree (the **single-box** chain matched the reference exactly),
+different-build daemons drift (the **cross-machine** chain did not).
 
 This empirically confirms the drift-class caveat already in the design notes
 (*"recovery must be drift-class-constrained — recovering a span onto a
 different-vendor peer silently diverges generation"*). Stated as a rule:
 
 > **§10 first-token parity holds across heterogeneous nodes; bit-identical
-> multi-token generation requires same-class nodes.**
+> multi-token generation requires same-drift-class (= same engine build) nodes.**
 
-The mesh is correct; determinism is a *same-class* property, not a universal one.
+The mesh is correct; determinism is a *same-class* property set by the **engine
+build**, which the gauge measures directly — not a universal one, and not a
+hardware-vendor one.
 
 ## 3. Why this matters (and why it's not a bug to "fix")
 
@@ -118,7 +139,8 @@ listing (building block: the Pillar's Mode-B WireGuard peering). See the v1.0 do
 |---|---|
 | Discover → pin → self-provision → negotiate → forward → token, cross-machine | ✅ proven, real binaries, 2 machines, 2 OSes |
 | §10 first-token parity, cross-machine | ✅ `id=12366 ' Paris'` |
-| Bit-identical multi-token, cross-vendor | ❌ drifts — **needs same-class nodes** (finding above) |
+| Bit-identical multi-token, cross-vendor | ⚠️ drifts when the **engine builds differ**; the gauge shows the *same* engine is bit-identical across Linux/Mac x86 (finding §2a) |
+| Drift-class gauge, cross-machine | ✅ proven — this box & Mac4 fingerprint **identical** on the same engine; the tool correctly isolates build-induced drift |
 | P2 self-provision over the network | ✅ Mac4 fetched + verified its slice over the tailnet |
 | Nostr discovery on a real relay | ✅ tailnet relay; public relays blocked by box egress firewall |
 | Cross-*network* (different tailnets) data plane | ⏳ not built — sovereign transport is the next build |
