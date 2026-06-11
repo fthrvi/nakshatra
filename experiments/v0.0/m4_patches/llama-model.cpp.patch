@@ -1,5 +1,5 @@
---- /home/operator/llama.cpp/src/llama-model.cpp.orig	2026-05-06 20:03:20.891545258 -0600
-+++ /home/operator/llama.cpp/src/llama-model.cpp	2026-05-06 20:03:20.905771976 -0600
+--- /home/operator/llama.cpp/src/llama-model.cpp.orig
++++ /home/operator/llama.cpp/src/llama-model.cpp
 @@ -2575,6 +2575,28 @@
  }
  
@@ -29,7 +29,7 @@
      const auto & split_mode   = params.split_mode;
      const auto & use_mlock    = params.use_mlock;
      const auto & tensor_split = params.tensor_split;
-@@ -2718,18 +2740,26 @@
+@@ -2718,18 +2740,33 @@
              case LLM_ARCH_MISTRAL3:
              case LLM_ARCH_LLAMA_EMBED:
                  {
@@ -55,7 +55,14 @@
 +                        output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
 +
 +                        if (output == NULL) {
-+                            output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_DUPLICATED);
++                            // Tied output = token_embd. If this worker already loaded
++                            // token_embd as the input embedding (first worker / whole
++                            // model), alias it (DUPLICATED). If not (a last-only worker
++                            // on a tied model), load it from this slice for real —
++                            // otherwise the slice's token_embd.weight goes unclaimed.
++                            output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"),
++                                                   {n_embd, n_vocab},
++                                                   nks_has_embd ? TENSOR_DUPLICATED : 0);
 +                        }
                      }
  
