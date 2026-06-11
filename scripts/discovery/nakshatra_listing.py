@@ -52,6 +52,12 @@ class NakshatraListing:
     # Control-protocol versions this node speaks (v1.0 §7). Empty ⇒ legacy v1.
     # Carried so a peer can filter out incompatible nodes before attempting a join.
     supported_protocol: list[int] = field(default_factory=list)
+    # Drift-class fingerprint (v1.1 §8.1) — the drift_gauge hash for the served
+    # model. Two nodes with the same drift_class agree on every argmax for the
+    # canonical probe and can form a bit-deterministic chain. None ⇒ unknown
+    # (ungated). Lets discovery pre-filter to a deterministic class, the same way
+    # supported_protocol pre-filters wire versions. See cross-machine-validation.md.
+    drift_class: Optional[str] = None
     created_unix: int = 0
     schema_version: int = SCHEMA_VERSION
     signature_b64: Optional[str] = None
@@ -137,6 +143,7 @@ class NakshatraListing:
             endpoint_hint=o.get("endpoint_hint", ""),
             capacity_full=bool(o.get("capacity_full", False)),
             supported_protocol=list(o.get("supported_protocol", [])),
+            drift_class=o.get("drift_class"),
             created_unix=int(o.get("created_unix", 0)),
             schema_version=int(o.get("schema_version", 0)),
             signature_b64=o.get("signature_b64"),

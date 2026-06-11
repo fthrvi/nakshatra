@@ -48,6 +48,7 @@ def cmd_publish(args: argparse.Namespace) -> int:
         endpoint_hint=args.endpoint or "",
         capacity_full=args.capacity_full,
         supported_protocol=list(SUPPORTED_CONTROL_VERSIONS),
+        drift_class=args.drift_class,
         created_unix=int(time.time()),
     )
     listing.sign(priv)

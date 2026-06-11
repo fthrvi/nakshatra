@@ -57,16 +57,29 @@ class RouteTarget:
 
 def resolve_serving_peer(relay: DiscoveryRelay, model: str, *,
                          mesh_id: Optional[str] = None,
-                         exclude_node_id: str = "") -> Optional[tuple[PinnedIdentity, str, float]]:
+                         exclude_node_id: str = "",
+                         require_drift_class: Optional[str] = None
+                         ) -> Optional[tuple[PinnedIdentity, str, float]]:
     """Discover the best *verified* peer serving `model`, ranked by measured
     compute. Returns (pinned_identity, endpoint_hint, score) or None.
 
     Only verified listings whose `serving` includes the model are considered;
-    rank_listings already drops unsigned/unverifiable ones and self."""
+    rank_listings already drops unsigned/unverifiable ones and self.
+
+    `require_drift_class` (v1.1 §8.1): when set (e.g. this node's own gauge
+    fingerprint), only peers advertising the SAME drift_class are eligible — a
+    bit-deterministic chain must stay in one engine-build class
+    (cross-machine-validation.md §2a). Leave None for throughput work where
+    bit-identity isn't required."""
     # §7: drop peers we can't speak to BEFORE pinning/forwarding — a clean
     # pre-join reject, never a silent attempt against an incompatible wire.
-    listings = [l for l in relay.query(mesh_id=mesh_id)
-                if model in l.serving and is_compatible(l.supported_protocol)]
+    # §8.1: when a deterministic class is required, drop out-of-class peers too.
+    listings = [
+        l for l in relay.query(mesh_id=mesh_id)
+        if model in l.serving
+        and is_compatible(l.supported_protocol)
+        and (require_drift_class is None or l.drift_class == require_drift_class)
+    ]
     ranked = rank_listings(listings, exclude_node_id=exclude_node_id,
                            want_mesh_id=mesh_id, want_model=model)
     for listing, score in ranked:
@@ -77,12 +90,15 @@ def resolve_serving_peer(relay: DiscoveryRelay, model: str, *,
 
 
 def route_or_local(model: str, local_model_names: Iterable[str], relay: DiscoveryRelay,
-                   *, mesh_id: Optional[str] = None, own_node_id: str = "") -> RouteTarget:
+                   *, mesh_id: Optional[str] = None, own_node_id: str = "",
+                   require_drift_class: Optional[str] = None) -> RouteTarget:
     """The entry-proxy decision. LOCAL if we serve it; else ROUTE to the best
-    discovered peer; else NOT_FOUND."""
+    discovered peer; else NOT_FOUND. `require_drift_class` (v1.1 §8.1) restricts
+    ROUTE to same-drift-class peers for bit-deterministic chains."""
     if model in set(local_model_names):
         return RouteTarget(Decision.LOCAL)
-    found = resolve_serving_peer(relay, model, mesh_id=mesh_id, exclude_node_id=own_node_id)
+    found = resolve_serving_peer(relay, model, mesh_id=mesh_id, exclude_node_id=own_node_id,
+                                 require_drift_class=require_drift_class)
     if found is None:
         return RouteTarget(Decision.NOT_FOUND)
     peer, endpoint, score = found
