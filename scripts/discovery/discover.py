@@ -48,6 +48,7 @@ def cmd_publish(args: argparse.Namespace) -> int:
         endpoint_hint=args.endpoint or "",
         capacity_full=args.capacity_full,
         supported_protocol=list(SUPPORTED_CONTROL_VERSIONS),
+        drift_class=args.drift_class,
         created_unix=int(time.time()),
     )
     listing.sign(priv)
@@ -92,6 +93,9 @@ def main() -> int:
     p.add_argument("--wanted", nargs="*", default=None)
     p.add_argument("--vram-bytes", type=int, default=0)
     p.add_argument("--node-count", type=int, default=1)
+    p.add_argument("--drift-class", default=None,
+                   help="drift_gauge fingerprint for the served model (v1.1 §8.1); "
+                        "lets peers pre-filter to a bit-deterministic engine-build class")
     p.add_argument("--decode-ms-per-layer", type=float, default=None,
                    help="measured compute Fᵢ signal (lower = faster)")
     p.add_argument("--endpoint", default=None)

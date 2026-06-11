@@ -24,13 +24,41 @@ from routing.model_router import (  # noqa: E402
     Decision, route_or_local, resolve_serving_peer, forward_chat)
 
 
-def _peer(node_id, serving, ms, endpoint="", mesh="m1"):
+def _peer(node_id, serving, ms, endpoint="", mesh="m1", drift_class=None):
     priv, pub = generate_keypair()
     l = NakshatraListing(mesh_id=mesh, node_id=node_id, ed25519_pubkey_hex=pub,
                          serving=serving, measured_decode_ms_per_layer=ms,
-                         endpoint_hint=endpoint)
+                         endpoint_hint=endpoint, drift_class=drift_class)
     l.sign(priv)
     return l
+
+
+# ── drift-class filtering (v1.1 §8.1) ─────────────────────────────────
+
+def test_drift_class_filter_routes_same_class_only():
+    relay = InMemoryRelay()
+    # the fastest peer is a DIFFERENT drift class → must be skipped when a
+    # deterministic class is required; the slower same-class peer is chosen.
+    relay.publish(_peer("fast-otherclass", ["m"], ms=0.5, endpoint="http://f:8080",
+                        drift_class="classB"))
+    relay.publish(_peer("ok-sameclass", ["m"], ms=5.0, endpoint="http://ok:8080",
+                        drift_class="classA"))
+    t = route_or_local("m", ["local"], relay, mesh_id="m1", require_drift_class="classA")
+    assert t.decision is Decision.ROUTE and t.peer.node_id == "ok-sameclass"
+
+
+def test_drift_class_unset_routes_regardless():
+    relay = InMemoryRelay()
+    relay.publish(_peer("any", ["m"], ms=2.0, endpoint="http://a:8080", drift_class="classB"))
+    t = route_or_local("m", ["local"], relay, mesh_id="m1")  # no class requirement
+    assert t.decision is Decision.ROUTE and t.peer.node_id == "any"
+
+
+def test_drift_class_no_match_is_not_found():
+    relay = InMemoryRelay()
+    relay.publish(_peer("p", ["m"], ms=1.0, endpoint="http://p:8080", drift_class="classB"))
+    t = route_or_local("m", ["local"], relay, mesh_id="m1", require_drift_class="classA")
+    assert t.decision is Decision.NOT_FOUND   # clean reject, never a cross-class chain
 
 
 # ── decisioning ───────────────────────────────────────────────────────
