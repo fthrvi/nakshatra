@@ -46,9 +46,12 @@ python3 -c "import grpc" 2>/dev/null || { echo "MISSING: grpc (activate the naks
 if [ "$fail" = 1 ]; then echo; echo "Prereqs unmet — see the header. Aborting."; exit 2; fi
 
 echo "[ref] single-machine greedy token from $REF_GGUF…"
-# Reference token: first generated token id at temp 0 (the parity anchor).
-REF_TOK=$(llama-cli -m "$REF_GGUF" -p "$PROMPT" -n 1 -c "$N_CTX" --temp 0 -no-cnv \
-            --no-display-prompt 2>/dev/null | head -c 64)
+# Reference token: first generated token at temp 0 (the parity anchor). Capture
+# to a file (NOT a pipe) so a short read can't SIGPIPE llama-cli under pipefail.
+REF_RAW="$(mktemp)"
+llama-cli -m "$REF_GGUF" -p "$PROMPT" -n 1 -c "$N_CTX" --temp 0 -no-cnv \
+  --no-display-prompt > "$REF_RAW" 2>/dev/null || true
+REF_TOK="$(tr -d '\n' < "$REF_RAW" | head -c 64)"
 echo "[ref] reference first token text: '$REF_TOK'"
 
 cleanup() { kill "${WA:-0}" "${WB:-0}" 2>/dev/null || true; }
