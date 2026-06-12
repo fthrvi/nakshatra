@@ -1,0 +1,20 @@
+[Unit]
+Description=Nakshatra unconscious tier — OpenAI /v1/chat/completions over the mesh
+Documentation=https://github.com/fthrvi/nakshatra/blob/main/docs/INFRA-MAP.md
+# Prithvi (L4) escalates here via think_deeper. ChainChatBackend spawns client.py
+# per request → the distributed worker chain.
+After=network.target nakshatra-unconscious-worker@a.service nakshatra-unconscious-worker@b.service
+Wants=nakshatra-unconscious-worker@a.service nakshatra-unconscious-worker@b.service
+
+[Service]
+Type=simple
+EnvironmentFile=-%h/.nakshatra/unconscious.env
+Environment=PORT=11599
+Environment=MODELS=%h/.nakshatra/serve_models.unconscious.yaml
+ExecStart=%h/nakshatra/.venv/bin/python %h/nakshatra/scripts/nakshatra_serve.py \
+    --port ${PORT} --bind 127.0.0.1 --models ${MODELS}
+Restart=always
+RestartSec=4
+
+[Install]
+WantedBy=default.target

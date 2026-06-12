@@ -1,0 +1,21 @@
+[Unit]
+Description=Nakshatra unconscious-tier worker %i (layer-split gRPC worker)
+Documentation=https://github.com/fthrvi/nakshatra/blob/main/docs/INFRA-MAP.md
+After=network.target
+
+[Service]
+Type=simple
+# Per-instance config: ~/.nakshatra/unconscious-worker-<a|b>.env defines
+#   PORT, SUB_GGUF, MODE, LAYER_START, LAYER_END
+EnvironmentFile=%h/.nakshatra/unconscious-worker-%i.env
+Environment=DAEMON_BIN=%h/llama.cpp/build/bin/llama-nakshatra-worker
+ExecStart=%h/nakshatra/.venv/bin/python %h/nakshatra/scripts/worker.py \
+    --port ${PORT} --sub-gguf ${SUB_GGUF} --mode ${MODE} \
+    --layer-start ${LAYER_START} --layer-end ${LAYER_END} \
+    --model-id nakshatra-unconscious-1b --daemon-bin ${DAEMON_BIN} \
+    --n-ctx 256 --n-gpu-layers 0
+Restart=always
+RestartSec=4
+
+[Install]
+WantedBy=default.target
