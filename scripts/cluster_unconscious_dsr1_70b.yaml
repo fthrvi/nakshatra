@@ -1,0 +1,37 @@
+# Nakshatra "unconscious tier" — 70B reasoning model split across THREE machines.
+#
+# DeepSeek-R1-Distill-Llama-70B (R1 chain-of-thought, 70B — far larger than the 8B
+# conscious). Llama-arch (80 blocks, hidden 8192). Split ~evenly across three 16GB
+# AMD GPUs so each ~14GB slice fits ENTIRELY in GPU (48GB total > 42GB model → no
+# CPU spill). Materialized from the Sthambha planner's split over the three
+# registered peers; activation hops cross Tailscale (8192 f32 = 32KB/token — the
+# wire is cheap, compute dominates).
+#
+#   this box (RX 9070 XT)  [0,27)   first  (token_embd)
+#   Mac4     (5700 XT)      [27,54)  middle
+#   mac3-2   (5700 XT)      [54,80)  last   (lm_head)
+model:
+  id: "nakshatra-unconscious-dsr1-70b"
+  hidden_size: 8192
+  num_blocks: 80
+  wire_dtype: f32
+
+workers:
+  - id: 70b-prithvi
+    address: 127.0.0.1
+    port: 5550
+    layer_range: [0, 27]
+    sub_gguf_path: /home/prithvi/.nakshatra/models/dsr1-70b-a.gguf
+    mode: first
+  - id: 70b-mac4
+    address: 100.93.112.98      # Mac4 (Tailscale)
+    port: 5550
+    layer_range: [27, 54]
+    sub_gguf_path: /Users/bishwa/.nakshatra/models/dsr1-70b-b.gguf
+    mode: middle
+  - id: 70b-mac3
+    address: 100.121.48.32      # mac3-2 (Tailscale)
+    port: 5550
+    layer_range: [54, 80]
+    sub_gguf_path: /Users/midev/.nakshatra/models/dsr1-70b-c.gguf
+    mode: last
