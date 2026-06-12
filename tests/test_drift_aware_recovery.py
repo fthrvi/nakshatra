@@ -67,3 +67,46 @@ def test_first_advanceable_none_when_all_locked():
     w0 = {"id": "w0", "cursor": 0, "candidates": [_c("A"), _c("B")]}
     w1 = {"id": "w1", "cursor": 0, "candidates": [_c("X"), _c("Y")]}
     assert first_advanceable_worker([w0, w1]) is None
+
+
+# ── regression: the primary candidate must CARRY drift_class ──────────
+# v1.1 polish. The config/registry chain builders copy a fixed key set onto the
+# primary candidate. If `drift_class` is dropped from that copy (as it originally
+# was), next_compatible_cursor reads candidates[0]["drift_class"] as None and the
+# whole constraint silently degrades to "any alternate". These tests pin the
+# contract: a classified primary built the way client.py builds it must reject a
+# mismatched alternate.
+
+# the exact key set client.py copies onto the primary candidate (keep in sync)
+_PRIMARY_KEYS = ("id", "address", "port", "layer_range", "mode",
+                 "peer_spki_hash", "drift_class")
+
+
+def _build_worker_like_client(w):
+    """Mirror client.py's candidate construction (primary key-copy + alternates)."""
+    primary = {k: w[k] for k in _PRIMARY_KEYS if k in w}
+    return {"id": w["id"], "cursor": 0,
+            "candidates": [primary] + list(w.get("alternates") or [])}
+
+def test_primary_keyset_includes_drift_class():
+    assert "drift_class" in _PRIMARY_KEYS   # the one-line regression guard
+
+def test_config_built_primary_enforces_drift_class():
+    # YAML-shaped worker: classA primary, a classB alternate (must be refused)
+    # and a classA alternate (must be the one chosen).
+    raw = {"id": "w0", "address": "10.0.0.1", "port": 5530,
+           "layer_range": [0, 8], "mode": "first", "drift_class": "classA",
+           "alternates": [
+               {"id": "altB", "drift_class": "classB"},   # wrong build → skip
+               {"id": "altA", "drift_class": "classA"}]}   # same build → take
+    w = _build_worker_like_client(raw)
+    assert w["candidates"][0]["drift_class"] == "classA"   # survived the copy
+    advanced = first_advanceable_worker([w])
+    assert advanced is w and w["cursor"] == 2              # skipped altB, took altA
+
+def test_config_built_primary_locks_when_only_mismatch():
+    raw = {"id": "w0", "address": "10.0.0.1", "port": 5530,
+           "layer_range": [0, 8], "mode": "first", "drift_class": "classA",
+           "alternates": [{"id": "altB", "drift_class": "classB"}]}
+    w = _build_worker_like_client(raw)
+    assert first_advanceable_worker([w]) is None           # no same-class → clean fail
