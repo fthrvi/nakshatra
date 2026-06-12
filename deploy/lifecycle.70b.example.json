@@ -1,0 +1,26 @@
+{
+  "_comment": "Scale-to-zero config for the 70B unconscious across the lab Macs. Point the serve at this with NAKSHATRA_LIFECYCLE_REMOTE_CONFIG=<path> (+ NAKSHATRA_LIFECYCLE_UNITS for this box's local [0,10) worker, + a SHORT NAKSHATRA_LIFECYCLE_IDLE_GRACE_S=90 because these are BORROWED university Macs). On a think_deeper request the serve SSH-summons all three; after the short idle grace it reaps them and the lab Macs return to their owners. Launch commands bake in the proven gotchas: DYLD_LIBRARY_PATH (copied-binary rpath), Mode-A env (plaintext register), and mac3-2's reduced --n-gpu-layers (the last worker has lm_head + the biggest slice → Metal OOM at full offload).",
+  "remote_workers": [
+    {
+      "name": "70b-bishwapc",
+      "ssh": "mentoringinstitute@100.109.164.69",
+      "probe": "100.109.164.69:5550",
+      "stop_match": "worker.py --port 5550",
+      "launch": "pkill -f 'worker.py --port 5550' 2>/dev/null; sleep 1; DYLD_LIBRARY_PATH=$HOME/llama.cpp-nks/build/bin NAKSHATRA_TLS_REQUIRED=false NAKSHATRA_AUTH_REQUIRED=false NAKSHATRA_REFUSE_UNREGISTERED_PEERS=false nohup $HOME/nks-venv/bin/python $HOME/nakshatra/scripts/worker.py --port 5550 --sub-gguf $HOME/.nakshatra/models/dsr1-70b-w1.gguf --mode middle --layer-start 10 --layer-end 33 --model-id nakshatra-unconscious-dsr1-70b --daemon-bin $HOME/llama.cpp-nks/build/bin/llama-nakshatra-worker --n-ctx 2048 --n-gpu-layers 99 --pillar-url http://100.105.17.76:7777 --node-id 70b-bishwapc --gpu-backend metal --gpu-vram-gb 16 --vram-offered-gb 13 > $HOME/nks-70b.log 2>&1 < /dev/null &"
+    },
+    {
+      "name": "70b-mac4",
+      "ssh": "bishwa@100.93.112.98",
+      "probe": "100.93.112.98:5550",
+      "stop_match": "worker.py --port 5550",
+      "launch": "pkill -f 'worker.py --port 5550' 2>/dev/null; sleep 1; DYLD_LIBRARY_PATH=$HOME/llama.cpp-nks/build/bin NAKSHATRA_TLS_REQUIRED=false NAKSHATRA_AUTH_REQUIRED=false NAKSHATRA_REFUSE_UNREGISTERED_PEERS=false nohup $HOME/nks-venv/bin/python $HOME/nakshatra/scripts/worker.py --port 5550 --sub-gguf $HOME/.nakshatra/models/dsr1-70b-w2.gguf --mode middle --layer-start 33 --layer-end 56 --model-id nakshatra-unconscious-dsr1-70b --daemon-bin $HOME/llama.cpp-nks/build/bin/llama-nakshatra-worker --n-ctx 2048 --n-gpu-layers 99 --pillar-url http://100.105.17.76:7777 --node-id 70b-mac4 --gpu-backend metal --gpu-vram-gb 16 --vram-offered-gb 13 > $HOME/nks-70b.log 2>&1 < /dev/null &"
+    },
+    {
+      "name": "70b-mac3",
+      "ssh": "midev@100.121.48.32",
+      "probe": "100.121.48.32:5550",
+      "stop_match": "worker.py --port 5550",
+      "launch": "pkill -f 'worker.py --port 5550' 2>/dev/null; sleep 1; DYLD_LIBRARY_PATH=$HOME/llama.cpp-nks/build/bin NAKSHATRA_TLS_REQUIRED=false NAKSHATRA_AUTH_REQUIRED=false NAKSHATRA_REFUSE_UNREGISTERED_PEERS=false nohup $HOME/nks-venv/bin/python $HOME/nakshatra/scripts/worker.py --port 5550 --sub-gguf $HOME/.nakshatra/models/dsr1-70b-w3.gguf --mode last --layer-start 56 --layer-end 80 --model-id nakshatra-unconscious-dsr1-70b --daemon-bin $HOME/llama.cpp-nks/build/bin/llama-nakshatra-worker --n-ctx 2048 --n-gpu-layers 18 --pillar-url http://100.105.17.76:7777 --node-id 70b-mac3 --gpu-backend metal --gpu-vram-gb 16 --vram-offered-gb 13 > $HOME/nks-70b.log 2>&1 < /dev/null &"
+    }
+  ]
+}

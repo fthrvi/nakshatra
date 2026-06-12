@@ -80,6 +80,92 @@ class SystemdLocalController(ChainController):
         return True
 
 
+from dataclasses import dataclass, field  # noqa: E402
+
+
+@dataclass
+class RemoteWorker:
+    """One worker on a REMOTE node, summoned/reaped over SSH. `launch` is the full
+    detached command to start it (it should `nohup … &`); `probe` is the
+    host:port to TCP-check for readiness; `stop_match` is the `pkill -f` pattern
+    that tears it down. This is the borrowed-machine member of a chain — it runs
+    ONLY while a session is active, then the node returns to its owner."""
+    name: str
+    ssh: str                      # user@host (Tailscale ok)
+    launch: str                   # remote shell command (must self-detach)
+    probe: tuple                  # (host, port) reachable from the orchestrator
+    stop_match: str               # pkill -f pattern
+
+
+class RemoteSshController(ChainController):
+    """Summon/reap a set of REMOTE workers over SSH — the multi-machine arm of
+    scale-to-zero. Same surface as the local controller, so the same
+    `ChainLifecycle` policy governs it. This is the seam the L3 (Sthambha) lease
+    manager replaces with pillar-summoned workers; until then the serve drives it
+    directly. Ownership-aware grace is set on the ChainLifecycle, not here."""
+
+    def __init__(self, workers: "list[RemoteWorker]",
+                 ssh_opts: str = "-o BatchMode=yes -o StrictHostKeyChecking=accept-new "
+                                 "-o ConnectTimeout=8",
+                 log: Callable[[str], None] = print):
+        self.workers = workers
+        self.ssh_opts = ssh_opts
+        self._log = log
+
+    def _ssh(self, uh: str, remote_cmd: str, timeout: float = 30.0) -> int:
+        return subprocess.run(
+            ["ssh", *self.ssh_opts.split(), uh, remote_cmd],
+            capture_output=True, timeout=timeout).returncode
+
+    def start(self) -> None:
+        for w in self.workers:
+            self._log(f"[lifecycle] summon remote {w.name} on {w.ssh}")
+            try:
+                self._ssh(w.ssh, w.launch)
+            except Exception as e:        # pragma: no cover - network
+                self._log(f"[lifecycle] summon {w.name} failed: {e}")
+
+    def stop(self) -> None:
+        for w in self.workers:
+            self._log(f"[lifecycle] reap remote {w.name} on {w.ssh} "
+                      f"(returning the borrowed machine)")
+            try:
+                self._ssh(w.ssh, f"pkill -f '{w.stop_match}' 2>/dev/null; "
+                                 f"pkill -f llama-nakshatra-worker 2>/dev/null; true")
+            except Exception as e:        # pragma: no cover - network
+                self._log(f"[lifecycle] reap {w.name} failed: {e}")
+
+    def is_ready(self) -> bool:
+        for w in self.workers:
+            host, port = w.probe
+            try:
+                with socket.create_connection((host, port), timeout=3):
+                    pass
+            except OSError:
+                return False
+        return True
+
+
+class CompositeController(ChainController):
+    """A chain spread across local + remote nodes: start/stop every member,
+    ready iff ALL are ready. Lets one ChainLifecycle govern a mixed-ownership
+    chain (e.g. this box `[0,10)` local + 3 lab Macs remote)."""
+
+    def __init__(self, controllers: "list[ChainController]"):
+        self.controllers = controllers
+
+    def start(self) -> None:
+        for c in self.controllers:
+            c.start()
+
+    def stop(self) -> None:
+        for c in self.controllers:
+            c.stop()
+
+    def is_ready(self) -> bool:
+        return all(c.is_ready() for c in self.controllers)
+
+
 # ── the policy: summon-on-demand + idle reap, request-aware ──────────
 class ChainLifecycle:
     """Gates requests through the chain: summon-if-down (block until ready),
@@ -173,17 +259,43 @@ class ChainLifecycle:
         self._stop_evt.set()
 
 
+def _remote_workers_from_json(path: str) -> "list[RemoteWorker]":
+    """Load remote worker specs from a JSON file:
+      {"remote_workers": [
+        {"name","ssh","launch","probe":"host:port","stop_match"}, ...]}"""
+    import json
+    data = json.loads(open(path).read())
+    out = []
+    for w in data.get("remote_workers", []):
+        host, _, port = str(w["probe"]).rpartition(":")
+        out.append(RemoteWorker(
+            name=w["name"], ssh=w["ssh"], launch=w["launch"],
+            probe=(host or "127.0.0.1", int(port)), stop_match=w["stop_match"]))
+    return out
+
+
 # ── build from env (returns None when not configured) ────────────────
 def from_env(log: Callable[[str], None] = print) -> Optional[ChainLifecycle]:
+    """Assemble the lifecycle from env. Local units and/or a remote-worker config
+    compose into one chain controller (a CompositeController when both present).
+    Returns None when nothing is configured (legacy always-on)."""
     units = (os.environ.get("NAKSHATRA_LIFECYCLE_UNITS") or "").split()
-    if not units:
+    remote_cfg = os.environ.get("NAKSHATRA_LIFECYCLE_REMOTE_CONFIG") or ""
+    if not units and not remote_cfg:
         return None
-    probes_raw = (os.environ.get("NAKSHATRA_LIFECYCLE_PROBES") or "").split()
-    probes: list[tuple[str, int]] = []
-    for hp in probes_raw:
-        host, _, port = hp.rpartition(":")
-        probes.append((host or "127.0.0.1", int(port)))
+
+    controllers: "list[ChainController]" = []
+    if units:
+        probes: list[tuple[str, int]] = []
+        for hp in (os.environ.get("NAKSHATRA_LIFECYCLE_PROBES") or "").split():
+            host, _, port = hp.rpartition(":")
+            probes.append((host or "127.0.0.1", int(port)))
+        controllers.append(SystemdLocalController(units, probes, log=log))
+    if remote_cfg:
+        controllers.append(RemoteSshController(
+            _remote_workers_from_json(remote_cfg), log=log))
+
+    ctrl = controllers[0] if len(controllers) == 1 else CompositeController(controllers)
     grace = float(os.environ.get("NAKSHATRA_LIFECYCLE_IDLE_GRACE_S", "600"))
     start_to = float(os.environ.get("NAKSHATRA_LIFECYCLE_START_TIMEOUT_S", "90"))
-    ctrl = SystemdLocalController(units, probes, log=log)
     return ChainLifecycle(ctrl, idle_grace_s=grace, start_timeout_s=start_to, log=log)

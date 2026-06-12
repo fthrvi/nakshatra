@@ -40,30 +40,42 @@ lifecycle:
 and re-summons in ~7.5 s on the next `think_deeper`. The conscious (ollama) already
 idle-unloads, so the GPU goes nearly empty when Prithvi rests.
 
-## L3 — Sthambha as a compute-lease manager (THE DESTINATION, next build)
-The `ChainController` interface is the seam. The same `ChainLifecycle` policy
-lifts to the mesh by swapping the controller and moving ownership to the pillar,
-which alone has the global view (registered peers + active plans):
+## Mesh-wide — remote summon/reap (BUILT, 2026-06-11)
+The `ChainController` seam now reaches across machines, so the SAME
+`ChainLifecycle` governs a chain spread over the fleet:
+- **`RemoteSshController`** — summons/reaps REMOTE workers over SSH. `start()`
+  runs each node's (self-detaching) launch command, `stop()` `pkill`s it
+  (returning the borrowed machine), `is_ready()` = all peers' gRPC ports up.
+  **Proven live on a lab Mac:** summoned in ~6s → reaped after idle ("returning
+  the borrowed machine") → re-summoned in ~4s.
+- **`CompositeController`** — one chain across local + remote nodes (e.g. this box
+  `[0,10)` local + 3 lab Macs remote); ready iff ALL are ready.
+- **`from_env`** composes them: `NAKSHATRA_LIFECYCLE_UNITS` (local systemd) +
+  `NAKSHATRA_LIFECYCLE_REMOTE_CONFIG` (a JSON of remote workers) → a
+  CompositeController. Borrowed nodes get a SHORT grace (~90s).
+- **`deploy/lifecycle.70b.example.json`** — the 70B-across-the-lab-Macs config
+  (launch commands bake in the proven gotchas). Re-launch the 70B + point the serve
+  at it ⇒ the lab Macs run ONLY during a deep query, then return to their owners.
 
-1. **`RemoteController`** — summons/reaps REMOTE workers (the lab Macs, peers) for
-   a planned chain. Same surface as `SystemdLocalController`; `start()` brings up
-   each peer's worker (today: the SSH bring-up sequence proven for the 70B fleet —
-   see `[[project_l2_to_l4_connected]]` for the recipe + gotchas; tomorrow: a small
-   per-node agent the pillar calls). `is_ready()` = all peers serving.
-2. **Lease in the pillar** — `POST /lease {model, ttl}` returns a summoned chain;
-   the pillar tracks last-activity and **reaps** the chain when its lease idles
-   past the **per-node ownership-aware grace** (a node declares its grace +
-   ownership class — `dedicated` | `borrowed` — at registration). Workers also
+So scale-to-zero is no longer just local — the **whole mesh** now obeys "summon,
+don't squat," driven from the serve.
+
+## L3 — Sthambha as the compute-lease OWNER (the remaining hop)
+The serve-driven controllers above realise the *outcome* for a single consumer
+(Prithvi's `think_deeper`). The final hop centralises *ownership* in the pillar so
+MANY consumers share one arbiter with the global view:
+1. **Lease in the pillar** — `POST /lease {model, ttl}` returns a summoned chain;
+   the pillar tracks last-activity and **reaps** it when the lease idles past the
+   **per-node ownership-aware grace** (each node declares grace + `dedicated` |
+   `borrowed` at registration). The `RemoteSshController` becomes the pillar's
+   summon mechanism (or a small per-node agent it signals). Workers also
    self-heartbeat; a worker MAY self-reap if it loses contact (decentralised
-   safety — the sovereign-mesh ethos: each node governs itself).
-3. **Keep the *plan* hot, not the *weights*** — the pillar already holds the
+   safety — each node governs itself).
+2. **Keep the *plan* hot, not the *weights*** — the pillar already holds the
    layer-split plan, so re-summon is "load weights on the assigned peers", not
-   "re-plan". Cold-start is the only cost, and it's the right one to pay.
+   "re-plan".
 
-Then `client.py --registry` / `nakshatra_serve`'s `registry_url` lease a chain on
-demand, and the whole mesh inherits "summon, don't squat" for free — borrowed
-machines are only ever busy during an actual query.
-
-**Status:** L4 done + live. L3 lease manager = the next focused build (touches the
-shared Pi pillar — coordinate with its owner). The seam (`ChainController`) and the
-policy (`ChainLifecycle`, ownership-aware grace) are already in place to receive it.
+Then `client.py --registry` / `registry_url` lease a chain on demand and the mesh
+inherits the policy globally. **Status:** L4 + mesh-wide remote = done. The
+pillar-OWNED lease is the remaining build (touches the shared Pi pillar —
+coordinate with its owner); the seam + policy are already in place to receive it.
