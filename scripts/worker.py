@@ -2729,6 +2729,15 @@ def main():
                     help="CPU threads offered. Default = --n-threads value.")
     ap.add_argument("--disk-for-cache-gb", type=float, default=0.0,
                     help="Disk space available for layer cache.")
+    # Compute-lease (scale-to-zero) ownership declaration → pillar grace.
+    ap.add_argument("--ownership-class", type=str, default="",
+                    choices=["", "dedicated", "borrowed"],
+                    help="'dedicated' (your own box, longer warm window) or "
+                         "'borrowed' (someone else's machine, release fast). "
+                         "Empty = don't declare (pillar defaults to borrowed).")
+    ap.add_argument("--idle-grace-s", type=float, default=0.0,
+                    help="Idle seconds before the pillar reaps this node's lease. "
+                         "0 = pillar uses the ownership-class default.")
     ap.add_argument("--skip-sha256", action="store_true",
                     help="Skip SHA-256 of sub-GGUF (for fast restarts; cached_files lacks hash).")
     ap.add_argument("--file-server-port", type=int, default=0,
@@ -3068,6 +3077,14 @@ def main():
             "cached_files": cached_files,
             "recent_rpc_ms": 0.0,  # Phase H — populated by heartbeat as data accrues
         }
+        # Compute-lease ownership (scale-to-zero): declare to the pillar how
+        # patiently it may keep this node summoned. Sent in the fabric block the
+        # pillar already parses; other fabric fields keep their safe defaults.
+        if args.ownership_class or args.idle_grace_s > 0:
+            register_payload["fabric"] = {
+                "ownership_class": args.ownership_class or "borrowed",
+                "idle_grace_s": float(args.idle_grace_s),
+            }
         # 2026-05-21 SPKI Phase 2.6: declare the worker's gRPC server
         # SPKI hash so the pillar can distribute it via /peers. Peer
         # workers will pin the TLS handshake against this value in
