@@ -15,6 +15,15 @@ Environment=N_GPU_LAYERS=99
 # L3 (Sthambha) registration — set PILLAR_URL in the env file to register this
 # worker as a compute peer (self-registers + heartbeats every 30s). Empty → no
 # registration (legacy static-chain behaviour). GPU_* describe the offered HW.
+#
+# Mode-A reconciliation: a configured pillar normally auto-enables gRPC TLS +
+# refuse-unregistered-peers, which would break the unconscious serve's PLAINTEXT
+# ClientBackend. These explicit opt-outs let the worker REGISTER with the pillar
+# (so the L3 planner sees it) while keeping its gRPC plaintext + open, so the
+# local serve keeps working. (mTLS is the right call for cross-WAN later.)
+Environment=NAKSHATRA_TLS_REQUIRED=false
+Environment=NAKSHATRA_AUTH_REQUIRED=false
+Environment=NAKSHATRA_REFUSE_UNREGISTERED_PEERS=false
 Environment=PILLAR_URL=
 Environment=GPU_VENDOR=AMD
 Environment=GPU_MODEL=RX-9070-XT
