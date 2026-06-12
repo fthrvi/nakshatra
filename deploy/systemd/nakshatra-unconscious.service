@@ -20,6 +20,12 @@ Environment=NAKSHATRA_LIFECYCLE_UNITS=nakshatra-unconscious-worker@a.service nak
 Environment=NAKSHATRA_LIFECYCLE_PROBES=127.0.0.1:5540 127.0.0.1:5541
 Environment=NAKSHATRA_LIFECYCLE_IDLE_GRACE_S=600
 Environment=NAKSHATRA_LIFECYCLE_START_TIMEOUT_S=120
+# L3 lease authority (Sthambha): the pillar owns the grace + the global,
+# multi-consumer expiry. The serve renews the shared lease per request and reaps
+# only when the pillar says all consumers are idle. Signs as a registered peer.
+Environment=NAKSHATRA_LIFECYCLE_PILLAR_URL=http://100.105.17.76:7777
+Environment=NAKSHATRA_LIFECYCLE_LEASE_MODEL=nakshatra-unconscious-dsr1-llama8b
+Environment=NAKSHATRA_LIFECYCLE_LEASE_KEYID=unconscious-a
 ExecStart=%h/nakshatra/.venv/bin/python %h/nakshatra/scripts/nakshatra_serve.py \
     --port ${PORT} --bind 127.0.0.1 --models ${MODELS}
 Restart=always
