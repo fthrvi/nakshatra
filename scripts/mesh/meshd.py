@@ -90,6 +90,12 @@ class MeshConfig:
     identity_file: Path
     status_file: Path
     once: bool = False                  # one loop then exit (for tests/CI)
+    peer_ttl: float = 0.0               # ignore listings older than this (0 → auto)
+
+    def effective_ttl(self) -> float:
+        # a node re-publishes every `refresh`s; treat it dead after a few missed
+        # heartbeats so stale FileRelay listings age out of discovery.
+        return self.peer_ttl if self.peer_ttl > 0 else max(90.0, 4 * self.refresh)
 
 
 class MeshNode:
@@ -129,8 +135,21 @@ class MeshNode:
     # ── 2. discover (verify + pin + rank + same-drift-class only) ──
     def _discover(self) -> list[NakshatraListing]:
         listings = self.relay.query(mesh_id=self.cfg.mesh_id)
+        # heartbeat TTL: a live node re-publishes every `refresh`s; drop listings
+        # whose last heartbeat is older than effective_ttl so a node that stopped
+        # ages out of discovery (and its tunnel gets pruned). FileRelay never
+        # deletes files, so this is what makes "peer left → tunnel closes" work.
+        now = int(time.time())
+        ttl = self.cfg.effective_ttl()
+        fresh = []
+        for l in listings:
+            age = now - (l.created_unix or 0)
+            if age > ttl:
+                self._log(f"skip {l.node_id}: stale heartbeat ({age}s > {ttl:.0f}s TTL)")
+                continue
+            fresh.append(l)
         ranked = rank_listings(
-            listings, exclude_node_id=self.node_id,
+            fresh, exclude_node_id=self.node_id,
             want_mesh_id=self.cfg.mesh_id,
             want_model=self.cfg.serving[0] if self.cfg.serving else None,
         )
@@ -304,18 +323,27 @@ def _parse_args(argv=None) -> MeshConfig:
     ap.add_argument("--decode-ms-per-layer", type=float, default=None,
                     help="measured compute signal for ranking")
     ap.add_argument("--refresh", type=float, default=30.0)
+    ap.add_argument("--peer-ttl", type=float, default=0.0,
+                    help="ignore peer listings older than this many seconds "
+                         "(0 → auto: max(90, 4×refresh))")
     ap.add_argument("--identity-file", default=str(home_nks / "mesh.key"))
     ap.add_argument("--status-file", default=str(home_nks / "mesh-status.json"))
     ap.add_argument("--once", action="store_true", help="run one loop then exit")
     a = ap.parse_args(argv)
     host, _, port = a.rendezvous.rpartition(":")
+    # Normalize systemd's empty ${TOKENS}: an unset env var arrives as "" — treat
+    # empty serving entries / worker-addr / drift-class as "not set" so a
+    # consumer-only node configures cleanly from the same unit file.
+    serving = [s for s in a.serving if s]
+    worker_addr = a.worker_addr or None
+    drift_class = a.drift_class or None
     return MeshConfig(
-        mesh_id=a.mesh_id, serving=a.serving, relay_dir=a.relay_dir,
+        mesh_id=a.mesh_id, serving=serving, relay_dir=a.relay_dir,
         rendezvous_host=host or "127.0.0.1", rendezvous_port=int(port),
-        worker_addr=a.worker_addr, drift_class=a.drift_class,
+        worker_addr=worker_addr, drift_class=drift_class,
         endpoint_hint=a.endpoint, decode_ms_per_layer=a.decode_ms_per_layer,
         refresh=a.refresh, identity_file=Path(a.identity_file),
-        status_file=Path(a.status_file), once=a.once,
+        status_file=Path(a.status_file), once=a.once, peer_ttl=a.peer_ttl,
     )
 
 

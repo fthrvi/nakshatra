@@ -11,15 +11,18 @@ EnvironmentFile=%h/.nakshatra/meshd.env
 Environment=RELAY_DIR=%h/.nakshatra/relay
 Environment=RENDEZVOUS=127.0.0.1:51820
 Environment=REFRESH=30
+# --flag=${VAR} (equals form) keeps each a single token even when the value is
+# empty, so a consumer-only node (empty SERVING/WORKER_ADDR/DRIFT_CLASS) parses
+# cleanly from the same unit. meshd normalizes "" → not-set.
 ExecStart=%h/nakshatra/.venv/bin/python %h/nakshatra/scripts/mesh/meshd.py \
-    --mesh-id ${MESH_ID} \
-    --serving ${SERVING} \
-    --relay-dir ${RELAY_DIR} \
-    --rendezvous ${RENDEZVOUS} \
-    --drift-class ${DRIFT_CLASS} \
-    --worker-addr ${WORKER_ADDR} \
-    --endpoint ${ENDPOINT_HINT} \
-    --refresh ${REFRESH}
+    --mesh-id=${MESH_ID} \
+    --serving=${SERVING} \
+    --relay-dir=${RELAY_DIR} \
+    --rendezvous=${RENDEZVOUS} \
+    --drift-class=${DRIFT_CLASS} \
+    --worker-addr=${WORKER_ADDR} \
+    --endpoint=${ENDPOINT_HINT} \
+    --refresh=${REFRESH}
 Restart=always
 RestartSec=5
 NoNewPrivileges=true
