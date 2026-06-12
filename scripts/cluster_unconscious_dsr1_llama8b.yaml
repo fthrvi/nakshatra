@@ -1,0 +1,27 @@
+# Nakshatra "unconscious tier" — REAL reasoning model (scale-up from the 1B MVP).
+#
+# DeepSeek-R1-Distill-Llama-8B — a genuine chain-of-thought reasoning model (R1
+# distilled into Llama-3.1-8B). LLAMA arch → the nakshatra partial-load daemon
+# handles it as-is (qwen2 would need a daemon rebuild). ~4.9 GB Q4 split across two
+# GPU workers → CO-FITS with Prithvi's conscious 8B on the RX 9070 XT (16 GB), so
+# both brains stay GPU-resident. This is the "deep thinking layer" think_deeper
+# escalates to: the conscious self speaks; this slow reasoner does the deliberation.
+model:
+  id: "nakshatra-unconscious-dsr1-llama8b"
+  hidden_size: 4096
+  num_blocks: 32
+  wire_dtype: f32
+
+workers:
+  - id: dsr1l-a
+    address: 127.0.0.1
+    port: 5540
+    layer_range: [0, 16]
+    sub_gguf_path: /home/prithvi/.nakshatra/models/dsr1-llama8b-a.gguf
+    mode: first
+  - id: dsr1l-b
+    address: 127.0.0.1
+    port: 5541
+    layer_range: [16, 32]
+    sub_gguf_path: /home/prithvi/.nakshatra/models/dsr1-llama8b-b.gguf
+    mode: last
