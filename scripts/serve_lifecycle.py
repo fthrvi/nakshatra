@@ -140,6 +140,14 @@ class ChainLifecycle:
         if self._reaper is not None:
             return
         self._last_active = time.monotonic()
+        # Adopt an already-running chain (e.g. workers up from a previous boot)
+        # so the reaper will reap it after grace even if no request arrives.
+        try:
+            if self.controller.is_ready():
+                self._up = True
+                self._log("[lifecycle] adopted already-running chain")
+        except Exception:
+            pass
         self._reaper = threading.Thread(target=self._reap_loop, daemon=True)
         self._reaper.start()
         self._log(f"[lifecycle] reaper armed: idle-grace={self.idle_grace_s:.0f}s "

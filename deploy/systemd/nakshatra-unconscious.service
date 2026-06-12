@@ -3,14 +3,23 @@ Description=Nakshatra unconscious tier — OpenAI /v1/chat/completions over the 
 Documentation=https://github.com/fthrvi/nakshatra/blob/main/docs/INFRA-MAP.md
 # Prithvi (L4) escalates here via think_deeper. ChainChatBackend spawns client.py
 # per request → the distributed worker chain.
-After=network.target nakshatra-unconscious-worker@a.service nakshatra-unconscious-worker@b.service
-Wants=nakshatra-unconscious-worker@a.service nakshatra-unconscious-worker@b.service
+# SCALE-TO-ZERO: the serve (no GPU) stays up always; it SUMMONS the worker units
+# on a request and REAPS them after idle (compute is summoned, not squatted). So
+# NO Wants=/After= the workers — the serve owns their lifecycle, not boot.
+After=network.target
 
 [Service]
 Type=simple
 EnvironmentFile=-%h/.nakshatra/unconscious.env
 Environment=PORT=11599
 Environment=MODELS=%h/.nakshatra/serve_models.unconscious.yaml
+# Scale-to-zero: idle-grace 600s (dedicated box; set ~90 for borrowed nodes).
+# PROBES = the worker gRPC ports (LISTEN ⇒ daemon loaded). The serve runs
+# `systemctl --user start/stop` on UNITS, so it needs the user bus:
+Environment=NAKSHATRA_LIFECYCLE_UNITS=nakshatra-unconscious-worker@a.service nakshatra-unconscious-worker@b.service
+Environment=NAKSHATRA_LIFECYCLE_PROBES=127.0.0.1:5540 127.0.0.1:5541
+Environment=NAKSHATRA_LIFECYCLE_IDLE_GRACE_S=600
+Environment=NAKSHATRA_LIFECYCLE_START_TIMEOUT_S=120
 ExecStart=%h/nakshatra/.venv/bin/python %h/nakshatra/scripts/nakshatra_serve.py \
     --port ${PORT} --bind 127.0.0.1 --models ${MODELS}
 Restart=always
