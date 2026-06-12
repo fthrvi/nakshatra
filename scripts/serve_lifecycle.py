@@ -166,6 +166,87 @@ class CompositeController(ChainController):
         return all(c.is_ready() for c in self.controllers)
 
 
+# ── L3: the pillar (Sthambha) as the lease authority ─────────────────
+class PillarLeaseClient:
+    """Consumer side of the pillar compute-lease. The pillar OWNS the lease (the
+    global, multi-consumer view + the ownership-aware grace + the expiry clock);
+    this client just (1) leases a model's chain, (2) RENEWS per request via the
+    pure renew endpoint (no chain re-resolution → robust to transient peer-state
+    blips), and (3) reads the lease state — an `expired` read is the pillar telling
+    the serve to reap. So the serve reaps only when ALL consumers have gone idle
+    (the politeness the serve can't see alone). Signs as a registered peer."""
+
+    def __init__(self, pillar_url: str, model_id: str, keyid: str,
+                 priv_key: bytes, log: Callable[[str], None] = print):
+        self.base = pillar_url.rstrip("/")
+        self.model_id = model_id
+        self.keyid = keyid
+        self.priv = priv_key
+        self._log = log
+        self.lease_id: Optional[str] = None
+
+    def _call(self, method: str, path: str, body: Optional[dict] = None,
+              timeout: float = 10.0):
+        import json
+        import urllib.request
+        import urllib.error
+        import nakshatra_auth as _na
+        raw = json.dumps(body).encode() if body is not None else b""
+        hdr, _ = _na.build_signed_envelope(self.priv, self.keyid, method, path, raw)
+        req = urllib.request.Request(
+            self.base + path, data=(raw if body is not None else None),
+            method=method,
+            headers={"Content-Type": "application/json", "Authorization": hdr})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            try:
+                return e.code, json.loads(e.read())
+            except Exception:
+                return e.code, {}
+        except Exception as e:                       # network — fail soft
+            return 0, {"error": str(e)}
+
+    def lease(self, retries: int = 3) -> Optional[dict]:
+        """Summon-or-renew the shared lease; returns the lease dict (incl.
+        idle_grace_s, chain) or None. Retries a transient 409."""
+        for _ in range(max(1, retries)):
+            st, b = self._call("POST", "/lease", {"model_id": self.model_id})
+            if st == 200:
+                self.lease_id = b.get("lease_id")
+                return b
+            if st != 409:
+                self._log(f"[lease] POST /lease -> {st}: {b.get('error')}")
+                return None
+        self._log("[lease] POST /lease kept returning 409 (chain not ready)")
+        return None
+
+    def renew(self) -> Optional[dict]:
+        if not self.lease_id:
+            return self.lease()
+        st, b = self._call("POST", f"/lease/{self.lease_id}/renew", {})
+        if st == 200:
+            return b
+        if st == 404:                                # lease gone → re-lease
+            self.lease_id = None
+            return self.lease()
+        return None
+
+    def is_expired(self) -> bool:
+        """True iff the pillar says the lease has expired (all consumers idle) —
+        i.e. it's safe/right to reap. Fail-SAFE: on a network error we say NOT
+        expired (don't reap on uncertainty)."""
+        if not self.lease_id:
+            return False
+        st, b = self._call("GET", f"/lease/{self.lease_id}")
+        if st == 200:
+            return b.get("state") == "expired"
+        if st == 404:
+            return True
+        return False                                 # network blip → keep alive
+
+
 # ── the policy: summon-on-demand + idle reap, request-aware ──────────
 class ChainLifecycle:
     """Gates requests through the chain: summon-if-down (block until ready),
@@ -177,11 +258,16 @@ class ChainLifecycle:
 
     def __init__(self, controller: ChainController, idle_grace_s: float = 600.0,
                  start_timeout_s: float = 90.0, poll_s: float = 1.0,
+                 lease_client: "Optional[PillarLeaseClient]" = None,
                  log: Callable[[str], None] = print):
         self.controller = controller
         self.idle_grace_s = idle_grace_s
         self.start_timeout_s = start_timeout_s
         self.poll_s = poll_s
+        # Optional L3 authority: when set, the pillar's lease grace overrides the
+        # local one and the pillar's expiry decides the reap (so we never reap
+        # while ANOTHER consumer holds the lease — the global politeness view).
+        self.lease_client = lease_client
         self._log = log
         self._lock = threading.Lock()
         self._active = 0                 # in-flight requests
@@ -194,6 +280,15 @@ class ChainLifecycle:
     def begin(self) -> None:
         """Ensure the chain is up (cold-start + block until ready), then mark a
         request in-flight. Raises TimeoutError if it can't summon in time."""
+        # L3: register this consumer's activity with the pillar (renew the shared
+        # lease) + adopt the pillar's ownership-aware grace. Best-effort.
+        if self.lease_client is not None:
+            try:
+                info = self.lease_client.renew()
+                if info and info.get("idle_grace_s"):
+                    self.idle_grace_s = float(info["idle_grace_s"])
+            except Exception as e:
+                self._log(f"[lease] renew failed (continuing): {e}")
         with self._lock:
             self._active += 1
             self._last_active = time.monotonic()
@@ -244,16 +339,26 @@ class ChainLifecycle:
             self._stop_evt.wait(min(30.0, self.idle_grace_s / 2 or 30.0))
             with self._lock:
                 idle = time.monotonic() - self._last_active
-                should = (self._up and self._active == 0
-                          and idle >= self.idle_grace_s)
-            if should:
-                self._log(f"[lifecycle] idle {idle:.0f}s ≥ grace — reaping chain "
-                          f"(freeing GPU; re-summoned on next request)")
+                local_due = (self._up and self._active == 0
+                             and idle >= self.idle_grace_s)
+            if not local_due:
+                continue
+            # L3: when leased, the PILLAR decides (it sees all consumers). Only
+            # reap if the pillar's lease has expired — never while another
+            # consumer holds it. Fail-safe: a network blip keeps the chain up.
+            if self.lease_client is not None:
                 try:
-                    self.controller.stop()
-                finally:
-                    with self._lock:
-                        self._up = False
+                    if not self.lease_client.is_expired():
+                        continue
+                except Exception:
+                    continue
+            self._log(f"[lifecycle] idle {idle:.0f}s ≥ grace — reaping chain "
+                      f"(freeing GPU; re-summoned on next request)")
+            try:
+                self.controller.stop()
+            finally:
+                with self._lock:
+                    self._up = False
 
     def stop_reaper(self) -> None:
         self._stop_evt.set()
@@ -298,4 +403,24 @@ def from_env(log: Callable[[str], None] = print) -> Optional[ChainLifecycle]:
     ctrl = controllers[0] if len(controllers) == 1 else CompositeController(controllers)
     grace = float(os.environ.get("NAKSHATRA_LIFECYCLE_IDLE_GRACE_S", "600"))
     start_to = float(os.environ.get("NAKSHATRA_LIFECYCLE_START_TIMEOUT_S", "90"))
-    return ChainLifecycle(ctrl, idle_grace_s=grace, start_timeout_s=start_to, log=log)
+
+    # L3: optional pillar lease authority. When a pillar URL + lease model are
+    # set, the serve becomes a lease consumer — the pillar's ownership-aware grace
+    # + global expiry govern the reap (so we never reap a chain another consumer
+    # is using). Signs as a registered peer (the worker key on this box).
+    lease_client = None
+    pillar = os.environ.get("NAKSHATRA_LIFECYCLE_PILLAR_URL") or ""
+    lease_model = os.environ.get("NAKSHATRA_LIFECYCLE_LEASE_MODEL") or ""
+    if pillar and lease_model:
+        try:
+            import nakshatra_auth as _na
+            priv, _pub = _na.load_or_create_worker_key()
+            keyid = os.environ.get("NAKSHATRA_LIFECYCLE_LEASE_KEYID") or "unconscious-a"
+            lease_client = PillarLeaseClient(pillar, lease_model, keyid, priv, log=log)
+            log.info("L3 lease authority: pillar=%s model=%s as=%s",
+                     pillar, lease_model, keyid) if hasattr(log, "info") else \
+                log(f"[lease] pillar={pillar} model={lease_model} as={keyid}")
+        except Exception as e:
+            log(f"[lease] client unavailable: {e}")
+    return ChainLifecycle(ctrl, idle_grace_s=grace, start_timeout_s=start_to,
+                          lease_client=lease_client, log=log)
