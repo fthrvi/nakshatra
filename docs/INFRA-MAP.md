@@ -75,13 +75,59 @@ Status legend:  ✅ proven live · 🟢 built + tested · 🟡 staged / config-d
 
 **Test suites green this session:** drift + cache `22 passed`; nostr + discovery + handshake + relay + mux + secure_channel + gauge `46 passed, 1 skipped`.
 
-## What is NOT auto-running (the honest gaps — all integration, not capability)
+## Always-on capstone (2026-06-11) — the mesh now stands itself up
 
-- ⬜ **No standing live mesh right now.** The transport stack is *proven* but not left running — each demo was brought up by hand (Pillar relay via bg-SSH that dies on disconnect; Vultr relay was transient). There is no always-on Nostr publisher + relay daemon yet.
-- 🟡 **Nostr discovery → tunnel auto-bringup** not wired: listings carry `wg_pubkey`/`transport`/`relay_hint`/`drift_class`, but a peer doesn't yet auto-dial a tunnel on admission (config-driven today).
-- 🟡 **O(t) productionization:** proven via the Forward-relay driver (client in the per-hop loop = the v1.1 §8.5 path). Folding it into `client.py`'s recovery branch as the default, and the worker-push variant (worker-side cache + catch-up RPC + proto field), are staged.
-- ⬜ **Hole-punching** to skip the relay when a peer is directly reachable (optimization).
-- ⬜ **Standing-relay hardening:** rendezvous-id allowlist + rate-limit (the spike relays were open).
+The two operational gaps are **CLOSED**. There is a long-running daemon + the
+discovery→tunnel auto-bringup, installable as systemd `--user` services:
+
+- 🟢 **`scripts/mesh/meshd.py`** — the node daemon: publish-heartbeat (re-sign +
+  republish the signed listing every `--refresh`s) → discover (verify + pin +
+  rank + **same-drift-class** + **heartbeat-TTL** staleness) → **auto-dial an
+  Ed25519-pinned X25519+ChaCha20 tunnel** to each admitted peer. Writes a status
+  file each loop.
+- 🟢 **`scripts/mesh/pairing.py`** — coordination-free rendezvous id + role: both
+  sides derive the same id and opposite client/server roles from the two pubkeys
+  + who serves a worker (no negotiation round-trip).
+- 🟢 **`deploy/systemd/{nakshatra-relay,nakshatra-meshd}.service`** + `install-mesh.sh`
+  — `Restart=always`, enabled at login. `./deploy/install-mesh.sh status` shows it.
+- ✅ **PROVEN twice on this box:**
+  - `validate/mesh_capstone.py` — two in-process meshd nodes auto-form a tunnel; a
+    real gRPC `Info` traverses it → `MESH_CAPSTONE_OK`.
+  - `validate/mesh_join_standing.py` — a worker peer joins the **deployed**
+    standing services; the running orchestrator auto-tunnels to it and carries
+    real gRPC → `MESH_JOIN_OK`. Verified: enabled-at-login, crash→auto-restart,
+    peer-leaves→tunnel-pruned (heartbeat TTL).
+
+**Live status now:** `nakshatra-relay` + `nakshatra-meshd` active on this box; the
+node publishes a signature-valid listing with its real gauge drift-class
+(`prithvi-q8@gauge1:327418908285`). 24/7 across logout needs `sudo loginctl
+enable-linger $USER` (one-time).
+
+## What is still NOT auto-running (smaller, honest gaps)
+
+- 🟡 **Discovery substrate is FileRelay** (a shared/local directory of signed
+  listings) by default — zero-dep and always-on, but local. `meshd --nostr-relay
+  wss://…` swaps in a real **public Nostr** relay (signed-listing schema is
+  identical; needs `websocket-client`). The signing/verify/rank path is proven
+  live either way.
+- 🟡 **Reachability across NATs** still needs a public rendezvous relay (Vultr/Pi);
+  the local standing relay binds `127.0.0.1`/`::`. The §7 cross-NAT run proved the
+  remote-relay path — wiring meshd's `--rendezvous` at a standing public relay is
+  config, not code.
+- 🟡 **O(t) productionization:** proven via the Forward-relay driver. Folding it
+  into `client.py`'s recovery branch as the default, and the worker-push variant
+  (worker-side cache + catch-up RPC + proto field), are staged.
+- ⬜ **Hole-punching** to skip the relay when a peer is directly reachable.
+- ⬜ **Standing-relay hardening:** rendezvous-id allowlist + rate-limit; active
+  liveness probe on idle tunnels (today a dead idle tunnel is reaped via the
+  discovery TTL, not by sensing the broken pipe).
+- ⬜ **Bidirectional auto-tunnel** per pair (today one directed tunnel/pair —
+  enough for client-orchestrated chains; push-mode worker↔worker is the extension).
 
 ## One-line summary
-**The whole pipeline — discover → pin → drift-gate → encrypted relay tunnel → layer-split inference → O(t) recovery — is BUILT and each stage has been PROVEN on real hardware (this box + Mac4 + a public VPS).** What's left is *operations*: leaving a relay + publisher running, and auto-wiring discovery→tunnel so it forms without hand-holding.
+**The whole pipeline — discover → pin → drift-gate → encrypted relay tunnel →
+layer-split inference → O(t) recovery — is BUILT, PROVEN on real hardware, and now
+STANDS ITSELF UP:** `meshd` + systemd services publish, discover, and auto-form
+encrypted tunnels with no hand-holding (proven against the deployed services via
+`mesh_join_standing.py`). What remains is reach/scale polish: a standing *public*
+relay + Nostr publisher for cross-NAT strangers (the local always-on path is done).
