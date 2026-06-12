@@ -1,0 +1,26 @@
+# Nakshatra "unconscious tier" — REAL reasoning model (scale-up from the 1B MVP).
+#
+# DeepSeek-R1-Distill-Qwen-14B (a genuine chain-of-thought reasoning model, 14B —
+# larger than Prithvi's 8B conscious self) split across two GPU workers on this box.
+# This is the "deep thinking layer" think_deeper escalates to. Both workers offload
+# to the RX 9070 XT (16 GB); ~9 GB Q4 weights + KV fit with room. Scale further =
+# more layers across more machines (Mac4 etc. — same client.py, remote addresses).
+model:
+  id: "nakshatra-unconscious-dsr1-14b"
+  hidden_size: 5120
+  num_blocks: 48
+  wire_dtype: f32
+
+workers:
+  - id: dsr1-a
+    address: 127.0.0.1
+    port: 5540
+    layer_range: [0, 24]
+    sub_gguf_path: /home/prithvi/.nakshatra/models/dsr1-14b-a.gguf
+    mode: first
+  - id: dsr1-b
+    address: 127.0.0.1
+    port: 5541
+    layer_range: [24, 48]
+    sub_gguf_path: /home/prithvi/.nakshatra/models/dsr1-14b-b.gguf
+    mode: last
