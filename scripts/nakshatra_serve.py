@@ -672,27 +672,44 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
         prompt = _render_prompt(messages, entry)
         cid, created = "chatcmpl-" + _gen_id(), int(time.time())
 
-        if req.get("stream"):
-            return self._stream_openai_chat(entry, prompt, max_tokens,
-                                            options, backend, cid, created)
+        # Scale-to-zero: summon the worker chain if it was reaped while idle
+        # (compute is summoned, not squatted — serve_lifecycle.py). No-op when
+        # NAKSHATRA_LIFECYCLE_* is unset (legacy always-on behaviour).
+        lc = getattr(self.server, "chat_lifecycle", None)
+        if lc is not None:
+            try:
+                lc.begin()
+            except Exception as e:  # cold-start timed out / controller failed
+                log.error("lifecycle summon failed: %s", e)
+                self._openai_error(HTTPStatus.SERVICE_UNAVAILABLE,
+                                   "reasoning tier is warming up; retry shortly",
+                                   "server_error")
+                return 503
         try:
-            result = backend.generate(entry, prompt, max_tokens, options)
-        except ChainBackendError as e:
-            log.error("chain backend error: %s", e)
-            self._openai_error(HTTPStatus.BAD_GATEWAY, "chain generation failed",
-                               "server_error")
-            return 502
-        p, c = result.prompt_eval_count, result.eval_count
-        self._json(HTTPStatus.OK, {
-            "id": cid, "object": "chat.completion", "created": created,
-            "model": entry.name,
-            "choices": [{"index": 0,
-                         "message": {"role": "assistant", "content": result.text},
-                         "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": p, "completion_tokens": c,
-                      "total_tokens": p + c},
-        })
-        return 200
+            if req.get("stream"):
+                return self._stream_openai_chat(entry, prompt, max_tokens,
+                                                options, backend, cid, created)
+            try:
+                result = backend.generate(entry, prompt, max_tokens, options)
+            except ChainBackendError as e:
+                log.error("chain backend error: %s", e)
+                self._openai_error(HTTPStatus.BAD_GATEWAY, "chain generation failed",
+                                   "server_error")
+                return 502
+            p, c = result.prompt_eval_count, result.eval_count
+            self._json(HTTPStatus.OK, {
+                "id": cid, "object": "chat.completion", "created": created,
+                "model": entry.name,
+                "choices": [{"index": 0,
+                             "message": {"role": "assistant", "content": result.text},
+                             "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": p, "completion_tokens": c,
+                          "total_tokens": p + c},
+            })
+            return 200
+        finally:
+            if lc is not None:
+                lc.end()
 
     def _try_route_openai(self, name: str, req: dict) -> bool:
         """v1.0 §6 — forward a non-local model to a discovered peer that serves
@@ -769,7 +786,8 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
 
 def build_server(bind: str, port: int,
                  models: Optional[dict] = None,
-                 chat_backend: "Optional[ChatBackend]" = None
+                 chat_backend: "Optional[ChatBackend]" = None,
+                 chat_lifecycle=None
                  ) -> ThreadingHTTPServer:
     """Construct + return a ThreadingHTTPServer bound to (bind, port).
 
@@ -786,6 +804,7 @@ def build_server(bind: str, port: int,
     server = ThreadingHTTPServer((bind, port), NakshatraServeHandler)
     server.models = models or {}
     server.chat_backend = chat_backend
+    server.chat_lifecycle = chat_lifecycle
     return server
 
 
@@ -844,7 +863,19 @@ def main(argv: Optional[list[str]] = None) -> int:
         log.info("serving STUB backend (no chain): %r", args.stub_backend[:60])
     else:
         chat_backend = ChainChatBackend() if models else None
-    server = build_server(args.bind, args.port, models, chat_backend)
+    # Scale-to-zero lifecycle (compute is summoned, not squatted). Active only
+    # when NAKSHATRA_LIFECYCLE_UNITS is set; otherwise None → always-on legacy.
+    chat_lifecycle = None
+    try:
+        import serve_lifecycle
+        chat_lifecycle = serve_lifecycle.from_env(log=log.info)
+        if chat_lifecycle is not None:
+            chat_lifecycle.start_reaper()
+            log.info("scale-to-zero ARMED (idle-grace=%.0fs)",
+                     chat_lifecycle.idle_grace_s)
+    except Exception as e:
+        log.warning("scale-to-zero lifecycle unavailable: %s", e)
+    server = build_server(args.bind, args.port, models, chat_backend, chat_lifecycle)
     log.info("nakshatra_serve listening on %s:%d (version=%s, %d model(s): %s)",
              args.bind, args.port, VERSION_STRING, len(models),
              ", ".join(models) or "none")
