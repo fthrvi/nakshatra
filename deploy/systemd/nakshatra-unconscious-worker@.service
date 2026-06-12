@@ -6,14 +6,17 @@ After=network.target
 [Service]
 Type=simple
 # Per-instance config: ~/.nakshatra/unconscious-worker-<a|b>.env defines
-#   PORT, SUB_GGUF, MODE, LAYER_START, LAYER_END
+#   PORT, SUB_GGUF, MODE, LAYER_START, LAYER_END, MODEL_ID, N_CTX, N_GPU_LAYERS
 EnvironmentFile=%h/.nakshatra/unconscious-worker-%i.env
 Environment=DAEMON_BIN=%h/llama.cpp/build/bin/llama-nakshatra-worker
+Environment=MODEL_ID=nakshatra-unconscious
+Environment=N_CTX=2048
+Environment=N_GPU_LAYERS=99
 ExecStart=%h/nakshatra/.venv/bin/python %h/nakshatra/scripts/worker.py \
     --port ${PORT} --sub-gguf ${SUB_GGUF} --mode ${MODE} \
     --layer-start ${LAYER_START} --layer-end ${LAYER_END} \
-    --model-id nakshatra-unconscious-1b --daemon-bin ${DAEMON_BIN} \
-    --n-ctx 256 --n-gpu-layers 0
+    --model-id ${MODEL_ID} --daemon-bin ${DAEMON_BIN} \
+    --n-ctx ${N_CTX} --n-gpu-layers ${N_GPU_LAYERS}
 Restart=always
 RestartSec=4
 
