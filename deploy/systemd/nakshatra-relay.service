@@ -1,0 +1,24 @@
+[Unit]
+Description=Nakshatra rendezvous relay (untrusted byte-forwarder, v1.1 §8.4)
+Documentation=https://github.com/fthrvi/nakshatra/blob/main/docs/INFRA-MAP.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# EnvironmentFile is optional; defaults bind dual-stack :51820.
+EnvironmentFile=-%h/.nakshatra/relay.env
+Environment=NKS_RELAY_HOST=::
+Environment=NKS_RELAY_PORT=51820
+ExecStart=%h/nakshatra/.venv/bin/python %h/nakshatra/scripts/transport/relay.py --host ${NKS_RELAY_HOST} --port ${NKS_RELAY_PORT}
+Restart=always
+RestartSec=3
+# the relay never interprets bytes; lock it down
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.nakshatra
+
+[Install]
+WantedBy=default.target

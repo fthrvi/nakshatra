@@ -48,18 +48,35 @@ def rendezvous_id(a_pub_hex: str, b_pub_hex: str, mesh_id: str) -> bytes:
     return h.digest()[:16]
 
 
-def pair_role(my_pub_hex: str, peer_pub_hex: str, mesh_id: str) -> PairRole:
+def pair_role(my_pub_hex: str, peer_pub_hex: str, mesh_id: str,
+              i_serve: bool = True, peer_serves: bool = True) -> PairRole:
     """My role in the auto-tunnel with `peer`. Opposite of what the peer derives.
 
-    Canonical rule: the lexicographically SMALLER pubkey is the initiator + the
-    client (it dials and exposes the local port). Deterministic, restart-stable,
-    needs no coordination."""
+    Two independent assignments, both coordination-free:
+
+    • **is_initiator** (X25519 handshake ordering) — the lexicographically SMALLER
+      pubkey initiates. Pure key order, so exactly one of each.
+
+    • **is_client** (who consumes whose worker) — the node that SERVES a worker is
+      the tunnel server; a consumer-only node is the client. `i_serve`/`peer_serves`
+      come from the signed listing (`serving` non-empty), so both sides agree
+      without a round-trip. When BOTH serve (or neither), fall back to the pubkey
+      tie-break (smaller = client) so the choice is still deterministic.
+
+    Both rules are restart-stable because the keys + the listing are persisted /
+    signed."""
     if my_pub_hex.lower() == peer_pub_hex.lower():
         raise ValueError("cannot pair a node with itself (identical pubkeys)")
     i_am_smaller = my_pub_hex.lower() < peer_pub_hex.lower()
+    if i_serve and not peer_serves:
+        is_client = False                      # only I serve → I'm the server
+    elif peer_serves and not i_serve:
+        is_client = True                       # only peer serves → I consume it
+    else:
+        is_client = i_am_smaller               # both/neither serve → key tie-break
     return PairRole(
         rendezvous_id=rendezvous_id(my_pub_hex, peer_pub_hex, mesh_id),
         is_initiator=i_am_smaller,
-        is_client=i_am_smaller,
+        is_client=is_client,
         peer_pubkey_hex=peer_pub_hex,
     )

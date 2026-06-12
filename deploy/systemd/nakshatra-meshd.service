@@ -1,0 +1,32 @@
+[Unit]
+Description=Nakshatra node daemon (publish + discover + auto-tunnel, v1.1 capstone)
+Documentation=https://github.com/fthrvi/nakshatra/blob/main/docs/INFRA-MAP.md
+After=network-online.target nakshatra-relay.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Per-node config — see deploy/meshd.env.example. Required: MESH_ID, SERVING.
+EnvironmentFile=%h/.nakshatra/meshd.env
+Environment=RELAY_DIR=%h/.nakshatra/relay
+Environment=RENDEZVOUS=127.0.0.1:51820
+Environment=REFRESH=30
+ExecStart=%h/nakshatra/.venv/bin/python %h/nakshatra/scripts/mesh/meshd.py \
+    --mesh-id ${MESH_ID} \
+    --serving ${SERVING} \
+    --relay-dir ${RELAY_DIR} \
+    --rendezvous ${RENDEZVOUS} \
+    --drift-class ${DRIFT_CLASS} \
+    --worker-addr ${WORKER_ADDR} \
+    --endpoint ${ENDPOINT_HINT} \
+    --refresh ${REFRESH}
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.nakshatra
+
+[Install]
+WantedBy=default.target
