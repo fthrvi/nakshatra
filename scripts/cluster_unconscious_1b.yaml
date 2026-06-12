@@ -1,0 +1,26 @@
+# Nakshatra "unconscious tier" chain — the distributed brain Prithvi (L4)
+# escalates to via think_deeper → nakshatra_serve /v1/chat/completions.
+#
+# MVP model: Llama-3.2-1B split across two local workers (16 blocks, hidden 2048).
+# This proves the L2→L4 connection with REAL distributed inference. The scale path
+# is identical config: point sub_gguf_path at a larger model's slices and add
+# workers (or address mesh-tunnel-exposed remote peers — see docs/INFRA-MAP.md).
+model:
+  id: "nakshatra-unconscious-1b"
+  hidden_size: 2048
+  num_blocks: 16
+  wire_dtype: f32
+
+workers:
+  - id: unconscious-a
+    address: 127.0.0.1
+    port: 5530
+    layer_range: [0, 8]
+    sub_gguf_path: /home/prithvi/.nakshatra/models/node-A.gguf
+    mode: first
+  - id: unconscious-b
+    address: 127.0.0.1
+    port: 5531
+    layer_range: [8, 16]
+    sub_gguf_path: /home/prithvi/.nakshatra/models/node-B.gguf
+    mode: last
