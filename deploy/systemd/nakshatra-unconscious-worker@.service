@@ -12,11 +12,24 @@ Environment=DAEMON_BIN=%h/llama.cpp/build/bin/llama-nakshatra-worker
 Environment=MODEL_ID=nakshatra-unconscious
 Environment=N_CTX=2048
 Environment=N_GPU_LAYERS=99
+# L3 (Sthambha) registration — set PILLAR_URL in the env file to register this
+# worker as a compute peer (self-registers + heartbeats every 30s). Empty → no
+# registration (legacy static-chain behaviour). GPU_* describe the offered HW.
+Environment=PILLAR_URL=
+Environment=GPU_VENDOR=AMD
+Environment=GPU_MODEL=RX-9070-XT
+Environment=GPU_VRAM_GB=16
+Environment=GPU_BACKEND=rocm
+Environment=VRAM_OFFERED_GB=6
 ExecStart=%h/nakshatra/.venv/bin/python %h/nakshatra/scripts/worker.py \
     --port ${PORT} --sub-gguf ${SUB_GGUF} --mode ${MODE} \
     --layer-start ${LAYER_START} --layer-end ${LAYER_END} \
     --model-id ${MODEL_ID} --daemon-bin ${DAEMON_BIN} \
-    --n-ctx ${N_CTX} --n-gpu-layers ${N_GPU_LAYERS}
+    --n-ctx ${N_CTX} --n-gpu-layers ${N_GPU_LAYERS} \
+    --pillar-url=${PILLAR_URL} --node-id=unconscious-%i \
+    --gpu-vendor=${GPU_VENDOR} --gpu-model=${GPU_MODEL} \
+    --gpu-vram-gb=${GPU_VRAM_GB} --gpu-backend=${GPU_BACKEND} \
+    --vram-offered-gb=${VRAM_OFFERED_GB}
 Restart=always
 RestartSec=4
 
