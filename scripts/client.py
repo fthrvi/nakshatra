@@ -430,6 +430,11 @@ def build_chain_from_registry(registry_url: str, model_id: str) -> list:
                 # payload we already loaded. defensive parse mirrors
                 # _fetch_spki_index for the pillar-served chain path.
                 "peer_spki_hash": _sanitize_spki(peer.get("peer_spki_hash")),
+                # v1.1 hardening: carry the peer's drift class (P1 §8.1 Nostr
+                # listing / gauge fingerprint) so drift-class-constrained
+                # recovery engages on registry-built chains too. None for an
+                # unclassified legacy peer → legacy any-alternate behaviour.
+                "drift_class": peer.get("drift_class"),
             })
             used_node_ids.add(peer["node_id"])
             cursor = offering["layer_end"]
@@ -537,8 +542,14 @@ def main():
     # per-worker cursor selects the active candidate. On failure, the
     # recovery handler advances cursors and rebuilds the chain.
     for w in workers:
+        # v1.1 hardening: carry `drift_class` onto the primary candidate so the
+        # drift-class-constrained recovery (recovery/drift_aware.py) actually
+        # engages — next_compatible_cursor reads candidates[0]["drift_class"] as
+        # the class an alternate must match. Omitting it here silently degraded
+        # the constraint to the legacy "any alternate" path (primary class None
+        # → allow anything). Alternates already pass through verbatim below.
         primary = {k: w[k] for k in ("id", "address", "port", "layer_range",
-                                       "mode", "peer_spki_hash")
+                                       "mode", "peer_spki_hash", "drift_class")
                    if k in w}
         primary["sub_gguf_path"] = w.get("sub_gguf_path", "")
         # Normalize per-candidate hashes too: alternates may omit the
