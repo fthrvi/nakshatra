@@ -85,5 +85,3 @@ Status legend:  ✅ proven live · 🟢 built + tested · 🟡 staged / config-d
 
 ## One-line summary
 **The whole pipeline — discover → pin → drift-gate → encrypted relay tunnel → layer-split inference → O(t) recovery — is BUILT and each stage has been PROVEN on real hardware (this box + Mac4 + a public VPS).** What's left is *operations*: leaving a relay + publisher running, and auto-wiring discovery→tunnel so it forms without hand-holding.
-```
-```
