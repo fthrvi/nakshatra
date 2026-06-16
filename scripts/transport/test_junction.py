@@ -6,6 +6,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import junction as J
 
 
+def _is_closed(sock) -> bool:
+    """A denied connection is closed by the junction — surfaces as clean EOF OR a RST, depending
+    on timing/OS. Both mean 'no channel'."""
+    try:
+        sock.settimeout(2)
+        return sock.recv(16) == b""
+    except (ConnectionResetError, ConnectionError, OSError):
+        return True
+
+
 def _admit_if_ok(req):
     return {"admitted": bool(req and req.get("ok")), "tier": "trusted", "tenant": "t",
             "reason": "ok" if (req and req.get("ok")) else "not on roster"}
@@ -48,8 +58,7 @@ def test_unadmitted_is_denied_no_pairing():
         time.sleep(0.3)
         assert j.denied == 1 and j.paired == 0 and j.admitted == 0
         # the junction closed the socket → the peer reads EOF
-        bad.settimeout(2)
-        assert bad.recv(16) == b"", "denied peer's socket was not closed"
+        assert _is_closed(bad), "denied peer's socket was not closed"
     finally:
         j.stop()
 
@@ -61,8 +70,7 @@ def test_no_preamble_is_denied():
         s.sendall(b"\x00\x00\x00\x00")           # zero-length preamble → invalid
         time.sleep(0.2)
         assert j.denied == 1 and j.paired == 0
-        s.settimeout(2)
-        assert s.recv(16) == b""
+        assert _is_closed(s)
     finally:
         j.stop()
 
