@@ -80,6 +80,15 @@ class ModelEntry:
     chain_yaml: Optional[str] = None
     registry_url: Optional[str] = None
     details: dict = field(default_factory=dict)
+    # from_roster mode (fabric/serve_chain): the chain is GENERATED at request time from the live
+    # roster — firewall-gated (eligible_workers) + slices provisioned from a content-addressed
+    # package — instead of a frozen chain_yaml. Needs hidden_size; package location comes from
+    # `package` or the model→package registry (~/.nakshatra/packages.yaml).
+    from_roster: bool = False
+    package: Optional[str] = None
+    hidden_size: Optional[int] = None
+    num_layers: Optional[int] = None
+    wire_dtype: str = "f32"
 
 
 def _load_models(path: str) -> dict[str, ModelEntry]:
@@ -121,17 +130,24 @@ def _load_models(path: str) -> dict[str, ModelEntry]:
             raise ModelConfigError(f"{path}: model #{i} is not a mapping")
         name, tok = raw.get("name"), raw.get("tokenizer_gguf")
         chain_yaml, registry_url = raw.get("chain_yaml"), raw.get("registry_url")
+        from_roster = bool(raw.get("from_roster"))
         missing = [k for k, v in (("name", name), ("tokenizer_gguf", tok)) if not v]
         if missing:
             raise ModelConfigError(f"{path}: model #{i} missing {', '.join(missing)}")
-        if not (chain_yaml or registry_url):
+        if not (chain_yaml or registry_url or from_roster):
             raise ModelConfigError(
-                f"{path}: model {name!r} needs chain_yaml or registry_url")
+                f"{path}: model {name!r} needs chain_yaml, registry_url, or from_roster")
+        if from_roster and not raw.get("hidden_size"):
+            raise ModelConfigError(
+                f"{path}: model {name!r} has from_roster but no hidden_size")
         if name in registry:
             raise ModelConfigError(f"{path}: duplicate model name {name!r}")
         registry[name] = ModelEntry(
             name=name, tokenizer_gguf=tok, chain_yaml=chain_yaml,
-            registry_url=registry_url, details=raw.get("details") or {})
+            registry_url=registry_url, details=raw.get("details") or {},
+            from_roster=from_roster, package=raw.get("package"),
+            hidden_size=raw.get("hidden_size"), num_layers=raw.get("num_layers"),
+            wire_dtype=raw.get("wire_dtype") or "f32")
     return registry
 
 
@@ -266,11 +282,32 @@ class ChainChatBackend(ChatBackend):
                "--model-path", entry.tokenizer_gguf,
                "--prompt", prompt, "--max-tokens", str(max_tokens),
                "--use-streaming"]
-        if entry.chain_yaml:
+        if entry.from_roster:
+            cmd += ["--config", self._roster_chain_yaml(entry)]
+        elif entry.chain_yaml:
             cmd += ["--config", entry.chain_yaml]
         else:
             cmd += ["--registry", entry.registry_url or "", "--model-id", entry.name]
         return cmd
+
+    def _roster_chain_yaml(self, entry) -> str:
+        """from_roster: GENERATE the chain from the live roster at request time (firewall-gated +
+        package-sliced). Generated fresh per call — cheap, since PackageSlicer caches the slices —
+        so the chain tracks roster/policy changes. Raises ChainBackendError (→502) if the firewall
+        leaves no eligible worker, rather than serve a sensitive model on an ineligible peer."""
+        if self._scripts not in sys.path:
+            sys.path.insert(0, self._scripts)
+        sys.path.insert(0, os.path.join(self._scripts, "fabric"))
+        try:
+            from fabric.serve_chain import build_chain_from_roster
+        except ImportError:
+            from serve_chain import build_chain_from_roster
+        try:
+            return build_chain_from_roster(
+                entry.name, hidden_size=entry.hidden_size, num_layers=entry.num_layers,
+                wire_dtype=entry.wire_dtype, package_location=entry.package)
+        except (PermissionError, FileNotFoundError, ValueError) as e:
+            raise ChainBackendError(f"from_roster chain generation failed: {e}")
 
     def generate(self, entry, prompt, max_tokens, options):
         import subprocess

@@ -355,10 +355,54 @@ def test_missing_config_fails_fast(tmp_path):
     "models:\n  - name: x\n    tokenizer_gguf: t\n    chain_yaml: c\n"
     "  - name: x\n    tokenizer_gguf: t2\n    chain_yaml: c2",    # dup name
     "nope: true",                                                 # no models key
+    "models:\n  - name: x\n    tokenizer_gguf: t\n    from_roster: true",  # from_roster w/o hidden_size
 ])
 def test_invalid_config_rejected(tmp_path, bad):
     with pytest.raises(ns.ModelConfigError):
         ns._load_models(_write_models_yaml(tmp_path, bad))
+
+
+_ROSTER_MODEL = """\
+    models:
+      - name: prithvi-private
+        tokenizer_gguf: /models/dsr1/m.gguf
+        from_roster: true
+        package: /home/x/.nakshatra/packages/dsr1
+        hidden_size: 4096
+        num_layers: 32
+        details: {family: llama}
+"""
+
+
+def test_load_models_from_roster(tmp_path):
+    reg = ns._load_models(_write_models_yaml(tmp_path, _ROSTER_MODEL))
+    e = reg["prithvi-private"]
+    assert e.from_roster is True and e.chain_yaml is None and e.registry_url is None
+    assert e.hidden_size == 4096 and e.num_layers == 32
+    assert e.package.endswith("/packages/dsr1") and e.wire_dtype == "f32"
+
+
+def test_cmd_from_roster_generates_chain(monkeypatch):
+    """ChainChatBackend._cmd, for a from_roster entry, generates the chain at request time and
+    passes the generated YAML to client.py via --config (not a static chain_yaml)."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    import fabric.serve_chain as serve_chain  # the module _roster_chain_yaml imports
+    calls = {}
+
+    def fake_build(model_id, **kw):
+        calls["model_id"] = model_id
+        calls["hidden_size"] = kw.get("hidden_size")
+        calls["package_location"] = kw.get("package_location")
+        return "/tmp/generated.from-roster.chain.yaml"
+
+    monkeypatch.setattr(serve_chain, "build_chain_from_roster", fake_build)
+    entry = ns.ModelEntry(name="prithvi-private", tokenizer_gguf="/m.gguf", from_roster=True,
+                          package="/pkg", hidden_size=4096, num_layers=32)
+    cmd = ns.ChainChatBackend()._cmd(entry, "hi", 8)
+    assert "--config" in cmd
+    assert cmd[cmd.index("--config") + 1] == "/tmp/generated.from-roster.chain.yaml"
+    assert "--registry" not in cmd
+    assert calls == {"model_id": "prithvi-private", "hidden_size": 4096, "package_location": "/pkg"}
 
 
 def test_main_exits_nonzero_on_bad_config(tmp_path):
