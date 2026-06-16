@@ -16,8 +16,8 @@ Environment=MODELS=%h/.nakshatra/serve_models.unconscious.yaml
 # Scale-to-zero: idle-grace 600s (dedicated box; set ~90 for borrowed nodes).
 # PROBES = the worker gRPC ports (LISTEN ⇒ daemon loaded). The serve runs
 # `systemctl --user start/stop` on UNITS, so it needs the user bus:
-Environment=NAKSHATRA_LIFECYCLE_UNITS=nakshatra-unconscious-worker@a.service nakshatra-unconscious-worker@b.service
-Environment=NAKSHATRA_LIFECYCLE_PROBES=127.0.0.1:5540 127.0.0.1:5541
+Environment="NAKSHATRA_LIFECYCLE_UNITS=nakshatra-unconscious-worker@a.service nakshatra-unconscious-worker@b.service"
+Environment="NAKSHATRA_LIFECYCLE_PROBES=127.0.0.1:5540 127.0.0.1:5541"
 Environment=NAKSHATRA_LIFECYCLE_IDLE_GRACE_S=600
 Environment=NAKSHATRA_LIFECYCLE_START_TIMEOUT_S=120
 # L3 lease authority (Sthambha): the pillar owns the grace + the global,
