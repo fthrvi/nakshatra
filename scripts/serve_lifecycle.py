@@ -166,6 +166,119 @@ class CompositeController(ChainController):
         return all(c.is_ready() for c in self.controllers)
 
 
+@dataclass
+class RosterWorkerSpec:
+    """How to summon the LOCAL workers for a from_roster model — the autonomous arm of slice 4.
+    Instead of fixed pre-cut systemd units, the controller asks the planner (serve_chain) for the
+    current firewall-eligible assignment and launches one `worker.py` per LOCAL slot, each
+    SELF-PROVISIONING its layer slice from the content-addressed package (`--package-url`). Remote
+    slots are left to the mesh/SSH controllers — this one only owns this box's workers."""
+    model_id: str
+    hidden_size: int
+    package_location: str
+    num_layers: Optional[int] = None
+    daemon_bin: str = str(__import__("pathlib").Path.home() / "llama.cpp" / "build" / "bin" / "llama-nakshatra-worker")
+    python_bin: str = ""                   # which python runs worker.py (default: this interpreter)
+    scripts_dir: str = ""                  # where worker.py lives (default: this file's dir)
+    slice_dir: str = ""                    # self-provision dest dir (default ~/.nakshatra/slices)
+    n_ctx: int = 2048
+    n_gpu_layers: int = 99
+    worker_env: dict = field(default_factory=dict)
+
+
+class RosterWorkerController(ChainController):
+    """Summon/reap THIS box's workers for a from_roster model at the planner's assigned ranges,
+    self-provisioning each slice from the package. Same ChainController surface as the others, so the
+    same ChainLifecycle (scale-to-zero, reaper, optional pillar lease) governs it unchanged.
+
+    `plan_fn` is injectable (returns the chain dict {model, workers:[{id,address,port,layer_range,
+    mode}]}) so this tests without a control plane; `launch_fn(spec_dict)->Popen` is injectable so it
+    tests without a GPU."""
+
+    def __init__(self, spec: RosterWorkerSpec, *, plan_fn: Optional[Callable] = None,
+                 launch_fn: Optional[Callable] = None, log: Callable[[str], None] = print):
+        self.spec = spec
+        self._plan_fn = plan_fn
+        self._launch_fn = launch_fn
+        self._log = log
+        self._procs: list = []
+        self._probes: "list[tuple[str, int]]" = []
+        self.chain_yaml: Optional[str] = None
+
+    def _plan(self):
+        if self._plan_fn is not None:
+            return self._plan_fn()
+        import sys as _sys
+        from pathlib import Path as _P
+        fab = str(_P(self.spec.scripts_dir or _P(__file__).resolve().parent) / "fabric")
+        if fab not in _sys.path:
+            _sys.path.insert(0, fab)
+        from serve_chain import build_chain_from_roster
+        import yaml as _yaml
+        self.chain_yaml = build_chain_from_roster(
+            self.spec.model_id, hidden_size=self.spec.hidden_size,
+            num_layers=self.spec.num_layers, package_location=self.spec.package_location)
+        return _yaml.safe_load(open(self.chain_yaml))
+
+    def _default_launch(self, w: dict):
+        import sys as _sys
+        from pathlib import Path as _P
+        scripts = self.spec.scripts_dir or str(_P(__file__).resolve().parent)
+        py = self.spec.python_bin or _sys.executable
+        slice_dir = _P(self.spec.slice_dir or (_P.home() / ".nakshatra" / "slices"))
+        slice_dir.mkdir(parents=True, exist_ok=True)
+        s, e = w["layer_range"]
+        dest = slice_dir / f"{self.spec.model_id}-selfprov-L{s}-{e}.gguf"
+        env = {**os.environ, **(self.spec.worker_env or {})}
+        cmd = [py, str(_P(scripts) / "worker.py"), "--port", str(w["port"]),
+               "--sub-gguf", str(dest), "--package-url", self.spec.package_location,
+               "--mode", w["mode"], "--layer-start", str(s), "--layer-end", str(e),
+               "--model-id", self.spec.model_id, "--daemon-bin", self.spec.daemon_bin,
+               "--n-ctx", str(self.spec.n_ctx), "--n-gpu-layers", str(self.spec.n_gpu_layers),
+               "--node-id", f"roster-{w['id']}"]
+        return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+
+    def start(self) -> None:
+        chain = self._plan()
+        self._probes = []
+        launch = self._launch_fn or self._default_launch
+        for w in chain["workers"]:
+            host, port = w["address"], int(w["port"])
+            self._probes.append((host, port))
+            if host not in ("127.0.0.1", "localhost", "0.0.0.0"):
+                self._log(f"[lifecycle] {w['id']} is REMOTE ({host}:{port}) — left to the "
+                          f"mesh/SSH controller, not launched locally")
+                continue
+            if self._port_open(host, port):
+                continue                                   # already serving — leave it
+            self._log(f"[lifecycle] summon roster worker {w['id']} "
+                      f"layers={w['layer_range']} (self-provision from package)")
+            self._procs.append(launch(w))
+
+    def stop(self) -> None:
+        for p in self._procs:
+            try:
+                p.terminate()
+                p.wait(timeout=10)
+            except Exception:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+        self._procs = []
+
+    @staticmethod
+    def _port_open(host: str, port: int) -> bool:
+        try:
+            with socket.create_connection((host, port), timeout=2):
+                return True
+        except OSError:
+            return False
+
+    def is_ready(self) -> bool:
+        return bool(self._probes) and all(self._port_open(h, p) for h, p in self._probes)
+
+
 # ── L3: the pillar (Sthambha) as the lease authority ─────────────────
 class PillarLeaseClient:
     """Consumer side of the pillar compute-lease. The pillar OWNS the lease (the
@@ -386,7 +499,8 @@ def from_env(log: Callable[[str], None] = print) -> Optional[ChainLifecycle]:
     Returns None when nothing is configured (legacy always-on)."""
     units = (os.environ.get("NAKSHATRA_LIFECYCLE_UNITS") or "").split()
     remote_cfg = os.environ.get("NAKSHATRA_LIFECYCLE_REMOTE_CONFIG") or ""
-    if not units and not remote_cfg:
+    roster_model = os.environ.get("NAKSHATRA_LIFECYCLE_ROSTER_MODEL") or ""
+    if not units and not remote_cfg and not roster_model:
         return None
 
     controllers: "list[ChainController]" = []
@@ -399,6 +513,21 @@ def from_env(log: Callable[[str], None] = print) -> Optional[ChainLifecycle]:
     if remote_cfg:
         controllers.append(RemoteSshController(
             _remote_workers_from_json(remote_cfg), log=log))
+    if roster_model:
+        # Autonomous from_roster launch: summon THIS box's workers at the planner's assigned ranges,
+        # each self-provisioning its slice from the package. Hidden size is required (the chain header).
+        spec = RosterWorkerSpec(
+            model_id=roster_model,
+            hidden_size=int(os.environ["NAKSHATRA_LIFECYCLE_ROSTER_HIDDEN_SIZE"]),
+            package_location=os.environ.get("NAKSHATRA_LIFECYCLE_ROSTER_PACKAGE", ""),
+            num_layers=int(os.environ["NAKSHATRA_LIFECYCLE_ROSTER_NUM_LAYERS"])
+            if os.environ.get("NAKSHATRA_LIFECYCLE_ROSTER_NUM_LAYERS") else None,
+            daemon_bin=os.environ.get("NAKSHATRA_LIFECYCLE_DAEMON_BIN")
+            or RosterWorkerSpec.daemon_bin,
+            python_bin=os.environ.get("NAKSHATRA_LIFECYCLE_PYTHON_BIN", ""),
+            n_gpu_layers=int(os.environ.get("NAKSHATRA_LIFECYCLE_N_GPU_LAYERS", "99")),
+            n_ctx=int(os.environ.get("NAKSHATRA_LIFECYCLE_N_CTX", "2048")))
+        controllers.append(RosterWorkerController(spec, log=log))
 
     ctrl = controllers[0] if len(controllers) == 1 else CompositeController(controllers)
     grace = float(os.environ.get("NAKSHATRA_LIFECYCLE_IDLE_GRACE_S", "600"))
