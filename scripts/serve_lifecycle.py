@@ -24,6 +24,8 @@ Wiring (env on the serve; absent ⇒ feature OFF, legacy always-on behaviour):
 from __future__ import annotations
 
 import os
+import re
+import signal
 import socket
 import subprocess
 import threading
@@ -203,6 +205,7 @@ class RosterWorkerController(ChainController):
         self._log = log
         self._procs: list = []
         self._probes: "list[tuple[str, int]]" = []
+        self._adopted_ports: "list[int]" = []
         self.chain_yaml: Optional[str] = None
 
     def _plan(self):
@@ -236,11 +239,15 @@ class RosterWorkerController(ChainController):
                "--model-id", self.spec.model_id, "--daemon-bin", self.spec.daemon_bin,
                "--n-ctx", str(self.spec.n_ctx), "--n-gpu-layers", str(self.spec.n_gpu_layers),
                "--node-id", f"roster-{w['id']}"]
-        return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+        # start_new_session → own process group, so stop() can reap the worker AND its
+        # spawned daemon (the GPU-VRAM holder) in one killpg, not orphan the daemon.
+        return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                env=env, start_new_session=True)
 
     def start(self) -> None:
         chain = self._plan()
         self._probes = []
+        self._adopted_ports = []          # LOCAL ports already served by a PRIOR process
         launch = self._launch_fn or self._default_launch
         for w in chain["workers"]:
             host, port = w["address"], int(w["port"])
@@ -250,22 +257,61 @@ class RosterWorkerController(ChainController):
                           f"mesh/SSH controller, not launched locally")
                 continue
             if self._port_open(host, port):
-                continue                                   # already serving — leave it
+                # A worker is already serving this port — from a PREVIOUS serve process
+                # (we didn't launch it, so we hold no Popen handle). Record it so stop()
+                # can still reap it BY PORT; else it squats VRAM forever across restarts.
+                self._adopted_ports.append(port)
+                continue
             self._log(f"[lifecycle] summon roster worker {w['id']} "
                       f"layers={w['layer_range']} (self-provision from package)")
             self._procs.append(launch(w))
 
     def stop(self) -> None:
+        # 1) workers WE launched: kill the whole process group (worker + its daemon child)
         for p in self._procs:
             try:
-                p.terminate()
+                os.killpg(os.getpgid(p.pid), signal.SIGTERM)
                 p.wait(timeout=10)
             except Exception:
-                try:
-                    p.kill()
-                except Exception:
-                    pass
+                # fallback: no real process group (e.g. injected test procs) → terminate directly
+                for fn in (getattr(p, "terminate", None), getattr(p, "kill", None)):
+                    try:
+                        if fn:
+                            fn()
+                    except Exception:
+                        pass
         self._procs = []
+        # 2) workers adopted from a prior process: reap BY PORT (frees their VRAM too)
+        for port in getattr(self, "_adopted_ports", []):
+            self._reap_listener(port)
+        self._adopted_ports = []
+
+    @staticmethod
+    def _reap_listener(port: int) -> None:
+        """Best-effort: terminate the process listening on `port` AND its children
+        (the worker.py holds the gRPC port; its daemon child holds the VRAM). Used to
+        reap workers a previous serve process launched, which we hold no handle to."""
+        try:
+            out = subprocess.run(["ss", "-tlnpH", f"sport = :{port}"],
+                                 capture_output=True, text=True, timeout=5).stdout
+        except Exception:
+            return
+        pids = set(re.findall(r"pid=(\d+)", out))
+        for pid in pids:
+            pid = int(pid)
+            # children first (the daemon), then the listener
+            try:
+                kids = subprocess.run(["pgrep", "-P", str(pid)], capture_output=True,
+                                      text=True, timeout=5).stdout.split()
+            except Exception:
+                kids = []
+            for tgt in [int(k) for k in kids] + [pid]:
+                for sig in (signal.SIGTERM, signal.SIGKILL):
+                    try:
+                        os.kill(tgt, sig)
+                        break
+                    except Exception:
+                        pass
 
     @staticmethod
     def _port_open(host: str, port: int) -> bool:
