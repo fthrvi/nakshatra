@@ -51,6 +51,7 @@ from nakshatra_auth import load_or_create_worker_key  # noqa: E402
 from discovery.nakshatra_listing import NakshatraListing, rank_listings  # noqa: E402
 from discovery.relay import FileRelay, pin_from_listing  # noqa: E402
 from recovery.drift_aware import drift_compatible  # noqa: E402
+from discovery.provenance import provenance_from_daemon  # noqa: E402
 from transport.relay import connect as relay_connect  # noqa: E402
 from transport.secure_channel import secure_handshake  # noqa: E402
 from transport.mux_tunnel import MuxTunnel  # noqa: E402
@@ -89,6 +90,8 @@ class MeshConfig:
     refresh: float
     identity_file: Path
     status_file: Path
+    daemon_bin: Optional[str] = None    # local engine binary → build-provenance fingerprint
+    provenance_pin: Optional[str] = None  # expected provenance.short(); loud alert if the running build differs
     once: bool = False                  # one loop then exit (for tests/CI)
     peer_ttl: float = 0.0               # ignore listings older than this (0 → auto)
 
@@ -108,6 +111,21 @@ class MeshNode:
         self._stop = threading.Event()
         self._last_peers: list[dict] = []
         self._log(f"identity {self.node_id} (pub {self.pub[:16]}…) mesh={cfg.mesh_id}")
+        # Build-provenance: WHICH engine build is running (companion to the drift
+        # gauge's WHAT-it-computes). Computed from the local daemon binary; logged
+        # + surfaced in the status file; a pin mismatch is a loud integrity alert
+        # (the engine changed) — it never blocks chaining (drift_compatible owns that).
+        self.provenance = None
+        if cfg.daemon_bin:
+            try:
+                self.provenance = provenance_from_daemon(cfg.daemon_bin)
+                self._log(f"build-provenance {self.provenance.describe()}")
+                if cfg.provenance_pin and self.provenance.short() != cfg.provenance_pin:
+                    self._log(f"⚠ PROVENANCE MISMATCH: running {self.provenance.short()} != "
+                              f"pinned {cfg.provenance_pin} — the engine build changed "
+                              f"(update/swap/tamper). drift-class still gates chaining.")
+            except Exception as e:
+                self._log(f"build-provenance unavailable for {cfg.daemon_bin}: {e}")
 
     # ── logging ──
     def _log(self, msg: str) -> None:
@@ -251,6 +269,8 @@ class MeshNode:
             "mesh_id": self.cfg.mesh_id,
             "serving": self.cfg.serving,
             "drift_class": self.cfg.drift_class,
+            "provenance": self.provenance.short() if self.provenance else None,
+            "provenance_detail": self.provenance.describe() if self.provenance else None,
             "relay_dir": self.cfg.relay_dir,
             "rendezvous": f"{self.cfg.rendezvous_host}:{self.cfg.rendezvous_port}",
             "updated_unix": int(time.time()),
@@ -319,6 +339,12 @@ def _parse_args(argv=None) -> MeshConfig:
                     help="this node's local gRPC worker host:port to serve")
     ap.add_argument("--drift-class", default=None,
                     help="this node's drift-class fingerprint (gauge); peers must match")
+    ap.add_argument("--daemon-bin", default="",
+                    help="local engine binary; its hash + --version stamps form this "
+                         "node's build-provenance fingerprint (which build is running)")
+    ap.add_argument("--provenance-pin", default="",
+                    help="expected provenance short id (provN:hash12); loud alert if the "
+                         "running build differs — integrity check, not a chaining gate")
     ap.add_argument("--endpoint", default="", help="advisory dial hint in the listing")
     ap.add_argument("--decode-ms-per-layer", type=float, default=None,
                     help="measured compute signal for ranking")
@@ -337,13 +363,16 @@ def _parse_args(argv=None) -> MeshConfig:
     serving = [s for s in a.serving if s]
     worker_addr = a.worker_addr or None
     drift_class = a.drift_class or None
+    daemon_bin = a.daemon_bin or None
+    provenance_pin = a.provenance_pin or None
     return MeshConfig(
         mesh_id=a.mesh_id, serving=serving, relay_dir=a.relay_dir,
         rendezvous_host=host or "127.0.0.1", rendezvous_port=int(port),
         worker_addr=worker_addr, drift_class=drift_class,
         endpoint_hint=a.endpoint, decode_ms_per_layer=a.decode_ms_per_layer,
         refresh=a.refresh, identity_file=Path(a.identity_file),
-        status_file=Path(a.status_file), once=a.once, peer_ttl=a.peer_ttl,
+        status_file=Path(a.status_file), daemon_bin=daemon_bin,
+        provenance_pin=provenance_pin, once=a.once, peer_ttl=a.peer_ttl,
     )
 
 
