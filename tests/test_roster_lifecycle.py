@@ -80,6 +80,23 @@ def test_stop_terminates_launched():
     assert c._procs == []
 
 
+def test_adopts_and_reaps_prior_process_workers():
+    """Cross-restart squatting fix: a port already served by a PRIOR serve process is
+    recorded as adopted and reaped BY PORT on stop — not skipped-and-orphaned (which
+    left ~6GB squatting until a manual kill)."""
+    workers = [{"id": "a", "address": "127.0.0.1", "port": 5560, "layer_range": [0, 16], "mode": "first"},
+               {"id": "b", "address": "127.0.0.1", "port": 5561, "layer_range": [16, 32], "mode": "last"}]
+    c, launched = _controller(workers, open_ports=(5560,))   # a = a stale prior-process worker
+    c.start()
+    assert c._adopted_ports == [5560]                         # recorded for port-reaping
+    assert [p.w["port"] for p in launched] == [5561]          # b launched fresh (we own it)
+    reaped = []
+    c._reap_listener = staticmethod(lambda port: reaped.append(port))
+    c.stop()
+    assert reaped == [5560]                                   # adopted worker reaped by port
+    assert c._procs == [] and c._adopted_ports == []          # and our own launched proc torn down
+
+
 def test_is_ready_requires_all_probes_open():
     workers = [{"id": "a", "address": "127.0.0.1", "port": 5560, "layer_range": [0, 16], "mode": "first"},
                {"id": "b", "address": "127.0.0.1", "port": 5561, "layer_range": [16, 32], "mode": "last"}]
