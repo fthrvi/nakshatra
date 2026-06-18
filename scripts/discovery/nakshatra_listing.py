@@ -58,6 +58,14 @@ class NakshatraListing:
     # (ungated). Lets discovery pre-filter to a deterministic class, the same way
     # supported_protocol pre-filters wire versions. See cross-machine-validation.md.
     drift_class: Optional[str] = None
+    # Build-provenance id (v1.1) — WHICH engine build is running, the companion to
+    # drift_class's WHAT-it-computes. `provenance.BuildProvenance.wire()` form
+    # (provN:<full-sha256>): the daemon-binary hash + compile stamps. Lets a peer
+    # verify the build behind an identity, not just its behavioral class. Signed
+    # (in the canonical bytes) so it can't be forged in transit; self-reported, so
+    # it proves "this key CLAIMS this build" + detects tamper/swap, not a remote
+    # attestation. None ⇒ not advertised. NOT a chaining gate (drift_class is).
+    provenance: Optional[str] = None
     created_unix: int = 0
     schema_version: int = SCHEMA_VERSION
     signature_b64: Optional[str] = None
@@ -68,6 +76,12 @@ class NakshatraListing:
         d.pop("signature_b64", None)
         d["serving"] = sorted(self.serving)
         d["wanted"] = sorted(self.wanted)
+        # Backward-compat: omit provenance from the signed bytes when unset, so a
+        # node that doesn't advertise it produces byte-identical canonical bytes to
+        # a pre-provenance listing (existing signatures keep verifying; the field
+        # only enters the signature when a node actually advertises a build).
+        if d.get("provenance") is None:
+            d.pop("provenance", None)
         return d
 
     def canonical_bytes(self) -> bytes:
@@ -144,6 +158,7 @@ class NakshatraListing:
             capacity_full=bool(o.get("capacity_full", False)),
             supported_protocol=list(o.get("supported_protocol", [])),
             drift_class=o.get("drift_class"),
+            provenance=o.get("provenance"),
             created_unix=int(o.get("created_unix", 0)),
             schema_version=int(o.get("schema_version", 0)),
             signature_b64=o.get("signature_b64"),

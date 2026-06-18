@@ -58,6 +58,11 @@ class BuildProvenance:
     def short(self) -> str:
         return f"prov{self.prov_version}:{self.fingerprint[:12]}"
 
+    def wire(self) -> str:
+        """Self-contained, exact-comparable id for advertising to peers
+        (version-tagged full fingerprint). Compare with simple string equality."""
+        return f"prov{self.prov_version}:{self.fingerprint}"
+
     def describe(self) -> str:
         return (f"engine={self.engine_sha256[:12]} code={self.code_sha} "
                 f"host={self.build_host} built={self.built_at} → {self.short()}")

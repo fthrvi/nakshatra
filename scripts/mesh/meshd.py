@@ -142,6 +142,7 @@ class MeshNode:
             endpoint_hint=self.cfg.endpoint_hint,
             supported_protocol=list(SUPPORTED_CONTROL_VERSIONS),
             drift_class=self.cfg.drift_class,
+            provenance=self.provenance.wire() if self.provenance else None,
             created_unix=int(time.time()),
         )
         listing.sign(self.priv)
@@ -259,8 +260,12 @@ class MeshNode:
 
     # ── status ──
     def _write_status(self, peers: list[NakshatraListing]) -> None:
+        my_prov = self.provenance.wire() if self.provenance else None
         self._last_peers = [{"node_id": p.node_id,
                              "drift_class": p.drift_class,
+                             "provenance": p.provenance,
+                             # peers can now verify each other's BUILD, not just behavior:
+                             "same_build_as_me": (my_prov is not None and p.provenance == my_prov),
                              "decode_ms_per_layer": p.measured_decode_ms_per_layer,
                              "endpoint_hint": p.endpoint_hint} for p in peers]
         status = {
@@ -269,7 +274,7 @@ class MeshNode:
             "mesh_id": self.cfg.mesh_id,
             "serving": self.cfg.serving,
             "drift_class": self.cfg.drift_class,
-            "provenance": self.provenance.short() if self.provenance else None,
+            "provenance": self.provenance.wire() if self.provenance else None,
             "provenance_detail": self.provenance.describe() if self.provenance else None,
             "relay_dir": self.cfg.relay_dir,
             "rendezvous": f"{self.cfg.rendezvous_host}:{self.cfg.rendezvous_port}",
