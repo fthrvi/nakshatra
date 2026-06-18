@@ -50,11 +50,17 @@ needs FOUR things. **It is NOT one command — (B) the daemon build is the gatin
 python3 -m venv ~/nks-venv && ~/nks-venv/bin/pip install grpcio protobuf cryptography pyyaml gguf numpy
 ```
 
-**(B) ⚠ THE DAEMON — `llama-nakshatra-worker` — NOT in the repo; must be BUILT for ijru's arch.**
-The hub's binary is gfx1201-ROCm and won't run elsewhere. ijru builds the patched llama.cpp (partial-load)
-for ITS backend (CPU if no GPU). **Need ijru's OS/arch/GPU to give the exact recipe** (Linux-x86-CPU vs
-macOS-Metal differ; macOS uses the lab-Mac recipe in [[project_l2_to_l4_connected]] — copy build +
-`install_name_tool -add_rpath` + `codesign`). The patch lives at `experiments/v0.0/m4_patches/`.
+**(B) THE DAEMON — `llama-nakshatra-worker` — NOT in the repo; BUILD it on ijru.**
+ijru = **Linux x86-64 + NVIDIA** (confirmed 2026-06-17) → **CUDA build**. The hub's binary is gfx1201-ROCm
+and won't run elsewhere, but the partial-load patches are backend-agnostic — the only difference is the
+`-DGGML_CUDA=ON` configure flag. **A verified, idempotent build script is committed: `deploy/build-ijru-cuda.sh`.**
+On ijru, from its nakshatra checkout: `nvcc --version` (CUDA toolkit must be installed) then
+`bash deploy/build-ijru-cuda.sh` → produces `~/llama.cpp/build/bin/llama-nakshatra-worker`. The script
+pins llama.cpp to base `c46583b` (tag b8445), applies the 5 Llama m4 partial-load patches (verified clean
+at `-p4` on that base 2026-06-17; NOT the qwen3moe patches — DeepSeek-R1-Distill-Llama is Llama arch),
+drops the fabric example + registers it, CUDA-configures and builds. Override the SM arch with
+`CUDA_ARCH=86 bash deploy/build-ijru-cuda.sh` if `native` autodetect fails. The patch set lives at
+`experiments/v0.0/m4_patches/`; the worker source at `experiments/v0.0/{worker_daemon.cpp,shm_ring.hpp}`.
 ⚠ **drift-class (CORRECTED 2026-06-17 — it is NOT a build string).** `drift_compatible`
 (`scripts/recovery/drift_aware.py`) compares a **behavioral fingerprint**, not an engine label: the
 hub's live class is `prithvi-q8@gauge1:327418908285` — a hash of the **greedy token-id sequence** the
@@ -85,16 +91,18 @@ scp -r ~/.nakshatra/packages/dsr1-llama8b  ijru:~/.nakshatra/packages/dsr1-llama
 range is assigned by ME at chain-build time (proof: hub=[0,16) first, ijru=[16,32) last, general-7b/32L):
 ```
 # meshd (publish to the SHARED cross-NAT rendezvous — NOT the hub's local 127.0.0.1:51820; the mesh
-# lane owns this addr — likely the VPS relay/junction). Same --mesh-id as the hub.
+# lane owns this addr — the VPS relay/junction). Same --mesh-id (prithvi-q8) as the hub.
+# ⚠ OMIT --drift-class on the FIRST proof: ijru's CUDA build won't match the hub's behavioral
+#   fingerprint (prithvi-q8@gauge1:…); the hub side runs drift-UNSET so this side can too.
 ~/nks-venv/bin/python ~/nakshatra/scripts/mesh/meshd.py --relay-dir ~/.nakshatra/relay \
-  --rendezvous <SHARED-RENDEZVOUS-HOST:PORT> --worker-addr 127.0.0.1:5570 \
-  --mesh-id <hub-mesh-id> --drift-class <ijru-build-class>   # &  (background)
-# the worker (last slot [16,32); --n-gpu-layers 0 if CPU):
+  --rendezvous <SHARED-VPS-RENDEZVOUS:PORT> --worker-addr 127.0.0.1:5570 \
+  --mesh-id prithvi-q8   # & (background) — no --drift-class for the proof
+# the worker (last slot [16,32); NVIDIA → offload with --n-gpu-layers 99):
 NAKSHATRA_TLS_REQUIRED=false NAKSHATRA_AUTH_REQUIRED=false NAKSHATRA_REFUSE_UNREGISTERED_PEERS=false \
 ~/nks-venv/bin/python ~/nakshatra/scripts/worker.py --port 5570 \
-  --sub-gguf ~/.nakshatra/ijru-L16-32.gguf --package-url http://<hub-relay-addr>:8099/dsr1-llama8b \
+  --sub-gguf ~/.nakshatra/ijru-L16-32.gguf --package-url ~/.nakshatra/packages/dsr1-llama8b \
   --mode last --layer-start 16 --layer-end 32 --model-id general-7b \
-  --daemon-bin ~/<built-daemon-path> --n-ctx 2048 --n-gpu-layers 0 --node-id ijru-w
+  --daemon-bin ~/llama.cpp/build/bin/llama-nakshatra-worker --n-ctx 2048 --n-gpu-layers 99 --node-id ijru-w
 ```
 Then ping me: the hub's meshd tunnels ijru's worker to a local `127.0.0.1:<local_port>`; I put that port
 in the chain as the `last` worker (hub serves `first` [0,16)), run client.py → the real two-box token.
