@@ -1,8 +1,18 @@
-# Cross-box unconscious / federation proof (ijru = operator-B) — STAGED, deferred
+# Cross-box unconscious / federation proof (ijru = operator-B) — ALL 3 GATES CLOSED, awaiting ijru online
 
 The last open piece of Fork A: a **true cross-box run** — a 2nd operator's box (`ijru`) serving part of
-a chain over the mesh. **Deferred** 2026-06-16 (Biswa + the federation lane): `ijru` is doing Phase 2
-(verified distro PULL) first, not serving yet. Everything below is staged so wiring it is fast.
+a chain over the mesh.
+
+**STATUS 2026-06-17 — every gate on the hub/infra side is CLOSED; only ijru-being-online remains:**
+- **(a) ijru daemon build:** ✅ verified CUDA recipe `deploy/build-ijru-cuda.sh` (patches verified clean at -p4).
+- **(b) shared rendezvous:** ✅ LIVE — `nakshatra-rendezvous.service` on the VPS `45.63.109.137:51820`
+  (neutral blind-L4 junction; hub publishes to it cleanly, validated). No home-mesh port exposed.
+- **(c) drift-class:** ✅ resolved — heterogeneous ijru will mismatch the behavioral gauge, so the hub
+  side runs drift-UNSET (validated: proof meshd published to the VPS with no `--drift-class`).
+- Data-plane through the meshd tunnel: ✅ de-risked (`257ff02`).
+
+**To finish:** ijru comes online → runs `build-ijru-cuda.sh` → scp the package → meshd(→VPS, no drift)
++ worker → ping me → I start the hub proof meshd + wire `hub[0,16)+ijru[16,32)` on `general-7b` → token.
 
 ## The proof (what we run when ijru is up)
 NOT "ijru serves the unconscious" — the firewall forbids that, by design:
@@ -90,12 +100,13 @@ scp -r ~/.nakshatra/packages/dsr1-llama8b  ijru:~/.nakshatra/packages/dsr1-llama
 **(D) meshd publish + worker run** — so the hub's meshd discovers + tunnels ijru's worker. ijru's layer
 range is assigned by ME at chain-build time (proof: hub=[0,16) first, ijru=[16,32) last, general-7b/32L):
 ```
-# meshd (publish to the SHARED cross-NAT rendezvous — NOT the hub's local 127.0.0.1:51820; the mesh
-# lane owns this addr — the VPS relay/junction). Same --mesh-id (prithvi-q8) as the hub.
+# meshd (publish to the SHARED cross-NAT rendezvous — the VPS neutral junction, LIVE 2026-06-17:
+# nakshatra-rendezvous.service on 45.63.109.137:51820, reachable over the internet). Same --mesh-id
+# (prithvi-q8) as the hub. NOT the hub's local 127.0.0.1:51820.
 # ⚠ OMIT --drift-class on the FIRST proof: ijru's CUDA build won't match the hub's behavioral
 #   fingerprint (prithvi-q8@gauge1:…); the hub side runs drift-UNSET so this side can too.
 ~/nks-venv/bin/python ~/nakshatra/scripts/mesh/meshd.py --relay-dir ~/.nakshatra/relay \
-  --rendezvous <SHARED-VPS-RENDEZVOUS:PORT> --worker-addr 127.0.0.1:5570 \
+  --rendezvous 45.63.109.137:51820 --worker-addr 127.0.0.1:5570 \
   --mesh-id prithvi-q8   # & (background) — no --drift-class for the proof
 # the worker (last slot [16,32); NVIDIA → offload with --n-gpu-layers 99):
 NAKSHATRA_TLS_REQUIRED=false NAKSHATRA_AUTH_REQUIRED=false NAKSHATRA_REFUSE_UNREGISTERED_PEERS=false \
@@ -140,7 +151,7 @@ All three are non-destructive and leave the LIVE consumer meshd + the live uncon
    ```
    ~/nakshatra/.venv/bin/python ~/nakshatra/scripts/mesh/meshd.py \
      --mesh-id prithvi-q8 --relay-dir ~/.nakshatra/relay \
-     --rendezvous <SHARED-VPS-RENDEZVOUS:PORT>  --worker-addr 127.0.0.1:5540 \
+     --rendezvous 45.63.109.137:51820  --worker-addr 127.0.0.1:5540 \
      --endpoint hub-proof   # NO --drift-class  → drift_compatible() returns True for any ijru class
    ```
    (`--worker-addr` = the hub's first-half worker so meshd advertises it; the proof chain itself is
