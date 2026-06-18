@@ -107,10 +107,29 @@ NAKSHATRA_TLS_REQUIRED=false NAKSHATRA_AUTH_REQUIRED=false NAKSHATRA_REFUSE_UNRE
 Then ping me: the hub's meshd tunnels ijru's worker to a local `127.0.0.1:<local_port>`; I put that port
 in the chain as the `last` worker (hub serves `first` [0,16)), run client.py → the real two-box token.
 
-**Cross-lane prerequisites (NOT serve-layers):** (1) the SHARED cross-NAT rendezvous addr both meshds
-use — mesh lane (hub meshd currently `--rendezvous=127.0.0.1:51820`, LOCAL-only; verified 2026-06-17,
-`0 same-class peer(s); 0 tunnel(s) up`); (2) ijru's daemon build (drift mismatch is expected → hub-side
-drift UNSET for the proof, see below). My data-plane is de-risked (`257ff02`); these two gate the run.
+**Cross-lane prerequisites (NOT serve-layers):** (1) the SHARED cross-NAT rendezvous — DIAGNOSED FULLY
+2026-06-17 (see below); (2) ijru's daemon build — CLOSED (`build-ijru-cuda.sh`). Data-plane de-risked
+(`257ff02`).
+
+### Gate (b) FULLY DIAGNOSED 2026-06-17 — it's a firewall boundary, not a missing address
+Topology: relay VPS `45.63.109.137`, roaming-client pool `10.51.0.0/24` (relay self `10.51.0.1`),
+bridged into the home mesh `10.42.0.0/24` by the **Pi** (`10.42.0.3`, holds both nets:
+prithvi-wg0 + wg-egress). ijru = roaming client `10.51.0.14`.
+- The hub's nakshatra-relay (`relay.py`, the rendezvous) ALREADY listens on `*:51820` → reachable at
+  `10.42.0.1:51820`; meshd merely *connects* to `127.0.0.1`. Routing hub↔ijru exists via the Pi.
+- **BUT** the Pi's `PRITHVI_RELAY` FORWARD chain scopes roaming clients to ONLY `10.42.0.2:80,443`
+  (kali apps) + `10.42.0.3:53` (DNS), else **DROP**. So **ijru CANNOT reach `10.42.0.1:51820` today** —
+  the rendezvous is firewalled off by design (the VPS-relay multi-tenant scoping). This is gate (b).
+- **Two ways to open it (Biswa's security call):**
+  - **(b2, RECOMMENDED, sovereign-correct):** run `relay.py` on the VPS `45.63.109.137` as the neutral
+    blind-L4 junction (it's an *untrusted byte-forwarder* by design; the meshd tunnel is E2E-encrypted
+    over it, so the VPS sees only ciphertext). Both hub (route via wg) + ijru (relay client) reach it
+    WITHOUT exposing any home-mesh port to the roaming net. Matches `infra/nakshatra-junction`'s
+    "a blind-L4 junction must be listening". Rendezvous = `45.63.109.137:<port>`. Requires a VPS deploy.
+  - **(b1, faster, weaker):** add one scoped rule to the Pi's `PRITHVI_RELAY`:
+    `-d 10.42.0.1/32 -p tcp --dport 51820 -j ACCEPT` (insert before the trailing DROP). Then rendezvous
+    = `10.42.0.1:51820`. Pokes a single hole into the home mesh for the roaming net — reversible, but
+    weakens the boundary the audit established. Acceptable for a one-off proof; revert after.
 
 ## HUB-SIDE proof prep (my lane — staged, run at proof time; reversible)
 All three are non-destructive and leave the LIVE consumer meshd + the live unconscious untouched.
