@@ -102,8 +102,12 @@ class DraftModel:
     def __init__(self, model_path: str, n_ctx: int = 4096, n_gpu_layers: int = -1,
                  seed: int = 0, verbose: bool = False):
         from llama_cpp import Llama  # lazy: only when a real draft is constructed
+        # logits_all=True is REQUIRED: in llama-cpp-python 0.3.x, eval() only writes per-token
+        # logits into .scores when logits_all is set (the logits_all=False branch is a `pass`),
+        # so greedy argmax off .scores returns garbage without it. n_ctx is kept modest to bound
+        # the (n_ctx × n_vocab) scores allocation.
         self._llama = Llama(model_path=model_path, n_ctx=n_ctx, n_gpu_layers=n_gpu_layers,
-                            logits_all=False, seed=seed, verbose=verbose)
+                            logits_all=True, seed=seed, verbose=verbose)
         self.model_path = model_path
 
     def propose(self, prefix_tokens: Sequence[int], k: int) -> List[int]:
@@ -118,7 +122,7 @@ class DraftModel:
         llama.eval(list(prefix_tokens))
         out: List[int] = []
         for _ in range(k):
-            logits = llama.scores[llama.n_tokens - 1] if hasattr(llama, "scores") else llama.eval_logits[-1]
+            logits = llama.scores[llama.n_tokens - 1]   # last-token row (logits_all=True)
             tok = int(np.argmax(logits))
             out.append(tok)
             llama.eval([tok])
