@@ -15,6 +15,9 @@ service Nakshatra {
   rpc Info(InfoRequest) returns (InfoResponse);
   rpc Forward(ForwardRequest) returns (ForwardResponse);
   rpc Inference(stream InferenceStep) returns (stream InferenceStep);
+  // Speculative decoding (slice 1): discard a rejected speculative tail from this
+  // worker's KV. The coordinator fans this out to EVERY worker after accept().
+  rpc TruncateKV(TruncateRequest) returns (TruncateResponse);
 }
 
 message InfoRequest {}
@@ -49,11 +52,23 @@ message ForwardRequest {
   bool   has_token_ids = 4;          // if true, hidden_in is actually token IDs (worker 0 path)
   bool   keep_kv       = 5;          // streaming: don't clear KV cache before decode (set true on steps after the prefill)
   int32  start_pos     = 6;          // streaming: position of the first token in the worker's KV cache
+  // Speculative verify (slice 1): request the greedy argmax at EVERY position, not
+  // just the last. Default false → legacy single-final-token behaviour, unchanged.
+  // On the last worker, hidden_out then carries int32 top_token[n_tokens].
+  bool   all_logits    = 7;
 }
 
 message ForwardResponse {
   bytes hidden_out = 1;
 }
+
+// Speculative decoding: truncate this worker's KV to keep positions [0, n_keep),
+// discarding the rejected speculative tail. Driven by daemon cmd=4 (KV_TRUNCATE).
+message TruncateRequest {
+  int32 n_keep = 1;   // number of leading KV positions to keep for seq 0
+}
+
+message TruncateResponse {}
 
 message InferenceStep {
   string session_id     = 1;         // stable across the stream
