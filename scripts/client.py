@@ -33,6 +33,9 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import yaml
 
+from edge_health import EdgeError, EdgeFailureKind   # #17 live seam: typed edge faults so the
+# recovery loop can swap a dead worker instead of the process dying. Pure stdlib (duck-types grpc).
+
 # grpc + the generated stubs are needed only by the chain-walking / RPC
 # paths, NOT by registry discovery: build_chain_from_registry and its
 # helpers (_peer_chain_score, _try_pillar_chain, _sanitize_spki) are pure
