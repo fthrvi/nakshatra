@@ -71,9 +71,22 @@ class LedgerHook:
         try:
             with open(receipt_path) as f:
                 receipt = json.load(f)
-            return self._post("/settle", {"receipt": receipt, "requester": self.requester})
+            body = {"receipt": receipt, "requester": self.requester}
+            own = self._own_nodes(receipt)
+            if own:
+                body["own_nodes"] = own        # local infra → free
+            return self._post("/settle", body)
         except Exception:
             return None
+
+    def _own_nodes(self, receipt):
+        """Which serving nodes belong to the requester (→ free). NAKSHATRA_LEDGER_OWN_ALL=1 treats
+        every worker in the run as own (right for a single-operator box like Prithvi's); otherwise
+        NAKSHATRA_LEDGER_OWN_NODES is a comma list. Empty → nothing free (pure pay)."""
+        if _truthy(os.environ.get("NAKSHATRA_LEDGER_OWN_ALL", "")):
+            return [c.get("node_id") for c in receipt.get("chain", []) if c.get("node_id")]
+        nodes = os.environ.get("NAKSHATRA_LEDGER_OWN_NODES", "").strip()
+        return [n.strip() for n in nodes.split(",") if n.strip()] if nodes else []
 
     # ---- transport ----
     def _get(self, path: str):
