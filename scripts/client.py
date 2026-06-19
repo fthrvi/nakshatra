@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import queue
 import struct
 import sys
@@ -118,10 +119,10 @@ def detok_one(llama, tid):
 
 
 def call_forward(stub, payload, n_tokens, has_token_ids, worker_id="<unknown>",
-                 keep_kv=False, start_pos=0, timing=None):
+                 keep_kv=False, start_pos=0, timing=None, all_logits=False):
     req = pb.ForwardRequest(
         hidden_in=payload, batch=1, n_tokens=n_tokens, has_token_ids=has_token_ids,
-        keep_kv=keep_kv, start_pos=start_pos,
+        keep_kv=keep_kv, start_pos=start_pos, all_logits=all_logits,
     )
     t0 = time.time()
     try:
@@ -487,11 +488,28 @@ def main():
                          "v0.1 70B cluster). 'required': refuse to talk to "
                          "any worker without a declared SPKI hash. 'off': "
                          "force plaintext channels (escape hatch).")
+<<<<<<< HEAD
     ap.add_argument("--receipt-out", type=str, default="",
                     help="speed-stack #20: write a verifiable run receipt (JSON) to this "
                          "path after the run — distinct workers + per-stage timing + output "
                          "token sha256 + layer-map; verify with scripts/receipt.verify_receipt")
+=======
+    # Speculative decoding (slice 1). Default OFF; also enabled by env
+    # NAKSHATRA_SPECULATIVE=1. Engages only in unary mode when a draft model is
+    # given AND every worker advertises the "speculative" capability; any failure
+    # falls back to plain decode via the existing recovery path.
+    ap.add_argument("--speculative", action="store_true",
+                    help="enable speculative decoding (needs --draft-model-path; "
+                         "unary Forward mode only for slice 1)")
+    ap.add_argument("--draft-model-path", type=str, default="",
+                    help="full GGUF of a small same-tokenizer draft model "
+                         "(e.g. Llama-3.2-1B); runs locally on the coordinator")
+    ap.add_argument("--draft-max", type=int, default=4,
+                    help="K: number of tokens the draft proposes per step")
+>>>>>>> 09b466e (feat(inference): wire speculative decoding into the distributed decode loop (C))
     args = ap.parse_args()
+    if os.environ.get("NAKSHATRA_SPECULATIVE", "") in ("1", "true", "True"):
+        args.speculative = True
     # --use-streaming-push implies --use-streaming
     if args.use_streaming_push:
         args.use_streaming = True
@@ -663,6 +681,36 @@ def main():
     tokens, llama = tokenize_local(args.model_path, args.prompt)
     print(f"[chain] {len(tokens)} prompt tokens: {tokens}")
 
+    # ── Speculative decoding setup (slice 1) ──────────────────────────────────
+    # Engages only when explicitly enabled, a draft model is given, we're in unary
+    # Forward mode, and EVERY worker advertises the "speculative" capability. Any
+    # miss → plain decode (no error). Mirrors the push capability-negotiation above.
+    draft = None
+    accept = kv_keep_after = None          # bound when spec engages; used only then
+    spec_active = False
+    spec_k = max(1, int(args.draft_max))
+    if args.speculative:
+        reasons = []
+        if not args.draft_model_path:
+            reasons.append("no --draft-model-path")
+        if args.use_streaming or args.use_streaming_push:
+            reasons.append("streaming/push mode (slice 1 verify is unary-only)")
+        non_spec = [w["id"] for w, _, info in sorted_stubs
+                    if "speculative" not in info.protocol_capabilities]
+        if non_spec:
+            reasons.append(f"workers lack 'speculative' capability: {non_spec}")
+        if reasons:
+            print(f"[spec] requested but disabled: {'; '.join(reasons)} — plain decode.",
+                  file=sys.stderr)
+        else:
+            try:
+                from speculative import DraftModel, accept, kv_keep_after
+                draft = DraftModel(args.draft_model_path)
+                spec_active = True
+                print(f"[spec] ON: draft={args.draft_model_path} K={spec_k}", flush=True)
+            except Exception as e:
+                print(f"[spec] draft load failed ({e!r}) — plain decode.", file=sys.stderr)
+
     # Streaming KV reuse: workers keep their KV cache across steps. Step 0 is
     # the cold prefill (full prompt, keep_kv=False, start_pos=0). Each later
     # step ships only the previous newly-generated token (n=1, keep_kv=True,
@@ -697,7 +745,8 @@ def main():
                                       session_id=session_id))
         return out
 
-    def _step_call(idx, stub_tup, payload, n, has_tok, keep_kv, prefix_length):
+    def _step_call(idx, stub_tup, payload, n, has_tok, keep_kv, prefix_length,
+                   all_logits=False):
         w = stub_tup[0]
         if args.use_streaming_push:
             # Only the first worker is contacted directly. The step carries
@@ -715,7 +764,8 @@ def main():
                                        prefix_length=prefix_length, timing=timing)
         return call_forward(stub_tup[1], payload, n, has_token_ids=has_tok,
                             worker_id=w["id"],
-                            keep_kv=keep_kv, start_pos=prefix_length, timing=timing)
+                            keep_kv=keep_kv, start_pos=prefix_length, timing=timing,
+                            all_logits=all_logits)
 
     # v0.5 M0.5.4 v0: recovery loop. Wraps the chain walk in an outer
     # retry that, on stream/RPC failure, closes streams, opens fresh ones,
@@ -761,6 +811,61 @@ def main():
 
         try:
             for step in range(already_done, args.max_tokens):
+                # ── Speculative decode (slice 1) ──────────────────────────────
+                # Decode phase only; the cold prefill (step == already_done) stays
+                # plain. The draft proposes K tokens; ONE verify traversal (all_logits)
+                # returns K+1 greedy argmaxes; accept() commits the longest matching
+                # prefix + correction; TruncateKV fans the rejected tail out to EVERY
+                # worker. Any error propagates to the recovery except below, which
+                # resets all KV and disables spec → plain decode resumes (never raises
+                # into Prithvi's path). Output is identical to plain greedy decode.
+                if spec_active and step > already_done:
+                    cur = generated[-1]
+                    drafts = draft.propose(tokens + generated, spec_k)
+                    verify = [cur] + drafts
+                    n_v = len(verify)
+                    payload = struct.pack(f"<{n_v}i", *verify)
+                    hidden = _step_call(0, sorted_stubs[0], payload, n_v, True, True,
+                                        prefix_length, all_logits=True)
+                    if len(hidden) != n_v * n_embd * 4:
+                        raise RuntimeError(f"spec: first worker returned {len(hidden)} bytes")
+                    for idx, stub_tup in enumerate(sorted_stubs[1:-1], start=1):
+                        hidden = _step_call(idx, stub_tup, hidden, n_v, False, True,
+                                            prefix_length, all_logits=True)
+                        if len(hidden) != n_v * n_embd * 4:
+                            raise RuntimeError(f"spec: middle worker returned {len(hidden)} bytes")
+                    last_i = len(sorted_stubs) - 1
+                    last_resp = _step_call(last_i, sorted_stubs[last_i], hidden, n_v, False,
+                                           True, prefix_length, all_logits=True)
+                    if len(last_resp) != n_v * 4:
+                        raise RuntimeError(f"spec: last worker returned {len(last_resp)} bytes, "
+                                           f"expected {n_v * 4} verify argmaxes")
+                    target_argmax = list(struct.unpack(f"<{n_v}i", last_resp))
+                    res = accept(drafts, target_argmax)
+                    n_keep = kv_keep_after(prefix_length, res.n_accepted)
+                    # Fan TruncateKV to EVERY worker (a single miss leaves a stale KV
+                    # tail that silently corrupts the next step). Skip only on all-accept,
+                    # where nothing was trimmed (n_keep == prefix_length + n_v).
+                    if n_keep < prefix_length + n_v:
+                        for _w, _stub, _ in sorted_stubs:
+                            _stub.TruncateKV(pb.TruncateRequest(n_keep=n_keep), timeout=60.0)
+                    prefix_length = n_keep   # next start_pos == kept KV length
+                    stop = False
+                    for t in res.committed:
+                        if len(generated) >= args.max_tokens:
+                            stop = True
+                            break
+                        generated.append(t)
+                        if t in LLAMA3_EOS_IDS:
+                            print(f"[spec] step {step+1}: EOS {t} — stopping")
+                            stop = True
+                            break
+                        print(f"[spec] step {step+1}: +'{detok_one(llama, t)}' "
+                              f"(accept {res.n_accepted}/{spec_k})", flush=True)
+                    if stop or len(generated) >= args.max_tokens:
+                        break
+                    continue
+
                 if step == already_done:
                     # Cold prefill: prompt + any tokens already generated
                     # before this attempt. This rebuilds KV state on the
@@ -825,6 +930,13 @@ def main():
                     )
         except (grpc.RpcError, RuntimeError, SimulatedFailure) as e:
             recovery_attempts += 1
+            if spec_active:
+                # A speculative step may have left KV inconsistent across workers
+                # (partial TruncateKV). Recovery resets ALL KV via cold replay; also
+                # drop to plain decode so we can't re-hit the same spec failure.
+                spec_active = False
+                print("[spec] disabling speculative decode after failure; "
+                      "recovery replays with plain decode.", file=sys.stderr)
             kind = "simulated" if isinstance(e, SimulatedFailure) else type(e).__name__
             print(f"[recovery] {kind} failure: {e}", file=sys.stderr)
             if recovery_attempts > args.max_recovery_attempts:

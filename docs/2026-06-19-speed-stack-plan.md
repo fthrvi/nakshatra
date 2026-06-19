@@ -40,9 +40,12 @@ Cheap on its own, and the **enabler** for async pipelining.
 
 ### Phase 3 — Async pipelining ⭐ (finding #7) — the big throughput win
 Overlap multiple verify traversals so the loop is **throughput-bound, not latency-bound** (shard's 2.94→16.6).
-Requires Phase 2 (direct-return decouples the return path).
-- **Build:** coordinator drafts a continuous stream and pumps overlapping chunks without waiting; KV rollback
-  rides the next verify (no extra trip).
+Requires Phase 2 (direct-return decouples the return path). **Reference: FlowSpec (arXiv 2507.02620)** — our
+exact PP-over-WAN topology; the win is overlapping draft-gen with the in-flight verify traversal so the multi-hop
+round-trip is hidden. Slice 1 deliberately keeps `draft.propose` and the verify traversal **separable** in
+`client.py` so this drops in without restructuring (the advisor flagged this).
+- **Build:** coordinator drafts the next window while the previous round's verify is still traversing the
+  pipeline; handle the mispredict (the draft speculated before accept resolved); KV rollback rides the next verify.
 - **Gate:** tok/s scales toward the async ceiling `toks_per_traversal / max(draft_ms, verify_ms)`; output
   still token-identical.
 
@@ -127,13 +130,19 @@ Verified `g++ -fsyntax-only` clean against llama.cpp `c46583b` headers; both API
 - ⏭ **Remaining for (B): rebuild + deploy** — `deploy/build-ijru-cuda.sh` (ROCm flavor) into a *separate*
   binary, never overwriting the live `llama-nakshatra-worker`, in a coordinated GPU window (the GPU is Prithvi's).
 
-**(C) Worker + client wiring — TODO, behind `NAKSHATRA_SPECULATIVE=1`, default OFF.**
-- `worker.py`: relax the single-id response (today returns exactly 4 bytes; `Inference` packs one id at
-  `:1371-1373`) to carry K+1 ids; add a `TruncateKV` RPC over the daemon's D2 command.
-- `client.py:759-809`: when the flag is on AND a `--draft-model-path` is set, replace the single-token step with
-  draft.propose(K) → one batched verify traversal → `accept()` → truncate each worker's KV → append committed.
-  **Falls back to plain decode** if the flag is off / no draft / any error (never raises into Prithvi's path).
-  Draft model loads on the coordinator next to the existing `llama` handle (`client.py:107-110`).
+**(C) Worker + client wiring — ✅ DONE (code-complete, flag-gated `NAKSHATRA_SPECULATIVE`/`--speculative`, default OFF).**
+Reviewed against the advisor's 4 refinements (TruncateKV fan-out to ALL workers; next start_pos from `n_keep`;
+plain path's `len==4` assert untouched via a separate spec branch; errors → existing recovery except, which now
+disables spec). All files `py_compile` clean; proto regenerated; 12/12 spec unit tests still green.
+- `proto/nakshatra.proto`: `ForwardRequest.all_logits` (field 7) + new `TruncateKV(TruncateRequest{n_keep})` RPC.
+- `worker.py`: `CMD_KV_TRUNCATE=4`; `_run_forward` plumbs `all_logits` → daemon flag `0x2`; new `TruncateKV`
+  servicer (auth-checked, drives `cmd=4`); advertises a `"speculative"` capability. Multi-token response needs
+  no change — `_run_forward` already returns `resp[4:]` (K+1 ids pass straight through).
+- `client.py`: `--speculative`/`--draft-model-path`/`--draft-max` args (+ env); spec engages only in **unary
+  mode** when a draft loads AND every worker advertises `"speculative"` (mirrors the push capability check); a
+  separate decode-phase branch does draft→verify(all_logits)→`accept()`→TruncateKV-fan-out→commit, with a
+  per-token `max_tokens` budget guard; any error propagates to the existing recovery (resets KV + disables spec).
+  Cold prefill and plain decode are byte-for-byte unchanged.
 
 **(D) Harness — `tests/test_spec_pipeline_smoke.py` — TODO.**
 Asserts token-identity vs plain decode + reports tok/s, on a tiny CPU model first, then the live 8B in a
