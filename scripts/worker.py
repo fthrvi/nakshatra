@@ -334,6 +334,10 @@ CMD_TOKEN_DECODE = 1
 CMD_EMBD_DECODE  = 2
 CMD_INFO         = 3
 CMD_KV_TRUNCATE  = 4   # speculative decode: discard a rejected tail (payload = u32 n_keep)
+# #16: int8 hidden-state wire codec. Default OFF. When "int8", non-last workers quantize the
+# hidden state they emit and every worker dequantizes a hidden state it receives — ~4× less WAN
+# bytes/hop. All workers + the client must agree (set the same env). The daemon always sees f32.
+_ACT_QUANT = os.environ.get("NAKSHATRA_ACT_QUANT", "").strip().lower() == "int8"
 
 
 class ForwardResult(NamedTuple):
@@ -1178,6 +1182,16 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                     False, b"", "hidden_in size mismatch for token_ids mode",
                     client_error=True)
             cmd = CMD_TOKEN_DECODE
+        elif _ACT_QUANT:
+            # #16: the incoming hidden state is an int8 wire blob → dequantize to f32 for the daemon.
+            from act_quant import dequantize_int8, quant_blob_size
+            exp = quant_blob_size(n_tokens, self.n_embd)
+            if len(hidden_in) != exp:
+                return ForwardResult(
+                    False, b"", f"hidden_in size mismatch (int8): got {len(hidden_in)}, expected {exp}",
+                    client_error=True)
+            hidden_in = dequantize_int8(hidden_in, n_tokens, self.n_embd)
+            cmd = CMD_EMBD_DECODE
         else:
             expected = n_tokens * self.n_embd * 4
             if len(hidden_in) != expected:
@@ -1194,9 +1208,13 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                 False, b"",
                 f"daemon decode failed status={status} resp_len={len(resp)}",
                 client_error=False)
-        # Strip the 4-byte rtype prefix; payload is hidden_state OR
-        # int32 token id. Caller knows this worker's mode via Info.
-        return ForwardResult(True, resp[4:], "", client_error=False)
+        # Strip the 4-byte rtype prefix; payload is hidden_state OR int32 token id.
+        payload = resp[4:]
+        # #16: a worker that emits a HIDDEN STATE (not the last worker's token) quantizes it for the wire.
+        if _ACT_QUANT and self.mode != "last":
+            from act_quant import quantize_int8
+            payload = quantize_int8(payload, n_tokens, self.n_embd)
+        return ForwardResult(True, payload, "", client_error=False)
 
     def Forward(self, request, context):
         # Phase B (2026-05-20): authenticate the unary call. The signed

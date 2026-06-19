@@ -64,6 +64,15 @@ except ImportError:
 LLAMA3_EOS_IDS = {128001, 128008, 128009}
 
 
+def _hidden_bytes(n, n_embd):
+    """Expected wire bytes of an n-token hidden state — int8 blob when NAKSHATRA_ACT_QUANT=int8
+    (#16, the client just relays the opaque blob; workers quant/dequant), else fp32."""
+    if os.environ.get("NAKSHATRA_ACT_QUANT", "").strip().lower() == "int8":
+        from act_quant import quant_blob_size
+        return quant_blob_size(n, n_embd)
+    return n * n_embd * 4
+
+
 class PushFailure(RuntimeError):
     """v0.5 §9.5: a worker advertised rpc_push but its peer connection failed.
     Caught by the recovery loop to downgrade the session to streaming-only
@@ -824,12 +833,12 @@ def main():
                     payload = struct.pack(f"<{n_v}i", *verify)
                     hidden = _step_call(0, sorted_stubs[0], payload, n_v, True, True,
                                         prefix_length, all_logits=True)
-                    if len(hidden) != n_v * n_embd * 4:
+                    if len(hidden) != _hidden_bytes(n_v, n_embd):
                         raise RuntimeError(f"spec: first worker returned {len(hidden)} bytes")
                     for idx, stub_tup in enumerate(sorted_stubs[1:-1], start=1):
                         hidden = _step_call(idx, stub_tup, hidden, n_v, False, True,
                                             prefix_length, all_logits=True)
-                        if len(hidden) != n_v * n_embd * 4:
+                        if len(hidden) != _hidden_bytes(n_v, n_embd):
                             raise RuntimeError(f"spec: middle worker returned {len(hidden)} bytes")
                     last_i = len(sorted_stubs) - 1
                     last_resp = _step_call(last_i, sorted_stubs[last_i], hidden, n_v, False,
@@ -889,14 +898,14 @@ def main():
                     # Step 1: tokens → first worker → hidden
                     hidden = _step_call(0, sorted_stubs[0], token_payload, n_step, True,
                                         keep_kv, prefix_length)
-                    if len(hidden) != n_step * n_embd * 4:
-                        sys.exit(f"[chain] first worker {sorted_stubs[0][0]['id']!r} returned {len(hidden)} bytes, expected {n_step*n_embd*4}")
+                    if len(hidden) != _hidden_bytes(n_step, n_embd):
+                        sys.exit(f"[chain] first worker {sorted_stubs[0][0]['id']!r} returned {len(hidden)} bytes, expected {_hidden_bytes(n_step, n_embd)}")
 
                     # Steps 2..N-1: middle workers
                     for idx, stub_tup in enumerate(sorted_stubs[1:-1], start=1):
                         hidden = _step_call(idx, stub_tup, hidden, n_step, False,
                                             keep_kv, prefix_length)
-                        if len(hidden) != n_step * n_embd * 4:
+                        if len(hidden) != _hidden_bytes(n_step, n_embd):
                             sys.exit(f"[chain] middle worker {stub_tup[0]['id']!r} returned {len(hidden)} bytes")
 
                     # Step N: last worker → token id
