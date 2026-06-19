@@ -107,6 +107,66 @@ def test_is_ready_requires_all_probes_open():
     assert c.is_ready() is False
 
 
+def _gated_controller(workers, placement):
+    """A controller with the lifecycle gate ON, its placement decision stubbed (so we test the
+    start() gating without an admission control plane / roster)."""
+    launched = []
+
+    def launch(w):
+        p = _FakeProc(w)
+        launched.append(p)
+        return p
+
+    spec = sl.RosterWorkerSpec(model_id="dsr1", hidden_size=4096, package_location="/pkg",
+                               num_layers=32, lifecycle_gate=True)
+    c = sl.RosterWorkerController(spec, plan_fn=lambda: _chain(workers), launch_fn=launch)
+    c._port_open = staticmethod(lambda host, port: False)
+    c._lifecycle_placement = lambda: placement
+    return c, launched
+
+
+def _placement(state):
+    import unconscious_lifecycle as ul
+    return ul.Placement(state, [], 0, state.value)
+
+
+def test_gate_idle_does_not_summon():
+    import unconscious_lifecycle as ul
+    workers = [{"id": "a", "address": "127.0.0.1", "port": 5560, "layer_range": [0, 32], "mode": "solo"}]
+    c, launched = _gated_controller(workers, _placement(ul.UnconsciousState.IDLE_NO_HARDWARE))
+    c.start()
+    assert launched == [], "no owned hardware → must not summon"
+    assert c._procs == []
+
+
+def test_gate_disabled_does_not_summon():
+    import unconscious_lifecycle as ul
+    workers = [{"id": "a", "address": "127.0.0.1", "port": 5560, "layer_range": [0, 32], "mode": "solo"}]
+    c, launched = _gated_controller(workers, _placement(ul.UnconsciousState.DISABLED))
+    c.start()
+    assert launched == [], "operator disabled → must not summon"
+
+
+def test_gate_ready_summons_as_normal():
+    import unconscious_lifecycle as ul
+    workers = [{"id": "a", "address": "127.0.0.1", "port": 5560, "layer_range": [0, 16], "mode": "first"},
+               {"id": "b", "address": "127.0.0.1", "port": 5561, "layer_range": [16, 32], "mode": "last"}]
+    c, launched = _gated_controller(workers, _placement(ul.UnconsciousState.READY))
+    c.start()
+    assert {p.w["port"] for p in launched} == {5560, 5561}, "READY → summon as usual"
+
+
+def test_gate_off_by_default_never_calls_lifecycle():
+    # default spec (lifecycle_gate=False) must behave EXACTLY as before — never consult the gate.
+    workers = [{"id": "a", "address": "127.0.0.1", "port": 5560, "layer_range": [0, 32], "mode": "solo"}]
+    c, launched = _controller(workers)
+    called = []
+    c._lifecycle_placement = lambda: called.append(True)
+    c.start()
+    assert called == [], "gate off → _lifecycle_placement must not be consulted"
+    assert len(launched) == 1
+
+
 def test_from_env_builds_roster_controller(monkeypatch):
     for k in list(__import__("os").environ):
         if k.startswith("NAKSHATRA_LIFECYCLE"):

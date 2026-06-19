@@ -186,6 +186,8 @@ class RosterWorkerSpec:
     n_ctx: int = 2048
     n_gpu_layers: int = 99
     worker_env: dict = field(default_factory=dict)
+    lifecycle_gate: bool = False           # opt-in: gate summon on the 3-state unconscious lifecycle
+                                           # (toggle + owned-hardware presence). Off → today's behavior.
 
 
 class RosterWorkerController(ChainController):
@@ -244,7 +246,45 @@ class RosterWorkerController(ChainController):
         return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                 env=env, start_new_session=True)
 
+    def _lifecycle_placement(self):
+        """Consult the 3-state lifecycle (operator toggle + owned-hardware presence) using the SAME
+        firewall (eligible_workers) and roster source as _plan — so READY ⇔ _plan will succeed.
+        Writes the status JSON the hub reads. Returns a Placement."""
+        import sys as _sys
+        from pathlib import Path as _P
+        fab = str(_P(self.spec.scripts_dir or _P(__file__).resolve().parent) / "fabric")
+        if fab not in _sys.path:
+            _sys.path.insert(0, fab)
+        import unconscious_lifecycle as ul
+        from serve_planner import standings_from_roster
+        standings = standings_from_roster()
+        placement = ul.decide_placement(ul.read_enabled(ul.DEFAULT_FLAG_PATH),
+                                        standings, model_id=self.spec.model_id)
+        min_tier = ""
+        try:
+            import worker_join as wj
+            adm = wj._load_admission()
+            min_tier = adm.model_min_tier(self.spec.model_id, adm.load_models())
+        except Exception:
+            pass
+        try:
+            ul.write_status(ul.DEFAULT_STATUS_PATH, placement,
+                            model_id=self.spec.model_id, min_tier=min_tier)
+        except OSError:
+            pass                          # status is best-effort (e.g. /run not writable)
+        return placement
+
     def start(self) -> None:
+        if self.spec.lifecycle_gate:
+            placement = self._lifecycle_placement()
+            if not placement.is_ready:
+                # disabled or no owned hardware present → idle gracefully, don't summon (and don't
+                # let _plan's empty-eligible PermissionError crash the service).
+                self._log(f"[lifecycle] unconscious {placement.state.value}: {placement.reason} "
+                          f"— not summoning (stays scaled-to-zero)")
+                self._probes = []
+                self._adopted_ports = []
+                return
         chain = self._plan()
         self._probes = []
         self._adopted_ports = []          # LOCAL ports already served by a PRIOR process
