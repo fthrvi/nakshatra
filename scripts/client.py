@@ -183,10 +183,11 @@ class InferenceStream:
         try:
             return next(self._responses)
         except grpc.RpcError as e:
-            raise RuntimeError(
-                f"Inference stream to {self.worker_id!r} failed: "
-                f"{e.code().name} — {e.details()}"
-            ) from e
+            # #17 live seam: classify HERE, where the real grpc .code() is live (the
+            # plain-RuntimeError rewrap downstream would lose it). EdgeError is a
+            # RuntimeError subclass, so the recovery loop catches it and swaps to a
+            # healthy alternate instead of the process dying on a sys.exit.
+            raise EdgeError.from_exc(e, peer_id=self.worker_id, phase="forward") from e
 
     def close(self):
         if self._closed:
@@ -227,10 +228,11 @@ def call_inference_step(streamer, payload, n_tokens, has_token_ids,
         step.chain.extend(chain)
 
     t0 = time.time()
-    try:
-        resp = streamer.step(step)
-    except RuntimeError as e:
-        sys.exit(f"[chain] {e}")
+    # #17 live seam: a transport fault surfaces as EdgeError (from StreamHandle.step's grpc
+    # handler) or a plain RuntimeError ("stream already closed"). Both are RuntimeError, so we
+    # let them PROPAGATE to the recovery loop (which swaps/retries) instead of sys.exit-killing
+    # the process here.
+    resp = streamer.step(step)
     if timing is not None:
         timing.setdefault(streamer.worker_id, []).append(time.time() - t0)
 
@@ -240,13 +242,20 @@ def call_inference_step(streamer, payload, n_tokens, has_token_ids,
         # recovery loop, which downgrades the session to relay mode.
         if err_str.startswith("push_failed:"):
             raise PushFailure(f"worker {streamer.worker_id!r}: {err_str}")
-        sys.exit(f"[chain] worker {streamer.worker_id!r} reported error: {err_str}")
+        # #17 live seam: peer-side error → INTERNAL (not a transport fault, but a swap to a
+        # healthy alternate may still complete the request — strictly better than dying here).
+        raise EdgeError(peer_id=streamer.worker_id, kind=EdgeFailureKind.INTERNAL,
+                        reason=f"worker reported error: {err_str}", phase="forward")
     if resp.HasField("token_ids"):
         ids = list(resp.token_ids.ids)
         return struct.pack(f"<{len(ids)}i", *ids)
     if resp.HasField("hidden_state"):
         return resp.hidden_state.raw
-    sys.exit(f"[chain] worker {streamer.worker_id!r} returned an empty step")
+    # #17 live seam: PROTOCOL kind. v1's recovery loop still swaps (bounded by
+    # --max-recovery-attempts then surfaces) — better than instant death — and the typed kind
+    # lets the v2 is_transport_fault gate skip the pointless churn in one line.
+    raise EdgeError(peer_id=streamer.worker_id, kind=EdgeFailureKind.PROTOCOL,
+                    reason="returned an empty step", phase="forward")
 
 
 def _peer_chain_score(peer: dict) -> int:
@@ -898,7 +907,12 @@ def main():
                     next_id = struct.unpack("<i", last_resp)[0]
                     generated.append(next_id)
                 else:
-                    # Step 1: tokens → first worker → hidden
+                    # Step 1: tokens → first worker → hidden.
+                    # NOTE (#17): a wrong hidden byte-count is CORRUPTION/config (e.g. a worker
+                    # with a different NAKSHATRA_ACT_QUANT setting than the client), NOT a
+                    # transport fault — swapping alternates can't fix it and would just churn.
+                    # So these size-mismatch checks stay fail-fast (sys.exit), unlike the
+                    # transport faults above which now raise into the recovery loop.
                     hidden = _step_call(0, sorted_stubs[0], token_payload, n_step, True,
                                         keep_kv, prefix_length)
                     if len(hidden) != _hidden_bytes(n_step, n_embd):
