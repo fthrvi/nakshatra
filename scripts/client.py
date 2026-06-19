@@ -488,12 +488,10 @@ def main():
                          "v0.1 70B cluster). 'required': refuse to talk to "
                          "any worker without a declared SPKI hash. 'off': "
                          "force plaintext channels (escape hatch).")
-<<<<<<< HEAD
     ap.add_argument("--receipt-out", type=str, default="",
                     help="speed-stack #20: write a verifiable run receipt (JSON) to this "
                          "path after the run — distinct workers + per-stage timing + output "
                          "token sha256 + layer-map; verify with scripts/receipt.verify_receipt")
-=======
     # Speculative decoding (slice 1). Default OFF; also enabled by env
     # NAKSHATRA_SPECULATIVE=1. Engages only in unary mode when a draft model is
     # given AND every worker advertises the "speculative" capability; any failure
@@ -506,7 +504,6 @@ def main():
                          "(e.g. Llama-3.2-1B); runs locally on the coordinator")
     ap.add_argument("--draft-max", type=int, default=4,
                     help="K: number of tokens the draft proposes per step")
->>>>>>> 09b466e (feat(inference): wire speculative decoding into the distributed decode loop (C))
     args = ap.parse_args()
     if os.environ.get("NAKSHATRA_SPECULATIVE", "") in ("1", "true", "True"):
         args.speculative = True
