@@ -836,6 +836,11 @@ def main():
                     target_argmax = list(struct.unpack(f"<{n_v}i", last_resp))
                     res = accept(drafts, target_argmax)
                     n_keep = kv_keep_after(prefix_length, res.n_accepted)
+                    if os.environ.get("NAKSHATRA_SPEC_DEBUG"):
+                        print(f"[specdbg] p={prefix_length} cur={cur} drafts={drafts} "
+                              f"targ={target_argmax} acc={res.n_accepted} "
+                              f"commit={res.committed} n_keep={n_keep}",
+                              file=sys.stderr, flush=True)
                     # Fan TruncateKV to EVERY worker (a single miss leaves a stale KV
                     # tail that silently corrupts the next step). Skip only on all-accept,
                     # where nothing was trimmed (n_keep == prefix_length + n_v).
