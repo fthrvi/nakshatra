@@ -487,6 +487,10 @@ def main():
                          "v0.1 70B cluster). 'required': refuse to talk to "
                          "any worker without a declared SPKI hash. 'off': "
                          "force plaintext channels (escape hatch).")
+    ap.add_argument("--receipt-out", type=str, default="",
+                    help="speed-stack #20: write a verifiable run receipt (JSON) to this "
+                         "path after the run — distinct workers + per-stage timing + output "
+                         "token sha256 + layer-map; verify with scripts/receipt.verify_receipt")
     args = ap.parse_args()
     # --use-streaming-push implies --use-streaming
     if args.use_streaming_push:
@@ -870,6 +874,37 @@ def main():
     full = llama.detokenize(tokens + generated).decode("utf-8", errors="replace")
     gen = llama.detokenize(generated).decode("utf-8", errors="replace") if generated else ""
     print(f"[chain] generated {len(generated)} tokens in {elapsed:.2f}s  ({len(generated)/elapsed:.2f} tok/s)")
+
+    # speed-stack #20: optional verifiable run receipt. Additive + best-effort — a receipt
+    # failure must never break the run (wrapped). Assembled from data the coordinator already
+    # holds: generated tokens, per-worker `timing`, and each stage's Info (id/spki/layer-map).
+    if args.receipt_out:
+        try:
+            from receipt import build_receipt
+            chain = []
+            for w, _stub, info in sorted_stubs:
+                ts = timing.get(w["id"], [])
+                chain.append({
+                    "node_id": w["id"],
+                    "address": f'{w.get("address")}:{w.get("port")}',
+                    "spki_hash": w.get("peer_spki_hash"),
+                    "layer_start": info.layer_start,
+                    "layer_end": info.layer_end,
+                    "backend": info.backend,
+                    "mean_rpc_ms": (sum(ts) / len(ts) * 1000.0) if ts else None,
+                })
+            rcpt = build_receipt(
+                run_id=(session_id or uuid.uuid4().hex),
+                model_id=(args.model_id or args.model_path),
+                prompt_tokens=tokens, generated_tokens=generated,
+                workers=chain, elapsed_s=elapsed,
+                started_at=t0, ended_at=t0 + elapsed,
+            )
+            Path(args.receipt_out).write_text(json.dumps(rcpt, indent=2))
+            print(f"[receipt] wrote {args.receipt_out} "
+                  f"(output_sha256={rcpt['output_sha256'][:12]}…, {len(chain)} stages)")
+        except Exception as e:
+            print(f"[receipt] failed to write receipt: {e!r}", file=sys.stderr)
     print(f"[chain] per-worker total RPC time:")
     for wid, ts in timing.items():
         avg_first = ts[0] if ts else 0.0
