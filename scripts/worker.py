@@ -333,6 +333,7 @@ def _chain_id_from(plan_id: str) -> int:
 CMD_TOKEN_DECODE = 1
 CMD_EMBD_DECODE  = 2
 CMD_INFO         = 3
+CMD_KV_TRUNCATE  = 4   # speculative decode: discard a rejected tail (payload = u32 n_keep)
 
 
 class ForwardResult(NamedTuple):
@@ -1148,12 +1149,16 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                 "rpc_push",
                 "idempotency_cache",
                 "recovery_replay",
+                # slice 1: this worker's daemon supports all_logits verify (flag 0x2)
+                # + TruncateKV (cmd 4). The client only engages speculative decode
+                # when EVERY worker in the chain advertises this.
+                "speculative",
             ] + _control_version_caps(),
         )
 
     def _run_forward(self, hidden_in: bytes, n_tokens: int,
                      has_token_ids: bool, keep_kv: bool,
-                     start_pos: int) -> "ForwardResult":
+                     start_pos: int, all_logits: bool = False) -> "ForwardResult":
         """Shared daemon decode path — the transport-neutral core of a
         single forward step. Both the gRPC ``Forward`` RPC and the
         fabric backend (Phase D) call this so the two transports can
@@ -1166,7 +1171,7 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
         decide: it passes ``keep_kv`` + ``start_pos`` derived from the
         protobuf fields (gRPC) or the fabric header + per-chain state
         (fabric)."""
-        flags = 0x1 if keep_kv else 0x0
+        flags = (0x1 if keep_kv else 0x0) | (0x2 if all_logits else 0x0)
         if has_token_ids:
             if len(hidden_in) != n_tokens * 4:
                 return ForwardResult(
@@ -1204,7 +1209,7 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
         )
         result = self._run_forward(
             request.hidden_in, request.n_tokens, request.has_token_ids,
-            request.keep_kv, int(request.start_pos),
+            request.keep_kv, int(request.start_pos), request.all_logits,
         )
         if not result.ok:
             context.set_code(
@@ -1231,6 +1236,27 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                 return pb.ForwardResponse()
             return pb.ForwardResponse(hidden_out=token_bytes)
         return pb.ForwardResponse(hidden_out=result.payload)
+
+    def TruncateKV(self, request, context):
+        # Speculative decoding (slice 1): drop a rejected speculative tail from the
+        # daemon's KV (cmd=4 → llama_memory_seq_rm, keep [0, n_keep)). The coordinator
+        # fans this out to EVERY worker after accept(); a missed worker would silently
+        # corrupt the next step's attention with a stale KV tail (no error raised).
+        self._check_grpc_auth(
+            context, request.SerializeToString(),
+            method_path="/nakshatra.Nakshatra/TruncateKV",
+            is_streaming=False,
+        )
+        n_keep = int(request.n_keep)
+        if n_keep < 0:
+            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+            context.set_details(f"n_keep must be >= 0, got {n_keep}")
+            return pb.TruncateResponse()
+        status, _ = self.daemon.call(CMD_KV_TRUNCATE, 0, struct.pack("<I", n_keep))
+        if status != 0:
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(f"daemon KV truncate failed status={status}")
+        return pb.TruncateResponse()
 
     def Inference(self, request_iterator, context):
         """v0.5 M0.5.1 — streaming inference RPC.
