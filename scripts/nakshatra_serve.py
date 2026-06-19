@@ -255,6 +255,13 @@ def _parse_client_output(stdout: str) -> str:
     return text
 
 
+def _quiet_unlink(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
 class ChainChatBackend(ChatBackend):
     """Real backend: drives the live chain by invoking ``scripts/client.py``
     as a subprocess — deliberately NON-INVASIVE, so client.py's tangled,
@@ -277,11 +284,13 @@ class ChainChatBackend(ChatBackend):
         self._scripts = scripts_dir or os.path.dirname(os.path.abspath(__file__))
         self._timeout = timeout_s
 
-    def _cmd(self, entry, prompt, max_tokens) -> list:
+    def _cmd(self, entry, prompt, max_tokens, receipt_path=None) -> list:
         cmd = [sys.executable, os.path.join(self._scripts, "client.py"),
                "--model-path", entry.tokenizer_gguf,
                "--prompt", prompt, "--max-tokens", str(max_tokens),
                "--use-streaming"]
+        if receipt_path:                       # only when the credit hook is enabled
+            cmd += ["--receipt-out", receipt_path]
         if entry.from_roster:
             cmd += ["--config", self._roster_chain_yaml(entry)]
         elif entry.chain_yaml:
@@ -289,6 +298,24 @@ class ChainChatBackend(ChatBackend):
         else:
             cmd += ["--registry", entry.registry_url or "", "--model-id", entry.name]
         return cmd
+
+    def _ledger_hook(self):
+        """Cached credit-ledger hook. DEFAULT-OFF + FAIL-OPEN — never gates/breaks a run unless
+        NAKSHATRA_CREDITS=1 (and only DENIES with NAKSHATRA_CREDITS_ENFORCE=1). A broken/absent
+        ledger_client degrades to a no-op so the serve can never fail to load on its account."""
+        h = getattr(self, "_ledger_hook_cached", None)
+        if h is None:
+            try:
+                if self._scripts not in sys.path:
+                    sys.path.insert(0, self._scripts)
+                from ledger_client import LedgerHook
+                h = LedgerHook()
+            except Exception:
+                from types import SimpleNamespace
+                h = SimpleNamespace(enabled=False, wants_receipt=False,
+                                    gate=lambda est: (True, ""), settle=lambda p: None)
+            self._ledger_hook_cached = h
+        return h
 
     def _roster_chain_yaml(self, entry) -> str:
         """from_roster: GENERATE the chain from the live roster at request time (firewall-gated +
@@ -310,17 +337,34 @@ class ChainChatBackend(ChatBackend):
             raise ChainBackendError(f"from_roster chain generation failed: {e}")
 
     def generate(self, entry, prompt, max_tokens, options):
-        import subprocess
+        import subprocess, tempfile
+        hook = self._ledger_hook()
+        # gate before the run (no-op/advisory unless enforced; fail-open)
+        est = int(max_tokens) * int(getattr(entry, "num_layers", 0) or 0)
+        allow, reason = hook.gate(est)
+        if not allow:
+            raise ChainBackendError(f"credit gate: {reason}")
+        rcpt = None
+        if getattr(hook, "wants_receipt", False):
+            fd, rcpt = tempfile.mkstemp(suffix=".receipt.json")
+            os.close(fd)
         try:
-            out = subprocess.run(self._cmd(entry, prompt, max_tokens),
+            out = subprocess.run(self._cmd(entry, prompt, max_tokens, receipt_path=rcpt),
                                  capture_output=True, text=True,
                                  timeout=self._timeout)
         except subprocess.TimeoutExpired:
+            if rcpt:
+                _quiet_unlink(rcpt)
             raise ChainBackendError(
                 f"chain generation timed out after {self._timeout}s")
         if out.returncode != 0:
+            if rcpt:
+                _quiet_unlink(rcpt)
             raise ChainBackendError(
                 f"client.py exited {out.returncode}: {out.stderr.strip()[-400:]}")
+        if rcpt:
+            hook.settle(rcpt)                  # credit the workers (fail-open)
+            _quiet_unlink(rcpt)
         return GenerationResult(text=_parse_client_output(out.stdout))
 
     def generate_stream(self, entry, prompt, max_tokens, options):
