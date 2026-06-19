@@ -19,6 +19,14 @@
 //                 decode (streaming generation). Tokens are placed in KV
 //                 cache at positions [start_pos, start_pos + n_tokens).
 //                 If unset, daemon clears KV first (single-shot prefill).
+//   bit 1 (0x2) = all_logits (speculative verify). If set, request per-position
+//                 logits for EVERY token in the batch, not just the last. On the
+//                 LAST worker the response is result_type=2 followed by int32
+//                 top_token[n_tokens] — the greedy argmax at each position — so a
+//                 speculative-decode coordinator can verify K+1 candidate tokens
+//                 in one chain traversal. Unset → legacy single-final-token
+//                 behaviour, byte-for-byte unchanged. (Non-last workers ignore it;
+//                 they already return hidden states for all positions.)
 //
 // Commands:
 //   1 = TOKEN_DECODE  payload = int32 token_ids[n_tokens]
@@ -32,6 +40,13 @@
 //                     response payload = int32 n_layer_start, n_layer_end,
 //                                              n_embd, has_token_embd,
 //                                              has_lm_head, n_vocab
+//   4 = KV_TRUNCATE   payload = u32 n_keep
+//                     Discards a rejected speculative tail: removes KV for seq 0
+//                     at positions [n_keep, end), keeping [0, n_keep). No decode.
+//                     response payload empty.
+//
+// Response result_type (first 4 bytes of a decode payload):
+//   0 = hidden[n_tokens*n_embd]   1 = single top_token   2 = top_token[n_tokens]
 //
 // Status codes: 0 = ok, 1 = decode error, 2 = wire format error, 3 = arch
 // not supported.
@@ -294,7 +309,20 @@ int main(int argc, char ** argv) {
         uint64_t t_recv_done = timing_on ? now_ns() : 0;
         uint32_t payload_bytes = (uint32_t)payload.size();
 
-        const bool keep_kv = (flags & 0x1) != 0;
+        const bool keep_kv    = (flags & 0x1) != 0;
+        const bool all_logits = (flags & 0x2) != 0;   // speculative verify: argmax at every position
+
+        if (cmd == 4) {
+            // KV_TRUNCATE — discard a rejected speculative tail. Keep [0, n_keep),
+            // remove [n_keep, end) for seq 0. The only KV-rewind primitive (decode
+            // otherwise only ever appends). No model forward.
+            if (payload_bytes != sizeof(uint32_t)) { send_response(2, nullptr, 0); continue; }
+            uint32_t n_keep;
+            std::memcpy(&n_keep, payload.data(), 4);
+            llama_memory_seq_rm(llama_get_memory(ctx), 0, (llama_pos)n_keep, -1);
+            send_response(0, nullptr, 0);
+            continue;
+        }
 
         if (cmd == 3) {
             // INFO
@@ -334,7 +362,7 @@ int main(int argc, char ** argv) {
                 batch.pos[i] = (int32_t)(start_pos + i);
                 batch.n_seq_id[i] = 1;
                 batch.seq_id[i][0] = 0;
-                batch.logits[i] = (i == n_tokens - 1) ? 1 : 0;
+                batch.logits[i] = (all_logits || i == n_tokens - 1) ? 1 : 0;
             }
             if (timing_on) t_decode_start = now_ns();
             rc = llama_decode(ctx, batch);
@@ -352,7 +380,7 @@ int main(int argc, char ** argv) {
                 batch.pos[i] = (int32_t)(start_pos + i);
                 batch.n_seq_id[i] = 1;
                 batch.seq_id[i][0] = 0;
-                batch.logits[i] = (i == n_tokens - 1) ? 1 : 0;
+                batch.logits[i] = (all_logits || i == n_tokens - 1) ? 1 : 0;
             }
             if (timing_on) t_decode_start = now_ns();
             rc = llama_decode(ctx, batch);
@@ -389,7 +417,23 @@ int main(int argc, char ** argv) {
         }
         uint64_t t_get_embd_start = timing_on ? now_ns() : 0;
         uint64_t t_get_embd_done = 0, t_memcpy_done = 0;
-        if (mode_last) {
+        if (mode_last && all_logits) {
+            // Speculative verify: greedy argmax at EVERY position → top_token[n_tokens].
+            // Position p's logits are valid because all_logits set batch.logits[p]=1.
+            std::vector<uint8_t> out(4 + (size_t)n_tokens * sizeof(int32_t));
+            *(uint32_t*)out.data() = 2;     // result_type = tokens[]
+            int32_t* toks = (int32_t*)(out.data() + 4);
+            bool ok = true;
+            for (uint32_t p = 0; p < n_tokens; ++p) {
+                float* logits = llama_get_logits_ith(ctx, (int32_t)p);
+                if (!logits) { ok = false; break; }
+                int top = 0; float top_v = logits[0];
+                for (int i = 1; i < n_vocab; ++i) if (logits[i] > top_v) { top_v = logits[i]; top = i; }
+                toks[p] = top;
+            }
+            if (!ok) { send_response(1, nullptr, 0); continue; }
+            send_response(0, out.data(), (uint32_t)out.size());
+        } else if (mode_last) {
             float* logits = llama_get_logits_ith(ctx, -1);
             if (!logits) { send_response(1, nullptr, 0); continue; }
             int top = 0; float top_v = logits[0];

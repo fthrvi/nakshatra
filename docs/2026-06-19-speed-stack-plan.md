@@ -113,14 +113,19 @@ Pure `accept(drafts, target_argmax) -> AcceptResult` (longest greedy prefix + 1 
 `speculative_round` (transport-agnostic, verify_fn injected). Unit-tested incl. the **byte-identical-to-plain-
 greedy oracle** across perfect/garbage/mixed drafts (`tests/test_speculative.py`). Nothing imports it yet.
 
-**(B) Daemon patch — `llama-nakshatra-worker` (the real blocker) — TODO.**
-Patched llama.cpp source (reference: `experiments/v0.0/worker_daemon.cpp`; patches in
-`experiments/v0.0/m4_patches/`). Needs a ROCm rebuild.
-- **D1 — multi-position argmax.** Last worker must return K+1 token ids. Set `batch.logits[i]=1` for all i
-  (today only `i==n_tokens-1`, `worker_daemon.cpp:337,355`); loop argmax per position (today only
-  `llama_get_logits_ith(ctx,-1)`, `:393`); pack K+1 int32s with a count header.
-- **D2 — KV truncate.** New command `KV_TRUNCATE(seq, n_keep) -> llama_kv_cache_seq_rm(ctx, seq, n_keep, -1)`,
-  so a rejected tail is discarded (today KV only appends). Driven after `accept()` to `kv_keep_after(...)`.
+**(B) Daemon patch — `experiments/v0.0/worker_daemon.cpp` (the real blocker) — ✅ WRITTEN, syntax-clean, NOT YET BUILT.**
+The daemon source IS `worker_daemon.cpp` (copied into `llama.cpp/examples/nakshatra-spike/` and built as
+`llama-nakshatra-worker` by `deploy/build-ijru-cuda.sh`). Both changes are **purely additive** — a new flag bit
+and a new command — so the existing single-token path is byte-for-byte unchanged even if this binary shipped.
+Verified `g++ -fsyntax-only` clean against llama.cpp `c46583b` headers; both APIs (`llama_memory_seq_rm`,
+`llama_get_logits_ith`) confirmed present at that commit.
+- **D1 — multi-position argmax (flag `0x2 = all_logits`).** When set, `batch.logits[i]=1` for all i (was only
+  `i==n_tokens-1`); the last worker loops `llama_get_logits_ith(ctx, p)` per position and returns
+  `result_type=2` + `int32 top_token[n_tokens]`. Unset → legacy single-token, unchanged.
+- **D2 — KV truncate (new `cmd=4`).** `payload = u32 n_keep` → `llama_memory_seq_rm(mem, 0, n_keep, -1)`,
+  discarding the rejected tail. The only KV-rewind primitive in the daemon.
+- ⏭ **Remaining for (B): rebuild + deploy** — `deploy/build-ijru-cuda.sh` (ROCm flavor) into a *separate*
+  binary, never overwriting the live `llama-nakshatra-worker`, in a coordinated GPU window (the GPU is Prithvi's).
 
 **(C) Worker + client wiring — TODO, behind `NAKSHATRA_SPECULATIVE=1`, default OFF.**
 - `worker.py`: relax the single-id response (today returns exactly 4 bytes; `Inference` packs one id at
