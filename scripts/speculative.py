@@ -102,23 +102,47 @@ class DraftModel:
     def __init__(self, model_path: str, n_ctx: int = 4096, n_gpu_layers: int = -1,
                  seed: int = 0, verbose: bool = False):
         from llama_cpp import Llama  # lazy: only when a real draft is constructed
+        # logits_all=True is REQUIRED: in llama-cpp-python 0.3.x, eval() only writes per-token
+        # logits into .scores when logits_all is set (the logits_all=False branch is a `pass`),
+        # so greedy argmax off .scores returns garbage without it. n_ctx is kept modest to bound
+        # the (n_ctx × n_vocab) scores allocation.
         self._llama = Llama(model_path=model_path, n_ctx=n_ctx, n_gpu_layers=n_gpu_layers,
-                            logits_all=False, seed=seed, verbose=verbose)
+                            logits_all=True, seed=seed, verbose=verbose)
         self.model_path = model_path
 
     def propose(self, prefix_tokens: Sequence[int], k: int) -> List[int]:
         """Greedily propose the next k tokens following `prefix_tokens`.
 
-        Uses the draft's own KV via incremental eval. Greedy argmax each step. Returns up to
-        k token ids (fewer only if the draft emits EOS, which the caller may treat as a hint).
+        INCREMENTAL: the draft keeps its KV across rounds. Instead of re-evaluating the whole
+        prefix every round (O(prefix) → O(n²) over a generation), it finds the longest common
+        prefix between what's already cached and `prefix_tokens`, rolls the draft KV back to the
+        first divergence, and evaluates only the new suffix — so accepted drafts from last round
+        stay cached and only the freshly-committed tokens (≈ the correction + bonus) are evaluated.
+        Falls back to a full reset+eval on any internal-state surprise (never wrong, just slow).
         """
         import numpy as np
+        prefix = [int(t) for t in prefix_tokens]
         llama = self._llama
-        llama.reset()
-        llama.eval(list(prefix_tokens))
+        try:
+            n = int(llama.n_tokens)
+            # longest common prefix between cached input_ids[:n] and the new committed prefix
+            lcp = 0
+            cached = llama.input_ids
+            while lcp < n and lcp < len(prefix) and int(cached[lcp]) == prefix[lcp]:
+                lcp += 1
+            if lcp < n:                                  # roll the draft KV back to divergence
+                llama._ctx.kv_cache_seq_rm(-1, lcp, -1)
+                llama.n_tokens = lcp
+            if len(prefix) > llama.n_tokens:             # eval only the new committed suffix
+                llama.eval(prefix[llama.n_tokens:])
+            elif llama.n_tokens == 0:                    # cold: nothing cached yet
+                llama.eval(prefix)
+        except Exception:
+            llama.reset()
+            llama.eval(prefix)
         out: List[int] = []
         for _ in range(k):
-            logits = llama.scores[llama.n_tokens - 1] if hasattr(llama, "scores") else llama.eval_logits[-1]
+            logits = llama.scores[llama.n_tokens - 1]   # last-token row (logits_all=True)
             tok = int(np.argmax(logits))
             out.append(tok)
             llama.eval([tok])
