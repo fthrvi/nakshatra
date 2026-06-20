@@ -1333,14 +1333,20 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                 elif step.HasField("hidden_state"):
                     hs = step.hidden_state
                     n_tokens = hs.n_tokens
-                    expected = n_tokens * self.n_embd * 4
+                    # act-quant on the wire (streaming): the incoming hidden is int8 (quant_blob);
+                    # dequantize to f32 for the daemon. Size check uses the int8 blob size.
+                    if _ACT_QUANT:
+                        from act_quant import quant_blob_size, dequantize_int8
+                        expected = quant_blob_size(n_tokens, self.n_embd)
+                    else:
+                        expected = n_tokens * self.n_embd * 4
                     if len(hs.raw) != expected:
                         yield pb.InferenceStep(
                             session_id=step.session_id, step_id=step.step_id,
                             error=f"hidden_state size mismatch: got {len(hs.raw)}, expected {expected}".encode(),
                         )
                         return
-                    input_bytes = hs.raw
+                    input_bytes = dequantize_int8(hs.raw, n_tokens, self.n_embd) if _ACT_QUANT else hs.raw
                     cmd = CMD_EMBD_DECODE
                 else:
                     yield pb.InferenceStep(
@@ -1416,6 +1422,9 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                     token_id = struct.unpack("<i", payload[:4])[0]
                     out.token_ids.ids.append(token_id)
                 else:
+                    if _ACT_QUANT:   # non-last: quantize the emitted hidden to int8 for the wire
+                        from act_quant import quantize_int8
+                        payload = quantize_int8(payload, n_tokens, self.n_embd)
                     out.hidden_state.raw = payload
                     out.hidden_state.batch = 1
                     out.hidden_state.n_tokens = n_tokens
