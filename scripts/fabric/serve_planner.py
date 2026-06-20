@@ -113,7 +113,8 @@ def plan_chain(model_id: str, workers: Sequence[wj.WorkerStanding], *,
                partition_fn: Callable[[int, int], list] = contiguous_split,
                slice_for: Optional[Callable[[wj.WorkerStanding, int, int, str], str]] = None,
                min_tier_fn: Optional[Callable[[str], str]] = None,
-               rank: Optional[dict] = None) -> ChainPlan:
+               rank: Optional[dict] = None,
+               max_stages: Optional[int] = None) -> ChainPlan:
     """Produce a chain YAML for `model_id` from the admitted `workers`, GATED BY THE IDENTITY
     FIREWALL. Workers whose trust tier is below the model's min tier are excluded (logged in
     `rejected`); the rest get contiguous layer assignments.
@@ -121,7 +122,13 @@ def plan_chain(model_id: str, workers: Sequence[wj.WorkerStanding], *,
     eligible_fn(model, workers) -> (eligible, rejected) defaults to worker_join.eligible_workers,
     which reads the live admission model policy. Inject it (and/or min_tier_fn/rank) to run without
     a control plane. Raises if no worker survives the firewall (default-deny: refuse to serve rather
-    than fall back to a lower-tier peer)."""
+    than fall back to a lower-tier peer).
+
+    `max_stages` (FEWER-HOP placement, the WAN win): cap the chain to at most this many workers (each
+    then holds more layers). Every chain hop is a latency-bound round-trip over WAN, so 2 stages ~=
+    2x faster than 3; set this when workers are high-latency + have spare memory. The kept workers are
+    the FIRST `max_stages` of the (already RTT/preference-ordered) eligible list — so ordering upstream
+    decides WHICH survive. Minimum 2 (a chain needs first + last). None = use all eligible (default)."""
     if eligible_fn is None:
         eligible, rejected = wj.eligible_workers(model_id, list(workers),
                                                  min_tier_fn=min_tier_fn, rank=rank)
@@ -144,6 +151,11 @@ def plan_chain(model_id: str, workers: Sequence[wj.WorkerStanding], *,
             f"identity firewall: no admitted worker is eligible to serve '{model_id}' "
             f"(min tier '{floor or '?'}'); refusing to serve rather than drop to a lower tier. "
             f"rejected={[r.get('reason') for r in rejected]}")
+
+    # FEWER-HOP placement: cap stages for WAN (each kept worker holds more layers, but fewer
+    # latency-bound round-trips). Keep the first max_stages (>=2; ordering upstream picks WHICH).
+    if max_stages and len(eligible) > max(2, max_stages):
+        eligible = eligible[:max(2, max_stages)]
 
     slice_for = slice_for or (lambda w, s, e, m: _default_slice_for(w, s, e, m))
     assignment = partition_fn(num_layers, len(eligible))

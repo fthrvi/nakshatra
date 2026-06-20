@@ -107,6 +107,22 @@ def test_worker_endpoint_flows_into_yaml():
     assert w["address"] == "10.42.0.1" and w["port"] == 5540
 
 
+def test_max_stages_caps_hops_for_wan():
+    # FEWER-HOP placement: 4 eligible self workers, but cap to 2 stages (each holds more layers) — the
+    # WAN win (each chain hop is a latency-bound round-trip; 2 stages ~= 2x faster than 4).
+    pool = [_w("a", "self"), _w("b", "self"), _w("c", "self"), _w("d", "self")]
+    full = sp.plan_chain("prithvi-private", pool, num_layers=32, hidden_size=4096, min_tier_fn=MT, rank=RANK)
+    cap2 = sp.plan_chain("prithvi-private", pool, num_layers=32, hidden_size=4096, min_tier_fn=MT, rank=RANK, max_stages=2)
+    assert len(full.chain["workers"]) == 4
+    assert len(cap2.chain["workers"]) == 2
+    assert [w["mode"] for w in cap2.chain["workers"]] == ["first", "last"]
+    assert cap2.chain["workers"][0]["layer_range"] == [0, 16]   # contiguous + full coverage at 2 stages
+    assert cap2.chain["workers"][1]["layer_range"] == [16, 32]
+    # max_stages=1 clamps to the 2-stage minimum (a chain needs first AND last)
+    cap1 = sp.plan_chain("prithvi-private", pool, num_layers=32, hidden_size=4096, min_tier_fn=MT, rank=RANK, max_stages=1)
+    assert len(cap1.chain["workers"]) == 2
+
+
 # ── the roster bridge: peers.tsv shape -> standings ─────────────────────────────────────────────────
 def test_standings_from_roster():
     roster = {

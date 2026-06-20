@@ -65,11 +65,20 @@ def build_chain_from_roster(model_id: str, *, hidden_size: int,
         raise ValueError("num_layers unknown — pass it or ensure the package manifest carries n_layers")
 
     # 3) the rostered workers → firewall → contiguous assignment → chain.
+    # FEWER-HOP placement (WAN win): NAKSHATRA_MAX_STAGES caps the chain to N workers (each holds
+    # more layers, fewer latency-bound round-trips). Unset = use all eligible.
+    import os as _os
+    try:
+        _max_stages = int(_os.environ.get("NAKSHATRA_MAX_STAGES", "") or 0) or None
+    except ValueError:
+        _max_stages = None
     standings = sp.standings_from_roster(roster_loader=roster_loader)
     plan_fn = planner or sp.plan_chain
-    plan = plan_fn(model_id, standings, num_layers=num_layers, hidden_size=hidden_size,
-                   wire_dtype=wire_dtype, slice_for=slicer.slice_for,
-                   min_tier_fn=min_tier_fn, rank=rank)
+    _kw = dict(num_layers=num_layers, hidden_size=hidden_size, wire_dtype=wire_dtype,
+               slice_for=slicer.slice_for, min_tier_fn=min_tier_fn, rank=rank)
+    if _max_stages and plan_fn is sp.plan_chain:
+        _kw["max_stages"] = _max_stages
+    plan = plan_fn(model_id, standings, **_kw)
 
     # 4) write the generated chain where the serve points client.py.
     dest = Path(out_path) if out_path else (Path(cache_dir or (Path.home() / ".nakshatra" / "slices"))
