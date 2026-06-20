@@ -75,6 +75,16 @@ class LedgerHook:
             own = self._own_nodes(receipt)
             if own:
                 body["own_nodes"] = own        # local infra → free
+            # identity-binding: attach the holder-of-key-PROVEN accounts (each worker Ed25519-signed the
+            # stage it served). Advisory — the ledger credits BOUND accounts instead of trusting the
+            # coordinator's say-so. Empty for legacy receipts without worker_signatures (non-breaking).
+            try:
+                from identity_binding import creditable_accounts
+                accts, _ = creditable_accounts(receipt)
+                if accts:
+                    body["creditable_accounts"] = accts
+            except Exception:
+                pass
             return self._post("/settle", body)
         except Exception:
             return None

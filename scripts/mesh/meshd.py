@@ -50,6 +50,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from nakshatra_auth import load_or_create_worker_key  # noqa: E402
 from discovery.nakshatra_listing import NakshatraListing, rank_listings  # noqa: E402
 from discovery.relay import FileRelay, pin_from_listing  # noqa: E402
+from discovery.wanted_tracker import WantedTracker  # noqa: E402
 from recovery.drift_aware import drift_compatible  # noqa: E402
 from discovery.provenance import provenance_from_daemon  # noqa: E402
 from transport.relay import connect as relay_connect  # noqa: E402
@@ -94,6 +95,8 @@ class MeshConfig:
     provenance_pin: Optional[str] = None  # expected provenance.short(); loud alert if the running build differs
     once: bool = False                  # one loop then exit (for tests/CI)
     peer_ttl: float = 0.0               # ignore listings older than this (0 → auto)
+    wanted: list[str] = field(default_factory=list)   # static demand: models this node wants served (merged
+                                        # with live unmet-demand from the WantedTracker into the listing)
 
     def effective_ttl(self) -> float:
         # a node re-publishes every `refresh`s; treat it dead after a few missed
@@ -107,6 +110,10 @@ class MeshNode:
         self.priv, self.pub = load_or_create_worker_key(cfg.identity_file)
         self.node_id = "nks-" + self.pub[:12]
         self.relay = FileRelay(cfg.relay_dir)
+        # the discovery demand signal: static --wanted (cfg) merged with live unmet demand. The serve/gate
+        # path can call self.wanted_tracker.note(model) when a request can't be satisfied (no eligible
+        # worker / OOM / capacity-denied) so the next listing advertises real scarcity.
+        self.wanted_tracker = WantedTracker()
         self.tunnels: dict[str, TunnelHandle] = {}
         self._stop = threading.Event()
         self._last_peers: list[dict] = []
@@ -138,6 +145,7 @@ class MeshNode:
             node_id=self.node_id,
             ed25519_pubkey_hex=self.pub,
             serving=list(self.cfg.serving),
+            wanted=sorted(set(self.cfg.wanted) | set(self.wanted_tracker.wanted())),
             measured_decode_ms_per_layer=self.cfg.decode_ms_per_layer,
             endpoint_hint=self.cfg.endpoint_hint,
             supported_protocol=list(SUPPORTED_CONTROL_VERSIONS),
@@ -336,6 +344,9 @@ def _parse_args(argv=None) -> MeshConfig:
     ap.add_argument("--mesh-id", default="prithvi-q8")
     ap.add_argument("--serving", action="append", default=[],
                     help="model id served (repeatable)")
+    ap.add_argument("--wanted", action="append", default=[],
+                    help="model id this node WANTS served but can't (repeatable); the discovery "
+                         "demand signal a GPU owner can see and fill")
     ap.add_argument("--relay-dir", default=str(home_nks / "relay"),
                     help="FileRelay discovery directory (the shared substrate)")
     ap.add_argument("--rendezvous", default="127.0.0.1:51820",
@@ -366,6 +377,7 @@ def _parse_args(argv=None) -> MeshConfig:
     # empty serving entries / worker-addr / drift-class as "not set" so a
     # consumer-only node configures cleanly from the same unit file.
     serving = [s for s in a.serving if s]
+    wanted = [w for w in a.wanted if w]
     worker_addr = a.worker_addr or None
     drift_class = a.drift_class or None
     daemon_bin = a.daemon_bin or None
@@ -378,6 +390,7 @@ def _parse_args(argv=None) -> MeshConfig:
         refresh=a.refresh, identity_file=Path(a.identity_file),
         status_file=Path(a.status_file), daemon_bin=daemon_bin,
         provenance_pin=provenance_pin, once=a.once, peer_ttl=a.peer_ttl,
+        wanted=wanted,
     )
 
 
