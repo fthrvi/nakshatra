@@ -751,7 +751,11 @@ def main():
         if idx + 1 >= len(sorted_stubs):
             return None
         nxt_w = sorted_stubs[idx + 1][0]
-        return pb.NextServer(address=f"{nxt_w['address']}:{nxt_w['port']}",
+        # CO-LOCATED PUSH: the previous worker forwards to `internal_address` if set
+        # (e.g. 127.0.0.1 when both stages share a box — localhost hop, no WAN), while
+        # the client still reached the worker on its routable `address` at setup.
+        push_addr = nxt_w.get("internal_address") or nxt_w["address"]
+        return pb.NextServer(address=f"{push_addr}:{nxt_w['port']}",
                               session_id=session_id)
 
     def _chain_from(idx):
@@ -759,7 +763,8 @@ def main():
         idx+1, idx+2, ..., last. Empty if idx is the last worker. v0.5 M0.5.3 v2."""
         out = []
         for w, _, _ in sorted_stubs[idx + 1:]:
-            out.append(pb.NextServer(address=f"{w['address']}:{w['port']}",
+            push_addr = w.get("internal_address") or w["address"]   # co-located → localhost hop
+            out.append(pb.NextServer(address=f"{push_addr}:{w['port']}",
                                       session_id=session_id))
         return out
 
