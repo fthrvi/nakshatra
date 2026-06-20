@@ -1,8 +1,12 @@
 """Tests for identity_binding.py — holder-of-key proofs, receipt participation, credit accounts.
 Pure crypto, no hardware. Run: python3 -m pytest scripts/test_identity_binding.py -q"""
-from cryptography.hazmat.primitives.asymmetric import ed25519
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))   # scripts/ on path
 
-import identity_binding as ib
+from cryptography.hazmat.primitives.asymmetric import ed25519  # noqa: E402
+
+import identity_binding as ib  # noqa: E402
 
 
 def _key():

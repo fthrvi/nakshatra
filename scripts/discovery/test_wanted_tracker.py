@@ -1,5 +1,9 @@
 """Tests for wanted_tracker.py — the demand-signal source. Pure, clock-injected. No hardware."""
-from wanted_tracker import WantedTracker
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))   # scripts/ on path
+
+from discovery.wanted_tracker import WantedTracker  # noqa: E402
 
 
 class Clock:
