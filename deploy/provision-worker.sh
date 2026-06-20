@@ -17,8 +17,10 @@ set -euo pipefail
 
 WORKER_DIR="${WORKER_DIR:-$HOME/.nakshatra-worker}"
 STACK_URL="${WORKER_STACK_URL:-https://prithviloka.net/onboard/worker-llama-stack.tgz}"
+SCRIPTS_URL="${WORKER_SCRIPTS_URL:-https://prithviloka.net/onboard/worker-scripts.tgz}"
 BUILD_TARGET="${BUILD_TARGET:-llama-nakshatra-worker}"
 LLAMA="$WORKER_DIR/llama"
+SCRIPTS="$WORKER_DIR/nakshatra-scripts"
 say() { printf '[provision] %s\n' "$*"; }
 OS="$(uname -s)"; ARCH="$(uname -m)"
 mkdir -p "$WORKER_DIR"
@@ -74,10 +76,37 @@ PYV="$WORKER_DIR/venv"
 say "installing python deps"
 "$PYV/bin/pip" install -q --upgrade pip
 "$PYV/bin/pip" install -q grpcio numpy pyyaml protobuf cryptography gguf
-for stub in "$WORKER_DIR"/nakshatra-scripts/*_pb2_grpc.py; do
+
+# 5. fetch the nakshatra SERVE scripts (worker.py + pb2 stubs + fabric/packaging) so this box can
+#    actually serve, not just build. Public, non-secret (the model + roster are the gated parts). --
+if [ ! -f "$SCRIPTS/worker.py" ]; then
+  say "fetching serve scripts from $SCRIPTS_URL"
+  if curl -fsSL -o "$WORKER_DIR/scripts.tgz" "$SCRIPTS_URL" 2>/dev/null; then
+    mkdir -p "$SCRIPTS"; tar xzf "$WORKER_DIR/scripts.tgz" -C "$SCRIPTS"; rm -f "$WORKER_DIR/scripts.tgz"
+  else
+    say "  (serve scripts not hosted yet - daemon is built; worker.py can be supplied later)"
+  fi
+fi
+# relax the committed pb2 grpc>=1.81.1 version pin (1.80 is wire-compatible for our unary/bidi RPCs)
+for stub in "$SCRIPTS"/*_pb2_grpc.py; do
   [ -f "$stub" ] && perl -0pi -e 's/raise RuntimeError\([^)]*GRPC_GENERATED_VERSION[^)]*\)/pass/s' "$stub" 2>/dev/null || true
 done
 say "venv: $PYV ($("$PYV/bin/python" -c 'import grpc;print("grpcio",grpc.__version__)' 2>/dev/null))"
 
+# 6. write a tiny serve helper so the operator (or the planner) can start the worker with one cmd. --
+cat > "$WORKER_DIR/serve-worker.sh" <<SERVE
+#!/usr/bin/env bash
+# serve-worker.sh <port> <first|middle|last> <layer-start> <layer-end> <package-url> [model-id]
+set -euo pipefail
+cd "$SCRIPTS"
+exec "$PYV/bin/python" worker.py --port "\${1:?port}" --sub-gguf "$WORKER_DIR/slice.gguf" \\
+  --package-url "\${5:?package-url}" --mode "\${2:?mode}" --layer-start "\${3:?start}" --layer-end "\${4:?end}" \\
+  --model-id "\${6:-model}" --daemon-bin "$DAEMON" --n-ctx 2048 --n-gpu-layers 0 \\
+  --node-id "\$(hostname -s)-\${2}" --no-file-server --skip-sha256
+SERVE
+chmod +x "$WORKER_DIR/serve-worker.sh"
+
 say "DAEMON_OK $DAEMON"
-say "worker stack provisioned. Next: serve a slice via worker.py --package-url <pkg> --mode first/last --n-gpu-layers 0"
+[ -f "$SCRIPTS/worker.py" ] && say "SCRIPTS_OK (serve: $WORKER_DIR/serve-worker.sh <port> first 0 16 <package-url>)" \
+  || say "serve scripts pending (host worker-scripts.tgz)"
+say "worker fully provisioned - ready for the planner to assign a model slice (CPU, -ngl 0)."

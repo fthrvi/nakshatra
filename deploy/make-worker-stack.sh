@@ -20,3 +20,14 @@ tar czf "$OUT" -C "$SRC" \
 printf 'wrote %s (%.1f MB)\nsha256 %s\n' "$OUT" \
   "$(echo "scale=1; $(stat -f%z "$OUT" 2>/dev/null || stat -c%s "$OUT")/1048576" | bc 2>/dev/null || echo '?')" \
   "$(sha256sum "$OUT" 2>/dev/null | cut -c1-16 || shasum -a256 "$OUT" | cut -c1-16)"
+
+# the SERVE scripts bundle (worker.py + pb2 stubs + fabric/packaging) - public, non-secret. The model
+# + roster are the gated parts; these are just the protocol so a dial-out worker can run worker.py.
+SCRIPTS_SRC="${NAKSHATRA_SCRIPTS:-$HOME/nakshatra/scripts}"
+SCRIPTS_OUT="$(dirname "$OUT")/worker-scripts.tgz"
+if [ -f "$SCRIPTS_SRC/worker.py" ]; then
+  tar czf "$SCRIPTS_OUT" -C "$SCRIPTS_SRC" \
+    --exclude='__pycache__' --exclude='*.pyc' --exclude='.venv' --exclude='*.gguf' --exclude='test_*' .
+  printf 'wrote %s (%.1f MB)\n' "$SCRIPTS_OUT" \
+    "$(echo "scale=1; $(stat -f%z "$SCRIPTS_OUT" 2>/dev/null || stat -c%s "$SCRIPTS_OUT")/1048576" | bc 2>/dev/null || echo '?')"
+fi
