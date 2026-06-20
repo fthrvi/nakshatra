@@ -23,7 +23,7 @@ for w in "${WORKERS[@]}"; do
   IFS=: read -r h s e mode <<<"$w"
   ssh -o BatchMode=yes -o ConnectTimeout=12 "$h" "bash -lc '
     pkill -f worker.py 2>/dev/null; sleep 1
-    nohup ~/nakshatra-venv/bin/python ~/nakshatra-scripts/worker.py --port 5540 --sub-gguf ~/slice-$mode.gguf \
+    nohup env NAKSHATRA_ACT_QUANT=int8 ~/nakshatra-venv/bin/python ~/nakshatra-scripts/worker.py --port 5540 --sub-gguf ~/slice-$mode.gguf \
       --package-url ~/pkg --mode $mode --layer-start $s --layer-end $e --model-id dsr1-8b \
       --daemon-bin ~/llama-nak/build/bin/llama-nakshatra-worker --n-ctx 2048 --n-gpu-layers 0 \
       --node-id $h-$mode --no-file-server --skip-sha256 >~/w.log 2>&1 & echo started $h $mode'" 2>&1 | tail -1
@@ -41,7 +41,9 @@ echo "waiting for workers to load (CPU, ~30-60s)..."
 for i in $(seq 1 24); do up=0; for ip in "${IPS[@]}"; do timeout 5 bash -c "cat </dev/null >/dev/tcp/$ip/5540" 2>/dev/null && up=$((up+1)); done; [ "$up" = 3 ] && break; sleep 6; done
 echo "3 iMac workers up. Config: $CFG"
 
-CLIENT="$HOME/nakshatra/.venv/bin/python $HOME/nakshatra/scripts/client.py --config $CFG --model-path $MODEL_GGUF --tls-mode off --prompt"
+# act-quant on the wire: int8 hidden states = ~4x smaller = ~1.6x faster over the high-latency relay
+# (measured 0.98 -> 1.57 tok/s on the 3-iMac chain, output identical). Workers launched with it too.
+CLIENT="env NAKSHATRA_ACT_QUANT=int8 $HOME/nakshatra/.venv/bin/python $HOME/nakshatra/scripts/client.py --config $CFG --model-path $MODEL_GGUF --tls-mode off --prompt"
 if [ "${1:-}" = "chat" ]; then
   exec $CLIENT "${2:?prompt}" --max-tokens "${3:-32}"
 else
