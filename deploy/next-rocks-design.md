@@ -113,3 +113,33 @@ next dedicated C++ session rather than rushed marathon-tail code.
 
 
 **C++ STATUS 2026-06-21:** steps 1-3 DONE+TESTED on hub gfx1201. `worker_daemon.cpp` (backup `.pre-eagle`): EagleCapture + `eagle_cb_eval` (matches embd/l_out-0/l_out-1, host/device-safe via ggml_backend_tensor_get) + `cmd=5 EAGLE_HIDDEN` returns float32[n_tokens*3*n_embd] result_type=3. Verified: 4 toks→49152 real floats (4*3*4096); cmd=1 regression PASS (existing decode intact). REMAINING: step 4 `EagleDraft` in speculative.py (needs the trained head, ~0.60 + climbing) + step 5 gate/measure.
+
+---
+
+## EagleDraft (step 4) — FEASIBILITY PROVEN, build plan (2026-06-21)
+
+**Key finding:** `~/EAGLE/eagle/model/cnets.py` is the EAGLE-3 INFERENCE twin of the
+training head — `class Model` with `midlayer` (LlamaDecoderLayeremb), `fc(target_hidden×3)`,
+`d2t`/`t2d`, `lm_head(draft_vocab)` — i.e. SAME architecture as my trained `head_step*.pt`.
+So we REUSE EAGLE's own EAGLE-3 inference draft, not reinvent the recurrence (avoids the
+subtle-wrong trap).
+
+**Build (focused session, CPU for the head — tiny):**
+1. `scripts/eagle_draft.py`: load `head_step*.pt` (trainable params + d2t/t2d) into
+   `eagle.model.cnets.Model` (inference). Map our saved keys → its module names.
+2. `propose(hidden3, prefix_last_token, k)`: feed the target's 3 hidden states (from the
+   worker's `cmd=5 EAGLE_HIDDEN`) into the Model's draft generation; take the **top-1 chain**
+   (greedy path) of EAGLE's tree as k LINEAR draft tokens (our spec-decode is linear, not
+   tree). Map draft-vocab ids → full vocab via `d2t`.
+3. Wire into `scripts/speculative.py` as an `EagleDraft` implementing the `DraftModel.propose`
+   interface; the spec loop requests `cmd=5` on the first shard after the prefix decode.
+4. **VALIDATE: acceptance ≈ training acc (~0.60).** If the ported draft accepts near the
+   training number, the recurrence is correct; near-0 = wrong wiring (the trap). Gate here.
+5. Then byte-identical greedy gate + tok/s on netsim (the proof number).
+
+**Why not rushed now:** version-match is proven but the chain-extraction + cmd=5 wiring +
+acceptance validation is a careful multi-step build, best against a more-converged head
+(currently ~0.60, epoch 1, still climbing). A focused session, not marathon-tail code.
+
+**DONE this turn:** `eval_head.py` cast → bf16 (matches the bf16 head; ready to run for the
+honest held-out number). cmd=5 GPU integration test persisted at `deploy/test_eagle_cmd5.py`.
