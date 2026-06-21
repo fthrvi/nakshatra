@@ -155,3 +155,54 @@ def origin_source(pull_fn: Callable[["SliceRef", str], bool],
     def fetch(ref: SliceRef, dest_tmp: str) -> bool:
         return bool(pull_fn(ref, dest_tmp))
     return (name, fetch)
+
+
+# ── real mesh transport (HTTP, pairs with slice_server.py) ───────────
+def http_pull(peer: str, ref: SliceRef, dest_tmp: str,
+              timeout: float = 30.0, chunk: int = 8 << 20) -> bool:
+    """Stream a slice from a peer running slice_server. `peer` is host:port (or a
+    full base URL). Returns True iff the file landed with the expected size."""
+    import urllib.request
+    base = peer if peer.startswith("http") else f"http://{peer}"
+    url = f"{base.rstrip('/')}/slice/{ref.filename}"
+    req = urllib.request.Request(url)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        expect = int(r.headers.get("Content-Length") or 0)
+        got = 0
+        with open(dest_tmp, "wb") as f:
+            while True:
+                b = r.read(chunk)
+                if not b:
+                    break
+                f.write(b)
+                got += len(b)
+    return got > 0 and (expect == 0 or got == expect)
+
+
+def static_holders(peers: List[str]) -> Callable[["SliceRef"], List[str]]:
+    """Simplest holders_fn: try a fixed peer list in order (a 404 on /slice just
+    falls through to the next). No directory query needed — robust + good enough
+    until the TTL directory lands."""
+    def holders(ref: SliceRef) -> List[str]:
+        return list(peers)
+    return holders
+
+
+def make_ensure_fn(refs: List[SliceRef], cache_dir: str,
+                   peers: "Optional[List[str]]" = None,
+                   origin_pull: "Optional[Callable[[SliceRef, str], bool]]" = None,
+                   log: Callable[[str], None] = print) -> Callable[[], List[str]]:
+    """Build the standard fetch-if-absent chain (cache → mesh peers → origin) for
+    a model's slices and return an ensure_fn() that the ChainLifecycle calls on
+    summon. Returns the local paths of all `refs`, fetching any that are missing.
+    `peers` are host:port of nodes running slice_server; `origin_pull` is the
+    last-resort HF/ollama fetcher (omit until wired)."""
+    sources: List[Source] = []
+    if peers:
+        sources.append(mesh_peer_source(static_holders(peers), http_pull))
+    if origin_pull is not None:
+        sources.append(origin_source(origin_pull))
+
+    def ensure() -> List[str]:
+        return [ensure_present(r, cache_dir, sources, log=log) for r in refs]
+    return ensure

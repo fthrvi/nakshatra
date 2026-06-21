@@ -96,3 +96,35 @@ def test_warm_paths_missing_file_does_not_break_summon(tmp_path):
                            start_timeout_s=5, poll_s=0.01)
     assert lc.warm() is True
     assert c.starts == 1
+
+
+def test_ensure_fn_runs_before_summon_and_sets_warm_paths(tmp_path):
+    # summon = fetch-if-absent (ensure_fn) → warm → start. ensure_fn's returned
+    # paths become the warm set, and it runs before the controller starts.
+    order = []
+    f = tmp_path / "fetched@h-L0-16.gguf"
+    f.write_bytes(b"GGUF" + b"\x00" * 1024)
+
+    class _OrderCtrl(_Ctrl):
+        def start(self):
+            order.append("start")
+            super().start()
+
+    def ensure():
+        order.append("ensure")
+        return [str(f)]
+
+    c = _OrderCtrl(ready=True)
+    lc = sl.ChainLifecycle(c, ensure_fn=ensure, start_timeout_s=5, poll_s=0.01)
+    assert lc.warm() is True
+    assert order == ["ensure", "start"]      # fetch happened before summon
+    assert lc.warm_paths == [str(f)]         # adopted the fetched path
+
+
+def test_ensure_fn_failure_does_not_break_summon():
+    def boom():
+        raise RuntimeError("all sources down")
+    c = _Ctrl(ready=True)
+    lc = sl.ChainLifecycle(c, ensure_fn=boom, start_timeout_s=5, poll_s=0.01)
+    assert lc.warm() is True                  # degrades gracefully
+    assert c.starts == 1

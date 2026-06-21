@@ -459,12 +459,17 @@ class ChainLifecycle:
                  start_timeout_s: float = 90.0, poll_s: float = 1.0,
                  lease_client: "Optional[PillarLeaseClient]" = None,
                  warm_paths: "Optional[list[str]]" = None,
+                 ensure_fn: "Optional[Callable[[], list[str]]]" = None,
                  log: Callable[[str], None] = print):
         self.controller = controller
         # Node-local GGUF slice files to pre-read into the page cache on summon,
         # so the worker's mmap load skips the multi-GB disk read (slice_warm.py).
         # Page cache survives reaping → re-summon stays fast. Best-effort.
         self.warm_paths = list(warm_paths or [])
+        # Optional acquisition step (slice_fetch): called before warming to
+        # FETCH-IF-ABSENT the model's slices (cache → mesh peer → origin) and
+        # return their local paths. Makes summon = fetch-if-absent → warm → load.
+        self.ensure_fn = ensure_fn
         self.idle_grace_s = idle_grace_s
         self.start_timeout_s = start_timeout_s
         self.poll_s = poll_s
@@ -499,7 +504,8 @@ class ChainLifecycle:
             if self._up and self.controller.is_ready():
                 return
             # cold start
-            self._warm_slices()   # page-cache slices before the worker loads them
+            self._ensure_slices() # fetch-if-absent (cache→peer→origin) …
+            self._warm_slices()   # …then page-cache slices before the worker loads them
             self._log("[lifecycle] chain idle/down — summoning workers…")
             self.controller.start()
         # wait for readiness OUTSIDE the lock (cold-start can take ~10-20s)
@@ -541,7 +547,8 @@ class ChainLifecycle:
             self._last_active = time.monotonic()
             if self._up and self.controller.is_ready():
                 return True
-            self._warm_slices()   # page-cache the slices before the worker loads them
+            self._ensure_slices() # fetch-if-absent (cache→peer→origin) …
+            self._warm_slices()   # …then page-cache the slices before the worker loads them
             self._log("[lifecycle] pre-warm: summoning workers ahead of demand…")
             self.controller.start()
         deadline = time.monotonic() + self.start_timeout_s
@@ -554,6 +561,19 @@ class ChainLifecycle:
             self._stop_evt.wait(self.poll_s)
         self._log("[lifecycle] pre-warm timed out (cold-start deferred to first request)")
         return False
+
+    def _ensure_slices(self) -> None:
+        """Fetch-if-absent: acquire this model's slices (cache→peer→origin) before
+        summon, and adopt the returned local paths as the warm set. Best-effort —
+        a fetch failure degrades to whatever's already on disk, never breaks summon."""
+        if self.ensure_fn is None:
+            return
+        try:
+            paths = self.ensure_fn()
+            if paths:
+                self.warm_paths = list(paths)
+        except Exception as e:
+            self._log(f"[lifecycle] slice-fetch skipped: {e}")
 
     def _warm_slices(self) -> None:
         """Pre-read this model's local GGUF slices into the page cache so the
