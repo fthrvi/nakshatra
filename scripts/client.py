@@ -131,10 +131,12 @@ def detok_one(llama, tid):
 
 
 def call_forward(stub, payload, n_tokens, has_token_ids, worker_id="<unknown>",
-                 keep_kv=False, start_pos=0, timing=None, all_logits=False):
+                 keep_kv=False, start_pos=0, timing=None, all_logits=False,
+                 eagle_hidden=False):
     req = pb.ForwardRequest(
         hidden_in=payload, batch=1, n_tokens=n_tokens, has_token_ids=has_token_ids,
         keep_kv=keep_kv, start_pos=start_pos, all_logits=all_logits,
+        eagle_hidden=eagle_hidden,
     )
     t0 = time.time()
     try:

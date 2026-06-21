@@ -362,6 +362,7 @@ int main(int argc, char ** argv) {
         auto cp = llama_context_default_params();
         cp.n_ctx     = n_ctx;
         cp.n_batch   = n_ctx;
+        cp.n_seq_max = 2;            // seq 0 = serving/verify, seq 1 = EAGLE draft scratch
         cp.embeddings = true;
         cp.cb_eval = eagle_cb_eval;
         cp.cb_eval_user_data = &g_eagle_cap;
@@ -480,7 +481,16 @@ int main(int argc, char ** argv) {
         // First step in a session always sends keep_kv=false (cold prefill);
         // subsequent steps send keep_kv=true with start_pos = prefix_length
         // so the new tokens append to the existing KV cache.
-        if (!keep_kv) {
+        if (cmd == 5) {
+            // EAGLE→live KV ISOLATION (2026-06-21): the draft-hidden capture runs
+            // on a SCRATCH sequence (1), never seq 0. The serving/verify path owns
+            // seq 0; if cmd=5 cleared or appended there it would corrupt the
+            // speculative KV (rejected-tail invariants, M3 fusion). So cmd=5 is
+            // ALWAYS cold on seq 1: wipe seq 1, decode the full prefix at pos 0..
+            // (cheap — the first worker holds only ~2 layers). start_pos/keep_kv
+            // from the caller are ignored for cmd=5.
+            llama_memory_seq_rm(llama_get_memory(ctx), 1, -1, -1);
+        } else if (!keep_kv) {
             llama_memory_clear(llama_get_memory(ctx), true);
         } else {
             // M3 spec-decode FUSION (2026-06-21): a keep_kv forward implicitly
@@ -505,13 +515,17 @@ int main(int argc, char ** argv) {
                 send_response(2, nullptr, 0); continue;
             }
             const int32_t* tok = (const int32_t*) payload.data();
+            // cmd=5 (EAGLE draft) is isolated on scratch seq 1 at pos 0..; cmd=1
+            // (serving/verify) is on seq 0 at start_pos.. — see KV-isolation note.
+            const bool eagle = (cmd == 5);
+            const int32_t kv_seq = eagle ? 1 : 0;
             llama_batch batch = llama_batch_init(n_tokens, 0, 1);
             batch.n_tokens = n_tokens;
             for (uint32_t i = 0; i < n_tokens; ++i) {
                 batch.token[i] = (llama_token) tok[i];
-                batch.pos[i] = (int32_t)(start_pos + i);
+                batch.pos[i] = eagle ? (int32_t)i : (int32_t)(start_pos + i);
                 batch.n_seq_id[i] = 1;
-                batch.seq_id[i][0] = 0;
+                batch.seq_id[i][0] = kv_seq;
                 batch.logits[i] = (all_logits || i == n_tokens - 1) ? 1 : 0;
             }
             if (timing_on) t_decode_start = now_ns();
