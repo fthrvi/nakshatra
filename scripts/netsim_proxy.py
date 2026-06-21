@@ -19,17 +19,26 @@ import time
 
 
 async def _pump(reader, writer, delay_s, bytes_per_s):
+    # Inject latency PER BURST (one delay per logical request/response turn), not
+    # per TCP chunk — so payload SIZE doesn't change the latency (that's the whole
+    # point: model propagation RTT, not bandwidth). A burst = data arriving after a
+    # quiet gap; chunks within a burst stream at full speed once the "wire" is open.
+    GAP = 0.004  # s of quiet that marks a new burst (a new turn over the link)
+    last = 0.0
+    loop = asyncio.get_event_loop()
     try:
         while True:
             data = await reader.read(65536)
             if not data:
                 break
-            if delay_s > 0:
-                await asyncio.sleep(delay_s)
+            now = loop.time()
+            if delay_s > 0 and (now - last) > GAP:
+                await asyncio.sleep(delay_s)        # one-way propagation for this turn
             if bytes_per_s:
-                await asyncio.sleep(len(data) / bytes_per_s)  # crude bandwidth cap
+                await asyncio.sleep(len(data) / bytes_per_s)   # optional bandwidth cap
             writer.write(data)
             await writer.drain()
+            last = loop.time()
     except Exception:
         pass
     finally:
