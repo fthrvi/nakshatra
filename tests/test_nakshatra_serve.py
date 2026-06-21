@@ -528,10 +528,16 @@ def test_chat_streaming_backend_error_emits_terminal_chunk(tmp_path):
     assert chunks[-1]["done"] is True and "error" in chunks[-1]
 
 
-def test_chat_missing_messages_400(tmp_path):
+def test_chat_missing_messages_is_load(tmp_path):
+    # Ollama "load" convention: /api/chat with no messages preloads the model
+    # (our pre-warm path). Returns 200 with done_reason "load", not an error.
+    # No lifecycle is configured here, so warm() is a no-op and warmed=True.
     with _running_chat(_chat_models(tmp_path), _CapturingBackend()) as port:
-        status, _ = _post(port, "/api/chat", {"model": "llama-3.3-70b"})
-    assert status == 400
+        status, body = _post(port, "/api/chat", {"model": "llama-3.3-70b"})
+    assert status == 200
+    assert body["done"] is True
+    assert body["done_reason"] == "load"
+    assert body["message"]["content"] == ""
 
 
 def test_chat_backend_error_maps_to_502(tmp_path):
