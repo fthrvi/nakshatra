@@ -458,8 +458,13 @@ class ChainLifecycle:
     def __init__(self, controller: ChainController, idle_grace_s: float = 600.0,
                  start_timeout_s: float = 90.0, poll_s: float = 1.0,
                  lease_client: "Optional[PillarLeaseClient]" = None,
+                 warm_paths: "Optional[list[str]]" = None,
                  log: Callable[[str], None] = print):
         self.controller = controller
+        # Node-local GGUF slice files to pre-read into the page cache on summon,
+        # so the worker's mmap load skips the multi-GB disk read (slice_warm.py).
+        # Page cache survives reaping → re-summon stays fast. Best-effort.
+        self.warm_paths = list(warm_paths or [])
         self.idle_grace_s = idle_grace_s
         self.start_timeout_s = start_timeout_s
         self.poll_s = poll_s
@@ -494,6 +499,7 @@ class ChainLifecycle:
             if self._up and self.controller.is_ready():
                 return
             # cold start
+            self._warm_slices()   # page-cache slices before the worker loads them
             self._log("[lifecycle] chain idle/down — summoning workers…")
             self.controller.start()
         # wait for readiness OUTSIDE the lock (cold-start can take ~10-20s)
@@ -535,6 +541,7 @@ class ChainLifecycle:
             self._last_active = time.monotonic()
             if self._up and self.controller.is_ready():
                 return True
+            self._warm_slices()   # page-cache the slices before the worker loads them
             self._log("[lifecycle] pre-warm: summoning workers ahead of demand…")
             self.controller.start()
         deadline = time.monotonic() + self.start_timeout_s
@@ -547,6 +554,17 @@ class ChainLifecycle:
             self._stop_evt.wait(self.poll_s)
         self._log("[lifecycle] pre-warm timed out (cold-start deferred to first request)")
         return False
+
+    def _warm_slices(self) -> None:
+        """Pre-read this model's local GGUF slices into the page cache so the
+        worker's mmap load skips disk. Best-effort — never blocks/breaks summon."""
+        if not self.warm_paths:
+            return
+        try:
+            import slice_warm
+            slice_warm.warm_paths(self.warm_paths, log=self._log)
+        except Exception as e:
+            self._log(f"[lifecycle] slice-warm skipped: {e}")
 
     # reaper ----------------------------------------------------------
     def start_reaper(self) -> None:

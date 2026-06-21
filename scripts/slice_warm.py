@@ -127,7 +127,9 @@ def resident_fraction(path: str) -> float:
     except OSError:
         return -1.0
     try:
-        mm = mmap.mmap(fd, 0, prot=mmap.PROT_READ)
+        # ACCESS_COPY so ctypes.from_buffer (needs writable) can take the address;
+        # the COW view still reports the underlying file pages' residency.
+        mm = mmap.mmap(fd, 0, access=mmap.ACCESS_COPY)
     except (OSError, ValueError):
         os.close(fd)
         return -1.0
@@ -141,6 +143,8 @@ def resident_fraction(path: str) -> float:
             return -1.0
         resident = sum(1 for b in vec if b & 1)
         return resident / n
+    except (TypeError, ValueError, OSError):
+        return -1.0
     finally:
         mm.close()
         os.close(fd)

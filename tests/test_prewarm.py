@@ -4,10 +4,12 @@ Proves: warm() summons the chain ahead of demand (cold-start off the critical
 path), is idempotent when already hot, does NOT count as an in-flight request
 (so the reaper still governs it), returns False on summon timeout, and a real
 begin() after a warm() reuses the summon (no double cold-start)."""
+import os
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 import serve_lifecycle as sl
+import slice_warm
 
 
 class _Ctrl:
@@ -74,3 +76,23 @@ def test_warm_resets_idle_clock():
     lc._last_active = 0.0
     lc.warm()
     assert lc._last_active > 0.0   # reaper grace window starts fresh
+
+
+def test_warm_warms_slice_paths(tmp_path):
+    # warm() should page-cache the model's local slices before summoning workers.
+    f = tmp_path / "model@abc-L0-16.gguf"
+    f.write_bytes(os.urandom(3 << 20))
+    c = _Ctrl(ready=True)
+    lc = sl.ChainLifecycle(c, warm_paths=[str(f)], start_timeout_s=5, poll_s=0.01)
+    assert lc.warm() is True
+    frac = slice_warm.resident_fraction(str(f))
+    assert frac == -1.0 or frac > 0.9   # slice is hot in page cache after warm
+
+
+def test_warm_paths_missing_file_does_not_break_summon(tmp_path):
+    # a stale/missing slice path must never break the summon (best-effort warm).
+    c = _Ctrl(ready=True)
+    lc = sl.ChainLifecycle(c, warm_paths=[str(tmp_path / "gone.gguf")],
+                           start_timeout_s=5, poll_s=0.01)
+    assert lc.warm() is True
+    assert c.starts == 1
