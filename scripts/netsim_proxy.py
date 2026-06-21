@@ -15,10 +15,11 @@ delay-ms is ONE-WAY, so a request->response round trip incurs ~2x (e.g. 80 -> ~1
 """
 import argparse
 import asyncio
+import random
 import time
 
 
-async def _pump(reader, writer, delay_s, bytes_per_s):
+async def _pump(reader, writer, delay_s, bytes_per_s, jitter_s=0.0):
     # Inject latency PER BURST (one delay per logical request/response turn), not
     # per TCP chunk — so payload SIZE doesn't change the latency (that's the whole
     # point: model propagation RTT, not bandwidth). A burst = data arriving after a
@@ -33,7 +34,8 @@ async def _pump(reader, writer, delay_s, bytes_per_s):
                 break
             now = loop.time()
             if delay_s > 0 and (now - last) > GAP:
-                await asyncio.sleep(delay_s)        # one-way propagation for this turn
+                d = delay_s + (random.uniform(-jitter_s, jitter_s) if jitter_s else 0.0)
+                await asyncio.sleep(max(0.0, d))    # one-way propagation (+jitter) this turn
             if bytes_per_s:
                 await asyncio.sleep(len(data) / bytes_per_s)   # optional bandwidth cap
             writer.write(data)
@@ -53,10 +55,12 @@ def main():
     ap.add_argument("--listen", default="127.0.0.1:5572")
     ap.add_argument("--upstream", default="10.0.0.227:5570")
     ap.add_argument("--delay-ms", type=float, default=80.0, help="ONE-WAY delay (RTT ~= 2x)")
+    ap.add_argument("--jitter-ms", type=float, default=0.0, help="ONE-WAY random jitter +/-")
     ap.add_argument("--rate-mbit", type=float, default=0.0, help="0 = unlimited")
     args = ap.parse_args()
     lh, lp = args.listen.split(":"); uh, up = args.upstream.split(":")
     delay_s = args.delay_ms / 1000.0
+    jitter_s = args.jitter_ms / 1000.0
     bps = args.rate_mbit * 1e6 / 8 if args.rate_mbit else 0
 
     async def handle(cr, cw):
@@ -64,7 +68,8 @@ def main():
             ur, uw = await asyncio.open_connection(uh, int(up))
         except Exception:
             cw.close(); return
-        await asyncio.gather(_pump(cr, uw, delay_s, bps), _pump(ur, cw, delay_s, bps))
+        await asyncio.gather(_pump(cr, uw, delay_s, bps, jitter_s),
+                             _pump(ur, cw, delay_s, bps, jitter_s))
 
     async def run():
         srv = await asyncio.start_server(handle, lh, int(lp))
