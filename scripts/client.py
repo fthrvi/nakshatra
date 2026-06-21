@@ -866,13 +866,13 @@ def main():
                     target_argmax = list(struct.unpack(f"<{n_v}i", last_resp))
                     res = accept(drafts, target_argmax)
                     n_keep = kv_keep_after(prefix_length, res.n_accepted)
-                    # Fan TruncateKV to EVERY worker (a single miss leaves a stale KV
-                    # tail that silently corrupts the next step). Skip only on all-accept,
-                    # where nothing was trimmed (n_keep == prefix_length + n_v).
-                    if n_keep < prefix_length + n_v:
-                        for _w, _stub, _ in sorted_stubs:
-                            _stub.TruncateKV(pb.TruncateRequest(n_keep=n_keep), timeout=60.0)
-                    prefix_length = n_keep   # next start_pos == kept KV length
+                    # M3 FUSION (2026-06-21): no separate TruncateKV round-trip.
+                    # Setting prefix_length = n_keep makes the NEXT forward's start_pos
+                    # = n_keep, and the daemon now truncates its KV to start_pos before
+                    # decoding (worker_daemon.cpp keep_kv path) — folding the rejected-
+                    # tail discard into the next verify. ONE round-trip per speculative
+                    # step instead of two (RT/token 2.0 -> 1.0).
+                    prefix_length = n_keep   # next start_pos == kept KV length; daemon trims to it
                     stop = False
                     for t in res.committed:
                         if len(generated) >= args.max_tokens:
