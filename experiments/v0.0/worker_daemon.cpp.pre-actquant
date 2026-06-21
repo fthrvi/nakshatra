@@ -102,53 +102,6 @@ static bool eagle_cb_eval(struct ggml_tensor* t, bool ask, void* ud) {
     return true;
 }
 
-#include <cmath>
-// ── Activation quant (int8 per-token absmax) for the worker->worker hidden
-// crossing — ~4x fewer wire bytes (fp32->int8+scale). Per-token: float32 scale,
-// then int8[n_embd]. Lever for deep splits over slow links.
-static const int QBL = 32;   // quant block size (per-block scale contains outliers)
-static inline size_t qrow_bytes(int n_embd) {            // bytes per token, block-wise
-    int nb = (n_embd + QBL - 1) / QBL;
-    return (size_t)nb * (sizeof(float) + QBL);
-}
-static void quant_hidden_i8(const float* h, uint32_t n_tokens, int n_embd,
-                            std::vector<uint8_t>& out) {
-    const size_t row = qrow_bytes(n_embd);
-    out.resize((size_t)n_tokens * row);
-    for (uint32_t t = 0; t < n_tokens; ++t) {
-        const float* r = h + (size_t)t * n_embd;
-        uint8_t* prow = out.data() + (size_t)t * row;
-        for (int b = 0; b * QBL < n_embd; ++b) {
-            int s = b * QBL, e = std::min(s + QBL, n_embd);
-            float amax = 0.0f;
-            for (int i = s; i < e; ++i) { float a = std::fabs(r[i]); if (a > amax) amax = a; }
-            float scale = amax > 0.0f ? amax / 127.0f : 1.0f;
-            uint8_t* p = prow + (size_t)b * (sizeof(float) + QBL);
-            *(float*)p = scale;
-            int8_t* q = (int8_t*)(p + sizeof(float));
-            float inv = 1.0f / scale;
-            for (int i = s; i < e; ++i) {
-                int v = (int)std::lrint(r[i] * inv);
-                q[i - s] = (int8_t)(v < -127 ? -127 : (v > 127 ? 127 : v));
-            }
-        }
-    }
-}
-static void dequant_hidden_i8(const uint8_t* in, uint32_t n_tokens, int n_embd, float* out) {
-    const size_t row = qrow_bytes(n_embd);
-    for (uint32_t t = 0; t < n_tokens; ++t) {
-        const uint8_t* prow = in + (size_t)t * row;
-        float* o = out + (size_t)t * n_embd;
-        for (int b = 0; b * QBL < n_embd; ++b) {
-            int s = b * QBL, e = std::min(s + QBL, n_embd);
-            const uint8_t* p = prow + (size_t)b * (sizeof(float) + QBL);
-            float scale = *(const float*)p;
-            const int8_t* q = (const int8_t*)(p + sizeof(float));
-            for (int i = s; i < e; ++i) o[i] = q[i - s] * scale;
-        }
-    }
-}
-
 // 2026-05-30 fabric C++ Phase C.1 — timing instrumentation. Set
 // NAKSHATRA_FABRIC_TIMING=1 in the daemon's environment to print
 // per-decode wall-time breakdown to stderr. Off by default —
@@ -467,18 +420,13 @@ int main(int argc, char ** argv) {
             llama_batch_free(batch);
             if (cmd == 5) g_eagle_cap.on = false;
         } else if (cmd == 2) {
-            // EMBD_DECODE (flag 0x8 = quantized int8 input from previous worker)
-            const bool quant_in = (flags & 0x8) != 0;
-            const uint32_t need = quant_in
-                ? (uint32_t)((size_t)n_tokens * qrow_bytes(n_embd))
-                : n_tokens * (uint32_t)n_embd * sizeof(float);
-            if (payload_bytes != need) {
+            // EMBD_DECODE
+            if (payload_bytes != n_tokens * (uint32_t)n_embd * sizeof(float)) {
                 send_response(2, nullptr, 0); continue;
             }
             llama_batch batch = llama_batch_init(n_tokens, n_embd, 1);
             batch.n_tokens = n_tokens;
-            if (quant_in) dequant_hidden_i8(payload.data(), n_tokens, n_embd, batch.embd);
-            else memcpy(batch.embd, payload.data(), payload_bytes);
+            memcpy(batch.embd, payload.data(), payload_bytes);
             for (uint32_t i = 0; i < n_tokens; ++i) {
                 batch.pos[i] = (int32_t)(start_pos + i);
                 batch.n_seq_id[i] = 1;
@@ -573,21 +521,12 @@ int main(int argc, char ** argv) {
             float* hidden = llama_get_embeddings(ctx);
             if (timing_on) t_get_embd_done = now_ns();
             if (!hidden) { send_response(1, nullptr, 0); continue; }
-            if ((flags & 0x4) != 0) {       // quant_out: int8-quantize the crossing
-                std::vector<uint8_t> q; quant_hidden_i8(hidden, n_tokens, n_embd, q);
-                std::vector<uint8_t> out(4 + q.size());
-                *(uint32_t*)out.data() = 4;  // result_type = quantized hidden (int8)
-                memcpy(out.data() + 4, q.data(), q.size());
-                if (timing_on) t_memcpy_done = now_ns();
-                send_response(0, out.data(), (uint32_t)out.size());
-            } else {
-                size_t hbytes = (size_t)n_tokens * (size_t)n_embd * sizeof(float);
-                std::vector<uint8_t> out(4 + hbytes);
-                *(uint32_t*)out.data() = 0;     // result_type = hidden
-                memcpy(out.data() + 4, hidden, hbytes);
-                if (timing_on) t_memcpy_done = now_ns();
-                send_response(0, out.data(), (uint32_t)out.size());
-            }
+            size_t hbytes = (size_t)n_tokens * (size_t)n_embd * sizeof(float);
+            std::vector<uint8_t> out(4 + hbytes);
+            *(uint32_t*)out.data() = 0;     // result_type = hidden
+            memcpy(out.data() + 4, hidden, hbytes);
+            if (timing_on) t_memcpy_done = now_ns();
+            send_response(0, out.data(), (uint32_t)out.size());
         }
         if (timing_on) {
             uint64_t t_send_done = now_ns();
