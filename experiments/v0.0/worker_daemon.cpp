@@ -344,6 +344,16 @@ int main(int argc, char ** argv) {
         // so the new tokens append to the existing KV cache.
         if (!keep_kv) {
             llama_memory_clear(llama_get_memory(ctx), true);
+        } else {
+            // M3 spec-decode FUSION (2026-06-21): a keep_kv forward implicitly
+            // TRUNCATES the KV to start_pos before appending — discarding any
+            // rejected speculative tail left by the previous step. This folds the
+            // old separate TruncateKV (cmd=4) round-trip into the next verify, so a
+            // speculative step costs ONE round-trip, not two (RT/token 2.0 -> 1.0).
+            // On a normal keep_kv decode start_pos == current KV length, so the
+            // seq_rm is a no-op; only after a partial-accept (start_pos = n_keep <
+            // KV length) does it trim. cmd=4 remains for explicit/legacy callers.
+            llama_memory_seq_rm(llama_get_memory(ctx), 0, (llama_pos)start_pos, -1);
         }
 
         uint64_t t_decode_start = 0, t_decode_done = 0;
