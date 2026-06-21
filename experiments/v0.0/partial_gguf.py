@@ -97,10 +97,21 @@ def main():
     if not (0 <= layer_start < layer_end <= block_count):
         sys.exit(f"invalid range [{layer_start}, {layer_end}) for {block_count}-block model")
 
-    has_token_embd = args.keep_token_embd or (layer_start == 0)
+    # Tied embeddings: Llama-3.2-1B/3B (and other tied models) reuse
+    # token_embd.weight as the lm_head — there is NO separate output.weight in
+    # the source GGUF (llama.cpp omits it when tie_word_embeddings=True). So the
+    # LAST slice, which owns the lm_head, must carry token_embd.weight even
+    # though layer_start>0; otherwise the loader fails with "missing tensor
+    # 'token_embd.weight'". Detect by the absence of output.weight and force the
+    # embedding onto any slice that holds the head. (Automates the manual
+    # --keep-token-embd --keep-output that 8B-untied models never needed.)
+    is_tied = not any(t.name == "output.weight" for t in r.tensors)
     has_lm_head    = args.keep_output     or (layer_end == block_count)
+    has_token_embd = args.keep_token_embd or (layer_start == 0) or (is_tied and has_lm_head)
 
-    print(f"[arch]     {arch}", flush=True)
+    print(f"[arch]     {arch}  tied_embeddings={is_tied}", flush=True)
+    if is_tied and has_lm_head and layer_start > 0:
+        print(f"[tied]     last slice keeps token_embd.weight (serves as tied lm_head)", flush=True)
     print(f"[range]    src={block_count}, keeping=[{layer_start}, {layer_end})  embd={has_token_embd}  lm_head={has_lm_head}", flush=True)
 
     drop_top = set()
