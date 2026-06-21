@@ -25,8 +25,14 @@ actually want to serve.
 ## Pipeline (executable steps)
 1. **Env on ijru** (CUDA torch already works): `pip install --user eagle3` (or clone
    SafeAILab/EAGLE), transformers, accelerate, datasets.
-2. **Target + data:** the served target (start with `DeepSeek-R1-Distill-Llama-8B`, the
-   reasoning model that defeated the generic draft). Generate ~50–100k tokens of the
+2. **Target + data:** **PRITHVI'S OWN model** — `prithvi/training/prithvi-merged/`
+   (Llama-3.1-8B safetensors, his trained voice; the model we actually SERVE as
+   `prithvi:latest`). This is the right target for two reasons: (a) Prithvi's explicit
+   ask — "it won't train for DeepSeek-R1; it's MY model"; (b) product logic — accelerating
+   the model we serve is the real win, and a bespoke fine-tune is *exactly* the case a
+   generic off-the-shelf draft can't match (the EAGLE head is the only lever). The HF
+   safetensors are present (9 shards) → hidden-state extraction works directly.
+   (DeepSeek-R1 was the earlier placeholder; superseded.) Generate ~50–100k tokens of the
    target's OWN outputs on a reasoning+factual+code prompt mix (self-distillation data —
    EAGLE trains the head to mimic the target's feature→token map).
 3. **Train the EAGLE-3 head** on ijru (a few GPU-hours): head predicts the target's next
