@@ -14,6 +14,7 @@ across processes/nodes; now_fn is injectable for deterministic TTL tests.
 from __future__ import annotations
 import json
 import os
+import re
 import time
 from typing import Callable, Dict, List, Optional
 
@@ -94,3 +95,52 @@ def publish_self(directory: SliceDirectory, node: str, slices_dir: str,
         files = []
     directory.publish(node, files, meta=meta)
     return len(files)
+
+
+# ── multi-node SHARED directory (per-node files, lock-free) ───────────
+# For a directory shared across nodes (a mesh fs dir), a single JSON file would
+# clobber under concurrent writers. Instead each node writes its OWN file
+# `<dir>/<node>.json`; readers glob all of them. No locks, no lost updates.
+def _safe_node(node: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._:-]", "_", node)
+
+
+def publish_to_dir(dir_path: str, node: str, slices: List[str],
+                   now_fn: Callable[[], float] = time.time) -> str:
+    """Write this node's record to `<dir_path>/<node>.json` atomically. Each node
+    owns exactly one file, so concurrent publishers never clobber each other."""
+    os.makedirs(dir_path, exist_ok=True)
+    rec = {"node": node, "ts": now_fn(), "slices": list(slices)}
+    p = os.path.join(dir_path, _safe_node(node) + ".json")
+    tmp = f"{p}.tmp.{os.getpid()}"
+    with open(tmp, "w") as f:
+        json.dump(rec, f)
+    os.replace(tmp, p)            # atomic
+    return p
+
+
+def holders_from_dir(dir_path: str, ttl_s: float = 120.0,
+                     now_fn: Callable[[], float] = time.time
+                     ) -> Callable[[object], List[str]]:
+    """A holders_fn (for slice_fetch.make_ensure_fn) backed by a shared per-node
+    directory: globs all <node>.json, keeps fresh records, returns live holders
+    of a slice (freshest first). Accepts a SliceRef or a bare filename."""
+    def fn(ref) -> List[str]:
+        fname = getattr(ref, "filename", ref)
+        now = now_fn()
+        held = []
+        try:
+            names = [n for n in os.listdir(dir_path) if n.endswith(".json")]
+        except OSError:
+            return []
+        for n in names:
+            try:
+                with open(os.path.join(dir_path, n)) as f:
+                    rec = json.load(f)
+            except (OSError, ValueError):
+                continue
+            if now - rec.get("ts", 0) <= ttl_s and fname in rec.get("slices", ()):
+                held.append((rec.get("node", ""), rec.get("ts", 0)))
+        held.sort(key=lambda x: -x[1])
+        return [n for n, _ in held if n]
+    return fn

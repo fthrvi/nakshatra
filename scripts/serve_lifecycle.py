@@ -719,12 +719,19 @@ def from_env(log: Callable[[str], None] = print) -> Optional[ChainLifecycle]:
     peers_env = (os.environ.get("NAKSHATRA_SLICE_PEERS") or "").replace(",", " ").split()
     if warm_env:
         warm_paths = warm_env
+    dir_path = os.environ.get("NAKSHATRA_SLICE_DIR_PATH") or ""
+    dir_ttl = float(os.environ.get("NAKSHATRA_SLICE_DIR_TTL_S", "120"))
     if refs_env:
         try:
             import slice_fetch as _sf
             refs = [_parse_slice_ref(x) for x in refs_env]
-            ensure_fn = _sf.make_ensure_fn(refs, cache_dir,
-                                           peers=peers_env or None, log=log)
+            holders_fn = None
+            if dir_path:
+                import slice_directory as _sd
+                holders_fn = _sd.holders_from_dir(dir_path, ttl_s=dir_ttl)
+                log(f"[slice] dynamic holders via directory {dir_path} (ttl={dir_ttl:.0f}s)")
+            ensure_fn = _sf.make_ensure_fn(refs, cache_dir, peers=peers_env or None,
+                                           holders_fn=holders_fn, log=log)
             if warm_paths is None:
                 warm_paths = [_sf.cache_path(cache_dir, r) for r in refs]
             log(f"[slice] fetch-if-absent armed: {len(refs)} refs, "
