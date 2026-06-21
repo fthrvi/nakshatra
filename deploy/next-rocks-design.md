@@ -143,3 +143,30 @@ acceptance validation is a careful multi-step build, best against a more-converg
 
 **DONE this turn:** `eval_head.py` cast → bf16 (matches the bf16 head; ready to run for the
 honest held-out number). cmd=5 GPU integration test persisted at `deploy/test_eagle_cmd5.py`.
+
+---
+
+## FINAL EAGLE→live wiring (scoped 2026-06-21) — gated on the serving-hidden head
+
+All components built+tested: C++ cmd=5 (daemon) · `eagle_draft` (load+propose) ·
+`eagle_speculative.EagleDraft` (DraftModel wrapper) · train/serve fix proven · full
+retrain producing `head_serving_hidden.pt`. REMAINING = expose cmd=5 through gRPC +
+swap the draft. Do it ADDITIVE + FLAG-GATED (off by default → live serving untouched):
+
+1. **proto** (`proto/nakshatra.proto` ForwardRequest): add `bool eagle_hidden = N;`
+   (additive field, default false). Regen stubs (`scripts/generate.sh`).
+2. **worker.py** (Forward handler): `CMD_EAGLE_HIDDEN = 5`; when `req.eagle_hidden`,
+   send daemon cmd=5 (not cmd=1/2) → return the hidden3 bytes (result_type=3). New
+   branch, inert when the flag is false.
+3. **client.py** (spec loop): a `cmd5_fn(prefix_ids)` = `call_forward(stub0, …,
+   eagle_hidden=True)` on the first worker → hidden3; behind `--eagle-head <ckpt>`,
+   build `eagle_speculative.EagleDraft(head, base, cfg, cmd5_fn)` and use it as
+   `draft` instead of the GGUF DraftModel. Default path unchanged.
+4. **Validate**: gRPC cmd=5 round-trip (worker→daemon→hidden3 back), then the spec
+   loop with the retrained head → acceptance should match the held-out number →
+   byte-identical greedy gate → measure tok/s (the speedup number).
+
+Why head-gated + not rushed at the tail: it's live-serving-path proto/gRPC surgery,
+pointless before the retrained head exists, and the session's repeated lesson is that
+rushing live-path multi-file changes late = breakage. Additive+flag-gated keeps it
+safe; do it WITH the head in hand as the coherent final step.
