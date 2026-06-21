@@ -69,3 +69,41 @@ steps showing acc climbing vs the current bs=1 baseline.
 
 **Honest note:** even unblocked, a converged high-τ head is many GPU-hours; this
 removes the *ceiling*, it doesn't make it instant.
+
+---
+
+## EAGLE → live: expose target hidden states from the C++ worker (the speedup payoff)
+
+**Goal:** at inference the trained EAGLE-3 head needs the target's `hidden_states[0,1,2]`
+(embedding + first 2 layers — all on the FIRST worker, which holds layers 0-16).
+Today `worker_daemon.cpp` emits only the FINAL layer's hidden via `llama_get_embeddings`.
+We must emit the 3 EAGLE-input hidden states so the head (Python `EagleDraft`) can draft.
+
+**Why it's not a one-shot:** llama.cpp exposes no intermediate-layer API. Capture needs
+a **ggml eval callback** (`llama_context_params.cb_eval` + `cb_eval_user_data`, set BEFORE
+`llama_init_from_model`). The callback fires per tensor during graph eval; you match the
+**layer-output tensors by name** and memcpy their data. **Tensor names are version-specific**
+→ step 1 is discovery, not guessing.
+
+**Executable steps (build-in-the-loop on the hub gfx1201 — local llama.cpp build, reliable):**
+1. **Discovery probe:** add `cp.cb_eval` that, on `ask==false`, `fprintf(stderr, t->name)`
+   for one decode, behind `NAKSHATRA_EAGLE_PROBE=1`. Build + run on a hub slice →
+   learn the exact names of the layer-0/1/2 output tensors (likely `l_out-0`, `l_out-1`,
+   … or `ffn_out-N`/`norm-N` depending on build). ~10 min once focused.
+2. **Capture:** in the callback, when `t->name` matches the 3 target layers, copy
+   `ggml_backend_tensor_get` into a `std::vector<float>` keyed by layer (size n_tokens×n_embd).
+3. **Protocol cmd=5 EAGLE_HIDDEN:** like TOKEN_DECODE but the response payload is
+   `float32 hidden3[n_tokens * 3 * n_embd]` (the 3 captured layers concatenated, matching
+   cnets `torch.cat((h0,h1,h2),dim=-1)`). result_type=3.
+4. **Client `EagleDraft`** (`scripts/speculative.py`): on the first shard, request cmd=5,
+   assemble the 3 hidden states, run the trained head (`head_step*.pt` → the EAGLE-3
+   forward: fc → midlayer → norm → lm_head → draft tokens via d2t), propose K. Keep the
+   GGUF-draft path as fallback (the existing `DraftModel` interface).
+5. **Gate:** byte-identical greedy output vs no-spec; measure τ + tok/s on netsim.
+
+**Gating:** end-to-end value needs a TRAINED head (batch-4 run in progress). The C++
+plumbing (steps 1-3) can be built + shape-verified independently of head quality.
+
+**Honest note:** this is a multi-hour focused ggml build, best done with the hub GPU in
+the loop (discovery → capture → verify shapes), NOT blind. Scoped + ready; flagged as the
+next dedicated C++ session rather than rushed marathon-tail code.
