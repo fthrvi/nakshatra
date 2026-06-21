@@ -708,5 +708,43 @@ def from_env(log: Callable[[str], None] = print) -> Optional[ChainLifecycle]:
                 log(f"[lease] pillar={pillar} model={lease_model} as={keyid}")
         except Exception as e:
             log(f"[lease] client unavailable: {e}")
+    # Slice acquisition + page-cache warm. With peers/refs configured, summon
+    # becomes fetch-if-absent (cache→peer→origin) → page-cache warm → load.
+    warm_paths = None
+    ensure_fn = None
+    cache_dir = (os.environ.get("NAKSHATRA_SLICE_CACHE_DIR")
+                 or os.path.expanduser("~/.nakshatra/slices"))
+    warm_env = (os.environ.get("NAKSHATRA_WARM_PATHS") or "").replace(",", " ").split()
+    refs_env = (os.environ.get("NAKSHATRA_SLICE_REFS") or "").replace(",", " ").split()
+    peers_env = (os.environ.get("NAKSHATRA_SLICE_PEERS") or "").replace(",", " ").split()
+    if warm_env:
+        warm_paths = warm_env
+    if refs_env:
+        try:
+            import slice_fetch as _sf
+            refs = [_parse_slice_ref(x) for x in refs_env]
+            ensure_fn = _sf.make_ensure_fn(refs, cache_dir,
+                                           peers=peers_env or None, log=log)
+            if warm_paths is None:
+                warm_paths = [_sf.cache_path(cache_dir, r) for r in refs]
+            log(f"[slice] fetch-if-absent armed: {len(refs)} refs, "
+                f"peers={peers_env or 'none'}, cache={cache_dir}")
+        except Exception as e:
+            log(f"[slice] fetch wiring failed: {e}")
+
     return ChainLifecycle(ctrl, idle_grace_s=grace, start_timeout_s=start_to,
-                          lease_client=lease_client, log=log)
+                          lease_client=lease_client, warm_paths=warm_paths,
+                          ensure_fn=ensure_fn, log=log)
+
+
+def _parse_slice_ref(s: str):
+    """Parse 'model@hash-L<a>-<b>[.gguf]' into a SliceRef."""
+    import slice_fetch as _sf
+    s = s.strip()
+    if s.endswith(".gguf"):
+        s = s[:-5]
+    head, _, lr = s.rpartition("-L")
+    model, _, h = head.partition("@")
+    a, _, b = lr.partition("-")
+    return _sf.SliceRef(model=model, model_hash=h,
+                        layer_start=int(a), layer_end=int(b))

@@ -128,3 +128,11 @@ def test_ensure_fn_failure_does_not_break_summon():
     lc = sl.ChainLifecycle(c, ensure_fn=boom, start_timeout_s=5, poll_s=0.01)
     assert lc.warm() is True                  # degrades gracefully
     assert c.starts == 1
+
+
+def test_parse_slice_ref_roundtrip():
+    r = sl._parse_slice_ref("deepseek-r1-distill@13ba667a-L0-16.gguf")
+    assert r.model == "deepseek-r1-distill"
+    assert r.model_hash == "13ba667a"
+    assert r.layer_start == 0 and r.layer_end == 16
+    assert r.filename == "deepseek-r1-distill@13ba667a-L0-16.gguf"
