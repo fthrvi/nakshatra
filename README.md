@@ -2,9 +2,11 @@
 
 > Distributed LLM inference across heterogeneous workers (NVIDIA / AMD / Apple Silicon / CPU). Splits one model by layer ranges; patched llama.cpp + gRPC chain protocol. (Inspired by [Petals](README_PETALS.md); v0.1 design is independent.)
 
-Status (2026-05-06): **v0.1 functionally alive.** Two-worker cluster on Tailscale produces the same top-1 token as a single-machine `llama-cli` reference. See [`experiments/v0.0/m6_findings.md`](experiments/v0.0/m6_findings.md) for the empirical result.
+Status (2026-06): **v0.3 shipped, v0.5 protocol foundations in progress.** GPU acceleration (Metal + ROCm) is live on a 5-machine heterogeneous lab cluster; sub-GGUF auto-fetch, latency-aware chain assembly, and streaming KV-cache reuse are all shipped. Speculative decoding is proven on RDNA4 silicon (2.7× factual / 2.3× code, single-node). The original two-worker acceptance test — same top-1 token as a single-machine `llama-cli` reference — is in [`experiments/v0.0/m6_findings.md`](experiments/v0.0/m6_findings.md). See [Status — what's shipped, what's coming](#status--whats-shipped-whats-coming) below for the full breakdown.
 
-**Paper:** [Nakshatra: Vendor-Agnostic Distributed Inference on Heterogeneous Consumer Hardware](https://pnl.market/research/6a017d83b86a1bf1c69ea714) (fthrvi, 2026).
+**Paper:** [*Compute, Not the Wire: An Experience Report on Distributed LLM Inference over Heterogeneous Consumer AMD Radeon, RDNA4, and Mixed ROCm+Metal Clusters*](https://zenodo.org/records/20514967) (Bishwanath Bastola, 2026 — DOI [10.5281/zenodo.20514967](https://doi.org/10.5281/zenodo.20514967)). Earlier write-up: [Nakshatra: Vendor-Agnostic Distributed Inference on Heterogeneous Consumer Hardware](https://pnl.market/research/6a017d83b86a1bf1c69ea714).
+
+**Project home:** [prithviloka.net](https://prithviloka.net) — the public portal for the sovereign-compute stack Nakshatra is part of.
 
 ---
 
@@ -260,6 +262,16 @@ Each worker is a Python gRPC process that spawns a long-lived C++ daemon (`llama
 - Opt-in cryptographic verification (v1.0+).
 
 See [`docs/v0.5-design-lock.md`](docs/v0.5-design-lock.md) for the v0.5 design contract and acceptance criteria.
+
+## Roadmap
+
+Where the project is headed beyond the shipped v0.3 / in-progress v0.5 work. Each marker has a design doc under [`docs/`](docs/):
+
+- **Speed stack** — [`docs/2026-06-19-speed-stack-plan.md`](docs/2026-06-19-speed-stack-plan.md): a sequenced, gated build that closes every gap from the shard↔Nakshatra analysis, led by speculative decoding in the chain. Every change is additive + flag-gated, default OFF, so the live inference path stays untouched until a flag flips.
+- **Compute lifecycle** — [`docs/compute-lifecycle.md`](docs/compute-lifecycle.md): "summon, don't squat" — a worker holds a GPU only while serving an active session, then tears down and returns the (often borrowed) machine to its owner; chains re-summon cold on the next request.
+- **v1.0 discovery & distribution** — [`docs/v1.0-discovery-and-distribution.md`](docs/v1.0-discovery-and-distribution.md): DHT / public-network peer discovery and layer-package weight distribution (P1–P4 built + unit-tested on a branch).
+- **v1.0 fault tolerance** — [`docs/v1.0-fault-tolerance.md`](docs/v1.0-fault-tolerance.md): per-token in-flight recovery for a churning mesh of strangers, with the drift-class soundness constraint.
+- **v1.1 sovereign transport** — [`docs/v1.1-sovereign-transport.md`](docs/v1.1-sovereign-transport.md): the data plane that lets nodes on *different* networks join — turning "our tailnet mesh" into a network strangers can join, on top of the already-network-agnostic Nostr discovery.
 
 ## License & attribution
 
