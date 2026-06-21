@@ -527,6 +527,17 @@ def main():
                          "(e.g. Llama-3.2-1B); runs locally on the coordinator")
     ap.add_argument("--draft-max", type=int, default=4,
                     help="K: number of tokens the draft proposes per step")
+    # EAGLE→live (2026-06-21): swap the GGUF draft for the matched EAGLE-3 head,
+    # fed by the FIRST worker's cmd=5 hidden states (isolated on scratch seq 1).
+    # Requires every worker to advertise the "eagle_hidden" capability.
+    ap.add_argument("--eagle-head", type=str, default="",
+                    help="EAGLE-3 draft head checkpoint (.pt). When set, replaces "
+                         "--draft-model-path; the draft runs on the first worker's "
+                         "cmd=5 hidden states (KV-safe scratch sequence).")
+    ap.add_argument("--eagle-base", type=str, default="",
+                    help="EAGLE base model dir (HF config source) for the head")
+    ap.add_argument("--eagle-config", type=str, default="",
+                    help="EAGLE head config json (draft_vocab etc.)")
     args = ap.parse_args()
     if os.environ.get("NAKSHATRA_SPECULATIVE", "") in ("1", "true", "True"):
         args.speculative = True
