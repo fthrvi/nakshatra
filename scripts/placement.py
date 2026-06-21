@@ -114,6 +114,54 @@ def assign_spans(cluster: List[Node], total_layers: int, model_gb: float,
     return spans
 
 
+def balanced_spans(cluster: List[Node], total_layers: int, model_gb: float,
+                   headroom_gb: float = 1.0) -> Optional[Dict[str, Tuple[int, int]]]:
+    """WATER-FILLING placement (shard's heterogeneous edge): partition contiguous
+    layer ranges to MINIMIZE the slowest pipeline stage — `max_i (layers_i /
+    tok_per_s_i)` — not just split proportionally. The pipeline's per-token time is
+    its slowest stage, so equalizing stage-time (capacity-aware, VRAM-capped) is the
+    right objective on mixed GPUs (a fast 4090 should hold more layers than a slow
+    3060). Returns {node:(start,end)} contiguous + full coverage, or None if even
+    the balanced split can't fit. Falls back to vram-weighting if throughput unknown.
+
+    Method: binary-search the stage-time ceiling T; at T each node can serve
+    floor(T * tok_per_s) layers (capped by VRAM); find the min T whose capacity
+    covers all layers, then assign greedily up to each node's share."""
+    per_layer_gb = model_gb / total_layers
+    cap = {n.name: max(0, int((n.vram_gb - headroom_gb) / per_layer_gb)) for n in cluster}
+    if sum(cap.values()) < total_layers:
+        return None
+    rate = {n.name: (n.tok_per_s if n.tok_per_s > 0 else n.vram_gb) for n in cluster}
+
+    def layers_at(T: float) -> Dict[str, int]:
+        # at stage-time ceiling T, node can do up to T*rate layers (VRAM-capped)
+        return {n.name: min(cap[n.name], int(T * rate[n.name])) for n in cluster}
+
+    lo, hi = 0.0, total_layers / min(rate.values()) + 1.0   # hi: slowest node does all
+    for _ in range(60):                                      # binary search on T
+        mid = (lo + hi) / 2
+        if sum(layers_at(mid).values()) >= total_layers:
+            hi = mid
+        else:
+            lo = mid
+    alloc = layers_at(hi)
+    # trim overshoot to exactly total_layers, dropping from the most-overloaded first
+    extra = sum(alloc.values()) - total_layers
+    for n in sorted(cluster, key=lambda n: -(alloc[n.name] / rate[n.name] if alloc[n.name] else 0)):
+        if extra <= 0:
+            break
+        d = min(extra, alloc[n.name]); alloc[n.name] -= d; extra -= d
+    if sum(alloc.values()) != total_layers:
+        return None
+    spans: Dict[str, Tuple[int, int]] = {}
+    cur = 0
+    for n in cluster:                                        # contiguous, node order
+        k = alloc[n.name]
+        if k > 0:
+            spans[n.name] = (cur, cur + k); cur += k
+    return spans
+
+
 @dataclass
 class Plan:
     whole_host: Optional[str] = None
@@ -133,7 +181,9 @@ def plan(model_gb: float, total_layers: int, nodes: List[Node],
         return Plan(whole_host=host.name, reason="fits one box — route, don't split")
     rtt_ms = rtt_ms or {}
     for cluster in metro_clusters(nodes, rtt_ms, cluster_threshold_ms):
-        spans = assign_spans(cluster, total_layers, model_gb, headroom_gb)
+        # water-filling (stage-time-balanced) first; fall back to proportional
+        spans = (balanced_spans(cluster, total_layers, model_gb, headroom_gb)
+                 or assign_spans(cluster, total_layers, model_gb, headroom_gb))
         if spans is not None:
             return Plan(splits=spans, cluster=[n.name for n in cluster],
                         reason=f"split across {len(spans)} nodes in one cluster")

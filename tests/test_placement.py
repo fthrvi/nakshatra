@@ -71,3 +71,38 @@ def test_prefers_split_in_one_cluster_not_across_wan():
     p = pl.plan(model_gb=40.0, total_layers=80, nodes=nodes, rtt_ms=rtt)
     assert set(p.cluster) == {"near0", "near1"}     # the low-RTT cluster
     assert "far" not in p.splits
+
+
+def test_balanced_spans_faster_node_gets_more_layers():
+    # fast node (3x throughput) should hold ~3x the layers — equalizing stage time
+    nodes=[pl.Node("fast",vram_gb=40,tok_per_s=90), pl.Node("slow",vram_gb=40,tok_per_s=30)]
+    sp=pl.balanced_spans(nodes, total_layers=80, model_gb=40.0)
+    assert sp is not None
+    fast=sp["fast"][1]-sp["fast"][0]; slow=sp["slow"][1]-sp["slow"][0]
+    assert fast+slow==80
+    assert fast>slow                                  # faster node carries more
+    # stage times should be close (within ~20%): layers/rate
+    tf, ts = fast/90, slow/30
+    assert abs(tf-ts)/max(tf,ts) < 0.25
+
+
+def test_balanced_spans_contiguous_full_coverage():
+    nodes=[pl.Node("a",24,50), pl.Node("b",24,50), pl.Node("c",24,50)]
+    sp=pl.balanced_spans(nodes, total_layers=60, model_gb=30.0)
+    spans=sorted(sp.values())
+    assert spans[0][0]==0 and spans[-1][1]==60
+    for (a,b),(c,d) in zip(spans, spans[1:]): assert b==c
+
+
+def test_balanced_spans_respects_vram_cap():
+    # fast but tiny-VRAM node can't take its "fair" throughput share
+    nodes=[pl.Node("fast_small",vram_gb=7,tok_per_s=200), pl.Node("big",vram_gb=60,tok_per_s=40)]
+    sp=pl.balanced_spans(nodes, total_layers=80, model_gb=40.0)  # 0.5GB/layer
+    assert sp is not None and sum(b-a for a,b in sp.values())==80
+    # fast_small caps at (7-1)/0.5 = 12 layers despite high throughput
+    assert sp.get("fast_small",(0,0))[1]-sp.get("fast_small",(0,0))[0] <= 12
+
+
+def test_balanced_spans_too_small_returns_none():
+    nodes=[pl.Node("a",8,50), pl.Node("b",8,50)]
+    assert pl.balanced_spans(nodes, total_layers=80, model_gb=40.0) is None
