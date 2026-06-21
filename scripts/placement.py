@@ -188,3 +188,30 @@ def plan(model_gb: float, total_layers: int, nodes: List[Node],
             return Plan(splits=spans, cluster=[n.name for n in cluster],
                         reason=f"split across {len(spans)} nodes in one cluster")
     raise ValueError("no node fits whole and no single cluster can hold the split")
+
+
+def plan_to_chain(plan: Plan, *, model_id: str, model_hash: str, hidden_size: int,
+                  total_layers: int, node_addr: Dict[str, Tuple[str, int]],
+                  slices_dir: str, wire_dtype: str = "f32") -> dict:
+    """Emit a client.py chain config from a Plan — makes the water-filling planner's
+    output directly SERVABLE (the planner's hands). For a split, produces the
+    `{model, workers:[{id,address,port,layer_range,mode,sub_gguf_path}]}` chain
+    (mode = first/mid/last by layer position; slice path is content-addressed). For
+    route-whole, returns `{route_to: host, port}` — no split chain needed."""
+    if plan.whole_host:
+        host, port = node_addr[plan.whole_host]
+        return {"route_to": {"host": host, "port": port, "node": plan.whole_host}}
+    workers = []
+    for node, (a, b) in sorted(plan.splits.items(), key=lambda kv: kv[1][0]):
+        host, port = node_addr[node]
+        mode = "first" if a == 0 else ("last" if b == total_layers else "mid")
+        workers.append({
+            "id": f"plan-{node}",
+            "address": host, "port": port,
+            "layer_range": [a, b],
+            "mode": mode,
+            "sub_gguf_path": f"{slices_dir}/{model_id}@{model_hash}-L{a}-{b}.gguf",
+        })
+    return {"model": {"id": model_id, "hidden_size": hidden_size,
+                      "num_blocks": total_layers, "wire_dtype": wire_dtype},
+            "workers": workers}

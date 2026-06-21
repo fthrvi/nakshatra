@@ -106,3 +106,41 @@ def test_balanced_spans_respects_vram_cap():
 def test_balanced_spans_too_small_returns_none():
     nodes=[pl.Node("a",8,50), pl.Node("b",8,50)]
     assert pl.balanced_spans(nodes, total_layers=80, model_gb=40.0) is None
+
+
+def _addr(names):
+    return {n: ("10.0.0."+str(10+i), 5560+i) for i, n in enumerate(names)}
+
+
+def test_plan_to_chain_split_emits_servable_workers():
+    nodes=[pl.Node("g0",24,50), pl.Node("g1",24,50)]
+    p=pl.plan(model_gb=40.0, total_layers=80, nodes=nodes, rtt_ms={("g0","g1"):2.0})
+    ch=pl.plan_to_chain(p, model_id="m", model_hash="abc", hidden_size=4096,
+                        total_layers=80, node_addr=_addr(["g0","g1"]),
+                        slices_dir="/slices")
+    ws=ch["workers"]
+    assert len(ws)==2
+    assert ws[0]["mode"]=="first" and ws[0]["layer_range"][0]==0
+    assert ws[-1]["mode"]=="last" and ws[-1]["layer_range"][1]==80
+    # contiguous coverage + content-addressed slice paths
+    assert ws[0]["layer_range"][1]==ws[1]["layer_range"][0]
+    assert ws[0]["sub_gguf_path"]=="/slices/m@abc-L0-%d.gguf"%ws[0]["layer_range"][1]
+    assert ch["model"]["num_blocks"]==80
+
+
+def test_plan_to_chain_three_way_has_mid():
+    nodes=[pl.Node("a",20,50),pl.Node("b",20,50),pl.Node("c",20,50)]
+    rtt={("a","b"):2.0,("a","c"):2.0,("b","c"):2.0}
+    p=pl.plan(model_gb=48.0, total_layers=96, nodes=nodes, rtt_ms=rtt)
+    ch=pl.plan_to_chain(p, model_id="m", model_hash="h", hidden_size=4096,
+                        total_layers=96, node_addr=_addr(["a","b","c"]), slices_dir="/s")
+    modes=[w["mode"] for w in ch["workers"]]
+    assert modes[0]=="first" and modes[-1]=="last" and "mid" in modes
+
+
+def test_plan_to_chain_whole_host_is_route_directive():
+    nodes=[pl.Node("big",24,70)]
+    p=pl.plan(model_gb=9.0, total_layers=32, nodes=nodes)
+    ch=pl.plan_to_chain(p, model_id="m", model_hash="h", hidden_size=4096,
+                        total_layers=32, node_addr=_addr(["big"]), slices_dir="/s")
+    assert "route_to" in ch and ch["route_to"]["node"]=="big" and "workers" not in ch
