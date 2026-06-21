@@ -341,32 +341,47 @@ int main(int argc, char ** argv) {
     common_init();
     llama_backend_init();
 
-    auto mp = llama_model_default_params();
-    mp.n_gpu_layers = n_gpu_layers;
-    llama_model* model = llama_model_load_from_file(sub_gguf.c_str(), mp);
-    if (!model) {
-        fprintf(stderr, "[daemon] failed to load model: %s\n", sub_gguf.c_str());
-        return 2;
-    }
-    auto cp = llama_context_default_params();
-    cp.n_ctx     = n_ctx;
-    cp.n_batch   = n_ctx;
-    cp.embeddings = true;
-    cp.cb_eval = eagle_cb_eval;
-    cp.cb_eval_user_data = &g_eagle_cap;
-    if (n_threads > 0) {
-        cp.n_threads       = n_threads;
-        cp.n_threads_batch = n_threads;
-    }
-    llama_context* ctx = llama_init_from_model(model, cp);
-    if (!ctx) {
-        fprintf(stderr, "[daemon] failed to init context\n");
-        return 3;
-    }
-    int n_embd  = llama_model_n_embd(model);
-    int n_layer = llama_model_n_layer(model);
-    const llama_vocab* vocab = llama_model_get_vocab(model);
-    int n_vocab = llama_vocab_n_tokens(vocab);
+    // 2026-06-21 sleep-mode — model/ctx are now RELOADABLE so the daemon can
+    // free the GPU on idle (cmd=6 SLEEP) and re-acquire it on demand (cmd=7
+    // WAKE / first request) WITHOUT a process respawn or ROCm backend re-init.
+    // The slice stays warm in the host page cache (slice_warm), so wake is a
+    // host→GPU re-upload of a few seconds, not a cold ~7.5s summon. vLLM's
+    // "sleep mode" idea, in llama.cpp terms. load_mc() is the single load path.
+    llama_model* model = nullptr;
+    llama_context* ctx = nullptr;
+    int n_embd = 0, n_layer = 0, n_vocab = 0;
+    const llama_vocab* vocab = nullptr;
+    auto load_mc = [&]() -> int {
+        auto mp = llama_model_default_params();
+        mp.n_gpu_layers = n_gpu_layers;
+        model = llama_model_load_from_file(sub_gguf.c_str(), mp);
+        if (!model) {
+            fprintf(stderr, "[daemon] failed to load model: %s\n", sub_gguf.c_str());
+            return 2;
+        }
+        auto cp = llama_context_default_params();
+        cp.n_ctx     = n_ctx;
+        cp.n_batch   = n_ctx;
+        cp.embeddings = true;
+        cp.cb_eval = eagle_cb_eval;
+        cp.cb_eval_user_data = &g_eagle_cap;
+        if (n_threads > 0) {
+            cp.n_threads       = n_threads;
+            cp.n_threads_batch = n_threads;
+        }
+        ctx = llama_init_from_model(model, cp);
+        if (!ctx) {
+            fprintf(stderr, "[daemon] failed to init context\n");
+            return 3;
+        }
+        n_embd  = llama_model_n_embd(model);
+        n_layer = llama_model_n_layer(model);
+        vocab   = llama_model_get_vocab(model);
+        n_vocab = llama_vocab_n_tokens(vocab);
+        return 0;
+    };
+    { int rc0 = load_mc(); if (rc0 != 0) return rc0; }
+    bool sleeping = false;
 
     // The Nakshatra fields live on the model — reach in via llama.cpp's pubic
     // accessors where possible; for partial-load metadata we expose the
@@ -396,6 +411,44 @@ int main(int argc, char ** argv) {
 
         const bool keep_kv    = (flags & 0x1) != 0;
         const bool all_logits = (flags & 0x2) != 0;   // speculative verify: argmax at every position
+
+        // 2026-06-21 sleep-mode commands.
+        if (cmd == 6) {
+            // SLEEP — free the GPU (context + model weights) but keep the
+            // process + ROCm backend resident. Idempotent. The cached n_embd/
+            // n_layer/n_vocab survive so INFO still answers while asleep.
+            if (!sleeping) {
+                if (ctx)   { llama_free(ctx);             ctx   = nullptr; }
+                if (model) { llama_model_free(model);     model = nullptr; }
+                sleeping = true;
+                fprintf(stderr, "[daemon] sleep: GPU released, process resident\n");
+            }
+            send_response(0, nullptr, 0);
+            continue;
+        }
+        if (cmd == 7) {
+            // WAKE — re-acquire the GPU by reloading from the (warm) slice.
+            // No respawn, no backend re-init. Reports the wake latency.
+            if (sleeping) {
+                uint64_t tw0 = now_ns();
+                if (load_mc() != 0) { send_response(2, nullptr, 0); continue; }
+                sleeping = false;
+                fprintf(stderr, "[daemon] wake: reloaded in %.3f s\n",
+                        (now_ns() - tw0) / 1e9);
+            }
+            send_response(0, nullptr, 0);
+            continue;
+        }
+        // Transparent auto-wake: any model/ctx-touching command issued while
+        // asleep wakes first (the lifecycle "summon" path — first request pays
+        // the one-time wake). INFO (3) answers from cached metadata, no wake.
+        if (sleeping && (cmd == 1 || cmd == 2 || cmd == 4 || cmd == 5)) {
+            uint64_t tw0 = now_ns();
+            if (load_mc() != 0) { send_response(2, nullptr, 0); continue; }
+            sleeping = false;
+            fprintf(stderr, "[daemon] auto-wake (cmd=%u): reloaded in %.3f s\n",
+                    cmd, (now_ns() - tw0) / 1e9);
+        }
 
         if (cmd == 4) {
             // KV_TRUNCATE — discard a rejected speculative tail. Keep [0, n_keep),
