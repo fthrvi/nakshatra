@@ -86,10 +86,13 @@ a **ggml eval callback** (`llama_context_params.cb_eval` + `cb_eval_user_data`, 
 → step 1 is discovery, not guessing.
 
 **Executable steps (build-in-the-loop on the hub gfx1201 — local llama.cpp build, reliable):**
-1. **Discovery probe:** add `cp.cb_eval` that, on `ask==false`, `fprintf(stderr, t->name)`
-   for one decode, behind `NAKSHATRA_EAGLE_PROBE=1`. Build + run on a hub slice →
-   learn the exact names of the layer-0/1/2 output tensors (likely `l_out-0`, `l_out-1`,
-   … or `ffn_out-N`/`norm-N` depending on build). ~10 min once focused.
+1. **Discovery probe: ✅ DONE 2026-06-21.** Built `llama-eval-callback` on the hub and
+   dumped tensor names for this exact build. The 3 EAGLE inputs map to:
+   `hidden_states[0]` = **`embd`** (GET_ROWS, embedding output);
+   `hidden_states[1]` = **`l_out-0`** (ADD, after decoder layer 0);
+   `hidden_states[2]` = **`l_out-1`** (ADD, after decoder layer 1).
+   (Per-layer outputs are `l_out-N`; final = `result_norm`/`result_output`.) The cb_eval
+   capture is now CONCRETE — match `t->name in {embd, l_out-0, l_out-1}`, no guessing.
 2. **Capture:** in the callback, when `t->name` matches the 3 target layers, copy
    `ggml_backend_tensor_get` into a `std::vector<float>` keyed by layer (size n_tokens×n_embd).
 3. **Protocol cmd=5 EAGLE_HIDDEN:** like TOKEN_DECODE but the response payload is
