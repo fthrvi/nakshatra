@@ -515,6 +515,39 @@ class ChainLifecycle:
             self._active = max(0, self._active - 1)
             self._last_active = time.monotonic()
 
+    # pre-warm --------------------------------------------------------
+    def warm(self) -> bool:
+        """Proactively summon the chain AHEAD of the first request — the
+        pre-warm-on-model-select path. The holder nodes load their layer slices
+        into VRAM before the user ever waits, so the cold-start cost is paid off
+        the critical path. Unlike begin(), this does NOT count as an in-flight
+        request: it only resets the idle clock, so the reaper still grants the
+        full grace window and will reap if no real request follows. Idempotent;
+        returns True iff the chain is hot."""
+        if self.lease_client is not None:
+            try:
+                info = self.lease_client.renew()
+                if info and info.get("idle_grace_s"):
+                    self.idle_grace_s = float(info["idle_grace_s"])
+            except Exception as e:
+                self._log(f"[lease] warm renew failed (continuing): {e}")
+        with self._lock:
+            self._last_active = time.monotonic()
+            if self._up and self.controller.is_ready():
+                return True
+            self._log("[lifecycle] pre-warm: summoning workers ahead of demand…")
+            self.controller.start()
+        deadline = time.monotonic() + self.start_timeout_s
+        while time.monotonic() < deadline:
+            if self.controller.is_ready():
+                with self._lock:
+                    self._up = True
+                self._log("[lifecycle] pre-warm complete — chain hot")
+                return True
+            self._stop_evt.wait(self.poll_s)
+        self._log("[lifecycle] pre-warm timed out (cold-start deferred to first request)")
+        return False
+
     # reaper ----------------------------------------------------------
     def start_reaper(self) -> None:
         if self._reaper is not None:

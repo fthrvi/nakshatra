@@ -622,9 +622,27 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
             return 404
         messages = req.get("messages")
         if not isinstance(messages, list) or not messages:
-            self._json_error(HTTPStatus.BAD_REQUEST,
-                             "'messages' must be a non-empty list")
-            return 400
+            # Ollama "load" convention: an empty /api/chat preloads the model.
+            # We treat it as PRE-WARM — summon the worker chain so holder nodes
+            # load their layer slices into VRAM ahead of the first real request,
+            # paying the cold-start off the user's critical path. Any Ollama
+            # client (and our own UI) can warm a model with no new code.
+            lc = getattr(self.server, "chat_lifecycle", None)
+            warmed = True
+            if lc is not None and hasattr(lc, "warm"):
+                try:
+                    warmed = lc.warm()
+                except Exception as e:
+                    log.error("pre-warm failed: %s", e)
+                    warmed = False
+            self._json(HTTPStatus.OK, {
+                "model": entry.name,
+                "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "message": {"role": "assistant", "content": ""},
+                "done": True,
+                "done_reason": "load" if warmed else "unload",
+            })
+            return 200
         backend = getattr(self.server, "chat_backend", None)
         if backend is None:
             self._json_error(HTTPStatus.SERVICE_UNAVAILABLE,
