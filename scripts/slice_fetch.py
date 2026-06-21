@@ -190,15 +190,19 @@ def static_holders(peers: List[str]) -> Callable[["SliceRef"], List[str]]:
 
 def make_ensure_fn(refs: List[SliceRef], cache_dir: str,
                    peers: "Optional[List[str]]" = None,
+                   holders_fn: "Optional[Callable[[SliceRef], List[str]]]" = None,
                    origin_pull: "Optional[Callable[[SliceRef, str], bool]]" = None,
                    log: Callable[[str], None] = print) -> Callable[[], List[str]]:
     """Build the standard fetch-if-absent chain (cache → mesh peers → origin) for
     a model's slices and return an ensure_fn() that the ChainLifecycle calls on
     summon. Returns the local paths of all `refs`, fetching any that are missing.
-    `peers` are host:port of nodes running slice_server; `origin_pull` is the
-    last-resort HF/ollama fetcher (omit until wired)."""
+    Peer resolution: pass `holders_fn` (e.g. SliceDirectory.to_holders_fn() — the
+    live TTL directory) for dynamic who-holds-what, OR `peers` for a static list.
+    `origin_pull` is the last-resort HF/ollama fetcher (omit until wired)."""
     sources: List[Source] = []
-    if peers:
+    if holders_fn is not None:
+        sources.append(mesh_peer_source(holders_fn, http_pull))
+    elif peers:
         sources.append(mesh_peer_source(static_holders(peers), http_pull))
     if origin_pull is not None:
         sources.append(origin_source(origin_pull))
