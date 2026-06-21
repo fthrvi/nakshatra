@@ -212,3 +212,40 @@ NET: of the three, sleep-mode is now done+proven, ring-direct-return was already
 done, and libp2p is a future capability (not a gap). The one live-activation thread
 left (sleep gRPC RPC) groups with the EAGLE cmd=5 gRPC wiring — both gated on / done
 alongside the retrained head (now climbing: 0.000→0.639 acceptance on serving hidden).
+
+---
+
+## 2026-06-21 — COMBINED gRPC WIRING DONE (sleep/wake + EAGLE→live), additive + flag-gated
+
+All layers wired + tested. Live serving UNCHANGED when the flags are off.
+
+**proto/nakshatra.proto** (regen `scripts/generate.sh`): `ForwardRequest.eagle_hidden`
+(field 8); `Sleep`/`Wake` RPCs (+ `WakeResponse.wake_seconds`); capability tokens
+`sleep_wake` + `eagle_hidden`.
+
+**worker_daemon.cpp**: cmd=6 SLEEP / cmd=7 WAKE (proven 440ms, byte-identical) +
+**the KV-ISOLATION FIX that makes the live EAGLE swap correct**: cmd=5 (EAGLE draft
+hidden) now runs on a SCRATCH KV sequence (seq 1), always cold, so it never touches
+the serving/verify KV on seq 0. Required `cp.n_seq_max=2`. WITHOUT this, a draft
+cmd=5 (keep_kv=false) would `llama_memory_clear` seq 0 and corrupt the speculative
+verify (rejected-tail invariants / M3 fusion). Proven by `test_eagle_kv_isolation.py`:
+a keep_kv decode on seq 0 is BYTE-IDENTICAL with vs without interleaved cmd=5.
+
+**worker.py**: `Forward(eagle_hidden=True)`→`_run_forward` cmd=5 branch (raw f32×3
+passthrough, NOT act-quantized); `Sleep`/`Wake` servicers→daemon cmd 6/7; Info
+advertises the two new caps. (191 worker tests + 5 new routing tests pass.)
+
+**client.py**: `--eagle-head`/`--eagle-base`/`--eagle-config`; when set, swaps the
+GGUF `DraftModel` for `eagle_speculative.EagleDraft` whose cmd5_fn calls the FIRST
+worker via `call_forward(..., eagle_hidden=True)`; capability-negotiated (every
+worker must advertise `eagle_hidden`) else falls back to plain decode. (parses; 62
+serve/placement/cdc tests pass.)
+
+TEST LEDGER (this pass): test_sleep_wake 4/4 · test_eagle_kv_isolation PASS ·
+test_eagle_cmd5 PASS (regress) · test_worker_eagle_sleep_rpc 5/5 · worker/spec/tls
+191 · serve/placement/cdc 62. Daemon rebuilt clean on hub gfx1201.
+
+REMAINING = the MEASUREMENT milestone only: bring `head_serving_hidden.pt` (the
+retrained head, acceptance 0.000→0.639 climbing) + EAGLE config from ijru → run a
+live chain with `--eagle-head` → measure tok/s vs plain. The wiring it rides on is
+done + correct; this is the e2e bring-up + number, the natural next step.

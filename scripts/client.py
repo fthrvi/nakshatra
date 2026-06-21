@@ -722,17 +722,43 @@ def main():
     spec_k = max(1, int(args.draft_max))
     if args.speculative:
         reasons = []
-        if not args.draft_model_path:
-            reasons.append("no --draft-model-path")
+        use_eagle = bool(args.eagle_head)
+        if not args.draft_model_path and not use_eagle:
+            reasons.append("no --draft-model-path / --eagle-head")
         if args.use_streaming or args.use_streaming_push:
             reasons.append("streaming/push mode (slice 1 verify is unary-only)")
         non_spec = [w["id"] for w, _, info in sorted_stubs
                     if "speculative" not in info.protocol_capabilities]
         if non_spec:
             reasons.append(f"workers lack 'speculative' capability: {non_spec}")
+        if use_eagle:
+            no_eagle = [w["id"] for w, _, info in sorted_stubs
+                        if "eagle_hidden" not in info.protocol_capabilities]
+            if no_eagle:
+                reasons.append(f"workers lack 'eagle_hidden' capability: {no_eagle}")
         if reasons:
             print(f"[spec] requested but disabled: {'; '.join(reasons)} — plain decode.",
                   file=sys.stderr)
+        elif use_eagle:
+            try:
+                from speculative import accept, kv_keep_after
+                sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "deploy"))
+                from eagle_speculative import EagleDraft
+                first_w, first_stub, _ = sorted_stubs[0]
+                def _eagle_cmd5_fn(prefix_ids, _stub=first_stub, _wid=first_w["id"]):
+                    n = len(prefix_ids)
+                    raw = call_forward(_stub, struct.pack(f"<{n}i", *prefix_ids), n,
+                                       has_token_ids=True, worker_id=_wid,
+                                       eagle_hidden=True)
+                    return list(struct.unpack(f"<{len(raw) // 4}f", raw))
+                draft = EagleDraft(args.eagle_head, args.eagle_base,
+                                   args.eagle_config, _eagle_cmd5_fn)
+                spec_active = True
+                print(f"[spec] ON: EAGLE head={args.eagle_head} "
+                      f"(cmd=5 via {first_w['id']}) K={spec_k}", flush=True)
+            except Exception as e:
+                print(f"[spec] EAGLE head load failed ({e!r}) — plain decode.",
+                      file=sys.stderr)
         else:
             try:
                 from speculative import DraftModel, accept, kv_keep_after
