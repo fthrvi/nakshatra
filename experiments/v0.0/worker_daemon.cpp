@@ -65,6 +65,42 @@
 #include <string>
 #include <vector>
 #include <unistd.h>
+#include <cstring>
+#include "ggml-backend.h"
+
+// ── EAGLE-3 hidden-state capture (cmd=5 EAGLE_HIDDEN) ─────────────────
+// The draft head needs the target's hidden_states[0,1,2] = ggml tensors
+// {embd, l_out-0, l_out-1} (discovered via llama-eval-callback on this build).
+// cb_eval grabs them during decode ONLY when armed (g_eagle_cap.on); off => the
+// callback returns false immediately => zero overhead on normal decodes.
+struct EagleCapture {
+    bool on = false;
+    std::vector<float> h[3];
+    bool got[3] = {false, false, false};
+};
+static EagleCapture g_eagle_cap;
+static int eagle_idx(const char* nm) {
+    if (std::strcmp(nm, "embd")    == 0) return 0;   // hidden_states[0]
+    if (std::strcmp(nm, "l_out-0") == 0) return 1;   // hidden_states[1]
+    if (std::strcmp(nm, "l_out-1") == 0) return 2;   // hidden_states[2]
+    return -1;
+}
+static bool eagle_cb_eval(struct ggml_tensor* t, bool ask, void* ud) {
+    EagleCapture* cap = (EagleCapture*) ud;
+    if (!cap->on) return false;
+    int idx = eagle_idx(t->name);
+    if (ask) return idx >= 0;
+    if (idx < 0) return true;
+    size_t ne = ggml_nelements(t);
+    cap->h[idx].resize(ne);
+    if (ggml_backend_buffer_is_host(t->buffer)) {
+        std::memcpy(cap->h[idx].data(), t->data, ne * sizeof(float));
+    } else {
+        ggml_backend_tensor_get(t, cap->h[idx].data(), 0, ne * sizeof(float));
+    }
+    cap->got[idx] = true;
+    return true;
+}
 
 // 2026-05-30 fabric C++ Phase C.1 — timing instrumentation. Set
 // NAKSHATRA_FABRIC_TIMING=1 in the daemon's environment to print
@@ -269,6 +305,8 @@ int main(int argc, char ** argv) {
     cp.n_ctx     = n_ctx;
     cp.n_batch   = n_ctx;
     cp.embeddings = true;
+    cp.cb_eval = eagle_cb_eval;
+    cp.cb_eval_user_data = &g_eagle_cap;
     if (n_threads > 0) {
         cp.n_threads       = n_threads;
         cp.n_threads_batch = n_threads;
@@ -357,7 +395,9 @@ int main(int argc, char ** argv) {
         }
 
         uint64_t t_decode_start = 0, t_decode_done = 0;
-        if (cmd == 1) {
+        if (cmd == 1 || cmd == 5) {
+            if (cmd == 5) { g_eagle_cap.on = true;
+                            g_eagle_cap.got[0]=g_eagle_cap.got[1]=g_eagle_cap.got[2]=false; }
             // TOKEN_DECODE — use llama_batch_init so we can set explicit
             // positions (start_pos + i) instead of relying on the auto-zeroed
             // positions of llama_batch_get_one.
@@ -378,6 +418,7 @@ int main(int argc, char ** argv) {
             rc = llama_decode(ctx, batch);
             if (timing_on) t_decode_done = now_ns();
             llama_batch_free(batch);
+            if (cmd == 5) g_eagle_cap.on = false;
         } else if (cmd == 2) {
             // EMBD_DECODE
             if (payload_bytes != n_tokens * (uint32_t)n_embd * sizeof(float)) {
@@ -402,7 +443,30 @@ int main(int argc, char ** argv) {
         }
 
         if (rc != 0) {
+            g_eagle_cap.on = false;
             send_response(1, nullptr, 0);
+            continue;
+        }
+
+        if (cmd == 5) {
+            // EAGLE_HIDDEN — per token, concat the 3 captured layers:
+            // payload float32[n_tokens * 3 * n_embd], result_type=3. Only the
+            // FIRST worker (holds embd + layers 0,1) can serve this.
+            if (!(g_eagle_cap.got[0] && g_eagle_cap.got[1] && g_eagle_cap.got[2])) {
+                send_response(1, nullptr, 0); continue;
+            }
+            const size_t per = (size_t) n_embd;
+            std::vector<uint8_t> out(4 + (size_t)n_tokens * 3 * per * sizeof(float));
+            *(uint32_t*)out.data() = 3;     // result_type = eagle hidden3
+            float* dst = (float*)(out.data() + 4);
+            for (uint32_t tk = 0; tk < n_tokens; ++tk) {
+                for (int L = 0; L < 3; ++L) {
+                    std::memcpy(dst, g_eagle_cap.h[L].data() + (size_t)tk * per,
+                                per * sizeof(float));
+                    dst += per;
+                }
+            }
+            send_response(0, out.data(), (uint32_t)out.size());
             continue;
         }
 

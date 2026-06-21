@@ -93,9 +93,9 @@ a **ggml eval callback** (`llama_context_params.cb_eval` + `cb_eval_user_data`, 
    `hidden_states[2]` = **`l_out-1`** (ADD, after decoder layer 1).
    (Per-layer outputs are `l_out-N`; final = `result_norm`/`result_output`.) The cb_eval
    capture is now CONCRETE — match `t->name in {embd, l_out-0, l_out-1}`, no guessing.
-2. **Capture:** in the callback, when `t->name` matches the 3 target layers, copy
+2. **Capture: ✅ DONE 2026-06-21.** in the callback, when `t->name` matches the 3 target layers, copy
    `ggml_backend_tensor_get` into a `std::vector<float>` keyed by layer (size n_tokens×n_embd).
-3. **Protocol cmd=5 EAGLE_HIDDEN:** like TOKEN_DECODE but the response payload is
+3. **Protocol cmd=5 EAGLE_HIDDEN: ✅ DONE+TESTED 2026-06-21.** like TOKEN_DECODE but the response payload is
    `float32 hidden3[n_tokens * 3 * n_embd]` (the 3 captured layers concatenated, matching
    cnets `torch.cat((h0,h1,h2),dim=-1)`). result_type=3.
 4. **Client `EagleDraft`** (`scripts/speculative.py`): on the first shard, request cmd=5,
@@ -110,3 +110,6 @@ plumbing (steps 1-3) can be built + shape-verified independently of head quality
 **Honest note:** this is a multi-hour focused ggml build, best done with the hub GPU in
 the loop (discovery → capture → verify shapes), NOT blind. Scoped + ready; flagged as the
 next dedicated C++ session rather than rushed marathon-tail code.
+
+
+**C++ STATUS 2026-06-21:** steps 1-3 DONE+TESTED on hub gfx1201. `worker_daemon.cpp` (backup `.pre-eagle`): EagleCapture + `eagle_cb_eval` (matches embd/l_out-0/l_out-1, host/device-safe via ggml_backend_tensor_get) + `cmd=5 EAGLE_HIDDEN` returns float32[n_tokens*3*n_embd] result_type=3. Verified: 4 toks→49152 real floats (4*3*4096); cmd=1 regression PASS (existing decode intact). REMAINING: step 4 `EagleDraft` in speculative.py (needs the trained head, ~0.60 + climbing) + step 5 gate/measure.
