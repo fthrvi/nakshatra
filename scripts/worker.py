@@ -334,6 +334,9 @@ CMD_TOKEN_DECODE = 1
 CMD_EMBD_DECODE  = 2
 CMD_INFO         = 3
 CMD_KV_TRUNCATE  = 4   # speculative decode: discard a rejected tail (payload = u32 n_keep)
+CMD_EAGLE_HIDDEN = 5   # EAGLE→live: return float32[n_tokens,3,n_embd] draft hidden states
+CMD_SLEEP        = 6   # sleep-mode: release the GPU (free ctx+model), keep process resident
+CMD_WAKE         = 7   # sleep-mode: re-acquire the GPU (reload from warm page cache)
 # #16: int8 hidden-state wire codec. Default OFF. When "int8", non-last workers quantize the
 # hidden state they emit and every worker dequantizes a hidden state it receives — ~4× less WAN
 # bytes/hop. All workers + the client must agree (set the same env). The daemon always sees f32.
@@ -1157,12 +1160,18 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                 # + TruncateKV (cmd 4). The client only engages speculative decode
                 # when EVERY worker in the chain advertises this.
                 "speculative",
+                # 2026-06-21: GPU sleep/wake (Sleep/Wake RPCs → daemon cmd 6/7)
+                # and EAGLE→live draft-hidden (ForwardRequest.eagle_hidden → cmd 5).
+                # Clients/lifecycle probe these before using them; absent on old workers.
+                "sleep_wake",
+                "eagle_hidden",
             ] + _control_version_caps(),
         )
 
     def _run_forward(self, hidden_in: bytes, n_tokens: int,
                      has_token_ids: bool, keep_kv: bool,
-                     start_pos: int, all_logits: bool = False) -> "ForwardResult":
+                     start_pos: int, all_logits: bool = False,
+                     eagle_hidden: bool = False) -> "ForwardResult":
         """Shared daemon decode path — the transport-neutral core of a
         single forward step. Both the gRPC ``Forward`` RPC and the
         fabric backend (Phase D) call this so the two transports can
@@ -1176,6 +1185,24 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
         protobuf fields (gRPC) or the fabric header + per-chain state
         (fabric)."""
         flags = (0x1 if keep_kv else 0x0) | (0x2 if all_logits else 0x0)
+        if eagle_hidden:
+            # EAGLE→live: cmd=5 returns the captured pre-final hidden states
+            # (float32 [n_tokens, 3, n_embd] = embd / l_out-0 / l_out-1) for the
+            # draft head. First-worker path → input is token IDs. The payload is
+            # NOT activation-quantized: the head consumes raw f32×3.
+            if len(hidden_in) != n_tokens * 4:
+                return ForwardResult(
+                    False, b"", "eagle_hidden requires token_ids input "
+                    f"(got {len(hidden_in)} bytes, expected {n_tokens * 4})",
+                    client_error=True)
+            status, resp = self.daemon.call(
+                CMD_EAGLE_HIDDEN, n_tokens, hidden_in, start_pos=start_pos, flags=flags)
+            if status != 0 or len(resp) < 4:
+                return ForwardResult(
+                    False, b"",
+                    f"daemon eagle_hidden failed status={status} resp_len={len(resp)}",
+                    client_error=False)
+            return ForwardResult(True, resp[4:], "", client_error=False)
         if has_token_ids:
             if len(hidden_in) != n_tokens * 4:
                 return ForwardResult(
@@ -1228,6 +1255,7 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
         result = self._run_forward(
             request.hidden_in, request.n_tokens, request.has_token_ids,
             request.keep_kv, int(request.start_pos), request.all_logits,
+            eagle_hidden=request.eagle_hidden,
         )
         if not result.ok:
             context.set_code(
@@ -1242,7 +1270,7 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
         # this worker's intermediate hidden_state. Mid/last workers
         # never have the bridge wired and keep returning hidden_state
         # / token directly per the legacy path.
-        if self.fabric_first_worker_bridge is not None:
+        if self.fabric_first_worker_bridge is not None and not request.eagle_hidden:
             token_bytes = self.fabric_first_worker_bridge(
                 result.payload, step_id=int(request.start_pos),
                 layer_idx=self.layer_end,
@@ -1275,6 +1303,33 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
             context.set_code(grpc.StatusCode.INTERNAL)
             context.set_details(f"daemon KV truncate failed status={status}")
         return pb.TruncateResponse()
+
+    def Sleep(self, request, context):
+        # sleep-mode (2026-06-21): release the GPU (daemon cmd=6 frees ctx+model;
+        # the process + ROCm backend stay resident). Idempotent. The lifecycle
+        # calls this on idle-grace instead of a full reap — wake is ~440ms vs ~7.5s.
+        self._check_grpc_auth(
+            context, request.SerializeToString(),
+            method_path="/nakshatra.Nakshatra/Sleep", is_streaming=False)
+        status, _ = self.daemon.call(CMD_SLEEP, 0, b"")
+        if status != 0:
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(f"daemon sleep failed status={status}")
+        return pb.SleepResponse()
+
+    def Wake(self, request, context):
+        # sleep-mode (2026-06-21): re-acquire the GPU (daemon cmd=7 reloads from
+        # the warm page cache). Idempotent (no-op + 0s if already awake).
+        self._check_grpc_auth(
+            context, request.SerializeToString(),
+            method_path="/nakshatra.Nakshatra/Wake", is_streaming=False)
+        t0 = time.time()
+        status, _ = self.daemon.call(CMD_WAKE, 0, b"")
+        if status != 0:
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(f"daemon wake failed status={status}")
+            return pb.WakeResponse()
+        return pb.WakeResponse(wake_seconds=time.time() - t0)
 
     def Inference(self, request_iterator, context):
         """v0.5 M0.5.1 — streaming inference RPC.

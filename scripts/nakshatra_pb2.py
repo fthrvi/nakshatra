@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0fnakshatra.proto\x12\x0enakshatra.v0_1\"\r\n\x0bInfoRequest\"\xa2\x02\n\x0cInfoResponse\x12\x18\n\x10protocol_version\x18\x01 \x01(\t\x12\x0f\n\x07\x62\x61\x63kend\x18\x02 \x01(\t\x12\x10\n\x08model_id\x18\x03 \x01(\t\x12\x1a\n\x12model_content_hash\x18\x04 \x01(\x0c\x12\x13\n\x0blayer_start\x18\x05 \x01(\x05\x12\x11\n\tlayer_end\x18\x06 \x01(\x05\x12\x13\n\x0bhidden_size\x18\x07 \x01(\x05\x12\x12\n\nwire_dtype\x18\x08 \x01(\t\x12\x1c\n\x14kv_cache_tokens_free\x18\t \x01(\x05\x12\x16\n\x0ehas_token_embd\x18\n \x01(\x08\x12\x13\n\x0bhas_lm_head\x18\x0b \x01(\x08\x12\x1d\n\x15protocol_capabilities\x18\x0c \x03(\t\"\x93\x01\n\x0e\x46orwardRequest\x12\x11\n\thidden_in\x18\x01 \x01(\x0c\x12\r\n\x05\x62\x61tch\x18\x02 \x01(\x05\x12\x10\n\x08n_tokens\x18\x03 \x01(\x05\x12\x15\n\rhas_token_ids\x18\x04 \x01(\x08\x12\x0f\n\x07keep_kv\x18\x05 \x01(\x08\x12\x11\n\tstart_pos\x18\x06 \x01(\x05\x12\x12\n\nall_logits\x18\x07 \x01(\x08\"%\n\x0f\x46orwardResponse\x12\x12\n\nhidden_out\x18\x01 \x01(\x0c\"!\n\x0fTruncateRequest\x12\x0e\n\x06n_keep\x18\x01 \x01(\x05\"\x12\n\x10TruncateResponse\"\xe1\x02\n\rInferenceStep\x12\x12\n\nsession_id\x18\x01 \x01(\t\x12\x0f\n\x07step_id\x18\x02 \x01(\t\x12\x15\n\rprefix_length\x18\x03 \x01(\x05\x12\x33\n\x0chidden_state\x18\n \x01(\x0b\x32\x1b.nakshatra.v0_1.HiddenStateH\x00\x12-\n\ttoken_ids\x18\x0b \x01(\x0b\x32\x18.nakshatra.v0_1.TokenIdsH\x00\x12(\n\x06logits\x18\x0c \x01(\x0b\x32\x16.nakshatra.v0_1.LogitsH\x00\x12\x0f\n\x05\x65rror\x18\r \x01(\x0cH\x00\x12/\n\x0bnext_server\x18\x0e \x01(\x0b\x32\x1a.nakshatra.v0_1.NextServer\x12\x0e\n\x06pushed\x18\x0f \x01(\x08\x12)\n\x05\x63hain\x18\x10 \x03(\x0b\x32\x1a.nakshatra.v0_1.NextServerB\t\n\x07payload\"1\n\nNextServer\x12\x0f\n\x07\x61\x64\x64ress\x18\x01 \x01(\t\x12\x12\n\nsession_id\x18\x02 \x01(\t\"\x17\n\x08TokenIds\x12\x0b\n\x03ids\x18\x01 \x03(\x05\";\n\x0bHiddenState\x12\x0b\n\x03raw\x18\x01 \x01(\x0c\x12\r\n\x05\x62\x61tch\x18\x02 \x01(\x05\x12\x10\n\x08n_tokens\x18\x03 \x01(\x05\")\n\x06Logits\x12\x0b\n\x03raw\x18\x01 \x01(\x0c\x12\x12\n\nvocab_size\x18\x02 \x01(\x05\x32\xba\x02\n\tNakshatra\x12\x41\n\x04Info\x12\x1b.nakshatra.v0_1.InfoRequest\x1a\x1c.nakshatra.v0_1.InfoResponse\x12J\n\x07\x46orward\x12\x1e.nakshatra.v0_1.ForwardRequest\x1a\x1f.nakshatra.v0_1.ForwardResponse\x12M\n\tInference\x12\x1d.nakshatra.v0_1.InferenceStep\x1a\x1d.nakshatra.v0_1.InferenceStep(\x01\x30\x01\x12O\n\nTruncateKV\x12\x1f.nakshatra.v0_1.TruncateRequest\x1a .nakshatra.v0_1.TruncateResponseb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0fnakshatra.proto\x12\x0enakshatra.v0_1\"\r\n\x0bInfoRequest\"\xa2\x02\n\x0cInfoResponse\x12\x18\n\x10protocol_version\x18\x01 \x01(\t\x12\x0f\n\x07\x62\x61\x63kend\x18\x02 \x01(\t\x12\x10\n\x08model_id\x18\x03 \x01(\t\x12\x1a\n\x12model_content_hash\x18\x04 \x01(\x0c\x12\x13\n\x0blayer_start\x18\x05 \x01(\x05\x12\x11\n\tlayer_end\x18\x06 \x01(\x05\x12\x13\n\x0bhidden_size\x18\x07 \x01(\x05\x12\x12\n\nwire_dtype\x18\x08 \x01(\t\x12\x1c\n\x14kv_cache_tokens_free\x18\t \x01(\x05\x12\x16\n\x0ehas_token_embd\x18\n \x01(\x08\x12\x13\n\x0bhas_lm_head\x18\x0b \x01(\x08\x12\x1d\n\x15protocol_capabilities\x18\x0c \x03(\t\"\xa9\x01\n\x0e\x46orwardRequest\x12\x11\n\thidden_in\x18\x01 \x01(\x0c\x12\r\n\x05\x62\x61tch\x18\x02 \x01(\x05\x12\x10\n\x08n_tokens\x18\x03 \x01(\x05\x12\x15\n\rhas_token_ids\x18\x04 \x01(\x08\x12\x0f\n\x07keep_kv\x18\x05 \x01(\x08\x12\x11\n\tstart_pos\x18\x06 \x01(\x05\x12\x12\n\nall_logits\x18\x07 \x01(\x08\x12\x14\n\x0c\x65\x61gle_hidden\x18\x08 \x01(\x08\"%\n\x0f\x46orwardResponse\x12\x12\n\nhidden_out\x18\x01 \x01(\x0c\"!\n\x0fTruncateRequest\x12\x0e\n\x06n_keep\x18\x01 \x01(\x05\"\x12\n\x10TruncateResponse\"\x0e\n\x0cSleepRequest\"\x0f\n\rSleepResponse\"\r\n\x0bWakeRequest\"$\n\x0cWakeResponse\x12\x14\n\x0cwake_seconds\x18\x01 \x01(\x01\"\xe1\x02\n\rInferenceStep\x12\x12\n\nsession_id\x18\x01 \x01(\t\x12\x0f\n\x07step_id\x18\x02 \x01(\t\x12\x15\n\rprefix_length\x18\x03 \x01(\x05\x12\x33\n\x0chidden_state\x18\n \x01(\x0b\x32\x1b.nakshatra.v0_1.HiddenStateH\x00\x12-\n\ttoken_ids\x18\x0b \x01(\x0b\x32\x18.nakshatra.v0_1.TokenIdsH\x00\x12(\n\x06logits\x18\x0c \x01(\x0b\x32\x16.nakshatra.v0_1.LogitsH\x00\x12\x0f\n\x05\x65rror\x18\r \x01(\x0cH\x00\x12/\n\x0bnext_server\x18\x0e \x01(\x0b\x32\x1a.nakshatra.v0_1.NextServer\x12\x0e\n\x06pushed\x18\x0f \x01(\x08\x12)\n\x05\x63hain\x18\x10 \x03(\x0b\x32\x1a.nakshatra.v0_1.NextServerB\t\n\x07payload\"1\n\nNextServer\x12\x0f\n\x07\x61\x64\x64ress\x18\x01 \x01(\t\x12\x12\n\nsession_id\x18\x02 \x01(\t\"\x17\n\x08TokenIds\x12\x0b\n\x03ids\x18\x01 \x03(\x05\";\n\x0bHiddenState\x12\x0b\n\x03raw\x18\x01 \x01(\x0c\x12\r\n\x05\x62\x61tch\x18\x02 \x01(\x05\x12\x10\n\x08n_tokens\x18\x03 \x01(\x05\")\n\x06Logits\x12\x0b\n\x03raw\x18\x01 \x01(\x0c\x12\x12\n\nvocab_size\x18\x02 \x01(\x05\x32\xc3\x03\n\tNakshatra\x12\x41\n\x04Info\x12\x1b.nakshatra.v0_1.InfoRequest\x1a\x1c.nakshatra.v0_1.InfoResponse\x12J\n\x07\x46orward\x12\x1e.nakshatra.v0_1.ForwardRequest\x1a\x1f.nakshatra.v0_1.ForwardResponse\x12M\n\tInference\x12\x1d.nakshatra.v0_1.InferenceStep\x1a\x1d.nakshatra.v0_1.InferenceStep(\x01\x30\x01\x12O\n\nTruncateKV\x12\x1f.nakshatra.v0_1.TruncateRequest\x1a .nakshatra.v0_1.TruncateResponse\x12\x44\n\x05Sleep\x12\x1c.nakshatra.v0_1.SleepRequest\x1a\x1d.nakshatra.v0_1.SleepResponse\x12\x41\n\x04Wake\x12\x1b.nakshatra.v0_1.WakeRequest\x1a\x1c.nakshatra.v0_1.WakeResponseb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -36,23 +36,31 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_INFORESPONSE']._serialized_start=51
   _globals['_INFORESPONSE']._serialized_end=341
   _globals['_FORWARDREQUEST']._serialized_start=344
-  _globals['_FORWARDREQUEST']._serialized_end=491
-  _globals['_FORWARDRESPONSE']._serialized_start=493
-  _globals['_FORWARDRESPONSE']._serialized_end=530
-  _globals['_TRUNCATEREQUEST']._serialized_start=532
-  _globals['_TRUNCATEREQUEST']._serialized_end=565
-  _globals['_TRUNCATERESPONSE']._serialized_start=567
-  _globals['_TRUNCATERESPONSE']._serialized_end=585
-  _globals['_INFERENCESTEP']._serialized_start=588
-  _globals['_INFERENCESTEP']._serialized_end=941
-  _globals['_NEXTSERVER']._serialized_start=943
-  _globals['_NEXTSERVER']._serialized_end=992
-  _globals['_TOKENIDS']._serialized_start=994
-  _globals['_TOKENIDS']._serialized_end=1017
-  _globals['_HIDDENSTATE']._serialized_start=1019
-  _globals['_HIDDENSTATE']._serialized_end=1078
-  _globals['_LOGITS']._serialized_start=1080
-  _globals['_LOGITS']._serialized_end=1121
-  _globals['_NAKSHATRA']._serialized_start=1124
-  _globals['_NAKSHATRA']._serialized_end=1438
+  _globals['_FORWARDREQUEST']._serialized_end=513
+  _globals['_FORWARDRESPONSE']._serialized_start=515
+  _globals['_FORWARDRESPONSE']._serialized_end=552
+  _globals['_TRUNCATEREQUEST']._serialized_start=554
+  _globals['_TRUNCATEREQUEST']._serialized_end=587
+  _globals['_TRUNCATERESPONSE']._serialized_start=589
+  _globals['_TRUNCATERESPONSE']._serialized_end=607
+  _globals['_SLEEPREQUEST']._serialized_start=609
+  _globals['_SLEEPREQUEST']._serialized_end=623
+  _globals['_SLEEPRESPONSE']._serialized_start=625
+  _globals['_SLEEPRESPONSE']._serialized_end=640
+  _globals['_WAKEREQUEST']._serialized_start=642
+  _globals['_WAKEREQUEST']._serialized_end=655
+  _globals['_WAKERESPONSE']._serialized_start=657
+  _globals['_WAKERESPONSE']._serialized_end=693
+  _globals['_INFERENCESTEP']._serialized_start=696
+  _globals['_INFERENCESTEP']._serialized_end=1049
+  _globals['_NEXTSERVER']._serialized_start=1051
+  _globals['_NEXTSERVER']._serialized_end=1100
+  _globals['_TOKENIDS']._serialized_start=1102
+  _globals['_TOKENIDS']._serialized_end=1125
+  _globals['_HIDDENSTATE']._serialized_start=1127
+  _globals['_HIDDENSTATE']._serialized_end=1186
+  _globals['_LOGITS']._serialized_start=1188
+  _globals['_LOGITS']._serialized_end=1229
+  _globals['_NAKSHATRA']._serialized_start=1232
+  _globals['_NAKSHATRA']._serialized_end=1683
 # @@protoc_insertion_point(module_scope)

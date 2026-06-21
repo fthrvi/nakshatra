@@ -18,6 +18,13 @@ service Nakshatra {
   // Speculative decoding (slice 1): discard a rejected speculative tail from this
   // worker's KV. The coordinator fans this out to EVERY worker after accept().
   rpc TruncateKV(TruncateRequest) returns (TruncateResponse);
+  // 2026-06-21 sleep-mode: release/re-acquire the GPU without a process respawn.
+  // Sleep frees the daemon's ctx+model weights (keeps the process + ROCm backend
+  // resident); Wake reloads from the warm page cache (~440ms vs ~7.5s cold).
+  // Additive — older workers simply don't implement these; the lifecycle probes
+  // protocol_capabilities ("sleep_wake") before using them.
+  rpc Sleep(SleepRequest) returns (SleepResponse);
+  rpc Wake(WakeRequest) returns (WakeResponse);
 }
 
 message InfoRequest {}
@@ -42,6 +49,8 @@ message InfoResponse {
   //   "idempotency_cache"  — (session_id, step_id) replay cache
   //   "recovery_replay"    — supports cold-prefill of a (prompt + already-
   //                          generated-tokens) replay after recovery
+  //   "sleep_wake"         — Sleep/Wake RPCs (GPU release/re-acquire, 2026-06-21)
+  //   "eagle_hidden"       — ForwardRequest.eagle_hidden returns draft hidden states
   repeated string protocol_capabilities = 12;
 }
 
@@ -56,6 +65,12 @@ message ForwardRequest {
   // just the last. Default false → legacy single-final-token behaviour, unchanged.
   // On the last worker, hidden_out then carries int32 top_token[n_tokens].
   bool   all_logits    = 7;
+  // 2026-06-21 EAGLE→live: when true, the worker runs daemon cmd=5 (EAGLE_HIDDEN)
+  // instead of a normal forward and returns the captured pre-final hidden states
+  // (float32 [n_tokens, 3, hidden_size] — embd/l_out-0/l_out-1) for the draft head.
+  // Default false → normal forward, unchanged. Set only on the FIRST worker by an
+  // --eagle-head client; the head consumes these to propose tokens.
+  bool   eagle_hidden  = 8;
 }
 
 message ForwardResponse {
@@ -69,6 +84,13 @@ message TruncateRequest {
 }
 
 message TruncateResponse {}
+
+// 2026-06-21 sleep-mode control messages (empty bodies; status is conveyed by
+// gRPC success/failure + the daemon's wake-latency log line).
+message SleepRequest  {}
+message SleepResponse {}
+message WakeRequest   {}
+message WakeResponse  { double wake_seconds = 1; }   // 0 if already awake
 
 message InferenceStep {
   string session_id     = 1;         // stable across the stream

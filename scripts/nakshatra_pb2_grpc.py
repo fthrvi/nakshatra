@@ -63,6 +63,16 @@ class NakshatraStub:
                 request_serializer=nakshatra__pb2.TruncateRequest.SerializeToString,
                 response_deserializer=nakshatra__pb2.TruncateResponse.FromString,
                 _registered_method=True)
+        self.Sleep = channel.unary_unary(
+                '/nakshatra.v0_1.Nakshatra/Sleep',
+                request_serializer=nakshatra__pb2.SleepRequest.SerializeToString,
+                response_deserializer=nakshatra__pb2.SleepResponse.FromString,
+                _registered_method=True)
+        self.Wake = channel.unary_unary(
+                '/nakshatra.v0_1.Nakshatra/Wake',
+                request_serializer=nakshatra__pb2.WakeRequest.SerializeToString,
+                response_deserializer=nakshatra__pb2.WakeResponse.FromString,
+                _registered_method=True)
 
 
 class NakshatraServicer:
@@ -103,6 +113,23 @@ class NakshatraServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def Sleep(self, request, context):
+        """2026-06-21 sleep-mode: release/re-acquire the GPU without a process respawn.
+        Sleep frees the daemon's ctx+model weights (keeps the process + ROCm backend
+        resident); Wake reloads from the warm page cache (~440ms vs ~7.5s cold).
+        Additive — older workers simply don't implement these; the lifecycle probes
+        protocol_capabilities ("sleep_wake") before using them.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def Wake(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_NakshatraServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -125,6 +152,16 @@ def add_NakshatraServicer_to_server(servicer, server):
                     servicer.TruncateKV,
                     request_deserializer=nakshatra__pb2.TruncateRequest.FromString,
                     response_serializer=nakshatra__pb2.TruncateResponse.SerializeToString,
+            ),
+            'Sleep': grpc.unary_unary_rpc_method_handler(
+                    servicer.Sleep,
+                    request_deserializer=nakshatra__pb2.SleepRequest.FromString,
+                    response_serializer=nakshatra__pb2.SleepResponse.SerializeToString,
+            ),
+            'Wake': grpc.unary_unary_rpc_method_handler(
+                    servicer.Wake,
+                    request_deserializer=nakshatra__pb2.WakeRequest.FromString,
+                    response_serializer=nakshatra__pb2.WakeResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -244,6 +281,60 @@ class Nakshatra:
             '/nakshatra.v0_1.Nakshatra/TruncateKV',
             nakshatra__pb2.TruncateRequest.SerializeToString,
             nakshatra__pb2.TruncateResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Sleep(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/nakshatra.v0_1.Nakshatra/Sleep',
+            nakshatra__pb2.SleepRequest.SerializeToString,
+            nakshatra__pb2.SleepResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Wake(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/nakshatra.v0_1.Nakshatra/Wake',
+            nakshatra__pb2.WakeRequest.SerializeToString,
+            nakshatra__pb2.WakeResponse.FromString,
             options,
             channel_credentials,
             insecure,

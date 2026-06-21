@@ -170,3 +170,45 @@ Why head-gated + not rushed at the tail: it's live-serving-path proto/gRPC surge
 pointless before the retrained head exists, and the session's repeated lesson is that
 rushing live-path multi-file changes late = breakage. Additive+flag-gated keeps it
 safe; do it WITH the head in hand as the coherent final step.
+
+---
+
+## 2026-06-21 — "finish the heavy three" pass (sleep-mode / ring-direct-return / libp2p)
+
+### 1. sleep-mode (<1s wake) — ✅ BUILT + PROVEN
+worker_daemon.cpp: model/ctx made RELOADABLE via a single `load_mc()` lambda;
+new cmd=6 SLEEP (free ctx+model weights, process+ROCm backend stay resident) /
+cmd=7 WAKE (reload from the warm page cache) + a transparent auto-wake guard
+(any decode while asleep wakes first — the lifecycle "summon" path).
+Test `deploy/test_sleep_wake.py` (4/4 PASS):
+  - SLEEP frees VRAM (11986→9918 MB on just the 16-layer slice)
+  - INFO still answers while asleep (cached metadata)
+  - WAKE in **440 ms** (vs ~7.5 s cold summon = ~17× faster), decode BYTE-IDENTICAL
+  - transparent auto-wake (cmd=5 while asleep) byte-identical in 433 ms
+REMAINING (activation only): a gRPC Sleep/Wake RPC (worker.py → daemon cmd=6/7)
++ a lifecycle tier that sleeps on idle-grace instead of full reap. This is the
+SAME additive+flag-gated gRPC surgery as the EAGLE cmd=5 wiring → do them together.
+
+### 2. ring-direct-return — ✅ ALREADY BUILT (was mis-counted as remaining)
+The v0.5 M0.5.3 server-to-server push IS ring-direct-return: worker.py:1432-1507
+forwards a worker's hidden_state DIRECTLY to the next worker (v1 `next_server` for
+2-worker chains, v2 `chain` for any length — each worker pops the head + forwards
+the rest), eliminating the client-relay hop on split chains. Fault-handled
+(`push_failed:` → client downgrades to relay) and live-tested (bug found+fixed on
+node-d 2026-05-13). The blocking-Forward star path (client relays each hop) is the
+INTENTIONAL relay fallback. Nothing to build.
+
+### 3. libp2p sidecar — DEFERRED (capability our mesh already covers)
+Vendored, unbuilt (Go). Its purpose is permissionless NAT-traversal joining —
+strangers join with zero config / hole-punching. Our reachability is already
+provided by the WireGuard full-mesh + the dial-out onboarding (mesh-device.sh):
+every node gets a stable mesh IP and the relay covers away-clients. So libp2p is
+REDUNDANT until we want truly permissionless growth (the incentive-flywheel future
+where strangers join for credits). Decision: defer until that's the active goal;
+the vendored sidecar is the path when it is. Building a Go sidecar now for an
+unexercised capability is exactly the low-value tail-slog to avoid.
+
+NET: of the three, sleep-mode is now done+proven, ring-direct-return was already
+done, and libp2p is a future capability (not a gap). The one live-activation thread
+left (sleep gRPC RPC) groups with the EAGLE cmd=5 gRPC wiring — both gated on / done
+alongside the retrained head (now climbing: 0.000→0.639 acceptance on serving hidden).
