@@ -484,12 +484,14 @@ int main(int argc, char ** argv) {
         if (cmd == 5) {
             // EAGLE→live KV ISOLATION (2026-06-21): the draft-hidden capture runs
             // on a SCRATCH sequence (1), never seq 0. The serving/verify path owns
-            // seq 0; if cmd=5 cleared or appended there it would corrupt the
-            // speculative KV (rejected-tail invariants, M3 fusion). So cmd=5 is
-            // ALWAYS cold on seq 1: wipe seq 1, decode the full prefix at pos 0..
-            // (cheap — the first worker holds only ~2 layers). start_pos/keep_kv
-            // from the caller are ignored for cmd=5.
-            llama_memory_seq_rm(llama_get_memory(ctx), 1, -1, -1);
+            // seq 0; touching it would corrupt the speculative KV (M3 fusion).
+            // INCREMENTAL (2026-06-21): cmd=5 now honors keep_kv on seq 1 —
+            //   keep_kv=0 (cold): wipe seq 1, decode the prefix from pos 0;
+            //   keep_kv=1 (incremental): APPEND the new tokens at start_pos, reusing
+            //     the accumulated seq-1 KV → O(1)/step instead of re-forwarding the
+            //     whole prefix every step (kills the O(S^2) target cost). The hidden
+            //     captured is identical to a cold re-forward (same causal attention).
+            if (!keep_kv) llama_memory_seq_rm(llama_get_memory(ctx), 1, -1, -1);
         } else if (!keep_kv) {
             llama_memory_clear(llama_get_memory(ctx), true);
         } else {
@@ -523,7 +525,9 @@ int main(int argc, char ** argv) {
             batch.n_tokens = n_tokens;
             for (uint32_t i = 0; i < n_tokens; ++i) {
                 batch.token[i] = (llama_token) tok[i];
-                batch.pos[i] = eagle ? (int32_t)i : (int32_t)(start_pos + i);
+                // both paths use caller start_pos (cold cmd=5 sends start_pos=0;
+                // incremental cmd=5 sends the current seq-1 length).
+                batch.pos[i] = (int32_t)(start_pos + i);
                 batch.n_seq_id[i] = 1;
                 batch.seq_id[i][0] = kv_seq;
                 batch.logits[i] = (all_logits || i == n_tokens - 1) ? 1 : 0;

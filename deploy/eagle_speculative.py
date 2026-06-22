@@ -23,12 +23,18 @@ class EagleDraft:
             self.model = self.model.to("cuda")   # draft runs on GPU for a fair tok/s
         self.cmd5_fn = cmd5_fn   # (prefix_ids:list[int]) -> hidden3 flat [S*3*n_embd] or [S,3*n_embd]
         self.n_embd = self.cfg.hidden_size
+        self._hidden_override = None   # incremental mode: caller supplies accumulated hidden
+
+    def set_hidden(self, hidden_flat):
+        """Incremental mode: use this accumulated hidden buffer (len S*3*n_embd) for
+        the next propose instead of calling cmd5_fn (which would re-forward the prefix)."""
+        self._hidden_override = hidden_flat
 
     def propose(self, prefix_tokens, k):
         """Return k draft token ids (full vocab) for the continuation of prefix_tokens."""
         import torch, os, sys
         S = len(prefix_tokens)
-        hid = self.cmd5_fn(list(prefix_tokens))
+        hid = self._hidden_override if self._hidden_override is not None else self.cmd5_fn(list(prefix_tokens))
         h = torch.as_tensor(hid, dtype=torch.float32).reshape(1, S, 3 * self.n_embd)
         # move to the head's device (CUDA) so the draft forward runs on GPU
         dev = next(self.model.parameters()).device
