@@ -114,25 +114,45 @@ def run_plain():
     return gen, (MAX_NEW - 1) / dt, dt
 
 # ── EAGLE speculative (seq 0 verify + seq 1 draft hidden) ────────────────────
-def run_eagle(draft):
+def eagle_hidden(tokens, start, keep):
+    """cmd=5 on scratch seq 1; returns the captured hidden3 floats for `tokens`.
+    keep=False → cold (wipe seq 1, pos 0); keep=True → append at `start` (incremental)."""
+    n = len(tokens)
+    st, d = send_recv(5, n, start, (KEEP if keep else 0), struct.pack(f"<{n}i", *tokens))
+    assert st == 0 and struct.unpack("<I", d[:4])[0] == 3, f"cmd=5 failed st={st}"
+    return list(struct.unpack(f"<{(len(d)-4)//4}f", d[4:]))
+
+def run_eagle(draft, incremental=True):
     send_recv(4, 0, 0, 0, struct.pack("<I", 0))
     nxt = decode_argmax(prompt_ids, 0, keep=False)
-    # prefill established KV for the prompt (pos 0..P-1); next decode starts at P.
-    # `nxt` is the prefill's output token (no KV yet) — fed as `cur` next step.
     gen = [nxt]; prefix_length = len(prompt_ids)
     accepted_total = 0; steps = 0
+    # INCREMENTAL draft hidden: build seq-1 KV once over the prompt (cold), then
+    # APPEND only newly-committed tokens each step → target does O(1)/step, not a
+    # full-prefix re-forward (the O(S^2) tax). hidden_acc mirrors prompt+gen exactly.
+    hidden_acc = []
+    if incremental:
+        hidden_acc = eagle_hidden(prompt_ids, 0, keep=False)          # cold: prompt
+        hidden_acc += eagle_hidden([nxt], len(prompt_ids), keep=True)  # append nxt
+        seq1 = len(prompt_ids) + 1
     t0 = time.time()
     while len(gen) < MAX_NEW:
         cur = gen[-1]
-        drafts = draft.propose(prompt_ids + gen, K)      # cmd=5 on scratch seq 1
+        if incremental:
+            draft.set_hidden(hidden_acc)                  # use accumulated hidden (no re-forward)
+        drafts = draft.propose(prompt_ids + gen, K)
         verify = [cur] + list(drafts)
         targ = verify_argmax(verify, prefix_length)       # seq 0, M3-fused trim
         res = accept(drafts, targ)
         prefix_length = kv_keep_after(prefix_length, res.n_accepted)
         accepted_total += res.n_accepted; steps += 1
+        newly = []
         for t in res.committed:
-            gen.append(t)
+            gen.append(t); newly.append(t)
             if len(gen) >= MAX_NEW: break
+        if incremental and newly and len(gen) < MAX_NEW:
+            hidden_acc += eagle_hidden(newly, seq1, keep=True)   # append committed tokens' hidden
+            seq1 += len(newly)
     dt = time.time() - t0
     return gen, (len(gen) - 1) / dt, dt, accepted_total / max(steps, 1)
 
@@ -142,13 +162,23 @@ print(f"  {MAX_NEW-1} tokens in {plain_dt:.2f}s = {plain_tps:.2f} tok/s", flush=
 
 print("\n=== loading EAGLE head ===", flush=True)
 draft = EagleDraft(HEAD, BASE, CFG, daemon_cmd5_fn(send_recv))
-print("  head loaded; running EAGLE speculative…", flush=True)
-eagle_gen, eagle_tps, eagle_dt, mean_acc = run_eagle(draft)
+print("  head loaded.", flush=True)
+
+print("\n=== EAGLE (non-incremental: full-prefix cmd=5 each step) ===", flush=True)
+ni_gen, ni_tps, ni_dt, ni_acc = run_eagle(draft, incremental=False)
+draft.set_hidden(None)  # reset override before incremental run
+print(f"  {len(ni_gen)-1} tokens in {ni_dt:.2f}s = {ni_tps:.2f} tok/s "
+      f"(accept {ni_acc:.2f}/K={K})", flush=True)
+
+print("\n=== EAGLE (incremental: O(1)/step draft hidden) ===", flush=True)
+eagle_gen, eagle_tps, eagle_dt, mean_acc = run_eagle(draft, incremental=True)
 print(f"  {len(eagle_gen)-1} tokens in {eagle_dt:.2f}s = {eagle_tps:.2f} tok/s  "
-      f"(mean accepted/step={mean_acc:.2f} of K={K})", flush=True)
+      f"(accept {mean_acc:.2f}/K={K})", flush=True)
 
 match = plain_gen[:min(len(plain_gen), len(eagle_gen))] == eagle_gen[:min(len(plain_gen), len(eagle_gen))]
+ni_match = ni_gen[:min(len(ni_gen), len(eagle_gen))] == eagle_gen[:min(len(ni_gen), len(eagle_gen))]
 print(f"\n=== RESULT ===", flush=True)
+print(f"  EAGLE non-incr: {ni_tps:.2f} tok/s  ({ni_tps/plain_tps:.2f}x)  incr==nonincr_output={ni_match}", flush=True)
 print(f"  plain  : {plain_tps:.2f} tok/s", flush=True)
 print(f"  EAGLE  : {eagle_tps:.2f} tok/s", flush=True)
 print(f"  speedup: {eagle_tps/plain_tps:.2f}x   mean_accept={mean_acc:.2f}   "
