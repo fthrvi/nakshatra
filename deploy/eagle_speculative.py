@@ -16,19 +16,27 @@ sys.path.insert(0, os.path.expanduser("~/EAGLE")); sys.path.insert(0, os.path.ex
 
 class EagleDraft:
     def __init__(self, head_ckpt, base, config_path, cmd5_fn):
-        import eagle_draft
+        import eagle_draft, torch
         self._ed = eagle_draft
         self.model, _, self.cfg = eagle_draft.load_head(head_ckpt, base, config_path)
+        if torch.cuda.is_available():
+            self.model = self.model.to("cuda")   # draft runs on GPU for a fair tok/s
         self.cmd5_fn = cmd5_fn   # (prefix_ids:list[int]) -> hidden3 flat [S*3*n_embd] or [S,3*n_embd]
         self.n_embd = self.cfg.hidden_size
 
     def propose(self, prefix_tokens, k):
         """Return k draft token ids (full vocab) for the continuation of prefix_tokens."""
-        import torch
+        import torch, os, sys
         S = len(prefix_tokens)
         hid = self.cmd5_fn(list(prefix_tokens))
         h = torch.as_tensor(hid, dtype=torch.float32).reshape(1, S, 3 * self.n_embd)
-        ids = torch.tensor([list(prefix_tokens) + [prefix_tokens[-1]]])  # len S+1 (topK drops first)
+        # move to the head's device (CUDA) so the draft forward runs on GPU
+        dev = next(self.model.parameters()).device
+        h = h.to(dev)
+        ids = torch.tensor([list(prefix_tokens) + [prefix_tokens[-1]]]).to(dev)  # S+1 (topK drops first)
+        if os.environ.get("EAGLE_DBG"):
+            print(f"[dbg propose] S={S} h={tuple(h.shape)} ids={tuple(ids.shape)} k={k} dev={dev}",
+                  file=sys.stderr, flush=True)
         return self._ed.propose(self.model, h, ids, k)
 
 
