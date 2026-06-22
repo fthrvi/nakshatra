@@ -11,10 +11,13 @@ Run on ijru (conda eagle env: torch+CUDA). Usage:
 """
 import os, sys, time, struct, subprocess, threading, glob
 
-sys.path.insert(0, os.path.expanduser("~/nakshatra/scripts"))
-sys.path.insert(0, os.path.expanduser("~/nakshatra/deploy"))
-sys.path.insert(0, os.path.expanduser("~/EAGLE"))
-sys.path.insert(0, os.path.expanduser("~"))
+# APPEND (not insert-0) the repo dirs: ~/nakshatra/scripts has a packaging/ dir
+# that would shadow the real `packaging` (transformers dep) if it preceded
+# site-packages. Append → site-packages wins for stdlib/third-party modules.
+for _p in ("~/nakshatra/scripts", "~/nakshatra/deploy", "~/EAGLE", "~"):
+    _ap = os.path.expanduser(_p)
+    if _ap not in sys.path:
+        sys.path.append(_ap)
 
 GGUF = sys.argv[1]
 HEAD = sys.argv[2]
@@ -46,7 +49,13 @@ prompt_ids = list(tokenize(PROMPT))
 print(f"prompt='{PROMPT}' ({len(prompt_ids)} tokens)  K={K}  max_new={MAX_NEW}", flush=True)
 
 # ── launch whole-model daemon ────────────────────────────────────────────────
-p = subprocess.Popen([BIN, GGUF, "first", str(N_CTX), "0", "99"],
+# "last" mode → the worker emits TOKENS (lm_head argmax) for cmd=1, and argmax-
+# per-position for all_logits verify. cmd=1 still accepts token input (mode only
+# gates OUTPUT), and cmd=5 returns its hidden3 early (before the mode logic), so a
+# single "last"-mode whole-model worker is the complete loop: tokens in → tokens
+# out, plus draft hidden. (A "first"-mode worker would return hidden states, which
+# the decode-feedback loop would misread as a token — the bug this fixes.)
+p = subprocess.Popen([BIN, GGUF, "last", str(N_CTX), "0", "99"],
                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 ready = threading.Event()
 def watch():
@@ -102,7 +111,9 @@ def run_plain():
 def run_eagle(draft):
     send_recv(4, 0, 0, 0, struct.pack("<I", 0))
     nxt = decode_argmax(prompt_ids, 0, keep=False)
-    gen = [nxt]; prefix_length = len(prompt_ids) + 1
+    # prefill established KV for the prompt (pos 0..P-1); next decode starts at P.
+    # `nxt` is the prefill's output token (no KV yet) — fed as `cur` next step.
+    gen = [nxt]; prefix_length = len(prompt_ids)
     accepted_total = 0; steps = 0
     t0 = time.time()
     while len(gen) < MAX_NEW:
