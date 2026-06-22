@@ -286,3 +286,34 @@ Bugs fixed to get the clean run (all real, all in the live path):
 MILESTONE STATUS: "does EAGLE→live work end-to-end, correctly, on real hw?" = YES
 (proven, output-identical). "Is it faster yet?" = NO — gated on head acceptance
 (data) + incremental cmd=5. Both are clear, scoped follow-ups; neither is wiring.
+
+---
+
+## 2026-06-21 — INCREMENTAL cmd=5: clean decomposition of the slowdown
+
+Made cmd=5 incremental (daemon honors keep_kv on scratch seq 1 → append new tokens,
+O(1)/step; client accumulates hidden instead of re-forwarding the whole prefix).
+Side-by-side on ijru (prithvi-q8, NGL=26, K=4, 48 tok):
+
+  plain                 : 18.91 tok/s
+  EAGLE non-incremental :  4.09 tok/s  (0.22x)   full-prefix cmd=5 each step (O(S^2))
+  EAGLE incremental     :  7.03 tok/s  (0.37x)   O(1)/step draft hidden
+  acceptance 0.27 (both)   output_identical=True (all arms, incr==nonincr)
+
+DECOMPOSITION (what Biswa asked to isolate):
+ - The O(S^2) re-forward tax: 0.22x -> 0.37x = +72%. ARCHITECTURE, now fixed.
+ - The remaining sub-1.0x is ENTIRELY acceptance (0.27). DATA, not architecture.
+
+WHY still <1x: per step the design pays ~2 target forwards (incremental cmd=5 of the
+new tokens + the verify) for ~1.27 committed tokens (accept 0.27). To beat plain,
+committed/step must exceed the overhead — at acceptance ~0.7 (linear-chain mean
+≈ 1/(1-a) ≈ 3.3 tok/step) this flips to ~1.5x POSITIVE. So the lever is acceptance =
+more serving-hidden training data (the head saw only 500 samples; held-out 0.346).
+
+NEXT architecture win (optional, halves the remaining gap): FUSE cmd=5 into the verify
+forward — the verify (cmd=1 all_logits) already runs the target over the tokens; arm
+the eagle capture during it and reuse that hidden, dropping to ~1 target forward/step.
+Then it flips positive at acceptance ~0.5 instead of ~0.7.
+
+STATUS: architecture is now efficient (incremental, output-identical, KV-safe). The
+single remaining lever for a >1x live speedup is HEAD ACCEPTANCE = training data.
