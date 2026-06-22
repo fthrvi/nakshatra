@@ -249,3 +249,40 @@ REMAINING = the MEASUREMENT milestone only: bring `head_serving_hidden.pt` (the
 retrained head, acceptance 0.000→0.639 climbing) + EAGLE config from ijru → run a
 live chain with `--eagle-head` → measure tok/s vs plain. The wiring it rides on is
 done + correct; this is the e2e bring-up + number, the natural next step.
+
+---
+
+## 2026-06-21 — LIVE MEASUREMENT: pipeline PROVEN correct, speedup NEGATIVE (data-bound)
+
+First end-to-end EAGLE→live run on real hardware (ijru 3060, whole prithvi-q8 over
+the worker-daemon stdio protocol, head=head_serving_hidden.pt):
+
+  plain : 19.01 tok/s
+  EAGLE :  4.06 tok/s   speedup 0.21x   mean_accept=0.27/K=4   OUTPUT_IDENTICAL=True
+
+READ: the wiring is COMPLETE + CORRECT (output byte-identical to plain greedy — the
+cmd=5 scratch-seq isolation, verify, accept, M3-fused KV trim all work live). But it
+is 5x SLOWER right now, for two distinct, identified reasons:
+
+1. DATA (dominant): acceptance is 0.27 — the head is severely data-limited. Trained
+   on only 500 cmd=5 samples; held-out acceptance 0.346 (train 0.78 = overfit). EAGLE
+   needs ~2-3 accepted/step to win; 0.27 means it commits ~1.27 tok/step while paying
+   full draft+verify overhead. The lever: train on FAR more serving-hidden data
+   (extract thousands of cmd=5 samples, not 500) → push acceptance to 0.6+.
+2. ARCHITECTURE (measurement): the loop calls cmd=5 with the FULL prefix every step
+   (O(S) growing → O(S^2) total) instead of reusing the verify forward's hidden. Even
+   with perfect acceptance this re-forward would cap the win. Fix: make cmd=5
+   incremental (keep_kv on the scratch seq) or derive draft hidden from the verify pass.
+
+Bugs fixed to get the clean run (all real, all in the live path):
+ - verify off-by-one: prefix_length must be len(prompt) not +1 (KV hole at pos P).
+ - whole-model worker must launch mode="last" (emit tokens), not "first" (hidden).
+ - single-12GB-card OOM: q8 target + EAGLE head don't both fit all-GPU → NGL offload
+   (env, applied to BOTH plain+EAGLE so the ratio stays fair).
+ - eagle_draft.propose: RESET model.stable_kv=None each propose — topK_genrate caches
+   KV across calls; with a fresh full prefix each step the stale kv_len sliced
+   input_ids wrong (cat seq mismatch). THE bug that blocked every prior attempt.
+
+MILESTONE STATUS: "does EAGLE→live work end-to-end, correctly, on real hw?" = YES
+(proven, output-identical). "Is it faster yet?" = NO — gated on head acceptance
+(data) + incremental cmd=5. Both are clear, scoped follow-ups; neither is wiring.

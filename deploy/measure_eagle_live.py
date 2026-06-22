@@ -28,6 +28,12 @@ K = int(os.environ.get("SPEC_K", "4"))
 MAX_NEW = int(os.environ.get("MAX_NEW", "48"))
 BIN = os.path.expanduser("~/llama.cpp/build-cuda/bin/llama-nakshatra-worker")
 N_CTX = 512
+# On a single 12GB card the q8 target (~8GB) + the EAGLE head (~3.5GB w/ embedding
+# + CUDA ctx) don't both fit. Offload a few target layers to CPU to make room — the
+# SAME daemon serves plain and EAGLE, so the speedup RATIO stays fair (only absolute
+# tok/s drops). NGL=99 = all-GPU (needs a 2nd card / smaller target).
+NGL = os.environ.get("NGL", "28")
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 from speculative import accept, kv_keep_after
 from eagle_speculative import EagleDraft, daemon_cmd5_fn
@@ -55,7 +61,7 @@ print(f"prompt='{PROMPT}' ({len(prompt_ids)} tokens)  K={K}  max_new={MAX_NEW}",
 # single "last"-mode whole-model worker is the complete loop: tokens in → tokens
 # out, plus draft hidden. (A "first"-mode worker would return hidden states, which
 # the decode-feedback loop would misread as a token — the bug this fixes.)
-p = subprocess.Popen([BIN, GGUF, "last", str(N_CTX), "0", "99"],
+p = subprocess.Popen([BIN, GGUF, "last", str(N_CTX), "0", NGL],
                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 ready = threading.Event()
 def watch():
