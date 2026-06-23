@@ -162,6 +162,65 @@ def balanced_spans(cluster: List[Node], total_layers: int, model_gb: float,
     return spans
 
 
+# ── wire-cost-aware split: trade hops against stage-time (speed-stack #1.2) ─────────────
+def _rate_of(nodes: List[Node]) -> Dict[str, float]:
+    return {n.name: (n.tok_per_s if n.tok_per_s > 0 else n.vram_gb) for n in nodes}
+
+
+def stage_time_s(spans: Dict[str, Tuple[int, int]], rate: Dict[str, float]) -> float:
+    """Slowest pipeline stage (seconds/token): max_i(layers_i / rate_i) — the throughput
+    bound balanced_spans equalizes. rate is layers/sec (capacity)."""
+    return max(((b - a) / max(rate.get(n, 1e-9), 1e-9)) for n, (a, b) in spans.items())
+
+
+def wire_cost_s(spans: Dict[str, Tuple[int, int]],
+                rtt_ms: Dict[Tuple[str, str], float], *,
+                bytes_per_token: float = 0.0, bandwidth_bps: float = 1e9) -> float:
+    """Per-token WIRE time (seconds): Σ over consecutive pipeline hops of
+    (rtt_seconds + bytes_per_token / bandwidth). Latency-dominated for batch-1 decode (the
+    hidden vector is small); the bandwidth term covers bulk transfers when bytes are given.
+    Hops follow layer order. Each token's activation crosses every hop → this is on the
+    critical path. A DIRECTIONAL cost (prefer fewer high-RTT hops), not a cycle model."""
+    order = [n for n, _ in sorted(spans.items(), key=lambda kv: kv[1][0])]
+    cost = 0.0
+    for a, b in zip(order, order[1:]):
+        r = rtt_ms.get((a, b), rtt_ms.get((b, a), 0.0))
+        cost += r / 1000.0 + (bytes_per_token / bandwidth_bps if bandwidth_bps else 0.0)
+    return cost
+
+
+def chain_cost_s(spans: Dict[str, Tuple[int, int]], rate: Dict[str, float],
+                 rtt_ms: Dict[Tuple[str, str], float], *,
+                 bytes_per_token: float = 0.0, bandwidth_bps: float = 1e9) -> float:
+    """Total per-token cost (seconds) = slowest stage compute + wire. Lower is better.
+    Adding a node lowers stage-time but adds a hop (wire) — this scores the trade so the
+    planner stops adding nodes once the new hop costs more than the compute it saves."""
+    return (stage_time_s(spans, rate)
+            + wire_cost_s(spans, rtt_ms, bytes_per_token=bytes_per_token, bandwidth_bps=bandwidth_bps))
+
+
+def choose_split(cluster: List[Node], total_layers: int, model_gb: float,
+                 rtt_ms: Dict[Tuple[str, str], float], *,
+                 bytes_per_token: float = 0.0, bandwidth_bps: float = 1e9,
+                 headroom_gb: float = 1.0) -> Optional[Dict[str, Tuple[int, int]]]:
+    """WIRE-AWARE split: among using the fastest K nodes of the cluster (K from the fewest
+    that fit, up to all), pick the balanced_spans assignment with the lowest chain_cost_s
+    (stage compute + wire). Fewer nodes = fewer hops (less wire) but higher per-stage compute;
+    this returns the K that genuinely minimizes per-token time. None if the cluster can't hold
+    the model. When RTT is ~0 it reduces to plain balanced_spans (most-nodes wins on stage-time)."""
+    ordered = sorted(cluster, key=lambda n: -(n.tok_per_s if n.tok_per_s > 0 else n.vram_gb))
+    best = None
+    for k in range(1, len(ordered) + 1):
+        spans = balanced_spans(ordered[:k], total_layers, model_gb, headroom_gb)
+        if spans is None:
+            continue
+        cost = chain_cost_s(spans, _rate_of(ordered[:k]), rtt_ms,
+                            bytes_per_token=bytes_per_token, bandwidth_bps=bandwidth_bps)
+        if best is None or cost < best[1]:
+            best = (spans, cost)
+    return best[0] if best else None
+
+
 @dataclass
 class Plan:
     whole_host: Optional[str] = None
