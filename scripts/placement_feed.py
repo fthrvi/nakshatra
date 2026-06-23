@@ -169,18 +169,41 @@ def telemetry_from_peers(peers: Iterable[Mapping],
 
 
 def fetch_pillar_peers(pillar_url: Optional[str], model_id: Optional[str] = None,
-                       timeout: float = 10.0) -> list:
-    """Fetch the pillar's live peer projection (GET {pillar}/peers[?model=]) — the dicts that carry
-    recent_rpc_ms / budget.vram_offered_gb / layer_offerings. Returns [] on ANY failure (caller then
-    has no telemetry → even-split fallback). stdlib-only; never raises — placement must not break
-    the serve."""
+                       timeout: float = 10.0, *, node_id: Optional[str] = None,
+                       key_path: Optional[str] = None) -> list:
+    """Fetch the pillar's live peer projection (GET {pillar}/peers) — the dicts that carry
+    recent_rpc_ms / budget.vram_offered_gb / layer_offerings.
+
+    SIGNS the request with the worker's Ed25519 key (Sthambha-Ed25519) when one is available,
+    so auth-required pillars (which 401 a bare GET) accept it; degrades to UNSIGNED otherwise,
+    matching client.py's _fetch_spki_index. The URL stays plain `/peers` (no ?model= query) —
+    it matches the existing /peers convention and sidesteps any query-in-canonical ambiguity;
+    model filtering happens downstream in telemetry_from_peers(). node_id (the keyid) resolves
+    param → NAKSHATRA_NODE_ID → hostname; the key loads from key_path → ~/.nakshatra/keys/
+    worker.ed25519 (load-only — never creates a stray unregistered key). [] on ANY failure
+    (incl. 401); never raises — placement must not break the serve."""
     if not pillar_url:
         return []
     import json as _json
     from urllib import request as _rq
-    url = pillar_url.rstrip("/") + "/peers" + (f"?model={model_id}" if model_id else "")
+    base, path = pillar_url.rstrip("/"), "/peers"
+    headers = {}
+    try:                                   # best-effort signed auth (Sthambha-Ed25519)
+        import os as _os, socket as _sock
+        from pathlib import Path as _P
+        kp = _P(key_path) if key_path else (_P.home() / ".nakshatra" / "keys" / "worker.ed25519")
+        if kp.exists():
+            priv = kp.read_bytes()
+            if len(priv) == 32:
+                nid = node_id or _os.environ.get("NAKSHATRA_NODE_ID") or _sock.gethostname()
+                import nakshatra_auth as _na
+                hdr, _ = _na.build_signed_envelope(priv, nid, "GET", path, b"")
+                headers["Authorization"] = hdr
+    except Exception:
+        pass                               # → unsigned fallback
     try:
-        with _rq.urlopen(url, timeout=timeout) as r:
+        with _rq.urlopen(_rq.Request(base + path, headers=headers, method="GET"),
+                         timeout=timeout) as r:
             data = _json.loads(r.read().decode("utf-8"))
         if isinstance(data, dict):
             return data.get("peers") or data.get("online") or []

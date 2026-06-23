@@ -248,6 +248,31 @@ def test_fetch_pillar_peers_safe_on_bad_input():
     assert pf.fetch_pillar_peers("http://127.0.0.1:1", "m", timeout=0.5) == []  # refused → []
 
 
+def test_pillar_fetch_signature_verifies():
+    """The Sthambha-Ed25519 signature fetch_pillar_peers produces over GET /peers must verify
+    against the signer's pubkey — proving the canonical/signing is correct, so an auth-required
+    pillar will ACCEPT it once the key is registered (the cross-box blocker fix)."""
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import nakshatra_auth as na
+    except Exception as e:
+        import pytest
+        pytest.skip(f"nakshatra_auth unavailable: {e!r}")
+    priv, pub = na.generate_keypair()
+    ts = 1700000000
+    sig = na.sign_request(priv, "GET", "/peers", b"", ts)
+    assert na.verify_request(pub, "GET", "/peers", b"", ts, sig) is True
+    assert na.verify_request(pub, "GET", "/peers?x=1", b"", ts, sig) is False   # path-bound
+
+
+def test_fetch_pillar_peers_signs_with_key(tmp_path):
+    """With a key present, the signing branch runs (and fails open to [] on a refused conn)."""
+    key = tmp_path / "worker.ed25519"
+    key.write_bytes(b"\x01" * 32)
+    assert pf.fetch_pillar_peers("http://127.0.0.1:1", "m", timeout=0.5,
+                                 node_id="hub", key_path=str(key)) == []
+
+
 # ── live glue: serve_chain under NKS_SMART_PLACEMENT routes whole to the fast node ─────
 
 def test_serve_chain_smart_placement_routes_whole(tmp_path):
