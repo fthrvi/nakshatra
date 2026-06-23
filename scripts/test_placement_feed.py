@@ -164,6 +164,83 @@ def test_planner_routes_whole_when_one_node_fits():
     assert "route_to" in chain and chain["route_to"]["node"] == "big-fast"
 
 
+# ── serve adapter: placement.Plan → serve assignment, + the place_fn factory ──────────
+
+class _W:
+    """Minimal fake WorkerStanding: node_id + capabilities (what serve_planner reads)."""
+    def __init__(self, node_id, addr="10.0.0.1", port=5540):
+        self.node_id = node_id
+        self.capabilities = {"address": addr, "port": port}
+
+
+def test_assignment_from_plan_route_whole():
+    plan = placement.Plan(whole_host="fast")
+    wbn = {"fast": _W("fast")}
+    out = pf.assignment_from_plan(plan, wbn, 16)
+    assert out == [(wbn["fast"], 0, 16, "solo")]
+
+
+def test_assignment_from_plan_split_modes_and_coverage():
+    plan = placement.Plan(splits={"a": (0, 8), "b": (8, 16)}, cluster=["a", "b"])
+    wbn = {"a": _W("a"), "b": _W("b")}
+    out = pf.assignment_from_plan(plan, wbn, 16)
+    assert [(w.node_id, s, e, m) for (w, s, e, m) in out] == \
+        [("a", 0, 8, "first"), ("b", 8, 16, "last")]
+    assert out[0][1] == 0 and out[-1][2] == 16          # contiguous full coverage
+
+
+def test_make_place_fn_routes_whole_when_fits():
+    workers = [_W("big")]
+    telem = {"big": {"vram_gb": 24.0, "recent_rpc_ms": 20.0, "layers_served": 16}}
+    place = pf.make_place_fn(model_gb=8.0, telemetry_of=lambda w: telem[w.node_id])
+    assert place(workers, 16) == [(workers[0], 0, 16, "solo")]   # route-don't-split
+
+
+def test_make_place_fn_split_is_capacity_weighted():
+    fast, slow = _W("fast"), _W("slow")
+    telem = {"fast": {"vram_gb": 6.0, "recent_rpc_ms": 20.0, "layers_served": 16},
+             "slow": {"vram_gb": 6.0, "recent_rpc_ms": 80.0, "layers_served": 16}}
+    place = pf.make_place_fn(model_gb=8.0, telemetry_of=lambda w: telem[w.node_id],
+                             rtt_samples=[("fast", "slow", 2.0)])
+    out = place([fast, slow], 16)
+    assert out is not None and len(out) == 2
+    by = {w.node_id: (s, e) for (w, s, e, m) in out}
+    assert (by["fast"][1] - by["fast"][0]) > (by["slow"][1] - by["slow"][0])   # fast holds more
+    spans = sorted(by.values())
+    assert spans[0][0] == 0 and spans[-1][1] == 16       # contiguous coverage
+
+
+def test_make_place_fn_none_when_unplaceable():
+    place = pf.make_place_fn(model_gb=100.0,
+                             telemetry_of=lambda w: {"vram_gb": 2.0, "recent_rpc_ms": 50.0})
+    assert place([_W("tiny")], 16) is None               # → caller falls back to even split
+
+
+def test_plan_chain_uses_place_fn_end_to_end():
+    """The live seam: plan_chain with an injected place_fn emits a chain from the
+    placement (fast node gets more layers, contiguous [0,16) coverage)."""
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent / "fabric"))
+        import serve_planner as sp
+    except Exception as e:
+        import pytest
+        pytest.skip(f"serve_planner deps unavailable here: {e!r}")
+    ws = [_W("fast"), _W("slow")]
+    telem = {"fast": {"vram_gb": 6.0, "recent_rpc_ms": 20.0, "layers_served": 16},
+             "slow": {"vram_gb": 6.0, "recent_rpc_ms": 80.0, "layers_served": 16}}
+    place = pf.make_place_fn(model_gb=8.0, telemetry_of=lambda w: telem[w.node_id],
+                             rtt_samples=[("fast", "slow", 2.0)])
+    cp = sp.plan_chain("m", ws, num_layers=16, hidden_size=4096,
+                       eligible_fn=lambda model, workers: (workers, []),
+                       min_tier_fn=lambda m: "", place_fn=place)
+    wy = cp.chain["workers"]
+    assert len(wy) == 2
+    span = {x["id"]: (x["layer_range"][1] - x["layer_range"][0]) for x in wy}
+    assert span["fast"] > span["slow"]
+    rs = sorted([x["layer_range"] for x in wy])
+    assert rs[0][0] == 0 and rs[-1][1] == 16
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-q"]))
