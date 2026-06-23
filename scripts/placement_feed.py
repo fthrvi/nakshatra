@@ -168,6 +168,27 @@ def telemetry_from_peers(peers: Iterable[Mapping],
     return {_peer_name(p): peer_to_telemetry(p, model_id) for p in peers if _peer_name(p)}
 
 
+def fetch_pillar_peers(pillar_url: Optional[str], model_id: Optional[str] = None,
+                       timeout: float = 10.0) -> list:
+    """Fetch the pillar's live peer projection (GET {pillar}/peers[?model=]) — the dicts that carry
+    recent_rpc_ms / budget.vram_offered_gb / layer_offerings. Returns [] on ANY failure (caller then
+    has no telemetry → even-split fallback). stdlib-only; never raises — placement must not break
+    the serve."""
+    if not pillar_url:
+        return []
+    import json as _json
+    from urllib import request as _rq
+    url = pillar_url.rstrip("/") + "/peers" + (f"?model={model_id}" if model_id else "")
+    try:
+        with _rq.urlopen(url, timeout=timeout) as r:
+            data = _json.loads(r.read().decode("utf-8"))
+        if isinstance(data, dict):
+            return data.get("peers") or data.get("online") or []
+        return data or []
+    except Exception:
+        return []
+
+
 def to_placement_inputs(peers: Iterable[Mapping], *, model_id: Optional[str] = None,
                         rtt_samples: Optional[Iterable[Tuple[str, str, float]]] = None
                         ) -> Tuple[List[placement.Node], Dict[Tuple[str, str], float],

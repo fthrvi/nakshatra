@@ -89,6 +89,9 @@ class ModelEntry:
     hidden_size: Optional[int] = None
     num_layers: Optional[int] = None
     wire_dtype: str = "f32"
+    # operator-declared total model size (GB) — lets NKS_SMART_PLACEMENT decide route-whole-vs-split
+    # without a runtime size lookup. Optional; if absent, serve_chain estimates from the package.
+    model_size_gb: Optional[float] = None
 
 
 def _load_models(path: str) -> dict[str, ModelEntry]:
@@ -147,7 +150,8 @@ def _load_models(path: str) -> dict[str, ModelEntry]:
             registry_url=registry_url, details=raw.get("details") or {},
             from_roster=from_roster, package=raw.get("package"),
             hidden_size=raw.get("hidden_size"), num_layers=raw.get("num_layers"),
-            wire_dtype=raw.get("wire_dtype") or "f32")
+            wire_dtype=raw.get("wire_dtype") or "f32",
+            model_size_gb=raw.get("model_size_gb"))
     return registry
 
 
@@ -332,7 +336,12 @@ class ChainChatBackend(ChatBackend):
         try:
             return build_chain_from_roster(
                 entry.name, hidden_size=entry.hidden_size, num_layers=entry.num_layers,
-                wire_dtype=entry.wire_dtype, package_location=entry.package)
+                wire_dtype=entry.wire_dtype, package_location=entry.package,
+                # NKS_SMART_PLACEMENT inputs (no-ops unless the flag is set in serve_chain):
+                model_size_gb=getattr(entry, "model_size_gb", None),
+                pillar_url=(os.environ.get("NAKSHATRA_PILLAR_URL")
+                            or os.environ.get("NAKSHATRA_LIFECYCLE_PILLAR_URL")
+                            or entry.registry_url))
         except (PermissionError, FileNotFoundError, ValueError) as e:
             raise ChainBackendError(f"from_roster chain generation failed: {e}")
 

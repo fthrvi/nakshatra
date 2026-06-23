@@ -27,6 +27,24 @@ import serve_planner as sp
 import package_slicer as ps
 
 
+def _estimate_model_gb(slicer) -> Optional[float]:
+    """Best-effort total model size in GB from the package manifest's artifact byte sizes.
+    None if it can't be determined (caller then needs an operator-declared size, else skips
+    smart placement). Never raises."""
+    try:
+        if hasattr(slicer, "_ensure_manifest"):
+            slicer._ensure_manifest()
+        arts = (getattr(slicer, "artifacts", None)
+                or getattr(getattr(slicer, "manifest", None), "artifacts", None)
+                or getattr(getattr(slicer, "package", None), "artifacts", None))
+        if arts:
+            total = sum(int(getattr(a, "size", 0) or 0) for a in arts)
+            return round(total / 1e9, 2) if total else None
+    except Exception:
+        pass
+    return None
+
+
 def build_chain_from_roster(model_id: str, *, hidden_size: int,
                             num_layers: Optional[int] = None, wire_dtype: str = "f32",
                             package_location: Optional[str] = None,
@@ -37,7 +55,10 @@ def build_chain_from_roster(model_id: str, *, hidden_size: int,
                             slicer_factory: Optional[Callable] = None,
                             planner: Optional[Callable] = None,
                             min_tier_fn: Optional[Callable] = None,
-                            rank: Optional[dict] = None) -> str:
+                            rank: Optional[dict] = None,
+                            model_size_gb: Optional[float] = None,
+                            pillar_url: Optional[str] = None,
+                            peers_fetcher: Optional[Callable] = None) -> str:
     """Generate a client.py chain YAML for `model_id` from the live roster, gated by the identity
     firewall, with slices provisioned from the model's content-addressed package. Returns the YAML
     path. Raises if no rostered worker is firewall-eligible (default-deny — the serve then 502s
@@ -78,6 +99,25 @@ def build_chain_from_roster(model_id: str, *, hidden_size: int,
                slice_for=slicer.slice_for, min_tier_fn=min_tier_fn, rank=rank)
     if _max_stages and plan_fn is sp.plan_chain:
         _kw["max_stages"] = _max_stages
+    # SMART PLACEMENT (NKS_SMART_PLACEMENT): capacity-aware placement on MEASURED data — route the
+    # whole model to the fastest node that fits (0 inter-worker hops, the route-don't-split win),
+    # else a balanced split. Needs the model size (operator-declared model_size_gb, else estimated
+    # from the package) + live pillar telemetry (recent_rpc_ms / VRAM offered). ANY gap → place_fn
+    # returns None → plan_chain falls back to the even split. Fail-open; flag default off.
+    if (_os.environ.get("NKS_SMART_PLACEMENT", "").strip().lower() in ("1", "true", "yes")
+            and plan_fn is sp.plan_chain):
+        try:
+            import placement_feed as _pf
+            _gb = model_size_gb or _estimate_model_gb(slicer)
+            _purl = (pillar_url or _os.environ.get("NAKSHATRA_PILLAR_URL")
+                     or _os.environ.get("NAKSHATRA_LIFECYCLE_PILLAR_URL"))
+            _peers = (peers_fetcher or _pf.fetch_pillar_peers)(_purl, model_id) if _purl else []
+            if _gb and _peers:
+                _telem = _pf.telemetry_from_peers(_peers, model_id)
+                _kw["place_fn"] = _pf.make_place_fn(
+                    model_gb=_gb, telemetry_of=lambda w: _telem.get(w.node_id, {}))
+        except Exception:
+            pass   # fail-open → even split; placement must never break the serve
     plan = plan_fn(model_id, standings, **_kw)
 
     # 4) write the generated chain where the serve points client.py.
