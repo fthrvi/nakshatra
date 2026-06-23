@@ -191,3 +191,50 @@ def to_placement_inputs(peers: Iterable[Mapping], *, model_id: Optional[str] = N
         host, _, port = str(coord).partition(":")
         addr[name] = (host or "127.0.0.1", int(port) if port.isdigit() else 0)
     return nodes, rtt, addr
+
+
+# ── serve adapter: placement.Plan → serve_planner assignment (the Phase-1 seam) ───────
+
+def assignment_from_plan(plan, workers_by_name: Mapping, total_layers: int) -> list:
+    """Map a placement.Plan onto serve_planner's assignment shape:
+    [(worker, layer_start, layer_end, mode), ...]. Route-whole → one SOLO worker holding
+    [0, total_layers). Split → the chosen cluster nodes in layer order (first/middle/last).
+    Workers absent from `workers_by_name` are skipped (shouldn't happen). Returns [] if the
+    plan can't be realized — the caller then falls back to the even split."""
+    if getattr(plan, "whole_host", None):
+        w = workers_by_name.get(plan.whole_host)
+        return [(w, 0, total_layers, "solo")] if w is not None else []
+    items = sorted(plan.splits.items(), key=lambda kv: kv[1][0])  # by layer_start
+    n = len(items)
+    out = []
+    for i, (name, (a, b)) in enumerate(items):
+        w = workers_by_name.get(name)
+        if w is None:
+            continue
+        mode = "solo" if n == 1 else ("first" if i == 0 else ("last" if i == n - 1 else "middle"))
+        out.append((w, a, b, mode))
+    return out
+
+
+def make_place_fn(*, model_gb: float, telemetry_of, rtt_samples=None, headroom_gb: float = 1.0,
+                  name_of=lambda w: w.node_id):
+    """Build a serve_planner `place_fn`: (workers, num_layers) -> [(worker,start,end,mode)] | None.
+
+    Runs the real planner on MEASURED data: telemetry_of(worker) -> {vram_gb, recent_rpc_ms,
+    layers_served} feeds capacity (route-whole when one node fits = 0 wire crossings; else a
+    capacity- and RTT-aware split inside one low-RTT cluster). Returns None on any failure or
+    un-placeable model so the caller falls back to the even split — placement never fails the
+    serve. This is what plan_chain calls behind NKS_SMART_PLACEMENT."""
+    rtt = rtt_matrix(rtt_samples or [])
+
+    def place(workers, num_layers):
+        try:
+            telem = {name_of(w): telemetry_of(w) for w in workers}
+            nodes = build_nodes(telem)
+            p = placement.plan(model_gb=model_gb, total_layers=num_layers, nodes=nodes,
+                               rtt_ms=rtt, headroom_gb=headroom_gb)
+            return assignment_from_plan(p, {name_of(w): w for w in workers}, num_layers) or None
+        except Exception:
+            return None
+
+    return place

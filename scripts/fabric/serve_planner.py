@@ -114,6 +114,7 @@ def plan_chain(model_id: str, workers: Sequence[wj.WorkerStanding], *,
                slice_for: Optional[Callable[[wj.WorkerStanding, int, int, str], str]] = None,
                min_tier_fn: Optional[Callable[[str], str]] = None,
                rank: Optional[dict] = None,
+               place_fn: Optional[Callable] = None,
                max_stages: Optional[int] = None) -> ChainPlan:
     """Produce a chain YAML for `model_id` from the admitted `workers`, GATED BY THE IDENTITY
     FIREWALL. Workers whose trust tier is below the model's min tier are excluded (logged in
@@ -158,9 +159,19 @@ def plan_chain(model_id: str, workers: Sequence[wj.WorkerStanding], *,
         eligible = eligible[:max(2, max_stages)]
 
     slice_for = slice_for or (lambda w, s, e, m: _default_slice_for(w, s, e, m))
-    assignment = partition_fn(num_layers, len(eligible))
+    # SMART PLACEMENT (NKS_SMART_PLACEMENT): if a place_fn is injected and it returns a
+    # capacity/wire-aware assignment over a CHOSEN SUBSET of eligible workers, use that
+    # (route-whole = one solo worker; else a balanced split). If it returns falsy — model
+    # un-placeable or no telemetry — fall back to the built-in even split. Placement never
+    # fails the serve; worst case it's the current behavior.
+    placed = place_fn(eligible, num_layers) if place_fn is not None else None
+    if placed:
+        used = list(placed)
+    else:
+        used = [(w, s, e, m)
+                for w, (s, e, m) in zip(eligible, partition_fn(num_layers, len(eligible)))]
     workers_yaml = []
-    for w, (start, end, mode) in zip(eligible, assignment):
+    for w, start, end, mode in used:
         addr, port = _addr_port(w)
         workers_yaml.append({
             "id": w.node_id, "address": addr, "port": port,
