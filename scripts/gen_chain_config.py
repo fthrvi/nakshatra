@@ -81,31 +81,85 @@ def _parse_node(s: str) -> Tuple[str, str, int]:
     return (parts[0], parts[1], int(parts[2]))
 
 
+def nodes_from_roster(path: str) -> List[Tuple[str, str, int]]:
+    """Parse a roster TSV (pubkey·name·operator·tier·tenant·coord, TAB-sep, # = comment) →
+    [(name, host, port)] in FILE ORDER — so you don't hand-type node addresses. Raises if a
+    coord's port is non-numeric (e.g. an unsubstituted __IJRU_TUNNEL_PORT__ placeholder — fill
+    it from the meshd tunnel first)."""
+    out: List[Tuple[str, str, int]] = []
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        c = line.split("\t")
+        if len(c) < 6:
+            continue
+        name, coord = c[1], c[5]
+        host, _, port = coord.partition(":")
+        if not port.isdigit():
+            raise ValueError(f"roster node {name!r} coord {coord!r} has no numeric port "
+                             f"— substitute the tunnel port first")
+        out.append((name, host, int(port)))
+    return out
+
+
+def _gather_nodes(roster, extra_nodes) -> List[Tuple[str, str, int]]:
+    nodes = nodes_from_roster(roster) if roster else []
+    nodes += (extra_nodes or [])
+    if not nodes:
+        raise SystemExit("need --roster and/or --node")
+    return nodes
+
+
+def _pick(nodes, name):
+    """The node that holds the whole model (route-whole/pair). Default = first."""
+    if name:
+        for n in nodes:
+            if n[0] == name:
+                return n
+        raise SystemExit(f"--route-node {name!r} not among {[n[0] for n in nodes]}")
+    return nodes[0]
+
+
+def _write(chain, out, label):
+    import yaml
+    text = yaml.safe_dump(chain, sort_keys=False)
+    if out:
+        Path(out).write_text(text)
+        print(f"wrote {out} ({label}: {len(chain['workers'])} worker(s))")
+    else:
+        print(text)
+
+
 def main():
-    ap = argparse.ArgumentParser(description="generate a client.py chain YAML for the placement A/B")
-    ap.add_argument("mode", choices=["route-whole", "split"])
+    ap = argparse.ArgumentParser(description="generate client.py chain YAML(s) for the placement A/B")
+    ap.add_argument("mode", choices=["route-whole", "split", "pair"],
+                    help="route-whole = 1 solo worker; split = even across nodes; pair = BOTH (A/B)")
     ap.add_argument("--model", required=True)
     ap.add_argument("--hidden-size", type=int, required=True)
     ap.add_argument("--num-layers", type=int, required=True)
-    ap.add_argument("--node", action="append", type=_parse_node, required=True,
-                    help="name,host,port — repeat for split; exactly one for route-whole")
+    ap.add_argument("--node", action="append", type=_parse_node, default=[],
+                    help="name,host,port — repeatable; appended after --roster")
+    ap.add_argument("--roster", help="roster TSV to auto-fill nodes (name+coord), in file order")
+    ap.add_argument("--route-node", help="node that holds the whole model (route-whole/pair); default=first")
     ap.add_argument("--slices-dir", default=str(Path.home() / ".nakshatra" / "slices"))
     ap.add_argument("--wire-dtype", default="f32")
-    ap.add_argument("--out", help="write YAML here (default: stdout)")
+    ap.add_argument("--out", help="output path (route-whole/split); default stdout")
+    ap.add_argument("--out-route", default="route.yaml", help="pair: route-whole output path")
+    ap.add_argument("--out-split", default="split.yaml", help="pair: split output path")
     a = ap.parse_args()
+    nodes = _gather_nodes(a.roster, a.node)
+    rw = lambda n: route_whole(a.model, a.hidden_size, a.num_layers, n, a.slices_dir, a.wire_dtype)
+    sp = lambda: even_split(a.model, a.hidden_size, a.num_layers, nodes, a.slices_dir, a.wire_dtype)
     if a.mode == "route-whole":
-        if len(a.node) != 1:
-            ap.error("route-whole needs exactly one --node")
-        chain = route_whole(a.model, a.hidden_size, a.num_layers, a.node[0], a.slices_dir, a.wire_dtype)
-    else:
-        chain = even_split(a.model, a.hidden_size, a.num_layers, a.node, a.slices_dir, a.wire_dtype)
-    import yaml
-    out = yaml.safe_dump(chain, sort_keys=False)
-    if a.out:
-        Path(a.out).write_text(out)
-        print(f"wrote {a.out} ({len(chain['workers'])} worker(s), mode={a.mode})")
-    else:
-        print(out)
+        _write(rw(_pick(nodes, a.route_node)), a.out, "route-whole")
+    elif a.mode == "split":
+        _write(sp(), a.out, "split")
+    else:  # pair — both arms of the A/B in one command
+        _write(rw(_pick(nodes, a.route_node)), a.out_route, "route-whole")
+        _write(sp(), a.out_split, "split")
+        print(f"\nA/B ready:\n  bench_placement.py --model-path <gguf> "
+              f"--route-config {a.out_route} --split-config {a.out_split}")
 
 
 if __name__ == "__main__":
