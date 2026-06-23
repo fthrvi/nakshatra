@@ -260,19 +260,54 @@ def assignment_from_plan(plan, workers_by_name: Mapping, total_layers: int) -> l
     return out
 
 
-def make_place_fn(*, model_gb: float, telemetry_of, rtt_samples=None, headroom_gb: float = 1.0,
-                  name_of=lambda w: w.node_id):
+def _worker_addr(w):
+    caps = getattr(w, "capabilities", None) or {}
+    return caps.get("address"), caps.get("port")
+
+
+def probe_rtt(workers, *, name_of=lambda w: w.node_id, addr_of=_worker_addr,
+              self_name: str = "hub", timeout: float = 2.0) -> list:
+    """Measure live NETWORK RTT to each worker via a TCP connect to its address:port — which
+    traverses any junction/relay TUNNEL, unlike an ICMP ping to a tunnel's 127.0.0.1 endpoint
+    (that would read ~0ms and hide the real WAN cost). Returns [(self_name, node, ms)] for
+    reachable workers; unreachable ones are skipped (placement then sees no edge → its own
+    cluster). Best-effort; never raises. This is what feeds RTT-aware splitting at chain-build."""
+    import socket
+    import time as _t
+    out = []
+    for w in workers:
+        try:
+            addr, port = addr_of(w)
+            if not addr or not port:
+                continue
+            t0 = _t.time()
+            socket.create_connection((addr, int(port)), timeout=timeout).close()
+            out.append((self_name, name_of(w), round((_t.time() - t0) * 1000, 2)))
+        except Exception:
+            continue
+    return out
+
+
+def make_place_fn(*, model_gb: float, telemetry_of, rtt_samples=None, probe: bool = False,
+                  headroom_gb: float = 1.0, name_of=lambda w: w.node_id):
     """Build a serve_planner `place_fn`: (workers, num_layers) -> [(worker,start,end,mode)] | None.
 
     Runs the real planner on MEASURED data: telemetry_of(worker) -> {vram_gb, recent_rpc_ms,
     layers_served} feeds capacity (route-whole when one node fits = 0 wire crossings; else a
-    capacity- and RTT-aware split inside one low-RTT cluster). Returns None on any failure or
+    capacity- and RTT-aware split inside one low-RTT cluster). RTT comes from `rtt_samples` if
+    given, else — when `probe=True` — a live TCP-connect probe of the eligible workers at plan
+    time (so splits cluster by REAL latency; without RTT, metro_clusters makes singletons and a
+    forced split can't form → falls back to even split). Returns None on any failure or
     un-placeable model so the caller falls back to the even split — placement never fails the
     serve. This is what plan_chain calls behind NKS_SMART_PLACEMENT."""
-    rtt = rtt_matrix(rtt_samples or [])
+    static_rtt = rtt_samples
 
     def place(workers, num_layers):
         try:
+            samples = static_rtt
+            if probe and not samples:
+                samples = probe_rtt(workers, name_of=name_of)
+            rtt = rtt_matrix(samples or [])
             telem = {name_of(w): telemetry_of(w) for w in workers}
             nodes = build_nodes(telem)
             p = placement.plan(model_gb=model_gb, total_layers=num_layers, nodes=nodes,

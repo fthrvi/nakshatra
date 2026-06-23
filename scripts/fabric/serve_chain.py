@@ -115,7 +115,8 @@ def build_chain_from_roster(model_id: str, *, hidden_size: int,
             if _gb and _peers:
                 _telem = _pf.telemetry_from_peers(_peers, model_id)
                 _kw["place_fn"] = _pf.make_place_fn(
-                    model_gb=_gb, telemetry_of=lambda w: _telem.get(w.node_id, {}))
+                    model_gb=_gb, telemetry_of=lambda w: _telem.get(w.node_id, {}),
+                    probe=True)   # live TCP-connect RTT → metro_clusters can form a real split
         except Exception:
             pass   # fail-open → even split; placement must never break the serve
     plan = plan_fn(model_id, standings, **_kw)

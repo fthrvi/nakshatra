@@ -322,6 +322,48 @@ def test_serve_chain_smart_placement_routes_whole(tmp_path):
     assert chain["workers"][0]["layer_range"] == [0, 16]    # whole model
 
 
+# ── RTT probe + probe-enabled splitting ───────────────────────────────────────────────
+
+def _listener():
+    import socket
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    s.listen(8)
+    return s, s.getsockname()[1]
+
+
+def test_probe_rtt_reachable_and_skips_unreachable():
+    s, port = _listener()
+    try:
+        out = pf.probe_rtt([_W("r", "127.0.0.1", port), _W("d", "127.0.0.1", 1)])  # 1 = refused
+        names = {n for (_, n, _) in out}
+        assert "r" in names and "d" not in names                 # reachable kept, dead skipped
+        assert all(ms >= 0 for (_, _, ms) in out)
+    finally:
+        s.close()
+
+
+def test_make_place_fn_probe_enables_split():
+    """Two equal nodes (the hub + a peer), neither fits the whole model → forced split. WITHOUT
+    RTT, metro_clusters makes singletons and the split can't form (→ None). WITH probe=True, the
+    live self→peer RTT (the hub is the probe's self_name) clusters them so the split forms. Proves
+    the RTT probe is what enables splitting. (In a real split the hub IS one of the nodes, so the
+    star-probe from self gives exactly the hub↔peer edge metro_clusters needs.)"""
+    s, port = _listener()
+    try:
+        hub, peer = _W("hub", "127.0.0.1", port), _W("peer", "127.0.0.1", port)
+        telem = {"hub": {"vram_gb": 6.0, "recent_rpc_ms": 20.0, "layers_served": 16},
+                 "peer": {"vram_gb": 6.0, "recent_rpc_ms": 80.0, "layers_served": 16}}
+        tof = lambda w: telem[w.node_id]
+        # no RTT, no probe → can't cluster → None (fallback)
+        assert pf.make_place_fn(model_gb=8.0, telemetry_of=tof)([hub, peer], 16) is None
+        # probe on → localhost self(hub)→peer RTT clusters them → split forms
+        out = pf.make_place_fn(model_gb=8.0, telemetry_of=tof, probe=True)([hub, peer], 16)
+        assert out is not None and len(out) == 2
+    finally:
+        s.close()
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-q"]))
