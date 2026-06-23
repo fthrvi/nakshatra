@@ -114,9 +114,11 @@ def build_chain_from_roster(model_id: str, *, hidden_size: int,
             _peers = (peers_fetcher or _pf.fetch_pillar_peers)(_purl, model_id) if _purl else []
             if _gb and _peers:
                 _telem = _pf.telemetry_from_peers(_peers, model_id)
+                _bpt = hidden_size * {"f32": 4, "f16": 2, "bf16": 2}.get(wire_dtype, 4)
                 _kw["place_fn"] = _pf.make_place_fn(
                     model_gb=_gb, telemetry_of=lambda w: _telem.get(w.node_id, {}),
-                    probe=True)   # live TCP-connect RTT → metro_clusters can form a real split
+                    probe=True,             # live TCP-connect RTT → metro_clusters can form a split
+                    bytes_per_token=_bpt)   # wire-aware split: trade hops against stage-time
         except Exception:
             pass   # fail-open → even split; placement must never break the serve
     plan = plan_fn(model_id, standings, **_kw)

@@ -232,17 +232,27 @@ class Plan:
 def plan(model_gb: float, total_layers: int, nodes: List[Node],
          rtt_ms: "Optional[Dict[Tuple[str, str], float]]" = None,
          cluster_threshold_ms: float = 5.0,
-         headroom_gb: float = 1.0) -> Plan:
-    """Route-whole if any node fits; else split inside the best (largest-capacity)
-    metro cluster. Raises ValueError if even the best cluster can't hold it."""
+         headroom_gb: float = 1.0,
+         bytes_per_token: float = 0.0,
+         bandwidth_bps: float = 1e9) -> Plan:
+    """Route-whole if any node fits; else split inside the best (largest-capacity) metro
+    cluster. When `bytes_per_token` (= hidden_size × wire_dtype_bytes) is given, the split is
+    WIRE-AWARE (choose_split): it trades hops against stage-time and uses only as many nodes as
+    actually lowers per-token time. Default (bytes_per_token=0) keeps the plain water-filling
+    split — byte-identical prior behavior. Raises ValueError if even the best cluster can't hold it."""
     host = choose_whole_host(nodes, model_gb, headroom_gb)
     if host is not None:
         return Plan(whole_host=host.name, reason="fits one box — route, don't split")
     rtt_ms = rtt_ms or {}
     for cluster in metro_clusters(nodes, rtt_ms, cluster_threshold_ms):
-        # water-filling (stage-time-balanced) first; fall back to proportional
-        spans = (balanced_spans(cluster, total_layers, model_gb, headroom_gb)
-                 or assign_spans(cluster, total_layers, model_gb, headroom_gb))
+        if bytes_per_token > 0:
+            spans = choose_split(cluster, total_layers, model_gb, rtt_ms,
+                                 bytes_per_token=bytes_per_token, bandwidth_bps=bandwidth_bps,
+                                 headroom_gb=headroom_gb)
+        else:
+            # water-filling (stage-time-balanced) first; fall back to proportional
+            spans = (balanced_spans(cluster, total_layers, model_gb, headroom_gb)
+                     or assign_spans(cluster, total_layers, model_gb, headroom_gb))
         if spans is not None:
             return Plan(splits=spans, cluster=[n.name for n in cluster],
                         reason=f"split across {len(spans)} nodes in one cluster")
