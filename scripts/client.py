@@ -64,7 +64,11 @@ except ImportError:
     _TLS_AVAILABLE = False
 
 
-LLAMA3_EOS_IDS = {128001, 128008, 128009}
+# End-of-generation token ids, multi-arch. Llama-3 (~128k vocab) and Qwen3 (~151k vocab) live in
+# disjoint id ranges, so the union never false-stops either model:
+#   Llama-3: 128001 <|end_of_text|>, 128008 <|eom_id|>, 128009 <|eot_id|>
+#   Qwen3:   151643 <|endoftext|>,   151645 <|im_end|>   (ChatML end-of-turn — needed for chat)
+LLAMA3_EOS_IDS = {128001, 128008, 128009, 151643, 151645}
 
 
 def _hidden_bytes(n, n_embd):
