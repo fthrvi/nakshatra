@@ -290,7 +290,8 @@ def probe_rtt(workers, *, name_of=lambda w: w.node_id, addr_of=_worker_addr,
 
 def make_place_fn(*, model_gb: float, telemetry_of, rtt_samples=None, probe: bool = False,
                   headroom_gb: float = 1.0, bytes_per_token: float = 0.0,
-                  bandwidth_bps: float = 1e9, name_of=lambda w: w.node_id):
+                  bandwidth_bps: float = 1e9, cluster_threshold_ms: float = 5.0,
+                  name_of=lambda w: w.node_id):
     """Build a serve_planner `place_fn`: (workers, num_layers) -> [(worker,start,end,mode)] | None.
 
     Runs the real planner on MEASURED data: telemetry_of(worker) -> {vram_gb, recent_rpc_ms,
@@ -312,7 +313,8 @@ def make_place_fn(*, model_gb: float, telemetry_of, rtt_samples=None, probe: boo
             telem = {name_of(w): telemetry_of(w) for w in workers}
             nodes = build_nodes(telem)
             p = placement.plan(model_gb=model_gb, total_layers=num_layers, nodes=nodes,
-                               rtt_ms=rtt, headroom_gb=headroom_gb,
+                               rtt_ms=rtt, cluster_threshold_ms=cluster_threshold_ms,
+                               headroom_gb=headroom_gb,
                                bytes_per_token=bytes_per_token, bandwidth_bps=bandwidth_bps)
             return assignment_from_plan(p, {name_of(w): w for w in workers}, num_layers) or None
         except Exception:

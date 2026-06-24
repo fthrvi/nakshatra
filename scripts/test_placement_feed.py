@@ -364,6 +364,24 @@ def test_make_place_fn_probe_enables_split():
         s.close()
 
 
+def test_make_place_fn_high_threshold_allows_wan_split():
+    """A big model that fits NO single node MUST split. With the default 5ms cluster threshold,
+    a 170ms (WAN) pair can't cluster → None (engine refuses). Raising cluster_threshold_ms above
+    the RTT lets the INTENTIONAL WAN split form — the big-model-cross-box case (e.g. qwen3-30b on
+    hub+ijru)."""
+    hub, peer = _W("hub", "10.0.0.1", 1), _W("peer", "10.0.0.2", 2)
+    telem = {"hub": {"vram_gb": 6.0, "recent_rpc_ms": 20.0, "layers_served": 16},
+             "peer": {"vram_gb": 6.0, "recent_rpc_ms": 80.0, "layers_served": 16}}
+    tof = lambda w: telem[w.node_id]
+    samples = [("hub", "peer", 170.0)]                    # WAN-class RTT
+    # default threshold (5ms) → can't cluster a 170ms pair → no split
+    assert pf.make_place_fn(model_gb=8.0, telemetry_of=tof, rtt_samples=samples)([hub, peer], 16) is None
+    # threshold raised above the RTT → the WAN split forms
+    out = pf.make_place_fn(model_gb=8.0, telemetry_of=tof, rtt_samples=samples,
+                           cluster_threshold_ms=300.0)([hub, peer], 16)
+    assert out is not None and len(out) == 2
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-q"]))
