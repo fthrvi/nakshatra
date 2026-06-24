@@ -110,14 +110,6 @@ def fetch_and_assemble(location: str, start: int, end: int, dest_sub_gguf: str,
     needed = pkg.artifacts_for_range(start, end)
     has_token_embd = (start == 0)
     has_lm_head = (end == pkg.n_layers)
-    # qwen3moe-style models require output_norm.weight on EVERY worker for the partial-load
-    # (llama's patched loader makes it optional; qwen3moe's doesn't). It lives in the head
-    # fragment alongside the big lm_head — fetch that fragment for non-last workers too so
-    # _assemble can lift JUST the tiny output_norm onto them (lm_head stays last-only).
-    if not has_lm_head:
-        _head = pkg.shared_by_role("head")
-        if _head is not None and _head not in needed:
-            needed = list(needed) + [_head]
     print(f"[fetch-pkg] {pkg.model_id}@{pkg.revision[:12]} range=[{start},{end}) "
           f"→ {len(needed)} fragments (embd={has_token_embd} head={has_lm_head})", flush=True)
 
@@ -199,12 +191,6 @@ def _assemble(pkg: NakshatraPackage, local: dict[str, Path], start: int, end: in
             if emb and emb.path in local:
                 _add([t for t in _tensors_from(local[emb.path])
                       if t.name == "token_embd.weight"])
-    else:
-        # non-last worker: lift ONLY the tiny output_norm.weight from the head fragment (the
-        # qwen3moe partial-load needs it present), never the big lm_head (output.weight).
-        _hp = _role_path(pkg, "head")
-        if _hp in local:
-            _add([t for t in _tensors_from(local[_hp]) if t.name == "output_norm.weight"])
 
     w.write_header_to_file()
     w.write_kv_data_to_file()
