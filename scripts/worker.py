@@ -365,7 +365,9 @@ class ForwardResult(NamedTuple):
 # worker side. See ~/trisul/plans/2026-05-20-nakshatra-worker-hardening-
 # sprint.md for the design context.
 
-WORKER_GRPC_MAX_MESSAGE_BYTES = 16 * 1024 * 1024     # A1: explicit cap
+WORKER_GRPC_MAX_MESSAGE_BYTES = 256 * 1024 * 1024     # A1: explicit cap — 256MB covers a full
+# 2048-ctx prefill hidden-state (n_tok × hidden × 4B; e.g. 2048×5120×4 ≈ 42MB). The 16MB prior cap
+# (and the 4MB gRPC default on the CLIENT channels) was dropping any real prompt (RESOURCE_EXHAUSTED).
 INFERENCE_STREAM_IDLE_TIMEOUT_S = 60.0                # A2: bound slow clients
 MAX_PEER_STREAMS = 64                                 # A3: LRU cap
 SPKI_HASH_LENGTH = 64                                 # A4: sha256 hex
@@ -973,7 +975,9 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
         if not _TLS_AVAILABLE:
             # No TLS module — legacy Mode-A bringup. The Phase 2 boot
             # path already emitted a WARN; just open insecure.
-            return grpc.insecure_channel(address)
+            return grpc.insecure_channel(address, options=[
+                ("grpc.max_receive_message_length", WORKER_GRPC_MAX_MESSAGE_BYTES),
+                ("grpc.max_send_message_length", WORKER_GRPC_MAX_MESSAGE_BYTES)])
         expected = (self.peer_resolver.expected_spki(address)
                     if self.peer_resolver is not None else None)
         try:

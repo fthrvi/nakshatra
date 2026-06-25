@@ -111,7 +111,12 @@ def _open_chain_channel(address: str, expected_spki: str | None,
     later, after _setup_chain returns).
     """
     if tls_mode == "off" or not _TLS_AVAILABLE:
-        return grpc.insecure_channel(address)
+        # Raise the gRPC message cap from the 4MiB default: a prefill hidden-state is
+        # n_prompt_tokens × hidden × 4 bytes (e.g. 400 tok × 5120 × 4 = 8.4MB), which blows the
+        # default → "RESOURCE_EXHAUSTED" empty gen on any real prompt. 256MB covers a full 2048-ctx.
+        return grpc.insecure_channel(address, options=[
+            ("grpc.max_receive_message_length", 256 * 1024 * 1024),
+            ("grpc.max_send_message_length", 256 * 1024 * 1024)])
     try:
         return _wtls.open_pinned_channel(
             address, expected_spki,
