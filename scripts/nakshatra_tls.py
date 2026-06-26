@@ -343,6 +343,19 @@ def probe_peer_spki(
     return compute_spki_hash_from_pem(cert_pem), cert_pem
 
 
+# Activations forwarded between chain workers are LARGE — a 2048-ctx prefill is
+# tens of MB. Without lifting gRPC's 4MB default on EVERY worker→worker channel,
+# the pinned/TLS path here drops any real prompt as RESOURCE_EXHAUSTED, which the
+# chain surfaces generically as "Ijru dropping mid-generation". The insecure path
+# + the worker SERVER channels already cap at 256MB; this channel was the one gap.
+# Keep in sync with worker.WORKER_GRPC_MAX_MESSAGE_BYTES. [hotfix 2026-06-25]
+_GRPC_MAX_MESSAGE_BYTES = 256 * 1024 * 1024
+_GRPC_MSG_OPTS = [
+    ("grpc.max_receive_message_length", _GRPC_MAX_MESSAGE_BYTES),
+    ("grpc.max_send_message_length", _GRPC_MAX_MESSAGE_BYTES),
+]
+
+
 def open_pinned_channel(
     address: str,
     expected_spki: str | None,
@@ -368,7 +381,7 @@ def open_pinned_channel(
     if expected_spki is None:
         if refuse_unpinned:
             raise PinError("unpinned_peer", address=address)
-        return grpc.insecure_channel(address)
+        return grpc.insecure_channel(address, options=_GRPC_MSG_OPTS)
     try:
         actual_spki, cert_pem = probe_peer_spki(
             address, timeout=probe_timeout_s)
@@ -392,5 +405,6 @@ def open_pinned_channel(
     creds = grpc.ssl_channel_credentials(root_certificates=cert_pem)
     return grpc.secure_channel(
         address, creds,
-        options=[("grpc.ssl_target_name_override", "nakshatra.local")],
+        options=[("grpc.ssl_target_name_override", "nakshatra.local"),
+                 *_GRPC_MSG_OPTS],
     )
