@@ -385,3 +385,47 @@ def test_make_place_fn_high_threshold_allows_wan_split():
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+# ── conscious-VRAM reservation (Prithvi's pinned slice must never be pooled) ──────────
+def _clear_reserve_env(mp):
+    for k in ("NKS_VRAM_RESERVE_GB", "NKS_CONSCIOUS_NODE", "NKS_CONSCIOUS_RESERVE_GB"):
+        mp.delenv(k, raising=False)
+
+
+def test_reserve_default_none(monkeypatch):
+    _clear_reserve_env(monkeypatch)
+    n = pf.make_node("hub", vram_gb=16.0)
+    assert n.vram_gb == 16.0   # no env → no reservation, unchanged behavior
+
+
+def test_reserve_single_node_env(monkeypatch):
+    _clear_reserve_env(monkeypatch)
+    monkeypatch.setenv("NKS_CONSCIOUS_NODE", "hub")
+    monkeypatch.setenv("NKS_CONSCIOUS_RESERVE_GB", "11")
+    hub = pf.make_node("hub", vram_gb=16.0)
+    ijru = pf.make_node("ijru", vram_gb=12.0)
+    assert hub.vram_gb == 5.0      # 16 - 11 reserved for the pinned conscious model
+    assert ijru.vram_gb == 12.0    # other nodes untouched
+
+
+def test_reserve_json_map(monkeypatch):
+    _clear_reserve_env(monkeypatch)
+    monkeypatch.setenv("NKS_VRAM_RESERVE_GB", '{"hub": 10.5, "ijru": 1.0}')
+    assert pf.make_node("hub", vram_gb=16.0).vram_gb == 5.5
+    assert pf.make_node("ijru", vram_gb=12.0).vram_gb == 11.0
+
+
+def test_reserve_never_negative(monkeypatch):
+    _clear_reserve_env(monkeypatch)
+    monkeypatch.setenv("NKS_CONSCIOUS_NODE", "hub")
+    monkeypatch.setenv("NKS_CONSCIOUS_RESERVE_GB", "99")
+    assert pf.make_node("hub", vram_gb=16.0).vram_gb == 0.0
+
+
+def test_reserve_flows_through_build_nodes(monkeypatch):
+    _clear_reserve_env(monkeypatch)
+    monkeypatch.setenv("NKS_CONSCIOUS_NODE", "hub")
+    monkeypatch.setenv("NKS_CONSCIOUS_RESERVE_GB", "11")
+    nodes = {n.name: n for n in pf.build_nodes({"hub": {"vram_gb": 16.0}, "ijru": {"vram_gb": 12.0}})}
+    assert nodes["hub"].vram_gb == 5.0 and nodes["ijru"].vram_gb == 12.0
