@@ -37,12 +37,43 @@ pays a measured, minimized wire cost — never an invisible one.
 """
 from __future__ import annotations
 
+import json
+import os
 import sys
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import placement  # the pure planner (Node, plan, plan_to_chain)
+
+
+# ── conscious-VRAM reservation ────────────────────────────────────────────────────────
+# A node may run a PINNED conscious model (Prithvi's 8B, kept resident on the hub GPU). That
+# VRAM is NOT the pool's to use — the unconscious must never be placed into the conscious
+# slice. So when building the planner's view we SUBTRACT a per-node reserve, so placement
+# only ever sees a node's FREE-for-the-pool VRAM. Configure either:
+#   NKS_VRAM_RESERVE_GB='{"hub": 11.0}'                      (explicit per-node map), or
+#   NKS_CONSCIOUS_NODE=hub  +  NKS_CONSCIOUS_RESERVE_GB=11   (the common single-node case)
+# Default = no reservation (0) → no behavior change for deployments that don't pin a model.
+def _reserve_map() -> Dict[str, float]:
+    raw = os.environ.get("NKS_VRAM_RESERVE_GB", "").strip()
+    if raw:
+        try:
+            return {str(k): float(v) for k, v in json.loads(raw).items()}
+        except Exception:
+            pass
+    node = os.environ.get("NKS_CONSCIOUS_NODE", "").strip()
+    try:
+        gb = float(os.environ.get("NKS_CONSCIOUS_RESERVE_GB", "0") or 0)
+    except ValueError:
+        gb = 0.0
+    return {node: gb} if node and gb > 0 else {}
+
+
+def _reserved_vram(name: str, vram_gb: float) -> float:
+    """A node's VRAM minus its conscious reservation — what's actually free for the pool."""
+    r = _reserve_map().get(name, 0.0)
+    return max(0.0, float(vram_gb or 0.0) - r)
 
 
 # ── pure core: telemetry → capacity → Node (deterministic, unit-tested) ──────────────
@@ -68,10 +99,11 @@ def capacity_tok_per_s(recent_rpc_ms: float, layers_served: Optional[int] = None
 
 def make_node(name: str, vram_gb: float, recent_rpc_ms: float = 0.0,
               layers_served: Optional[int] = None) -> placement.Node:
-    """Build a placement.Node from one node's static identity + live telemetry."""
+    """Build a placement.Node from one node's static identity + live telemetry.
+    VRAM is the node's POOL-FREE VRAM (physical/offered minus any pinned conscious slice)."""
     return placement.Node(
         name=name,
-        vram_gb=float(vram_gb or 0.0),
+        vram_gb=_reserved_vram(name, vram_gb),
         tok_per_s=capacity_tok_per_s(recent_rpc_ms, layers_served),
     )
 
