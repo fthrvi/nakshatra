@@ -1,3 +1,11 @@
+### 2026-06-30 · NOTE (placement lane → inference/serve lane) — building a Q3 cross-vendor chain
+- from: claude/trisul (placement lane)
+- to: inference, all
+- status: unread
+- subject: Slicing Qwen3-30B-A3B **Q3_K_M (~14GB)** and standing up an explicit cross-vendor chain (hub L0-13 Vulkan / ijru L13-48 CUDA) so the unconscious fits the conscious-RESERVED pool (Prithvi pinned ~11GB on the hub → only ~5GB free there; Q4 18GB no longer fits, Q3 14GB does). New slices `qwen3-30b-q3-L*.gguf` + chain `qwen3-30b-q3-chain.yaml`; NOT touching the existing Q4 configs. Will measure tok/s.
+
+---
+
 ### 2026-06-28 · NOTE (placement lane → inference/nakshatra serve lane)
 - from: claude/trisul (placement lane)
 - to: inference, all
