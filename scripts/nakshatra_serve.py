@@ -92,6 +92,12 @@ class ModelEntry:
     # operator-declared total model size (GB) — lets NKS_SMART_PLACEMENT decide route-whole-vs-split
     # without a runtime size lookup. Optional; if absent, serve_chain estimates from the package.
     model_size_gb: Optional[float] = None
+    # reasoning model (DeepSeek-R1-style): output is "<think>…</think>answer",
+    # often with the opener pre-filled by the chat template. The /v1 surface
+    # splits it into OpenAI-style content + reasoning_content so agent
+    # consumers don't see raw think tags. Set `think:` in serve_models.yaml;
+    # defaults from a name heuristic on the tokenizer/package path.
+    think: bool = False
 
 
 def _load_models(path: str) -> dict[str, ModelEntry]:
@@ -145,14 +151,25 @@ def _load_models(path: str) -> dict[str, ModelEntry]:
                 f"{path}: model {name!r} has from_roster but no hidden_size")
         if name in registry:
             raise ModelConfigError(f"{path}: duplicate model name {name!r}")
+        think_raw = raw.get("think")
+        think = bool(think_raw) if think_raw is not None else \
+            _looks_reasoning_model(tok, raw.get("package"))
         registry[name] = ModelEntry(
             name=name, tokenizer_gguf=tok, chain_yaml=chain_yaml,
             registry_url=registry_url, details=raw.get("details") or {},
             from_roster=from_roster, package=raw.get("package"),
             hidden_size=raw.get("hidden_size"), num_layers=raw.get("num_layers"),
             wire_dtype=raw.get("wire_dtype") or "f32",
-            model_size_gb=raw.get("model_size_gb"))
+            model_size_gb=raw.get("model_size_gb"),
+            think=think)
     return registry
+
+
+def _looks_reasoning_model(*paths: Optional[str]) -> bool:
+    """Name heuristic for the registry default of ``ModelEntry.think`` —
+    an explicit ``think:`` in serve_models.yaml always wins over this."""
+    blob = " ".join(p.lower() for p in paths if p)
+    return any(t in blob for t in ("r1", "qwq", "reasoning"))
 
 
 def _ollama_tag(entry: ModelEntry) -> dict:
@@ -450,6 +467,92 @@ def _gen_id() -> str:
     """Short opaque id for OpenAI-style response ids (chatcmpl-<id>)."""
     import uuid
     return uuid.uuid4().hex[:24]
+
+
+# ── Reasoning-model think-tag split (/v1 surface only) ──────────────
+# R1-style models emit "<think>…reasoning…</think>answer" — and because the
+# chat template usually pre-fills the opener, the wire text often STARTS
+# mid-reasoning and only the closing tag appears. OpenAI-consuming agents
+# (zero, Cursor, openai SDK) expect clean `content`; the reasoning goes to
+# the de-facto `reasoning_content` field (DeepSeek convention — unknown
+# fields are ignored by strict clients). The Ollama /api/chat path is left
+# untouched: Prithvi's think_deeper parses raw think tags itself.
+# Disable with NKS_OAI_THINK=raw (registered in trisul/infra/toggles.tsv).
+
+_THINK_OPEN = "<think>"
+_THINK_CLOSE = "</think>"
+
+
+def _think_split_enabled(entry: ModelEntry) -> bool:
+    return entry.think and os.environ.get("NKS_OAI_THINK", "split") != "raw"
+
+
+def _split_think(text: str) -> tuple[str, str]:
+    """Non-streaming split → ``(reasoning, content)``. No closing tag →
+    everything is content (fail open: never hide the answer)."""
+    if _THINK_CLOSE not in text:
+        return "", text
+    head, _, tail = text.partition(_THINK_CLOSE)
+    head = head.lstrip()
+    if head.startswith(_THINK_OPEN):
+        head = head[len(_THINK_OPEN):]
+    return head.strip(), tail.lstrip("\n")
+
+
+class _ThinkStreamFilter:
+    """Incremental version of :func:`_split_think` for the SSE path.
+
+    Until the closing tag passes, deltas are reasoning (the opener may be
+    template-pre-filled, so the head is reasoning by definition on a think
+    model); after it, deltas are content. ``feed`` returns a list of
+    ``("reasoning"|"content", text)`` pieces, holding back only a possible
+    partial tag at the buffer tail so tags split across deltas still match.
+    """
+
+    def __init__(self):
+        self._buf = ""
+        self._content_mode = False
+        self._opener_checked = False
+
+    def feed(self, delta: str) -> list[tuple[str, str]]:
+        if self._content_mode:
+            return [("content", delta)] if delta else []
+        self._buf += delta
+        if not self._opener_checked:
+            probe = self._buf.lstrip()
+            if probe.startswith(_THINK_OPEN):
+                self._buf = probe[len(_THINK_OPEN):]
+                self._opener_checked = True
+            elif probe and not _THINK_OPEN.startswith(probe):
+                self._opener_checked = True  # head text isn't an opener
+            else:
+                return []  # all-whitespace or partial "<thi…" — hold
+        idx = self._buf.find(_THINK_CLOSE)
+        if idx != -1:
+            head, tail = self._buf[:idx], self._buf[idx + len(_THINK_CLOSE):]
+            self._buf, self._content_mode = "", True
+            out: list[tuple[str, str]] = []
+            if head.strip():
+                out.append(("reasoning", head))
+            tail = tail.lstrip("\n")
+            if tail:
+                out.append(("content", tail))
+            return out
+        # emit reasoning, holding back a tail that could open a closing tag
+        keep = 0
+        for k in range(min(len(_THINK_CLOSE) - 1, len(self._buf)), 0, -1):
+            if _THINK_CLOSE.startswith(self._buf[-k:]):
+                keep = k
+                break
+        emit = self._buf[:len(self._buf) - keep] if keep else self._buf
+        self._buf = self._buf[len(emit):]
+        return [("reasoning", emit)] if emit else []
+
+    def close(self) -> list[tuple[str, str]]:
+        """Stream ended without a closing tag — flush leftovers as content
+        (fail open, mirroring :func:`_split_think`)."""
+        buf, self._buf = self._buf, ""
+        return [("content", buf)] if buf else []
 
 
 # ── HTTP handler ────────────────────────────────────────────────────
@@ -805,11 +908,17 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
                                    "server_error")
                 return 502
             p, c = result.prompt_eval_count, result.eval_count
+            message = {"role": "assistant", "content": result.text}
+            if _think_split_enabled(entry):
+                reasoning, content = _split_think(result.text)
+                message["content"] = content
+                if reasoning:
+                    message["reasoning_content"] = reasoning
             self._json(HTTPStatus.OK, {
                 "id": cid, "object": "chat.completion", "created": created,
                 "model": entry.name,
                 "choices": [{"index": 0,
-                             "message": {"role": "assistant", "content": result.text},
+                             "message": message,
                              "finish_reason": "stop"}],
                 "usage": {"prompt_tokens": p, "completion_tokens": c,
                           "total_tokens": p + c},
@@ -871,9 +980,15 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
             self.wfile.flush()
 
         _sse(_chunk({"role": "assistant"}))   # OpenAI's first delta carries the role
+        think_filter = _ThinkStreamFilter() if _think_split_enabled(entry) else None
         try:
             for delta in backend.generate_stream(entry, prompt, max_tokens, options):
-                _sse(_chunk({"content": delta}))
+                if think_filter is None:
+                    _sse(_chunk({"content": delta}))
+                    continue
+                for kind, text in think_filter.feed(delta):
+                    _sse(_chunk({"reasoning_content": text} if kind == "reasoning"
+                                else {"content": text}))
         except ChainBackendError as e:
             log.error("stream backend error: %s", e)
             try:
@@ -883,6 +998,10 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
             except Exception:
                 pass
             return 502
+        if think_filter is not None:
+            for kind, text in think_filter.close():
+                _sse(_chunk({"reasoning_content": text} if kind == "reasoning"
+                            else {"content": text}))
         _sse(_chunk({}, finish="stop"))
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
@@ -938,8 +1057,10 @@ def main(argv: Optional[list[str]] = None) -> int:
                     help=f"port to bind (default {DEFAULT_PORT}, "
                          f"matches Ollama)")
     ap.add_argument("--bind", default="0.0.0.0",
-                    help="address to bind (default 0.0.0.0 so other "
-                         "tailnet hosts can reach)")
+                    help="address(es) to bind — comma-separated for multiple "
+                         "sockets on the same port (e.g. '127.0.0.1,10.42.0.1' "
+                         "= localhost + WG mesh, the :8078 confinement pattern; "
+                         "default 0.0.0.0)")
     ap.add_argument("--models", default=None,
                     help="path to serve_models.yaml (model registry). "
                          "Omit to run with an empty registry "
@@ -983,9 +1104,28 @@ def main(argv: Optional[list[str]] = None) -> int:
                      chat_lifecycle.idle_grace_s)
     except Exception as e:
         log.warning("scale-to-zero lifecycle unavailable: %s", e)
-    server = build_server(args.bind, args.port, models, chat_backend, chat_lifecycle)
-    log.info("nakshatra_serve listening on %s:%d (version=%s, %d model(s): %s)",
-             args.bind, args.port, VERSION_STRING, len(models),
+    binds = [b.strip() for b in args.bind.split(",") if b.strip()] or ["0.0.0.0"]
+    server = build_server(binds[0], args.port, models, chat_backend, chat_lifecycle)
+    # Extra sockets (same port, same registry/backend objects) — lets the
+    # unconscious stay localhost-confined AND mesh-reachable without opening
+    # 0.0.0.0 (matches the localhost+WG dual-bind used by :8078).
+    extra_servers = []
+    for addr in binds[1:]:
+        try:
+            extra = build_server(addr, args.port, models, chat_backend,
+                                 chat_lifecycle)
+        except OSError as e:
+            # e.g. WG interface not up yet — serve on what we have rather
+            # than fail the whole unit; the primary bind is authoritative.
+            log.warning("extra bind %s:%d unavailable: %s", addr, args.port, e)
+            continue
+        import threading
+        threading.Thread(target=extra.serve_forever, daemon=True,
+                         name=f"serve-{addr}").start()
+        extra_servers.append(extra)
+    log.info("nakshatra_serve listening on %s port %d (version=%s, %d model(s): %s)",
+             " + ".join([binds[0]] + [s.server_address[0] for s in extra_servers]),
+             args.port, VERSION_STRING, len(models),
              ", ".join(models) or "none")
     try:
         server.serve_forever()
@@ -994,6 +1134,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     finally:
         server.shutdown()
         server.server_close()
+        for extra in extra_servers:
+            extra.shutdown()
+            extra.server_close()
     return 0
 
 

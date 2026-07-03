@@ -708,3 +708,119 @@ def test_cors_on_responses_and_preflight():
             assert r.headers.get("Access-Control-Allow-Origin") == "*"
             assert "POST" in r.headers.get("Access-Control-Allow-Methods", "")
             assert "Content-Type" in r.headers.get("Access-Control-Allow-Headers", "")
+
+
+# ── /v1 think-tag split (reasoning models) ──────────────────────────
+
+
+_THINK_MODELS = """\
+    models:
+      - name: dsr1-8b
+        tokenizer_gguf: /models/dsr1/DeepSeek-R1-Distill-Llama-8B.gguf
+        chain_yaml: scripts/cluster_5worker.yaml
+        think: true
+      - name: plain-8b
+        tokenizer_gguf: /models/plain/m.gguf
+        chain_yaml: scripts/cluster_5worker.yaml
+"""
+
+
+def _think_models(tmp_path):
+    return ns._load_models(_write_models_yaml(tmp_path, _THINK_MODELS))
+
+
+def test_load_models_think_explicit_and_heuristic(tmp_path):
+    reg = _think_models(tmp_path)
+    assert reg["dsr1-8b"].think is True
+    assert reg["plain-8b"].think is False
+    # heuristic default: r1-ish tokenizer path flips think on without yaml
+    heur = """\
+    models:
+      - name: implicit
+        tokenizer_gguf: /models/deepseek-r1-distill/m.gguf
+        chain_yaml: scripts/cluster_5worker.yaml
+    """
+    assert ns._load_models(_write_models_yaml(tmp_path, heur))["implicit"].think
+
+
+def test_split_think_variants():
+    assert ns._split_think("<think>plan</think>\nanswer") == ("plan", "answer")
+    # template pre-filled opener: only the closing tag is on the wire
+    assert ns._split_think("plan bits</think>\nanswer") == ("plan bits", "answer")
+    # no closing tag → fail open: everything stays content
+    assert ns._split_think("just an answer") == ("", "just an answer")
+
+
+def test_v1_nonstream_think_split(tmp_path):
+    stub = ns.StubChatBackend("<think>I plan.</think>\nThe answer.")
+    with _running_chat(_think_models(tmp_path), stub) as port:
+        status, body = _post(port, "/v1/chat/completions", {
+            "model": "dsr1-8b",
+            "messages": [{"role": "user", "content": "hi"}]})
+    assert status == 200
+    msg = body["choices"][0]["message"]
+    assert msg["content"] == "The answer."
+    assert msg["reasoning_content"] == "I plan."
+
+
+def test_v1_nonstream_plain_model_untouched(tmp_path):
+    stub = ns.StubChatBackend("<think>x</think>\ny")
+    with _running_chat(_think_models(tmp_path), stub) as port:
+        _, body = _post(port, "/v1/chat/completions", {
+            "model": "plain-8b",
+            "messages": [{"role": "user", "content": "hi"}]})
+    msg = body["choices"][0]["message"]
+    assert "<think>" in msg["content"] and "reasoning_content" not in msg
+
+
+def test_v1_nonstream_think_raw_env_disables(tmp_path, monkeypatch):
+    monkeypatch.setenv("NKS_OAI_THINK", "raw")
+    stub = ns.StubChatBackend("<think>x</think>\ny")
+    with _running_chat(_think_models(tmp_path), stub) as port:
+        _, body = _post(port, "/v1/chat/completions", {
+            "model": "dsr1-8b",
+            "messages": [{"role": "user", "content": "hi"}]})
+    msg = body["choices"][0]["message"]
+    assert "</think>" in msg["content"] and "reasoning_content" not in msg
+
+
+def test_v1_stream_think_split(tmp_path):
+    # per-word stub deltas: the closing tag arrives as its own delta
+    stub = ns.StubChatBackend("<think> deep plan </think> final answer")
+    with _running_chat(_think_models(tmp_path), stub) as port:
+        chunks = _post_sse(port, "/v1/chat/completions", {
+            "model": "dsr1-8b", "stream": True,
+            "messages": [{"role": "user", "content": "hi"}]})
+    deltas = [c["choices"][0]["delta"] for c in chunks]
+    reasoning = "".join(d.get("reasoning_content", "") for d in deltas)
+    content = "".join(d.get("content", "") for d in deltas)
+    assert reasoning.strip() == "deep plan"
+    assert content.strip() == "final answer"
+    assert "<think>" not in content and "</think>" not in content
+    assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
+
+
+def test_v1_stream_prefilled_opener(tmp_path):
+    # R1-style wire text: opener was pre-filled by the template, so the
+    # stream STARTS mid-reasoning and only the closing tag appears.
+    stub = ns.StubChatBackend("plan bits </think> the answer")
+    with _running_chat(_think_models(tmp_path), stub) as port:
+        chunks = _post_sse(port, "/v1/chat/completions", {
+            "model": "dsr1-8b", "stream": True,
+            "messages": [{"role": "user", "content": "hi"}]})
+    deltas = [c["choices"][0]["delta"] for c in chunks]
+    reasoning = "".join(d.get("reasoning_content", "") for d in deltas)
+    content = "".join(d.get("content", "") for d in deltas)
+    assert reasoning.strip() == "plan bits"
+    assert content.strip() == "the answer"
+
+
+def test_v1_stream_plain_model_untouched(tmp_path):
+    stub = ns.StubChatBackend("hello streaming world")
+    with _running_chat(_think_models(tmp_path), stub) as port:
+        chunks = _post_sse(port, "/v1/chat/completions", {
+            "model": "plain-8b", "stream": True,
+            "messages": [{"role": "user", "content": "hi"}]})
+    deltas = [c["choices"][0]["delta"] for c in chunks]
+    assert not any("reasoning_content" in d for d in deltas)
+    assert "".join(d.get("content", "") for d in deltas) == "hello streaming world"
