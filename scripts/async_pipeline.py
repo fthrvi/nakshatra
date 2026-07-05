@@ -68,8 +68,8 @@ class _Chunk:
     start_pos: int                 # KV start_pos this chunk assumed for its predecessor
     assumed_cur: int               # what predecessor `cur` we ASSUMED (== real for chunk 0)
     assumed_start_pos: int         # what predecessor start_pos we assumed
-    future: "Future[List[int]]"    # resolves to the K+1 target argmaxes
-    cancelled: bool = False
+    future: "Future[Optional[List[int]]]"   # resolves to the K+1 target argmaxes (None if flushed)
+    cancel: "threading.Event" = field(default_factory=threading.Event)
 
 
 class PipelineChain:
@@ -97,11 +97,21 @@ class PipelineChain:
     def occupancy(self) -> int:
         return self._peak
 
-    def _traverse(self, payload: bytes, n: int, start_pos: int) -> List[int]:
+    def _traverse(self, payload: bytes, n: int, start_pos: int,
+                  cancel: "Optional[threading.Event]") -> Optional[List[int]]:
         buf = payload
         last = len(self._stages) - 1
         for i, stage in enumerate(self._stages):
+            # A flushed chunk must STOP advancing here — a cancelled Future does not halt an
+            # already-running traversal, and letting it keep writing downstream workers' KV
+            # would corrupt state. Re-checking the flag at every stage boundary bounds a
+            # mispredicted chunk's KV footprint to stages it had already entered (which the
+            # corrected re-issue then trims away via its lower start_pos). See module docstring.
+            if cancel is not None and cancel.is_set():
+                return None
             with self._locks[i]:            # in-order per stage; other stages run concurrently
+                if cancel is not None and cancel.is_set():
+                    return None
                 with self._busy_lock:
                     self._busy += 1
                     self._peak = max(self._peak, self._busy)
@@ -114,8 +124,9 @@ class PipelineChain:
         import struct
         return list(struct.unpack(f"<{len(buf) // 4}i", buf))
 
-    def submit(self, payload: bytes, n: int, start_pos: int) -> "Future[List[int]]":
-        return self._pool.submit(self._traverse, payload, n, start_pos)
+    def submit(self, payload: bytes, n: int, start_pos: int,
+               cancel: "Optional[threading.Event]" = None) -> "Future[Optional[List[int]]]":
+        return self._pool.submit(self._traverse, payload, n, start_pos, cancel)
 
     def close(self) -> None:
         self._pool.shutdown(wait=True)
@@ -162,9 +173,10 @@ def pipelined_spec_decode(
         proposed = propose(cond_prefix + [cur], spec_k + 1)
         drafts = list(proposed[:spec_k])
         verify = [cur] + drafts
-        fut = chain.submit(_pack(verify), len(verify), start_pos)
         ch = _Chunk(idx=next_idx, cur=cur, drafts=drafts, start_pos=start_pos,
-                    assumed_cur=assumed_cur, assumed_start_pos=assumed_start_pos, future=fut)
+                    assumed_cur=assumed_cur, assumed_start_pos=assumed_start_pos,
+                    future=None)  # type: ignore[arg-type]
+        ch.future = chain.submit(_pack(verify), len(verify), start_pos, ch.cancel)
         # stash the predicted-next cur on the chunk for the filler below
         ch._pred_next_cur = proposed[spec_k] if len(proposed) > spec_k else cur   # type: ignore[attr-defined]
         next_idx += 1
@@ -219,8 +231,8 @@ def pipelined_spec_decode(
             # happen. Their KV writes get rewound when the corrected chunk re-enters each
             # stage with the corrected start_pos (daemon TruncateKV / start_pos trim).
             for ch in inflight:
-                ch.cancelled = True
-                ch.future.cancel()
+                ch.cancel.set()      # stop it advancing to further stages (checked per-stage)
+                ch.future.cancel()   # best-effort: skip it if it never started
             inflight.clear()
         # if not mispredicted, the surviving in-flight chunks are valid; keep draining them.
 
