@@ -536,6 +536,18 @@ def main():
                          "(e.g. Llama-3.2-1B); runs locally on the coordinator")
     ap.add_argument("--draft-max", type=int, default=4,
                     help="K: number of tokens the draft proposes per step")
+    # Async pipelining (Shard's 2.94→16.6 tok/s technique): keep several spec verify-chunks
+    # in flight so every worker stage stays busy instead of one-at-a-time (the pipeline
+    # bubble). Correctness stays byte-identical to greedy (commit-only-confirmed invariant in
+    # async_pipeline.py). Default OFF — the proven sequential path is untouched. Applies only
+    # to the explicit-stage streaming path with spec active (not --use-streaming-push).
+    ap.add_argument("--async-pipeline", action="store_true",
+                    default=os.environ.get("NKS_ASYNC_PIPELINE") == "1",
+                    help="pipeline speculative decode: keep N verify-chunks in flight "
+                         "(env NKS_ASYNC_PIPELINE=1)")
+    ap.add_argument("--async-inflight", type=int,
+                    default=int(os.environ.get("NKS_ASYNC_INFLIGHT", "3")),
+                    help="max speculative verify-chunks in flight (pipeline depth target)")
     # EAGLE→live (2026-06-21): swap the GGUF draft for the matched EAGLE-3 head,
     # fed by the FIRST worker's cmd=5 hidden states (isolated on scratch seq 1).
     # Requires every worker to advertise the "eagle_hidden" capability.
