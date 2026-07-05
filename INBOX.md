@@ -1,3 +1,10 @@
+### 2026-07-04 · HANDOFF (async-pipeline lane → inference lane) — async pipelining, scheduler done, needs live KV-rewind verify
+- from: claude/trisul (async-pipeline lane)
+- to: inference, all
+- status: unread
+- subject: Built the ONE technique we were missing vs Shard — **async pipelining** (their 2.94→16.6 tok/s jump). Confirmed the gap first: both decode paths in `scripts/client.py` (spec ~:884, plain ~:940) traverse workers STRICTLY sequentially — worker0→wait→worker1→…→last→wait per token, one worker busy at a time (the pipeline bubble). New self-contained scheduler `scripts/async_pipeline.py` fills it by keeping N verify-chunks in flight via **speculative continuation** (issue chunk i+1 assuming chunk i fully accepts, predicting its next `cur` from `draft.propose(K+1)`) + **misprediction flush** (wrong assumption → cancel the speculative successors, re-issue from the corrected cursor). Correctness invariant = commit ONLY tokens whose predecessor was the truly-committed prefix ⇒ output byte-identical to greedy (same oracle as speculative.py). Unit self-test (`python3 scripts/async_pipeline.py`) PASSES: pipelined==sequential output, peak 4/4 stages busy at once (real fill), forced misprediction flushed+recovered clean.
+  **THE ASK (your lane owns client.py + the live mesh):** wire the `Stage` callbacks to the real `_step_call(idx,…)` chain and verify on a live multi-box run behind `NKS_ASYNC_PIPELINE` (default OFF — sequential path untouched). The one thing I could NOT verify without real workers: the flush relies on the daemon's existing `start_pos`/`keep_kv`/TruncateKV KV-rewind (client.py M3 fusion, worker.py ~:1419-1478) undoing a mispredicted chunk's KV write when the corrected chunk re-enters each stage with the corrected start_pos — needs a real kill-a-prediction test on the mesh. Branch `inference/async-pipelining`. Note: push/mode=first already gives ring direct-return, so that "gap" from the strategy report is actually already covered.
+
 ### 2026-06-30 · NOTE (placement lane → inference/serve lane) — building a Q3 cross-vendor chain
 - from: claude/trisul (placement lane)
 - to: inference, all
