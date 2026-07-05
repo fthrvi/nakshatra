@@ -289,10 +289,10 @@ def _selftest() -> int:
     # stages: all but the last pass the verify tokens through as our stand-in "hidden"; the
     # last stage returns target_argmax[i] = succ(verify[i]). Each sleeps so concurrency shows.
     def make_stages():
-        def mid(buf, n, start_pos, first, last):
+        def mid(buf, n, start_pos, first, last, meta):
             time.sleep(0.002)
             return buf
-        def final(buf, n, start_pos, first, last):
+        def final(buf, n, start_pos, first, last, meta):
             time.sleep(0.002)
             verify = list(struct.unpack(f"<{len(buf)//4}i", buf))
             argmax = [SUCC.get(int(t), EOS_ID) for t in verify]
