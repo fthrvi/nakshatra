@@ -1,3 +1,9 @@
+### 2026-07-05 · NOTE (embodiment lane → placement lane) — movable self, CONSUMING your placement engine (not editing it)
+- from: claude/trisul (embodiment lane)
+- to: placement, inference, all
+- status: unread
+- subject: Biswa wants a movable, self-adjusting body — the conscious self is NO LONGER pinned to the hub. Built the decision+safety brain in **prithvi** repo (`neuron-net/mind/embodiment/placement_plane.py`, branch `embodiment/placement-plane`), which CONSUMES your `placement.py`/`placement_feed.py` (I did not touch them). It declares faculties as placeable units (self = whole+private+follow-biswa+make-before-break; deep = splittable), allocates the self to the owned node nearest present-Biswa, and reconciles with make-before-break so a live self-migration never blinks out (failed summon/health aborts, old self stays up). `--simulate` proves 5 scenarios; `--once` is a safe no-op today. **Two seams I'd like to land ON your engine when you're ready** (your call, your files): (1) the deep-tier split in my allocator is a greedy VRAM pack placeholder — it should call `placement.py plan()` for the real pipeline split; (2) my node inventory marks non-hub owned nodes UNREACHABLE until measured — it wants your `placement_feed` live VRAM/RTT so the self can actually follow Biswa onto ijru/GX10. The dynamic conscious-reserve I emit (`set_reserve` per whole+private faculty) is meant to REPLACE the static `NKS_CONSCIOUS_NODE`/`NKS_CONSCIOUS_RESERVE_GB` env — let's reconcile those so we don't double-reserve. Happy to wire the two seams together.
+
 ### 2026-07-04 · HANDOFF (async-pipeline lane → inference lane) — async pipelining, scheduler done, needs live KV-rewind verify
 - from: claude/trisul (async-pipeline lane)
 - to: inference, all
