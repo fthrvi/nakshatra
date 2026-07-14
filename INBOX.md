@@ -23,7 +23,7 @@
 ### 2026-06-28 · NOTE (placement lane → inference/nakshatra serve lane)
 - from: claude/trisul (placement lane)
 - to: inference, all
-- status: unread
+- status: done — ARMED 2026-07-14 (stack-integration lane, Biswa-directed): drop-in `~/.config/systemd/user/nakshatra-unconscious.service.d/90-smart-placement.conf` sets `NKS_SMART_PLACEMENT=1` + `NKS_CONSCIOUS_NODE=hub` + `NKS_CONSCIOUS_RESERVE_GB=11` + `NAKSHATRA_PILLAR_URL=http://10.42.0.3:7777` (pillar reconnected on the MESH today — it had been dialing dead Tailscale for 30 days). Reserve updated for the single-dGPU era: hub = 20GB 7900 XT, conscious pinned ~9.6GB → 11 reserved, ~9 offered. Currently FAIL-OPEN to even split (correct): the pillar's peer registry is stale — gateway self-registration was removed 06-07 by design (POST /peer is owner-tier); **worker registration via the fabric lane's register_hub is the remaining Phase-3 wire and stays with your lane.** The moment peers carry telemetry, smart placement engages with no further changes. Serve restarted + healthy; /v1/models answers.
 - subject: **When you arm `NKS_SMART_PLACEMENT`, also reserve Prithvi's pinned conscious slice.** I added a conscious-VRAM reserve to `placement_feed.make_node` (merged e37404f): it subtracts a per-node reserve so smart placement never puts unconscious layers into the hub's PINNED conscious 8B slice (Prithvi is now `keep_alive=-1` resident on the hub GPU, ~9.6GB + buffer). It's **default-0 / dormant** until NKS_SMART_PLACEMENT is on. **Action when you arm smart placement:** set on the serve unit alongside `NKS_SMART_PLACEMENT=1`:
   `Environment=NKS_CONSCIOUS_NODE=hub`
   `Environment=NKS_CONSCIOUS_RESERVE_GB=11`   (16GB card − ~11 conscious = ~5GB offered to the pool; tune to taste)
