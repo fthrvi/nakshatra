@@ -328,6 +328,37 @@ def test_lifecycle_backend_from_chain_lifecycles_unwraps_controller():
     assert backend.list_running() == ["m1"]
 
 
+# ── from_serve_registry — the live-serve controller-registry handle ───
+def test_from_serve_registry_uses_an_injected_registry_without_importing_serve():
+    ctrl = _StubController(ready=True)
+    backend = rec.LifecycleBackend.from_serve_registry({"m1": ctrl}, log=lambda *_: None)
+    assert backend.list_running() == ["m1"]
+    # a copy, not a live alias — mutating the caller's dict afterward must not
+    # change what the backend already built its controllers dict from.
+    backend._controllers["m1"] = _StubController(ready=False)
+    assert backend.list_running() == []
+
+
+def test_from_serve_registry_reads_the_live_nakshatra_serve_module_dict(monkeypatch):
+    import nakshatra_serve as ns
+    ctrl = _StubController(ready=True)
+    monkeypatch.setitem(ns.controllers, "m1", ctrl)
+    backend = rec.LifecycleBackend.from_serve_registry(log=lambda *_: None)
+    assert backend.list_running() == ["m1"]
+    # summon/reap call THROUGH to the real object nakshatra_serve.main() would have
+    # populated — proving this is the actual controller handle, not a copy that
+    # happens to duck-type the same.
+    backend.reap("m1")
+    assert ctrl.stopped == 1
+
+
+def test_from_serve_registry_empty_when_serve_never_armed_lifecycle(monkeypatch):
+    import nakshatra_serve as ns
+    monkeypatch.setattr(ns, "controllers", {})
+    backend = rec.LifecycleBackend.from_serve_registry(log=lambda *_: None)
+    assert backend.list_running() == []
+
+
 # ── end-to-end with the real reconciler + LifecycleBackend, dry-run only ──
 def test_end_to_end_plan_against_lifecycle_backend_dry_run():
     resident_down = _StubController(ready=False)

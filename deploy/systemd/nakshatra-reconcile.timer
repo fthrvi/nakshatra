@@ -1,0 +1,13 @@
+[Unit]
+Description=Run nakshatra-reconcile.service every 10 minutes (dry-run lifecycle reconcile)
+Documentation=https://github.com/fthrvi/nakshatra/blob/main/docs/findings/lifecycle-reconcile.md
+# STAGED, NOT ARMED — see nakshatra-reconcile.service for the full dry-run-by-default
+# reasoning. Nothing in this branch enables this timer.
+
+[Timer]
+OnCalendar=*:0/10
+Persistent=true
+Unit=nakshatra-reconcile.service
+
+[Install]
+WantedBy=timers.target

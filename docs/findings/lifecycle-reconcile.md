@@ -1,7 +1,8 @@
 # Declarative model lifecycle reconciliation (Mesh-LLM adoption #3)
 
-**Status:** module + tests landed on `serving/lifecycle-reconcile`. Not armed on any live
-serve — see "The remaining ask" below.
+**Status:** module + tests landed on `serving/lifecycle-reconcile`. Controller-registry
+handle + a staged (not enabled) systemd timer landed on `serving/live-seams` — see
+"What landed since" below. Still not armed on any live serve.
 
 ## Why
 
@@ -127,28 +128,58 @@ stub controllers stand in for anything real. `python3 scripts/lifecycle_reconcil
 `--model-lifecycle-id` and again with one set but no `NAKSHATRA_LIFECYCLE_*` env) and
 confirmed to print the dry-run banner and exit 0 without touching anything.
 
-## The remaining ask (operator's call)
+## What landed since (branch `serving/live-seams`, 2026-07-29)
 
-Two things intentionally left undone here:
+Both items below are now built. Neither is ARMED — no unit is installed/enabled, and
+`NKS_RECONCILE_APPLY` still isn't set anywhere in this repo. That decision remains the
+operator's, per the original ask.
 
-1. **A systemd timer unit** (`nakshatra-lifecycle-reconcile.timer` +
-   `.service`, mirroring the existing `deploy/systemd/` pattern) that runs
-   `lifecycle_reconcile.py --desired <path> --interval N` (or a periodic `--once` via the
-   timer instead of the script's own loop — either shape works; the module doesn't care
-   which). Not written here because it needs a real desired-state yaml path and a decision
-   on cadence, both operator calls.
-2. **Arming it against the live `nakshatra-unconscious` serve.** Today that serve builds
-   its `ChainLifecycle` from `NAKSHATRA_LIFECYCLE_*` env inside `nakshatra_serve.py`'s
-   `main()` — there's no long-lived handle an external process can reach to build a
-   `LifecycleBackend` from. The CLI's `main()` here calls `serve_lifecycle.from_env()`
-   itself (same env the live unit would export) to reconstruct an equivalent controller and
-   wraps it under `--model-lifecycle-id`, which works for the CLI's own process but means
-   reconcile and the serve are two independent processes each calling
-   `SystemdLocalController`/`RosterWorkerController` methods against the same systemd
-   units — safe (idempotent start/stop, `is_ready()` is a pure TCP probe) but worth the
-   operator's eyes before it's scheduled unattended, since it's the first thing in this
-   repo that acts on the live unconscious lifecycle from *outside* the request path.
+1. **The controller-registry handle.** `nakshatra_serve.py` now carries a module-level
+   `controllers: dict[str, ChainController]` registry (just above `build_server`) that
+   `main()` populates via `_register_lifecycle_controller()` right after it arms
+   scale-to-zero — keyed by `NAKSHATRA_LIFECYCLE_MODEL_ID` (new), falling back to the
+   existing `NAKSHATRA_LIFECYCLE_ROSTER_MODEL`, then the literal `"default"`.
+   `LifecycleBackend.from_serve_registry()` (new classmethod, `scripts/lifecycle_reconcile.py`)
+   reads it directly — either an injected dict (tests) or, by default, imports
+   `nakshatra_serve` and reads its live `controllers`.
 
-Neither of these was done as part of this branch — pure module + tests only, per the
-brief. `NKS_RECONCILE_APPLY` stays unset / no `--apply` anywhere in this repo until the
-operator decides to wire the timer.
+   **Honesty note, unchanged from before:** this handle is real but only reaches an
+   IN-PROCESS consumer — something importing `nakshatra_serve` in the SAME interpreter
+   that ran its `main()` (a future embedded reconciler thread, a REPL attached to the
+   live serve, a test). It does **not** bridge the process boundary the standalone CLI /
+   systemd timer below uses — that's still a separate OS process, and its `main()` still
+   calls `serve_lifecycle.from_env()` itself to reconstruct an equivalent controller from
+   the same env, exactly as described in the paragraph this replaced. Two independent
+   processes driving the same idempotent systemd-unit/TCP-probe primitives remains safe;
+   `from_serve_registry()` is the seam a *future* in-process reconciler would use to skip
+   that duplication, not something that closes the gap for today's separate-process CLI.
+
+2. **A systemd timer unit** — `deploy/systemd/nakshatra-reconcile.service` +
+   `deploy/systemd/nakshatra-reconcile.timer` (mirroring the existing `deploy/systemd/`
+   pattern, `OnCalendar=*:0/10`). **Staged only: nothing in this repo runs
+   `systemctl --user enable`/`start` on it.** The service runs
+   `lifecycle_reconcile.py --desired <path> --model-lifecycle-id <id> --once` with no
+   `--apply` and no `NKS_RECONCILE_APPLY` — every scheduled run is a dry-run pass that
+   only logs what it would summon/reap. The unit file's own comments say, in the
+   operator's words: arming real execution (adding `--apply`, or setting
+   `NKS_RECONCILE_APPLY=1`) is the operator's explicit call, made after reading a run or
+   two of the dry-run logs — this remains the first thing in the repo that would act on
+   the live unconscious lifecycle from *outside* the request path, so it should not go
+   live silently.
+
+## What's still the operator's call
+
+- Copying `scripts/serve_models.desired.example.yaml` to a real path (default
+  `~/.nakshatra/serve_models.desired.yaml`, documented in the staged `.service` file) and
+  declaring actual model ids/desired-states in it.
+- Setting `MODEL_LIFECYCLE_ID` in the staged unit (or `NAKSHATRA_LIFECYCLE_MODEL_ID` on
+  the live serve) so the two line up — today it's a label only (see the honesty note
+  above), but it should still name the real chain for the plan/log output to make sense.
+- Actually enabling the timer (`systemctl --user enable --now nakshatra-reconcile.timer`
+  after copying both unit files into `~/.config/systemd/user/`) and, once its dry-run
+  logs look right, arming `--apply`/`NKS_RECONCILE_APPLY=1`.
+- A genuinely multi-model live registry: `controllers` today gets exactly the ONE
+  controller `nakshatra_serve.py`'s single `ChainLifecycle` builds (unchanged
+  architecture) — `from_serve_registry()` reads whatever's in that dict, so a real
+  multi-model registry only needs `_register_lifecycle_controller()`'s construction to
+  change, not the reconcile side.
