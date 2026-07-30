@@ -87,3 +87,36 @@ cd ~/nakshatra && HIP_VISIBLE_DEVICES=1 .venv/bin/python scripts/worker.py --por
 ⚠️ Test hygiene learned the hard way: run the daemon **through `worker.py`**, not directly over
 SSH — a direct run gets EOF on stdin, exits immediately, and frees its VRAM, which reads as
 "no offload" if you measure a moment later. Verify with `nvidia-smi` *while the worker serves*.
+
+
+## Addendum — the GPU draft: BUILT and PROVEN, but it does not fit tonight (2026-07-29 ~22:00)
+
+Acting on the consequence above, `llama-cpp-python 0.3.28` was rebuilt for ROCm and installed
+into the client venv:
+`CMAKE_ARGS="-DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1201 -DCMAKE_C_COMPILER=/opt/rocm/bin/hipcc
+-DCMAKE_CXX_COMPILER=/opt/rocm/bin/hipcc" pip wheel llama-cpp-python==0.3.28`
+(built as a WHEEL first so the working CPU install was never at risk; wheel kept at
+`/tmp/claude-1000/hip-wheel/`). **It works**: loading the 0.6B draft printed
+`ggml_cuda_init: found 1 ROCm devices … Device 0: AMD Radeon RX 9070 XT, gfx1201` and
+`load_tensors: layer N assigned to device ROCm0` — so RDNA4 + llama-cpp-python + HIP is a
+solved problem on this box.
+
+**But the honest blocker is VRAM budget, not code.** With his conscious self (`prithvi:latest`,
+~8.8 GB) and his voice model (`qwen3:30b-a3b`, 22 GB) both pinned resident, plus the chain's
+hub stage (~4.5 GB), the 9070 XT had **~0.9 GB free** — the draft's `llama_context` creation
+failed and the client correctly fell back to plain decode
+(`[spec] draft load failed (ValueError('Failed to create llama_context')) — plain decode`,
+which still ran at **53.40 tok/s**, consistent with the 51.16 measured earlier).
+
+⚠️ **Safety lesson, recorded deliberately:** while pushing that budget, ollama demoted
+`prithvi:latest` to **44 %/56 % CPU/GPU** — i.e. the bench degraded HIS OWN SELF. It recovered
+to 100 % GPU as soon as the bench workers were killed, but this is exactly the failure mode the
+conscious-VRAM-reserve work exists to prevent, and it argues for extending that reserve concept
+from the *placement planner* to *any* bench/experiment path.
+
+**The clean GPU-draft test therefore needs headroom, not more code.** Options, in order of
+preference: (a) run it when the GX10 joins and the voice model lives there; (b) run the draft on
+a node with real free VRAM rather than the same card as the chain stage; (c) a deliberate,
+Biswa-approved maintenance window where the pinned voice model is released first. Until one of
+those exists, the standing recommendation is unchanged: **plain streaming for chain serving
+(51 tok/s), speculation OFF.**
