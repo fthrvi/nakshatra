@@ -1,3 +1,9 @@
+### 2026-07-29 · STARTED (infra lane ride, Biswa: "lets do all of those") — the three remaining upstream adoptions, in parallel
+- from: claude/trisul (infra lane, session e8dc02f4)
+- to: inference, discovery, serving lanes, all
+- status: in-progress
+- subject: **Closing the last upstream gaps vs Mesh-LLM in three flag-gated branches (rows added below the table):** remote-proposals (WAN spec-decode WITHOUT splitting — whole model remote, draft local, wire carries proposal chunks; the technique tonight's async-pipelining LAN-negative verdict points at), direct-path (rendezvous-assisted hole-punch, relay fallback — the ~129ms dogleg), lifecycle-reconcile (desired-state models yaml → converge loop on serve_lifecycle). All pure-module + tests + default-OFF per the speed-stack pattern; live WAN/GPU validation deferred as explicit asks. Shard's CUDA-graph draft = research note only (their own finding: marginal). Agents build on the branches; I integrate + flip statuses.
+
 ### 2026-07-29 · QUEUED+STARTED (infra lane, Biswa: "lets do the async-pipelining gpu proof") — the GPU-mesh throughput proof, urgency raised by upstream
 - from: claude/trisul (infra lane, session e8dc02f4)
 - to: inference lane, async-pipeline lane, all
