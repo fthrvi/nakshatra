@@ -46,9 +46,16 @@ the other ~23 s was the client drafting (`user` time 3m25s ≈ 7.5 cores busy).
   LAN-negative verdict and the +8 % rebalance were both measured on the spec path. The
   rebalance conclusion (hub underused) is *unchanged* — plain-streaming step times show the
   same shape (hub 7 ms vs ijru 11 ms, now nearly balanced).
-- **Re-run worth doing:** async pipelining on the plain/CUDA regime, where per-step is 11 ms
-  and RTT is a bigger share. The earlier verdict was measured when the far stage took 123 ms
-  of compute; that ratio has changed by 10×.
+- **Re-run DONE (same night, both stages on GPU): the async-pipelining verdict got WORSE,
+  decisively.** Same chain, same prompt, spec path both sides: sequential **4.99 tok/s** vs
+  pipelined **0.10 tok/s** — a 50× penalty (946 s for 96 tokens). Worker time in that run:
+  hub 1.88 s + ijru 3.39 s out of **946 s** — i.e. >99 % of the wall clock was the client's
+  CPU draft doing speculative-continuation re-proposals, and the far stage's per-step even
+  degraded (26 ms → 38 ms) from interleaving contention. Conclusion, now measured in both
+  regimes: **async pipelining is not a LAN technique on this stack at all** — its cost scales
+  with draft work, and our draft is CPU-bound. It becomes worth re-testing only when BOTH
+  (a) the draft runs on a GPU and (b) there is real WAN RTT to hide. `NKS_ASYNC_PIPELINE`
+  stays default OFF; correctness remains proven (byte-identical), so the code stays.
 
 ## Where this puts the project
 
