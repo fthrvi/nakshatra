@@ -1,0 +1,33 @@
+# serve_models.desired.yaml — DESIRED STATE for lifecycle_reconcile.py.
+#
+# NOT the same file as serve_models.yaml (the request-routing registry — model
+# id -> tokenizer/chain). This one declares, per model id, what its LIFECYCLE
+# should be; lifecycle_reconcile.py converges the live serve_lifecycle
+# chain(s) toward it. Copy to serve_models.desired.yaml and edit; keep the
+# real file LOCAL if it names anything host-specific in `note`.
+#
+# desired:
+#   resident   - must be up. reconcile summons it if it's found down, and
+#                NEVER reaps it (it's declared "always on", not "idle-reapable").
+#   on-demand  - the existing scale-to-zero (serve_lifecycle.ChainLifecycle:
+#                summon-on-request, reap-after-idle-grace) governs it.
+#                reconcile takes NO action either way — reported as a Noop
+#                every cycle, up or down, so it shows in the plan without
+#                being touched.
+#   absent     - must NOT be running. reconcile reaps it if it's found up.
+#
+# A model running but NOT listed here at all is reported, never reaped —
+# reconcile only ever acts on what the operator declared (the same
+# never-evict-what-you-don't-own instinct as the conscious VRAM reserve).
+models:
+  - name: nakshatra-unconscious-30b
+    desired: resident
+    note: >-
+      Prithvi's think_deeper reasoner — keep it warm; the 7.5s cold-start is
+      a real thinking-latency hit he feels mid-turn.
+  - name: qwen3-coder-30b
+    desired: on-demand
+    note: coding escalation — fine to scale to zero between uses, existing grace stands.
+  - name: llama-3.3-70b-experimental
+    desired: absent
+    note: superseded by qwen3-coder-30b; declared absent so reconcile reaps it if anyone leaves it running.
