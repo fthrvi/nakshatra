@@ -1008,6 +1008,114 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
         return 200
 
 
+# ── Lifecycle controller registry (external reconcile handle) ───────
+# lifecycle-reconcile finding's "remaining ask" #2: today `main()` builds its
+# ChainLifecycle from env and nothing outside this process can reach the
+# resulting ChainController — reconcile's CLI has to reconstruct an
+# equivalent one from the SAME env (serve_lifecycle.from_env() again) rather
+# than share the live object. This is the smallest honest fix: a module-level
+# registry `main()` populates when it builds `chat_lifecycle`, keyed by an
+# operator-declared model id (the same id a lifecycle_reconcile desired-state
+# yaml names in its `name:` field). Registration only — nothing in this file
+# reads it back; it exists purely so an IN-PROCESS consumer (a future
+# embedded reconciler thread, a test, a REPL attached to this interpreter)
+# can get the REAL controller object instead of a second one pointed at the
+# same systemd units. It does NOT bridge the process boundary the standalone
+# `lifecycle_reconcile.py` CLI/systemd-timer path uses today — that's a
+# separate OS process and still reconstructs its own controller via
+# `serve_lifecycle.from_env()`, unchanged. See
+# lifecycle_reconcile.LifecycleBackend.from_serve_registry() and
+# docs/findings/lifecycle-reconcile.md.
+controllers: "dict[str, object]" = {}
+
+
+def _register_lifecycle_controller(chat_lifecycle) -> Optional[str]:
+    """Register `chat_lifecycle.controller` into the module-level `controllers`
+    registry, returning the model id it was registered under (or None if
+    `chat_lifecycle` is None — nothing to register). Split out of `main()` so
+    it's unit-testable without booting the HTTP server or a real lifecycle.
+
+    The registry key is NAKSHATRA_LIFECYCLE_MODEL_ID if set, else
+    NAKSHATRA_LIFECYCLE_ROSTER_MODEL (the id from_roster wiring already uses),
+    else the literal "default" — today's serve governs exactly ONE chain
+    regardless of how many models are in the request-routing registry, so
+    there's no per-model id to fall back to from `models` itself."""
+    if chat_lifecycle is None:
+        return None
+    model_id = (os.environ.get("NAKSHATRA_LIFECYCLE_MODEL_ID")
+                or os.environ.get("NAKSHATRA_LIFECYCLE_ROSTER_MODEL")
+                or "default")
+    controllers[model_id] = chat_lifecycle.controller
+    return model_id
+
+
+# ── Remote-proposals verifier mount (Mesh-LLM adoption #1) ───────────
+# remote-proposals finding's "remaining ask" #1/#2: mount VerifierSession on
+# nakshatra_serve behind a real transport + a real whole-model verify_fn.
+# Behind NKS_REMOTE_PROPOSALS=1 (default OFF ⇒ nothing below this comment
+# ever runs, and scripts/remote_verifier_backend.py — the llama_cpp adapter —
+# is never even imported, so the flag-off serve is byte-identical to before
+# this seam existed and needs no llama_cpp installed). See
+# docs/findings/remote-proposals.md.
+_proposals_handle: Optional[tuple] = None   # keeps (httpd, thread, verifier, session) alive
+
+
+def _maybe_start_proposals_server(log=log) -> Optional[tuple]:
+    """Mount remote_proposals.VerifierSession behind remote_proposals.serve_verifier,
+    backed by a REAL whole-model llama.cpp verify_fn loaded CPU-ONLY
+    (n_gpu_layers=0 — can never touch conscious/voice VRAM), in a daemon
+    thread alongside the OpenAI/Ollama facade.
+
+    Env:
+      NKS_REMOTE_PROPOSALS=1        arm this (default unset/0 = no-op, no import)
+      NKS_VERIFIER_GGUF=<path>      required — the whole verifier model (vocab
+                                     MUST match whatever draft a remote WAN
+                                     client runs; not enforced here beyond the
+                                     optional NKS_VERIFIER_EXPECT_VOCAB check)
+      NKS_PROPOSALS_PORT            default 11601
+      NKS_PROPOSALS_HOST            default 127.0.0.1 (loopback — this is the
+                                     thin stdlib transport remote_proposals.py
+                                     itself describes as "a seam, not the real
+                                     transport"; widen deliberately, at the
+                                     operator's call, when arming this for real
+                                     WAN traffic)
+      NKS_VERIFIER_N_CTX            default 4096
+      NKS_VERIFIER_EXPECT_VOCAB     optional int — fail loud on a tokenizer
+                                     mismatch instead of silently wrong argmaxes
+
+    Returns the (httpd, thread, verifier, session) handle, or None when unarmed
+    or construction failed (logged, never raised — a bad GGUF path must not
+    take down the whole serve)."""
+    global _proposals_handle
+    if os.environ.get("NKS_REMOTE_PROPOSALS") != "1":
+        return None
+    gguf = os.environ.get("NKS_VERIFIER_GGUF")
+    if not gguf:
+        log.warning("NKS_REMOTE_PROPOSALS=1 but NKS_VERIFIER_GGUF is unset — "
+                    "remote-proposals verifier NOT started")
+        return None
+    try:
+        import remote_verifier_backend as rvb
+        expect_vocab = os.environ.get("NKS_VERIFIER_EXPECT_VOCAB")
+        handle = rvb.start_proposals_server(
+            gguf,
+            host=os.environ.get("NKS_PROPOSALS_HOST", "127.0.0.1"),
+            port=int(os.environ.get("NKS_PROPOSALS_PORT", "11601")),
+            n_ctx=int(os.environ.get("NKS_VERIFIER_N_CTX", "4096")),
+            expect_vocab_size=int(expect_vocab) if expect_vocab else None,
+            log=log.info,
+        )
+        httpd = handle[0]
+        log.info("remote-proposals verifier ARMED on %s:%d "
+                 "(gguf=%s, CPU-only n_gpu_layers=0)",
+                 httpd.server_address[0], httpd.server_address[1], gguf)
+        _proposals_handle = handle
+        return handle
+    except Exception as e:
+        log.error("remote-proposals verifier failed to start: %s", e)
+        return None
+
+
 # ── Server lifecycle ────────────────────────────────────────────────
 
 
@@ -1102,8 +1210,13 @@ def main(argv: Optional[list[str]] = None) -> int:
             chat_lifecycle.start_reaper()
             log.info("scale-to-zero ARMED (idle-grace=%.0fs)",
                      chat_lifecycle.idle_grace_s)
+            registered_id = _register_lifecycle_controller(chat_lifecycle)
+            log.info("lifecycle controller registered as %r "
+                     "(nakshatra_serve.controllers, in-process reconcile handle)",
+                     registered_id)
     except Exception as e:
         log.warning("scale-to-zero lifecycle unavailable: %s", e)
+    _maybe_start_proposals_server()
     binds = [b.strip() for b in args.bind.split(",") if b.strip()] or ["0.0.0.0"]
     server = build_server(binds[0], args.port, models, chat_backend, chat_lifecycle)
     # Extra sockets (same port, same registry/backend objects) — lets the

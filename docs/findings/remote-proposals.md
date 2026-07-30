@@ -3,8 +3,10 @@
 **Landed:** 2026-07-29, branch `inference/remote-proposals` (Mesh-LLM adoption #1, one of
 three parallel lanes staked in `INBOX.md` the same night as the async-pipelining GPU proof).
 **Status:** Protocol core done + unit-proven (`scripts/remote_proposals.py`, no GPU/model/live
-services). NOT wired into `nakshatra_serve` or `client.py`. NOT run over a real WAN link or
-against a real whole-model verifier — see "Remaining ask" below.
+services). Mounted on `nakshatra_serve` behind `NKS_REMOTE_PROPOSALS=1` with a real
+llama.cpp CPU-only verify_fn on branch `serving/live-seams` (2026-07-29) — see "What landed
+since" below. Still NOT run over a real WAN link — that's the one item left; see "Remaining
+ask" #3.
 
 ## What it is
 
@@ -72,23 +74,48 @@ same shape Mesh-LLM and Shard's own remote-verifier mode use to make WAN federat
 economical without chain-splitting: hide the WAN RTT behind draft-generated tokens instead of
 behind pipeline fill.
 
-## Remaining ask (explicit, deferred)
+## What landed since (branch `serving/live-seams`, 2026-07-29) — items 1 & 2
 
-This branch delivers the **pure protocol module only** — no wiring, no live model, no WAN
-test, per the no-GPU/no-live-services scope of this lane. What's left, for whichever lane
-picks it up next:
+- **`nakshatra_serve.py` mounts `VerifierSession`** behind
+  `_maybe_start_proposals_server()`, gated on `NKS_REMOTE_PROPOSALS=1` (default
+  unset/OFF ⇒ this function no-ops and `scripts/remote_verifier_backend.py` — the adapter
+  module — is never even imported; the flag-off serve is byte-identical to before this
+  seam existed, proven by a subprocess test that `llama_cpp`/`remote_verifier_backend`
+  never land in `sys.modules` on a plain import). Still rides the SAME thin
+  `serve_verifier`/`http_submit` stdlib loopback transport described above — that
+  characterization is unchanged, just now actually mounted, on `NKS_PROPOSALS_PORT`
+  (default 11601) in a daemon thread alongside the OpenAI/Ollama facade.
+- **A real whole-model `verify_fn`**: `scripts/remote_verifier_backend.py`'s
+  `LlamaVerifier` wraps a `llama_cpp.Llama` handle loaded `n_gpu_layers=0` (hardcoded,
+  CPU-only — never touches conscious/voice VRAM), `logits_all=True` (same requirement as
+  `speculative.py`'s `DraftModel`). It rewinds the KV cache to `start_pos` via
+  `llama._ctx.kv_cache_seq_rm(...)` before each batch — the exact primitive item 2 asked
+  for, modeled directly on `DraftModel.propose`'s LCP rollback — and returns one greedy
+  argmax per input token via `.scores`. Proven against a deterministic `FakeLlama` (no
+  llama_cpp, no GGUF) in `tests/test_remote_verifier_backend.py`: the per-position argmax
+  contract, the rewind-on-mispredict path (asserting the exact `kv_cache_seq_rm` call), a
+  vocab-mismatch guardrail (`NKS_VERIFIER_EXPECT_VOCAB`), and the full
+  `proposal_loop`/`VerifierSession` byte-identical-to-sequential oracle running THROUGH
+  the adapter for perfect/adversarial/mixed drafts — plus a loopback smoke that starts the
+  verifier thread on port 0 with the fake model and round-trips one proposal via
+  `http_submit`.
 
-1. **Mount `VerifierSession` on `nakshatra_serve`** behind a real endpoint (the current
-   `serve_verifier`/`http_submit` stdlib loopback pair is a deliberately thin seam — enough
-   to prove the protocol survives serialization, not the production transport).
-2. **Wire a real whole-model `verify_fn`** — a real forward pass over an actual llama.cpp
-   (or equivalent) handle that truncates its KV cache to `start_pos` before evaluating each
-   batch (the real KV-rewind primitive this module's cursor arithmetic assumes exists;
-   `speculative.py`'s `DraftModel` and the worker daemon's `TruncateKV` are the closest
-   existing analogs to model this on).
+**Honesty note:** "vocab must match the draft family" is enforced only when the operator
+sets `NKS_VERIFIER_EXPECT_VOCAB` — there is no draft model reference on the server side to
+compare against automatically (the draft lives on the WAN client, which this branch does
+not build). And `VerifierSession` still runs ONE continuous generation stream per process
+(seeded from the verifier's BOS token by default) — a per-request session pool is not
+built; that's still a production-transport question, same as before.
+
+## Remaining ask (explicit, deferred) — item 3
+
+1. ~~Mount `VerifierSession` on `nakshatra_serve` behind a real endpoint~~ — done above.
+2. ~~Wire a real whole-model `verify_fn`~~ — done above.
 3. **A live WAN test**, e.g. across the sovereign mesh's actual inter-site RTT (the UNM lab
    site or a VPS hop), measuring tok/s WITH vs WITHOUT proposals against a real remote
    verifier + local draft — the throughput half of the correctness-is-proven,
-   throughput-is-not pattern this lane inherited from the async-pipelining finding.
-4. Land behind `NKS_REMOTE_PROPOSALS` (declared, default OFF, in `scripts/remote_proposals.py`
-   already — not yet read anywhere, since nothing wires the module in yet).
+   throughput-is-not pattern this lane inherited from the async-pipelining finding. Needs
+   a real GGUF on both ends (verifier + draft, matching tokenizer families) and live mesh
+   nodes — out of scope for a no-GPU/no-live-services branch.
+4. ~~Land behind `NKS_REMOTE_PROPOSALS`~~ — done; now actually read (`nakshatra_serve.py`'s
+   `_maybe_start_proposals_server()`), still default OFF.

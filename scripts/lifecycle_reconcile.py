@@ -263,6 +263,33 @@ class LifecycleBackend(Backend):
         that's down, reap an `absent` that's up)."""
         return cls({mid: lc.controller for mid, lc in lifecycles.items()}, log=log)
 
+    @classmethod
+    def from_serve_registry(cls, registry: "Optional[dict]" = None,
+                            log: Callable[[str], None] = print) -> "LifecycleBackend":
+        """Build directly from `nakshatra_serve.controllers` — the live serve
+        process's module-level registry of `{model_id: ChainController}`,
+        populated when `main()` builds its `ChainLifecycle` from env (see
+        `nakshatra_serve._register_lifecycle_controller` and
+        docs/findings/lifecycle-reconcile.md).
+
+        `registry` is injectable for tests; omitted, this imports
+        `nakshatra_serve` and reads its live `controllers` dict.
+
+        HONESTY NOTE: this only works for an IN-PROCESS consumer — something
+        importing `nakshatra_serve` in the SAME Python interpreter that ran
+        its `main()` (a future embedded reconciler thread, a REPL attached to
+        the live serve, or a test). It does NOT bridge the process boundary
+        the standalone `lifecycle_reconcile.py` CLI / systemd timer uses —
+        that runs as a separate OS process and still reconstructs an
+        equivalent controller via `serve_lifecycle.from_env()` (see `main()`
+        below), exactly as before this classmethod existed. A dict in one
+        process's memory is not reachable from another process without an
+        IPC/RPC layer this branch does not build."""
+        if registry is None:
+            import nakshatra_serve
+            registry = nakshatra_serve.controllers
+        return cls(dict(registry), log=log)
+
     def _require(self, model_id: str):
         ctrl = self._controllers.get(model_id)
         if ctrl is None:

@@ -1,0 +1,48 @@
+[Unit]
+Description=Nakshatra declarative lifecycle reconcile — DRY-RUN pass (Mesh-LLM adoption #3)
+Documentation=https://github.com/fthrvi/nakshatra/blob/main/docs/findings/lifecycle-reconcile.md
+# STAGED, NOT ARMED. This unit ships in the repo (branch serving/live-seams) for the
+# operator to review and copy into ~/.config/systemd/user/ when ready — nothing in
+# this branch runs `systemctl --user enable`/`start` on it. Triggered by the companion
+# nakshatra-reconcile.timer (OnCalendar=*:0/10); this is a Type=oneshot, not a
+# long-running daemon, so it does NOT need Wants=/After= the live serve.
+#
+# DRY-RUN BY DEFAULT AND ON PURPOSE: `--once` below has no `--apply`, and
+# NKS_RECONCILE_APPLY is not set — every run only LOGS what it WOULD summon/reap
+# (`[reconcile] [dry-run] would …`) and touches nothing. Arming real execution
+# (adding `--apply` to ExecStart, or setting NKS_RECONCILE_APPLY=1 in reconcile.env)
+# is the OPERATOR'S EXPLICIT CALL — make it only after reading a run or two of these
+# dry-run logs (`journalctl --user -u nakshatra-reconcile.service`), because this is
+# the first thing in this repo that would act on the live nakshatra-unconscious
+# lifecycle from OUTSIDE the request path. See docs/findings/lifecycle-reconcile.md
+# "The remaining ask".
+After=network.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-%h/.nakshatra/reconcile.env
+# Copy scripts/serve_models.desired.example.yaml to this path (or point DESIRED_STATE
+# at wherever you keep it) and edit it BEFORE this does anything meaningful — an
+# absent/malformed file makes every run exit non-zero (logged FATAL, still a no-op,
+# never a crash of the timer itself).
+Environment=DESIRED_STATE=%h/.nakshatra/serve_models.desired.yaml
+# Must match a `name:` entry in DESIRED_STATE. This is a LABEL only — it does not
+# select which chain gets reconstructed (serve_lifecycle.from_env() below reads the
+# SAME NAKSHATRA_LIFECYCLE_* env the live nakshatra-unconscious.service exports and
+# always builds the one chain it describes); it just names that chain in the plan/log
+# output so it lines up with DESIRED_STATE's yaml. The placeholder below is
+# deliberately not a real model id so an un-edited copy of this file is obviously
+# unconfigured rather than silently matching the wrong thing.
+Environment=MODEL_LIFECYCLE_ID=CHANGE_ME_TO_MATCH_DESIRED_STATE_YAML_NAME
+# lifecycle_reconcile.py's own from_env() path (see its main()) reconstructs an
+# equivalent ChainController from the SAME NAKSHATRA_LIFECYCLE_* variables the live
+# serve exports — it is a SEPARATE OS process from nakshatra_serve.py, so it cannot
+# reach nakshatra_serve.controllers (the in-process registry LifecycleBackend.
+# from_serve_registry() reads — see docs/findings/lifecycle-reconcile.md). Both
+# processes end up driving the same idempotent systemd-unit/TCP-probe primitives, so
+# running side by side is safe, just duplicated construction — export the identical
+# NAKSHATRA_LIFECYCLE_* set nakshatra-unconscious.service uses, e.g. via a shared
+# EnvironmentFile or by uncommenting below:
+#EnvironmentFile=-%h/.nakshatra/unconscious.env
+ExecStart=%h/nakshatra/.venv/bin/python %h/nakshatra/scripts/lifecycle_reconcile.py \
+    --desired ${DESIRED_STATE} --model-lifecycle-id ${MODEL_LIFECYCLE_ID} --once

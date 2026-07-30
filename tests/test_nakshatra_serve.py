@@ -824,3 +824,127 @@ def test_v1_stream_plain_model_untouched(tmp_path):
     deltas = [c["choices"][0]["delta"] for c in chunks]
     assert not any("reasoning_content" in d for d in deltas)
     assert "".join(d.get("content", "") for d in deltas) == "hello streaming world"
+
+
+# ── controller registry — the lifecycle_reconcile external handle ────
+class _StubChainLifecycle:
+    """Duck-types the one attribute _register_lifecycle_controller reads —
+    serve_lifecycle.ChainLifecycle's `.controller`."""
+    def __init__(self, controller):
+        self.controller = controller
+
+
+@pytest.fixture
+def _clean_controllers():
+    ns.controllers.clear()
+    yield
+    ns.controllers.clear()
+
+
+def test_register_lifecycle_controller_none_is_a_noop(_clean_controllers):
+    assert ns._register_lifecycle_controller(None) is None
+    assert ns.controllers == {}
+
+
+def test_register_lifecycle_controller_defaults_to_default_id(monkeypatch, _clean_controllers):
+    monkeypatch.delenv("NAKSHATRA_LIFECYCLE_MODEL_ID", raising=False)
+    monkeypatch.delenv("NAKSHATRA_LIFECYCLE_ROSTER_MODEL", raising=False)
+    ctrl = object()
+    model_id = ns._register_lifecycle_controller(_StubChainLifecycle(ctrl))
+    assert model_id == "default"
+    assert ns.controllers["default"] is ctrl
+
+
+def test_register_lifecycle_controller_falls_back_to_roster_model(monkeypatch, _clean_controllers):
+    monkeypatch.delenv("NAKSHATRA_LIFECYCLE_MODEL_ID", raising=False)
+    monkeypatch.setenv("NAKSHATRA_LIFECYCLE_ROSTER_MODEL", "qwen3-coder-30b")
+    ctrl = object()
+    model_id = ns._register_lifecycle_controller(_StubChainLifecycle(ctrl))
+    assert model_id == "qwen3-coder-30b"
+    assert ns.controllers["qwen3-coder-30b"] is ctrl
+
+
+def test_register_lifecycle_controller_explicit_id_wins_over_roster_model(monkeypatch, _clean_controllers):
+    monkeypatch.setenv("NAKSHATRA_LIFECYCLE_MODEL_ID", "nakshatra-unconscious-30b")
+    monkeypatch.setenv("NAKSHATRA_LIFECYCLE_ROSTER_MODEL", "should-be-ignored")
+    ctrl = object()
+    model_id = ns._register_lifecycle_controller(_StubChainLifecycle(ctrl))
+    assert model_id == "nakshatra-unconscious-30b"
+    assert set(ns.controllers) == {"nakshatra-unconscious-30b"}
+
+
+# ── remote-proposals verifier mount — flag-off is byte-identical ─────
+def test_maybe_start_proposals_server_noop_when_flag_unset(monkeypatch):
+    monkeypatch.delenv("NKS_REMOTE_PROPOSALS", raising=False)
+    ns._proposals_handle = None
+    assert ns._maybe_start_proposals_server() is None
+    assert ns._proposals_handle is None
+
+
+def test_maybe_start_proposals_server_noop_when_flag_is_not_exactly_one(monkeypatch):
+    monkeypatch.setenv("NKS_REMOTE_PROPOSALS", "true")   # only the literal "1" arms it
+    ns._proposals_handle = None
+    assert ns._maybe_start_proposals_server() is None
+    assert ns._proposals_handle is None
+
+
+def test_maybe_start_proposals_server_warns_without_gguf(monkeypatch, caplog):
+    monkeypatch.setenv("NKS_REMOTE_PROPOSALS", "1")
+    monkeypatch.delenv("NKS_VERIFIER_GGUF", raising=False)
+    ns._proposals_handle = None
+    with caplog.at_level(logging.WARNING, logger="nakshatra_serve"):
+        result = ns._maybe_start_proposals_server()
+    assert result is None
+    assert ns._proposals_handle is None
+    assert any("NKS_VERIFIER_GGUF" in r.message for r in caplog.records)
+
+
+def test_maybe_start_proposals_server_wires_the_real_adapter(monkeypatch, tmp_path):
+    # Doesn't touch llama_cpp/a real GGUF: swaps in a fake remote_verifier_backend
+    # module to prove nakshatra_serve reads the env + calls start_proposals_server
+    # with the right arguments — the adapter's OWN correctness is
+    # tests/test_remote_verifier_backend.py's job.
+    calls = {}
+
+    class _FakeHttpd:
+        server_address = ("127.0.0.1", 54321)
+
+    class _FakeModule:
+        @staticmethod
+        def start_proposals_server(model_path, **kwargs):
+            calls["model_path"] = model_path
+            calls["kwargs"] = kwargs
+            return (_FakeHttpd(), "thread-stub", "verifier-stub", "session-stub")
+
+    monkeypatch.setitem(sys.modules, "remote_verifier_backend", _FakeModule)
+    monkeypatch.setenv("NKS_REMOTE_PROPOSALS", "1")
+    monkeypatch.setenv("NKS_VERIFIER_GGUF", str(tmp_path / "verifier.gguf"))
+    monkeypatch.setenv("NKS_PROPOSALS_PORT", "0")
+    ns._proposals_handle = None
+    try:
+        handle = ns._maybe_start_proposals_server()
+        assert handle is not None
+        assert calls["model_path"] == str(tmp_path / "verifier.gguf")
+        assert calls["kwargs"]["port"] == 0
+        assert calls["kwargs"]["host"] == "127.0.0.1"
+        assert ns._proposals_handle is not None
+    finally:
+        ns._proposals_handle = None
+
+
+def test_import_nakshatra_serve_does_not_pull_llama_cpp_or_adapter():
+    """Flag-off must mean byte-identical serve behavior — including no new
+    import-time dependency. Runs in a FRESH subprocess (not this test process,
+    which may already have imported these modules via other tests) and checks
+    neither `llama_cpp` nor the adapter module land in sys.modules merely from
+    `import nakshatra_serve`."""
+    import subprocess
+    scripts_dir = str(Path(__file__).resolve().parent.parent / "scripts")
+    code = (
+        f"import sys; sys.path.insert(0, {scripts_dir!r}); import nakshatra_serve; "
+        "print('llama_cpp' in sys.modules, 'remote_verifier_backend' in sys.modules)"
+    )
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True,
+                         text=True, timeout=30)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == "False False", out.stdout
