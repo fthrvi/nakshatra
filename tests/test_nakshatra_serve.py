@@ -608,10 +608,33 @@ def test_render_gemma_maps_assistant_to_model():
 
 
 def test_render_prompt_unknown_family_defaults_to_llama():
+    # NB: this used to use family="qwen" as the stand-in for "unknown" — which
+    # is exactly how the deep rung shipped 2026-07-30, prompting a Qwen3 chain
+    # with the Llama-3 template. Use a family we genuinely do not template.
     entry = ns.ModelEntry(name="x", tokenizer_gguf="t", chain_yaml="c",
-                          details={"family": "qwen"})
+                          details={"family": "mistral"})
     out = ns._render_prompt([{"role": "user", "content": "hi"}], entry)
     assert out.startswith("<|begin_of_text|>")
+
+
+def test_render_prompt_qwen_family_uses_chatml():
+    for fam in ("qwen3moe", "qwen2", "chatml"):
+        entry = ns.ModelEntry(name="x", tokenizer_gguf="t", chain_yaml="c",
+                              details={"family": fam})
+        out = ns._render_prompt([{"role": "user", "content": "hi"}], entry)
+        assert out.startswith("<|im_start|>user\n"), fam
+        assert out.endswith("<|im_start|>assistant\n"), fam
+        assert "<|eot_id|>" not in out, fam
+
+
+def test_render_chatml_keeps_system_and_turn_order():
+    out = ns._render_chatml([{"role": "system", "content": "be terse"},
+                             {"role": "user", "content": "hi"},
+                             {"role": "assistant", "content": "hello"},
+                             {"role": "user", "content": "more"}])
+    assert out.index("be terse") < out.index("hi") < out.index("hello")
+    assert out.count("<|im_end|>") == 4
+    assert out.endswith("<|im_start|>assistant\n")
 
 
 # ── OpenAI-compat surface (/v1) ─────────────────────────────────────

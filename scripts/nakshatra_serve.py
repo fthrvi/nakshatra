@@ -449,17 +449,40 @@ def _render_gemma(messages: list) -> str:
     return "".join(out)
 
 
+def _render_chatml(messages: list) -> str:
+    """ChatML — the Qwen family (and most non-Llama chat models): each turn is
+    ``<|im_start|>role\\n content <|im_end|>``, ending with an open assistant
+    turn. Qwen3 "Thinking" builds then emit their reasoning inside ``<think>``
+    before the answer, which the caller strips."""
+    parts = []
+    for m in messages:
+        parts.append(f"<|im_start|>{m.get('role', 'user')}\n"
+                     f"{m.get('content', '')}<|im_end|>\n")
+    parts.append("<|im_start|>assistant\n")
+    return "".join(parts)
+
+
 def _render_prompt(messages: list, entry: ModelEntry) -> str:
     """Render Ollama ``messages`` into one prompt string, dispatching by model
-    family (Phase E). Llama-3 and Gemma — the two families actually in play
-    (the 70B chain and Prithvi's conscious gemma3) — have hand-written
-    templates; unknown families default to Llama-3. The fully general path
-    (apply the GGUF's embedded ``tokenizer.chat_template`` via llama_cpp) is a
-    box-side follow-on; it needs the GGUF + llama_cpp, so it can't be unit-
-    tested on the gateway host."""
+    family (Phase E). Llama-3, Gemma and ChatML/Qwen — the families actually in
+    play (the 70B chain, Prithvi's conscious gemma3, and the Qwen3-30B deep
+    rung) — have hand-written templates; unknown families default to Llama-3.
+
+    The Qwen branch was added 2026-07-30 after the deep rung went live: a
+    ``qwen3moe`` chain fell through to the Llama-3 template, so every deep
+    thought was prompted in the wrong format and echoed a stray ``<|eot_id|>``
+    back into Prithvi's reasoning. Coherent output masked it — the model was
+    robust enough to answer anyway, which is exactly why family dispatch has to
+    be explicit rather than "whatever the default is".
+
+    The fully general path (apply the GGUF's embedded
+    ``tokenizer.chat_template`` via llama_cpp) is a box-side follow-on; it needs
+    the GGUF + llama_cpp, so it can't be unit-tested on the gateway host."""
     family = (entry.details.get("family") or "").lower()
     if "gemma" in family:
         return _render_gemma(messages)
+    if "qwen" in family or "chatml" in family:
+        return _render_chatml(messages)
     return _render_llama3(messages)
 
 
