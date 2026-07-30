@@ -1,0 +1,24 @@
+[Unit]
+Description=Nakshatra deep rung — the 30B split chain as an OpenAI-compatible model (:11600), scale-to-zero
+Documentation=file:///home/prithvi/nakshatra/docs/findings/cuda-chain-51-tok-s.md
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/prithvi/nakshatra
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# scale-to-zero: hub stage is a local unit, ijru stage is summoned over SSH.
+# Neither holds a GPU until a request arrives; both reaped after the grace.
+Environment=NAKSHATRA_LIFECYCLE_UNITS=nakshatra-q3-hub.service
+Environment=NAKSHATRA_LIFECYCLE_PROBES=127.0.0.1:5562
+Environment=NAKSHATRA_LIFECYCLE_REMOTE_CONFIG=/home/prithvi/.nakshatra/lifecycle-deep30b.json
+Environment=NAKSHATRA_LIFECYCLE_IDLE_GRACE_S=600
+Environment=NAKSHATRA_LIFECYCLE_START_TIMEOUT_S=240
+ExecStart=/home/prithvi/nakshatra/.venv/bin/python /home/prithvi/nakshatra/scripts/nakshatra_serve.py \
+  --port 11600 --bind 127.0.0.1,10.42.0.1 \
+  --models /home/prithvi/.nakshatra/serve_models.deep30b.yaml
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

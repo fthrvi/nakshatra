@@ -1,0 +1,18 @@
+{
+  "_comment": [
+    "Remote arm of the deep chain's scale-to-zero: ijru's CUDA stage.",
+    "launch uses systemd-run --user, NOT nohup/setsid — a plain background",
+    "launch was killed repeatedly when the ssh session closed (2026-07-29).",
+    "stop_match reaps by the port so a stray worker can never linger on a",
+    "borrowed GPU."
+  ],
+  "remote_workers": [
+    {
+      "name": "ijru-gpu",
+      "ssh": "prithviraj@10.0.0.233",
+      "launch": "systemd-run --user --unit=nks-q3-ijru --collect --setenv=HOME=/home/prithviraj /usr/bin/python3 /home/prithviraj/nakshatra/scripts/worker.py --port 5572 --sub-gguf /home/prithviraj/.nakshatra/slices/qwen3-30b-q3-L15-48.gguf --mode last --layer-start 15 --layer-end 48 --daemon-bin /home/prithviraj/llama.cpp/build-cuda-static/bin/llama-nakshatra-worker --n-ctx 4096 --n-gpu-layers 99",
+      "probe": "10.0.0.233:5572",
+      "stop_match": "worker.py --port 5572"
+    }
+  ]
+}
