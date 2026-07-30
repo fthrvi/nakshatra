@@ -120,3 +120,39 @@ a node with real free VRAM rather than the same card as the chain stage; (c) a d
 Biswa-approved maintenance window where the pinned voice model is released first. Until one of
 those exists, the standing recommendation is unchanged: **plain streaming for chain serving
 (51 tok/s), speculation OFF.**
+
+
+## The GPU-draft test, actually run (2026-07-29 ~22:20) — and the real lesson
+
+Biswa asked whether to push his conscious self to CPU to free VRAM. **We did not.** The 22 GB
+tenant was the *voice test model* (`qwen3:30b-a3b`, pinned that morning for the voice
+experiment) — stateless and re-summonable — so it was released instead and re-pinned
+afterwards. His self was never demoted. (Recommended pattern for any future bench that needs
+headroom: release the replaceable tenant, never the self.)
+
+With ~30 GB free, all four configurations on the identical chain/prompt/budget:
+
+| decode path | draft | tok/s | worker time / wall |
+|---|---|---|---|
+| speculative (unary) | CPU | 4.99 | 2.0 s / 19.2 s |
+| speculative (unary) | **GPU** | **12.20** | 2.2 s / 7.9 s |
+| async pipelined | CPU | 0.10 | 5.3 s / 946 s |
+| async pipelined | **GPU** | **6.60** | 7.9 s / 14.6 s |
+| **plain streaming** | — | **51–53** | 1.8 s / 1.9 s |
+
+**The GPU draft is worth 2.4× to speculation (4.99 → 12.20) and 66× to pipelining
+(0.10 → 6.60) — and neither comes close to plain streaming.** So the CPU draft was never the
+whole story; it was masking the real finding:
+
+**The unary RPC path is the bottleneck, not the algorithm.** Both speculative and pipelined
+decode ride `Forward` unary calls (that is where `all_logits`/`keep_kv`/`start_pos` live);
+plain decode rides the persistent streaming channel. Per token the streaming path costs ~5–11 ms
+per stage; the unary path pays setup on every one of its 44–128 calls. Speculation's whole
+premise — amortise the expensive step over K tokens — is defeated when the *transport* per call
+costs more than the compute it is amortising.
+
+**Standing recommendation (unchanged, now fully evidenced): plain streaming for chain serving,
+`--speculative` OFF, `NKS_ASYNC_PIPELINE` OFF.** The genuinely promising direction is not a
+better draft but **speculative decode ON the streaming transport** — i.e. teach the streaming
+path to carry K-token verify batches. Until that exists, spec-decode's measured 2.7× on a
+single model does not survive the trip onto this chain.
