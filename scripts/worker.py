@@ -1169,6 +1169,13 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                 # Clients/lifecycle probe these before using them; absent on old workers.
                 "sleep_wake",
                 "eagle_hidden",
+                # 2026-07-29: speculative decode ON THE STREAM — this worker's Inference
+                # handler honours InferenceStep.all_logits (returns one argmax per input
+                # position on mode=last, instead of only the final one). The client only
+                # engages --stream-spec when EVERY worker in the chain advertises this;
+                # an old worker silently ignoring the field would return a single token
+                # where K+1 were expected, so absence must hard-refuse, never degrade quietly.
+                "stream_spec",
             ] + _control_version_caps(),
         )
 
@@ -1414,7 +1421,10 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                     )
                     return
 
-                flags = 0x0 if first_step else 0x1
+                # 2026-07-29 stream-spec: OR in the same 0x2 all_logits bit the unary
+                # Forward path sets (_run_forward above) — one daemon.call primitive,
+                # two transports. Default false -> flags unchanged -> byte-identical.
+                flags = (0x0 if first_step else 0x1) | (0x2 if step.all_logits else 0x0)
                 first_step = False
                 # Phase D3 (2026-05-20): bound prefix_length. Proto
                 # already enforces int type, but unbounded value
@@ -1478,8 +1488,16 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                     prefix_length=step.prefix_length + n_tokens,
                 )
                 if self.mode == "last":
-                    token_id = struct.unpack("<i", payload[:4])[0]
-                    out.token_ids.ids.append(token_id)
+                    if step.all_logits:
+                        # stream-spec verify: one argmax per input position (a
+                        # single-final-token response here would silently truncate
+                        # a K+1-position verify to 1 — the capability gate in
+                        # client.py is what makes this branch safe to take).
+                        n_ids = len(payload) // 4
+                        out.token_ids.ids.extend(struct.unpack(f"<{n_ids}i", payload))
+                    else:
+                        token_id = struct.unpack("<i", payload[:4])[0]
+                        out.token_ids.ids.append(token_id)
                 else:
                     if _ACT_QUANT:   # non-last: quantize the emitted hidden to int8 for the wire
                         from act_quant import quantize_int8

@@ -51,6 +51,8 @@ message InfoResponse {
   //                          generated-tokens) replay after recovery
   //   "sleep_wake"         — Sleep/Wake RPCs (GPU release/re-acquire, 2026-06-21)
   //   "eagle_hidden"       — ForwardRequest.eagle_hidden returns draft hidden states
+  //   "stream_spec"        — InferenceStep.all_logits honoured on the streaming
+  //                          Inference RPC (speculative decode on the stream, 2026-07-29)
   repeated string protocol_capabilities = 12;
 }
 
@@ -119,6 +121,20 @@ message InferenceStep {
   NextServer next_server = 14;
   bool       pushed      = 15;       // true when this step arrived via push, not direct from client
   repeated NextServer chain = 16;    // v2: full remaining chain; head = immediate next; pop on forward
+
+  // Speculative decoding ON THE STREAM (2026-07-29): request the greedy argmax at
+  // EVERY position, not just the last — the streaming twin of ForwardRequest.all_logits
+  // (field 7), so a verify traversal can ride the persistent Inference stream instead of
+  // paying unary Forward's per-call setup on every one of K+1 positions. Default false ->
+  // legacy single-final-token behaviour, byte-identical to today. On the last worker with
+  // all_logits=true, the response's token_ids.ids carries one argmax per input position
+  // (length == the step's token/hidden count) instead of a single id. Non-last workers are
+  // unaffected — they keep returning hidden_state either way. Older workers silently ignore
+  // this field (proto3), so the client MUST refuse stream-spec unless every worker in the
+  // chain advertises the "stream_spec" capability (see InfoResponse.protocol_capabilities) —
+  // otherwise an old worker would return a single token where K+1 were expected, corrupting
+  // accept() silently instead of failing loud.
+  bool       all_logits  = 17;
 }
 
 message NextServer {
