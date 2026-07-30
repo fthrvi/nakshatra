@@ -536,6 +536,18 @@ def main():
                          "(e.g. Llama-3.2-1B); runs locally on the coordinator")
     ap.add_argument("--draft-max", type=int, default=4,
                     help="K: number of tokens the draft proposes per step")
+    # Async pipelining (Shard's 2.94→16.6 tok/s technique): keep several spec verify-chunks
+    # in flight so every worker stage stays busy instead of one-at-a-time (the pipeline
+    # bubble). Correctness stays byte-identical to greedy (commit-only-confirmed invariant in
+    # async_pipeline.py). Default OFF — the proven sequential path is untouched. Applies only
+    # to the explicit-stage streaming path with spec active (not --use-streaming-push).
+    ap.add_argument("--async-pipeline", action="store_true",
+                    default=os.environ.get("NKS_ASYNC_PIPELINE") == "1",
+                    help="pipeline speculative decode: keep N verify-chunks in flight "
+                         "(env NKS_ASYNC_PIPELINE=1)")
+    ap.add_argument("--async-inflight", type=int,
+                    default=int(os.environ.get("NKS_ASYNC_INFLIGHT", "3")),
+                    help="max speculative verify-chunks in flight (pipeline depth target)")
     # EAGLE→live (2026-06-21): swap the GGUF draft for the matched EAGLE-3 head,
     # fed by the FIRST worker's cmd=5 hidden states (isolated on scratch seq 1).
     # Requires every worker to advertise the "eagle_hidden" capability.
@@ -838,6 +850,62 @@ def main():
                             keep_kv=keep_kv, start_pos=prefix_length, timing=timing,
                             all_logits=all_logits)
 
+    def _run_async_pipeline():
+        """Async-pipelined speculative decode over the unary-Forward chain (spec's transport).
+
+        Keeps up to args.async_inflight verify-chunks in flight so every worker stage stays busy
+        instead of one-at-a-time. Output is byte-identical to the sequential spec path — the
+        scheduler (async_pipeline.pipelined_spec_decode) commits only verify-confirmed tokens and
+        flushes mispredicted speculative chunks, whose KV writes the daemon rewinds via start_pos.
+        Appends committed tokens to `generated`; raises on transport fault so the caller can fall
+        back to sequential decode."""
+        from async_pipeline import PipelineChain, pipelined_spec_decode
+
+        stubs = [t[1] for t in sorted_stubs]
+        wids = [t[0]["id"] for t in sorted_stubs]
+
+        # Stage adapter for worker i: verify traversal ⇒ all_logits=True, keep_kv=True. The
+        # daemon trims its KV to start_pos before decoding (M3 fusion) — which is exactly the
+        # rewind a flushed chunk's corrected re-issue relies on. `meta` (unique per issued chunk)
+        # is unused here because unary Forward has no step_id idempotency cache; it exists so the
+        # streaming variant can key on it without a corrupt cache hit.
+        def make_stage(i):
+            def stage(payload, n, start_pos, first, last, meta):
+                return call_forward(stubs[i], payload, n, has_token_ids=first,
+                                    worker_id=wids[i], keep_kv=True, start_pos=start_pos,
+                                    all_logits=True, timing=timing)
+            return stage
+        chain = PipelineChain([make_stage(i) for i in range(len(sorted_stubs))])
+        try:
+            # ── cold prefill (sequential, plain): establish KV on every worker ──────────
+            pre = list(tokens) + list(generated)
+            n_pre = len(pre)
+            buf = struct.pack(f"<{n_pre}i", *pre)
+            for i, (w, stub, _) in enumerate(sorted_stubs):
+                buf = call_forward(stub, buf, n_pre, has_token_ids=(i == 0), worker_id=w["id"],
+                                   keep_kv=False, start_pos=0, timing=timing)
+                if i < len(sorted_stubs) - 1 and len(buf) != _hidden_bytes(n_pre, n_embd):
+                    raise RuntimeError(f"async prefill: worker {w['id']!r} returned {len(buf)} bytes")
+            first_id = struct.unpack("<i", buf)[0]
+            generated.append(first_id)
+            print(f"[async] prefill → id={first_id} '{detok_one(llama, first_id)}'; "
+                  f"pipelining spec-decode, depth={args.async_inflight}, K={spec_k}", flush=True)
+            if first_id in LLAMA3_EOS_IDS:
+                return
+
+            def _emit(t):
+                print(f"[async] +'{detok_one(llama, t)}' (id={t})", flush=True)
+
+            out = pipelined_spec_decode(
+                chain=chain, propose=draft.propose, prompt=pre, first_cur=first_id,
+                start_pos0=n_pre, spec_k=spec_k,
+                max_new=max(0, args.max_tokens - len(generated)),
+                max_inflight=max(1, int(args.async_inflight)),
+                eos_ids=LLAMA3_EOS_IDS, on_token=_emit)
+            generated.extend(out)
+        finally:
+            chain.close()
+
     # v0.5 M0.5.4 v0: recovery loop. Wraps the chain walk in an outer
     # retry that, on stream/RPC failure, closes streams, opens fresh ones,
     # and re-prefills with (prompt + tokens already generated). The model
@@ -879,6 +947,27 @@ def main():
 
         prefix_length = 0  # workers' KV is fresh on (re-)open
         already_done = len(generated)
+
+        # ── Async-pipelined speculative decode (opt-in) ────────────────────────────────
+        # Spec-decode runs over the unary Forward path, so async pipelining applies there
+        # (not streaming/push). On any transport fault, drop spec + fall back to the proven
+        # sequential loop via the normal recovery machinery.
+        if (args.async_pipeline and spec_active
+                and not args.use_streaming and not args.use_streaming_push):
+            try:
+                _run_async_pipeline()
+                break  # generation complete → leave the recovery loop
+            except (grpc.RpcError, RuntimeError) as e:
+                print(f"[async] pipeline failed ({type(e).__name__}: {e}); "
+                      f"falling back to sequential decode", file=sys.stderr)
+                spec_active = False   # a mid-pipeline fault may leave KV inconsistent
+                recovery_attempts += 1
+                if recovery_attempts > args.max_recovery_attempts:
+                    for s in streamers:
+                        s.close()
+                    raise
+                restart_requested = True
+                continue
 
         try:
             for step in range(already_done, args.max_tokens):
