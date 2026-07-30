@@ -209,7 +209,7 @@ class InferenceStream:
 
 def call_inference_step(streamer, payload, n_tokens, has_token_ids,
                          session_id, step_idx, prefix_length, timing=None,
-                         next_server=None, chain=None):
+                         next_server=None, chain=None, all_logits=False):
     """v0.5 M0.5.1 streaming equivalent of call_forward. Returns raw bytes
     matching Forward's return shape (hidden state OR int32 token id), so
     chain-walk code consumes the result identically.
@@ -220,11 +220,19 @@ def call_inference_step(streamer, payload, n_tokens, has_token_ids,
       - chain (v0.5 M0.5.3 v2): list of NextServer for the WHOLE remaining
         chain after the receiving worker. Each downstream worker pops the
         head and forwards the rest. Works for chains of any length.
+
+    all_logits (2026-07-29 stream-spec): the streaming twin of call_forward's
+    all_logits — request one argmax per input position instead of only the
+    last. Default False -> identical to the plain streaming path today. When
+    the receiving worker is mode=last with all_logits=True, `resp.token_ids.ids`
+    carries n_tokens ids and the returned bytes are n_tokens*4 (K+1 verify
+    argmaxes), which the generic packing below already handles unchanged.
     """
     step = pb.InferenceStep(
         session_id=session_id,
         step_id=f"step-{step_idx}",
         prefix_length=prefix_length,
+        all_logits=all_logits,
     )
     if has_token_ids:
         ids = list(struct.unpack(f"<{n_tokens}i", payload))
@@ -267,6 +275,79 @@ def call_inference_step(streamer, payload, n_tokens, has_token_ids,
     # lets the v2 is_transport_fault gate skip the pointless churn in one line.
     raise EdgeError(peer_id=streamer.worker_id, kind=EdgeFailureKind.PROTOCOL,
                     reason="returned an empty step", phase="forward")
+
+
+# ── Speculative decode ON THE STREAM (2026-07-29) ──────────────────────────────
+# docs/findings/cuda-chain-51-tok-s.md: unary --speculative pays per-call RPC setup
+# on every one of K+1 verify positions and loses to plain streaming even with a GPU
+# draft (12.20 vs 51-53 tok/s). This carries the SAME verify traversal (accept()/
+# kv_keep_after() from speculative.py, unchanged) over the persistent per-worker
+# Inference streams instead, using InferenceStep.all_logits + a prefix_length
+# rewind on the next step (worker.py already trims KV to start_pos==prefix_length
+# before decoding — the same primitive the unary M3 fusion uses, now driven
+# through the stream).
+
+def stream_spec_disable_reasons(use_streaming: bool, use_streaming_push: bool,
+                                draft_ready: bool, worker_caps) -> list[str]:
+    """Pure gate — no gRPC, no draft model. `worker_caps` is an iterable of
+    (worker_id, capabilities_list) pairs, one per chain member (mirrors the
+    `sorted_stubs` shape client.py already has: `[(w, stub, info), ...]`, so
+    call sites pass `[(w["id"], info.protocol_capabilities) for w, _, info in
+    sorted_stubs]`). Returns an empty list when stream-spec may engage;
+    otherwise a list of human-readable reasons it must fall back to plain
+    streaming decode. Protobuf silently ignores fields it doesn't recognize,
+    so an old worker missing 'stream_spec' would return ONE token where K+1
+    were expected — this refusal is what makes that failure mode impossible
+    instead of a silent wrong answer."""
+    reasons = []
+    if not use_streaming or use_streaming_push:
+        reasons.append("--stream-spec requires --use-streaming (not --use-streaming-push)")
+    if not draft_ready:
+        reasons.append("no --draft-model-path")
+    non_ss = [wid for wid, caps in worker_caps if "stream_spec" not in caps]
+    if non_ss:
+        reasons.append(f"workers lack 'stream_spec' capability: {non_ss}")
+    return reasons
+
+
+def stream_spec_verify_fn(streamers, sorted_stubs, n_embd, session_id, step_idx,
+                          prefix_length, timing=None):
+    """Build a verify_fn(token_ids) -> List[int] closure matching
+    speculative.speculative_round's contract, driven over the persistent
+    per-worker Inference streams instead of unary Forward. `prefix_length` is
+    held FIXED for the whole verify round (the workers' KV already covers
+    [0, prefix_length) plus whatever the LAST round's rejected tail wrote —
+    the daemon call at this prefix_length re-decodes from there); the caller
+    is responsible for advancing prefix_length via kv_keep_after() after
+    accept() decides how many of this round's positions to keep — THAT
+    reassignment is the KV rewind, and it happens once, up in the decode
+    loop, not per worker call here."""
+    def verify_fn(verify_tokens):
+        n_v = len(verify_tokens)
+        payload = struct.pack(f"<{n_v}i", *verify_tokens)
+        hidden = call_inference_step(streamers[0], payload, n_v, True,
+                                     session_id=session_id, step_idx=step_idx,
+                                     prefix_length=prefix_length, timing=timing,
+                                     all_logits=True)
+        if len(hidden) != _hidden_bytes(n_v, n_embd):
+            raise RuntimeError(f"stream-spec: first worker returned {len(hidden)} bytes")
+        for idx, stub_tup in enumerate(sorted_stubs[1:-1], start=1):
+            hidden = call_inference_step(streamers[idx], hidden, n_v, False,
+                                         session_id=session_id, step_idx=step_idx,
+                                         prefix_length=prefix_length, timing=timing,
+                                         all_logits=True)
+            if len(hidden) != _hidden_bytes(n_v, n_embd):
+                raise RuntimeError(f"stream-spec: middle worker returned {len(hidden)} bytes")
+        last_i = len(sorted_stubs) - 1
+        last_resp = call_inference_step(streamers[last_i], hidden, n_v, False,
+                                        session_id=session_id, step_idx=step_idx,
+                                        prefix_length=prefix_length, timing=timing,
+                                        all_logits=True)
+        if len(last_resp) != n_v * 4:
+            raise RuntimeError(f"stream-spec: last worker returned {len(last_resp)} bytes, "
+                               f"expected {n_v * 4} verify argmaxes")
+        return list(struct.unpack(f"<{n_v}i", last_resp))
+    return verify_fn
 
 
 def _peer_chain_score(peer: dict) -> int:
@@ -536,6 +617,19 @@ def main():
                          "(e.g. Llama-3.2-1B); runs locally on the coordinator")
     ap.add_argument("--draft-max", type=int, default=4,
                     help="K: number of tokens the draft proposes per step")
+    # Speculative decode ON THE STREAM (2026-07-29, docs/findings/cuda-chain-51-tok-s.md):
+    # the unary --speculative path pays per-call RPC setup on every one of K+1 verify
+    # positions and loses even to plain streaming with a GPU draft. This reuses the same
+    # accept()/DraftModel machinery but rides the persistent Inference stream (all_logits
+    # on InferenceStep + a prefix_length rewind) instead of unary Forward. Default OFF;
+    # also enabled by env NKS_STREAM_SPEC=1. Needs --draft-model-path (or --eagle-head is
+    # NOT yet wired for this path) and --use-streaming (not push); refuses and falls back
+    # to plain streaming unless EVERY worker advertises the "stream_spec" capability.
+    ap.add_argument("--stream-spec", action="store_true",
+                    default=os.environ.get("NKS_STREAM_SPEC") == "1",
+                    help="speculative decode over the persistent streaming Inference RPC "
+                         "instead of unary Forward (needs --use-streaming + "
+                         "--draft-model-path; env NKS_STREAM_SPEC=1)")
     # Async pipelining (Shard's 2.94→16.6 tok/s technique): keep several spec verify-chunks
     # in flight so every worker stage stays busy instead of one-at-a-time (the pipeline
     # bubble). Correctness stays byte-identical to greedy (commit-only-confirmed invariant in
@@ -789,6 +883,32 @@ def main():
             except Exception as e:
                 print(f"[spec] draft load failed ({e!r}) — plain decode.", file=sys.stderr)
 
+    # ── Speculative decode ON THE STREAM setup ─────────────────────────────────
+    # Independent of the unary --speculative gate above (which explicitly disables
+    # itself in streaming mode — "slice 1 verify is unary-only"). Engages only when
+    # requested, a draft model loads, and every worker in the chain advertises
+    # "stream_spec". Any miss -> plain streaming decode (no error).
+    stream_spec_active = False
+    stream_draft = None
+    if args.stream_spec:
+        worker_caps = [(w["id"], info.protocol_capabilities) for w, _, info in sorted_stubs]
+        ss_reasons = stream_spec_disable_reasons(
+            args.use_streaming, args.use_streaming_push,
+            bool(args.draft_model_path), worker_caps,
+        )
+        if ss_reasons:
+            print(f"[stream-spec] requested but disabled: {'; '.join(ss_reasons)} — "
+                  f"falling back to plain streaming decode.", file=sys.stderr)
+        else:
+            try:
+                from speculative import DraftModel, accept, kv_keep_after, speculative_round
+                stream_draft = DraftModel(args.draft_model_path)
+                stream_spec_active = True
+                print(f"[stream-spec] ON: draft={args.draft_model_path} K={spec_k}", flush=True)
+            except Exception as e:
+                print(f"[stream-spec] draft load failed ({e!r}) — plain streaming decode.",
+                      file=sys.stderr)
+
     # Streaming KV reuse: workers keep their KV cache across steps. Step 0 is
     # the cold prefill (full prompt, keep_kv=False, start_pos=0). Each later
     # step ships only the previous newly-generated token (n=1, keep_kv=True,
@@ -971,6 +1091,41 @@ def main():
 
         try:
             for step in range(already_done, args.max_tokens):
+                # ── Speculative decode ON THE STREAM (2026-07-29) ───────────────
+                # Same shape as the unary spec branch below, but the verify traversal
+                # rides the persistent per-worker Inference streams (stream_spec_verify_fn)
+                # instead of unary Forward — that's the whole point (no per-call RPC setup
+                # on each of the K+1 verify positions). Reuses speculative_round (unchanged,
+                # already proven byte-identical-to-greedy) so only the transport differs.
+                if stream_spec_active and step > already_done:
+                    verify_fn = stream_spec_verify_fn(
+                        streamers, sorted_stubs, n_embd, session_id, step,
+                        prefix_length, timing=timing)
+                    res, drafts = speculative_round(
+                        stream_draft, tokens + generated, spec_k, verify_fn)
+                    # KV rewind: the workers' streams just wrote all n_v verify positions;
+                    # the NEXT step's prefix_length is the kept-KV length, smaller when the
+                    # draft was wrong anywhere — worker.py's Inference handler passes this
+                    # straight through as start_pos to the daemon (keep_kv=True), which
+                    # trims to it before decoding. Same primitive as the unary M3 fusion,
+                    # now driven over the stream.
+                    prefix_length = kv_keep_after(prefix_length, res.n_accepted)
+                    stop = False
+                    for t in res.committed:
+                        if len(generated) >= args.max_tokens:
+                            stop = True
+                            break
+                        generated.append(t)
+                        if t in LLAMA3_EOS_IDS:
+                            print(f"[stream-spec] step {step+1}: EOS {t} — stopping")
+                            stop = True
+                            break
+                        print(f"[stream-spec] step {step+1}: +'{detok_one(llama, t)}' "
+                              f"(accept {res.n_accepted}/{spec_k})", flush=True)
+                    if stop or len(generated) >= args.max_tokens:
+                        break
+                    continue
+
                 # ── Speculative decode (slice 1) ──────────────────────────────
                 # Decode phase only; the cold prefill (step == already_done) stays
                 # plain. The draft proposes K tokens; ONE verify traversal (all_logits)
@@ -1102,6 +1257,14 @@ def main():
                 spec_active = False
                 print("[spec] disabling speculative decode after failure; "
                       "recovery replays with plain decode.", file=sys.stderr)
+            if stream_spec_active:
+                # Same reasoning as spec_active above: a verify round may have left
+                # per-worker KV inconsistent (rewind not yet applied everywhere).
+                # Recovery re-opens fresh streams and cold-replays, so plain streaming
+                # decode is the safe resume path.
+                stream_spec_active = False
+                print("[stream-spec] disabling stream-spec after failure; "
+                      "recovery replays with plain streaming decode.", file=sys.stderr)
             kind = "simulated" if isinstance(e, SimulatedFailure) else type(e).__name__
             print(f"[recovery] {kind} failure: {e}", file=sys.stderr)
             if recovery_attempts > args.max_recovery_attempts:
