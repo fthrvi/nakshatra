@@ -222,3 +222,37 @@ actual finding:
 - `tests/test_worker_stream_spec.py`, `tests/test_client_stream_spec.py` — 22 new tests.
 - Receipts from the live run: `/tmp/claude-1000/wt-stream-spec/.receipts/*.json` (not
   committed — scratch, matches the repo's convention of not checking in run receipts).
+
+
+## Independent re-run (coordinator, 2026-07-29 ~23:10) — and WHY speculation loses here
+
+Re-ran on the same chain after merging to main, with the voice model released for headroom
+(his self never touched) and both workers on their GPUs:
+
+| run | flags | tok/s | output_sha256 |
+|---|---|---|---|
+| plain streaming | `--use-streaming` | **45.5** (51-65 across runs) | `d8522cc25569` |
+| **stream-spec** | `--speculative --use-streaming --stream-spec` | **16.09** | `acbf8f81c377` |
+| unary spec (earlier, same session) | `--speculative` | 12.20 | `acbf8f81c377` |
+
+**stream-spec is ~30 % faster than unary spec (16.09 vs 12.20) and byte-identical to it** —
+the transport change works exactly as designed. But it is still ~3× slower than plain
+streaming, so the transport was NOT the dominant cost. Two capability-gate behaviours were
+confirmed live and are worth keeping: the client refused stream-spec with a clear message when
+`--use-streaming` was absent, and both workers advertised the new `stream_spec` capability.
+
+### The real reason: this target model is already draft-speed
+
+Speculative decoding only pays when *target cost ≫ draft cost*. Our target is
+**Qwen3-30B-A3B — an MoE with only ~3 B active parameters per token**, split across two GPUs at
+~11 ms/stage (~20 ms/token). The 0.6 B draft, sharing the same 9070 XT, costs a comparable
+amount per proposal. Paying K draft steps to save K×20 ms is a losing trade; the technique's
+whole premise is missing on this deployment.
+
+**Prediction (and the test that would falsify it):** speculation should pay on a **dense**
+target where the ratio is real — e.g. the planned 70 B split (Sthambha Stage 2). Same code,
+same flags, ratio inverted. Until then, chain serving stays on plain streaming.
+
+### Operational notes from this run
+- ijru has **no forgejo push key**; syncing it means `scp`-ing `scripts/{worker.py,nakshatra_pb2.py,nakshatra_pb2_grpc.py}` from the hub (done — ijru now runs main's worker; its git tree therefore shows drift, and `nakshatra_pb2*.py` are new files there).
+- The ROCm wheel was built `-DAMDGPU_TARGETS=gfx1201` only, so the draft **segfaults on the 7900 XT (gfx1100)** — it must run on GPU index 1. Rebuild with both targets if the draft ever needs the other card.
