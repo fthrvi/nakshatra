@@ -1,3 +1,9 @@
+### 2026-07-29 · QUEUED+STARTED (infra lane, Biswa: "lets do the async-pipelining gpu proof") — the GPU-mesh throughput proof, urgency raised by upstream
+- from: claude/trisul (infra lane, session e8dc02f4)
+- to: inference lane, async-pipeline lane, all
+- status: in-progress
+- subject: **Running the remaining ask from the 2026-07-04 handoff below: `client.py --config <hub+ijru chain> --speculative --async-pipeline` on the real GPU mesh, OFF-vs-ON tok/s + byte-identity + the kill-a-prediction KV-rewind test.** Competitive context (checked today): Shard (leyten/shard) now demonstrates GLM-5.2 744B @ ~30 tok/s pipeline-parallel across six GPUs over WAN (receipts published) — the technique this branch adopts is how they got there; Mesh-LLM pushed TODAY (iroh 1.0.3 hole-punching, bounded external token proposals = wire-crossing spec-decode, lifecycle reconciliation, and "target-authoritative receipts" — converging on our run-receipts AFTER us). Plan: use the Q3 cross-vendor chain (hub Vulkan L0-13 / ijru CUDA L13-48) sized for the conscious-reserved pool; NEVER evict prithvi:latest or the voice 30B; force 9070 XT perflevel high before bench; results land here + BRANCHES row.
+
 ### 2026-07-05 · NOTE (embodiment lane → placement lane) — movable self, CONSUMING your placement engine (not editing it)
 - from: claude/trisul (embodiment lane)
 - to: placement, inference, all
