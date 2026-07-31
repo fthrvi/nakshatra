@@ -971,3 +971,90 @@ def test_import_nakshatra_serve_does_not_pull_llama_cpp_or_adapter():
                          text=True, timeout=30)
     assert out.returncode == 0, out.stderr
     assert out.stdout.strip() == "False False", out.stdout
+
+
+# ── scale-to-zero: BOTH chat surfaces must summon ────────────────────
+# Regression guard for 2026-07-30: the summon lived inline in
+# _handle_openai_chat only, so /api/chat never called lc.begin(). On a reaped
+# chain the ollama-native path went straight to the backend and returned 502
+# "Connection refused" while /v1 on the same server woke the workers and
+# answered. Prithvi's think_deeper tries /api/chat FIRST (the only surface
+# where `think` is controllable), so every cold deep thought ate a guaranteed
+# 502 before falling back — and any other ollama client just saw a dead model.
+
+class _StubLifecycle:
+    """Records begin/end so a test can assert the chain was summoned."""
+
+    def __init__(self, fail: bool = False):
+        self.begins = 0
+        self.ends = 0
+        self.fail = fail
+
+    def begin(self):
+        self.begins += 1
+        if self.fail:
+            raise RuntimeError("cold start timed out")
+
+    def end(self):
+        self.ends += 1
+
+
+@contextmanager
+def _running_chat_lc(models, backend, lc) -> Iterator[int]:
+    port = _free_port()
+    server = ns.build_server("127.0.0.1", port, models, backend, lc)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    time.sleep(0.05)
+    try:
+        yield port
+    finally:
+        server.shutdown()
+        server.server_close()
+        t.join(timeout=2.0)
+
+
+def test_api_chat_summons_the_chain(tmp_path):
+    lc = _StubLifecycle()
+    with _running_chat_lc(_chat_models(tmp_path), _CapturingBackend(), lc) as port:
+        status, _ = _post(port, "/api/chat", {
+            "model": "llama-3.3-70b",
+            "messages": [{"role": "user", "content": "hi"}]})
+    assert status == 200
+    assert lc.begins == 1, "/api/chat must summon a reaped chain, not 502"
+    assert lc.ends == 1, "the session must be released so the reaper can run"
+
+
+def test_api_chat_streaming_summons_the_chain(tmp_path):
+    lc = _StubLifecycle()
+    with _running_chat_lc(_chat_models(tmp_path), _CapturingBackend(), lc) as port:
+        _post_lines(port, "/api/chat", {
+            "model": "llama-3.3-70b", "stream": True,
+            "messages": [{"role": "user", "content": "hi"}]})
+    assert lc.begins == 1 and lc.ends == 1
+
+
+def test_api_chat_cold_start_failure_is_503_not_502(tmp_path):
+    # A chain that cannot be woken is "retry shortly" (503), not "generation
+    # failed" (502) — and the backend must never be reached.
+    class _NeverCalled(ns.ChatBackend):
+        def generate(self, *a, **k):
+            raise AssertionError("backend reached despite a failed summon")
+
+    lc = _StubLifecycle(fail=True)
+    with _running_chat_lc(_chat_models(tmp_path), _NeverCalled(), lc) as port:
+        status, _ = _post(port, "/api/chat", {
+            "model": "llama-3.3-70b",
+            "messages": [{"role": "user", "content": "hi"}]})
+    assert status == 503
+    assert lc.ends == 0, "nothing to release when the summon never succeeded"
+
+
+def test_openai_chat_still_summons_after_refactor(tmp_path):
+    lc = _StubLifecycle()
+    with _running_chat_lc(_chat_models(tmp_path), _CapturingBackend(), lc) as port:
+        status, _ = _post(port, "/v1/chat/completions", {
+            "model": "llama-3.3-70b",
+            "messages": [{"role": "user", "content": "hi"}]})
+    assert status == 200
+    assert lc.begins == 1 and lc.ends == 1

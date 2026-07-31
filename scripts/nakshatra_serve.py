@@ -206,6 +206,12 @@ class ChainBackendError(RuntimeError):
     unparseable output). Mapped to a 502 at the HTTP layer."""
 
 
+class _LifecycleColdStart(RuntimeError):
+    """Scale-to-zero could not bring the chain up in time. Mapped to a 503 at
+    the HTTP layer — distinct from a 502, because the right client response is
+    "retry shortly", not "this request was malformed or the chain is broken"."""
+
+
 @dataclass
 class GenerationResult:
     """What a backend returns for one /api/chat turn."""
@@ -743,8 +749,9 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
 
     def _handle_chat(self) -> int:
         """Ollama ``/api/chat``. Validates the model + messages, renders the
-        prompt, then returns either one Ollama-shaped JSON reply (Phase C) or
-        a newline-delimited JSON stream (Phase D) depending on ``stream``."""
+        prompt, summons the chain if it was reaped, then returns either one
+        Ollama-shaped JSON reply (Phase C) or a newline-delimited JSON stream
+        (Phase D) depending on ``stream``."""
         try:
             req = self._read_json_body()
         except ValueError:
@@ -787,28 +794,65 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
         max_tokens = int(options.get("num_predict") or DEFAULT_NUM_PREDICT)
         prompt = _render_prompt(messages, entry)
 
-        if req.get("stream"):
-            return self._stream_chat(entry, prompt, max_tokens, options, backend)
-
-        t0 = time.monotonic()
         try:
-            result = backend.generate(entry, prompt, max_tokens, options)
-        except ChainBackendError as e:
-            log.error("chain backend error: %s", e)
-            self._json_error(HTTPStatus.BAD_GATEWAY, "chain generation failed")
-            return 502
-        total_ns = int((time.monotonic() - t0) * 1e9)
-        self._json(HTTPStatus.OK, {
-            "model": entry.name,
-            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "message": {"role": "assistant", "content": result.text},
-            "done": True,
-            "done_reason": result.done_reason,
-            "total_duration": total_ns,
-            "prompt_eval_count": result.prompt_eval_count,
-            "eval_count": result.eval_count,
-        })
-        return 200
+            lc = self._begin_session()
+        except _LifecycleColdStart:
+            self._json_error(HTTPStatus.SERVICE_UNAVAILABLE,
+                             "model is warming up; retry shortly")
+            return 503
+        try:
+            if req.get("stream"):
+                return self._stream_chat(entry, prompt, max_tokens, options, backend)
+
+            t0 = time.monotonic()
+            try:
+                result = backend.generate(entry, prompt, max_tokens, options)
+            except ChainBackendError as e:
+                log.error("chain backend error: %s", e)
+                self._json_error(HTTPStatus.BAD_GATEWAY, "chain generation failed")
+                return 502
+            total_ns = int((time.monotonic() - t0) * 1e9)
+            self._json(HTTPStatus.OK, {
+                "model": entry.name,
+                "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "message": {"role": "assistant", "content": result.text},
+                "done": True,
+                "done_reason": result.done_reason,
+                "total_duration": total_ns,
+                "prompt_eval_count": result.prompt_eval_count,
+                "eval_count": result.eval_count,
+            })
+            return 200
+        finally:
+            if lc is not None:
+                lc.end()
+
+    def _begin_session(self):
+        """Scale-to-zero: summon the worker chain if the reaper took it while
+        idle (compute is summoned, not squatted — serve_lifecycle.py). Returns
+        the lifecycle handle for the caller to ``end()`` in a ``finally``, or
+        None when NAKSHATRA_LIFECYCLE_* is unset (legacy always-on behaviour).
+
+        Shared by BOTH chat surfaces. It used to live inline in
+        ``_handle_openai_chat`` only, so ``/api/chat`` never summoned: on a
+        reaped chain the ollama-native path went straight to the backend and
+        returned 502 ``Connection refused`` while ``/v1`` on the same server
+        woke the workers and answered. Prithvi's think_deeper tries /api/chat
+        first (it is the only surface where ``think`` is controllable), so
+        every cold deep thought ate a guaranteed 502 before falling back —
+        and any other ollama client just saw a dead model.
+
+        Raises _LifecycleColdStart so each surface can render the error in its
+        own envelope (ollama vs OpenAI)."""
+        lc = getattr(self.server, "chat_lifecycle", None)
+        if lc is None:
+            return None
+        try:
+            lc.begin()
+        except Exception as e:      # cold-start timed out / controller failed
+            log.error("lifecycle summon failed: %s", e)
+            raise _LifecycleColdStart(str(e)) from e
+        return lc
 
     def _stream_chat(self, entry, prompt, max_tokens, options, backend) -> int:
         """Ollama streaming /api/chat (Phase D): newline-delimited JSON — N
@@ -906,19 +950,13 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
         prompt = _render_prompt(messages, entry)
         cid, created = "chatcmpl-" + _gen_id(), int(time.time())
 
-        # Scale-to-zero: summon the worker chain if it was reaped while idle
-        # (compute is summoned, not squatted — serve_lifecycle.py). No-op when
-        # NAKSHATRA_LIFECYCLE_* is unset (legacy always-on behaviour).
-        lc = getattr(self.server, "chat_lifecycle", None)
-        if lc is not None:
-            try:
-                lc.begin()
-            except Exception as e:  # cold-start timed out / controller failed
-                log.error("lifecycle summon failed: %s", e)
-                self._openai_error(HTTPStatus.SERVICE_UNAVAILABLE,
-                                   "reasoning tier is warming up; retry shortly",
-                                   "server_error")
-                return 503
+        try:
+            lc = self._begin_session()
+        except _LifecycleColdStart:
+            self._openai_error(HTTPStatus.SERVICE_UNAVAILABLE,
+                               "reasoning tier is warming up; retry shortly",
+                               "server_error")
+            return 503
         try:
             if req.get("stream"):
                 return self._stream_openai_chat(entry, prompt, max_tokens,
