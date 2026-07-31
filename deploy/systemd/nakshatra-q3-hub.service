@@ -1,0 +1,18 @@
+[Unit]
+Description=Nakshatra deep chain — hub stage (Qwen3-30B-A3B Q3, layers 0-15, ROCm)
+Documentation=file:///home/prithvi/nakshatra/docs/findings/cuda-chain-51-tok-s.md
+# NOT enabled on purpose: this unit is SUMMONED by nakshatra-deep.service's
+# scale-to-zero controller and reaped on idle. Compute is summoned, not squatted.
+
+[Service]
+Type=simple
+WorkingDirectory=/home/prithvi/nakshatra
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=HIP_VISIBLE_DEVICES=1
+ExecStart=/home/prithvi/nakshatra/.venv/bin/python /home/prithvi/nakshatra/scripts/worker.py \
+  --port 5562 \
+  --sub-gguf /home/prithvi/.nakshatra/slices/qwen3-30b-q3-L0-15.gguf \
+  --mode first --layer-start 0 --layer-end 15 \
+  --daemon-bin /home/prithvi/llama.cpp/build/bin/llama-nakshatra-worker \
+  --n-ctx 4096 --n-gpu-layers 99
+Restart=no

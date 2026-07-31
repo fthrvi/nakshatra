@@ -1,0 +1,18 @@
+# THE DEEP RUNG (Biswa, 2026-07-30): "whenever he needs more access, prithvi can call
+# nakshatra and load the bigger model only if vram space is available on the ijru pc".
+#
+# Serves last night's PROVEN chain (51.16 tok/s, 2026-07-29) as an OpenAI-compatible
+# model on :11600 — hub ROCm L0-15 + ijru CUDA L15-48, Q3_K_M, plain streaming.
+# Scale-to-zero: neither worker holds a GPU until a request arrives; both are reaped
+# after the idle grace. It does NOT evict his conscious self — coexistence was measured
+# (46.95 tok/s chain + self resident, 20 GB free), which is why this replaces the old
+# :8078 prithvi-deep rung whose summoner evicted him.
+#
+# Tokenizer: the Qwen3-30B-A3B vocab is quant-independent, so the existing ollama blob
+# serves the Q3 chain (loaded vocab_only).
+models:
+  - name: qwen3-30b-q3
+    tokenizer_gguf: /usr/share/ollama/.ollama/models/blobs/sha256-58574f2e94b99fb9e4391408b57e5aeaaaec10f6384e9a699fc2cb43a5c8eabf
+    chain_yaml: /home/prithvi/.nakshatra/qwen3-30b-q3-chain-v2.yaml
+    model_size_gb: 14
+    details: {family: qwen3moe, parameter_size: "30B-A3B", quantization_level: Q3_K_M}
