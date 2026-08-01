@@ -56,3 +56,53 @@ and it is **not** a change to make unattended: ijru is now at another site, so a
 WG config that fails to come back strands a box nobody can walk over to. The
 punch proves the path exists and holds; adopting it for the tunnel is a separate,
 supervised change (endpoint + PersistentKeepalive, with a timed revert).
+
+---
+
+## ADOPTED — the tunnel now uses the direct path (2026-08-01, same day)
+
+The "NOT done, needs an operator call" section above is closed. The change went in
+supervised, and the payoff is larger than the RTT ratio alone predicted.
+
+**It was NOT a repoint.** The `show` op (added to the scoped-sudo surface for
+exactly this) revealed that **ijru has no peer of its own**: all of
+`10.51.0.0/24` — ijru, the operator's MacBook, every roaming device — rides ONE
+peer, the Pi. And ijru's side has a single peer, the VPS relay, holding
+`10.42.0.0/24 10.51.0.0/24`. Repointing "the peer that carries ijru" would have
+moved the entire roaming plane; run over that plane from the MacBook, it would
+have cut the operator off mid-change.
+
+The correct change is **additive** — one `/32` peer on each side:
+
+| box | peer added | allowed-ips | endpoint |
+|---|---|---|---|
+| ijru | hub | `10.42.0.1/32` | `98.60.180.64:51820` |
+| hub | ijru | `10.51.0.14/32` | `73.26.30.141:52301` |
+
+WireGuard resolves by longest prefix, so each `/32` takes exactly one address off
+the relay's broad route and **every other roaming client stays on the relay,
+untouched**. Both were applied live (`wg set`, never written to the `.conf`), with
+a timed self-removal armed on ijru *before* the change — a box at another site
+must be able to heal itself.
+
+### Result
+
+| | RTT (avg / min) | split-chain throughput |
+|---|---|---|
+| relayed | 170.9 / 124.6 ms | 4.85 tok/s |
+| **direct** | **74.5 / 17.7 ms** | **18.29, 18.07, 17.73 tok/s** |
+
+**3.77× on the workload from a routing change** — no model, no kernel, no engine
+touched. His deep rung answers in 2.7 s end to end.
+
+The chain pays one round trip per decode step, so throughput tracks RTT almost
+directly; the *floor* falling 124.6 → 17.7 ms is the number that matters, more
+than the average.
+
+### Honest caveat on the average
+
+The direct tunnel averages 74.5 ms against a 23 ms raw public path, spread 17–143
+ms with mdev 27. It is **not bimodal**, so this is not packets taking two routes —
+it is ijru's **wifi** at the new site. Wire it, or expect the average to move
+around. The earlier 28.6 ms punch figure was a short burst at a quiet moment and
+should not be quoted as the steady state.
