@@ -249,7 +249,21 @@ def serve_verifier(session: "VerifierSession", host: str = "127.0.0.1", port: in
                 with lock:
                     n_accepted, correction, cursor = session.submit(proposal)
             except ValueError as e:
-                return self.send_error(400, str(e))
+                # The HTTP reason-phrase is latin-1 by spec, and our own error
+                # strings contain em-dashes — so send_error(400, str(e)) raised
+                # UnicodeEncodeError *inside the error handler*, killed the
+                # connection, and the client saw RemoteDisconnected with no clue
+                # what went wrong. An error path that destroys the error is worse
+                # than no error path. Reason phrase stays ASCII; detail goes in
+                # the body where it belongs. (2026-08-01, first live WAN run.)
+                detail = str(e).encode("ascii", "replace").decode("ascii")
+                body = json.dumps({"error": detail}).encode()
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             payload = json.dumps({
                 "n_accepted": n_accepted,
                 "correction_token": correction,

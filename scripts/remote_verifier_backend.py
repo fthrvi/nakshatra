@@ -152,6 +152,19 @@ def make_verifier_session(model_path: Optional[str] = None, *, n_ctx: int = 4096
         verifier = LlamaVerifier(model_path, n_ctx=n_ctx, seed=seed, verbose=verbose,
                                  expect_vocab_size=expect_vocab_size, llama=llama)
     seed_tokens = list(prompt_tokens) if prompt_tokens else [verifier.bos_token()]
+    # PRIME THE KV before handing the session over. VerifierSession sets
+    # cursor = len(seed_tokens) - 1, i.e. it assumes the verifier has already
+    # evaluated the prefix. A freshly-built LlamaVerifier has n_tokens == 0, so
+    # for any seed longer than ONE token the first submit() raises
+    # "start_pos ahead of this adapter's cached KV".
+    #
+    # This never showed up because the default seed is a single BOS token, where
+    # cursor == 0 == n_cached and the arithmetic is accidentally consistent.
+    # It only bites with a real multi-token prompt — which is exactly the WAN
+    # scenario the module was written for and had never been run (2026-08-01,
+    # first live use, 19-token prompt).
+    if len(seed_tokens) > 1:
+        verifier.verify(seed_tokens, 0)
     session = remote_proposals.VerifierSession(verifier, seed_tokens, max_window=max_window)
     return verifier, session
 
