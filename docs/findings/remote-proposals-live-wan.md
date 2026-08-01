@@ -67,3 +67,50 @@ names precisely this — *"Instead of re-evaluating the whole prefix every round
 (O(prefix) → O(n²) over a generation)"*. Switching to the incremental draft doubled
 throughput, 2.94 → 5.87. **A benchmark harness that bypasses the optimised path in
 the repo it is benchmarking will produce a confident, wrong negative.**
+
+---
+
+## RE-RUN ON THE DIRECT PATH — the technique inverts, and we found a crossover (2026-08-01)
+
+Same day, same chain, same prompt and budget. Only the link changed: the
+hub↔ijru tunnel moved off the VPS dogleg onto a direct peer
+(`direct-path-live-wan.md`), ~171 ms → ~75 ms average.
+
+| link | split chain | proposals k=1 | proposals k=4 | winner |
+|---|---|---|---|---|
+| relayed, ~171 ms | 4.85 | 4.10 | **5.87** | **proposals**, by 1.21× |
+| direct, ~75 ms | **18.29** | 15.25 | 14.72 | **split**, by 1.20× |
+
+Two reversals in one table:
+
+1. **k=4 stopped beating k=1.** Bounded proposals trade *draft compute* for
+   *round trips*: 54 → 36, eighteen saved. At 171 ms those eighteen were worth
+   ~3.3 s and paid for the drafting easily. At 75 ms they are worth ~1.3 s, and
+   the draft cost — unchanged — now exceeds the saving. 5.87 → 14.72 in absolute
+   terms, but a 1.43× *win* became a 3% *loss*.
+2. **Splitting overtook proposals entirely.** The doctrine flipped back: at WAN
+   distance keeping models whole and bounding round trips wins; once the link is
+   fast, moving activations wins again.
+
+### This is the third instance of one failure shape
+
+Speculative decoding amortises weight streaming. Async pipelining amortises
+far-stage compute. Remote proposals amortise round trips. Each is worthless — or
+negative — when the thing it amortises is not where the time goes. The novelty
+is not that any one of them lost; it is that **the same sentence explains all
+three**, and that the winner changes with a variable (link RTT) that none of the
+techniques can see.
+
+### A measured crossover, not a doctrine
+
+`paper-draft.md` states "route whole models where they fit; split only when a
+model fits nowhere" as a rule. The agenda's C2 asked for a *predictive* model
+instead of an anecdote. This is the first real bracket:
+
+**the split-vs-proposals crossover lies between ~75 ms and ~171 ms RTT**, for a
+30B-class MoE split two ways against a 14B whole verifier with a 0.6B draft.
+
+That is a testable interval, not a preference. Filling it in — sweep RTT with
+`tc netem` on the direct path and find where the curves cross — is now a
+cheap experiment that needs no new hardware, and it turns the doctrine into a
+number.
