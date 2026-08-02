@@ -24,6 +24,13 @@ templating land in Phases C–E. The registry only needs to *describe*
 which models are servable and where their chains live; it does not load
 weights or touch the chain. Keep the no-models runtime dependency-free
 (PyYAML is imported lazily, only when `--models` is given).
+
+**Route, don't (always) split:** a model entry can also set `engine_url`
+(+ optional `engine_model`) to point at a LOCAL engine already serving it
+whole (ollama, llama.cpp server, ...) — `ProxyChatBackend` forwards chat
+completions there instead of driving nakshatra's own chain, so a model
+that fits on one box gets advertised + routed through this surface
+without ever touching client.py. See `RoutingChatBackend`.
 """
 from __future__ import annotations
 
@@ -34,6 +41,8 @@ import os
 import re
 import sys
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -72,11 +81,13 @@ class ModelConfigError(Exception):
 class ModelEntry:
     """One servable model: a ``name`` Prithvi selects by, the tokenizer
     GGUF the chain was split from, and where its chain lives — a static
-    cluster YAML (``chain_yaml``) or a pillar registry URL
-    (``registry_url``). Chain orchestration is Phase C+; this phase only
-    needs the entry to exist and be advertised via /api/tags."""
+    cluster YAML (``chain_yaml``), a pillar registry URL
+    (``registry_url``), or a LOCAL engine already serving it
+    (``engine_url`` — proxied, not chained; see ProxyChatBackend). Chain
+    orchestration is Phase C+; this phase only needs the entry to exist
+    and be advertised via /api/tags."""
     name: str
-    tokenizer_gguf: str
+    tokenizer_gguf: Optional[str] = None
     chain_yaml: Optional[str] = None
     registry_url: Optional[str] = None
     details: dict = field(default_factory=dict)
@@ -98,6 +109,16 @@ class ModelEntry:
     # consumers don't see raw think tags. Set `think:` in serve_models.yaml;
     # defaults from a name heuristic on the tokenizer/package path.
     think: bool = False
+    # engine_url mode (the "route" half of route-don't-split): the model
+    # already lives on a LOCAL engine speaking the OpenAI-compat wire (ollama,
+    # llama.cpp server, vLLM, ...). nakshatra ADVERTISES it + forwards chat
+    # completions to the engine (ProxyChatBackend) instead of driving its own
+    # chain via client.py — no prompt rendering, no tokenizer needed on this
+    # side. `engine_model` is the engine-side model tag (defaults to `name`);
+    # `engine_timeout_s` overrides ProxyChatBackend's default per-entry.
+    engine_url: Optional[str] = None
+    engine_model: Optional[str] = None
+    engine_timeout_s: Optional[float] = None
 
 
 def _load_models(path: str) -> dict[str, ModelEntry]:
@@ -112,8 +133,10 @@ def _load_models(path: str) -> dict[str, ModelEntry]:
             details: {family: llama, parameter_size: "70B", quantization_level: Q4_K_M}
 
     Raises ``ModelConfigError`` on a missing file, bad YAML, or any entry
-    lacking a name, a tokenizer, or a chain (chain_yaml | registry_url),
-    or on a duplicate model name.
+    lacking a name, a tokenizer, or a chain source
+    (chain_yaml | registry_url | from_roster | engine_url), or on a
+    duplicate model name. ``tokenizer_gguf`` is NOT required when
+    ``engine_url`` is set — a proxied model tokenizes on the engine side.
     """
     try:
         import yaml  # lazy: keeps the no-models runtime stdlib-only
@@ -140,12 +163,19 @@ def _load_models(path: str) -> dict[str, ModelEntry]:
         name, tok = raw.get("name"), raw.get("tokenizer_gguf")
         chain_yaml, registry_url = raw.get("chain_yaml"), raw.get("registry_url")
         from_roster = bool(raw.get("from_roster"))
-        missing = [k for k, v in (("name", name), ("tokenizer_gguf", tok)) if not v]
+        engine_url = raw.get("engine_url")
+        missing = [k for k, v in (("name", name),) if not v]
+        # tokenizer_gguf is only required when nakshatra itself renders a
+        # prompt / drives a chain — an engine_url entry proxies to a local
+        # engine that tokenizes on its own side.
+        if not tok and not engine_url:
+            missing.append("tokenizer_gguf")
         if missing:
             raise ModelConfigError(f"{path}: model #{i} missing {', '.join(missing)}")
-        if not (chain_yaml or registry_url or from_roster):
+        if not (chain_yaml or registry_url or from_roster or engine_url):
             raise ModelConfigError(
-                f"{path}: model {name!r} needs chain_yaml, registry_url, or from_roster")
+                f"{path}: model {name!r} needs chain_yaml, registry_url, "
+                f"from_roster, or engine_url")
         if from_roster and not raw.get("hidden_size"):
             raise ModelConfigError(
                 f"{path}: model {name!r} has from_roster but no hidden_size")
@@ -161,7 +191,9 @@ def _load_models(path: str) -> dict[str, ModelEntry]:
             hidden_size=raw.get("hidden_size"), num_layers=raw.get("num_layers"),
             wire_dtype=raw.get("wire_dtype") or "f32",
             model_size_gb=raw.get("model_size_gb"),
-            think=think)
+            think=think,
+            engine_url=engine_url, engine_model=raw.get("engine_model"),
+            engine_timeout_s=raw.get("engine_timeout_s"))
     return registry
 
 
@@ -180,12 +212,15 @@ def _ollama_tag(entry: ModelEntry) -> dict:
     import hashlib
     import os
     size, modified_at = 0, "1970-01-01T00:00:00Z"
-    try:
-        st = os.stat(entry.tokenizer_gguf)
-        size = st.st_size
-        modified_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(st.st_mtime))
-    except OSError:
-        pass  # artifact lives on the chain, not the gateway host — placeholders
+    if entry.tokenizer_gguf:
+        try:
+            st = os.stat(entry.tokenizer_gguf)
+            size = st.st_size
+            modified_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(st.st_mtime))
+        except OSError:
+            pass  # artifact lives on the chain, not the gateway host — placeholders
+    # engine_url entries have no tokenizer_gguf at all (proxied models
+    # tokenize on the engine side) — placeholders above cover that case too.
     digest = "sha256:" + hashlib.sha256(entry.name.encode()).hexdigest()
     details = {"format": "gguf"}
     details.update(entry.details)
@@ -420,6 +455,153 @@ class ChainChatBackend(ChatBackend):
             proc.stderr.close()
         if rc != 0:
             raise ChainBackendError(f"client.py exited {rc}: {err.strip()[-400:]}")
+
+
+# ── Proxy backend (route-whole to a local engine) ───────────────────
+# The "route" half of route-don't-split, finally expressed in the serve
+# surface: some models fit whole on one box and are already loaded by a
+# local engine (ollama, llama.cpp server, vLLM, ...) that speaks the same
+# OpenAI-compat wire we do. Rather than re-tokenize + drive a chain via
+# client.py, ProxyChatBackend just forwards the chat completion to the
+# engine's own /v1/chat/completions and re-dresses the reply — the engine
+# already owns tokenization + its model's chat template.
+
+
+class ProxyChatBackend(ChatBackend):
+    """Forwards ``generate``/``generate_stream`` to ``entry.engine_url``'s
+    OpenAI-compat ``/v1/chat/completions``, both non-streaming and SSE.
+
+    Unlike ChainChatBackend, this backend does NOT use the rendered
+    ``prompt`` string — the engine does its own chat templating, so the
+    original ``messages`` list (stashed onto ``options["messages"]`` by the
+    HTTP handler, alongside ``temperature``/``top_p`` the same way it already
+    carries those) is forwarded as-is; ``prompt`` is only a fallback for a
+    caller that has no messages to give. The entry's public ``name`` is
+    translated to ``engine_model`` (default: same as ``name``) in the
+    forwarded payload, since the engine may tag the model differently.
+
+    stdlib-only (``urllib.request``), matching this repo's other HTTP
+    clients (ledger_client.py, remote_proposals.py) — no ``requests``
+    dependency. Engine unreachable or a non-200 response both raise
+    ChainBackendError, the same exception ChainChatBackend raises on a
+    broken chain, so the HTTP layer maps either backend's failure to a
+    clean 502 / streaming terminal error without caring which one is live.
+    """
+
+    #: sensible default when an entry doesn't set engine_timeout_s — long
+    #: enough for a cold local-engine load, short enough to fail visibly
+    #: rather than hang a request forever.
+    DEFAULT_TIMEOUT_S = 120.0
+
+    def __init__(self, timeout_s: float = DEFAULT_TIMEOUT_S):
+        self._default_timeout = timeout_s
+
+    def _url(self, entry: ModelEntry) -> str:
+        return entry.engine_url.rstrip("/") + "/v1/chat/completions"
+
+    def _timeout(self, entry: ModelEntry) -> float:
+        return entry.engine_timeout_s or self._default_timeout
+
+    def _payload(self, entry: ModelEntry, prompt: str, max_tokens: int,
+                options: dict, stream: bool) -> dict:
+        messages = options.get("messages") or [{"role": "user", "content": prompt}]
+        payload = {"model": entry.engine_model or entry.name,
+                  "messages": messages, "max_tokens": max_tokens, "stream": stream}
+        for k in ("temperature", "top_p"):
+            if k in options:
+                payload[k] = options[k]
+        return payload
+
+    def _call_engine(self, entry: ModelEntry, payload: dict, timeout: float):
+        """POST to the engine + return the (streaming-capable) response
+        object. Both "can't connect" and "connected but non-200" map to
+        ChainBackendError — never let a proxied model's failure look
+        different from a chained one's."""
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(self._url(entry), data=data,
+                                     headers={"Content-Type": "application/json"},
+                                     method="POST")
+        try:
+            return urllib.request.urlopen(req, timeout=timeout)
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", "replace")[:400]
+            raise ChainBackendError(
+                f"engine {entry.engine_url} returned {e.code}: {body}") from e
+        except (urllib.error.URLError, OSError, TimeoutError) as e:
+            raise ChainBackendError(
+                f"engine {entry.engine_url} unreachable: {e}") from e
+
+    def generate(self, entry, prompt, max_tokens, options):
+        payload = self._payload(entry, prompt, max_tokens, options, stream=False)
+        with self._call_engine(entry, payload, self._timeout(entry)) as resp:
+            data = json.loads(resp.read())
+        choice = (data.get("choices") or [{}])[0]
+        message = choice.get("message") or {}
+        usage = data.get("usage") or {}
+        return GenerationResult(
+            text=message.get("content", ""),
+            eval_count=usage.get("completion_tokens", 0),
+            prompt_eval_count=usage.get("prompt_tokens", 0),
+            done_reason=choice.get("finish_reason") or "stop")
+
+    def generate_stream(self, entry, prompt, max_tokens, options):
+        """Stream SSE ``data: {chunk}`` lines from the engine, yielding each
+        chunk's ``choices[0].delta.content`` — the same shape our own
+        ``_stream_openai_chat`` emits, since it IS an OpenAI-compat wire on
+        both ends. Stops at the ``data: [DONE]`` sentinel."""
+        payload = self._payload(entry, prompt, max_tokens, options, stream=True)
+        resp = self._call_engine(entry, payload, self._timeout(entry))
+        try:
+            for raw_line in resp:
+                line = raw_line.decode("utf-8", "replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                chunk = line[len("data:"):].strip()
+                if chunk == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(chunk)
+                except ValueError:
+                    continue
+                delta = (obj.get("choices") or [{}])[0].get("delta") or {}
+                content = delta.get("content")
+                if content:
+                    yield content
+        except (urllib.error.URLError, OSError) as e:
+            raise ChainBackendError(
+                f"engine {entry.engine_url} dropped mid-stream: {e}") from e
+        finally:
+            resp.close()
+
+
+class RoutingChatBackend(ChatBackend):
+    """Per-entry backend dispatch: an ``engine_url`` entry is forwarded to a
+    local engine (ProxyChatBackend); every other entry drives the chain as
+    before (ChainChatBackend, unchanged). One instance replaces the
+    previously-single ChainChatBackend at the server level, so "wherever the
+    server picks ChainChatBackend for a model" now looks at each entry
+    instead of the whole registry.
+
+    Additive: a registry with no engine_url entries dispatches every call
+    straight through to ``chain`` — byte-identical to before this class
+    existed. Rule for an entry that sets BOTH engine_url and chain_yaml
+    (deliberately permitted by ``_load_models`` — same policy as chain_yaml
+    + registry_url coexisting today): engine_url wins. Setting it is an
+    explicit, cheaper request to proxy; chain_yaml left in place (e.g. as a
+    fallback an operator is staging) never overrides that."""
+
+    def __init__(self, chain: ChatBackend, proxy: Optional["ProxyChatBackend"] = None):
+        self._chain = chain
+        self._proxy = proxy or ProxyChatBackend()
+
+    def _pick(self, entry: ModelEntry) -> ChatBackend:
+        return self._proxy if entry.engine_url else self._chain
+
+    def generate(self, entry, prompt, max_tokens, options):
+        return self._pick(entry).generate(entry, prompt, max_tokens, options)
+
+    def generate_stream(self, entry, prompt, max_tokens, options):
+        return self._pick(entry).generate_stream(entry, prompt, max_tokens, options)
 
 
 def _render_llama3(messages: list) -> str:
@@ -793,6 +975,11 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
         options = req.get("options") or {}
         max_tokens = int(options.get("num_predict") or DEFAULT_NUM_PREDICT)
         prompt = _render_prompt(messages, entry)
+        # carried through for ProxyChatBackend (engine_url entries): the
+        # engine does its own chat templating, so it wants the original
+        # messages, not our rendered prompt. ChainChatBackend/StubChatBackend
+        # never read this key — harmless passthrough for them.
+        options["messages"] = messages
 
         try:
             lc = self._begin_session()
@@ -948,6 +1135,9 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
             if k in req:
                 options[k] = req[k]
         prompt = _render_prompt(messages, entry)
+        # see _handle_chat's identical comment: ProxyChatBackend wants the
+        # original messages, not our rendered prompt.
+        options["messages"] = messages
         cid, created = "chatcmpl-" + _gen_id(), int(time.time())
 
         try:
@@ -1252,15 +1442,18 @@ def main(argv: Optional[list[str]] = None) -> int:
             log.error("model config error: %s", e)
             return 2
 
-    # Backend: an explicit stub (wire-smoke) wins; otherwise the real chain
-    # backend whenever we have models. The per-request subprocess into
-    # client.py needs no construction-time deps, so ChainChatBackend is cheap
-    # even when the cluster is down (errors surface at request time).
+    # Backend: an explicit stub (wire-smoke) wins; otherwise RoutingChatBackend
+    # whenever we have models — it dispatches per-entry to ChainChatBackend
+    # (the default, unchanged) or ProxyChatBackend for engine_url entries. The
+    # per-request subprocess into client.py needs no construction-time deps,
+    # so ChainChatBackend is cheap even when the cluster is down (errors
+    # surface at request time); same for ProxyChatBackend (errors surface on
+    # first request to an unreachable engine).
     if args.stub_backend is not None:
         chat_backend = StubChatBackend(args.stub_backend)
         log.info("serving STUB backend (no chain): %r", args.stub_backend[:60])
     else:
-        chat_backend = ChainChatBackend() if models else None
+        chat_backend = RoutingChatBackend(ChainChatBackend()) if models else None
     # Scale-to-zero lifecycle (compute is summoned, not squatted). Active only
     # when NAKSHATRA_LIFECYCLE_UNITS is set; otherwise None → always-on legacy.
     chat_lifecycle = None

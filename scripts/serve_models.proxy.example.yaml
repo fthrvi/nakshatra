@@ -1,0 +1,39 @@
+# serve_models.proxy.example.yaml — engine_url (route-whole) entries for
+# nakshatra_serve.py.
+#
+# The "route" half of route-don't-split: a model that already fits whole on
+# one box and is served by a LOCAL engine (ollama here; a llama.cpp server or
+# vLLM's OpenAI-compat surface work the same way) doesn't need nakshatra's own
+# chain machinery. Set `engine_url` instead of chain_yaml/registry_url/
+# from_roster and nakshatra ADVERTISES the model (/api/tags, /v1/models) and
+# FORWARDS chat completions to the engine's own /v1/chat/completions
+# (ProxyChatBackend) — streaming and non-streaming both. `tokenizer_gguf` is
+# NOT required for these entries: the engine tokenizes + applies its own chat
+# template on its side.
+#
+# This file is an EXAMPLE for the loka experiment (pointing at a local
+# ollama). Merge the entries you want into the real serve_models.yaml
+# (~/.nakshatra/serve_models.yaml) by hand — this file is not loaded as-is.
+models:
+  - name: qwen3:14b
+    engine_url: http://127.0.0.1:11434   # ollama's default port
+    # engine_model omitted — defaults to `name`, which already matches the
+    # tag ollama would show for `ollama list`. Set it explicitly when the
+    # public name and the engine's tag need to differ (e.g. serving the same
+    # ollama model under two nakshatra-facing names/policies).
+    details: {family: qwen3, parameter_size: "14B", quantization_level: Q4_K_M}
+
+  - name: llama3.1:8b
+    engine_url: http://127.0.0.1:11434
+    engine_model: llama3.1:8b
+    # per-entry override of ProxyChatBackend's ~120s default — a small model
+    # that should fail fast rather than hang behind a wedged engine.
+    engine_timeout_s: 60
+    details: {family: llama, parameter_size: "8B", quantization_level: Q4_K_M}
+
+  # A remote engine on another mesh node works identically — engine_url is
+  # just a base URL, not necessarily loopback. Point it at the overlay IP
+  # (mesh-roster.tsv), never a raw LAN address.
+  # - name: qwen3-coder-30b
+  #   engine_url: http://10.42.0.5:11434   # e.g. elitedesk's ollama
+  #   engine_model: qwen3-coder:30b
