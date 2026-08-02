@@ -50,6 +50,7 @@ verifier behind `serve_verifier` and running it over an actual WAN hop is the re
 """
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import threading
@@ -233,6 +234,12 @@ def serve_verifier(session: "VerifierSession", host: str = "127.0.0.1", port: in
     lock = threading.Lock()     # one session, serialize concurrent HTTP submits onto it
 
     class Handler(BaseHTTPRequestHandler):
+        # HTTP/1.1 keeps the socket open between requests. The default 1.0 closes
+        # after every response, which forces the client to re-handshake and makes
+        # connection pooling on the far side pointless. Every response path here
+        # sends an explicit Content-Length, which is what 1.1 requires.
+        protocol_version = "HTTP/1.1"
+
         def log_message(self, *a):
             pass  # quiet by default, matches slice_server.py
 
@@ -278,16 +285,64 @@ def serve_verifier(session: "VerifierSession", host: str = "127.0.0.1", port: in
     return ThreadingHTTPServer((host, port), Handler)
 
 
+#: one live connection per peer. See http_submit.
+_CONNS: dict = {}
+_CONNS_LOCK = threading.Lock()
+
+
+def close_connections() -> None:
+    """Drop every pooled connection (tests, shutdown, peer changed address)."""
+    with _CONNS_LOCK:
+        for c in _CONNS.values():
+            try:
+                c.close()
+            except Exception:
+                pass
+        _CONNS.clear()
+
+
 def http_submit(peer: str, proposal: Sequence[int], timeout: float = 5.0) -> Tuple[int, Optional[int], int]:
     """Client-side counterpart to serve_verifier. `peer` is "host:port" (no scheme),
-    matching slice_fetch's peer-address convention."""
+    matching slice_fetch's peer-address convention.
+
+    KEEPS THE CONNECTION OPEN. The original used urllib.urlopen, which opens a
+    fresh TCP connection per call — so every proposal round paid a handshake AND
+    the request: TWO round trips, not one, on a protocol whose entire purpose is
+    to economise round trips.
+
+    Measured 2026-08-01 on a real WAN link, fitting ms-per-token against RTT:
+    the proposals arm paid **0.967 ms of RTT per token** where one round trip per
+    2.67-token round predicts 0.375, and two predicts 0.749. The fit also
+    produced a NEGATIVE intercept — physically impossible, and the clue that the
+    model was misspecified rather than the technique being weak. The measured
+    split-vs-proposals crossover of ~110 ms RTT was therefore substantially an
+    artifact of a urllib default.
+
+    Retries once on a dropped connection: a pooled socket can be closed by the
+    peer between calls, and that is routine, not an error."""
     body = json.dumps({"proposal": [int(t) for t in proposal]}).encode()
-    req = urllib.request.Request(
-        f"http://{peer}/submit", data=body,
-        headers={"Content-Type": "application/json"}, method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        data = json.load(r)
+    host, _, port = peer.rpartition(":")
+    for attempt in (0, 1):
+        with _CONNS_LOCK:
+            conn = _CONNS.get(peer)
+            if conn is None:
+                conn = http.client.HTTPConnection(host or "127.0.0.1", int(port), timeout=timeout)
+                _CONNS[peer] = conn
+        try:
+            conn.request("POST", "/submit", body=body,
+                         headers={"Content-Type": "application/json"})
+            resp = conn.getresponse()
+            data = json.loads(resp.read())
+            break
+        except Exception:
+            with _CONNS_LOCK:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                _CONNS.pop(peer, None)
+            if attempt == 1:
+                raise
     correction = data["correction_token"]
     return int(data["n_accepted"]), (None if correction is None else int(correction)), int(data["cursor"])
 
