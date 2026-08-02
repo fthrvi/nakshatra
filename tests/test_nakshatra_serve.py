@@ -28,6 +28,7 @@ import time
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Iterator
 
@@ -1058,3 +1059,292 @@ def test_openai_chat_still_summons_after_refactor(tmp_path):
             "messages": [{"role": "user", "content": "hi"}]})
     assert status == 200
     assert lc.begins == 1 and lc.ends == 1
+
+
+# ── engine_url proxy backend (route-whole to a local engine) ────────
+# The "route" half of route-don't-split: a model already served by a local
+# engine (ollama, llama.cpp server, ...) is advertised + forwarded to instead
+# of driven through nakshatra's own chain. Fake engine below is a stdlib
+# http.server stand-in for the engine's OpenAI-compat /v1/chat/completions,
+# mirroring tests/test_routing.py's _CapturingHandler pattern.
+
+def _make_fake_engine_handler(reply_text="engine reply", status_code=200,
+                              usage=None):
+    """Build a fresh handler class per test (class attrs are the only way
+    ThreadingHTTPServer's per-connection instantiation gets configuration
+    in). Captures the last forwarded request body + path onto
+    ``.captured`` so a test can assert what nakshatra sent."""
+    class _FakeEngineHandler(BaseHTTPRequestHandler):
+        captured: dict = {}
+
+        def log_message(self, *a):
+            pass
+
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length", "0"))
+            body = json.loads(self.rfile.read(n) or b"{}")
+            _FakeEngineHandler.captured = {"path": self.path, "body": body}
+            if status_code != 200:
+                payload = json.dumps({"error": "boom"}).encode()
+                self.send_response(status_code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+            if body.get("stream"):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                for i, word in enumerate(reply_text.split()):
+                    chunk = {"choices": [{"delta":
+                             {"content": word if i == 0 else " " + word}}]}
+                    self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
+                    self.wfile.flush()
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+                return
+            resp = json.dumps({
+                "choices": [{"message": {"role": "assistant", "content": reply_text},
+                            "finish_reason": "stop"}],
+                "usage": usage or {"prompt_tokens": 3, "completion_tokens": 2},
+            }).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(resp)))
+            self.end_headers()
+            self.wfile.write(resp)
+
+    return _FakeEngineHandler
+
+
+@contextmanager
+def _running_fake_engine(reply_text="engine reply", status_code=200, usage=None):
+    """Start the fake engine on an ephemeral port; yield (base_url, handler)
+    so a test can hit ProxyChatBackend/the real serve stack against it and
+    then inspect ``handler.captured``."""
+    handler = _make_fake_engine_handler(reply_text, status_code, usage)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    port = server.server_address[1]
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        yield f"http://127.0.0.1:{port}", handler
+    finally:
+        server.shutdown()
+        server.server_close()
+        t.join(timeout=2.0)
+
+
+_ENGINE_MODEL = """\
+    models:
+      - name: qwen3-14b-local
+        engine_url: http://127.0.0.1:11434
+        engine_model: qwen3:14b
+        details: {family: qwen3, parameter_size: "14B"}
+"""
+
+
+# ── registry validation ──────────────────────────────────────────────
+
+def test_load_models_engine_url_accepted_without_tokenizer(tmp_path):
+    reg = ns._load_models(_write_models_yaml(tmp_path, _ENGINE_MODEL))
+    e = reg["qwen3-14b-local"]
+    assert e.tokenizer_gguf is None
+    assert e.engine_url == "http://127.0.0.1:11434"
+    assert e.engine_model == "qwen3:14b"
+
+
+def test_invalid_config_rejected_missing_everything(tmp_path):
+    """Name alone (no tokenizer_gguf, no chain_yaml/registry_url/from_roster/
+    engine_url) must still be rejected — engine_url only relaxes the
+    tokenizer requirement, it doesn't make a model source optional."""
+    with pytest.raises(ns.ModelConfigError):
+        ns._load_models(_write_models_yaml(tmp_path, "models:\n  - name: x\n"))
+
+
+def test_engine_url_and_chain_yaml_both_present_loads(tmp_path):
+    """_load_models permits both set on one entry (same permissive policy as
+    chain_yaml + registry_url already coexisting today) — the RUNTIME rule
+    for the ambiguity (engine_url wins) lives in RoutingChatBackend and is
+    tested below by test_routing_backend_prefers_engine_over_chain."""
+    body = """\
+    models:
+      - name: x
+        tokenizer_gguf: /models/x/m.gguf
+        chain_yaml: scripts/cluster_5worker.yaml
+        engine_url: http://127.0.0.1:11434
+    """
+    reg = ns._load_models(_write_models_yaml(tmp_path, body))
+    e = reg["x"]
+    assert e.chain_yaml is not None and e.engine_url is not None
+
+
+# ── ProxyChatBackend: request shaping ────────────────────────────────
+
+def test_proxy_backend_translates_name_and_preserves_request():
+    with _running_fake_engine("Paris.", usage={"prompt_tokens": 5,
+                                               "completion_tokens": 2}) as (url, handler):
+        entry = ns.ModelEntry(name="qwen3-14b-local", engine_url=url, engine_model="qwen3:14b")
+        options = {"messages": [{"role": "user", "content": "capital of France?"}],
+                  "temperature": 0.3}
+        result = ns.ProxyChatBackend().generate(entry, "unused prompt", 64, options)
+    assert result.text == "Paris."
+    assert result.eval_count == 2 and result.prompt_eval_count == 5
+    assert result.done_reason == "stop"
+    body = handler.captured["body"]
+    assert body["model"] == "qwen3:14b"            # public name -> engine_model
+    assert body["messages"] == options["messages"]  # original messages, not the rendered prompt
+    assert body["temperature"] == 0.3
+    assert body["max_tokens"] == 64
+    assert body["stream"] is False
+    assert handler.captured["path"] == "/v1/chat/completions"
+
+
+def test_proxy_backend_defaults_engine_model_to_entry_name():
+    with _running_fake_engine("ok") as (url, handler):
+        entry = ns.ModelEntry(name="llama3.1-8b-local", engine_url=url)   # no engine_model set
+        ns.ProxyChatBackend().generate(
+            entry, "hi", 8, {"messages": [{"role": "user", "content": "hi"}]})
+    assert handler.captured["body"]["model"] == "llama3.1-8b-local"
+
+
+def test_proxy_backend_falls_back_to_rendered_prompt_without_messages():
+    """A caller with no messages in options (defensive path — the handler
+    always supplies them today) still gets a valid one-turn payload."""
+    with _running_fake_engine("ok") as (url, handler):
+        entry = ns.ModelEntry(name="m", engine_url=url)
+        ns.ProxyChatBackend().generate(entry, "rendered prompt text", 8, {})
+    assert handler.captured["body"]["messages"] == [
+        {"role": "user", "content": "rendered prompt text"}]
+
+
+# ── ProxyChatBackend: streaming pass-through ─────────────────────────
+
+def test_proxy_backend_streaming_pass_through():
+    with _running_fake_engine("Paris is the capital") as (url, handler):
+        entry = ns.ModelEntry(name="m", engine_url=url)
+        options = {"messages": [{"role": "user", "content": "capital?"}]}
+        chunks = list(ns.ProxyChatBackend().generate_stream(entry, "unused", 32, options))
+    assert "".join(chunks) == "Paris is the capital"
+    assert handler.captured["body"]["stream"] is True
+
+
+# ── ProxyChatBackend: engine-down / non-200 → clean error surface ───
+
+def test_proxy_backend_engine_down_raises_clean_error():
+    port = _free_port()   # bound-then-released: guaranteed nothing is listening
+    entry = ns.ModelEntry(name="m", engine_url=f"http://127.0.0.1:{port}")
+    with pytest.raises(ns.ChainBackendError):
+        ns.ProxyChatBackend(timeout_s=2.0).generate(entry, "hi", 8, {})
+
+
+def test_proxy_backend_streaming_engine_down_raises_clean_error():
+    port = _free_port()
+    entry = ns.ModelEntry(name="m", engine_url=f"http://127.0.0.1:{port}")
+    with pytest.raises(ns.ChainBackendError):
+        list(ns.ProxyChatBackend(timeout_s=2.0).generate_stream(entry, "hi", 8, {}))
+
+
+def test_proxy_backend_non_200_raises_clean_error():
+    with _running_fake_engine(status_code=500) as (url, handler):
+        entry = ns.ModelEntry(name="m", engine_url=url)
+        with pytest.raises(ns.ChainBackendError):
+            ns.ProxyChatBackend().generate(entry, "hi", 8, {})
+
+
+# ── RoutingChatBackend: per-entry dispatch ───────────────────────────
+
+class _ChainSpy(ns.ChatBackend):
+    """Records which entry the chain backend was asked to generate for."""
+
+    def __init__(self, reply="chain-reply"):
+        self.reply = reply
+        self.calls = []
+
+    def generate(self, entry, prompt, max_tokens, options):
+        self.calls.append(entry.name)
+        return ns.GenerationResult(text=self.reply)
+
+
+def test_routing_backend_dispatches_by_entry():
+    with _running_fake_engine("proxy-reply") as (url, handler):
+        chain = _ChainSpy()
+        router = ns.RoutingChatBackend(chain)
+        chain_entry = ns.ModelEntry(name="chained", tokenizer_gguf="t", chain_yaml="c.yaml")
+        proxy_entry = ns.ModelEntry(name="proxied", engine_url=url)
+
+        chain_result = router.generate(chain_entry, "p", 8, {})
+        proxy_result = router.generate(
+            proxy_entry, "p", 8, {"messages": [{"role": "user", "content": "hi"}]})
+
+    assert chain_result.text == "chain-reply" and chain.calls == ["chained"]
+    assert proxy_result.text == "proxy-reply"
+
+
+def test_routing_backend_prefers_engine_over_chain_when_both_set():
+    """Regression guard for the engine_url+chain_yaml coexistence rule
+    documented on RoutingChatBackend / _load_models: engine_url wins, the
+    chain backend is never even reached."""
+    class _NeverCalled(ns.ChatBackend):
+        def generate(self, *a, **k):
+            raise AssertionError("chain backend reached despite engine_url being set")
+
+    with _running_fake_engine("proxy-reply") as (url, handler):
+        router = ns.RoutingChatBackend(_NeverCalled())
+        entry = ns.ModelEntry(name="both", tokenizer_gguf="/m.gguf",
+                              chain_yaml="scripts/cluster_5worker.yaml", engine_url=url)
+        result = router.generate(
+            entry, "p", 8, {"messages": [{"role": "user", "content": "hi"}]})
+    assert result.text == "proxy-reply"
+
+
+# ── end-to-end: registry → RoutingChatBackend → ProxyChatBackend → engine ──
+
+_ENGINE_ONLY_MODEL_TMPL = """\
+    models:
+      - name: qwen3-14b-local
+        engine_url: {url}
+        engine_model: qwen3:14b
+        details: {{family: qwen3, parameter_size: "14B"}}
+"""
+
+
+def test_v1_chat_completions_proxied_end_to_end(tmp_path):
+    with _running_fake_engine("Proxied answer.",
+                              usage={"prompt_tokens": 4, "completion_tokens": 3}) as (url, handler):
+        reg = ns._load_models(_write_models_yaml(
+            tmp_path, _ENGINE_ONLY_MODEL_TMPL.format(url=url)))
+        router = ns.RoutingChatBackend(ns.ChainChatBackend())
+        with _running_chat(reg, router) as port:
+            status, body = _post(port, "/v1/chat/completions", {
+                "model": "qwen3-14b-local",
+                "messages": [{"role": "user", "content": "hi"}]})
+    assert status == 200
+    assert body["choices"][0]["message"]["content"] == "Proxied answer."
+    assert body["usage"]["completion_tokens"] == 3
+    assert handler.captured["body"]["model"] == "qwen3:14b"
+
+
+def test_api_chat_streaming_proxied_end_to_end(tmp_path):
+    with _running_fake_engine("stream reply here") as (url, handler):
+        reg = ns._load_models(_write_models_yaml(
+            tmp_path, _ENGINE_ONLY_MODEL_TMPL.format(url=url)))
+        router = ns.RoutingChatBackend(ns.ChainChatBackend())
+        with _running_chat(reg, router) as port:
+            chunks = _post_lines(port, "/api/chat", {
+                "model": "qwen3-14b-local", "stream": True,
+                "messages": [{"role": "user", "content": "hi"}]})
+    assert "".join(c["message"]["content"] for c in chunks[:-1]) == "stream reply here"
+    assert chunks[-1]["done"] is True
+
+
+def test_api_tags_advertises_engine_url_entry_without_tokenizer(tmp_path):
+    reg = ns._load_models(_write_models_yaml(tmp_path, _ENGINE_MODEL))
+    with _running_server_models(reg) as port:
+        status, body = _get(port, "/api/tags")
+    assert status == 200
+    tag = body["models"][0]
+    assert tag["name"] == "qwen3-14b-local"
+    assert tag["size"] == 0            # no local tokenizer_gguf to stat
+    assert tag["details"]["parameter_size"] == "14B"
