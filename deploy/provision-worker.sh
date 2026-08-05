@@ -134,6 +134,39 @@ elif _have nvidia-smi && nvidia-smi -L >/dev/null 2>&1; then
   if [ "$NVCC_OK" = 1 ]; then
     ACCEL="cuda(sm_$CC)"
     ACCEL_FLAGS="-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=$CC"
+    # ⚠ Pick the CUDA HOST compiler deliberately. Two separate limits apply and only one of them
+    # is discoverable:
+    #   (a) CUDA's own ceiling, declared in crt/host_config.h as `#if __GNUC__ > N`. Read it.
+    #   (b) GCC 15.2 SEGFAULTS in its own register allocator compiling nvcc-generated stub code
+    #       ("during RTL pass: ira ... internal compiler error"), even though CUDA 13.3 permits
+    #       GCC 15. So the version being *allowed* is not the same as it *working* — do not infer
+    #       (b) from (a). Observed on Ubuntu 26.04 / gcc 15.2 / CUDA 13.3 building for sm_120.
+    # Hence: newest g++ that is <= CUDA's ceiling AND <= 14.
+    HC_MAX=14
+    for _hc in /usr/local/cuda*/targets/*/include/crt/host_config.h; do
+      [ -f "$_hc" ] || continue
+      _n="$(grep -oE '__GNUC__ > [0-9]+' "$_hc" 2>/dev/null | head -1 | awk '{print $3}')"
+      [ -n "$_n" ] && [ "$_n" -lt "$HC_MAX" ] && HC_MAX="$_n"
+      break
+    done
+    HOSTCC=""
+    for _v in $(seq "$HC_MAX" -1 11); do
+      if command -v "g++-$_v" >/dev/null 2>&1; then HOSTCC="$(command -v g++-$_v)"; break; fi
+    done
+    if [ -z "$HOSTCC" ] && _apt; then
+      say "installing g++-$HC_MAX as the CUDA host compiler (the default g++ is unusable for nvcc)"
+      sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "g++-$HC_MAX" "gcc-$HC_MAX" >/dev/null 2>&1 || true
+      command -v "g++-$HC_MAX" >/dev/null 2>&1 && HOSTCC="$(command -v g++-$HC_MAX)"
+    fi
+    if [ -n "$HOSTCC" ]; then
+      ACCEL_FLAGS="$ACCEL_FLAGS -DCMAKE_CUDA_HOST_COMPILER=$HOSTCC"
+      ACCEL="$ACCEL host=$(basename "$HOSTCC")"
+    else
+      say "no g++ <= $HC_MAX available — nvcc will use the default host compiler and may ICE"
+    fi
+    # CUDA template instantiation is memory-hungry per job; cap parallelism so a 32-thread box
+    # does not try 32 of them at once.
+    [ "$NPROC" -gt 16 ] && NPROC=16
   else
     say "NVIDIA GPU present but no usable nvcc — building CPU-only (set WORKER_INSTALL_CUDA=1 with sudo to fix)"
   fi
