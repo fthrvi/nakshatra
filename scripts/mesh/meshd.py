@@ -21,8 +21,10 @@ loops, no hand-holding:
 
 Discovery backend is pluggable: FileRelay (zero-dep, the always-on local/shared
 substrate) by default; pass `--nostr-relay wss://…` to publish/query over a real
-public Nostr relay instead (needs websocket-client; the signed-listing schema is
-identical either way).
+public Nostr relay instead (needs coincurve + websocket-client; the signed-listing
+schema is identical either way). The Nostr event key persists at --nostr-key-file
+(default ~/.nakshatra/keys/nostr.secp256k1) so restarts REPLACE this node's
+listing (NIP-33 keys on the event pubkey) instead of orphaning it.
 
 A status file (`--status-file`, default ~/.nakshatra/mesh-status.json) is written
 every loop so the systemd unit / an operator can see published-as, peers-seen,
@@ -97,6 +99,9 @@ class MeshConfig:
     peer_ttl: float = 0.0               # ignore listings older than this (0 → auto)
     wanted: list[str] = field(default_factory=list)   # static demand: models this node wants served (merged
                                         # with live unmet-demand from the WantedTracker into the listing)
+    nostr_relay: Optional[str] = None   # ws(s)://… → discovery over NostrRelay instead of FileRelay
+    nostr_key_file: Optional[Path] = None  # persisted secp256k1 event key (NEVER ephemeral: replaceable
+                                        # events key on the pubkey — a per-process key orphans old listings)
 
     def effective_ttl(self) -> float:
         # a node re-publishes every `refresh`s; treat it dead after a few missed
@@ -109,7 +114,20 @@ class MeshNode:
         self.cfg = cfg
         self.priv, self.pub = load_or_create_worker_key(cfg.identity_file)
         self.node_id = "nks-" + self.pub[:12]
-        self.relay = FileRelay(cfg.relay_dir)
+        if cfg.nostr_relay:
+            # Same signed-listing schema either way; only the transport differs.
+            # The event key is loaded from disk, not minted per process — an
+            # ephemeral key would defeat NIP-33 replacement and strand every
+            # previous listing on the relay as a permanent ghost.
+            from discovery import nostr as _nostr  # lazy: only this path needs coincurve
+            from discovery.relay import NostrRelay
+            key_file = cfg.nostr_key_file or (Path.home() / ".nakshatra" / "keys" / "nostr.secp256k1")
+            nostr_priv = _nostr.load_or_create_key(key_file)
+            self.relay = NostrRelay(cfg.nostr_relay, nostr_privkey_hex=nostr_priv)
+            self._log(f"discovery via nostr relay {cfg.nostr_relay} "
+                      f"(event key {_nostr.pubkey_of(nostr_priv)[:12]}… from {key_file})")
+        else:
+            self.relay = FileRelay(cfg.relay_dir)
         # the discovery demand signal: static --wanted (cfg) merged with live unmet demand. The serve/gate
         # path can call self.wanted_tracker.note(model) when a request can't be satisfied (no eligible
         # worker / OOM / capacity-denied) so the next listing advertises real scarcity.
@@ -349,6 +367,13 @@ def _parse_args(argv=None) -> MeshConfig:
                          "demand signal a GPU owner can see and fill")
     ap.add_argument("--relay-dir", default=str(home_nks / "relay"),
                     help="FileRelay discovery directory (the shared substrate)")
+    ap.add_argument("--nostr-relay", default="",
+                    help="ws(s):// Nostr relay URL — publish/query listings there "
+                         "instead of the FileRelay (needs coincurve + websocket-client)")
+    ap.add_argument("--nostr-key-file", default=str(home_nks / "keys" / "nostr.secp256k1"),
+                    help="persisted secp256k1 event key for --nostr-relay (created 0600 "
+                         "on first use; reused across restarts so listings REPLACE, "
+                         "never accumulate)")
     ap.add_argument("--rendezvous", default="127.0.0.1:51820",
                     help="rendezvous relay host:port for tunnel bring-up")
     ap.add_argument("--worker-addr", default=None,
@@ -391,6 +416,8 @@ def _parse_args(argv=None) -> MeshConfig:
         status_file=Path(a.status_file), daemon_bin=daemon_bin,
         provenance_pin=provenance_pin, once=a.once, peer_ttl=a.peer_ttl,
         wanted=wanted,
+        nostr_relay=(a.nostr_relay or None),
+        nostr_key_file=Path(a.nostr_key_file) if a.nostr_key_file else None,
     )
 
 

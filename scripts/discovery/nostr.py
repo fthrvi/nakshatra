@@ -28,6 +28,31 @@ def pubkey_of(privkey_hex: str) -> str:
     return _xonly_hex(PrivateKey(bytes.fromhex(privkey_hex)))
 
 
+def load_or_create_key(path) -> str:
+    """Persisted Nostr identity (privkey hex), created on first use (0600).
+
+    Replaceable-event semantics key on (kind, pubkey, d-tag): a fresh key per
+    process would orphan every previous listing on the relay instead of
+    replacing it, and the relay would accumulate dead listings forever. Any
+    long-lived publisher (meshd) MUST load its event key from disk — same
+    contract as nakshatra_auth.load_or_create_worker_key for the mesh key.
+    """
+    import os
+    from pathlib import Path
+
+    p = Path(path).expanduser()
+    if p.exists():
+        key = p.read_text().strip()
+        pubkey_of(key)  # validates hex + curve point before anyone signs with it
+        return key
+    p.parent.mkdir(parents=True, exist_ok=True)
+    key = keygen()[0]
+    fd = os.open(str(p), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(key + "\n")
+    return key
+
+
 def _xonly_hex(pk: PrivateKey) -> str:
     # BIP340 x-only pubkey = the 32-byte x coordinate (drop the compressed prefix).
     return pk.public_key.format(compressed=True)[1:].hex()
