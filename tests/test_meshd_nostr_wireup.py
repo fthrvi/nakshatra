@@ -93,3 +93,47 @@ def test_load_or_create_key_rejects_corrupt_file(tmp_path):
     p.write_text("not-a-key\n")
     with pytest.raises(Exception):
         nostr.load_or_create_key(p)                   # corrupt key must never sign
+
+
+# ── audit gap (b): per-node NIP-33 d-tag ──
+
+def test_nostr_d_tag_scoped_to_node(tmp_path):
+    """One shared event key publishing two nodes in one mesh must not have the
+    second listing replace the first: d must be mesh_id/node_id, not mesh_id."""
+    from nakshatra_auth import generate_keypair
+    from discovery.nakshatra_listing import NakshatraListing
+    from discovery.relay import listing_to_nostr_event_content
+
+    def _l(node_id):
+        priv, pub = generate_keypair()
+        l = NakshatraListing(mesh_id="m1", node_id=node_id, ed25519_pubkey_hex=pub)
+        l.sign(priv)
+        return l
+
+    d_of = lambda ev: [t for t in ev["tags"] if t[0] == "d"][0][1]
+    a, b = listing_to_nostr_event_content(_l("nks-aaa")), listing_to_nostr_event_content(_l("nks-bbb"))
+    assert d_of(a) == "m1/nks-aaa" and d_of(b) == "m1/nks-bbb"
+    assert d_of(a) != d_of(b)      # distinct replaceable addresses under one pubkey
+
+
+# ── audit gap (c): capacity fields populated ──
+
+def test_listing_carries_probed_vram_and_node_count(tmp_path, monkeypatch):
+    import fabric.worker_join as wj
+    monkeypatch.setattr(wj, "detect_capabilities",
+                        lambda: {"gpu": "FakeGPU", "vram_mb": 20480, "backend": "cuda"})
+    node = MeshNode(_cfg(tmp_path))
+    node._last_peers = [{"node_id": "p1"}, {"node_id": "p2"}]
+    listing = node._build_listing()
+    assert listing.total_vram_bytes == 20480 * 1024 * 1024
+    assert listing.node_count == 3          # self + 2 admitted peers last loop
+    assert listing.verify()                 # capacity fields ride inside the signature
+
+
+def test_probe_failure_lists_at_zero_not_crash(tmp_path, monkeypatch):
+    import fabric.worker_join as wj
+    monkeypatch.setattr(wj, "detect_capabilities",
+                        lambda: (_ for _ in ()).throw(RuntimeError("no smi")))
+    node = MeshNode(_cfg(tmp_path))
+    assert node.total_vram_bytes == 0
+    assert node._build_listing().total_vram_bytes == 0

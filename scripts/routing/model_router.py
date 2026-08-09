@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import enum
 import json
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
@@ -55,10 +56,19 @@ class RouteTarget:
     score: float = 0.0
 
 
+# Default listing freshness for routing decisions. Matches meshd's heartbeat
+# discipline (publish every 30s, dead after a few missed beats — its auto TTL
+# floor is 90s; nks-capacity drops peers at 90s too). Before this existed,
+# resolve_serving_peer would happily route to a listing of ANY age — a node
+# gone for a week still won routing as long as its file sat on the relay.
+ROUTE_MAX_AGE_S = 120.0
+
+
 def resolve_serving_peer(relay: DiscoveryRelay, model: str, *,
                          mesh_id: Optional[str] = None,
                          exclude_node_id: str = "",
-                         require_drift_class: Optional[str] = None
+                         require_drift_class: Optional[str] = None,
+                         max_age_s: Optional[float] = ROUTE_MAX_AGE_S
                          ) -> Optional[tuple[PinnedIdentity, str, float]]:
     """Discover the best *verified* peer serving `model`, ranked by measured
     compute. Returns (pinned_identity, endpoint_hint, score) or None.
@@ -70,15 +80,23 @@ def resolve_serving_peer(relay: DiscoveryRelay, model: str, *,
     fingerprint), only peers advertising the SAME drift_class are eligible — a
     bit-deterministic chain must stay in one engine-build class
     (cross-machine-validation.md §2a). Leave None for throughput work where
-    bit-identity isn't required."""
+    bit-identity isn't required.
+
+    `max_age_s`: drop listings whose heartbeat is older than this before ranking
+    (default ROUTE_MAX_AGE_S; None disables — caller owns the risk). Listings
+    with created_unix=0 predate stamping (legacy CLI publishes) and are exempt:
+    unknown age is not infinite age, and the signature already gates forgery."""
     # §7: drop peers we can't speak to BEFORE pinning/forwarding — a clean
     # pre-join reject, never a silent attempt against an incompatible wire.
     # §8.1: when a deterministic class is required, drop out-of-class peers too.
+    now = time.time()
     listings = [
         l for l in relay.query(mesh_id=mesh_id)
         if model in l.serving
         and is_compatible(l.supported_protocol)
         and (require_drift_class is None or l.drift_class == require_drift_class)
+        and (max_age_s is None or not l.created_unix
+             or (now - l.created_unix) <= max_age_s)
     ]
     ranked = rank_listings(listings, exclude_node_id=exclude_node_id,
                            want_mesh_id=mesh_id, want_model=model)
@@ -91,14 +109,17 @@ def resolve_serving_peer(relay: DiscoveryRelay, model: str, *,
 
 def route_or_local(model: str, local_model_names: Iterable[str], relay: DiscoveryRelay,
                    *, mesh_id: Optional[str] = None, own_node_id: str = "",
-                   require_drift_class: Optional[str] = None) -> RouteTarget:
+                   require_drift_class: Optional[str] = None,
+                   max_age_s: Optional[float] = ROUTE_MAX_AGE_S) -> RouteTarget:
     """The entry-proxy decision. LOCAL if we serve it; else ROUTE to the best
     discovered peer; else NOT_FOUND. `require_drift_class` (v1.1 §8.1) restricts
-    ROUTE to same-drift-class peers for bit-deterministic chains."""
+    ROUTE to same-drift-class peers for bit-deterministic chains. `max_age_s`
+    drops stale-heartbeat peers before ranking (see resolve_serving_peer)."""
     if model in set(local_model_names):
         return RouteTarget(Decision.LOCAL)
     found = resolve_serving_peer(relay, model, mesh_id=mesh_id, exclude_node_id=own_node_id,
-                                 require_drift_class=require_drift_class)
+                                 require_drift_class=require_drift_class,
+                                 max_age_s=max_age_s)
     if found is None:
         return RouteTarget(Decision.NOT_FOUND)
     peer, endpoint, score = found

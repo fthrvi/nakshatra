@@ -159,7 +159,12 @@ def listing_to_nostr_event_content(listing: NakshatraListing) -> dict:
     if not listing.verify():
         raise ListingError("won't map an unverified listing to a Nostr event")
     tags = [
-        ["d", listing.mesh_id],                      # NIP-33 replaceable addressing
+        # NIP-33 replaceable addressing keys on (kind, event-pubkey, d). With
+        # d = mesh_id alone, one Nostr key publishing for TWO nodes in the same
+        # mesh silently replaces the sibling's listing. Scoping d to
+        # mesh_id/node_id makes replacement per-node no matter how keys are
+        # shared; queries are untouched (they filter on #mesh_id, never d).
+        ["d", f"{listing.mesh_id}/{listing.node_id}"],
         ["mesh_id", listing.mesh_id],
         ["node_id", listing.node_id],
         ["ed25519", listing.ed25519_pubkey_hex],     # the mesh key admission pins

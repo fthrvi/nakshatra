@@ -167,3 +167,45 @@ def test_forward_chat_is_signed_and_authenticates():
                               int(parts["ts"]), parts["sig"])
     finally:
         server.shutdown()
+
+
+# ── listing freshness (2026-08-09 audit gap: router routed to ANY-age listing) ──
+
+def _stamped_peer(node_id, serving, ms, endpoint, age_s, mesh="m1"):
+    import time as _t
+    priv, pub = generate_keypair()
+    l = NakshatraListing(mesh_id=mesh, node_id=node_id, ed25519_pubkey_hex=pub,
+                         serving=serving, measured_decode_ms_per_layer=ms,
+                         endpoint_hint=endpoint, created_unix=int(_t.time()) - age_s)
+    l.sign(priv)
+    return l
+
+
+def test_stale_listing_not_routed_to():
+    relay = InMemoryRelay()
+    relay.publish(_stamped_peer("old-fast", ["m"], 1.0, "10.0.0.1:1", age_s=3600))
+    relay.publish(_stamped_peer("fresh-slow", ["m"], 50.0, "10.0.0.2:1", age_s=5))
+    got = resolve_serving_peer(relay, "m", mesh_id="m1")
+    assert got is not None and got[0].node_id == "fresh-slow"   # stale winner dropped
+
+
+def test_all_stale_means_not_found():
+    relay = InMemoryRelay()
+    relay.publish(_stamped_peer("old", ["m"], 1.0, "10.0.0.1:1", age_s=3600))
+    t = route_or_local("m", ["something-else"], relay, mesh_id="m1")
+    assert t.decision is Decision.NOT_FOUND
+
+
+def test_max_age_none_disables_freshness():
+    relay = InMemoryRelay()
+    relay.publish(_stamped_peer("old", ["m"], 1.0, "10.0.0.1:1", age_s=3600))
+    got = resolve_serving_peer(relay, "m", mesh_id="m1", max_age_s=None)
+    assert got is not None and got[0].node_id == "old"
+
+
+def test_unstamped_legacy_listing_still_routes():
+    # created_unix=0 predates stamping — unknown age is not infinite age
+    relay = InMemoryRelay()
+    relay.publish(_peer("legacy", ["m"], 1.0, endpoint="10.0.0.3:1"))
+    got = resolve_serving_peer(relay, "m", mesh_id="m1")
+    assert got is not None and got[0].node_id == "legacy"

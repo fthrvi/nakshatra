@@ -136,6 +136,19 @@ class MeshNode:
         self._stop = threading.Event()
         self._last_peers: list[dict] = []
         self._log(f"identity {self.node_id} (pub {self.pub[:16]}…) mesh={cfg.mesh_id}")
+        # Capability probe — ONCE, at startup (total VRAM is static; free VRAM is
+        # not a listing field). Reuses fabric's detect_capabilities instead of
+        # growing a sixth VRAM prober. Before this, every listing advertised
+        # total_vram_bytes=0 and discovery could not answer "who has VRAM X".
+        self.total_vram_bytes = 0
+        try:
+            from fabric.worker_join import detect_capabilities
+            caps = detect_capabilities()
+            self.total_vram_bytes = int(caps.get("vram_mb") or 0) * 1024 * 1024
+            self._log(f"capability probe: {caps.get('gpu')} "
+                      f"{caps.get('vram_mb')}MB ({caps.get('backend')})")
+        except Exception as e:  # a node with no probe still lists — honestly, at 0
+            self._log(f"capability probe unavailable: {e}")
         # Build-provenance: WHICH engine build is running (companion to the drift
         # gauge's WHAT-it-computes). Computed from the local daemon binary; logged
         # + surfaced in the status file; a pin mismatch is a loud integrity alert
@@ -166,6 +179,8 @@ class MeshNode:
             wanted=sorted(set(self.cfg.wanted) | set(self.wanted_tracker.wanted())),
             measured_decode_ms_per_layer=self.cfg.decode_ms_per_layer,
             endpoint_hint=self.cfg.endpoint_hint,
+            total_vram_bytes=self.total_vram_bytes,
+            node_count=1 + len(self._last_peers),   # mesh size as this node saw it last loop
             supported_protocol=list(SUPPORTED_CONTROL_VERSIONS),
             drift_class=self.cfg.drift_class,
             provenance=self.provenance.wire() if self.provenance else None,
