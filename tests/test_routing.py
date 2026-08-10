@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -24,11 +25,17 @@ from routing.model_router import (  # noqa: E402
     Decision, route_or_local, resolve_serving_peer, forward_chat)
 
 
-def _peer(node_id, serving, ms, endpoint="", mesh="m1", drift_class=None):
+def _peer(node_id, serving, ms, endpoint="", mesh="m1", drift_class=None,
+          created_unix=None):
+    import time as _t
     priv, pub = generate_keypair()
+    # live peers are stamped in production (meshd/discover.py); default to now so
+    # the routing freshness gate doesn't drop these fixtures. Pass created_unix=0
+    # explicitly to exercise the unstamped-is-dropped path.
     l = NakshatraListing(mesh_id=mesh, node_id=node_id, ed25519_pubkey_hex=pub,
                          serving=serving, measured_decode_ms_per_layer=ms,
-                         endpoint_hint=endpoint, drift_class=drift_class)
+                         endpoint_hint=endpoint, drift_class=drift_class,
+                         created_unix=int(_t.time()) if created_unix is None else created_unix)
     l.sign(priv)
     return l
 
@@ -141,7 +148,8 @@ def test_forward_chat_is_signed_and_authenticates():
         priv, pub = generate_keypair()
         peer = NakshatraListing(mesh_id="m1", node_id="peer", ed25519_pubkey_hex=pub,
                                 serving=["llama-70b"], measured_decode_ms_per_layer=2.0,
-                                endpoint_hint=f"http://127.0.0.1:{port}")
+                                endpoint_hint=f"http://127.0.0.1:{port}",
+                                created_unix=int(time.time()))
         peer.sign(priv)
         relay.publish(peer)
 
@@ -167,3 +175,71 @@ def test_forward_chat_is_signed_and_authenticates():
                               int(parts["ts"]), parts["sig"])
     finally:
         server.shutdown()
+
+
+# ── listing freshness (2026-08-09 audit gap: router routed to ANY-age listing) ──
+
+def _stamped_peer(node_id, serving, ms, endpoint, age_s, mesh="m1"):
+    import time as _t
+    priv, pub = generate_keypair()
+    l = NakshatraListing(mesh_id=mesh, node_id=node_id, ed25519_pubkey_hex=pub,
+                         serving=serving, measured_decode_ms_per_layer=ms,
+                         endpoint_hint=endpoint, created_unix=int(_t.time()) - age_s)
+    l.sign(priv)
+    return l
+
+
+def test_stale_listing_not_routed_to():
+    relay = InMemoryRelay()
+    relay.publish(_stamped_peer("old-fast", ["m"], 1.0, "10.0.0.1:1", age_s=3600))
+    relay.publish(_stamped_peer("fresh-slow", ["m"], 50.0, "10.0.0.2:1", age_s=5))
+    got = resolve_serving_peer(relay, "m", mesh_id="m1")
+    assert got is not None and got[0].node_id == "fresh-slow"   # stale winner dropped
+
+
+def test_all_stale_means_not_found():
+    relay = InMemoryRelay()
+    relay.publish(_stamped_peer("old", ["m"], 1.0, "10.0.0.1:1", age_s=3600))
+    t = route_or_local("m", ["something-else"], relay, mesh_id="m1")
+    assert t.decision is Decision.NOT_FOUND
+
+
+def test_max_age_none_disables_freshness():
+    relay = InMemoryRelay()
+    relay.publish(_stamped_peer("old", ["m"], 1.0, "10.0.0.1:1", age_s=3600))
+    got = resolve_serving_peer(relay, "m", mesh_id="m1", max_age_s=None)
+    assert got is not None and got[0].node_id == "old"
+
+
+def test_unstamped_listing_is_dropped():
+    # created_unix=0 (no _peer stamp) = infinitely old → dropped by the gate.
+    # A signed listing with no timestamp is indistinguishable from an ancient one.
+    relay = InMemoryRelay()
+    relay.publish(_peer("unstamped", ["m"], 1.0, endpoint="10.0.0.3:1", created_unix=0))
+    assert resolve_serving_peer(relay, "m", mesh_id="m1") is None
+    # …unless the gate is disabled
+    got = resolve_serving_peer(relay, "m", mesh_id="m1", max_age_s=None)
+    assert got is not None and got[0].node_id == "unstamped"
+
+
+def test_env_default_max_age(monkeypatch):
+    # The env→default wiring is a pure helper; test it directly (no module reload,
+    # which would pollute sibling tests holding imported route_or_local/Decision).
+    from routing.model_router import _default_max_age
+    monkeypatch.delenv("NKS_ROUTE_MAX_AGE_S", raising=False)
+    assert _default_max_age() == 120.0                  # unset → default
+    monkeypatch.setenv("NKS_ROUTE_MAX_AGE_S", "7200")
+    assert _default_max_age() == 7200.0                 # widened
+    monkeypatch.setenv("NKS_ROUTE_MAX_AGE_S", "0")
+    assert _default_max_age() is None                   # 0 disables the gate
+    monkeypatch.setenv("NKS_ROUTE_MAX_AGE_S", "-5")
+    assert _default_max_age() is None                   # negative disables too
+    monkeypatch.setenv("NKS_ROUTE_MAX_AGE_S", "garbage")
+    assert _default_max_age() == 120.0                  # unparseable → safe default
+
+
+def test_explicit_widened_max_age_keeps_hour_old():
+    relay = InMemoryRelay()
+    relay.publish(_stamped_peer("hour-old", ["m"], 1.0, "10.0.0.1:1", age_s=3600))
+    got = resolve_serving_peer(relay, "m", mesh_id="m1", max_age_s=7200)
+    assert got is not None and got[0].node_id == "hour-old"

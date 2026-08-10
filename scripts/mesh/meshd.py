@@ -21,8 +21,10 @@ loops, no hand-holding:
 
 Discovery backend is pluggable: FileRelay (zero-dep, the always-on local/shared
 substrate) by default; pass `--nostr-relay wss://…` to publish/query over a real
-public Nostr relay instead (needs websocket-client; the signed-listing schema is
-identical either way).
+public Nostr relay instead (needs coincurve + websocket-client; the signed-listing
+schema is identical either way). The Nostr event key persists at --nostr-key-file
+(default ~/.nakshatra/keys/nostr.secp256k1) so restarts REPLACE this node's
+listing (NIP-33 keys on the event pubkey) instead of orphaning it.
 
 A status file (`--status-file`, default ~/.nakshatra/mesh-status.json) is written
 every loop so the systemd unit / an operator can see published-as, peers-seen,
@@ -97,6 +99,11 @@ class MeshConfig:
     peer_ttl: float = 0.0               # ignore listings older than this (0 → auto)
     wanted: list[str] = field(default_factory=list)   # static demand: models this node wants served (merged
                                         # with live unmet-demand from the WantedTracker into the listing)
+    nostr_relay: Optional[str] = None   # ws(s)://… → discovery over NostrRelay instead of FileRelay
+    nostr_key_file: Optional[Path] = None  # persisted secp256k1 event key (NEVER ephemeral: replaceable
+                                        # events key on the pubkey — a per-process key orphans old listings)
+    peer_allowlist: Optional[Path] = None  # Ed25519 mesh-pubkey hexes allowed to auto-tunnel over a public
+                                        # relay (one/line). Unset over Nostr ⇒ observe-only (no tunnels).
 
     def effective_ttl(self) -> float:
         # a node re-publishes every `refresh`s; treat it dead after a few missed
@@ -109,7 +116,38 @@ class MeshNode:
         self.cfg = cfg
         self.priv, self.pub = load_or_create_worker_key(cfg.identity_file)
         self.node_id = "nks-" + self.pub[:12]
-        self.relay = FileRelay(cfg.relay_dir)
+        self._nostr_mode = bool(cfg.nostr_relay)
+        if cfg.nostr_relay:
+            # Same signed-listing schema either way; only the transport differs.
+            # The event key is loaded from disk, not minted per process — an
+            # ephemeral key would defeat NIP-33 replacement and strand every
+            # previous listing on the relay as a permanent ghost.
+            from discovery import nostr as _nostr  # lazy: only this path needs coincurve
+            from discovery.relay import NostrRelay
+            key_file = cfg.nostr_key_file or (Path.home() / ".nakshatra" / "keys" / "nostr.secp256k1")
+            nostr_priv = _nostr.load_or_create_key(key_file)
+            self.relay = NostrRelay(cfg.nostr_relay, nostr_privkey_hex=nostr_priv)
+            self._log(f"discovery via nostr relay {cfg.nostr_relay} "
+                      f"(event key {_nostr.pubkey_of(nostr_priv)[:12]}… from {key_file})")
+        else:
+            self.relay = FileRelay(cfg.relay_dir)
+        # AUTO-TUNNEL ADMISSION (the trust boundary). On FileRelay the shared
+        # directory's filesystem ACL *is* the admission list — a stranger can't
+        # drop a listing there — so behaviour is unchanged (allowlist optional).
+        # On a PUBLIC Nostr relay that gate is gone: anyone can publish a
+        # correctly-signed listing carrying our mesh_id/drift_class, and
+        # discovery would admit it. So over Nostr we auto-tunnel ONLY to peers
+        # whose Ed25519 mesh key is in --peer-allowlist; with no allowlist,
+        # discovery still works but NO tunnel is opened (observe-only). This
+        # keeps relay.py's invariant: discovery says who exists, it never widens
+        # what they can do. Opening the mesh to the public network is a
+        # deliberate operator act (populate the allowlist), never a default.
+        self._allowlist = self._load_allowlist(cfg.peer_allowlist)
+        self._tunnel_blocked_logged: set[str] = set()
+        if self._nostr_mode and not self._allowlist:
+            self._log("⚠ nostr discovery WITHOUT --peer-allowlist: observe-only "
+                      "(peers discovered, NO auto-tunnel). Populate the allowlist "
+                      "to serve/consume over the public relay.")
         # the discovery demand signal: static --wanted (cfg) merged with live unmet demand. The serve/gate
         # path can call self.wanted_tracker.note(model) when a request can't be satisfied (no eligible
         # worker / OOM / capacity-denied) so the next listing advertises real scarcity.
@@ -118,6 +156,11 @@ class MeshNode:
         self._stop = threading.Event()
         self._last_peers: list[dict] = []
         self._log(f"identity {self.node_id} (pub {self.pub[:16]}…) mesh={cfg.mesh_id}")
+        # Total VRAM is probed LAZILY on the first _build_listing and cached once
+        # non-zero — NOT in __init__: a systemd --user service can start before
+        # amdgpu/ROCm is ready, and an __init__ probe would pin 0 into every
+        # listing until a human restart. -1 = "not yet probed".
+        self._total_vram_bytes = -1
         # Build-provenance: WHICH engine build is running (companion to the drift
         # gauge's WHAT-it-computes). Computed from the local daemon binary; logged
         # + surfaced in the status file; a pin mismatch is a loud integrity alert
@@ -138,6 +181,77 @@ class MeshNode:
     def _log(self, msg: str) -> None:
         print(f"[meshd] {msg}", flush=True)
 
+    # ── admission (auto-tunnel trust boundary) ──
+    @staticmethod
+    def _load_allowlist(path: Optional[Path]) -> frozenset[str]:
+        """Ed25519 mesh-pubkey hexes permitted to auto-tunnel. One per line;
+        '#' comments and blanks ignored. Missing/empty file → empty set."""
+        if not path:
+            return frozenset()
+        try:
+            lines = Path(path).expanduser().read_text().splitlines()
+        except OSError:
+            return frozenset()
+        return frozenset(s.strip().lower() for ln in lines
+                         if (s := ln.split("#", 1)[0].strip()))
+
+    def _tunnel_permitted(self, peer: NakshatraListing) -> bool:
+        # FileRelay: the shared-dir ACL already gates who can publish → unchanged.
+        if not self._nostr_mode:
+            return True
+        if peer.ed25519_pubkey_hex.lower() in self._allowlist:
+            return True
+        if peer.node_id not in self._tunnel_blocked_logged:   # log once per peer
+            self._tunnel_blocked_logged.add(peer.node_id)
+            self._log(f"tunnel to {peer.node_id} BLOCKED: pubkey not in "
+                      f"--peer-allowlist (discovered, not served/consumed over "
+                      f"the public relay)")
+        return False
+
+    # ── capability (lazy, cached, all-GPU) ──
+    def _probe_total_vram_bytes(self) -> int:
+        """Sum of accelerator VRAM across ALL local GPUs (bytes). detect_capabilities
+        reports only the first card; a box named `total_vram_bytes` in a signed,
+        published listing must not under-report a multi-GPU node. Sums every
+        nvidia-smi / rocm-smi row; falls back to fabric's single-card figure for
+        Metal/Vulkan/unknown. 0 = nothing detected (node still lists, honestly)."""
+        import re
+        import shutil
+        import subprocess
+        try:
+            if shutil.which("nvidia-smi"):
+                out = subprocess.run(
+                    ["nvidia-smi", "--query-gpu=memory.total",
+                     "--format=csv,noheader,nounits"],
+                    capture_output=True, text=True, timeout=8).stdout
+                mb = sum(int(re.sub(r"\D", "", ln) or 0) for ln in out.splitlines() if ln.strip())
+                if mb:
+                    return mb * 1024 * 1024
+            elif shutil.which("rocm-smi"):
+                out = subprocess.run(["rocm-smi", "--showmeminfo", "vram", "--csv"],
+                                     capture_output=True, text=True, timeout=8).stdout
+                by = sum(int(m) for m in re.findall(r"(\d{6,})", out or ""))
+                if by:
+                    return by
+        except Exception:
+            pass
+        try:  # Metal / Vulkan / single-vendor fallback — first card is all fabric gives
+            from fabric.worker_join import detect_capabilities
+            return int(detect_capabilities().get("vram_mb") or 0) * 1024 * 1024
+        except Exception:
+            return 0
+
+    def _vram_bytes(self) -> int:
+        """Lazy + cached. Re-probes each call until it gets a non-zero (GPU may
+        not be ready at boot); freezes on the first real reading."""
+        if self._total_vram_bytes > 0:
+            return self._total_vram_bytes
+        probed = self._probe_total_vram_bytes()
+        if probed > 0:
+            self._total_vram_bytes = probed
+            self._log(f"capability probe: total VRAM {probed // (1024*1024)} MB")
+        return probed
+
     # ── 1. publish ──
     def _build_listing(self) -> NakshatraListing:
         listing = NakshatraListing(
@@ -148,6 +262,12 @@ class MeshNode:
             wanted=sorted(set(self.cfg.wanted) | set(self.wanted_tracker.wanted())),
             measured_decode_ms_per_layer=self.cfg.decode_ms_per_layer,
             endpoint_hint=self.cfg.endpoint_hint,
+            total_vram_bytes=self._vram_bytes(),
+            # node_count stays 1: a self-reported local peer-count is unverifiable,
+            # flaps on every tunnel churn, and (W_NODE_COUNT=5.0) would dominate
+            # ranking over real measured compute. Left at the schema default until
+            # a verified mesh-size source exists — see nakshatra_listing.W_NODE_COUNT.
+            node_count=1,
             supported_protocol=list(SUPPORTED_CONTROL_VERSIONS),
             drift_class=self.cfg.drift_class,
             provenance=self.provenance.wire() if self.provenance else None,
@@ -192,6 +312,11 @@ class MeshNode:
 
     # ── 3. auto-tunnel ──
     def _ensure_tunnel(self, peer: NakshatraListing) -> None:
+        # Trust boundary: over a public relay, never auto-proxy the local worker
+        # to a peer we didn't explicitly allow (see __init__). Discovery already
+        # happened; this only decides whether to open the encrypted pipe.
+        if not self._tunnel_permitted(peer):
+            return
         h = self.tunnels.get(peer.node_id)
         if h is not None and h.alive():
             return
@@ -349,6 +474,18 @@ def _parse_args(argv=None) -> MeshConfig:
                          "demand signal a GPU owner can see and fill")
     ap.add_argument("--relay-dir", default=str(home_nks / "relay"),
                     help="FileRelay discovery directory (the shared substrate)")
+    ap.add_argument("--nostr-relay", default="",
+                    help="ws(s):// Nostr relay URL — publish/query listings there "
+                         "instead of the FileRelay (needs coincurve + websocket-client)")
+    ap.add_argument("--nostr-key-file", default=str(home_nks / "keys" / "nostr.secp256k1"),
+                    help="persisted secp256k1 event key for --nostr-relay (created 0600 "
+                         "on first use; reused across restarts so listings REPLACE, "
+                         "never accumulate)")
+    ap.add_argument("--peer-allowlist", default="",
+                    help="file of Ed25519 mesh-pubkey hexes (one/line, # comments) allowed "
+                         "to AUTO-TUNNEL when discovered over a public --nostr-relay. Unset "
+                         "over Nostr ⇒ observe-only (discovery works, no tunnels). Ignored "
+                         "on FileRelay (the shared-dir ACL is the gate).")
     ap.add_argument("--rendezvous", default="127.0.0.1:51820",
                     help="rendezvous relay host:port for tunnel bring-up")
     ap.add_argument("--worker-addr", default=None,
@@ -391,6 +528,9 @@ def _parse_args(argv=None) -> MeshConfig:
         status_file=Path(a.status_file), daemon_bin=daemon_bin,
         provenance_pin=provenance_pin, once=a.once, peer_ttl=a.peer_ttl,
         wanted=wanted,
+        nostr_relay=(a.nostr_relay or None),
+        nostr_key_file=Path(a.nostr_key_file) if a.nostr_key_file else None,
+        peer_allowlist=Path(a.peer_allowlist) if a.peer_allowlist else None,
     )
 
 

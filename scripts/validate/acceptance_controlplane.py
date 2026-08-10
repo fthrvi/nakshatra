@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -65,7 +66,7 @@ class Node:
             serving=[serving], measured_decode_ms_per_layer=self.decode_ms,
             endpoint_hint=f"http://127.0.0.1:55{self.start:02d}",
             supported_protocol=list(SUPPORTED_CONTROL_VERSIONS),
-            node_count=1,
+            node_count=1, created_unix=int(time.time()),
         )
         l.sign(self.priv)
         self.relay.publish(l)

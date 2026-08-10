@@ -69,10 +69,12 @@ def test_is_compatible_shortcut():
 # ── routing filters incompatible peers (§7 pre-join reject) ───────────
 
 def _peer(node_id, serving, ms, endpoint, supported):
+    import time
     priv, pub = generate_keypair()
     l = NakshatraListing(mesh_id="m1", node_id=node_id, ed25519_pubkey_hex=pub,
                          serving=serving, measured_decode_ms_per_layer=ms,
-                         endpoint_hint=endpoint, supported_protocol=supported)
+                         endpoint_hint=endpoint, supported_protocol=supported,
+                         created_unix=int(time.time()))  # live peer: stamped (freshness gate)
     l.sign(priv)
     return l
 
