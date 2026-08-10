@@ -14,10 +14,16 @@ Environment=REFRESH=30
 # --flag=${VAR} (equals form) keeps each a single token even when the value is
 # empty, so a consumer-only node (empty SERVING/WORKER_ADDR/DRIFT_CLASS) parses
 # cleanly from the same unit. meshd normalizes "" → not-set.
+# NOSTR_RELAY empty ⇒ FileRelay (default, unchanged). Set it + PEER_ALLOWLIST to
+# discover/serve over a public relay; without the allowlist meshd stays
+# observe-only (see meshd.env.example). Carried in the unit so `install-mesh.sh`
+# can't silently revert the flip on its next idempotent run.
 ExecStart=%h/nakshatra/.venv/bin/python %h/nakshatra/scripts/mesh/meshd.py \
     --mesh-id=${MESH_ID} \
     --serving=${SERVING} \
     --relay-dir=${RELAY_DIR} \
+    --nostr-relay=${NOSTR_RELAY} \
+    --peer-allowlist=${PEER_ALLOWLIST} \
     --rendezvous=${RENDEZVOUS} \
     --drift-class=${DRIFT_CLASS} \
     --worker-addr=${WORKER_ADDR} \

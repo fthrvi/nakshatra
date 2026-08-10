@@ -88,11 +88,38 @@ def test_load_or_create_key_creates_0600(tmp_path):
     assert stat.S_IMODE(p.stat().st_mode) == 0o600
 
 
-def test_load_or_create_key_rejects_corrupt_file(tmp_path):
+def test_load_or_create_key_regenerates_corrupt_file(tmp_path):
+    # A malformed/half-written key must REGENERATE, never raise — else a
+    # Restart=always daemon hot-loops forever on a bricked key file.
     p = tmp_path / "nostr.hex"
     p.write_text("not-a-key\n")
-    with pytest.raises(Exception):
-        nostr.load_or_create_key(p)                   # corrupt key must never sign
+    key = nostr.load_or_create_key(p)
+    assert nostr.pubkey_of(key)                        # a fresh, valid key
+    assert p.read_text().strip() == key                # bad content replaced
+    assert stat.S_IMODE(p.stat().st_mode) == 0o600
+
+
+def test_load_or_create_key_regenerates_empty_file(tmp_path):
+    p = tmp_path / "nostr.hex"
+    p.write_text("")                                   # 0-byte = interrupted create
+    key = nostr.load_or_create_key(p)
+    assert nostr.pubkey_of(key)
+
+
+def test_load_or_create_key_tightens_loose_perms(tmp_path):
+    p = tmp_path / "nostr.hex"
+    good = nostr.keygen()[0]
+    p.write_text(good + "\n")
+    import os as _os
+    _os.chmod(p, 0o644)
+    key = nostr.load_or_create_key(p)                  # loads the good key…
+    assert key == good
+    assert stat.S_IMODE(p.stat().st_mode) == 0o600     # …and tightens perms in place
+
+
+def test_load_or_create_key_stable_second_call(tmp_path):
+    p = tmp_path / "nostr.hex"
+    assert nostr.load_or_create_key(p) == nostr.load_or_create_key(p)
 
 
 # ── audit gap (b): per-node NIP-33 d-tag ──
@@ -116,24 +143,73 @@ def test_nostr_d_tag_scoped_to_node(tmp_path):
     assert d_of(a) != d_of(b)      # distinct replaceable addresses under one pubkey
 
 
-# ── audit gap (c): capacity fields populated ──
+# ── audit gap (c): capacity fields populated (probe lazy, cached, all-GPU) ──
 
-def test_listing_carries_probed_vram_and_node_count(tmp_path, monkeypatch):
-    import fabric.worker_join as wj
-    monkeypatch.setattr(wj, "detect_capabilities",
-                        lambda: {"gpu": "FakeGPU", "vram_mb": 20480, "backend": "cuda"})
+def test_vram_probed_lazily_not_in_init(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(MeshNode, "_probe_total_vram_bytes",
+                        lambda self: (calls.append(1), 20480 * 1024 * 1024)[1])
     node = MeshNode(_cfg(tmp_path))
-    node._last_peers = [{"node_id": "p1"}, {"node_id": "p2"}]
+    assert node._total_vram_bytes == -1 and calls == []      # NOT probed at construction
     listing = node._build_listing()
-    assert listing.total_vram_bytes == 20480 * 1024 * 1024
-    assert listing.node_count == 3          # self + 2 admitted peers last loop
-    assert listing.verify()                 # capacity fields ride inside the signature
+    assert listing.total_vram_bytes == 20480 * 1024 * 1024   # probed on first build
+    assert node._total_vram_bytes == 20480 * 1024 * 1024     # cached
+    assert listing.node_count == 1                           # self-reported count reverted
+    assert listing.verify()                                  # rides inside the signature
+    node._build_listing()
+    assert len(calls) == 1                                    # cached, not re-probed
 
 
-def test_probe_failure_lists_at_zero_not_crash(tmp_path, monkeypatch):
-    import fabric.worker_join as wj
-    monkeypatch.setattr(wj, "detect_capabilities",
-                        lambda: (_ for _ in ()).throw(RuntimeError("no smi")))
+def test_vram_probe_failure_lists_at_zero(tmp_path, monkeypatch):
+    monkeypatch.setattr(MeshNode, "_probe_total_vram_bytes", lambda self: 0)
     node = MeshNode(_cfg(tmp_path))
-    assert node.total_vram_bytes == 0
+    assert node._build_listing().total_vram_bytes == 0       # honest 0, no crash
+
+
+def test_vram_probe_retries_until_nonzero(tmp_path, monkeypatch):
+    # GPU cold at boot → 0; must re-probe (not freeze 0) until a real reading.
+    seq = iter([0, 0, 8192 * 1024 * 1024])
+    monkeypatch.setattr(MeshNode, "_probe_total_vram_bytes", lambda self: next(seq))
+    node = MeshNode(_cfg(tmp_path))
     assert node._build_listing().total_vram_bytes == 0
+    assert node._build_listing().total_vram_bytes == 0
+    assert node._build_listing().total_vram_bytes == 8192 * 1024 * 1024
+
+
+def test_vram_sums_all_gpus(tmp_path, monkeypatch):
+    # detect_capabilities is card0-only; _probe_total_vram_bytes must sum rows.
+    import shutil, subprocess
+    monkeypatch.setattr(shutil, "which", lambda n: "/usr/bin/nvidia-smi" if n == "nvidia-smi" else None)
+
+    class _R:  # 3 cards, one per line
+        stdout = "20480\n16320\n2048\n"
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: _R())
+    node = MeshNode(_cfg(tmp_path))
+    assert node._probe_total_vram_bytes() == (20480 + 16320 + 2048) * 1024 * 1024
+
+
+# ── audit gap (a) trust boundary: auto-tunnel allowlist over a public relay ──
+
+def _peer_listing(pub="ab" * 32, node_id="nks-peer"):
+    from discovery.nakshatra_listing import NakshatraListing
+    return NakshatraListing(mesh_id="m", node_id=node_id, ed25519_pubkey_hex=pub)
+
+
+def test_filerelay_tunnels_freely(tmp_path):
+    node = MeshNode(_cfg(tmp_path))                          # FileRelay: ACL is the gate
+    assert node._tunnel_permitted(_peer_listing()) is True
+
+
+def test_nostr_without_allowlist_is_observe_only(tmp_path):
+    node = MeshNode(_cfg(tmp_path, nostr_relay="wss://r",
+                         nostr_key_file=tmp_path / "k.hex"))
+    assert node._tunnel_permitted(_peer_listing()) is False  # discovered, NOT tunneled
+
+
+def test_nostr_with_allowlist_permits_only_listed(tmp_path):
+    allow = tmp_path / "allow.txt"
+    allow.write_text("# my peers\nAB" + "AB" * 31 + "\n")     # case-insensitive
+    node = MeshNode(_cfg(tmp_path, nostr_relay="wss://r",
+                         nostr_key_file=tmp_path / "k.hex", peer_allowlist=allow))
+    assert node._tunnel_permitted(_peer_listing(pub="ab" * 32)) is True
+    assert node._tunnel_permitted(_peer_listing(pub="cd" * 32, node_id="nks-x")) is False
