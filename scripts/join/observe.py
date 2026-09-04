@@ -19,6 +19,12 @@ import subprocess
 from typing import Any, Dict
 
 from acceldetect import detect_accel
+from dlplan import download_argv
+from identityfacts import identity_facts
+from probeparse import parse_probe
+from servecmd import serve_argv as build_serve_argv
+
+from join import act
 from compat import compatible          # noqa: F401  (used by the admit facts)
 from joincode import decode_join
 from procargs import serve_args
@@ -75,9 +81,55 @@ def observe(phase: str, facts: Dict[str, Any]) -> Dict[str, Any]:
         return {"accel": accel, "free_bytes": st.f_bavail * st.f_frsize,
                 "listeners": _listeners()}
 
+    if phase == "acquire":
+        # ⚠️ THE DOWNLOAD HAPPENS HERE, and its outcome is a FACT. `phase_acquire` decides
+        # what a nonzero exit means; this only reports it. The plan is built by `dlplan`,
+        # which refuses http and embedded credentials before curl ever runs.
+        url, dest = facts.get("package_url"), facts.get("slice_path")
+        if not (isinstance(url, str) and isinstance(dest, str) and url and dest):
+            return {}
+        try:
+            argv = download_argv(url, dest, resume=True)
+        except ValueError as e:
+            # A plan we refuse to build is an acquire that failed before it started.
+            return {"download_exit_code": 126, "download_stderr": f"refused to plan: {e}"}
+        return act.download(argv, dest)
+
+    if phase == "identity":
+        return identity_facts(bool(facts.get("key_existed")),
+                              facts.get("identity_pubkey") or "",
+                              facts.get("roster") if isinstance(facts.get("roster"), dict) else {},
+                              facts.get("node_id") or "")
+
     if phase == "serve":
         pid = facts.get("daemon_pid")
-        return {"running_argv": serve_args(pid)} if isinstance(pid, int) and pid > 0 else {}
+        if isinstance(pid, int) and pid > 0:
+            return {"running_argv": serve_args(pid)}
+        # ⚠️ No daemon yet: start one. The argv is built by `servecmd` from facts the earlier
+        # phases established — never re-derived here, because the build already decided the
+        # backend and ngl, and a second derivation is a second chance to disagree.
+        try:
+            argv = build_serve_argv(facts.get("python") or "python3",
+                                    facts.get("worker_script") or "worker.py", facts)
+        except ValueError as e:
+            return {"daemon_start_error": str(e)}
+        out = act.start_daemon(argv, facts.get("daemon_log") or "/tmp/nakshatra-worker.log")
+        pid = out.get("daemon_pid")
+        if isinstance(pid, int):
+            health = facts.get("health_url") or f"http://127.0.0.1:{facts.get('port')}/health"
+            out["polls"] = act.poll_health(health, attempts=int(facts.get("ready_attempts") or 20),
+                                           delay_fn=lambda i: min(2.0 * i, 15.0), pid=pid)
+            out["running_argv"] = serve_args(pid)
+        return out
+
+    if phase == "prove":
+        url = facts.get("probe_url") or f"http://127.0.0.1:{facts.get('port')}/v1/completions"
+        r = act.probe(url, facts.get("probe_payload") or
+                      {"prompt": "ok", "max_tokens": 4, "model": facts.get("model_id") or ""})
+        out = dict(r)
+        out.update(parse_probe(r.get("probe_body") or ""))
+        out.pop("probe_body", None)          # ⚠️ raw model output does not belong in facts
+        return out
 
     return {}
 
