@@ -1,5 +1,5 @@
 import pytest
-from phase_identity import identity
+from join.phase_identity import identity
 
 
 def test_clean_identity():

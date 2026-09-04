@@ -1,5 +1,5 @@
 import pytest
-from phase_prove import prove
+from join.phase_prove import prove
 
 
 def test_successful_probe():

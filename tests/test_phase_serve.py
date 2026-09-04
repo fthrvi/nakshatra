@@ -1,5 +1,5 @@
 import pytest
-from phase_serve import serve
+from join.phase_serve import serve
 
 
 def test_healthy_gpu_node():

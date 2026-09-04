@@ -1,0 +1,13 @@
+{"join": {"coordinator": "https://hub.example", "token": "t", "relay": "", "expires_at": 0},
+ "now": 1000, "node_version": "1.2.3", "coordinator_version": "1.2.9",
+ "package_url": "https://cdn.example.com/m.gguf",
+ "accel": "cuda", "free_bytes": 100000000000, "slice_bytes": 1000000000,
+ "port": 8080, "listeners": [], "vram_bytes": 25769803776, "n_layers": 32,
+ "model_bytes_per_layer": 419430400, "ctx_tokens": 98304, "kv_bytes_per_token": 128,
+ "download_exit_code": 0, "downloaded_bytes": 1000000000, "expected_bytes": 1000000000,
+ "downloaded_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+ "expected_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+ "identity_pubkey": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+ "identity_is_new": false, "registered": true, "roster_pubkey": null,
+ "daemon_pid": 4242, "running_argv": ["llama-server","--n-gpu-layers","99","--port","8080"],
+ "answered_probe_ms": 12.5, "probe_tokens": [1,2,3], "probe_layers": [0,32]}
