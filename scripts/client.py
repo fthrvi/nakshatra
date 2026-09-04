@@ -1354,6 +1354,51 @@ def main():
                 workers=chain, elapsed_s=elapsed,
                 started_at=t0, ended_at=t0 + elapsed,
             )
+            # ⚠️⚠️ ASK EACH WORKER TO SIGN FOR ITSELF. This is the half a keyring cannot
+            # do: the coordinator holds no stranger's private key — deliberately, since one
+            # that could mint a worker's signature defeats the purpose of signatures. Each
+            # worker signs with ITS OWN key and returns what IT believes it served.
+            #
+            # ⚠️ Additive and best-effort by design. A worker predating the RPC returns
+            # UNIMPLEMENTED; one that has exited raises; one with no identity returns
+            # FAILED_PRECONDITION. NONE is fatal — the stage goes unsigned,
+            # `signature_coverage` reports it as a gap, and that stage earns nothing. A run
+            # that produced tokens must not be failed because a worker could not be paid.
+            collected_sigs = []
+            for w, _stub_sp, info in sorted_stubs:
+                try:
+                    r = _stub_sp.SignParticipation(pb.SignParticipationRequest(
+                        run_id=run_id, output_sha256=rcpt["output_sha256"],
+                        layer_start=info.layer_start, layer_end=info.layer_end), timeout=20)
+                except Exception as e:                       # noqa: BLE001
+                    code = getattr(e, "code", lambda: None)()
+                    note = getattr(code, "name", None) or type(e).__name__
+                    print(f"[receipt] {w['id']}: unsigned ({note}) — that stage earns nothing",
+                          file=sys.stderr)
+                    continue
+                if not r.sig:
+                    continue
+                collected_sigs.append({"node_id": r.node_id, "pubkey": r.pubkey,
+                                       "layer_start": r.layer_start,
+                                       "layer_end": r.layer_end, "sig": r.sig})
+                if (r.layer_start, r.layer_end) != (info.layer_start, info.layer_end):
+                    # ⚠️ NOT an error, and deliberately not corrected. The worker signed what
+                    # it believes; the disagreement is evidence and `signature_coverage`
+                    # surfaces it. Trusting the coordinator here would erase the only signal
+                    # that the two disagree.
+                    print(f"[receipt] {w['id']} signed [{r.layer_start},{r.layer_end}) but the "
+                          f"chain says [{info.layer_start},{info.layer_end}) — coverage will "
+                          "show the gap", file=sys.stderr)
+            if collected_sigs:
+                rcpt = build_receipt(
+                    run_id=run_id, model_id=(args.model_id or args.model_path),
+                    prompt_tokens=tokens, generated_tokens=generated,
+                    workers=chain, elapsed_s=elapsed,
+                    started_at=t0, ended_at=t0 + elapsed,
+                    worker_signatures=collected_sigs)
+                print(f"[receipt] {len(collected_sigs)}/{len(chain)} stages signed by their "
+                      "own workers (participation PROVEN, not coordinator-asserted)")
+
             if args.participation_keyring:
                 # ⚠️ NEVER FALL BACK TO AN UNSIGNED RECEIPT. An operator who passed this flag
                 # asked for attested participation; quietly writing a coordinator-asserted one

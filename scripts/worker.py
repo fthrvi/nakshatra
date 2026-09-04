@@ -1342,6 +1342,56 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
             return pb.WakeResponse()
         return pb.WakeResponse(wake_seconds=time.time() - t0)
 
+    def SignParticipation(self, request, context):
+        """Sign, with this node's OWN mesh key, the stage this worker actually served.
+
+        ⚠️⚠️ IT SIGNS WHAT IT BELIEVES, NOT WHAT IT WAS ASKED. The request carries the
+        coordinator's idea of this worker's span; the response carries THIS WORKER'S. If they
+        disagree, the mismatch surfaces in `signature_coverage` as a gap — which is the
+        detector that exists for exactly this. A worker that echoed the requested span would
+        turn its key into a rubber stamp and make the whole scheme decorative.
+
+        ⚠️ LOADS THE KEY, NEVER CREATES ONE. `load_or_create_worker_key` would mint a fresh
+        identity if the file were missing — and a new key here means everything earned under
+        the old one becomes unreachable, silently, in the middle of a signing call. A node
+        with no key cannot be paid; that is a FAILED_PRECONDITION for an operator to fix, not
+        something to paper over by inventing an identity.
+        """
+        self._check_grpc_auth(
+            context, request.SerializeToString(),
+            method_path="/nakshatra.Nakshatra/SignParticipation", is_streaming=False)
+
+        key_path = _wauth.WORKER_KEY_PATH
+        if not key_path.exists():
+            context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+            context.set_details(f"no worker identity at {key_path}; this node can serve but "
+                                "cannot be credited — run the join/registration step")
+            return pb.SignParticipationResponse()
+        priv = key_path.read_bytes()
+        if len(priv) != 32:
+            context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+            context.set_details("worker key is malformed; refusing to sign with it")
+            return pb.SignParticipationResponse()
+
+        run_id = (request.run_id or "").strip()
+        out_sha = (request.output_sha256 or "").strip()
+        if not run_id or not out_sha:
+            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+            context.set_details("run_id and output_sha256 are both required")
+            return pb.SignParticipationResponse()
+
+        from identity_binding import pub_of, sign_participation
+        node_id = os.environ.get("NAKSHATRA_NODE_ID") or socket.gethostname()
+        priv_hex = priv.hex()
+        entry = sign_participation(priv_hex, run_id=run_id, node_id=node_id,
+                                   layer_start=int(self.layer_start),
+                                   layer_end=int(self.layer_end),
+                                   output_sha256=out_sha)
+        return pb.SignParticipationResponse(
+            node_id=node_id, pubkey=pub_of(priv_hex),
+            layer_start=int(self.layer_start), layer_end=int(self.layer_end),
+            sig=entry["sig"])
+
     def Inference(self, request_iterator, context):
         """v0.5 M0.5.1 — streaming inference RPC.
 
