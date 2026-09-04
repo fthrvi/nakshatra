@@ -80,11 +80,30 @@ class LedgerHook:
             # coordinator's say-so. Empty for legacy receipts without worker_signatures (non-breaking).
             try:
                 from identity_binding import creditable_accounts
-                accts, _ = creditable_accounts(receipt)
+                from roster import load_roster
+                # ⚠️ `pinned` is REQUIRED now, and what we pass decides who can be paid.
+                # NAKSHATRA_ROSTER unset ⇒ pin an EMPTY roster, which credits nobody. That is
+                # the fail-closed reading and it is deliberate: the alternative — accepting any
+                # key when no roster is configured — is precisely the optional-pin defect that
+                # let an unregistered key certify any node over any span.
+                # ⚠️⚠️ This call used to omit `pinned` entirely and sat inside a bare
+                # `except Exception: pass`, so when the argument became required the breakage
+                # was INVISIBLE: settle() would simply stop attaching accounts and credit
+                # nobody, with nothing in any log. The narrower excepts below exist so a
+                # roster that fails to load is distinguishable from a receipt with no
+                # signatures — silence here is what made the first bug cost weeks.
+                roster_path = os.environ.get("NAKSHATRA_ROSTER", "").strip()
+                pinned = load_roster(roster_path) if roster_path else {}
+                accts, problems = creditable_accounts(receipt, pinned=pinned)
                 if accts:
                     body["creditable_accounts"] = accts
-            except Exception:
-                pass
+                elif problems and roster_path:
+                    body["participation_problems"] = problems[:8]
+            except (FileNotFoundError, ValueError) as e:
+                # a roster that will not load must not silently become "credit nobody"
+                body["participation_problems"] = [f"roster unusable: {e}"]
+            except ImportError:
+                pass                      # identity_binding/roster absent — legacy deployment
             return self._post("/settle", body)
         except Exception:
             return None

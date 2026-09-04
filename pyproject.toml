@@ -5,6 +5,25 @@ requires = [
 ]
 build-backend = "setuptools.build_meta"
 
+[tool.pytest.ini_options]
+# ⚠️⚠️ WHY THIS EXISTS. There was no pytest config at all, so "the suite" was whatever a
+# human typed — and everyone typed `pytest tests/`. Meanwhile 20 test files live OUTSIDE
+# tests/, ~145 tests, collected by nobody. On 2026-09-04 that hid EIGHT failures in
+# scripts/test_identity_binding.py — the test file for the very module being changed — behind
+# a green "780 passed" run of tests/. A suite that does not collect the tests for the code you
+# touched cannot tell you whether you broke it, and it reports success either way.
+#
+# `testpaths` makes a bare `pytest` collect both, so the default command and the honest
+# command are the same command. That is the whole point: a check nobody remembers to run
+# is not a check.
+testpaths = ["tests", "scripts"]
+
+# ⛔ deploy/ IS DELIBERATELY EXCLUDED, AND NOT BECAUSE ITS TESTS FAIL.
+# deploy/test_eagle_cmd5.py, test_sleep_wake.py and test_eagle_kv_isolation.py are hardware
+# harnesses wearing test_ names: they spawn a real slice daemon AT IMPORT TIME and load a
+# model with n_gpu_layers=99. Collecting them does not check the GPU — it USES it, on
+# whatever machine ran pytest, including one already serving. "A check must never kill what
+# it is checking." Run them by hand, deliberately, on a box you are willing to disturb.
 [tool.black]
 line-length = 120
 required-version = "22.3.0"
