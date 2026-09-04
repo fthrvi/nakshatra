@@ -1,7 +1,3 @@
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-
 import pytest
 from identity_binding import verify_participation, UNPINNED_ACCEPT_ANY_KEY, pub_of
 from worker_sigs import build_worker_signatures

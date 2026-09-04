@@ -73,3 +73,15 @@ def cleanup_children():
 
     if _HIVEMIND_AVAILABLE:
         MPFuture.reset_backend()
+
+# ⚠️ scripts/ ON THE PATH, ONCE, HERE — not prepended into each test file.
+# The modules under test live in scripts/, not an installed package, so every test that
+# imports one needs it on sys.path. Doing that per-file means every new test file either
+# repeats the incantation or fails with ModuleNotFoundError that looks like a missing
+# dependency rather than a layout quirk. conftest.py is the one place pytest guarantees to
+# load before collection, so it is the one place this belongs.
+import sys as _sys
+from pathlib import Path as _Path
+_scripts = str(_Path(__file__).resolve().parents[1] / "scripts")
+if _scripts not in _sys.path:
+    _sys.path.insert(0, _scripts)
