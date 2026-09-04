@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import socket
 import struct
+import time
 import threading
 from typing import Optional
 
@@ -114,14 +115,39 @@ def _pipe(a: socket.socket, b: socket.socket) -> None:
 class RendezvousRelay:
     """Pairs sockets by rendezvous_id and pipes between them. Untrusted forwarder."""
 
-    def __init__(self, host: str = "::", port: int = DEFAULT_PORT) -> None:
+    def __init__(self, host: str = "::", port: int = DEFAULT_PORT, *,
+                 allowlist: Optional[set] = None,
+                 max_waiting: int = 256,
+                 waiting_ttl_s: float = 120.0,
+                 max_per_ip_per_min: int = 60) -> None:
+        """A STANDING relay needs limits; a spike relay could do without them.
+
+        ⚠️⚠️ THE UNBOUNDED WAIT WAS THE SHARP EDGE, not the missing allowlist. `_waiting`
+        held a socket per unpaired rendezvous_id with no expiry and no cap: connect N times
+        with N distinct ids, never send a partner, and the relay holds N sockets and N dict
+        entries forever. Anyone who can reach the port can exhaust its file descriptors —
+        no secret required, no id guessed. TTL + cap close that, and they are ALWAYS ON
+        because they cannot break a legitimate pairing (a partner that has not arrived in
+        two minutes is not arriving).
+
+        ⚠️ The allowlist is OPTIONAL and off by default, deliberately. Defaulting it on with
+        an empty set would deny every existing deployment on upgrade; defaulting it on with
+        a permissive value would be theatre. `None` means "open, as before" and the operator
+        of a standing relay sets it. `docs/` should say so where the relay is deployed.
+        """
         self.host = host
         self.port = port
-        self._waiting: dict[bytes, socket.socket] = {}
+        self.allowlist = allowlist            # None ⇒ any rendezvous_id (previous behaviour)
+        self.max_waiting = max(1, int(max_waiting))
+        self.waiting_ttl_s = max(1.0, float(waiting_ttl_s))
+        self.max_per_ip_per_min = max(1, int(max_per_ip_per_min))
+        self._waiting: dict[bytes, tuple] = {}          # rid -> (sock, arrived_at)
+        self._recent: dict[str, list] = {}              # ip -> [timestamps]
         self._lock = threading.Lock()
         self._srv: Optional[socket.socket] = None
         self._stop = threading.Event()
         self.paired = 0  # counter for observability/tests
+        self.refused = 0 # refusals, by any limit — observability, and a rate to alarm on
 
     def _serve_socket(self) -> socket.socket:
         # Dual-stack where possible (bind :: accepts v4-mapped + v6).
@@ -146,23 +172,76 @@ class RendezvousRelay:
     def _accept_loop(self) -> None:
         while not self._stop.is_set():
             try:
-                conn, _ = self._srv.accept()
+                conn, addr = self._srv.accept()
             except OSError:
                 break
+            if not self._admit(addr):
+                # ⚠️ Closed without reading. A refused connection must not get to spend our
+                # time in _recv_id — that is the cheap half of the attack.
+                self.refused += 1
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+                continue
             threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
+
+    def _admit(self, addr) -> bool:
+        """Per-source rate limit, checked BEFORE any protocol read."""
+        ip = str(addr[0]) if addr else "?"
+        now = time.monotonic()
+        with self._lock:
+            hits = [t for t in self._recent.get(ip, ()) if now - t < 60.0]
+            if len(hits) >= self.max_per_ip_per_min:
+                self._recent[ip] = hits
+                return False
+            hits.append(now)
+            self._recent[ip] = hits
+            if len(self._recent) > 4096:        # bound the bookkeeping itself
+                cutoff = now - 60.0
+                self._recent = {k: v for k, v in self._recent.items()
+                                if v and v[-1] > cutoff}
+        return True
+
+    def _reap_locked(self, now: float) -> None:
+        """Drop waiters older than the TTL. Called under the lock."""
+        stale = [rid for rid, (_s, t) in self._waiting.items()
+                 if now - t > self.waiting_ttl_s]
+        for rid in stale:
+            sock, _ = self._waiting.pop(rid)
+            self.refused += 1
+            try:
+                sock.close()
+            except OSError:
+                pass
 
     def _handle(self, conn: socket.socket) -> None:
         rid = _recv_id(conn)
         if rid is None:
             conn.close()
             return
+        # ⚠️ Allowlist AFTER reading the id (we must know it) but BEFORE storing anything.
+        if self.allowlist is not None and rid not in self.allowlist:
+            self.refused += 1
+            conn.close()
+            return
+        now = time.monotonic()
         with self._lock:
-            peer = self._waiting.pop(rid, None)
-            if peer is None:
-                self._waiting[rid] = conn
+            self._reap_locked(now)
+            entry = self._waiting.pop(rid, None)
+            if entry is None:
+                if len(self._waiting) >= self.max_waiting:
+                    # ⚠️ Refuse the NEW arrival rather than evicting an existing waiter: a
+                    # flood must not be able to knock out legitimate half-pairs already in
+                    # progress, which is what LRU eviction would let it do.
+                    self.refused += 1
+                    conn.close()
+                    return
+                self._waiting[rid] = (conn, now)
                 return  # wait for the partner; the partner's _handle pairs us
+            peer = entry[0]
+            self.paired += 1        # under the lock: the counter is read by tests
         # we are the second arrival → pair the two sockets, pipe both directions
-        self.paired += 1
         threading.Thread(target=_pipe, args=(peer, conn), daemon=True).start()
         threading.Thread(target=_pipe, args=(conn, peer), daemon=True).start()
 
