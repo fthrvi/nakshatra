@@ -110,3 +110,19 @@ def test_never_raises():
             may_consume(*args)
         except Exception:
             pytest.fail(f"may_consume raised on args: {args}")
+
+def test_the_tier_ordering_matches_the_control_plane():
+    """⚠️ The one test that catches drift between two definitions of the same thing.
+
+    `admission.py` owns the trust-tier ordering and `worker_join` gates the planner by it —
+    that is what keeps Prithvi's sensitive models off a stranger's GPU. This module re-derived
+    the same four names independently. If the control plane ever reorders or renames a tier,
+    THIS fails, rather than the two silently disagreeing about who may be paid.
+    """
+    import creditlimit
+    if creditlimit.tier_source() != "control-plane":
+        import pytest
+        pytest.skip("control plane not reachable from here; local fallback in force")
+    assert creditlimit.TIER_RANK == {"stranger": 0, "known": 1, "trusted": 2, "self": 3}
+    for tier in creditlimit.TIERS:
+        assert tier in creditlimit.TIER_RANK, f"{tier} has a limit but no rank"

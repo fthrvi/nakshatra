@@ -18,6 +18,45 @@ contact with the internet. We choose 100 units — enough for a few real API cal
 a small batch of operations, but too small to be worth attacking at scale.
 """
 
+
+# ⚠️⚠️ THE TIER ORDERING IS NOT OURS TO INVENT. `trisul/infra/control-plane/admission.py`
+# has defined TIER_RANK = {"stranger":0,"known":1,"trusted":2,"self":3} since before this
+# file existed, and `fabric/worker_join.py` already gates the planner by it — that is what
+# keeps Prithvi's sensitive models off a stranger's GPU. This module re-derived the same four
+# names independently, which is how a repo ends up with two answers to one question and only
+# discovers the drift when they disagree about who may be paid.
+#
+# So: READ the control plane's ordering when it is reachable, and fall back to a local copy
+# only so nakshatra still runs standalone. `tier_source()` says which is in force — a
+# fallback that is indistinguishable from the real thing is how the drift hides.
+def _load_tier_rank():
+    import os
+    from pathlib import Path
+    cp = os.environ.get("NAKSHATRA_ADMISSION_DIR",
+                        str(Path.home() / "trisul" / "infra" / "control-plane"))
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("_adm", Path(cp) / "admission.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        rank = getattr(mod, "TIER_RANK", None)
+        if isinstance(rank, dict) and rank:
+            return dict(rank), "control-plane"
+    except Exception:
+        pass
+    # ⚠️ Kept in sync BY TEST, not by hope: test_creditlimit asserts these match whenever the
+    # control plane is reachable, so a change there fails here instead of silently diverging.
+    return {"stranger": 0, "known": 1, "trusted": 2, "self": 3}, "local-fallback"
+
+
+TIER_RANK, _TIER_SOURCE = _load_tier_rank()
+
+
+def tier_source() -> str:
+    """Which ordering is in force — 'control-plane' or 'local-fallback'."""
+    return _TIER_SOURCE
+
+
 TIERS: dict[str, int] = {
     # stranger: first-time visitor, minimal trust
     # 100 units: enough for ~10-20 small operations, but not worth attacking at scale
