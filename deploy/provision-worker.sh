@@ -207,6 +207,23 @@ done
 say "venv: $PYV ($("$PYV/bin/python" -c 'import grpc;print("grpcio",grpc.__version__)' 2>/dev/null))"
 
 # 6. write a tiny serve helper so the operator (or the planner) can start the worker with one cmd. --
+# ⚠️⚠️ DERIVE THE RUNTIME FLAGS FROM THE BUILD WE JUST DID. Until 2026-09-04 this heredoc
+# hardcoded `--n-gpu-layers 0` and passed no --gpu-backend at all, so a box that had just
+# spent minutes detecting its compute capability, pinning a host compiler and statically
+# linking CUDA got a serve command that ran the model ON THE CPU. worker.py's own defaults
+# are 0 and "cpu", so nothing downstream corrected it either. It is the same silent-CPU
+# fallback the comment at the top of this file says was already found once, in a different
+# place — the build learned the answer and then threw it away.
+case "$ACCEL" in
+  cuda*)     SERVE_BACKEND=cuda;   SERVE_NGL=99 ;;
+  hip/rocm)  SERVE_BACKEND=rocm;   SERVE_NGL=99 ;;
+  # ⚠️ Metal stays at 0 DELIBERATELY — it is compiled on macOS but numerically broken on
+  # the Intel-iMac Radeons in this fleet (see the ACCEL comment above). Changing this to
+  # 99 would trade a slow-but-correct worker for a fast wrong one.
+  metal*)    SERVE_BACKEND=metal;  SERVE_NGL=0  ;;
+  *)         SERVE_BACKEND=cpu;    SERVE_NGL=0  ;;
+esac
+say "serve flags: --gpu-backend $SERVE_BACKEND --n-gpu-layers $SERVE_NGL   (from ACCEL=$ACCEL)"
 cat > "$WORKER_DIR/serve-worker.sh" <<SERVE
 #!/usr/bin/env bash
 # serve-worker.sh <port> <first|middle|last> <layer-start> <layer-end> <package-url> [model-id]
@@ -214,7 +231,9 @@ set -euo pipefail
 cd "$SCRIPTS"
 exec "$PYV/bin/python" worker.py --port "\${1:?port}" --sub-gguf "$WORKER_DIR/slice.gguf" \\
   --package-url "\${5:?package-url}" --mode "\${2:?mode}" --layer-start "\${3:?start}" --layer-end "\${4:?end}" \\
-  --model-id "\${6:-model}" --daemon-bin "$DAEMON" --n-ctx 2048 --n-gpu-layers 0 \\
+  --model-id "\${6:-model}" --daemon-bin "$DAEMON" --n-ctx 2048 \\
+  --gpu-backend "\${NKS_GPU_BACKEND:-$SERVE_BACKEND}" \\
+  --n-gpu-layers "\${NKS_NGL:-$SERVE_NGL}" \\
   --node-id "\$(hostname -s)-\${2}" --no-file-server --skip-sha256
 SERVE
 chmod +x "$WORKER_DIR/serve-worker.sh"
