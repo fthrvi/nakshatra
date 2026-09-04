@@ -71,16 +71,20 @@ def select_global_ipv6(addrs: list[str]) -> Optional[str]:
         score_val = 0
         # Check for EUI-64 pattern (ff:fe in the interface identifier)
         # Interface identifier is the last 64 bits (last 4 groups)
-        addr_str = str(addr)
-        # Convert to hex string without colons for easier searching
-        hex_str = addr_str.replace(":", "")
-        # Check for fffe pattern in the last 16 characters (8 bytes = 64 bits)
-        if "fffe" in hex_str[-16:]:
-            score_val += 2
-        # Count zero groups
-        zero_groups = addr_str.count("0")
-        if zero_groups >= 3:
-            score_val += 1
+        # ⚠️⚠️ WORK ON THE EXPLODED FORM, AND COUNT GROUPS — NOT CHARACTERS.
+        # This counted `str(addr).count("0")`, the literal character, which is not the same
+        # thing at all: the compressed `2601:8c0:681:f790::388c` contains two '0' characters,
+        # while the PRIVACY address `2601:8c0:681:f790:4dd4:c670:418c:7404` contains four —
+        # so the rotating address outscored the stable one and the heuristic ran backwards.
+        # Caught by running it against this machine's real addresses; twelve synthetic tests
+        # had not, because none of them used a compressed form.
+        groups = addr.exploded.split(":")          # always 8 groups, 4 hex digits each
+        iid = groups[4:]                           # the interface identifier: last 64 bits
+        if "fffe" in "".join(iid):
+            score_val += 2                         # EUI-64 derived — stable by construction
+        if sum(1 for g in iid if g == "0000") >= 3:
+            score_val += 1                         # a low, mostly-zero IID: a delegated/static
+                                                   # address, not one SLAAC randomised
 
         # Secondary: string representation for deterministic tie-breaking
         return (-score_val, str(addr))  # Negative score for ascending sort

@@ -85,3 +85,42 @@ def test_select_global_ipv6_determinism():
     result1 = select_global_ipv6(addresses)
     result2 = select_global_ipv6(list(reversed(addresses)))
     assert result1 == result2
+
+# ── regression: real addresses from a real machine ────────────────────────────────────────
+# ⚠️ These are the three global v6 addresses a real dual-stack Linux box presented on
+# 2026-09-04. The selector picked the PRIVACY address over the stable one, because the
+# stability heuristic counted the CHARACTER '0' rather than zero GROUPS: the compressed
+# `2601:8c0:681:f790::388c` has two '0' characters, the rotating
+# `2601:8c0:681:f790:4dd4:c670:418c:7404` has four.
+#
+# Twelve synthetic tests missed it because not one of them used a COMPRESSED address. Real
+# data found it in a single call. That is the whole argument for running against a live box
+# before believing a heuristic.
+REAL_BOX = [
+    "2601:8c0:681:f790::388c",                        # stable, delegated /128
+    "2601:8c0:681:f790:4dd4:c670:418c:7404",          # temporary / privacy
+    "2601:8c0:681:f790:903f:e789:1f8d:9296",          # dynamic mngtmpaddr
+]
+
+
+def test_prefers_the_stable_address_over_the_privacy_ones():
+    assert select_global_ipv6(REAL_BOX) == "2601:8c0:681:f790::388c"
+
+
+def test_that_preference_does_not_depend_on_list_order():
+    import itertools
+    for perm in itertools.permutations(REAL_BOX):
+        assert select_global_ipv6(list(perm)) == "2601:8c0:681:f790::388c"
+
+
+def test_eui64_still_outranks_a_low_iid():
+    """The EUI-64 signal is stronger evidence of stability than a mostly-zero IID."""
+    eui = "2001:db8::201:2ff:fffe:3344"
+    assert select_global_ipv6([eui, "2001:db8::1"]) == eui
+
+
+def test_a_privacy_only_box_still_gets_an_answer():
+    """⚠️ A box with ONLY privacy addresses is still reachable — the heuristic picks a worse
+    address, it does not refuse. A wrong guess costs a re-announce, not a failure."""
+    only_privacy = REAL_BOX[1:]
+    assert select_global_ipv6(only_privacy) in only_privacy
