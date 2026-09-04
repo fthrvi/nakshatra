@@ -172,6 +172,18 @@ elif _have nvidia-smi && nvidia-smi -L >/dev/null 2>&1; then
   fi
 elif _have hipconfig || _have rocminfo; then
   ACCEL="hip/rocm"; ACCEL_FLAGS="-DGGML_HIP=ON"
+elif _have glslc && [ -n "$(ls /usr/share/vulkan/icd.d/*.json 2>/dev/null)" ]; then
+  # ⚠️⚠️ VULKAN IS THE VENDOR-NEUTRAL PATH, AND IT IS THE THESIS. `build-vulkan-worker.sh`
+  # has existed since before this line, calls ITSELF "the load-bearing build for the
+  # heterogeneous-fleet thesis" — and was referenced from nowhere, so ACCEL could never take
+  # this value and an Intel Arc box provisioned CPU-only. The engine was deliberately built
+  # backend-agnostic (the partial-load patch is frontend-only) precisely so this would work;
+  # the only missing piece was a detection branch.
+  #
+  # ⚠️ Requires BOTH a shader compiler AND an installed ICD. `glslc` alone means the SDK is
+  # present and says nothing about a driver being there — a box with the toolchain and no
+  # GPU would build Vulkan and serve nothing. An ICD json is what a real driver installs.
+  ACCEL="vulkan"; ACCEL_FLAGS="-DGGML_VULKAN=ON"
 fi
 
 say "building $BUILD_TARGET (accel=$ACCEL, GGML_METAL=$METAL, -j$NPROC)"
@@ -221,6 +233,7 @@ case "$ACCEL" in
   # the Intel-iMac Radeons in this fleet (see the ACCEL comment above). Changing this to
   # 99 would trade a slow-but-correct worker for a fast wrong one.
   metal*)    SERVE_BACKEND=metal;  SERVE_NGL=0  ;;
+  vulkan*)   SERVE_BACKEND=vulkan; SERVE_NGL=99 ;;
   *)         SERVE_BACKEND=cpu;    SERVE_NGL=0  ;;
 esac
 say "serve flags: --gpu-backend $SERVE_BACKEND --n-gpu-layers $SERVE_NGL   (from ACCEL=$ACCEL)"
