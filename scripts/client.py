@@ -605,6 +605,15 @@ def main():
                     help="speed-stack #20: write a verifiable run receipt (JSON) to this "
                          "path after the run — distinct workers + per-stage timing + output "
                          "token sha256 + layer-map; verify with scripts/receipt.verify_receipt")
+    ap.add_argument("--participation-keyring", type=str, default="",
+                    help="JSON {node_id: priv_hex} of nodes THIS operator owns. Each listed "
+                         "stage is signed for, upgrading the receipt's participation from "
+                         "coordinator-asserted to holder-of-key proven. Single-operator only: "
+                         "a stage whose node_id is absent is left unsigned, never faked — a "
+                         "coordinator that could mint a worker's signature would defeat the "
+                         "purpose of having signatures. Signing for someone else's node needs "
+                         "the worker to sign and return it (a proto change), because "
+                         "output_sha256 covers the whole run and is unknown until it ends.")
     # Speculative decoding (slice 1). Default OFF; also enabled by env
     # NAKSHATRA_SPECULATIVE=1. Engages only in unary mode when a draft model is
     # given AND every worker advertises the "speculative" capability; any failure
@@ -1333,18 +1342,65 @@ def main():
                     "backend": info.backend,
                     "mean_rpc_ms": (sum(ts) / len(ts) * 1000.0) if ts else None,
                 })
+            run_id = (session_id or uuid.uuid4().hex)
+            # Build once WITHOUT signatures to learn the run's output_sha256 — it covers the
+            # whole generated sequence, so it does not exist until generation is finished.
+            # ⚠️ That ordering is the reason a worker cannot sign inline on ForwardResponse or
+            # the Inference stream, and why attesting someone else's node needs a post-run RPC.
             rcpt = build_receipt(
-                run_id=(session_id or uuid.uuid4().hex),
+                run_id=run_id,
                 model_id=(args.model_id or args.model_path),
                 prompt_tokens=tokens, generated_tokens=generated,
                 workers=chain, elapsed_s=elapsed,
                 started_at=t0, ended_at=t0 + elapsed,
             )
+            if args.participation_keyring:
+                # ⚠️ NEVER FALL BACK TO AN UNSIGNED RECEIPT. An operator who passed this flag
+                # asked for attested participation; quietly writing a coordinator-asserted one
+                # hands them a file saying `signed_by="coordinator"` while they believe it is
+                # proven. Anything raised here is caught by the handler at the bottom of this
+                # block, which writes NO receipt and prints a banner — see the note there.
+                from worker_sigs import build_worker_signatures
+                keyring = json.loads(Path(args.participation_keyring).read_text())
+                if not isinstance(keyring, dict):
+                    raise ValueError("--participation-keyring must be a JSON object "
+                                     "{node_id: priv_hex}")
+                sigs = build_worker_signatures(
+                    [{"node_id": c["node_id"], "layer_start": c["layer_start"],
+                      "layer_end": c["layer_end"]} for c in chain],
+                    keyring, run_id=run_id, output_sha256=rcpt["output_sha256"])
+                rcpt = build_receipt(
+                    run_id=run_id,
+                    model_id=(args.model_id or args.model_path),
+                    prompt_tokens=tokens, generated_tokens=generated,
+                    workers=chain, elapsed_s=elapsed,
+                    started_at=t0, ended_at=t0 + elapsed,
+                    worker_signatures=sigs,
+                )
+                unsigned = [c["node_id"] for c in chain
+                            if c["node_id"] not in {s["node_id"] for s in sigs}]
+                print(f"[receipt] signed {len(sigs)}/{len(chain)} stages"
+                      + (f"; NO KEY for {unsigned} — those stages earn nothing" if unsigned else ""))
             Path(args.receipt_out).write_text(json.dumps(rcpt, indent=2))
             print(f"[receipt] wrote {args.receipt_out} "
                   f"(output_sha256={rcpt['output_sha256'][:12]}…, {len(chain)} stages)")
         except Exception as e:
-            print(f"[receipt] failed to write receipt: {e!r}", file=sys.stderr)
+            # ⚠️ An operator who passed --participation-keyring asked for ATTESTED
+            # participation. One more stderr line in a long run is missable, and the failure
+            # is silent where it matters: no receipt means the ledger credits nobody, weeks
+            # later, with nothing pointing back to a typo in a keyring path. So that case gets
+            # its own unmissable banner. Either way no receipt is written — an unsigned
+            # receipt is never substituted for the signed one that was asked for.
+            if args.participation_keyring:
+                print("\n" + "!" * 72, file=sys.stderr)
+                print(f"[receipt] SIGNED RECEIPT REQUESTED BUT NOT WRITTEN: {e!r}",
+                      file=sys.stderr)
+                print(f"[receipt]   keyring: {args.participation_keyring}", file=sys.stderr)
+                print("[receipt]   no receipt was written — these stages will earn NOTHING",
+                      file=sys.stderr)
+                print("!" * 72 + "\n", file=sys.stderr)
+            else:
+                print(f"[receipt] failed to write receipt: {e!r}", file=sys.stderr)
     print(f"[chain] per-worker total RPC time:")
     for wid, ts in timing.items():
         avg_first = ts[0] if ts else 0.0
