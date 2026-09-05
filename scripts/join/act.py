@@ -92,7 +92,11 @@ def start_daemon(argv: List[str], log_path: str) -> Dict[str, Any]:
     try:
         os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
         log = open(log_path, "ab")
-        p = subprocess.Popen(argv, stdout=log, stderr=log, start_new_session=True)
+        # ⚠️ Belt and braces with --pillar-url: the env var is the explicit switch, and an
+        # explicit switch cannot be lost to a future refactor of the truth table.
+        env = dict(os.environ, NAKSHATRA_AUTH_REQUIRED="true",
+                   NAKSHATRA_REFUSE_UNREGISTERED_PEERS="true")
+        p = subprocess.Popen(argv, stdout=log, stderr=log, start_new_session=True, env=env)
         return {"daemon_pid": p.pid, "daemon_log": log_path}
     except Exception as e:                                   # noqa: BLE001
         return {"daemon_pid": None, "daemon_start_error": f"{type(e).__name__}: {e}"}
