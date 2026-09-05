@@ -25,6 +25,9 @@ from probeparse import parse_probe
 from servecmd import serve_argv as build_serve_argv
 
 from join import act
+
+#: What this node reports as its own version. Bumped on wire-affecting changes.
+NODE_VERSION = "1.1.0"
 from compat import compatible          # noqa: F401  (used by the admit facts)
 from joincode import decode_join
 from procargs import serve_args
@@ -61,7 +64,8 @@ def _listeners() -> list[dict]:
 def observe(phase: str, facts: Dict[str, Any]) -> Dict[str, Any]:
     """Gather what `phase` is about to need. Called by the orchestrator BEFORE each phase."""
     if phase == "admit":
-        out: Dict[str, Any] = {"now": int(__import__("time").time())}
+        out: Dict[str, Any] = {"now": int(__import__("time").time()),
+                               "node_version": NODE_VERSION}
         code = facts.get("join_code")
         if isinstance(code, str) and code:
             try:
@@ -71,6 +75,13 @@ def observe(phase: str, facts: Dict[str, Any]) -> Dict[str, Any]:
                 # phase will refuse for want of `join`, and the reason reaches the operator
                 # without the credential reaching the log.
                 out["join_decode_error"] = str(e)
+                return out
+            # ⚠️ The coordinator supplies the rest — package_url and its version. Without
+            # this call the real path died at phase 1 on "missing package_url" while the
+            # end-to-end test passed on a preloaded fixture. The fetch is the acting layer's;
+            # a coordinator that cannot be reached leaves these "not observed", and admit
+            # refuses honestly.
+            out.update(act.fetch_join_info(out["join"]["coordinator"]))
         return out
 
     if phase == "preflight":
@@ -93,7 +104,7 @@ def observe(phase: str, facts: Dict[str, Any]) -> Dict[str, Any]:
         except ValueError as e:
             # A plan we refuse to build is an acquire that failed before it started.
             return {"download_exit_code": 126, "download_stderr": f"refused to plan: {e}"}
-        return act.download(argv, dest)
+        return act.download(argv, dest, url=url)
 
     if phase == "identity":
         return identity_facts(bool(facts.get("key_existed")),

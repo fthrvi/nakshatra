@@ -32,6 +32,7 @@ import threading
 from typing import Optional
 
 MAGIC = b"NKSR1"            # rendezvous protocol marker
+ID_READ_TIMEOUT_S = 10.0   # a legitimate client sends its id immediately
 MAX_ID = 128
 DEFAULT_PORT = 9777
 
@@ -216,9 +217,22 @@ class RendezvousRelay:
                 pass
 
     def _handle(self, conn: socket.socket) -> None:
-        rid = _recv_id(conn)
+        # ⚠️⚠️ THE ID READ MUST HAVE A DEADLINE. A client that connects and sends NOTHING
+        # parked this thread in _recv_id forever — and never reached `_waiting`, so the TTL
+        # never applied to it. Twenty silent connects held twenty threads and twenty fds
+        # indefinitely, no id needed. The rate limit slows it; only a deadline ends it.
+        try:
+            conn.settimeout(ID_READ_TIMEOUT_S)
+            rid = _recv_id(conn)
+            conn.settimeout(None)             # the pipe itself is long-lived
+        except (socket.timeout, OSError):
+            rid = None
         if rid is None:
-            conn.close()
+            self.refused += 1
+            try:
+                conn.close()
+            except OSError:
+                pass
             return
         # ⚠️ Allowlist AFTER reading the id (we must know it) but BEFORE storing anything.
         if self.allowlist is not None and rid not in self.allowlist:

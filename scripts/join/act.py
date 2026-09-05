@@ -13,8 +13,11 @@ decides what they mean. An exception here would bypass the phase that exists to 
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import os
+import socket as _socket
+import urllib.parse
 import signal
 import subprocess
 import time
@@ -23,8 +26,37 @@ import urllib.request
 from typing import Any, Dict, List
 
 
-def download(argv: List[str], dest: str) -> Dict[str, Any]:
+def _resolved_ips_are_safe(url: str) -> tuple[bool, str]:
+    """⚠️⚠️ THE PURE CHECK LOOKS AT THE STRING; THIS LOOKS AT WHERE IT GOES. `pkgurl` rejects
+    an IP literal in a private range and cannot do more — resolution is I/O. So a hostname
+    that RESOLVES to 169.254.169.254 sailed through, and DNS rebinding makes that trivial to
+    arrange. Resolve here, at the last moment before the dial, and refuse if ANY answer is
+    private, loopback, link-local or reserved. Every A/AAAA record — an attacker controls the
+    order they come back in."""
+    try:
+        host = urllib.parse.urlsplit(url).hostname
+        if not host:
+            return False, "no host in url"
+        infos = _socket.getaddrinfo(host, None, proto=_socket.IPPROTO_TCP)
+    except (OSError, ValueError) as e:
+        return False, f"could not resolve {host!r}: {e}"
+    bad = []
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast
+                or ip.is_reserved or ip.is_unspecified):
+            bad.append(str(ip))
+    if bad:
+        return False, f"{host} resolves to a non-public address: {', '.join(bad)}"
+    return True, ""
+
+
+def download(argv: List[str], dest: str, *, url: str = "") -> Dict[str, Any]:
     """Run a download plan. Returns what happened — never judges it."""
+    if url:
+        ok, why = _resolved_ips_are_safe(url)
+        if not ok:
+            return {"download_exit_code": 126, "download_stderr": f"refused: {why}"}
     try:
         p = subprocess.run(argv, capture_output=True, text=True, timeout=3600)
         code, err = p.returncode, (p.stderr or "")[-2000:]
@@ -112,6 +144,40 @@ def probe(url: str, payload: Dict[str, Any], timeout: int = 120) -> Dict[str, An
     except Exception as e:                                   # noqa: BLE001
         return {"probe_body": "", "probe_error": f"{type(e).__name__}: {e}",
                 "answered_probe_ms": None}
+
+
+def fetch_join_info(coordinator: str, timeout: int = 15) -> Dict[str, Any]:
+    """Ask the coordinator what a joining node needs: the package URL and its version.
+
+    ⚠️ WHY THIS EXISTS. The `--code` path decoded the join code and then went straight to
+    `admit`, which needs `package_url`, `node_version` and `coordinator_version` — none of
+    which anything supplied. Production failed at phase 1 with "missing package_url", while
+    the end-to-end test passed because its fixture preloaded all six phases' facts. A test
+    that passes only with a fixture the real path never sees is a test of the fixture.
+
+    Returns the facts on success; on ANY failure returns nothing, so admit refuses with
+    "not observed" — which is the honest answer when the coordinator cannot be reached.
+    """
+    try:
+        base = coordinator.rstrip("/")
+        ok, why = _resolved_ips_are_safe(base)
+        if not ok:
+            return {"join_info_error": f"coordinator refused: {why}"}
+        req = urllib.request.Request(base + "/v1/join-info",
+                                     headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read().decode("utf-8", "replace"))
+    except Exception as e:                                   # noqa: BLE001
+        return {"join_info_error": f"{type(e).__name__}: {e}"}
+    out: Dict[str, Any] = {}
+    if isinstance(data, dict):
+        if isinstance(data.get("package_url"), str):
+            out["package_url"] = data["package_url"]
+        if isinstance(data.get("version"), str):
+            out["coordinator_version"] = data["version"]
+        if isinstance(data.get("node_id"), str):
+            out["node_id"] = data["node_id"]
+    return out
 
 
 def stop_daemon(pid: int | None) -> Dict[str, Any]:

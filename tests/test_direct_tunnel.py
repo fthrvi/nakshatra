@@ -58,18 +58,46 @@ def test_a_private_hint_is_allowed_on_lan_and_refused_off_it():
     assert sock is None and "private" in why_off      # never tried it
 
 
-def test_direct_wins_when_the_peer_answers(listener):
-    port, _ = listener
-    called = []
-    def never_relay():
-        called.append(1)
-        raise AssertionError("relay was used when direct was available")
-    # loopback is refused by the filter, so use the machine's own routable-looking path:
-    # a listener on 127.0.0.1 cannot be dialled by design — assert THAT, which is the
-    # security property, and cover the success path via open_pipe's injection below.
-    sock, why = dial_direct(f"127.0.0.1:{port}")
-    assert sock is None and "loopback" in why
-    assert not called
+def _lan_ip():
+    """A non-loopback address of THIS machine, so the filter permits the dial."""
+    import ipaddress, subprocess, re
+    try:
+        out = subprocess.run(["ip", "-4", "-o", "addr"], capture_output=True, text=True).stdout
+    except Exception:
+        return None
+    for m in re.finditer(r"inet (\d+\.\d+\.\d+\.\d+)/", out):
+        ip = ipaddress.ip_address(m.group(1))
+        if ip.is_private and not ip.is_loopback and not ip.is_link_local:
+            return str(ip)
+    return None
+
+
+def test_direct_wins_when_the_peer_answers():
+    """⚠️ A REAL successful dial. The previous version of this test never dialled anything —
+    it asserted that loopback is refused and stopped, so the success path had NO test and
+    open_pipe's `was_direct=True` branch was never executed. Found by an external review.
+    Binds on this machine's own LAN address, which the filter permits with allow_lan=True."""
+    ip = _lan_ip()
+    if ip is None:
+        pytest.skip("no non-loopback IPv4 on this machine")
+    srv = socket.socket(); srv.bind((ip, 0)); srv.listen(1)
+    port = srv.getsockname()[1]
+    accepted = []
+    threading.Thread(target=lambda: accepted.append(srv.accept()[0]), daemon=True).start()
+    try:
+        relay_called = []
+        sock, why, direct = open_pipe(f"{ip}:{port}",
+                                      lambda: relay_called.append(1) or socket.socketpair()[0],
+                                      allow_lan=True, timeout=3.0)
+        assert direct is True, why
+        assert sock is not None and "direct to" in why
+        assert not relay_called, "relay was consulted although the direct dial succeeded"
+        sock.sendall(b"ping")
+        import time; time.sleep(0.2)
+        assert accepted and accepted[0].recv(4) == b"ping"
+        sock.close()
+    finally:
+        srv.close()
 
 
 def test_open_pipe_falls_back_to_the_relay(listener):
