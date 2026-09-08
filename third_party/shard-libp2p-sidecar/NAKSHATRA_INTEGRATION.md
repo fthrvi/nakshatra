@@ -1,11 +1,22 @@
 # libp2p sidecar — vendored from `leyten/shard`, for nakshatra's permissionless tier
 
-> **Attribution / License.** This directory is **vendored verbatim from
+> **Attribution / License.** This directory is **vendored from
 > [`leyten/shard`](https://github.com/leyten/shard) `sidecar/` @ `e2469732`**, licensed
-> **Apache-2.0** (see `LICENSE`). Unmodified. Finding **#22** (speed-stack plan / shard delta).
+> **Apache-2.0** (see `LICENSE`). Finding **#22** (speed-stack plan / shard delta).
 > We adopt it because it's the part of shard that is *both proven and engine-agnostic* — a
 > transparent TCP↔libp2p tunnel that doesn't care what runs on the wire, so it carries our
 > existing gRPC/fabric without engine changes.
+>
+> ⚠️ **No longer unmodified as of 2026-09-07.** One deliberate, narrow patch in `main.go`:
+> upstream's relay-reservation loop calls `relayclient.Reserve()` exactly once per process and
+> never again — a reservation silently expires (~1hr TTL observed) with nothing here to notice,
+> and the first sign of trouble is a downstream dial failing `NO_RESERVATION` on the relay's
+> side, potentially much later. Added `renewRelayReservation`/`halfLife`: a background goroutine
+> per relay that re-reserves at half the granted TTL (with a 30s retry backoff on failure), for
+> as long as the process runs. Verified against a real relay with a deliberately short TTL
+> (15s) — the reservation renewed continuously across multiple cycles with no gap; see the
+> commit for the full test transcript. Every other line in this directory is still exactly
+> `e2469732`'s.
 
 ## What it is
 A Go `go-libp2p` daemon that runs beside a node's engine and gives it, for free:

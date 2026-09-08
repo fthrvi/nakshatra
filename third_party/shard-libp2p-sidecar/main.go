@@ -165,6 +165,52 @@ func fullAddrs(h host.Host) []string {
 	return out
 }
 
+// halfLife returns a time roughly halfway to expiration. No floor: a relay that grants a
+// short TTL means exactly that little time exists, and a floor here would wait PAST the
+// expiration it's meant to beat — the wrong failure mode this patch exists to fix in the
+// first place. Reserve()'s own network round-trip (and the 30s retry backoff on failure)
+// already bound how often this can actually fire.
+func halfLife(expiration time.Time) time.Time {
+	half := time.Until(expiration) / 2
+	if half < 0 {
+		half = 0
+	}
+	return time.Now().Add(half)
+}
+
+// renewRelayReservation keeps a circuit-relay-v2 reservation on relay alive for the life of h.
+// PATCH (2026-09-07, nakshatra): upstream's relayclient.Reserve() reserves ONCE and is never
+// called again by anything in this file — a reservation silently expires (observed ~1hr TTL)
+// after which the relay drops this node with no error logged anywhere; only the NEXT dial
+// attempt through it fails, downstream, as NO_RESERVATION. This loop re-reserves at half the
+// granted TTL and retries every 30s on failure (a relay that's briefly unreachable should not
+// permanently strand this node) — see NAKSHATRA_INTEGRATION.md for why this departs from
+// upstream's "vendored verbatim" claim.
+func renewRelayReservation(h host.Host, relay peer.AddrInfo, next time.Time) {
+	for {
+		if wait := time.Until(next); wait > 0 {
+			time.Sleep(wait)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if err := h.Connect(ctx, relay); err != nil {
+			cancel()
+			log.Printf("relay renew %s: connect: %v (retrying in 30s)", relay.ID, err)
+			next = time.Now().Add(30 * time.Second)
+			continue
+		}
+		res, err := relayclient.Reserve(ctx, h, relay)
+		cancel()
+		if err != nil {
+			log.Printf("relay renew %s: reserve: %v (retrying in 30s)", relay.ID, err)
+			next = time.Now().Add(30 * time.Second)
+			continue
+		}
+		h.ConnManager().Protect(relay.ID, "relay")
+		log.Printf("RENEWED relay slot on %s (expires %s)", relay.ID, res.Expiration)
+		next = halfLife(res.Expiration)
+	}
+}
+
 func main() {
 	keyPath := flag.String("key", "", "path to persist the node key (keeps PeerId stable)")
 	peerAddr := flag.String("peer", "", "self-test: dial this /p2p multiaddr and round-trip a frame")
@@ -276,16 +322,19 @@ func main() {
 		if err := h.Connect(ctx, relay); err != nil {
 			log.Printf("relay connect %s: %v", relay.ID, err)
 			cancel()
+			go renewRelayReservation(h, relay, time.Now().Add(30*time.Second))
 			continue
 		}
 		res, err := relayclient.Reserve(ctx, h, relay)
 		cancel()
 		if err != nil {
 			log.Printf("relay reserve %s: %v", relay.ID, err)
+			go renewRelayReservation(h, relay, time.Now().Add(30*time.Second))
 			continue
 		}
 		h.ConnManager().Protect(relay.ID, "relay")
 		log.Printf("RESERVED relay slot on %s (expires %s)", relay.ID, res.Expiration)
+		go renewRelayReservation(h, relay, halfLife(res.Expiration))
 	}
 
 	// Tunnel mode: a transparent TCP<->libp2p bridge. The engine keeps its own socket
