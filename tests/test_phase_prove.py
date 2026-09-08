@@ -116,6 +116,37 @@ def test_ngl_zero_on_cpu_is_fine():
     assert updates == {"joined": True, "serving_layers": [2, 5]}
 
 
+def test_probe_never_answered():
+    """Moved from test_phase_serve.py 2026-09-07: this is the only phase that can legitimately
+    check answered_probe_ms, since it's the only phase whose observation actually performs the
+    probe."""
+    facts = {
+        "probe_tokens": [1, 2, 3],
+        "probe_layers": [2, 5],
+        "n_layers": 12,
+        "serve_ngl": 3,
+        "accel": "cuda",
+        "answered_probe_ms": None,
+    }
+    success, problems, updates = prove(facts)
+    assert success is False
+    assert "probe did not answer — no real response time was observed" in problems
+
+
+def test_probe_zero_ms():
+    facts = {
+        "probe_tokens": [1, 2, 3],
+        "probe_layers": [2, 5],
+        "n_layers": 12,
+        "serve_ngl": 3,
+        "accel": "cuda",
+        "answered_probe_ms": 0,
+    }
+    success, problems, updates = prove(facts)
+    assert success is False
+    assert "probe did not answer — no real response time was observed" in problems
+
+
 def test_90_second_probe():
     facts = {
         "probe_tokens": [1, 2, 3],

@@ -88,7 +88,17 @@ def test_bad_pid():
     assert "daemon_pid is not a positive int" in problems
 
 
-def test_probe_none():
+# ⚠️ test_probe_none / test_probe_zero / test_probe_too_slow REMOVED 2026-09-07: serve() no
+# longer checks answered_probe_ms at all — that fact is only ever produced by observing PROVE,
+# which the real orchestrator runs strictly after serve, so a check on it here could never be
+# satisfied on a genuine live run. Coverage for "did it actually answer, and in time" moved to
+# test_phase_prove.py, which is where the probe itself actually happens. See phase_serve.py's
+# module docstring for the finding.
+
+
+def test_probe_field_present_but_irrelevant_here():
+    """serve() must not even look at answered_probe_ms any more — a present-but-bad value
+    (e.g. left over from a previous run's facts) must not affect serve's own verdict."""
     facts = {
         "daemon_pid": 12345,
         "running_argv": ["llama", "--n-gpu-layers", "99"],
@@ -96,32 +106,9 @@ def test_probe_none():
         "answered_probe_ms": None,
     }
     success, problems, updates = serve(facts)
-    assert success is False
-    assert "probe did not answer in time" in problems
-
-
-def test_probe_zero():
-    facts = {
-        "daemon_pid": 12345,
-        "running_argv": ["llama", "--n-gpu-layers", "99"],
-        "accel": "cuda",
-        "answered_probe_ms": 0,
-    }
-    success, problems, updates = serve(facts)
-    assert success is False
-    assert "probe did not answer in time" in problems
-
-
-def test_probe_too_slow():
-    facts = {
-        "daemon_pid": 12345,
-        "running_argv": ["llama", "--n-gpu-layers", "99"],
-        "accel": "cuda",
-        "answered_probe_ms": 60000,
-    }
-    success, problems, updates = serve(facts)
-    assert success is False
-    assert "probe did not answer in time" in problems
+    assert success is True
+    assert problems == []
+    assert updates == {"serving": True, "serve_ngl": 99}
 
 
 def test_missing_observations():

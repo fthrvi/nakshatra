@@ -30,8 +30,14 @@ def prove(facts: dict) -> tuple[bool, list[str], dict]:
                 problems.append("a node can pass every earlier check, answer the probe, and still be running on CPU with an idle card")
 
     # Check answered_probe_ms
+    # ⚠️ THIS IS THE ONLY PLACE THAT MAY REQUIRE `answered_probe_ms` — moved from phase_serve
+    # 2026-09-07, which ran before the probe existed and so could never pass on a real run.
+    # A missing/invalid value here means the probe never produced a real answer at all, which
+    # is a distinct, worse problem than answering too slowly, and must not be silently ignored.
     answered_probe_ms = facts.get("answered_probe_ms")
-    if answered_probe_ms is not None and isinstance(answered_probe_ms, (int, float)) and answered_probe_ms >= 60000:
+    if not isinstance(answered_probe_ms, (int, float)) or isinstance(answered_probe_ms, bool) or answered_probe_ms <= 0:
+        problems.append("probe did not answer — no real response time was observed")
+    elif answered_probe_ms >= 60000:
         problems.append("it answered, eventually, in a way no requester will wait for")
 
     # If no problems, set success updates

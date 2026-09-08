@@ -1,4 +1,13 @@
 def serve(facts: dict) -> tuple[bool, list[str], dict]:
+    """⚠️⚠️ THIS PHASE MUST NEVER REQUIRE `answered_probe_ms`. That fact is produced by
+    observing PROVE, which the orchestrator runs strictly AFTER serve (PHASE_ORDER in
+    join/__init__.py). A check here on that field is unsatisfiable by construction on every
+    real run: observe("serve", facts) starts the daemon and polls /health, never /v1/completions,
+    so `answered_probe_ms` is always None when this function is called for real. Found
+    2026-09-07 — the fixture-based end-to-end test passed because it preloads every phase's
+    facts up front, masking that the live `--code` path could never pass this phase. Whether
+    the daemon actually ANSWERS correctly is prove's job (it exists for exactly this); serve's
+    job is only whether a correctly-configured daemon is running."""
     problems = []
     updates = {}
 
@@ -58,11 +67,6 @@ def serve(facts: dict) -> tuple[bool, list[str], dict]:
     elif accel == "cpu":
         if ngl is not None and ngl != 0:
             problems.append("claiming offload with no GPU")
-
-    # Check answered_probe_ms
-    answered_probe_ms = facts.get("answered_probe_ms")
-    if answered_probe_ms is None or answered_probe_ms <= 0 or answered_probe_ms >= 60000:
-        problems.append("probe did not answer in time")
 
     # If no problems, set success updates
     if not problems:
