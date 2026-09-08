@@ -37,12 +37,28 @@ import (
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/protocol"
 	relayclient "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/client"
 	"github.com/multiformats/go-multiaddr"
 )
 
 // activationProto is the stream protocol carrying inter-stage traffic (and the self-test).
-const activationProto = "/shard/activation/1.0.0"
+const (
+	activationProto       = "/shard/activation/1.0.0"
+	activationRelayReason = "shard activation stream"
+)
+
+// openActivationStream opts into circuit-relay connections. go-libp2p marks
+// relayed connections limited; without this context option Swarm.NewStream waits
+// for a direct-path upgrade until the caller's deadline expires.
+func openActivationStream(
+	ctx context.Context,
+	p peer.ID,
+	open func(context.Context, peer.ID, ...protocol.ID) (network.Stream, error),
+) (network.Stream, error) {
+	ctx = network.WithAllowLimitedConn(ctx, activationRelayReason)
+	return open(ctx, p, activationProto)
+}
 
 // stringList is a repeatable string flag (used for -forward).
 type stringList []string
@@ -371,7 +387,7 @@ func main() {
 		if err := h.Connect(ctx, *info); err != nil {
 			log.Fatalf("connect: %v", err)
 		}
-		s, err := h.NewStream(ctx, info.ID, activationProto)
+		s, err := openActivationStream(ctx, info.ID, h.NewStream)
 		if err != nil {
 			log.Fatalf("stream: %v", err)
 		}
@@ -431,7 +447,7 @@ func openStream(h host.Host, peerAddr string) (network.Stream, error) {
 	if err := h.Connect(ctx, *info); err != nil {
 		return nil, err
 	}
-	return h.NewStream(ctx, info.ID, activationProto)
+	return openActivationStream(ctx, info.ID, h.NewStream)
 }
 
 // monitorConns logs each new connection and whether it's via a relay or DIRECT — so we

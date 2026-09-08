@@ -5,6 +5,7 @@ On create add a row (status=active, owner). On merge flip to `merged→<sha>`.
 
 | branch | sector | description | base | status | owner |
 |---|---|---|---|---|---|
+| transport/allow-relay-streams | transport | Permit activation streams to use libp2p circuit-relay connections marked limited; otherwise `NewStream` waits for a direct upgrade until timeout. Includes a regression test for the stream-opening context. | main | active | codex/trisul (Blackwell lane) |
 | inference/spec-decode-pipeline | inference | wire speculative decoding into the distributed decode loop (slice 1 of the shard-gap speed stack); flag-gated, default OFF | main | merged→6a31658 | claude/trisul (specdec lane) |
 | inference/spec-decode-speedup | inference | incremental draft KV (O(n²)→O(n) draft, 1.76× faster); spec-decode #6 speedup | main | merged→6a31658 | claude/trisul (specdec lane) |
 | inference/rtt-topology-order | inference | RTT-aware pipeline ordering (speed-stack finding #11): order the chain by measured inter-node latency; pure module + planner seam, no GPU | main | merged→fcc012c | claude/trisul (specdec lane) |
