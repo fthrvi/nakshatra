@@ -75,6 +75,26 @@ def test_await_worker_port_gives_up_after_timeout_without_blocking_forever():
             os.environ["NKS_SUMMON_STAGGER_TIMEOUT_S"] = had
 
 
+def test_start_DOES_stagger_with_the_real_default_launcher():
+    """The positive case the earlier 'is'-based check silently failed: with NO launch_fn injected
+    (so start() falls back to self._default_launch, the real subprocess launcher), the stagger
+    MUST fire. `launch == self._default_launch` (bound methods aren't singletons — `is` is always
+    False here even for the real launcher, which is exactly the bug this test pins down)."""
+    workers = [{"id": "a", "address": "127.0.0.1", "port": 5560, "layer_range": [0, 16], "mode": "first"},
+               {"id": "b", "address": "127.0.0.1", "port": 5561, "layer_range": [16, 32], "mode": "last"}]
+    c = sl.RosterWorkerController(_spec(), plan_fn=lambda: _chain(workers))  # no launch_fn
+    c._port_open = staticmethod(lambda host, port: False)
+    real_popen = sl.subprocess.Popen
+    sl.subprocess.Popen = lambda *a, **kw: _FakeProc({})   # never spawn a real process
+    calls = []
+    c._await_worker_port = lambda *a, **kw: calls.append(a)
+    try:
+        c.start()
+    finally:
+        sl.subprocess.Popen = real_popen
+    assert len(calls) == 2, f"expected the stagger to run for both real-launched workers, got {calls}"
+
+
 def test_start_does_not_stagger_when_launch_fn_is_injected():
     """A test/simulated launch_fn spawns no real GPU daemon — staggering after it would just be
     dead time. Only the REAL subprocess launcher (_default_launch) should ever wait."""

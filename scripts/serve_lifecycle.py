@@ -305,9 +305,13 @@ class RosterWorkerController(ChainController):
             self._log(f"[lifecycle] summon roster worker {w['id']} "
                       f"layers={w['layer_range']} (self-provision from package)")
             self._procs.append(launch(w))
-            if launch is self._default_launch:
-                # Only the REAL subprocess launcher spawns a GPU daemon that can race another
-                # one — an injected test launch_fn spawns nothing to wait for.
+            if launch == self._default_launch:
+                # `==` not `is`: bound methods aren't singletons — self._default_launch accessed
+                # twice gives two distinct-identity-but-equal objects, so `is` here is ALWAYS
+                # False even for the real launcher (confirmed: this exact bug shipped once and
+                # silently made the whole stagger a no-op). Only the real subprocess launcher
+                # spawns a GPU daemon that can race another one — an injected test launch_fn
+                # spawns nothing to wait for.
                 self._await_worker_port(host, port, w["id"])
 
     def _await_worker_port(self, host: str, port: int, worker_id: str) -> None:
