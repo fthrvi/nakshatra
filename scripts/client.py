@@ -126,7 +126,70 @@ def _open_chain_channel(address: str, expected_spki: str | None,
         sys.exit(f"[chain] TLS pin failure for {address}: {e}")
 
 
-def tokenize_local(model_path, prompt):
+class RemoteTokenizer:
+    """Drop-in replacement for the pieces of a vocab-only `Llama` object this file actually
+    uses (`.tokenize()`, `.detokenize()`) — backed by a resident tokenizer_daemon.py over a Unix
+    socket instead of loading the model in THIS process. 2026-09-12: measured ~0.3-0.5s per
+    request for `Llama(vocab_only=True)` to load, paid on every chat turn because
+    nakshatra_serve.py spawns a fresh client.py subprocess per request. A resident daemon this
+    connects to pays that cost once, at daemon startup, not per turn — verified round-trip
+    latency ~0.6ms per call once connected. Every OTHER caller of `llama.tokenize`/
+    `llama.detokenize` in this file (detok_one, the final full/gen detokenize) is unchanged;
+    they just see an object with the same two methods.
+
+    One connection per client.py invocation (opened once, reused for every tokenize/detokenize
+    call during that run — a chat turn does many small detokenize calls, one per generated
+    token, so re-connecting per call would defeat the purpose)."""
+
+    def __init__(self, socket_path: str, timeout: float = 10.0):
+        import socket as _socket
+        self._sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        self._sock.settimeout(timeout)
+        self._sock.connect(socket_path)
+        self._buf = b""
+
+    def _call(self, req: dict) -> dict:
+        import json as _json
+        self._sock.sendall((_json.dumps(req) + "\n").encode("utf-8"))
+        while b"\n" not in self._buf:
+            chunk = self._sock.recv(65536)
+            if not chunk:
+                raise ConnectionError("tokenizer daemon closed the connection")
+            self._buf += chunk
+        line, _, self._buf = self._buf.partition(b"\n")
+        resp = _json.loads(line.decode("utf-8"))
+        if "error" in resp:
+            raise RuntimeError(f"tokenizer daemon: {resp['error']}")
+        return resp
+
+    def tokenize(self, text: bytes, add_bos: bool = True, special: bool = True):
+        resp = self._call({"op": "tokenize", "text": text.decode("utf-8"),
+                          "add_bos": add_bos, "special": special})
+        return resp["ids"]
+
+    def detokenize(self, ids) -> bytes:
+        resp = self._call({"op": "detokenize", "ids": list(ids)})
+        return resp["text"].encode("utf-8")
+
+    def close(self):
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+
+
+def tokenize_local(model_path, prompt, tokenizer_socket: str = ""):
+    """tokenizer_socket, when given, uses a resident tokenizer_daemon.py instead of loading
+    the model in this process — see RemoteTokenizer's docstring for why. Any connection failure
+    (daemon not running, stale socket, etc.) falls back to the normal local load rather than
+    failing the whole request — the daemon is a latency optimization, never a hard dependency."""
+    if tokenizer_socket:
+        try:
+            llama = RemoteTokenizer(tokenizer_socket)
+            return llama.tokenize(prompt.encode("utf-8"), add_bos=True, special=True), llama
+        except Exception as e:
+            print(f"[chain] tokenizer daemon unavailable ({e!r}) — loading locally instead",
+                  file=sys.stderr)
     from llama_cpp import Llama
     llama = Llama(model_path=model_path, vocab_only=True, verbose=False)
     return llama.tokenize(prompt.encode("utf-8"), add_bos=True, special=True), llama
@@ -581,6 +644,11 @@ def main():
     ap.add_argument("--model-id", type=str, default="",
                     help="Model id to query in the registry (required if --registry)")
     ap.add_argument("--model-path", type=str, required=True, help="full GGUF path for tokenizer (must match the model that was split)")
+    ap.add_argument("--tokenizer-socket", type=str, default="",
+                    help="2026-09-12: Unix socket of a resident tokenizer_daemon.py serving "
+                         "--model-path's vocab — skips the ~0.3-0.5s per-process Llama(vocab_"
+                         "only=True) reload. Falls back to a local load if the daemon isn't "
+                         "reachable; never a hard requirement.")
     ap.add_argument("--prompt", type=str, default="The capital of France is")
     ap.add_argument("--max-tokens", "-n", type=int, default=1)
     ap.add_argument("--use-streaming", action="store_true",
@@ -836,7 +904,7 @@ def main():
 
     # Tokenize
     print(f"[chain] tokenizing locally")
-    tokens, llama = tokenize_local(args.model_path, args.prompt)
+    tokens, llama = tokenize_local(args.model_path, args.prompt, args.tokenizer_socket)
     print(f"[chain] {len(tokens)} prompt tokens: {tokens}")
 
     # ── Speculative decoding setup (slice 1) ──────────────────────────────────

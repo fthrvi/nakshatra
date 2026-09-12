@@ -406,6 +406,65 @@ def test_cmd_from_roster_generates_chain(monkeypatch):
     assert calls == {"model_id": "prithvi-private", "hidden_size": 4096, "package_location": "/pkg"}
 
 
+# ── _tokenizer_socket (2026-09-12, perf/resident-tokenizer-cache) ──────────
+
+
+def test_tokenizer_socket_off_by_default(monkeypatch):
+    monkeypatch.delenv("NKS_TOKENIZER_DAEMON", raising=False)
+    assert ns.ChainChatBackend()._tokenizer_socket("/m.gguf") == ""
+
+
+def test_cmd_omits_tokenizer_socket_flag_when_daemon_disabled(monkeypatch):
+    monkeypatch.delenv("NKS_TOKENIZER_DAEMON", raising=False)
+    entry = ns.ModelEntry(name="m", tokenizer_gguf="/m.gguf", chain_yaml="/c.yaml")
+    cmd = ns.ChainChatBackend()._cmd(entry, "hi", 8)
+    assert "--tokenizer-socket" not in cmd
+
+
+def test_tokenizer_socket_reuses_an_already_alive_daemon(monkeypatch):
+    """If a daemon is already listening at the deterministic path, don't spawn a second one —
+    just hand back the path."""
+    monkeypatch.setenv("NKS_TOKENIZER_DAEMON", "1")
+    backend = ns.ChainChatBackend()
+    # Precompute the exact socket path _tokenizer_socket derives, then listen on it ourselves —
+    # standing in for an already-running tokenizer_daemon.py. A short /tmp dir, NOT pytest's
+    # tmp_path — AF_UNIX paths are capped at ~108 bytes and tmp_path's per-test nesting blows past
+    # that immediately.
+    import hashlib
+    import shutil
+    import tempfile
+    from pathlib import Path as _Path
+    fake_home = _Path(tempfile.mkdtemp(prefix="nkstok"))
+    digest = hashlib.sha256(b"/fake/model.gguf").hexdigest()[:16]
+    sock_dir = fake_home / ".nakshatra" / "tokenizer-sockets"
+    sock_dir.mkdir(parents=True)
+    sock_path = sock_dir / f"{digest}.sock"
+    monkeypatch.setattr(_Path, "home", staticmethod(lambda: fake_home))
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(str(sock_path))
+    srv.listen(1)
+    try:
+        spawned = {"called": False}
+        monkeypatch.setattr("subprocess.Popen", lambda *a, **kw: spawned.__setitem__("called", True))
+        got = backend._tokenizer_socket("/fake/model.gguf")
+        assert got == str(sock_path)
+        assert spawned["called"] is False, "must not spawn a second daemon when one is already alive"
+    finally:
+        srv.close()
+        shutil.rmtree(fake_home, ignore_errors=True)
+
+
+def test_tokenizer_socket_gives_up_cleanly_if_daemon_never_comes_up(monkeypatch):
+    """A daemon that Popen() 'succeeds' at launching but never actually starts listening (crashed,
+    missing dependency, etc.) must not hang the request — _tokenizer_socket falls back to "",
+    and the caller (tokenize_local) falls back to a local load."""
+    monkeypatch.setenv("NKS_TOKENIZER_DAEMON", "1")
+    monkeypatch.setenv("NKS_TOKENIZER_DAEMON_STARTUP_WAIT_S", "0.3")   # keep the test fast
+    monkeypatch.setattr("subprocess.Popen", lambda *a, **kw: object())   # "launches", does nothing
+    got = ns.ChainChatBackend()._tokenizer_socket("/definitely/nothing/listens/here.gguf")
+    assert got == ""
+
+
 def test_main_exits_nonzero_on_bad_config(tmp_path):
     rc = ns.main(["--models", str(tmp_path / "missing.yaml"), "--port", "0"])
     assert rc == 2

@@ -346,11 +346,64 @@ class ChainChatBackend(ChatBackend):
         self._scripts = scripts_dir or os.path.dirname(os.path.abspath(__file__))
         self._timeout = timeout_s
 
+    def _tokenizer_socket(self, tokenizer_gguf: str) -> str:
+        """2026-09-12 (perf/resident-tokenizer-cache): NKS_TOKENIZER_DAEMON=1 opt-in. Ensures a
+        resident tokenizer_daemon.py is running for this GGUF and returns its socket path — ""
+        if the flag is off or the daemon couldn't be ensured (client.py's own tokenize_local()
+        falls back to a local load either way, so "" here is always safe, just slower).
+        Default OFF: this touches the live serving path, and the win (skip a ~0.3-0.5s per-
+        request Llama(vocab_only=True) reload) is proven in isolation but not yet measured
+        through this exact integration — flip it on deliberately, watch it, then default it on."""
+        if os.environ.get("NKS_TOKENIZER_DAEMON", "").strip().lower() not in ("1", "true", "yes"):
+            return ""
+        import hashlib
+        import socket as _socket
+        import subprocess as _subprocess
+        import time as _time
+        from pathlib import Path as _Path
+        sock_dir = _Path.home() / ".nakshatra" / "tokenizer-sockets"
+        sock_dir.mkdir(parents=True, exist_ok=True)
+        digest = hashlib.sha256(tokenizer_gguf.encode("utf-8")).hexdigest()[:16]
+        sock_path = str(sock_dir / f"{digest}.sock")
+
+        def _alive() -> bool:
+            try:
+                s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+                s.settimeout(1.0)
+                s.connect(sock_path)
+                s.close()
+                return True
+            except OSError:
+                return False
+
+        if _alive():
+            return sock_path
+        try:
+            _subprocess.Popen(
+                [sys.executable, os.path.join(self._scripts, "tokenizer_daemon.py"),
+                 tokenizer_gguf, "--socket", sock_path,
+                 "--idle-timeout-s", os.environ.get("NKS_TOKENIZER_DAEMON_IDLE_S", "600")],
+                stdout=_subprocess.DEVNULL, stderr=_subprocess.DEVNULL,
+                start_new_session=True,   # detach — must outlive THIS request, not just this call
+            )
+        except Exception:
+            return ""
+        wait_s = float(os.environ.get("NKS_TOKENIZER_DAEMON_STARTUP_WAIT_S", "15.0"))
+        deadline = _time.monotonic() + wait_s
+        while _time.monotonic() < deadline:
+            if _alive():
+                return sock_path
+            _time.sleep(0.1)
+        return ""   # didn't come up in time — caller falls back to a local load, not an error
+
     def _cmd(self, entry, prompt, max_tokens, receipt_path=None) -> list:
         cmd = [sys.executable, os.path.join(self._scripts, "client.py"),
                "--model-path", entry.tokenizer_gguf,
                "--prompt", prompt, "--max-tokens", str(max_tokens),
                "--use-streaming"]
+        tok_sock = self._tokenizer_socket(entry.tokenizer_gguf)
+        if tok_sock:
+            cmd += ["--tokenizer-socket", tok_sock]
         if receipt_path:                       # only when the credit hook is enabled
             cmd += ["--receipt-out", receipt_path]
         if entry.from_roster:
