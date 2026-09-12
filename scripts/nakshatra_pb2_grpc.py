@@ -73,6 +73,11 @@ class NakshatraStub:
                 request_serializer=nakshatra__pb2.WakeRequest.SerializeToString,
                 response_deserializer=nakshatra__pb2.WakeResponse.FromString,
                 _registered_method=True)
+        self.SignParticipation = channel.unary_unary(
+                '/nakshatra.v0_1.Nakshatra/SignParticipation',
+                request_serializer=nakshatra__pb2.SignParticipationRequest.SerializeToString,
+                response_deserializer=nakshatra__pb2.SignParticipationResponse.FromString,
+                _registered_method=True)
 
 
 class NakshatraServicer:
@@ -130,6 +135,26 @@ class NakshatraServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def SignParticipation(self, request, context):
+        """2026-09-04 participation: a worker signs, with its OWN mesh key, the stage it
+        actually served — turning a receipt's participation from COORDINATOR-ASSERTED into
+        holder-of-key PROVEN. Until this existed, "who worked" was a claim by the one party
+        with a motive to lie, and a stranger's node could serve but could never be paid.
+
+        Called ONCE PER WORKER, AFTER generation, and it cannot be otherwise: the signed
+        message binds output_sha256, which covers the WHOLE run's output and does not exist
+        until the last token is out. A worker that finished its layers on token 1 of 400 has
+        nothing to sign yet — which is why this cannot ride on ForwardResponse or the
+        Inference stream.
+
+        Additive: a worker that does not implement it returns UNIMPLEMENTED, the coordinator
+        records no signature for that stage, and the receipt stays signed_by="coordinator" as
+        before. Old and new nodes interoperate for as long as a rollout takes.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_NakshatraServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -162,6 +187,11 @@ def add_NakshatraServicer_to_server(servicer, server):
                     servicer.Wake,
                     request_deserializer=nakshatra__pb2.WakeRequest.FromString,
                     response_serializer=nakshatra__pb2.WakeResponse.SerializeToString,
+            ),
+            'SignParticipation': grpc.unary_unary_rpc_method_handler(
+                    servicer.SignParticipation,
+                    request_deserializer=nakshatra__pb2.SignParticipationRequest.FromString,
+                    response_serializer=nakshatra__pb2.SignParticipationResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -335,6 +365,33 @@ class Nakshatra:
             '/nakshatra.v0_1.Nakshatra/Wake',
             nakshatra__pb2.WakeRequest.SerializeToString,
             nakshatra__pb2.WakeResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def SignParticipation(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/nakshatra.v0_1.Nakshatra/SignParticipation',
+            nakshatra__pb2.SignParticipationRequest.SerializeToString,
+            nakshatra__pb2.SignParticipationResponse.FromString,
             options,
             channel_credentials,
             insecure,

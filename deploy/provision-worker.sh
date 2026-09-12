@@ -18,6 +18,33 @@ set -euo pipefail
 WORKER_DIR="${WORKER_DIR:-$HOME/.nakshatra-worker}"
 STACK_URL="${WORKER_STACK_URL:-https://prithviloka.net/onboard/worker-llama-stack.tgz}"
 SCRIPTS_URL="${WORKER_SCRIPTS_URL:-https://prithviloka.net/onboard/worker-scripts.tgz}"
+
+# ⚠️⚠️ VERIFY BEFORE EXTRACTING, FAIL CLOSED. Until 2026-09-04 every archive this script
+# fetched was extracted or executed with NO integrity check — TLS was the only guarantee. A
+# compromised origin, a mis-issued certificate, or a TLS-terminating proxy (routine on campus
+# and corporate networks) meant remote code execution on every machine that ever joined.
+# A MISSING expected hash is NOT permission: this refuses until the hash is configured, and
+# WORKER_ALLOW_UNVERIFIED=1 exists only for development, with a warning that cannot be missed.
+_verify_or_die() {
+  local file="$1" want="$2" what="$3"
+  if [ -z "$want" ]; then
+    if [ "${WORKER_ALLOW_UNVERIFIED:-}" = "1" ]; then
+      say "⚠️⚠️  UNVERIFIED: no expected SHA-256 for $what and WORKER_ALLOW_UNVERIFIED=1 — DEV ONLY"
+      return 0
+    fi
+    say "REFUSING: no expected SHA-256 configured for $what."
+    say "  Set WORKER_STACK_SHA256 / WORKER_SCRIPTS_SHA256 to the published hashes, or"
+    say "  WORKER_ALLOW_UNVERIFIED=1 for development. Code that runs on this machine does not"
+    say "  ship before its hash does."
+    exit 1
+  fi
+  local got; got="$(sha256sum "$file" | cut -d' ' -f1)"
+  if [ "$got" != "$want" ]; then
+    say "REFUSING: $what hash mismatch"; say "  expected $want"; say "  got      $got"
+    rm -f "$file"; exit 1
+  fi
+  say "verified $what (sha256 ${got:0:12}…)"
+}
 BUILD_TARGET="${BUILD_TARGET:-llama-nakshatra-worker}"
 LLAMA="$WORKER_DIR/llama"
 SCRIPTS="$WORKER_DIR/nakshatra-scripts"
@@ -76,6 +103,7 @@ command -v cc >/dev/null 2>&1 || say "WARNING: no C compiler — the build will 
 if [ ! -f "$LLAMA/examples/nakshatra-spike/worker_daemon.cpp" ]; then
   say "fetching patched llama.cpp source from $STACK_URL"
   curl -fsSL -o "$WORKER_DIR/stack.tgz" "$STACK_URL"
+  _verify_or_die "$WORKER_DIR/stack.tgz" "${WORKER_STACK_SHA256:-}" "stack.tgz (the engine this box will BUILD AND RUN)"
   mkdir -p "$LLAMA"; tar xzf "$WORKER_DIR/stack.tgz" -C "$LLAMA"; rm -f "$WORKER_DIR/stack.tgz"
 fi
 say "source ready at $LLAMA"
@@ -172,6 +200,18 @@ elif _have nvidia-smi && nvidia-smi -L >/dev/null 2>&1; then
   fi
 elif _have hipconfig || _have rocminfo; then
   ACCEL="hip/rocm"; ACCEL_FLAGS="-DGGML_HIP=ON"
+elif _have glslc && [ -n "$(ls /usr/share/vulkan/icd.d/*.json 2>/dev/null)" ]; then
+  # ⚠️⚠️ VULKAN IS THE VENDOR-NEUTRAL PATH, AND IT IS THE THESIS. `build-vulkan-worker.sh`
+  # has existed since before this line, calls ITSELF "the load-bearing build for the
+  # heterogeneous-fleet thesis" — and was referenced from nowhere, so ACCEL could never take
+  # this value and an Intel Arc box provisioned CPU-only. The engine was deliberately built
+  # backend-agnostic (the partial-load patch is frontend-only) precisely so this would work;
+  # the only missing piece was a detection branch.
+  #
+  # ⚠️ Requires BOTH a shader compiler AND an installed ICD. `glslc` alone means the SDK is
+  # present and says nothing about a driver being there — a box with the toolchain and no
+  # GPU would build Vulkan and serve nothing. An ICD json is what a real driver installs.
+  ACCEL="vulkan"; ACCEL_FLAGS="-DGGML_VULKAN=ON"
 fi
 
 say "building $BUILD_TARGET (accel=$ACCEL, GGML_METAL=$METAL, -j$NPROC)"
@@ -195,6 +235,7 @@ say "installing python deps"
 if [ ! -f "$SCRIPTS/worker.py" ]; then
   say "fetching serve scripts from $SCRIPTS_URL"
   if curl -fsSL -o "$WORKER_DIR/scripts.tgz" "$SCRIPTS_URL" 2>/dev/null; then
+    _verify_or_die "$WORKER_DIR/scripts.tgz" "${WORKER_SCRIPTS_SHA256:-}" "scripts.tgz (worker.py — this box will EXECUTE it)"
     mkdir -p "$SCRIPTS"; tar xzf "$WORKER_DIR/scripts.tgz" -C "$SCRIPTS"; rm -f "$WORKER_DIR/scripts.tgz"
   else
     say "  (serve scripts not hosted yet - daemon is built; worker.py can be supplied later)"
@@ -221,6 +262,7 @@ case "$ACCEL" in
   # the Intel-iMac Radeons in this fleet (see the ACCEL comment above). Changing this to
   # 99 would trade a slow-but-correct worker for a fast wrong one.
   metal*)    SERVE_BACKEND=metal;  SERVE_NGL=0  ;;
+  vulkan*)   SERVE_BACKEND=vulkan; SERVE_NGL=99 ;;
   *)         SERVE_BACKEND=cpu;    SERVE_NGL=0  ;;
 esac
 say "serve flags: --gpu-backend $SERVE_BACKEND --n-gpu-layers $SERVE_NGL   (from ACCEL=$ACCEL)"

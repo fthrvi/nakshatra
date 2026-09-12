@@ -42,7 +42,18 @@ fail=0
 [ "$fail" = 1 ] && { echo; echo "Prereqs unmet — see header. Aborting."; exit 2; }
 
 echo "[ref] llama-simple greedy continuation (full model)…"
-REF="$("$BIN_DIR/llama-simple" -m "$REF_GGUF" -n "$NTOK" -ngl 99 "$PROMPT" 2>/dev/null | tr -d '\0')"
+# ⚠️ FALL BACK TO CPU IF THE GPU PATH IS SILENT. `llama-simple -ngl 99` writes NO stdout on
+# this ROCm build — which is how the reference came back empty and the old gate passed
+# vacuously for months. The reference only has to be CORRECT, not fast: it is one greedy
+# continuation of a 1B, and a silent reference is worse than a slow one.
+NGL_REF="${NGL_REF:-99}"
+REF="$("$BIN_DIR/llama-simple" -m "$REF_GGUF" -n "$NTOK" -ngl "$NGL_REF" "$PROMPT" 2>/dev/null | tr -d '\0')"
+if [ -z "$REF" ] && [ "$NGL_REF" != "0" ]; then
+  echo "[ref] -ngl $NGL_REF produced nothing (known on this ROCm build) — retrying on CPU…"
+  REF="$("$BIN_DIR/llama-simple" -m "$REF_GGUF" -n "$NTOK" -ngl 0 "$PROMPT" 2>/dev/null | tr -d '\0')"
+fi
+# llama-simple echoes the BOS marker; strip it so the prompt-split below lines up.
+REF="${REF#<|begin_of_text|>}"
 REF="${REF#<|begin_of_text|>}"
 echo "[ref] '$REF'"
 
@@ -72,8 +83,40 @@ CHAIN="$(grep '\[chain\] full:' /tmp/_chain.log | sed 's/.*full: //; s/^.//; s/.
 echo; echo "=== §10 PARITY ==="
 echo "reference: '$REF'"
 echo "chain    : '$CHAIN'"
-if [ "The capital of France is$REF" = "$CHAIN" ] || [ "$PROMPT$REF" = "$CHAIN" ] || echo "$CHAIN" | grep -q "$REF"; then
-  echo "✅ §10 TOKEN PARITY: PASS — distributed == single-machine, provisioned from a signed package."
+
+# ⚠️⚠️ AN EMPTY REFERENCE IS A BROKEN RUN, NOT A PASS. The old gate ended in
+# `echo "$CHAIN" | grep -q "$REF"` — and `grep -q ""` matches ANY input, so whenever the
+# reference produced nothing the gate passed unconditionally. It did produce nothing:
+# `llama-simple -ngl 99` writes no stdout on this ROCm build, so every GPU run of this
+# acceptance has been vacuous. The gate that certifies the whole system could not fail.
+if [ -z "$REF" ]; then
+  echo "❌ NO REFERENCE — llama-simple produced no output, so there is nothing to compare."
+  echo "   This is NOT a pass. On ROCm try -ngl 0 (the GPU path writes no stdout here):"
+  echo "     $BIN_DIR/llama-simple -m $REF_GGUF -n $NTOK -ngl 0 \"$PROMPT\""
+  exit 1
+fi
+if [ -z "$CHAIN" ]; then
+  echo "❌ NO CHAIN OUTPUT — the distributed run produced nothing."
+  exit 1
+fi
+
+# ⚠️ THE BAR IS THE FIRST GENERATED TOKEN, not the whole continuation. §10 says "the
+# byte-identical greedy token" (singular) and the v0.1 marker is id=12366 ' Paris'. Greedy
+# decode across a SPLIT model and a WHOLE one accumulates different floating-point rounding,
+# so the strings legitimately diverge after a few tokens — the old whole-string comparison
+# would have FAILED a correct run the moment the reference started working. Wrong in both
+# directions: it could not fail when the reference was empty, and could not pass when it was
+# not.
+ref_tail="${REF#*$PROMPT}"
+chain_tail="${CHAIN#*$PROMPT}"
+ref_first="$(printf '%s' "$ref_tail"  | awk '{print $1}')"
+chain_first="$(printf '%s' "$chain_tail" | awk '{print $1}')"
+echo "first generated token — reference: '$ref_first'  chain: '$chain_first'"
+if [ -n "$ref_first" ] && [ "$ref_first" = "$chain_first" ]; then
+  echo "✅ §10 TOKEN PARITY: PASS — first greedy token identical, provisioned from a signed package."
+  echo "   (later tokens may diverge: split vs whole accumulate different FP rounding)"
 else
-  echo "❌ MISMATCH — capture both + worker logs (/tmp/_wA.log /tmp/_wB.log). This is the bug the run exists to find."
+  echo "❌ MISMATCH on the FIRST token — capture both + worker logs (/tmp/_wA.log /tmp/_wB.log)."
+  echo "   This is the bug the run exists to find."
+  exit 1
 fi

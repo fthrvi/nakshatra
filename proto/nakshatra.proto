@@ -25,6 +25,21 @@ service Nakshatra {
   // protocol_capabilities ("sleep_wake") before using them.
   rpc Sleep(SleepRequest) returns (SleepResponse);
   rpc Wake(WakeRequest) returns (WakeResponse);
+  // 2026-09-04 participation: a worker signs, with its OWN mesh key, the stage it
+  // actually served — turning a receipt's participation from COORDINATOR-ASSERTED into
+  // holder-of-key PROVEN. Until this existed, "who worked" was a claim by the one party
+  // with a motive to lie, and a stranger's node could serve but could never be paid.
+  //
+  // Called ONCE PER WORKER, AFTER generation, and it cannot be otherwise: the signed
+  // message binds output_sha256, which covers the WHOLE run's output and does not exist
+  // until the last token is out. A worker that finished its layers on token 1 of 400 has
+  // nothing to sign yet — which is why this cannot ride on ForwardResponse or the
+  // Inference stream.
+  //
+  // Additive: a worker that does not implement it returns UNIMPLEMENTED, the coordinator
+  // records no signature for that stage, and the receipt stays signed_by="coordinator" as
+  // before. Old and new nodes interoperate for as long as a rollout takes.
+  rpc SignParticipation(SignParticipationRequest) returns (SignParticipationResponse);
 }
 
 message InfoRequest {}
@@ -145,3 +160,30 @@ message NextServer {
 message TokenIds    { repeated int32 ids = 1; }
 message HiddenState { bytes raw = 1; int32 batch = 2; int32 n_tokens = 3; }
 message Logits      { bytes raw = 1; int32 vocab_size = 2; }
+
+// ── participation (2026-09-04) ────────────────────────────────────────────────────────
+message SignParticipationRequest {
+  string run_id        = 1;
+  // The sha256 over the WHOLE run's generated tokens. Known only after generation ends,
+  // which is what forces this to be a separate, post-run call.
+  string output_sha256 = 2;
+  // What the COORDINATOR believes this worker served. Advisory only — see the response.
+  int32  layer_start   = 3;
+  int32  layer_end     = 4;
+}
+
+message SignParticipationResponse {
+  string node_id = 1;
+  string pubkey  = 2;
+  // ⚠️⚠️ WHAT THE WORKER BELIEVES IT SERVED, AND IT SIGNS THIS, NOT THE REQUEST'S CLAIM.
+  // If the coordinator asks it to attest [0,32) and it served [0,13), it returns [0,13) —
+  // and the mismatch then shows up in signature_coverage as a gap, which is exactly the
+  // detector that exists for it. A worker that echoed the requested span would turn its
+  // key into a rubber stamp and make the whole exercise decorative.
+  int32  layer_start = 3;
+  int32  layer_end   = 4;
+  // base64 Ed25519 over "{run_id}|{node_id}|[{a},{b})|{output_sha256}" — the SAME frozen
+  // canonical every existing receipt uses. This adds a way to TRANSPORT a signature; it
+  // changes nothing about what a signature IS.
+  string sig = 5;
+}

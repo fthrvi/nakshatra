@@ -18,10 +18,19 @@ HONESTY SCOPE (what a receipt can and cannot prove — verify_receipt never over
     differently across engines/backends, so cross-engine bit-exactness is not claimable.
   • model identity — ASSERTED via model_id only. The gRPC model_content_hash is a zero stub
     today (worker.py returns b"\\x00"*32), so it is deliberately NOT treated as proof.
-  • participation — v1 is COORDINATOR-ASSERTED (signed_by="coordinator"). `worker_signatures`
-    is a non-breaking placeholder; later each worker Ed25519-signs "{run_id}|{node_id}|
-    [{a},{b})|{output_sha256}" (reusing nakshatra_auth's per-node key) so participation
-    becomes cryptographically attested rather than coordinator-claimed.
+  • participation — `signed_by` is now DERIVED from the receipt's contents, not asserted:
+    "workers" when `worker_signatures` is non-empty, "coordinator" otherwise. Each entry is a
+    worker's Ed25519 signature over "{run_id}|{node_id}|[{a},{b})|{output_sha256}".
+    ⚠️ `signed_by="workers"` claims PROVENANCE, never validity — the signatures still have to
+    verify against a pinned roster (`identity_binding.creditable_accounts`) before anything is
+    creditable. A signature nobody checked is a string.
+    ⚠️⚠️ WHO CAN POPULATE IT, AND WHY THAT IS THE HARD PART: the coordinator holds no worker
+    private keys — deliberately, since a coordinator that could mint a worker's signature
+    recreates the problem signatures exist to solve. So a SINGLE OPERATOR holding every node's
+    key can fill this from a local keyring today, and a run across SOMEONE ELSE'S node cannot:
+    that needs the worker to sign and return it, which is a proto change. And it cannot ride
+    on an existing response, because `output_sha256` covers the whole run's output and is
+    unknown until generation ends — it has to be collected afterwards.
 
 Pure: no GPU, no network, no proto change. `engine_provenance` / `worker_signatures` are
 passthrough (populated by the caller when available). Fully unit-tested.
@@ -80,7 +89,15 @@ def build_receipt(*, run_id: str, model_id: str,
         "receipt_version": RECEIPT_VERSION,
         "run_id": run_id,
         "model_id": model_id,
-        "signed_by": "coordinator",
+        # ⚠️ DERIVED, NEVER ASSERTED. This was the constant "coordinator" while
+        # `worker_signatures` sat beside it as a placeholder — so a receipt that DID carry
+        # real signatures would still have described itself as coordinator-asserted, and a
+        # consumer deciding whether to trust it would read the wrong answer off the field
+        # that exists to answer exactly that. The field now reports what the receipt actually
+        # contains: "workers" only when at least one worker signed for itself.
+        # It is a claim about PROVENANCE, not validity — the signatures still have to verify
+        # against a pinned roster before anything may be credited.
+        "signed_by": ("workers" if (worker_signatures or []) else "coordinator"),
         "started_at": started_at,
         "ended_at": ended_at,
         "elapsed_s": elapsed_s,

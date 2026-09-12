@@ -912,6 +912,18 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
         self._push_count = 0
         self._push_errors = 0
         self._peer_evictions = 0
+        # 2026-09-12 participation binding — see SignParticipation's docstring. Maps
+        # session_id -> {"last_touch": float, "generated_token_ids": [int, ...]} for the
+        # sessions THIS worker has actually served, populated by Inference() itself (never
+        # by the request being verified). Mirrors the idempotency cache's TTL+cap shape —
+        # same eviction pattern, separate map, because this one must outlive a session's
+        # idempotency entries (SignParticipation is called AFTER generation ends, by which
+        # point early steps may already be idle-evicted from _idem_cache).
+        self._participation_lock = threading.Lock()
+        self._served_sessions: "collections.OrderedDict" = collections.OrderedDict()
+        self._served_ttl = max(idem_ttl_seconds, 900.0)   # a generation can outlive a short idem TTL
+        self._served_max_sessions = 2048
+        self._last_activity_ts = 0.0  # any step served at all — the fallback for the sessionless Forward RPC
 
     def _idem_evict(self, now: float):
         """Drop expired sessions, then cap total entries. Caller holds _idem_lock."""
@@ -951,6 +963,52 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                 "sessions": sessions, "entries": entries,
                 "max_entries": self._idem_max, "ttl_seconds": self._idem_ttl,
             }
+
+    def _served_evict(self, now: float):
+        """Drop expired sessions, then cap total sessions. Caller holds _participation_lock.
+        Mirrors `_idem_evict` — same shape, separate map (see __init__ for why)."""
+        expired = [s for s, e in self._served_sessions.items()
+                  if now - e["last_touch"] > self._served_ttl]
+        for s in expired:
+            del self._served_sessions[s]
+        while len(self._served_sessions) > self._served_max_sessions:
+            oldest = min(self._served_sessions, key=lambda s: self._served_sessions[s]["last_touch"])
+            del self._served_sessions[oldest]
+
+    def _record_session_activity(self, session_id: str, token_id: Optional[int] = None):
+        """Called ONLY from the real serving path (Inference), right after this worker
+        actually ran a decode for `session_id` — never from SignParticipation, which only
+        ever READS this. `token_id` is appended when this worker just produced the run's
+        final token for that step (mode=="last"), so the accumulated list is exactly the
+        sequence `receipt.output_sha256()` would hash for a run this worker genuinely
+        finished end to end."""
+        if not session_id:
+            return
+        with self._participation_lock:
+            now = time.time()
+            # ⚠️ Deliberately does NOT touch `_last_activity_ts` — that field is the
+            # SESSIONLESS Forward fallback's signal only (see SignParticipation). If this
+            # method updated it too, activity on a DIFFERENT, real session would make an
+            # unrelated, never-served run_id look recently active and launder straight past
+            # the sessionless fallback — exactly the gap the fallback exists to close, not
+            # reopen.
+            entry = self._served_sessions.setdefault(
+                session_id, {"last_touch": now, "generated_token_ids": []})
+            entry["last_touch"] = now
+            if token_id is not None:
+                entry["generated_token_ids"].append(int(token_id))
+            self._served_evict(now)
+
+    def _participation_evidence(self, run_id: str):
+        """Return (was_this_run_seen, generated_token_ids_or_None) for SignParticipation to
+        judge against. Read-only — never mutates `_served_sessions` beyond eviction."""
+        with self._participation_lock:
+            now = time.time()
+            self._served_evict(now)
+            entry = self._served_sessions.get(run_id)
+            if entry is None:
+                return False, None
+            return True, list(entry["generated_token_ids"])
 
     def _open_outbound_channel(self, address: str):
         """2026-05-21 SPKI Phase 3 — open a gRPC channel for outbound
@@ -1274,6 +1332,14 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                 else grpc.StatusCode.INTERNAL)
             context.set_details(result.error)
             return pb.ForwardResponse()
+        # 2026-09-12 participation binding: Forward carries no session/run id at all (the
+        # proto docs it as a stateless single-forward-pass testing aid), so there is nothing
+        # to key per-run evidence on here. Recording only the generic "this worker did SOME
+        # real decode work just now" timestamp is what lets SignParticipation's sessionless
+        # fallback refuse a node that has NEVER served anything, without pretending Forward
+        # calls can be bound to a specific run_id — see SignParticipation's docstring.
+        with self._participation_lock:
+            self._last_activity_ts = time.time()
         # 2026-05-29 fabric Phase F — first-worker gRPC→fabric bridge.
         # When the bridge is wired (mode=first + --transport=fabric),
         # the gRPC reply carries the chain's FINAL token (after the
@@ -1341,6 +1407,107 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
             context.set_details(f"daemon wake failed status={status}")
             return pb.WakeResponse()
         return pb.WakeResponse(wake_seconds=time.time() - t0)
+
+    def SignParticipation(self, request, context):
+        """Sign, with this node's OWN mesh key, the stage this worker actually served.
+
+        ⚠️⚠️ IT SIGNS WHAT IT BELIEVES, NOT WHAT IT WAS ASKED. The request carries the
+        coordinator's idea of this worker's span; the response carries THIS WORKER'S. If they
+        disagree, the mismatch surfaces in `signature_coverage` as a gap — which is the
+        detector that exists for exactly this. A worker that echoed the requested span would
+        turn its key into a rubber stamp and make the whole scheme decorative.
+
+        ⚠️ LOADS THE KEY, NEVER CREATES ONE. `load_or_create_worker_key` would mint a fresh
+        identity if the file were missing — and a new key here means everything earned under
+        the old one becomes unreachable, silently, in the middle of a signing call. A node
+        with no key cannot be paid; that is a FAILED_PRECONDITION for an operator to fix, not
+        something to paper over by inventing an identity.
+
+        ⚠️⚠️ 2026-09-12 — IT ALSO REFUSES TO SIGN WORK IT NEVER SAW. Before this, `run_id` and
+        `output_sha256` were taken ENTIRELY from the caller with zero correlation to any real
+        `Forward`/`Inference` call this worker served — the layer-span check above stops a
+        coordinator from putting words in this worker's mouth about WHICH layers, but nothing
+        stopped ANY authenticated peer from calling `SignParticipation(run_id="anything",
+        output_sha256="anything")` cold and getting a validly-signed fake proof. There is no
+        run_id on the wire for the (default) unary Forward path — the proto documents Forward
+        as a stateless testing aid — so the real correlator is `session_id`, which the
+        streaming Inference RPC already carries and which client.py already uses AS run_id
+        (`run_id = session_id or uuid4()`, see client.py). `_record_session_activity` is
+        populated ONLY by Inference() actually running a decode; this method only ever reads
+        it, in `_participation_evidence`. Three outcomes:
+          1. This run_id was never served AND this node has no recent Forward activity either
+             → refuse. Closes the cold-node case verbatim from the finding.
+          2. This run_id WAS served and this worker was the one producing the final tokens
+             (mode="last") → the claimed output_sha256 must match what this worker actually
+             emitted, byte for byte (`receipt.output_sha256` over the same token sequence).
+             A worker cannot be tricked into vouching for content it never produced.
+          3. This run_id was served but this worker only ever forwarded hidden state (not
+             last) → session-level evidence is the strongest this worker can independently
+             judge; allowed, same as before, but no longer for a NEVER-served run_id.
+        """
+        self._check_grpc_auth(
+            context, request.SerializeToString(),
+            method_path="/nakshatra.Nakshatra/SignParticipation", is_streaming=False)
+
+        key_path = _wauth.WORKER_KEY_PATH
+        if not key_path.exists():
+            context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+            context.set_details(f"no worker identity at {key_path}; this node can serve but "
+                                "cannot be credited — run the join/registration step")
+            return pb.SignParticipationResponse()
+        priv = key_path.read_bytes()
+        if len(priv) != 32:
+            context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+            context.set_details("worker key is malformed; refusing to sign with it")
+            return pb.SignParticipationResponse()
+
+        run_id = (request.run_id or "").strip()
+        out_sha = (request.output_sha256 or "").strip()
+        if not run_id or not out_sha:
+            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+            context.set_details("run_id and output_sha256 are both required")
+            return pb.SignParticipationResponse()
+
+        seen, generated_token_ids = self._participation_evidence(run_id)
+        if not seen:
+            # Sessionless fallback: unary Forward carries no run_id at all, so a legitimate
+            # Forward-only run can never appear in `_served_sessions` by construction. The
+            # best available signal there is "did this node do ANY real decode work
+            # recently" — refusing outright would break every non-streaming deployment;
+            # accepting unconditionally is the exact bug being fixed. Recent genuine
+            # activity is required either way.
+            with self._participation_lock:
+                recent = (self._last_activity_ts > 0
+                         and time.time() - self._last_activity_ts <= self._served_ttl)
+            if not recent:
+                context.set_code(grpc.StatusCode.PERMISSION_DENIED)
+                context.set_details(
+                    f"run_id {run_id!r} was never served by this node, and it has no recent "
+                    "decode activity either — refusing to sign work it never did")
+                return pb.SignParticipationResponse()
+        elif generated_token_ids:
+            # This worker WAS the run's final-token producer (mode=="last") for this exact
+            # session — it can independently recompute the same hash the client claims.
+            from receipt import output_sha256 as _output_sha256
+            observed = _output_sha256(generated_token_ids)
+            if observed != out_sha:
+                context.set_code(grpc.StatusCode.PERMISSION_DENIED)
+                context.set_details(
+                    f"output_sha256 {out_sha!r} does not match what this node actually "
+                    f"produced for run_id {run_id!r} ({observed!r}) — refusing to sign")
+                return pb.SignParticipationResponse()
+
+        from identity_binding import pub_of, sign_participation
+        node_id = os.environ.get("NAKSHATRA_NODE_ID") or socket.gethostname()
+        priv_hex = priv.hex()
+        entry = sign_participation(priv_hex, run_id=run_id, node_id=node_id,
+                                   layer_start=int(self.layer_start),
+                                   layer_end=int(self.layer_end),
+                                   output_sha256=out_sha)
+        return pb.SignParticipationResponse(
+            node_id=node_id, pubkey=pub_of(priv_hex),
+            layer_start=int(self.layer_start), layer_end=int(self.layer_end),
+            sig=entry["sig"])
 
     def Inference(self, request_iterator, context):
         """v0.5 M0.5.1 — streaming inference RPC.
@@ -1478,6 +1645,9 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                         prefix_length=step.prefix_length + n_tokens,
                     )
                     out.token_ids.ids.append(token_id)
+                    # 2026-09-12 participation binding: this IS the fabric-bridged first
+                    # worker's real output for this session — see SignParticipation.
+                    self._record_session_activity(step.session_id, token_id=token_id)
                     self._idem_put(step.session_id, step.step_id, out)
                     yield out
                     continue
@@ -1487,17 +1657,20 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                     step_id=step.step_id,
                     prefix_length=step.prefix_length + n_tokens,
                 )
+                final_token_id = None
                 if self.mode in ("last", "solo"):
                     if step.all_logits:
                         # stream-spec verify: one argmax per input position (a
                         # single-final-token response here would silently truncate
                         # a K+1-position verify to 1 — the capability gate in
-                        # client.py is what makes this branch safe to take).
+                        # client.py is what makes this branch safe to take). NOT the
+                        # run's accepted output — a verify pass, not a generation step —
+                        # so it does not feed participation evidence below.
                         n_ids = len(payload) // 4
                         out.token_ids.ids.extend(struct.unpack(f"<{n_ids}i", payload))
                     else:
-                        token_id = struct.unpack("<i", payload[:4])[0]
-                        out.token_ids.ids.append(token_id)
+                        final_token_id = struct.unpack("<i", payload[:4])[0]
+                        out.token_ids.ids.append(final_token_id)
                 else:
                     if _ACT_QUANT:   # non-last: quantize the emitted hidden to int8 for the wire
                         from act_quant import quantize_int8
@@ -1505,6 +1678,11 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                     out.hidden_state.raw = payload
                     out.hidden_state.batch = 1
                     out.hidden_state.n_tokens = n_tokens
+                # 2026-09-12 participation binding — see SignParticipation's docstring.
+                # Records that THIS worker served THIS session (every mode), and — only for
+                # a real accepted final token — the exact id, so `_participation_evidence`
+                # can reconstruct the same sequence `receipt.output_sha256()` hashes.
+                self._record_session_activity(step.session_id, token_id=final_token_id)
 
                 # v0.5 M0.5.3: server-to-server push. If the incoming step
                 # carries a next_server hint AND we produced a hidden_state
