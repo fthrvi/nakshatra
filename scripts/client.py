@@ -1236,6 +1236,7 @@ def main():
                     if len(solo_resp) != 4:
                         sys.exit(f"[chain] solo worker {sorted_stubs[0][0]['id']!r} returned {len(solo_resp)} bytes, expected 4")
                     next_id = struct.unpack("<i", solo_resp)[0]
+                    generated.append(next_id)
                 else:
                     # Step 1: tokens → first worker → hidden.
                     # NOTE (#17): a wrong hidden byte-count is CORRUPTION/config (e.g. a worker
