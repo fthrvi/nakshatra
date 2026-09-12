@@ -189,6 +189,29 @@ class _LastFakeStreamer:
 # walks sorted_stubs[1:-1] for middle workers (empty here) and reads len() for the last
 # index; the (w, stub, info) tuple contents are never touched for a 2-worker chain.
 _PLACEHOLDER_STUBS = [(None, None, None), (None, None, None)]
+_SOLO_PLACEHOLDER_STUBS = [(None, None, None)]
+
+
+class _SoloFakeStreamer:
+    """Stand-in for a route-whole ("solo") worker: holds every layer, so tokens go in
+    and the verify-round argmaxes come straight back out of the SAME call — no
+    hidden-state relay to a second worker at all."""
+
+    def __init__(self, target_argmax_rounds):
+        self.worker_id = "solo"
+        self._queue = [list(r) for r in target_argmax_rounds]
+        self.requests = []
+
+    def step(self, request_step):
+        self.requests.append(request_step)
+        n_v = len(request_step.token_ids.ids)
+        argmax = self._queue.pop(0)
+        assert len(argmax) == n_v, f"canned round has {len(argmax)} argmaxes, request wants {n_v}"
+        out = pb.InferenceStep(session_id=request_step.session_id,
+                               step_id=request_step.step_id,
+                               prefix_length=request_step.prefix_length + n_v)
+        out.token_ids.ids.extend(argmax)
+        return out
 
 
 def test_accept_all_commits_k_plus_bonus():
@@ -211,6 +234,31 @@ def test_accept_all_commits_k_plus_bonus():
     # prefix_length was held FIXED for the whole round (not advanced mid-round)
     assert first.requests[0].prefix_length == 5
     assert last.requests[0].prefix_length == 5
+
+
+def test_solo_chain_verify_fn_reads_the_single_workers_response_directly():
+    """Regression test for the 2026-09-12 bug: with exactly one worker (route-whole
+    placement), the old code unconditionally treated sorted_stubs[0] as a "first
+    worker" and demanded a hidden-state response — which a solo worker never sends
+    (it holds every layer, so it returns the verify argmaxes from its one and only
+    call). That mismatch crashed every real request through a solo chain with
+    'expected N bytes, got 4'. This proves the fix: a 1-element sorted_stubs list
+    must read token_ids straight off the single call, no hidden-state relay."""
+    n_embd = 4
+    solo = _SoloFakeStreamer([[10, 11, 99]])
+    verify_fn = cli.stream_spec_verify_fn(
+        [solo], _SOLO_PLACEHOLDER_STUBS, n_embd,
+        session_id="sess", step_idx=1, prefix_length=5)
+
+    draft = _FakeDraft([10, 11])
+    res, drafts = speculative_round(draft, [1, 2, 3], 2, verify_fn)
+
+    assert res.n_accepted == 2
+    assert res.committed == [10, 11, 99]
+    assert drafts == [10, 11]
+    assert len(solo.requests) == 1, "must be exactly one call, no relay hop"
+    assert all(r.all_logits for r in solo.requests)
+    assert solo.requests[0].prefix_length == 5
 
 
 def test_accept_none_commits_one_correction():

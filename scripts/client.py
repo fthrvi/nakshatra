@@ -325,6 +325,18 @@ def stream_spec_verify_fn(streamers, sorted_stubs, n_embd, session_id, step_idx,
     def verify_fn(verify_tokens):
         n_v = len(verify_tokens)
         payload = struct.pack(f"<{n_v}i", *verify_tokens)
+        if len(sorted_stubs) == 1:
+            # Solo chain: the one worker holds every layer, so its first response IS the
+            # verify-round argmaxes — no hidden-state relay. See the plain-decode loop's
+            # same branch for the full explanation.
+            solo_resp = call_inference_step(streamers[0], payload, n_v, True,
+                                            session_id=session_id, step_idx=step_idx,
+                                            prefix_length=prefix_length, timing=timing,
+                                            all_logits=True)
+            if len(solo_resp) != n_v * 4:
+                raise RuntimeError(f"stream-spec: solo worker returned {len(solo_resp)} bytes, "
+                                   f"expected {n_v * 4} verify argmaxes")
+            return list(struct.unpack(f"<{n_v}i", solo_resp))
         hidden = call_inference_step(streamers[0], payload, n_v, True,
                                      session_id=session_id, step_idx=step_idx,
                                      prefix_length=prefix_length, timing=timing,
@@ -1140,21 +1152,31 @@ def main():
                     verify = [cur] + drafts
                     n_v = len(verify)
                     payload = struct.pack(f"<{n_v}i", *verify)
-                    hidden = _step_call(0, sorted_stubs[0], payload, n_v, True, True,
-                                        prefix_length, all_logits=True)
-                    if len(hidden) != _hidden_bytes(n_v, n_embd):
-                        raise RuntimeError(f"spec: first worker returned {len(hidden)} bytes")
-                    for idx, stub_tup in enumerate(sorted_stubs[1:-1], start=1):
-                        hidden = _step_call(idx, stub_tup, hidden, n_v, False, True,
+                    if len(sorted_stubs) == 1:
+                        # Solo chain: same reasoning as the plain-decode loop and
+                        # stream_spec_verify_fn — the one worker's first response IS the
+                        # verify argmaxes, no hidden-state relay.
+                        last_resp = _step_call(0, sorted_stubs[0], payload, n_v, True, True,
+                                               prefix_length, all_logits=True)
+                        if len(last_resp) != n_v * 4:
+                            raise RuntimeError(f"spec: solo worker returned {len(last_resp)} bytes, "
+                                               f"expected {n_v * 4} verify argmaxes")
+                    else:
+                        hidden = _step_call(0, sorted_stubs[0], payload, n_v, True, True,
                                             prefix_length, all_logits=True)
                         if len(hidden) != _hidden_bytes(n_v, n_embd):
-                            raise RuntimeError(f"spec: middle worker returned {len(hidden)} bytes")
-                    last_i = len(sorted_stubs) - 1
-                    last_resp = _step_call(last_i, sorted_stubs[last_i], hidden, n_v, False,
-                                           True, prefix_length, all_logits=True)
-                    if len(last_resp) != n_v * 4:
-                        raise RuntimeError(f"spec: last worker returned {len(last_resp)} bytes, "
-                                           f"expected {n_v * 4} verify argmaxes")
+                            raise RuntimeError(f"spec: first worker returned {len(hidden)} bytes")
+                        for idx, stub_tup in enumerate(sorted_stubs[1:-1], start=1):
+                            hidden = _step_call(idx, stub_tup, hidden, n_v, False, True,
+                                                prefix_length, all_logits=True)
+                            if len(hidden) != _hidden_bytes(n_v, n_embd):
+                                raise RuntimeError(f"spec: middle worker returned {len(hidden)} bytes")
+                        last_i = len(sorted_stubs) - 1
+                        last_resp = _step_call(last_i, sorted_stubs[last_i], hidden, n_v, False,
+                                               True, prefix_length, all_logits=True)
+                        if len(last_resp) != n_v * 4:
+                            raise RuntimeError(f"spec: last worker returned {len(last_resp)} bytes, "
+                                               f"expected {n_v * 4} verify argmaxes")
                     target_argmax = list(struct.unpack(f"<{n_v}i", last_resp))
                     res = accept(drafts, target_argmax)
                     n_keep = kv_keep_after(prefix_length, res.n_accepted)
@@ -1203,6 +1225,17 @@ def main():
                         sys.exit(f"[chain] push mode: expected 4-byte token id from chain, got {len(last_resp)} bytes")
                     next_id = struct.unpack("<i", last_resp)[0]
                     generated.append(next_id)
+                elif len(sorted_stubs) == 1:
+                    # Solo chain (route-whole placement, 2026-09-12): the one worker holds
+                    # EVERY layer (has_token_embd AND has_lm_head both true — see worker.py's
+                    # mode="solo" handling), so it returns a token id directly from the first
+                    # and only call. There is no hidden-state relay to do. Treat this exactly
+                    # like the "last worker" case below, just with zero prior hops.
+                    solo_resp = _step_call(0, sorted_stubs[0], token_payload, n_step, True,
+                                           keep_kv, prefix_length)
+                    if len(solo_resp) != 4:
+                        sys.exit(f"[chain] solo worker {sorted_stubs[0][0]['id']!r} returned {len(solo_resp)} bytes, expected 4")
+                    next_id = struct.unpack("<i", solo_resp)[0]
                 else:
                     # Step 1: tokens → first worker → hidden.
                     # NOTE (#17): a wrong hidden byte-count is CORRUPTION/config (e.g. a worker
