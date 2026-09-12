@@ -116,7 +116,11 @@ def test_smart_placement_without_host_map_falls_back_to_even_split():
     import os
     d = Path(tempfile.mkdtemp())
     had = os.environ.get("NKS_SMART_PLACEMENT")
-    os.environ.pop("NKS_NODE_HOST_MAP", None)
+    had_map = os.environ.get("NKS_NODE_HOST_MAP")
+    # Point at a guaranteed-NONEXISTENT file rather than just unsetting the var — a real
+    # ~/.nakshatra/node-host-map.tsv may genuinely exist on a deployed box (it does, once this
+    # fix ships), and this test must prove the "no mapping" case regardless of machine state.
+    os.environ["NKS_NODE_HOST_MAP"] = str(d / "nonexistent-host-map.tsv")
     os.environ["NKS_SMART_PLACEMENT"] = "1"
     try:
         chain = _run_smart_placement(d)
@@ -124,6 +128,14 @@ def test_smart_placement_without_host_map_falls_back_to_even_split():
         assert ids == ["unconscious-a", "unconscious-b"], f"expected the even split, got {ids}"
     finally:
         shutil.rmtree(d, ignore_errors=True)
+        if had is None:
+            os.environ.pop("NKS_SMART_PLACEMENT", None)
+        else:
+            os.environ["NKS_SMART_PLACEMENT"] = had
+        if had_map is None:
+            os.environ.pop("NKS_NODE_HOST_MAP", None)
+        else:
+            os.environ["NKS_NODE_HOST_MAP"] = had_map
         if had is None:
             os.environ.pop("NKS_SMART_PLACEMENT", None)
         else:

@@ -305,6 +305,30 @@ class RosterWorkerController(ChainController):
             self._log(f"[lifecycle] summon roster worker {w['id']} "
                       f"layers={w['layer_range']} (self-provision from package)")
             self._procs.append(launch(w))
+            if launch is self._default_launch:
+                # Only the REAL subprocess launcher spawns a GPU daemon that can race another
+                # one — an injected test launch_fn spawns nothing to wait for.
+                self._await_worker_port(host, port, w["id"])
+
+    def _await_worker_port(self, host: str, port: int, worker_id: str) -> None:
+        """Block (bounded) until the just-launched worker's gRPC port opens before summoning the
+        NEXT one. Two llama-nakshatra-worker daemons launched back-to-back have been observed to
+        race during HIP/ROCm multi-device init and segfault (general protection fault in
+        libamdhip64.so) — reproduced twice, deterministic, only when launched together; the same
+        daemon loads cleanly every time run alone. Serializing the launches avoids the race.
+        Fail-safe: gives up after NKS_SUMMON_STAGGER_TIMEOUT_S (default 60) and moves on regardless
+        — a slow-but-healthy worker must never block the rest of the chain from summoning."""
+        try:
+            timeout = float(os.environ.get("NKS_SUMMON_STAGGER_TIMEOUT_S", "") or 60.0)
+        except ValueError:
+            timeout = 60.0
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self._port_open(host, port):
+                return
+            time.sleep(0.5)
+        self._log(f"[lifecycle] {worker_id} did not open {host}:{port} within {timeout}s — "
+                  f"summoning the next worker anyway")
 
     def stop(self) -> None:
         # 1) workers WE launched: kill the whole process group (worker + its daemon child)

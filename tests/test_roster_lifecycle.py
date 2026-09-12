@@ -43,6 +43,50 @@ def _controller(workers, open_ports=()):
     return c, launched
 
 
+def test_await_worker_port_returns_as_soon_as_port_opens():
+    c, _ = _controller([])
+    opened = {"v": False}
+    c._port_open = staticmethod(lambda host, port: opened["v"])
+    import threading
+    def flip_after_a_beat():
+        import time
+        time.sleep(0.05)
+        opened["v"] = True
+    threading.Thread(target=flip_after_a_beat).start()
+    t0 = __import__("time").time()
+    c._await_worker_port("127.0.0.1", 5560, "a")
+    assert __import__("time").time() - t0 < 2.0, "should return promptly once the port opens"
+
+
+def test_await_worker_port_gives_up_after_timeout_without_blocking_forever():
+    import os
+    c, _ = _controller([])
+    c._port_open = staticmethod(lambda host, port: False)   # never opens
+    had = os.environ.get("NKS_SUMMON_STAGGER_TIMEOUT_S")
+    os.environ["NKS_SUMMON_STAGGER_TIMEOUT_S"] = "0.2"
+    try:
+        t0 = __import__("time").time()
+        c._await_worker_port("127.0.0.1", 5560, "a")   # must return, not hang
+        assert __import__("time").time() - t0 < 2.0
+    finally:
+        if had is None:
+            os.environ.pop("NKS_SUMMON_STAGGER_TIMEOUT_S", None)
+        else:
+            os.environ["NKS_SUMMON_STAGGER_TIMEOUT_S"] = had
+
+
+def test_start_does_not_stagger_when_launch_fn_is_injected():
+    """A test/simulated launch_fn spawns no real GPU daemon — staggering after it would just be
+    dead time. Only the REAL subprocess launcher (_default_launch) should ever wait."""
+    workers = [{"id": "a", "address": "127.0.0.1", "port": 5560, "layer_range": [0, 16], "mode": "first"},
+               {"id": "b", "address": "127.0.0.1", "port": 5561, "layer_range": [16, 32], "mode": "last"}]
+    c, launched = _controller(workers)
+    calls = []
+    c._await_worker_port = lambda *a, **kw: calls.append(a)
+    c.start()
+    assert calls == [], "stagger must not run for an injected launch_fn"
+
+
 def test_launches_one_local_worker_per_slot():
     workers = [{"id": "a", "address": "127.0.0.1", "port": 5560, "layer_range": [0, 16], "mode": "first"},
                {"id": "b", "address": "127.0.0.1", "port": 5561, "layer_range": [16, 32], "mode": "last"}]
