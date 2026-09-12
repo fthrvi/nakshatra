@@ -1149,8 +1149,8 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
             hidden_size=self.n_embd,
             wire_dtype="f32",
             kv_cache_tokens_free=256,
-            has_token_embd=(self.mode == "first"),
-            has_lm_head=(self.mode == "last"),
+            has_token_embd=(self.mode in ("first", "solo")),
+            has_lm_head=(self.mode in ("last", "solo")),
             # v0.5 §9.1 closure — advertised features so the client can
             # negotiate push at session start without runtime probing.
             # v1.0 §7 — append control/vN tokens so the client can negotiate
@@ -1249,7 +1249,7 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
         # Strip the 4-byte rtype prefix; payload is hidden_state OR int32 token id.
         payload = resp[4:]
         # #16: a worker that emits a HIDDEN STATE (not the last worker's token) quantizes it for the wire.
-        if _ACT_QUANT and self.mode != "last":
+        if _ACT_QUANT and self.mode not in ("last", "solo"):
             from act_quant import quantize_int8
             payload = quantize_int8(payload, n_tokens, self.n_embd)
         return ForwardResult(True, payload, "", client_error=False)
@@ -1457,7 +1457,7 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                 # back via FEEDBACK, and yield it on the gRPC stream
                 # as token_ids. Skips the next_server / chain push
                 # path below (fabric owns worker↔worker now).
-                if (self.mode == "first"
+                if (self.mode in ("first", "solo")
                         and self.fabric_first_worker_bridge is not None):
                     token_bytes = self.fabric_first_worker_bridge(
                         payload, step_id=step.step_id,
@@ -1487,7 +1487,7 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                     step_id=step.step_id,
                     prefix_length=step.prefix_length + n_tokens,
                 )
-                if self.mode == "last":
+                if self.mode in ("last", "solo"):
                     if step.all_logits:
                         # stream-spec verify: one argmax per input position (a
                         # single-final-token response here would silently truncate
@@ -1539,7 +1539,7 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                     else:
                         next_addr = raw_addr if len(raw_addr.encode()) <= _ADDR_MAX else ""
                     next_session = step.next_server.session_id
-                if next_addr and self.mode != "last":
+                if next_addr and self.mode not in ("last", "solo"):
                     # Phase B5 (2026-05-20): SSRF defense. Worker pushes
                     # only to peers the pillar has registered. An attacker-
                     # supplied next_addr to internal-only endpoints (e.g.
@@ -2806,7 +2806,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=5500)
     ap.add_argument("--sub-gguf", type=str, required=True)
-    ap.add_argument("--mode", type=str, choices=["first", "middle", "last"], required=True)
+    ap.add_argument("--mode", type=str, choices=["first", "middle", "last", "solo"], required=True)
     # 2026-05-29 fabric Phase D — transport selector. Default grpc keeps
     # the existing v0.1 70B cluster (home-pc:5530) unchanged. fabric
     # opts into the network-fabric data plane: the worker calls /join,
@@ -3417,7 +3417,7 @@ def main():
             )
             fabric_thread.start()
             print("[worker] fabric serve loop started", flush=True)
-        if args.mode == "first" and fabric_backend.forward_link is not None:
+        if args.mode in ("first", "solo") and fabric_backend.forward_link is not None:
             # 2026-05-29 fabric Phase F — wire the gRPC→fabric bridge.
             # Forward will ship hidden_state via fabric + wait for
             # FEEDBACK at the feedback_link, then return the token in
