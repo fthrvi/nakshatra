@@ -26,37 +26,64 @@ import urllib.request
 from typing import Any, Dict, List
 
 
-def _resolved_ips_are_safe(url: str) -> tuple[bool, str]:
+def _resolved_ips_are_safe(url: str) -> tuple[bool, str, List[str]]:
     """⚠️⚠️ THE PURE CHECK LOOKS AT THE STRING; THIS LOOKS AT WHERE IT GOES. `pkgurl` rejects
     an IP literal in a private range and cannot do more — resolution is I/O. So a hostname
     that RESOLVES to 169.254.169.254 sailed through, and DNS rebinding makes that trivial to
     arrange. Resolve here, at the last moment before the dial, and refuse if ANY answer is
     private, loopback, link-local or reserved. Every A/AAAA record — an attacker controls the
-    order they come back in."""
+    order they come back in.
+
+    Returns the safe IPs too (third element), on success — this is a TOCTOU check by
+    construction (the "last moment" is still not the dial itself), so the caller MUST pin
+    these exact addresses into the actual connection (curl `--resolve`, or a direct socket)
+    instead of letting the transport re-resolve the hostname a second time and race a DNS
+    answer that can differ from the one just validated."""
     try:
         host = urllib.parse.urlsplit(url).hostname
         if not host:
-            return False, "no host in url"
+            return False, "no host in url", []
         infos = _socket.getaddrinfo(host, None, proto=_socket.IPPROTO_TCP)
     except (OSError, ValueError) as e:
-        return False, f"could not resolve {host!r}: {e}"
-    bad = []
+        return False, f"could not resolve {host!r}: {e}", []
+    bad, good = [], []
     for info in infos:
         ip = ipaddress.ip_address(info[4][0])
         if (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast
                 or ip.is_reserved or ip.is_unspecified):
             bad.append(str(ip))
+        else:
+            good.append(str(ip))
     if bad:
-        return False, f"{host} resolves to a non-public address: {', '.join(bad)}"
-    return True, ""
+        return False, f"{host} resolves to a non-public address: {', '.join(bad)}", []
+    return True, "", good
+
+
+def _pin_argv(argv: List[str], url: str, safe_ips: List[str]) -> List[str]:
+    """Rewrite a curl argv (as built by `dlplan.download_argv`) so curl's OWN DNS resolution
+    never runs for the pinned host — `--resolve host:port:ip[,ip...]` short-circuits it
+    straight to the addresses `_resolved_ips_are_safe` just validated, closing the TOCTOU gap
+    between that check and the actual dial. ALSO drops `-L`: `-fSL` follows redirects with no
+    revalidation of the Location host, so a URL that resolves publicly could 302 to
+    169.254.169.254 or any RFC1918 address and curl would follow it unconditionally. A
+    join-package URL is a direct object fetch, not a page — it should never need a redirect;
+    if a coordinator legitimately needs one, that is worth a comment (and a re-validating
+    hop-by-hop fetch) here, not silently threading a redirect through a spoofable check."""
+    parts = urllib.parse.urlsplit(url)
+    host, port = parts.hostname, parts.port or (443 if parts.scheme == "https" else 80)
+    out = [("-fS" if a == "-fSL" else a) for a in argv]
+    if out and out[0] == "curl":
+        out = [out[0], "--resolve", f"{host}:{port}:{','.join(safe_ips)}"] + out[1:]
+    return out
 
 
 def download(argv: List[str], dest: str, *, url: str = "") -> Dict[str, Any]:
     """Run a download plan. Returns what happened — never judges it."""
     if url:
-        ok, why = _resolved_ips_are_safe(url)
+        ok, why, safe_ips = _resolved_ips_are_safe(url)
         if not ok:
             return {"download_exit_code": 126, "download_stderr": f"refused: {why}"}
+        argv = _pin_argv(argv, url, safe_ips)
     try:
         p = subprocess.run(argv, capture_output=True, text=True, timeout=3600)
         code, err = p.returncode, (p.stderr or "")[-2000:]
@@ -150,6 +177,23 @@ def probe(url: str, payload: Dict[str, Any], timeout: int = 120) -> Dict[str, An
                 "answered_probe_ms": None}
 
 
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """`urlopen` follows redirects by default (`HTTPRedirectHandler` is installed in every
+    default opener) with no re-validation of the Location host — the same SSRF class as
+    curl's unpinned `-L` above, just in the stdlib path instead of the subprocess one. Refuse
+    to follow any hop whose resolved IPs are not the same "public, non-private, non-loopback,
+    non-link-local" set `_resolved_ips_are_safe` already enforces on the original URL."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        ok, why, _ips = _resolved_ips_are_safe(newurl)
+        if not ok:
+            raise urllib.error.HTTPError(newurl, code, f"redirect refused: {why}", headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_SAFE_OPENER = urllib.request.build_opener(_SafeRedirectHandler)
+
+
 def fetch_join_info(coordinator: str, timeout: int = 15) -> Dict[str, Any]:
     """Ask the coordinator what a joining node needs: the package URL and its version.
 
@@ -164,12 +208,15 @@ def fetch_join_info(coordinator: str, timeout: int = 15) -> Dict[str, Any]:
     """
     try:
         base = coordinator.rstrip("/")
-        ok, why = _resolved_ips_are_safe(base)
+        ok, why, _ips = _resolved_ips_are_safe(base)
         if not ok:
             return {"join_info_error": f"coordinator refused: {why}"}
         req = urllib.request.Request(base + "/v1/join-info",
                                      headers={"Accept": "application/json"})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        # ⚠️ Uses _SAFE_OPENER, not urlopen() directly: the default opener's redirect handler
+        # follows a 3xx unconditionally, which is the DNS-rebinding-via-redirect gap this
+        # whole function exists to close for the initial host.
+        with _SAFE_OPENER.open(req, timeout=timeout) as r:
             data = json.loads(r.read().decode("utf-8", "replace"))
     except Exception as e:                                   # noqa: BLE001
         return {"join_info_error": f"{type(e).__name__}: {e}"}

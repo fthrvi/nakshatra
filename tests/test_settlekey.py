@@ -157,25 +157,30 @@ def test_is_duplicate_does_not_mutate_seen_on_duplicate():
     assert seen == original_seen
 
 
-def test_malformed_receipt_still_produces_key():
-    malformed_receipts = [
-        None,
-        "not a dict",
-        123,
-        [],
+def test_non_dict_receipts_raise_instead_of_colliding_on_one_fake_key():
+    """⚠️ Regression for the collision bug: `except Exception: return sha256(b"")` used to
+    collapse EVERY non-dict input onto the SAME constant hash, so an unrelated `None` receipt
+    and a `123` receipt would "settle" as duplicates of each other. Fail loud instead — a
+    receipt that isn't even a dict is a bug upstream, not a key to mint."""
+    for receipt in [None, "not a dict", 123, []]:
+        with pytest.raises(TypeError):
+            settlement_key(receipt)
+
+
+def test_incomplete_but_dict_shaped_receipts_still_produce_distinct_keys():
+    """A dict missing fields (or with a malformed `worker_signatures`) is not the pathological
+    case above — it still has `.get`, so it still produces a real, order-independent key, and
+    a genuinely different receipt must not collide with it."""
+    same_key_variants = [
         {"run_id": "run-123"},  # missing output_sha256 and worker_signatures
-        {"run_id": "run-123", "output_sha256": "abc", "worker_signatures": "not a list"},
-        {"run_id": "run-123", "output_sha256": "abc", "worker_signatures": [123, "string"]},
+        {"run_id": "run-123", "worker_signatures": "not a list"},
+        {"run_id": "run-123", "worker_signatures": [123, "string"]},
     ]
-    
-    keys = []
-    for receipt in malformed_receipts:
-        try:
-            key = settlement_key(receipt)
-            keys.append(key)
-            # Should not raise
-        except Exception:
-            pytest.fail(f"settlement_key raised on malformed receipt: {receipt}")
-    
-    # All malformed receipts should produce deterministic keys
-    assert len(keys) == len(malformed_receipts)
+    different = {"run_id": "run-456"}
+
+    keys = [settlement_key(r) for r in same_key_variants]  # must not raise
+    # The malformed "worker_signatures" variants both normalize to [] (non-dict entries are
+    # dropped, a non-list collapses to []), so they legitimately collide with the missing-
+    # field case — but a genuinely different run_id must not collide with any of them.
+    assert len(set(keys)) == 1
+    assert settlement_key(different) not in keys
