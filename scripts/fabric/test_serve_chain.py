@@ -84,6 +84,34 @@ def test_default_deny_propagates():
         pass
 
 
+class _FakeArtifact:
+    def __init__(self, size):
+        self.size = size
+
+
+class _EnsuredPackageSlicer:
+    """Mimics a real PackageSlicer AFTER _ensure_manifest() has run against a real manifest
+    reader — i.e. .artifacts is populated, the shape package_slicer.py now produces."""
+    def __init__(self, artifacts):
+        self.artifacts = artifacts
+
+    def _ensure_manifest(self):
+        pass   # already "ensured" — nothing to do
+
+
+def test_estimate_model_gb_from_a_real_packageslicer_shape():
+    """Regression test for the bug: PackageSlicer never exposed .artifacts at all before
+    package_slicer.py's fix, so this always returned None for every real package, permanently."""
+    arts = [_FakeArtifact(1_000_000_000), _FakeArtifact(500_000_000), _FakeArtifact(250_000_000)]
+    gb = sc._estimate_model_gb(_EnsuredPackageSlicer(arts))
+    assert gb == 1.75, f"expected 1.75 GB, got {gb}"
+
+
+def test_estimate_model_gb_none_when_no_artifacts_available():
+    gb = sc._estimate_model_gb(_FakeSlicer("/pkg"))   # no .artifacts, no real _ensure_manifest
+    assert gb is None
+
+
 def _smart_placement_roster():
     """Two GPU-slot workers on the SAME physical box — exactly today's live unconscious-tier
     shape: both on 127.0.0.1, roster names 'unconscious-a'/'unconscious-b', while the box's

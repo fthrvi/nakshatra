@@ -31,10 +31,14 @@ if _PKG not in sys.path:
 
 
 def _default_manifest_reader(location: str):
-    """(model_id, revision, n_layers) for the package at `location` — a dir, package.json, or URL."""
+    """(model_id, revision, n_layers, artifacts) for the package at `location` — a dir,
+    package.json, or URL. `artifacts` (list[Artifact], each with a real byte `.size`) is what
+    lets serve_chain._estimate_model_gb() give NKS_SMART_PLACEMENT a real number without an
+    operator declaring model_size_gb by hand — before this, PackageSlicer never exposed it, so
+    the estimator's own getattr(slicer, "artifacts", None) always returned None."""
     from packaging.fetch_package import _read_manifest
     pkg, _root = _read_manifest(location)
-    return pkg.model_id, pkg.revision, pkg.n_layers
+    return pkg.model_id, pkg.revision, pkg.n_layers, pkg.artifacts
 
 
 def _default_assemble_fn(location, start, end, dest, *, require_signature, trusted_pubkeys):
@@ -64,10 +68,18 @@ class PackageSlicer:
         self._model_id = None
         self._revision = None
         self.n_layers = None
+        self.artifacts = None
 
     def _ensure_manifest(self):
         if self._revision is None:
-            self._model_id, self._revision, self.n_layers = self._read_manifest(self.location)
+            result = self._read_manifest(self.location)
+            # Accept both shapes: a real manifest reader returns 4 (incl. artifacts, for
+            # _estimate_model_gb); existing injected test readers return the original 3 and
+            # keep working unchanged (self.artifacts just stays None, same as before this).
+            if len(result) == 4:
+                self._model_id, self._revision, self.n_layers, self.artifacts = result
+            else:
+                self._model_id, self._revision, self.n_layers = result
         return self._revision
 
     def dest_for(self, model_id: str, start: int, end: int) -> Path:

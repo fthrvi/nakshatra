@@ -54,6 +54,34 @@ def test_distinct_ranges_distinct_slices(tmp_path):
     assert {(c["start"], c["end"]) for c in calls} == {(0, 20), (20, 32)}
 
 
+class _FakeArtifact:
+    def __init__(self, size):
+        self.size = size
+
+
+def test_3_tuple_manifest_reader_still_works_unchanged():
+    """Existing injected readers (this file's own _slicer(), and anyone else's) return
+    (model_id, revision, n_layers) — must keep working exactly as before; artifacts just stays
+    None rather than breaking."""
+    s = ps.PackageSlicer("/pkg", manifest_reader=lambda loc: ("dsr1", "rev1", 32))
+    s._ensure_manifest()
+    assert s.n_layers == 32
+    assert s.artifacts is None
+
+
+def test_4_tuple_manifest_reader_exposes_artifacts_for_size_estimation():
+    """A real manifest reader (package_slicer._default_manifest_reader) now also returns the
+    package's artifacts — this is what lets serve_chain._estimate_model_gb() compute a real
+    model_size_gb instead of always seeing None (the bug: PackageSlicer never exposed this at
+    all before today, for ANY package)."""
+    arts = [_FakeArtifact(1_000_000_000), _FakeArtifact(500_000_000)]
+    s = ps.PackageSlicer("/pkg", manifest_reader=lambda loc: ("dsr1", "rev1", 32, arts))
+    s._ensure_manifest()
+    assert s.artifacts is arts
+    total_gb = sum(a.size for a in s.artifacts) / 1e9
+    assert abs(total_gb - 1.5) < 1e-9
+
+
 def test_new_revision_writes_fresh_file(tmp_path):
     s1, _ = _slicer(tmp_path, revision="rev1AAAAAAAAAA")
     old = s1.slice_for(_FakeWorker(), 0, 16, "dsr1")
