@@ -168,6 +168,26 @@ cards, clocks forced `high`, agent paused. Verify a gfx1100 code object is prese
 honestly if the answer is 0%** — this is a cheap experiment whose negative is publishable.
 *Hardware:* home fleet.
 
+✅ **RESOLVED 2026-09-12 — the gfx1100-code-object half of this hypothesis was right, and it was
+worse than "costing throughput": it was a hard crash, not a slowdown.** Found by accident while
+debugging `nakshatra-unconscious.service` 502ing on every request (unrelated placement-fix work
+surfaced it). Root-caused with a live core dump + gdb backtrace (not inference from `--list-
+devices`, per this item's own bar):
+```
+rms_norm_f32_cuda → [4 unresolved frames in libamdhip64.so] → SIGSEGV
+hip_fatbin.cpp:687: No compatible code objects found for: gfx1100
+```
+Any kernel launch landing on the 7900 XT (gfx1100) segfaulted instead of erroring cleanly, because
+`AMDGPU_TARGETS=gfx1201` really did mean zero compiled kernels for gfx1100 — confirmed directly via
+`grep AMDGPU_TARGETS build/CMakeCache.txt`, no `roc-obj-ls` needed once the crash pinpointed it.
+**Fixed**: reconfigured `-DAMDGPU_TARGETS="gfx1100;gfx1201"`, rebuilt `llama-nakshatra-worker` +
+`llama-nakshatra-worker-fabric`. Verified: a segfault that reproduced 100% of the time (isolated
+repro script + core dump, no service dependency) now completes cleanly — 6 sequential decode steps,
+zero kernel faults. The three flag-throughput half of K1 (`ROCWMMA_FATTN`/`GRAPHS`/
+`FA_ALL_QUANTS`) is still unmeasured — this only closes the code-object question, not the
+benchmark. **Whoever rebuilds this tree from scratch: pass `-DAMDGPU_TARGETS="gfx1100;gfx1201"`
+explicitly — it is not the default and nothing else in this repo documents it.**
+
 **K2 — Does symmetric KV quantisation keep us on the fused FA kernel?** Mismatched `-ctk`/`-ctv`
 is reported to fall off the fused path on HIP with no warning and no log line — exactly the silent
 regression a one-user fleet carries for months. llama-bench `q8_0/q8_0`, `q4_0/q4_0`, `q4_0/f16`,
