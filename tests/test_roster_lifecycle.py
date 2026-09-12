@@ -43,43 +43,29 @@ def _controller(workers, open_ports=()):
     return c, launched
 
 
-def test_await_worker_port_returns_as_soon_as_port_opens():
-    c, _ = _controller([])
-    opened = {"v": False}
-    c._port_open = staticmethod(lambda host, port: opened["v"])
-    import threading
-    def flip_after_a_beat():
-        import time
-        time.sleep(0.05)
-        opened["v"] = True
-    threading.Thread(target=flip_after_a_beat).start()
-    t0 = __import__("time").time()
-    c._await_worker_port("127.0.0.1", 5560, "a")
-    assert __import__("time").time() - t0 < 2.0, "should return promptly once the port opens"
-
-
-def test_await_worker_port_gives_up_after_timeout_without_blocking_forever():
+def test_stagger_after_launch_respects_the_env_override():
     import os
     c, _ = _controller([])
-    c._port_open = staticmethod(lambda host, port: False)   # never opens
-    had = os.environ.get("NKS_SUMMON_STAGGER_TIMEOUT_S")
-    os.environ["NKS_SUMMON_STAGGER_TIMEOUT_S"] = "0.2"
+    had = os.environ.get("NKS_SUMMON_STAGGER_S")
+    os.environ["NKS_SUMMON_STAGGER_S"] = "0.05"
     try:
         t0 = __import__("time").time()
-        c._await_worker_port("127.0.0.1", 5560, "a")   # must return, not hang
-        assert __import__("time").time() - t0 < 2.0
+        c._stagger_after_launch("a")
+        elapsed = __import__("time").time() - t0
+        assert 0.04 <= elapsed < 1.0, f"expected ~0.05s sleep, took {elapsed}s"
     finally:
         if had is None:
-            os.environ.pop("NKS_SUMMON_STAGGER_TIMEOUT_S", None)
+            os.environ.pop("NKS_SUMMON_STAGGER_S", None)
         else:
-            os.environ["NKS_SUMMON_STAGGER_TIMEOUT_S"] = had
+            os.environ["NKS_SUMMON_STAGGER_S"] = had
 
 
-def test_start_DOES_stagger_with_the_real_default_launcher():
+def test_start_DOES_stagger_with_the_real_default_launcher_except_after_the_last_worker():
     """The positive case the earlier 'is'-based check silently failed: with NO launch_fn injected
     (so start() falls back to self._default_launch, the real subprocess launcher), the stagger
-    MUST fire. `launch == self._default_launch` (bound methods aren't singletons — `is` is always
-    False here even for the real launcher, which is exactly the bug this test pins down)."""
+    MUST fire between workers. `launch == self._default_launch` (bound methods aren't singletons —
+    `is` is always False here even for the real launcher, which is exactly the bug this test pins
+    down). It must NOT fire after the last worker — nothing summons after it."""
     workers = [{"id": "a", "address": "127.0.0.1", "port": 5560, "layer_range": [0, 16], "mode": "first"},
                {"id": "b", "address": "127.0.0.1", "port": 5561, "layer_range": [16, 32], "mode": "last"}]
     c = sl.RosterWorkerController(_spec(), plan_fn=lambda: _chain(workers))  # no launch_fn
@@ -87,12 +73,12 @@ def test_start_DOES_stagger_with_the_real_default_launcher():
     real_popen = sl.subprocess.Popen
     sl.subprocess.Popen = lambda *a, **kw: _FakeProc({})   # never spawn a real process
     calls = []
-    c._await_worker_port = lambda *a, **kw: calls.append(a)
+    c._stagger_after_launch = lambda *a, **kw: calls.append(a)
     try:
         c.start()
     finally:
         sl.subprocess.Popen = real_popen
-    assert len(calls) == 2, f"expected the stagger to run for both real-launched workers, got {calls}"
+    assert calls == [("a",)], f"expected the stagger only after the non-last worker, got {calls}"
 
 
 def test_start_does_not_stagger_when_launch_fn_is_injected():
@@ -102,7 +88,7 @@ def test_start_does_not_stagger_when_launch_fn_is_injected():
                {"id": "b", "address": "127.0.0.1", "port": 5561, "layer_range": [16, 32], "mode": "last"}]
     c, launched = _controller(workers)
     calls = []
-    c._await_worker_port = lambda *a, **kw: calls.append(a)
+    c._stagger_after_launch = lambda *a, **kw: calls.append(a)
     c.start()
     assert calls == [], "stagger must not run for an injected launch_fn"
 
