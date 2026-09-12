@@ -27,6 +27,39 @@ import serve_planner as sp
 import package_slicer as ps
 
 
+def _host_map_path() -> Path:
+    """Where the roster-worker → physical-node mapping lives. One line per mapped worker,
+    `worker_id<TAB>host_node_id` (# comments and blank lines ignored). Overridable for tests;
+    NKS_NODE_HOST_MAP can point at an alternate file in production."""
+    import os as _os
+    return Path(_os.environ.get("NKS_NODE_HOST_MAP", "") or (Path.home() / ".nakshatra" / "node-host-map.tsv"))
+
+
+def _load_host_map(path: Optional[Path] = None) -> dict:
+    """Parse the host-map file. Missing file → {} (every id maps to itself — today's behavior,
+    unchanged). Never raises: a malformed map degrades to no mapping, not a crash."""
+    m: dict = {}
+    try:
+        for line in (path or _host_map_path()).read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t") if "\t" in line else line.split()
+            if len(parts) >= 2:
+                m[parts[0]] = parts[1]
+    except (FileNotFoundError, OSError):
+        pass
+    return m
+
+
+def _host_of(node_id: str, host_map: dict) -> str:
+    """Resolve a roster worker's id to the physical node its pillar telemetry is filed under.
+    Two GPU-slot workers on the same box (e.g. 'unconscious-a'/'unconscious-b') both resolve to
+    that box's registrar identity (e.g. 'hub') when the map says so. An id absent from the map
+    resolves to itself, so an empty/missing map is exactly today's behavior."""
+    return host_map.get(node_id, node_id)
+
+
 def _estimate_model_gb(slicer) -> Optional[float]:
     """Best-effort total model size in GB from the package manifest's artifact byte sizes.
     None if it can't be determined (caller then needs an operator-declared size, else skips
@@ -114,18 +147,29 @@ def build_chain_from_roster(model_id: str, *, hidden_size: int,
             _peers = (peers_fetcher or _pf.fetch_pillar_peers)(_purl, model_id) if _purl else []
             if _gb and _peers:
                 _telem = _pf.telemetry_from_peers(_peers, model_id)
+                _hostmap = _load_host_map()
                 _bpt = hidden_size * {"f32": 4, "f16": 2, "bf16": 2}.get(wire_dtype, 4)
                 try:
                     _thr = float(_os.environ.get("NKS_CLUSTER_THRESHOLD_MS", "") or 5.0)
                 except ValueError:
                     _thr = 5.0
                 _kw["place_fn"] = _pf.make_place_fn(
-                    model_gb=_gb, telemetry_of=lambda w: _telem.get(w.node_id, {}),
+                    model_gb=_gb,
+                    telemetry_of=lambda w: _telem.get(_host_of(w.node_id, _hostmap), {}),
                     probe=True,             # live TCP-connect RTT → metro_clusters can form a split
                     bytes_per_token=_bpt,   # wire-aware split: trade hops against stage-time
                     cluster_threshold_ms=_thr)  # raise for INTENTIONAL WAN splits (big model, no node fits)
-        except Exception:
-            pass   # fail-open → even split; placement must never break the serve
+                sys.stderr.write(
+                    f"[smart-placement] model={model_id} gb={_gb} pillar_peers={len(_peers)} "
+                    f"telemetry_keys={sorted(_telem.keys())} host_map={_hostmap or '(none)'}\n")
+            else:
+                sys.stderr.write(
+                    f"[smart-placement] SKIPPED model={model_id} — "
+                    f"model_size_gb={'ok' if _gb else 'MISSING'} pillar_peers={len(_peers)} "
+                    f"(need both; falling back to even-split)\n")
+        except Exception as _e:
+            sys.stderr.write(
+                f"[smart-placement] EXCEPTION for model={model_id}, falling back to even-split: {_e!r}\n")
     plan = plan_fn(model_id, standings, **_kw)
 
     # 4) write the generated chain where the serve points client.py.

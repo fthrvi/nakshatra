@@ -337,6 +337,7 @@ def make_place_fn(*, model_gb: float, telemetry_of, rtt_samples=None, probe: boo
     static_rtt = rtt_samples
 
     def place(workers, num_layers):
+        import sys as _sys
         try:
             samples = static_rtt
             if probe and not samples:
@@ -344,12 +345,24 @@ def make_place_fn(*, model_gb: float, telemetry_of, rtt_samples=None, probe: boo
             rtt = rtt_matrix(samples or [])
             telem = {name_of(w): telemetry_of(w) for w in workers}
             nodes = build_nodes(telem)
+            if not any(n.vram_gb for n in nodes):
+                _sys.stderr.write(
+                    f"[placement] every candidate node has 0 vram_gb after telemetry lookup "
+                    f"(workers={[name_of(w) for w in workers]}) — telemetry_of() is very likely "
+                    f"keyed by the wrong node id; falling back to even-split\n")
             p = placement.plan(model_gb=model_gb, total_layers=num_layers, nodes=nodes,
                                rtt_ms=rtt, cluster_threshold_ms=cluster_threshold_ms,
                                headroom_gb=headroom_gb,
                                bytes_per_token=bytes_per_token, bandwidth_bps=bandwidth_bps)
-            return assignment_from_plan(p, {name_of(w): w for w in workers}, num_layers) or None
-        except Exception:
+            result = assignment_from_plan(p, {name_of(w): w for w in workers}, num_layers)
+            if not result:
+                _sys.stderr.write(
+                    f"[placement] plan produced no realizable assignment "
+                    f"(whole_host={getattr(p, 'whole_host', None)}, "
+                    f"splits={getattr(p, 'splits', None)}) — falling back to even-split\n")
+            return result or None
+        except Exception as _e:
+            _sys.stderr.write(f"[placement] place() raised, falling back to even-split: {_e!r}\n")
             return None
 
     return place

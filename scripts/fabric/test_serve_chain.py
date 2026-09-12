@@ -84,6 +84,78 @@ def test_default_deny_propagates():
         pass
 
 
+def _smart_placement_roster():
+    """Two GPU-slot workers on the SAME physical box — exactly today's live unconscious-tier
+    shape: both on 127.0.0.1, roster names 'unconscious-a'/'unconscious-b', while the box's
+    pillar telemetry is filed under its registrar identity 'hub'."""
+    return {
+        "pk-a": {"pubkey": "pk-a", "name": "unconscious-a", "operator": "me", "tier": "self",
+                 "tenant": "home", "coord": "127.0.0.1:5540"},
+        "pk-b": {"pubkey": "pk-b", "name": "unconscious-b", "operator": "me", "tier": "self",
+                 "tenant": "home", "coord": "127.0.0.1:5541"},
+    }
+
+
+def _run_smart_placement(d):
+    slicer = _FakeSlicer("/pkg")
+    peers = [{"node_id": "hub", "budget": {"vram_offered_gb": 9.0}, "recent_rpc_ms": 10.0}]
+    out = sc.build_chain_from_roster(
+        "prithvi-unconscious", hidden_size=4096, package_location="/pkg",
+        roster_loader=_smart_placement_roster, slicer_factory=lambda loc: slicer,
+        model_size_gb=8.0, pillar_url="http://fake-pillar",
+        peers_fetcher=lambda url, model_id: peers,
+        out_path=str(d / "gen.yaml"))
+    import yaml
+    return yaml.safe_load(Path(out).read_text())
+
+
+def test_smart_placement_without_host_map_falls_back_to_even_split():
+    """Locks in the bug this branch fixes: roster names ('unconscious-a') never match the
+    pillar's telemetry key ('hub'), so every node reads 0 vram_gb and placement can't place —
+    it falls open to the plain even split, same as if the flag were off."""
+    import os
+    d = Path(tempfile.mkdtemp())
+    had = os.environ.get("NKS_SMART_PLACEMENT")
+    os.environ.pop("NKS_NODE_HOST_MAP", None)
+    os.environ["NKS_SMART_PLACEMENT"] = "1"
+    try:
+        chain = _run_smart_placement(d)
+        ids = [w["id"] for w in chain["workers"]]
+        assert ids == ["unconscious-a", "unconscious-b"], f"expected the even split, got {ids}"
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+        if had is None:
+            os.environ.pop("NKS_SMART_PLACEMENT", None)
+        else:
+            os.environ["NKS_SMART_PLACEMENT"] = had
+
+
+def test_smart_placement_with_host_map_routes_whole():
+    """With the host map in place, telemetry_of() resolves 'unconscious-a'/'-b' to 'hub', finds
+    real VRAM there, and route-whole engages: ONE worker holding the whole model, zero
+    inter-worker hops — the fix this branch makes."""
+    import os
+    d = Path(tempfile.mkdtemp())
+    hostmap = d / "node-host-map.tsv"
+    hostmap.write_text("unconscious-a\thub\nunconscious-b\thub\n")
+    had_flag = os.environ.get("NKS_SMART_PLACEMENT")
+    had_map = os.environ.get("NKS_NODE_HOST_MAP")
+    os.environ["NKS_SMART_PLACEMENT"] = "1"
+    os.environ["NKS_NODE_HOST_MAP"] = str(hostmap)
+    try:
+        chain = _run_smart_placement(d)
+        ids = [w["id"] for w in chain["workers"]]
+        assert len(ids) == 1 and ids[0] in ("unconscious-a", "unconscious-b"), \
+            f"expected route-whole (1 worker), got {ids}"
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+        for k, had in (("NKS_SMART_PLACEMENT", had_flag), ("NKS_NODE_HOST_MAP", had_map)):
+            if had is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = had
+
+
 def test_no_package_location_errors():
     try:
         sc.build_chain_from_roster("unregistered-model", hidden_size=4096,
