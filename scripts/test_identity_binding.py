@@ -1,5 +1,11 @@
 """Tests for identity_binding.py — holder-of-key proofs, receipt participation, credit accounts.
 Pure crypto, no hardware. Run: python3 -m pytest scripts/test_identity_binding.py -q"""
+# ⚠️ These exercise the SIGNATURE layer, so they opt out of the roster explicitly with
+# UNPINNED_ACCEPT_ANY_KEY. They used to rely on `pinned` defaulting to None, which
+# silently skipped the roster check — the defect that made an unregistered key able to
+# certify any node. The roster-specific tests below still pin a real roster.
+# ⚠️⚠️ THIS FILE LIVES IN scripts/ AND `pytest tests/` DOES NOT COLLECT IT. That is how
+# eight failures here sat behind a "780 passed" run of the suite.
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))   # scripts/ on path
@@ -67,21 +73,21 @@ def test_sign_verify_participation_roundtrip():
     priv, pub = _key()
     e = ib.sign_participation(priv, run_id=RUN, node_id="w0", layer_start=0, layer_end=16, output_sha256=OUT)
     assert e["pubkey"] == pub and e["node_id"] == "w0"
-    ok, why = ib.verify_participation(e, run_id=RUN, output_sha256=OUT)
+    ok, why = ib.verify_participation(e, run_id=RUN, output_sha256=OUT, pinned=ib.UNPINNED_ACCEPT_ANY_KEY)
     assert ok, why
 
 
 def test_participation_rejects_wrong_output():
     priv, _ = _key()
     e = ib.sign_participation(priv, run_id=RUN, node_id="w0", layer_start=0, layer_end=16, output_sha256=OUT)
-    ok, _ = ib.verify_participation(e, run_id=RUN, output_sha256="b" * 64)
+    ok, _ = ib.verify_participation(e, run_id=RUN, output_sha256="b" * 64, pinned=ib.UNPINNED_ACCEPT_ANY_KEY)
     assert ok is False
 
 
 def test_participation_rejects_wrong_run():
     priv, _ = _key()
     e = ib.sign_participation(priv, run_id=RUN, node_id="w0", layer_start=0, layer_end=16, output_sha256=OUT)
-    ok, _ = ib.verify_participation(e, run_id="other-run", output_sha256=OUT)
+    ok, _ = ib.verify_participation(e, run_id="other-run", output_sha256=OUT, pinned=ib.UNPINNED_ACCEPT_ANY_KEY)
     assert ok is False
 
 
@@ -89,7 +95,7 @@ def test_participation_rejects_tampered_stage():
     priv, _ = _key()
     e = ib.sign_participation(priv, run_id=RUN, node_id="w0", layer_start=0, layer_end=16, output_sha256=OUT)
     e["layer_end"] = 24                                  # claim more layers than signed for
-    ok, _ = ib.verify_participation(e, run_id=RUN, output_sha256=OUT)
+    ok, _ = ib.verify_participation(e, run_id=RUN, output_sha256=OUT, pinned=ib.UNPINNED_ACCEPT_ANY_KEY)
     assert ok is False
 
 
@@ -117,7 +123,7 @@ def test_creditable_accounts_credits_valid_only():
     p0, pub0 = _key(); p1, pub1 = _key()
     good = ib.sign_participation(p0, run_id=RUN, node_id="w0", layer_start=0, layer_end=16, output_sha256=OUT)
     bad = ib.sign_participation(p1, run_id="WRONG", node_id="w1", layer_start=16, layer_end=32, output_sha256=OUT)
-    accts, problems = ib.creditable_accounts(_receipt([good, bad]))
+    accts, problems = ib.creditable_accounts(_receipt([good, bad]), pinned=ib.UNPINNED_ACCEPT_ANY_KEY)
     assert ib.account_id(pub0) in accts
     assert ib.account_id(pub1) not in accts            # bad proof earns nothing
     assert problems                                     # the bad one is reported
@@ -127,7 +133,7 @@ def test_creditable_accounts_dedups_per_account():
     p0, pub0 = _key()
     s_a = ib.sign_participation(p0, run_id=RUN, node_id="w0", layer_start=0, layer_end=16, output_sha256=OUT)
     s_b = ib.sign_participation(p0, run_id=RUN, node_id="w0", layer_start=16, layer_end=32, output_sha256=OUT)
-    accts, _ = ib.creditable_accounts(_receipt([s_a, s_b]))
+    accts, _ = ib.creditable_accounts(_receipt([s_a, s_b]), pinned=ib.UNPINNED_ACCEPT_ANY_KEY)
     assert accts == [ib.account_id(pub0)]               # one account, credited once
 
 
@@ -142,10 +148,10 @@ def test_creditable_accounts_enforces_pinned_roster():
 
 
 def test_creditable_accounts_no_signatures_is_nonbreaking():
-    accts, problems = ib.creditable_accounts({"run_id": RUN, "output_sha256": OUT})
+    accts, problems = ib.creditable_accounts({"run_id": RUN, "output_sha256": OUT}, pinned=ib.UNPINNED_ACCEPT_ANY_KEY)
     assert accts == [] and any("coordinator-asserted" in p for p in problems)
 
 
 def test_creditable_accounts_missing_fields():
-    accts, problems = ib.creditable_accounts({"worker_signatures": []})
+    accts, problems = ib.creditable_accounts({"worker_signatures": []}, pinned=ib.UNPINNED_ACCEPT_ANY_KEY)
     assert accts == [] and problems

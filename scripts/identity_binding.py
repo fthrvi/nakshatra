@@ -87,6 +87,12 @@ def account_id(pub_hex: str) -> str:
 
 
 # ── (c) receipt participation — holder-of-key proof of WHAT a worker served ──────────────────────────
+# ⚠️ The ONLY way to skip the roster check. A sentinel object, not None and not a string, so it
+# cannot be produced by a config typo, a JSON round-trip, or a forgotten keyword — opting out of
+# authentication should require typing something you would notice in a diff.
+UNPINNED_ACCEPT_ANY_KEY = object()
+
+
 def participation_message(run_id: str, node_id: str, layer_start: int, layer_end: int,
                           output_sha256: str) -> bytes:
     """The exact canonical the worker signs (matches receipt.py's documented placeholder format)."""
@@ -104,12 +110,23 @@ def sign_participation(priv_hex: str, *, run_id: str, node_id: str, layer_start:
 
 
 def verify_participation(entry: Dict[str, Any], *, run_id: str, output_sha256: str,
-                         pinned: Optional[Dict[str, str]] = None) -> Tuple[bool, str]:
+                         pinned: Any) -> Tuple[bool, str]:
     """Verify one worker's participation signature.
 
-    Checks the signature binds the claimed pubkey to THIS run + THIS exact stage + THIS output. If
-    `pinned` (node_id -> trusted pubkey, e.g. from the admission roster) is given, the signing key MUST
-    match the pinned one — default-deny: an unpinned or mismatched key earns nothing.
+    Checks the signature binds the claimed pubkey to THIS run + THIS exact stage + THIS output, AND
+    that the signing key is the one `pinned` (node_id -> trusted pubkey, from the admission roster)
+    says it must be. A key that is not rostered earns nothing.
+
+    ⚠️⚠️ `pinned` IS REQUIRED, AND THAT IS THE WHOLE POINT. It used to default to `None`, which
+    skipped the roster check entirely — and because the entry carries its OWN `pubkey`, the
+    signature then proved only "whoever wrote this entry holds the key inside this entry", which is
+    trivially true for anyone. An unregistered key could certify any node_id over any layer span and
+    this returned (True, 'ok'). The docstring called that default-deny. It was default-deny only
+    when a caller remembered an optional argument, and the one who forgot got a verifier that
+    authenticated nothing. Omitting it is now a TypeError at the call site.
+
+    To deliberately accept any key — a caller with no roster yet — pass
+    `pinned=UNPINNED_ACCEPT_ANY_KEY`. That is greppable; a forgotten keyword is not.
     Returns (ok, reason).
     """
     try:
@@ -117,7 +134,13 @@ def verify_participation(entry: Dict[str, Any], *, run_id: str, output_sha256: s
         a = int(entry["layer_start"]); b = int(entry["layer_end"]); sig = entry["sig"]
     except (KeyError, TypeError, ValueError) as e:
         return False, f"malformed participation entry ({e})"
-    if pinned is not None:
+    if pinned is not UNPINNED_ACCEPT_ANY_KEY:
+        # ⚠️ `None` is no longer "no roster, allow" — it is a roster we cannot read, so it denies.
+        # An empty dict is a roster with nobody in it, which also denies: both are the safe reading,
+        # and neither may be confused with the explicit opt-out above.
+        if not isinstance(pinned, dict):
+            return False, ("no roster pinned (pass a {node_id: pubkey} dict, or "
+                           "UNPINNED_ACCEPT_ANY_KEY to deliberately accept any key)")
         want = pinned.get(node_id)
         if want is None:
             return False, f"node '{node_id}' not in the pinned roster (default-deny)"
@@ -129,11 +152,15 @@ def verify_participation(entry: Dict[str, Any], *, run_id: str, output_sha256: s
 
 
 def creditable_accounts(receipt: Dict[str, Any], *,
-                        pinned: Optional[Dict[str, str]] = None) -> Tuple[List[str], List[str]]:
+                        pinned: Any) -> Tuple[List[str], List[str]]:
     """The metering bridge the credit ledger consumes. Given a run receipt, return the list of bound
     account_ids that may be credited — ONLY stages whose worker_signature holder-of-key-verifies against
-    this run's id + output (and, if `pinned` given, against the rostered key). Stages without a valid
-    proof earn NOTHING (no coordinator-asserted credit). Returns (accounts, problems).
+    this run's id + output AND against the rostered key. Stages without a valid proof earn NOTHING
+    (no coordinator-asserted credit). Returns (accounts, problems).
+
+    ⚠️ `pinned` is REQUIRED here for the same reason as in `verify_participation` — this is the
+    function the credit ledger consumes, so an unauthenticated default here is the one that
+    actually pays money. Pass `UNPINNED_ACCEPT_ANY_KEY` to opt out deliberately.
 
     Non-breaking: a receipt with no `worker_signatures` simply yields no creditable accounts + a note —
     it does not error, so legacy receipts and `verify_receipt()` are unaffected.
