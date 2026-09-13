@@ -373,6 +373,12 @@ MAX_PEER_STREAMS = 64                                 # A3: LRU cap
 SPKI_HASH_LENGTH = 64                                 # A4: sha256 hex
 MAX_CONCURRENT_SLICES = 1                             # A8: cap subprocess fan-out
 SLICE_SUBPROCESS_TIMEOUT_S = 1800                     # A8: was 3600
+# worker/kv-session-ownership-gate (2026-09-12): if a session's owner never
+# calls release_session() (worker thread killed, box crashed mid-stream), the
+# daemon must not stay locked to it forever — that would turn one bad session
+# into a permanent denial-of-service for every session after it. A stale
+# owner (idle longer than this) is treated as abandoned and reclaimed.
+KV_SESSION_STALE_AFTER_S = 300.0
 
 
 def validate_spki_hash_env(value: Optional[str]) -> Optional[str]:
@@ -723,6 +729,23 @@ class DaemonClient:
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
         self.lock = threading.Lock()
+        # worker/kv-session-ownership-gate (2026-09-12): `self.lock` above only
+        # makes ONE call() atomic on the wire (no garbled bytes if two threads
+        # call concurrently) — it does NOT protect the daemon's KV cache state.
+        # All serving/verify decode lives on a single fixed KV slot (seq 0 —
+        # see worker_daemon.cpp), so if two DIFFERENT logical sessions get
+        # routed to this same DaemonClient with overlapping lifetimes, each
+        # individual call() stays byte-clean but their turns can interleave
+        # and silently mutate each other's shared KV context. `_owner_lock` +
+        # `_owner_session` add a narrow, additive, fail-closed gate on top:
+        # acquire_session()/release_session() bracket one whole logical
+        # session (a full Inference stream, or one Forward call), and a call
+        # from a DIFFERENT session while the daemon is owned is refused
+        # loudly instead of allowed to interleave. Queuing a refused session
+        # is explicitly out of scope — refusing clearly is the fix for today.
+        self._owner_lock = threading.Lock()
+        self._owner_session: Optional[str] = None
+        self._owner_since: float = 0.0
         # Stderr buffer (Phase 3.6): keeps last N lines so we can verify what
         # the daemon ACTUALLY did (e.g., GPU offload count) vs. what we asked.
         self.stderr_lines = collections.deque(maxlen=500)
@@ -841,6 +864,57 @@ class DaemonClient:
             self.proc.wait(timeout=5)
         except Exception:
             self.proc.kill()
+
+    # -- worker/kv-session-ownership-gate (2026-09-12) -----------------------
+
+    def acquire_session(self, session_id: str,
+                         stale_after_s: float = KV_SESSION_STALE_AFTER_S) -> bool:
+        """Claim exclusive use of this daemon's KV state for `session_id`.
+
+        Returns True when the caller now owns the daemon — either it was free,
+        it was already owned by this same session_id (idempotent re-entry, so
+        a stream's later steps needn't re-acquire), or the previous owner went
+        stale (see KV_SESSION_STALE_AFTER_S) and is reclaimed. Returns False
+        when a DIFFERENT, still-live session currently owns it — the caller
+        must fail closed rather than proceed and interleave with it.
+        """
+        now = time.time()
+        with self._owner_lock:
+            if self._owner_session is None or self._owner_session == session_id:
+                self._owner_session = session_id
+                self._owner_since = now
+                return True
+            if now - self._owner_since > stale_after_s:
+                # Abandoned owner — its session ended (crash/kill/timeout)
+                # without calling release_session(). Reclaiming here is what
+                # stops one bad session from permanently locking out the
+                # daemon for everyone after it.
+                sys.stderr.write(
+                    f"[daemon] reclaiming stale KV-session ownership from "
+                    f"{self._owner_session!r} (idle {now - self._owner_since:.0f}s) "
+                    f"for {session_id!r}\n"
+                )
+                self._owner_session = session_id
+                self._owner_since = now
+                return True
+            return False
+
+    def release_session(self, session_id: str) -> None:
+        """Release ownership if `session_id` currently holds it.
+
+        A no-op for any other session id — this must never let a late or
+        duplicate release from a session that has already lost ownership
+        (e.g. reclaimed as stale) clobber a newer, legitimate owner.
+        """
+        with self._owner_lock:
+            if self._owner_session == session_id:
+                self._owner_session = None
+                self._owner_since = 0.0
+
+    @property
+    def current_owner(self) -> Optional[str]:
+        with self._owner_lock:
+            return self._owner_session
 
 
 # v0.5 §9.7: idempotency cache is sized in MB, internally converted to an
@@ -1321,11 +1395,31 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
             method_path="/nakshatra.Nakshatra/Forward",
             is_streaming=False,
         )
-        result = self._run_forward(
-            request.hidden_in, request.n_tokens, request.has_token_ids,
-            request.keep_kv, int(request.start_pos), request.all_logits,
-            eagle_hidden=request.eagle_hidden,
-        )
+        # worker/kv-session-ownership-gate (2026-09-12): Forward carries no
+        # session_id (it's a stateless single-forward-pass testing aid — see
+        # the participation-binding comment below), but it still calls into
+        # the SAME daemon/KV state as an Inference stream. Without this, a
+        # Forward call landing mid-stream could interleave a turn into
+        # another session's seq-0 KV cache exactly like two Inference streams
+        # could. Claim a synthetic, single-use session for just this call —
+        # refused (fail closed) if a real session currently owns the daemon,
+        # released immediately after so it never blocks anyone else.
+        forward_session_id = f"forward:{uuid.uuid4()}"
+        if not self.daemon.acquire_session(forward_session_id):
+            context.set_code(grpc.StatusCode.RESOURCE_EXHAUSTED)
+            context.set_details(
+                f"worker busy serving another session "
+                f"(owner={self.daemon.current_owner!r})"
+            )
+            return pb.ForwardResponse()
+        try:
+            result = self._run_forward(
+                request.hidden_in, request.n_tokens, request.has_token_ids,
+                request.keep_kv, int(request.start_pos), request.all_logits,
+                eagle_hidden=request.eagle_hidden,
+            )
+        finally:
+            self.daemon.release_session(forward_session_id)
         if not result.ok:
             context.set_code(
                 grpc.StatusCode.INVALID_ARGUMENT if result.client_error
@@ -1526,6 +1620,11 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
           otherwise  -> hidden_state (one vector per input token)
         """
         first_step = True
+        # worker/kv-session-ownership-gate (2026-09-12): set once this stream
+        # has claimed the daemon, so `finally` below knows whose ownership to
+        # release. Left None if we never acquire (e.g. refused, or the stream
+        # errors before the first frame) so we never release someone else's.
+        owned_session_id = None
         try:
             for step in _iter_with_idle_timeout(
                 request_iterator, INFERENCE_STREAM_IDLE_TIMEOUT_S
@@ -1540,6 +1639,26 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                         method_path="/nakshatra.Nakshatra/Inference",
                         is_streaming=True,
                     )
+                    # worker/kv-session-ownership-gate: claim this stream's
+                    # session on the daemon BEFORE anything in this stream can
+                    # touch the shared KV state (including a cache replay
+                    # below — the point is exclusivity for the whole logical
+                    # session, not just the calls that reach the daemon).
+                    # Fail closed: a session already owned by someone else who
+                    # hasn't gone stale gets refused, never interleaved.
+                    if not self.daemon.acquire_session(step.session_id):
+                        busy_msg = (
+                            f"worker busy serving another session "
+                            f"(owner={self.daemon.current_owner!r})"
+                        ).encode()
+                        context.set_code(grpc.StatusCode.RESOURCE_EXHAUSTED)
+                        context.set_details(busy_msg.decode())
+                        yield pb.InferenceStep(
+                            session_id=step.session_id, step_id=step.step_id,
+                            error=busy_msg,
+                        )
+                        return
+                    owned_session_id = step.session_id
                 # v0.5 M0.5.2: idempotency cache. If this (session_id, step_id) has
                 # been served before, return the cached response without touching
                 # the daemon. Note: a cache hit advances first_step too — the
@@ -1814,6 +1933,14 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
             context.set_code(grpc.StatusCode.INTERNAL)
             context.set_details(f"Inference stream error: {e}")
             return
+        finally:
+            # worker/kv-session-ownership-gate: release on EVERY exit path —
+            # normal completion, an early `return` above, the idle-timeout or
+            # generic-exception handlers, or the client dropping the stream.
+            # A session that errors or times out must not permanently lock
+            # out the daemon for the next one.
+            if owned_session_id is not None:
+                self.daemon.release_session(owned_session_id)
 
 
 # Phase I8: persistent nonce slot for soft-attestation. Pillar issues a

@@ -19,6 +19,21 @@ class FakeDaemon:
         self.n_embd = n_embd
         self.recent_rpc_ms = collections.deque(maxlen=20)
         self.calls = []
+        # worker/kv-session-ownership-gate (2026-09-12): WorkerServicer.Forward
+        # now claims/releases a per-call session on the daemon. This stub
+        # mirrors the trivial single-owner semantics of the real gate.
+        self._owner = None
+    def acquire_session(self, session_id, stale_after_s=None):
+        if self._owner is None or self._owner == session_id:
+            self._owner = session_id
+            return True
+        return False
+    def release_session(self, session_id):
+        if self._owner == session_id:
+            self._owner = None
+    @property
+    def current_owner(self):
+        return self._owner
     def info(self):
         return dict(layer_start=0, layer_end=2, n_embd=self.n_embd,
                     has_token_embd=True, has_lm_head=False, n_vocab=10)
