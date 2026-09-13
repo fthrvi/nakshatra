@@ -7,10 +7,14 @@ A punched NAT mapping is UDP; meshd's tunnel is `relay_connect` → TCP → `sec
 UDP endpoint would produce a tunnel that works on a quiet LAN and corrupts under real loss —
 the worst failure shape there is, because it passes every test you would think to write.
 
-Using the punch for what it actually gives — a VERIFIED REACHABLE ADDRESS AND AN RTT — is
-useful today and honest: it tells the placement layer which peers are close, and it tells
+Using the punch for what it actually gives — a VERIFIED REACHABLE ADDRESS AND AN RTT — would
+be useful and honest: it could tell the placement layer which peers are close, and tell
 `pathchoice` whether a direct path exists at all. Making it carry the tunnel needs a
 reliability layer over UDP, which is a separate piece of work with its own risks.
+
+⚠️ SCOPING (2026-09-13): this module has no caller today — `grep -rln "path_probe\|assess_peer"`
+across the repo turns up only this file and its own tests. It is not wired into the placement
+layer, `pathchoice`, or the (also-incomplete) `scripts/join/` sequence.
 
 Measured, on a real two-site WAN: relay 170.9 ms, direct 28.6 ms, 3.77x throughput. That is
 what is on the table — but only once something can safely carry bytes over it.

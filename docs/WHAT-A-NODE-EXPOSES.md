@@ -3,8 +3,16 @@
 **2026-09-04. Read the code, ran the checks. Two findings were serious and are fixed in the
 same commit as this file.**
 
-The question a stranger asks before running `nakshatra join`: *what can the network do to my
-machine?* Here is the answer from the code, with the parts that were wrong called out.
+The question a stranger asks before joining the mesh as a worker: *what can the network do to
+my machine?* Here is the answer from the code, with the parts that were wrong called out.
+
+⚠️ Note (2026-09-13): `scripts/join/` (the `nakshatra join` package referenced below) is a
+phase-contract decision engine, not a live onboarding path — the real `--code` flow cannot
+complete any phase today (no coordinator serves `/v1/join-info`, no keygen in-package, no
+box/package-fact producers). Live onboarding is `~/trisul/infra/onboarding/worker.sh`
+(strangers) or `nakshatra-registrar` (owned nodes). The security fixes below are real and
+apply to whichever path a node reaches this daemon through — see nakshatra memory
+`reference_join_package_scoping_and_verdict.md`.
 
 ## What a peer can make your worker do
 
@@ -40,13 +48,14 @@ public weights — from one directory, path-guarded. It leaks nothing you did no
     unset                          set           True
 
 The join path — `servecmd.serve_argv`, `observe`, `act` — contained **zero references to
-auth or a pillar URL.** So every node produced by `nakshatra join` came up in Mode A: TLS on
+auth or a pillar URL.** So any node reaching this code path came up in Mode A: TLS on
 the wire, but **no peer authentication** and, because `peer_resolver` is `None` in that mode,
 **the push-address SSRF gate switched off too.** Anyone who could reach the port could call
 `Forward` on a stranger's GPU for free, and could aim its next-hop push anywhere.
 
-Fixed: the join path now sets `NAKSHATRA_AUTH_REQUIRED=true` in the daemon's environment and
-passes the coordinator as `--pillar-url`. A joined node authenticates every non-`Info` call.
+Fixed: this code path now sets `NAKSHATRA_AUTH_REQUIRED=true` in the daemon's environment and
+passes the coordinator as `--pillar-url`. If a node reaches this path, it authenticates every
+non-`Info` call.
 
 ## ⛔ Finding 2 — the provisioner executed unverified downloads
 

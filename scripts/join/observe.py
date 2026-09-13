@@ -1,8 +1,12 @@
-"""The ONLY place in the join path that touches the world.
+"""The ONLY place in the join path that touches the world — and today it is mostly stubs.
 
-Every phase is a pure decision; this is what feeds them. Keeping all I/O behind one function
-is what makes `nakshatra join --dry-run` a real test rather than a demo: swap this for a dict
-and the entire six-phase sequence runs on a laptop with no GPU, no network and no coordinator.
+Every phase is a pure decision; this is what is meant to feed them. Keeping all I/O behind
+one function is what makes `nakshatra join --dry-run` a real test rather than a demo: swap
+this for a dict and the entire six-phase sequence runs on a laptop with no GPU, no network
+and no coordinator. ⚠️ But on the real `--code` path most of these observations don't exist
+yet: no coordinator serves `/v1/join-info`, no keygen lives in this package, and no code
+produces the box/package facts phase 2+ require — see `fetch_join_info()` in `act.py` and
+nakshatra memory `reference_join_package_scoping_and_verdict.md` for the full gap.
 
 ⚠️ An observation that FAILS returns nothing rather than raising. A fact we could not take is
 not a fact against the node — the phase decides whether it can proceed without it, and it

@@ -107,6 +107,11 @@ exercises the existing ones more often.
 
 ## Join-path integration
 
+⚠️ The `scripts/join/` sequence referenced below is a phase-contract decision engine, not a
+live onboarding path — see nakshatra memory `reference_join_package_scoping_and_verdict.md`.
+The live sequence today is `~/trisul/infra/onboarding/worker.sh`, which is where this
+integration would actually need to land until the join package's I/O gap closes.
+
 The join sequence should refuse to declare a shared machine `joined` without a sentinel:
 
 - `capability` reports `shared_host: true` when the platform is a desktop OS with an active

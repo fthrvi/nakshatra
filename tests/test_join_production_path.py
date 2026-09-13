@@ -8,6 +8,12 @@ review, not by the suite — which is the point.
 
 This drives the REAL `observe()` with the acting layer's network call stubbed to a reachable
 coordinator, and asserts admit is satisfied by what observe actually gathers.
+
+⚠️ SCOPING (2026-09-13): reaching phase 2 is as far as the real path gets. Phases 2-6 are
+known-unsatisfiable on the real `--code` path today — no coordinator serves `/v1/join-info`
+in production, no keygen exists in this package, and no code produces the box/package facts
+those phases require. See `tests/test_join_real_dispatcher_gap.py` and nakshatra memory
+`reference_join_package_scoping_and_verdict.md` for the full gap.
 """
 import json
 

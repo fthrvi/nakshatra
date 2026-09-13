@@ -37,10 +37,12 @@ def serve_argv(python: str, script: str, facts: dict) -> list[str]:
     # ⚠️⚠️ AUTH IS NOT OPTIONAL FOR A JOINED NODE. worker.py's resolve_auth_required() reads
     # (env unset, pillar_url "") as "Mode A legacy" — TLS on, but NO peer authentication, and
     # peer_resolver=None, which also disarms the push-address SSRF gate. Until 2026-09-04 this
-    # function passed neither, so every node produced by `nakshatra join` answered Forward /
+    # function passed neither, so any node reaching this code path answered Forward /
     # Inference to anyone who could reach the port, and would push to any address a peer
     # named. Passing the coordinator as --pillar-url flips the truth table to Mode B/C; the
     # explicit env switch in act.start_daemon is the second lock on the same door.
+    # (Note: `scripts/join/` cannot drive this today — see
+    # reference_join_package_scoping_and_verdict.md — but the fix applies to any caller.)
     # The coordinator is where observe.py put it: inside the decoded join code. A top-level
     # key is honoured too, for callers that pass a flat dict.
     join = facts.get("join")

@@ -1,4 +1,12 @@
-"""nakshatra join — one command turns a machine into a serving node.
+"""nakshatra join — a phase-contract decision engine with a stubbed observation layer.
+
+⚠️ SCOPING (2026-09-13): the real `--code` path cannot complete any phase today — no
+coordinator serves `GET /v1/join-info`, no keygen exists in this package, and no code
+produces the box/package facts later phases require. Live onboarding today is
+`~/trisul/infra/onboarding/worker.sh` (strangers) and the `nakshatra-registrar` service
+(owned nodes). Full analysis: nakshatra memory `reference_join_package_scoping_and_verdict.md`.
+What follows describes the decision engine itself, which is real and tested via
+`--observations`; it is the world-facing glue (`act.py`'s I/O) that is missing.
 
 ⚠️⚠️ THE DESIGN RULE THAT MAKES THIS TESTABLE: **phases DECIDE, the orchestrator ACTS.**
 

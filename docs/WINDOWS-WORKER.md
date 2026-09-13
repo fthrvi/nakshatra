@@ -7,8 +7,10 @@
 Every other option in this repo widens the fleet across *server* hardware. Windows is where
 the **idle consumer GPUs** are — the 3060s and 4070s in gaming machines that sit at 0%
 utilisation most of the day. The mission sentence says *any machine with a GPU joins with one
-command*. Today a Windows box cannot join at all, and that is the largest single population
-excluded.
+command*. Today a Windows box cannot join at all through any path — and, per nakshatra memory
+`reference_join_package_scoping_and_verdict.md`, neither can a Linux box via `scripts/join/`;
+the working Linux path is `~/trisul/infra/onboarding/worker.sh`. Windows exclusion is the
+largest single population still shut out regardless.
 
 ## The three routes
 

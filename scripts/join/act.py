@@ -197,6 +197,11 @@ _SAFE_OPENER = urllib.request.build_opener(_SafeRedirectHandler)
 def fetch_join_info(coordinator: str, timeout: int = 15) -> Dict[str, Any]:
     """Ask the coordinator what a joining node needs: the package URL and its version.
 
+    ⚠️ NO COORDINATOR SERVES THIS ROUTE TODAY. `grep -rn "join-info"` across this repo turns
+    up only this function, `observe.py`'s stub, and test fixtures — nothing implements
+    `GET /v1/join-info` anywhere in the codebase, so this call fails on any real coordinator.
+    See nakshatra memory `reference_join_package_scoping_and_verdict.md`.
+
     ⚠️ WHY THIS EXISTS. The `--code` path decoded the join code and then went straight to
     `admit`, which needs `package_url`, `node_version` and `coordinator_version` — none of
     which anything supplied. Production failed at phase 1 with "missing package_url", while

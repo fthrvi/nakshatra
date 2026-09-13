@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
-"""nakshatra join — one command turns a machine into a serving node.
+"""nakshatra join — a phase-contract decision engine with a stubbed observation layer.
 
-    join.py --code <join-code>                 # the real thing
+    join.py --code <join-code>                 # NOT functional today: no coordinator serves
+                                                # /v1/join-info, no keygen exists in this
+                                                # package, and no code produces the box/package
+                                                # facts later phases require. Live onboarding is
+                                                # ~/trisul/infra/onboarding/worker.sh (strangers)
+                                                # or nakshatra-registrar (owned nodes) — see
+                                                # nakshatra memory
+                                                # reference_join_package_scoping_and_verdict.md.
     join.py --observations facts.json          # every decision, no I/O at all
     join.py --observations facts.json --explain
 
