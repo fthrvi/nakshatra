@@ -997,7 +997,6 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
         self._served_sessions: "collections.OrderedDict" = collections.OrderedDict()
         self._served_ttl = max(idem_ttl_seconds, 900.0)   # a generation can outlive a short idem TTL
         self._served_max_sessions = 2048
-        self._last_activity_ts = 0.0  # any step served at all — the fallback for the sessionless Forward RPC
 
     def _idem_evict(self, now: float):
         """Drop expired sessions, then cap total entries. Caller holds _idem_lock."""
@@ -1060,12 +1059,9 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
             return
         with self._participation_lock:
             now = time.time()
-            # ⚠️ Deliberately does NOT touch `_last_activity_ts` — that field is the
-            # SESSIONLESS Forward fallback's signal only (see SignParticipation). If this
-            # method updated it too, activity on a DIFFERENT, real session would make an
-            # unrelated, never-served run_id look recently active and launder straight past
-            # the sessionless fallback — exactly the gap the fallback exists to close, not
-            # reopen.
+            # 2026-09-13: there is no sessionless fallback left to keep separate from (see
+            # SignParticipation) — this map is now the ONLY evidence SignParticipation ever
+            # consults, keyed strictly by the real session_id this worker served.
             entry = self._served_sessions.setdefault(
                 session_id, {"last_touch": now, "generated_token_ids": []})
             entry["last_touch"] = now
@@ -1426,14 +1422,18 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                 else grpc.StatusCode.INTERNAL)
             context.set_details(result.error)
             return pb.ForwardResponse()
-        # 2026-09-12 participation binding: Forward carries no session/run id at all (the
-        # proto docs it as a stateless single-forward-pass testing aid), so there is nothing
-        # to key per-run evidence on here. Recording only the generic "this worker did SOME
-        # real decode work just now" timestamp is what lets SignParticipation's sessionless
-        # fallback refuse a node that has NEVER served anything, without pretending Forward
-        # calls can be bound to a specific run_id — see SignParticipation's docstring.
-        with self._participation_lock:
-            self._last_activity_ts = time.time()
+        # 2026-09-13 participation binding: Forward carries no session/run id at all (the
+        # proto docs it as a stateless single-forward-pass testing aid), so there is NOTHING
+        # here that can ever be bound to a specific run_id or output_sha256 — not even "this
+        # node did some decode work recently". An earlier version of this comment described
+        # recording a bare timestamp here as evidence for a SignParticipation fallback; that
+        # fallback accepted ANY (run_id, output_sha256) pair as long as recent Forward
+        # activity existed, with no check that this node produced THAT run or THAT output —
+        # i.e. it signed exactly the forged proofs it was meant to refuse. It has been
+        # deleted (see SignParticipation's docstring) rather than narrowed, because Forward
+        # activity is fundamentally unable to supply the missing correlation: there is no
+        # per-call identifier here to check against. Deliberately a no-op now — kept as a
+        # comment, not a stub, so a future edit does not "restore" the removed timestamp.
         # 2026-05-29 fabric Phase F — first-worker gRPC→fabric bridge.
         # When the bridge is wired (mode=first + --transport=fabric),
         # the gRPC reply carries the chain's FINAL token (after the
@@ -1528,16 +1528,48 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
         streaming Inference RPC already carries and which client.py already uses AS run_id
         (`run_id = session_id or uuid4()`, see client.py). `_record_session_activity` is
         populated ONLY by Inference() actually running a decode; this method only ever reads
-        it, in `_participation_evidence`. Three outcomes:
-          1. This run_id was never served AND this node has no recent Forward activity either
-             → refuse. Closes the cold-node case verbatim from the finding.
+        it, in `_participation_evidence`.
+
+        ⚠️⚠️⚠️ 2026-09-13 — THE 2026-09-12 FIX STILL HAD A HOLE, AND IT HAS NOW BEEN REMOVED
+        RATHER THAN PATCHED AGAIN. The 09-12 version kept a "sessionless fallback" for a
+        never-served run_id: if this node had ANY recent Forward activity (`_last_activity_ts`
+        within `_served_ttl`, ~15 min), it signed the request's `output_sha256` UNCHECKED —
+        Forward carries no run_id or output at all, so that branch could not verify the
+        request's `run_id` or `output_sha256` against anything real. The exploit: call Forward
+        once (any cheap, unrelated request stamps the timestamp), then call
+        SignParticipation(run_id="<anything never served>", output_sha256="<anything>") within
+        15 minutes and receive a validly-signed proof for fabricated work. That fallback has
+        been deleted, not narrowed — see the comment where `_last_activity_ts` used to be set,
+        in Forward(), for why it cannot be repaired: Forward has no per-call identifier to bind
+        to a specific run_id or output_sha256, so ANY signal derived from "Forward ran
+        recently" is a proxy for activity, never for the truth of a specific (run_id,
+        output_sha256) pair — which is the one thing this method must not guess at.
+
+        The invariant now: SignParticipation signs a `(run_id, output_sha256)` pair ONLY when
+        `_participation_evidence(run_id)` shows this worker's OWN `Inference()` handler
+        actually recorded that run_id, AND — whenever this worker recorded the tokens it
+        itself produced as the run's final-token producer — the claimed `output_sha256`
+        reproduces the exact hash of those tokens. No other path signs. Concretely:
+          1. This run_id was never served by this node's own Inference() at all → refuse,
+             unconditionally. No fallback of any kind, no matter how recent other activity is.
           2. This run_id WAS served and this worker was the one producing the final tokens
              (mode="last") → the claimed output_sha256 must match what this worker actually
              emitted, byte for byte (`receipt.output_sha256` over the same token sequence).
              A worker cannot be tricked into vouching for content it never produced.
           3. This run_id was served but this worker only ever forwarded hidden state (not
-             last) → session-level evidence is the strongest this worker can independently
-             judge; allowed, same as before, but no longer for a NEVER-served run_id.
+             last) → session-level evidence (this worker really processed this run_id) is the
+             strongest this worker can independently judge, since it never held the final
+             tokens to hash; allowed, same as before, but only for a run_id it actually saw.
+
+        This makes the unary Forward RPC permanently unable to obtain a SignParticipation
+        proof for any run_id — by design, not by omission. Forward is a stateless
+        single-forward-pass testing aid with no run_id/session_id on the wire; there is no
+        way for it to ever supply verifiable per-run evidence, so no amount of "recent
+        activity" should ever be allowed to substitute for it. A worker that only ever
+        served a run_id through Forward — which, by construction, never happens, since
+        Forward's synthetic session id is never used as a participation key — has, correctly,
+        no way to get a signature for it. Only the streaming Inference() path can ever
+        produce genuine evidence.
         """
         self._check_grpc_auth(
             context, request.SerializeToString(),
@@ -1564,21 +1596,18 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
 
         seen, generated_token_ids = self._participation_evidence(run_id)
         if not seen:
-            # Sessionless fallback: unary Forward carries no run_id at all, so a legitimate
-            # Forward-only run can never appear in `_served_sessions` by construction. The
-            # best available signal there is "did this node do ANY real decode work
-            # recently" — refusing outright would break every non-streaming deployment;
-            # accepting unconditionally is the exact bug being fixed. Recent genuine
-            # activity is required either way.
-            with self._participation_lock:
-                recent = (self._last_activity_ts > 0
-                         and time.time() - self._last_activity_ts <= self._served_ttl)
-            if not recent:
-                context.set_code(grpc.StatusCode.PERMISSION_DENIED)
-                context.set_details(
-                    f"run_id {run_id!r} was never served by this node, and it has no recent "
-                    "decode activity either — refusing to sign work it never did")
-                return pb.SignParticipationResponse()
+            # 2026-09-13: NO fallback here, sessionless or otherwise. This run_id was never
+            # recorded by this node's own Inference() handler, so there is nothing to verify
+            # the request against — signing anyway (even gated on "recent Forward activity",
+            # the previous version's mistake) means vouching for a run this node cannot prove
+            # it did. See the docstring's 2026-09-13 section for the exploit this closes.
+            context.set_code(grpc.StatusCode.PERMISSION_DENIED)
+            context.set_details(
+                f"run_id {run_id!r} was never served by this node's streaming Inference "
+                "path — refusing to sign work it cannot independently verify (no sessionless "
+                "fallback; the unary Forward RPC carries no run_id and can never supply this "
+                "evidence)")
+            return pb.SignParticipationResponse()
         elif generated_token_ids:
             # This worker WAS the run's final-token producer (mode=="last") for this exact
             # session — it can independently recompute the same hash the client claims.

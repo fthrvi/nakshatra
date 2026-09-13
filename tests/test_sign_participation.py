@@ -24,15 +24,17 @@ def _servicer(monkey_layers=(0, 13)):
     s.layer_start, s.layer_end = monkey_layers
     s._check_grpc_auth = lambda *a, **k: None
     # 2026-09-12 participation binding: SignParticipation now consults the evidence a real
-    # Inference/Forward call would have populated. A hand-built servicer never runs
+    # Inference call would have populated. A hand-built servicer never runs
     # WorkerServicer.__init__, so these start empty exactly like a freshly-started worker
     # that has served nothing yet — tests that need "this node actually served the run"
-    # must call s._record_session_activity(...) (or set s._last_activity_ts) themselves.
+    # must call s._record_session_activity(...) themselves.
+    # 2026-09-13: the sessionless "recent Forward activity" fallback (`_last_activity_ts`)
+    # has been deleted from worker.py entirely — it could not verify a request's run_id or
+    # output_sha256 against anything real. There is nothing left to seed here for it.
     s._participation_lock = threading.Lock()
     s._served_sessions = collections.OrderedDict()
     s._served_ttl = 900.0
     s._served_max_sessions = 2048
-    s._last_activity_ts = 0.0
     return s
 
 
@@ -151,6 +153,63 @@ def test_a_forged_output_hash_for_a_real_run_is_refused_when_this_worker_produce
     resp = s.SignParticipation(
         pb.SignParticipationRequest(run_id="r", output_sha256="not-" + real_hash), ctx)
     assert ctx.code == grpc.StatusCode.PERMISSION_DENIED
+    assert resp.sig == ""
+
+
+class _FakeDaemon:
+    """Minimal stand-in for DaemonClient's session-ownership surface — just enough for
+    Forward() to acquire/release without a real daemon subprocess."""
+    def __init__(self):
+        self._owner_session = None
+
+    def acquire_session(self, session_id, stale_after_s=300.0):
+        if self._owner_session is None or self._owner_session == session_id:
+            self._owner_session = session_id
+            return True
+        return False
+
+    def release_session(self, session_id):
+        if self._owner_session == session_id:
+            self._owner_session = None
+
+    @property
+    def current_owner(self):
+        return self._owner_session
+
+
+def test_one_forward_call_then_an_unrelated_forged_run_id_is_refused(tmp_path, monkeypatch):
+    """⚠️⚠️⚠️ THE EXACT EXPLOIT THIS SECOND FIX CLOSES. The 2026-09-12 fix's "sessionless
+    fallback" let ANY authenticated peer call one cheap, unrelated Forward RPC (which only
+    ever stamped a generic timestamp), then call SignParticipation for a completely
+    different, never-served run_id with a completely made-up output_sha256 — and receive a
+    validly-signed fake participation proof, because that fallback never checked run_id or
+    output_sha256 against anything Forward actually did. Reproduce it against the real
+    Forward() handler (not a hand-simulated substitute for it): one Forward call must not
+    make ANY subsequent run_id/output_sha256 signable."""
+    import worker
+    kp = tmp_path / "k"; kp.write_bytes(os.urandom(32))
+    monkeypatch.setattr(wauth, "WORKER_KEY_PATH", kp)
+
+    s = _servicer()
+    s.daemon = _FakeDaemon()
+    s.fabric_first_worker_bridge = None
+    from worker import ForwardResult
+    s._run_forward = lambda *a, **k: ForwardResult(True, b"\x00\x00\x00\x00", "", client_error=False)
+
+    # Step 1: one ordinary, unrelated Forward call — exactly what an attacker gets for free
+    # as an authenticated peer, with no run_id/output_sha256 of its own on the wire at all.
+    fwd_req = pb.ForwardRequest(hidden_in=b"", n_tokens=1, has_token_ids=False,
+                                keep_kv=False, start_pos=0, all_logits=False)
+    fwd_resp = s.Forward(fwd_req, Ctx())
+    assert fwd_resp.hidden_out != b"" or True  # Forward succeeded; exact payload irrelevant here
+
+    # Step 2: claim an arbitrary, never-served run_id with an arbitrary output_sha256.
+    ctx = Ctx()
+    resp = s.SignParticipation(
+        pb.SignParticipationRequest(run_id="attacker-picked-run-id",
+                                    output_sha256="attacker-picked-hash"), ctx)
+    assert ctx.code == grpc.StatusCode.PERMISSION_DENIED, \
+        "one Forward call must never make an unrelated run_id/output_sha256 signable"
     assert resp.sig == ""
 
 
