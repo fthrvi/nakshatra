@@ -279,14 +279,16 @@ class StubChatBackend(ChatBackend):
     it to verify the Ollama plumbing end-to-end before the cluster is up.
     Returns a canned reply; never touches the chain."""
 
-    def __init__(self, reply: str = "ok"):
+    def __init__(self, reply: str = "ok", done_reason: str = "stop"):
         self._reply = reply
+        self._done_reason = done_reason
 
     def generate(self, entry, prompt, max_tokens, options):
         return GenerationResult(
             text=self._reply,
             eval_count=len(self._reply.split()),
             prompt_eval_count=len(prompt.split()),
+            done_reason=self._done_reason,
         )
 
     def generate_stream(self, entry, prompt, max_tokens, options):
@@ -1223,7 +1225,7 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
                 "model": entry.name,
                 "choices": [{"index": 0,
                              "message": message,
-                             "finish_reason": "stop"}],
+                             "finish_reason": result.done_reason}],
                 "usage": {"prompt_tokens": p, "completion_tokens": c,
                           "total_tokens": p + c},
             })

@@ -744,6 +744,23 @@ def test_v1_chat_completions_nonstream(tmp_path):
         body["usage"]["prompt_tokens"] + body["usage"]["completion_tokens"])
 
 
+def test_v1_chat_completions_nonstream_surfaces_real_finish_reason(tmp_path):
+    """A truncated/length-limited completion must NOT be reported as
+    finish_reason "stop" — that's indistinguishable from a genuinely
+    complete answer to any caller (e.g. an editing agent) that relies on
+    finish_reason to detect a cut-off response. Found 2026-09-18: this
+    endpoint used to hardcode "stop" regardless of what the backend
+    actually reported."""
+    with _running_chat(_chat_models(tmp_path),
+                       ns.StubChatBackend("truncated mid-sen",
+                                          done_reason="length")) as port:
+        status, body = _post(port, "/v1/chat/completions", {
+            "model": "llama-3.3-70b",
+            "messages": [{"role": "user", "content": "capital?"}]})
+    assert status == 200
+    assert body["choices"][0]["finish_reason"] == "length"
+
+
 def test_v1_chat_completions_unknown_model_404_openai_error(tmp_path):
     with _running_chat(_chat_models(tmp_path), ns.StubChatBackend()) as port:
         status, body = _post(port, "/v1/chat/completions", {
