@@ -98,6 +98,23 @@ class RemoteWorker:
     probe: tuple                  # (host, port) reachable from the orchestrator
     stop_match: str               # pkill -f pattern
     stop: str = ""                # optional explicit remote stop command; empty = the `pkill -f stop_match` default
+    probe_grpc: bool = False      # readiness = a gRPC Info() answers, not just a TCP accept (see _grpc_info_ok)
+
+
+def _grpc_info_ok(host: str, port: int, timeout: float = 3.0) -> bool:
+    """True iff a worker actually ANSWERS gRPC Info at host:port (Info is exempt from worker auth). A bare TCP accept is not
+    readiness: blackwell's Windows portproxy accepts connections on 10.42.0.7:5562 whether or not the WSL worker behind it
+    exists, so a TCP probe declared the chain ready ~3 s after launch and the first request died on a worker that was not
+    up yet (2026-09-21)."""
+    try:
+        import grpc
+        import nakshatra_pb2 as pb
+        import nakshatra_pb2_grpc as pbg
+        with grpc.insecure_channel(f"{host}:{port}") as channel:
+            pbg.NakshatraStub(channel).Info(pb.InfoRequest(), timeout=timeout)
+        return True
+    except Exception:
+        return False
 
 
 class RemoteSshController(ChainController):
@@ -141,6 +158,10 @@ class RemoteSshController(ChainController):
     def is_ready(self) -> bool:
         for w in self.workers:
             host, port = w.probe
+            if w.probe_grpc:
+                if not _grpc_info_ok(host, port):
+                    return False
+                continue
             try:
                 with socket.create_connection((host, port), timeout=3):
                     pass
@@ -669,7 +690,8 @@ def _remote_workers_from_json(path: str) -> "list[RemoteWorker]":
         {"name","ssh","launch","probe":"host:port","stop_match" and/or "stop"}, ...]}
     `stop` is an explicit remote command (needed where the ssh login shell is not bash - a Windows/WSL node lands in
     PowerShell, where `pkill -f '...' 2>/dev/null` does not exist); without it the pkill default applies, so `stop_match`
-    is then required."""
+    is then required. `probe_grpc: true` makes readiness a real gRPC Info() call instead of a TCP accept (needed behind a
+    port forwarder that accepts connections before its backend exists)."""
     import json
     data = json.loads(open(path).read())
     out = []
@@ -680,7 +702,7 @@ def _remote_workers_from_json(path: str) -> "list[RemoteWorker]":
         out.append(RemoteWorker(
             name=w["name"], ssh=w["ssh"], launch=w["launch"],
             probe=(host or "127.0.0.1", int(port)), stop_match=w.get("stop_match", ""),
-            stop=w.get("stop", "")))
+            stop=w.get("stop", ""), probe_grpc=bool(w.get("probe_grpc", False))))
     return out
 
 

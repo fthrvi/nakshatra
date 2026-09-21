@@ -57,3 +57,73 @@ def test_a_worker_with_neither_stop_nor_stop_match_is_refused_at_load_time(tmp_p
     cfg.write_text(json.dumps({"remote_workers": [{"name": "c", "ssh": "h", "launch": "l", "probe": "h:1"}]}))
     with pytest.raises(ValueError, match="needs 'stop' or 'stop_match'"):
         sl._remote_workers_from_json(str(cfg))
+
+
+# ── readiness: a gRPC Info() answer, not a TCP accept ─────────────────────────────────────────────────────────────────
+import socket
+import threading
+
+
+def _accepting_socket():
+    """A listener that accepts TCP and speaks no gRPC - what blackwell's Windows portproxy does before its WSL backend exists."""
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(8)
+
+    def _loop():
+        while True:
+            try:
+                conn, _ = srv.accept()
+                conn.close()
+            except OSError:
+                return
+
+    threading.Thread(target=_loop, daemon=True).start()
+    return srv, srv.getsockname()[1]
+
+
+def test_a_tcp_accept_alone_is_ready_by_default_as_before():
+    srv, port = _accepting_socket()
+    try:
+        assert _Recorder([_w(probe=("127.0.0.1", port))]).is_ready() is True
+    finally:
+        srv.close()
+
+
+def test_with_probe_grpc_a_port_that_only_accepts_tcp_is_NOT_ready():
+    """The 2026-09-21 cold start: the forwarder accepted, the worker behind it was not up, and the chain was declared ready."""
+    srv, port = _accepting_socket()
+    try:
+        assert _Recorder([_w(probe=("127.0.0.1", port), probe_grpc=True)]).is_ready() is False
+    finally:
+        srv.close()
+
+
+def test_with_probe_grpc_a_real_grpc_server_answering_info_is_ready():
+    grpc = pytest.importorskip("grpc")
+    from concurrent import futures
+
+    import nakshatra_pb2 as pb
+    import nakshatra_pb2_grpc as pbg
+
+    class _Servicer(pbg.NakshatraServicer):
+        def Info(self, request, context):
+            return pb.InfoResponse()
+
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
+    pbg.add_NakshatraServicer_to_server(_Servicer(), server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    server.start()
+    try:
+        assert _Recorder([_w(probe=("127.0.0.1", port), probe_grpc=True)]).is_ready() is True
+    finally:
+        server.stop(0)
+
+
+def test_the_json_loader_reads_probe_grpc(tmp_path):
+    cfg = tmp_path / "remote.json"
+    cfg.write_text(json.dumps({"remote_workers": [
+        {"name": "a", "ssh": "h", "launch": "l", "probe": "h:1", "stop": "s", "probe_grpc": True},
+        {"name": "b", "ssh": "h", "launch": "l", "probe": "h:2", "stop": "s"}]}))
+    a, b = sl._remote_workers_from_json(str(cfg))
+    assert (a.probe_grpc, b.probe_grpc) == (True, False)
