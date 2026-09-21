@@ -203,6 +203,28 @@ def detok_one(llama, tid):
         return "?"
 
 
+# The exact method strings worker.py signs/verifies (NOT the protobuf service name nakshatra.v0_1.Nakshatra).
+_GRPC_AUTH_METHODS = {"Forward": "/nakshatra.Nakshatra/Forward", "Inference": "/nakshatra.Nakshatra/Inference"}
+
+
+def _grpc_auth_metadata(method: str, message_bytes: bytes, streaming: bool = False):
+    """`authorization` gRPC metadata for a call to an AUTHENTICATED worker, or None.
+
+    A worker that registered with a Sthambha pillar defaults to auth_required (Mode B/C) and rejects any call without a
+    signed `Sthambha-Ed25519` header: this driver had no way to send one, so it could only drive unauthenticated
+    (static-YAML, Mode A) workers. When NKS_REGISTRY_KEYID names a registered peer whose key this box holds, the call is
+    signed over the serialized request (Forward) or the FIRST frame (Inference, streaming), exactly as the worker verifies.
+    Unset = None = no metadata, the old behaviour."""
+    keyid = os.environ.get("NKS_REGISTRY_KEYID", "").strip()
+    if not keyid:
+        return None
+    import nakshatra_auth as _na
+    import nakshatra_grpc_auth as _ga
+    priv, _pub = _na.load_or_create_worker_key()
+    header = _ga.build_grpc_auth_header(priv, keyid, _GRPC_AUTH_METHODS[method], message_bytes, is_streaming=streaming)
+    return [("authorization", header)]
+
+
 def call_forward(stub, payload, n_tokens, has_token_ids, worker_id="<unknown>",
                  keep_kv=False, start_pos=0, timing=None, all_logits=False,
                  eagle_hidden=False):
@@ -213,7 +235,8 @@ def call_forward(stub, payload, n_tokens, has_token_ids, worker_id="<unknown>",
     )
     t0 = time.time()
     try:
-        resp = stub.Forward(req, timeout=300.0)
+        resp = stub.Forward(req, timeout=300.0,
+                            metadata=_grpc_auth_metadata("Forward", req.SerializeToString()))
     except grpc.RpcError as e:
         sys.exit(
             f"[chain] Forward RPC to worker {worker_id!r} failed: "
@@ -242,7 +265,8 @@ class InferenceStream:
         self.worker_id = worker_id
         self._req_q = queue.Queue()
         self._closed = False
-        self._responses = stub.Inference(self._request_gen())
+        self._stub = stub
+        self._responses = None   # started on the first step(): an authenticated worker verifies the FIRST frame's signature
 
     def _request_gen(self):
         while True:
@@ -255,6 +279,10 @@ class InferenceStream:
         if self._closed:
             raise RuntimeError(f"stream to {self.worker_id} already closed")
         self._req_q.put(request_step)
+        if self._responses is None:
+            self._responses = self._stub.Inference(
+                self._request_gen(),
+                metadata=_grpc_auth_metadata("Inference", request_step.SerializeToString(), streaming=True))
         try:
             return next(self._responses)
         except grpc.RpcError as e:
@@ -484,7 +512,7 @@ def _fetch_spki_index(registry_url: str) -> dict[str, str]:
     """
     url = f"{registry_url.rstrip('/')}/peers"
     try:
-        with urlrequest.urlopen(url, timeout=10) as resp:
+        with _registry_urlopen(url, timeout=10) as resp:
             data = json.loads(resp.read())
     except Exception as e:
         print(f"[chain] WARNING: SPKI index fetch failed ({e}); chain "
@@ -501,6 +529,24 @@ def _fetch_spki_index(registry_url: str) -> dict[str, str]:
     return index
 
 
+def _registry_urlopen(url: str, timeout: float = 10):
+    """urlopen for a Sthambha registry GET. Since the pillar's auth hardening /chain and /peers need a signed
+    `Authorization: Sthambha-Ed25519` header (an unsigned GET is a 401), so registry mode was silently broken.
+    When NKS_REGISTRY_KEYID names a registered peer whose key this box holds (nakshatra_auth's worker key), the request
+    is signed - over the FULL path INCLUDING the query string, which is what the pillar verifies. Unset = unsigned,
+    exactly the old behaviour, so older open pillars still work."""
+    keyid = os.environ.get("NKS_REGISTRY_KEYID", "").strip()
+    if not keyid:
+        return urlrequest.urlopen(url, timeout=timeout)
+    import nakshatra_auth as _na
+    from urllib.parse import urlsplit
+    parts = urlsplit(url)
+    signed_path = parts.path + (f"?{parts.query}" if parts.query else "")
+    priv, _pub = _na.load_or_create_worker_key()
+    header, _ts = _na.build_signed_envelope(priv, keyid, "GET", signed_path, b"")
+    return urlrequest.urlopen(urlrequest.Request(url, headers={"Authorization": header}), timeout=timeout)
+
+
 def _try_pillar_chain(registry_url: str, model_id: str) -> list | None:
     """Phase I: ask the pillar to assemble the chain itself.
 
@@ -510,11 +556,15 @@ def _try_pillar_chain(registry_url: str, model_id: str) -> list | None:
     clearer error message). Other failures propagate."""
     url = f"{registry_url.rstrip('/')}/chain?model={model_id}"
     try:
-        with urlrequest.urlopen(url, timeout=10) as resp:
+        with _registry_urlopen(url, timeout=10) as resp:
             data = json.loads(resp.read())
     except urlrequest.HTTPError as e:
         if e.code == 404:
             return None
+        if e.code == 401:
+            raise RuntimeError(
+                "the Sthambha pillar refused an unsigned registry request (401). Set NKS_REGISTRY_KEYID to a node id "
+                "registered with the pillar whose key this box holds (e.g. the box's registrar id), or use --config.") from e
         raise
     chain = data.get("chain") or []
     if not chain:
@@ -565,7 +615,7 @@ def build_chain_from_registry(registry_url: str, model_id: str) -> list:
         return pillar_chain
 
     url = f"{registry_url.rstrip('/')}/peers?model={model_id}"
-    with urlrequest.urlopen(url, timeout=10) as resp:
+    with _registry_urlopen(url, timeout=10) as resp:
         data = json.loads(resp.read())
 
     # Collect (peer, offering) pairs from online compute peers
