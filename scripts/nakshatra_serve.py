@@ -121,6 +121,20 @@ class ModelEntry:
     engine_url: Optional[str] = None
     engine_model: Optional[str] = None
     engine_timeout_s: Optional[float] = None
+    # engine_url entries on the /v1/chat/completions surface: forward the request
+    # to the engine as a byte-faithful reverse proxy — only `model` is rewritten —
+    # so `tools`/`tool_choice`/`stop`/`seed`/`response_format` reach the engine and
+    # `tool_calls`/`usage`/`finish_reason`/error statuses come back unchanged.
+    # (The text-only re-render path dropped all of them: measured 2026-09-19, a
+    # tool-aware model went from 100% valid tool calls direct to 0% through it.)
+    # Set `passthrough: false` to force the legacy text-only path; entries with
+    # `think` (reasoning-split) always use it. /api/chat is unaffected.
+    passthrough: bool = True
+    # Optional migration lever for passthrough entries: injected ONLY when the
+    # request sets neither `max_tokens` nor `max_completion_tokens`. The legacy text
+    # path always forced DEFAULT_NUM_PREDICT (256); passthrough leaves the engine's
+    # own default alone unless the operator sets this. None = fully faithful.
+    default_max_tokens: Optional[int] = None
 
 
 def _load_models(path: str) -> dict[str, ModelEntry]:
@@ -195,7 +209,9 @@ def _load_models(path: str) -> dict[str, ModelEntry]:
             model_size_gb=raw.get("model_size_gb"),
             think=think,
             engine_url=engine_url, engine_model=raw.get("engine_model"),
-            engine_timeout_s=raw.get("engine_timeout_s"))
+            engine_timeout_s=raw.get("engine_timeout_s"),
+            passthrough=bool(raw.get("passthrough", True)),
+            default_max_tokens=raw.get("default_max_tokens"))
     return registry
 
 
@@ -756,6 +772,13 @@ def _think_split_enabled(entry: ModelEntry) -> bool:
     return entry.think and os.environ.get("NKS_OAI_THINK", "split") != "raw"
 
 
+def _passthrough_enabled(entry: ModelEntry) -> bool:
+    """True when /v1/chat/completions for this entry is a raw reverse proxy to
+    its engine. Reasoning-split (`think`) entries keep the legacy path: the
+    <think> splitting lives there."""
+    return bool(entry.engine_url) and entry.passthrough and not _think_split_enabled(entry)
+
+
 def _split_think(text: str) -> tuple[str, str]:
     """Non-streaming split → ``(reasoning, content)``. No closing tag →
     everything is content (fail open: never hide the answer)."""
@@ -1182,6 +1205,20 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
             self._openai_error(HTTPStatus.BAD_REQUEST,
                                "'messages' must be a non-empty list")
             return 400
+        if _passthrough_enabled(entry):
+            # route-whole entry: reverse-proxy to its engine, byte-faithful.
+            try:
+                lc = self._begin_session()
+            except _LifecycleColdStart:
+                self._openai_error(HTTPStatus.SERVICE_UNAVAILABLE,
+                                   "reasoning tier is warming up; retry shortly",
+                                   "server_error")
+                return 503
+            try:
+                return self._passthrough_openai_chat(entry, req)
+            finally:
+                if lc is not None:
+                    lc.end()
         backend = getattr(self.server, "chat_backend", None)
         if backend is None:
             self._openai_error(HTTPStatus.SERVICE_UNAVAILABLE,
@@ -1236,6 +1273,99 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
         finally:
             if lc is not None:
                 lc.end()
+
+    def _passthrough_openai_chat(self, entry, req: dict) -> int:
+        """POST /v1/chat/completions for an ``engine_url`` entry as a reverse
+        proxy: the request goes to the engine with ONLY ``model`` rewritten
+        (``engine_model``), and the engine's answer comes back unchanged — tool
+        calls, usage (incl. cached-token details), finish_reason, reasoning
+        content, SSE framing and non-200 statuses included. The response's
+        ``model`` is set back to the public entry name (as the text path always
+        did). No max_tokens default is forced. The client's headers (auth) are
+        NOT forwarded."""
+        body = dict(req)
+        body["model"] = entry.engine_model or entry.name
+        if (entry.default_max_tokens and "max_tokens" not in body
+                and "max_completion_tokens" not in body):
+            body["max_tokens"] = int(entry.default_max_tokens)
+        url = entry.engine_url.rstrip("/") + "/v1/chat/completions"
+        timeout = entry.engine_timeout_s or ProxyChatBackend.DEFAULT_TIMEOUT_S
+        upstream = urllib.request.Request(
+            url, data=json.dumps(body).encode("utf-8"), method="POST",
+            headers={"Content-Type": "application/json"})
+
+        def _pub(obj):                       # engine model id -> public name
+            if isinstance(obj, dict) and "model" in obj:
+                obj["model"] = entry.name
+            return obj
+
+        try:
+            resp = urllib.request.urlopen(upstream, timeout=timeout)
+        except urllib.error.HTTPError as e:
+            # the engine answered with an error (context too long, bad tools
+            # schema, ...): relay ITS status + body — the client needs the reason.
+            payload = e.read()
+            self.send_response(e.code)
+            self.send_header("Content-Type",
+                             e.headers.get("Content-Type", "application/json"))
+            self.send_header("Content-Length", str(len(payload)))
+            self._cors()
+            self.end_headers()
+            self.wfile.write(payload)
+            return e.code
+        except (urllib.error.URLError, OSError, TimeoutError) as e:
+            log.error("passthrough: engine %s unreachable: %s", entry.engine_url, e)
+            self._openai_error(HTTPStatus.BAD_GATEWAY, "engine unreachable",
+                               "server_error")
+            return 502
+
+        with resp:
+            ctype = resp.headers.get("Content-Type", "application/json")
+            if "text/event-stream" not in ctype:
+                payload = resp.read()
+                try:
+                    payload = json.dumps(_pub(json.loads(payload))).encode("utf-8")
+                except ValueError:
+                    pass                      # not JSON: relay as-is
+                self.send_response(resp.status)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(payload)))
+                self._cors()
+                self.end_headers()
+                self.wfile.write(payload)
+                return resp.status
+            self.send_response(resp.status)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self._cors()
+            self.end_headers()
+            try:
+                for raw in resp:
+                    line = raw
+                    if raw.startswith(b"data:") and b"[DONE]" not in raw:
+                        try:
+                            obj = json.loads(raw[len(b"data:"):].strip())
+                            line = ("data: " + json.dumps(_pub(obj)) + "\n").encode("utf-8")
+                        except ValueError:
+                            pass              # not a JSON event: relay verbatim
+                    self.wfile.write(line)
+                    if not raw.strip():       # blank line ends an SSE event
+                        self.wfile.flush()
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass                          # client went away; resp closes below
+            except (urllib.error.URLError, OSError) as e:
+                log.error("passthrough: engine %s dropped mid-stream: %s",
+                          entry.engine_url, e)
+                try:
+                    self.wfile.write(b'data: {"error": {"message": "engine dropped '
+                                     b'mid-stream", "type": "server_error"}}\n\n'
+                                     b"data: [DONE]\n\n")
+                    self.wfile.flush()
+                except Exception:
+                    pass
+                return 502
+            return resp.status
 
     def _try_route_openai(self, name: str, req: dict) -> bool:
         """v1.0 §6 — forward a non-local model to a discovered peer that serves

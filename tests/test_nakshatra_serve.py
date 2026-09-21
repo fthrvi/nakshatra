@@ -1486,3 +1486,258 @@ def test_the_old_raw_format_lost_the_newline_tokens(tmp_path):
     streamed = _stream_with(_fake_chain_client(tmp_path, escape=False))
     assert streamed != "".join(_TOKENS[:5])
     assert "):" not in streamed and "\n" not in streamed
+
+# ── /v1/chat/completions pass-through for engine_url entries ─────────
+# Measured 2026-09-19 (agent-landscape bake-off, Stage A): through the old
+# text-only path a tool-aware model went from 100% valid tool calls (direct to
+# llama-server) to 0% — the gateway forwarded only model/messages/max_tokens/
+# stream/temperature/top_p and rebuilt every reply from text. These pin the
+# byte-faithful reverse-proxy behaviour that replaces it.
+
+_PT_TOOLS = [{"type": "function", "function": {
+    "name": "read_file", "description": "Read a file",
+    "parameters": {"type": "object", "properties": {"path": {"type": "string"}},
+                   "required": ["path"]}}}]
+
+_PT_TOOL_CALL_JSON = {
+    "id": "chatcmpl-eng", "object": "chat.completion", "model": "qwen3:14b",
+    "choices": [{"index": 0, "finish_reason": "tool_calls", "message": {
+        "role": "assistant", "content": None, "tool_calls": [{
+            "id": "call_1", "type": "function",
+            "function": {"name": "read_file",
+                         "arguments": "{\"path\": \"src/config.py\"}"}}]}}],
+    "usage": {"prompt_tokens": 149, "completion_tokens": 22, "total_tokens": 171,
+              "prompt_tokens_details": {"cached_tokens": 100}},
+}
+
+_PT_TEXT_JSON = {
+    "id": "chatcmpl-eng", "object": "chat.completion", "model": "qwen3:14b",
+    "choices": [{"index": 0, "finish_reason": "stop",
+                 "message": {"role": "assistant", "content": "hello"}}],
+    "usage": {"prompt_tokens": 3, "completion_tokens": 1},
+}
+
+
+def _pt_sse_events():
+    m = "qwen3:14b"
+    return [
+        {"model": m, "choices": [{"index": 0, "finish_reason": None,
+                                  "delta": {"role": "assistant", "content": None}}]},
+        {"model": m, "choices": [{"index": 0, "finish_reason": None, "delta": {
+            "tool_calls": [{"index": 0, "id": "call_1", "type": "function",
+                            "function": {"name": "read_file", "arguments": ""}}]}}]},
+        {"model": m, "choices": [{"index": 0, "finish_reason": None, "delta": {
+            "tool_calls": [{"index": 0, "function": {
+                "arguments": "{\"path\": \"src/config.py\"}"}}]}}]},
+        {"model": m, "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]},
+        {"model": m, "choices": [],
+         "usage": {"prompt_tokens": 149, "completion_tokens": 22, "total_tokens": 171}},
+    ]
+
+
+def _make_rich_engine_handler(status=200, nonstream=None, sse=None):
+    """Fake engine that records the FULL request (body + headers) and can answer
+    with tool calls / usage / SSE tool-call deltas / an error status."""
+    class _H(BaseHTTPRequestHandler):
+        captured: dict = {}
+
+        def log_message(self, *a):
+            pass
+
+        def _send(self, code, payload, ctype="application/json"):
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length", "0"))
+            body = json.loads(self.rfile.read(n) or b"{}")
+            _H.captured = {"path": self.path, "body": body,
+                           "headers": {k.lower(): v for k, v in self.headers.items()}}
+            if status != 200:
+                self._send(status, json.dumps({"error": {
+                    "message": "context too long",
+                    "type": "invalid_request_error"}}).encode())
+                return
+            if body.get("stream"):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                for ev in (sse or []):
+                    self.wfile.write(f"data: {json.dumps(ev)}\n\n".encode())
+                    self.wfile.flush()
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+                return
+            self._send(200, json.dumps(nonstream or _PT_TEXT_JSON).encode())
+    return _H
+
+
+@contextmanager
+def _running_rich_engine(**kw):
+    handler = _make_rich_engine_handler(**kw)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}", handler
+    finally:
+        server.shutdown()
+        server.server_close()
+        t.join(timeout=2.0)
+
+
+def _pt_registry(tmp_path, url, extra_lines=()):
+    body = ("    models:\n      - name: qwen3-14b-local\n"
+            f"        engine_url: {url}\n        engine_model: qwen3:14b\n"
+            + "".join(f"        {ln}\n" for ln in extra_lines))
+    return ns._load_models(_write_models_yaml(tmp_path, body))
+
+
+def _pt_server(reg):
+    return _running_chat(reg, ns.RoutingChatBackend(ns.ChainChatBackend()))
+
+
+def test_load_models_passthrough_defaults_true_and_can_be_disabled(tmp_path):
+    assert _pt_registry(tmp_path, "http://x:1")["qwen3-14b-local"].passthrough is True
+    off = _pt_registry(tmp_path, "http://x:1", ["passthrough: false"])
+    assert off["qwen3-14b-local"].passthrough is False
+
+
+def test_passthrough_forwards_every_field_and_returns_tool_calls(tmp_path):
+    req = {"model": "qwen3-14b-local",
+           "messages": [{"role": "user", "content": "Read src/config.py"}],
+           "tools": _PT_TOOLS, "tool_choice": "auto", "stop": ["END"], "seed": 7,
+           "response_format": {"type": "text"}, "temperature": 0.0,
+           "x_custom": {"k": 1}}
+    with _running_rich_engine(nonstream=_PT_TOOL_CALL_JSON) as (url, h):
+        with _pt_server(_pt_registry(tmp_path, url)) as port:
+            status, body = _post(port, "/v1/chat/completions", req)
+    sent = dict(h.captured["body"])
+    assert sent.pop("model") == "qwen3:14b"            # ONLY the model is rewritten
+    expected = dict(req)
+    expected.pop("model")
+    assert sent == expected                            # nothing dropped, nothing invented
+    assert h.captured["path"] == "/v1/chat/completions"
+    assert status == 200
+    choice = body["choices"][0]
+    assert choice["message"]["tool_calls"][0]["function"]["name"] == "read_file"
+    assert choice["finish_reason"] == "tool_calls"
+    assert body["usage"]["prompt_tokens_details"]["cached_tokens"] == 100
+    assert body["model"] == "qwen3-14b-local"          # public name restored
+
+
+def test_passthrough_does_not_force_a_max_tokens_default(tmp_path):
+    with _running_rich_engine() as (url, h):
+        with _pt_server(_pt_registry(tmp_path, url)) as port:
+            _post(port, "/v1/chat/completions", {
+                "model": "qwen3-14b-local",
+                "messages": [{"role": "user", "content": "hi"}]})
+            assert "max_tokens" not in h.captured["body"]
+            _post(port, "/v1/chat/completions", {
+                "model": "qwen3-14b-local", "max_tokens": 77,
+                "messages": [{"role": "user", "content": "hi"}]})
+            assert h.captured["body"]["max_tokens"] == 77
+
+
+def test_passthrough_streaming_relays_tool_call_deltas_finish_and_usage(tmp_path):
+    req = {"model": "qwen3-14b-local", "stream": True,
+           "stream_options": {"include_usage": True}, "tools": _PT_TOOLS,
+           "messages": [{"role": "user", "content": "Read src/config.py"}]}
+    with _running_rich_engine(sse=_pt_sse_events()) as (url, h):
+        with _pt_server(_pt_registry(tmp_path, url)) as port:
+            chunks = _post_sse(port, "/v1/chat/completions", req)
+            raw = urllib.request.urlopen(urllib.request.Request(
+                f"http://127.0.0.1:{port}/v1/chat/completions",
+                data=json.dumps(req).encode(),
+                headers={"Content-Type": "application/json"}, method="POST"),
+                timeout=2.0).read().decode()
+    assert h.captured["body"]["stream_options"] == {"include_usage": True}
+    assert h.captured["body"]["tools"] == _PT_TOOLS
+    assert all(c["model"] == "qwen3-14b-local" for c in chunks)
+    deltas = [c["choices"][0]["delta"]["tool_calls"] for c in chunks
+              if c["choices"] and c["choices"][0]["delta"].get("tool_calls")]
+    assert deltas[0][0]["function"]["name"] == "read_file"
+    assert "".join(d[0]["function"].get("arguments", "") for d in deltas) \
+        == "{\"path\": \"src/config.py\"}"
+    finishes = [c["choices"][0]["finish_reason"] for c in chunks
+                if c["choices"] and c["choices"][0].get("finish_reason")]
+    assert finishes == ["tool_calls"]                  # NOT a hardcoded "stop"
+    assert chunks[-1]["usage"]["completion_tokens"] == 22
+    assert raw.rstrip().endswith("data: [DONE]")
+
+
+def test_passthrough_relays_engine_error_status_and_body(tmp_path):
+    with _running_rich_engine(status=400) as (url, h):
+        with _pt_server(_pt_registry(tmp_path, url)) as port:
+            status, body = _post(port, "/v1/chat/completions", {
+                "model": "qwen3-14b-local",
+                "messages": [{"role": "user", "content": "hi"}]})
+    assert status == 400                               # the engine's own status, not a blanket 502
+    assert body["error"]["message"] == "context too long"
+
+
+def test_passthrough_engine_down_is_a_clean_502(tmp_path):
+    port_dead = _free_port()
+    with _pt_server(_pt_registry(tmp_path, f"http://127.0.0.1:{port_dead}")) as port:
+        status, body = _post(port, "/v1/chat/completions", {
+            "model": "qwen3-14b-local",
+            "messages": [{"role": "user", "content": "hi"}]}, timeout=5.0)
+    assert status == 502 and body["error"]["type"] == "server_error"
+
+
+def test_passthrough_does_not_forward_client_auth_header(tmp_path):
+    with _running_rich_engine() as (url, h):
+        with _pt_server(_pt_registry(tmp_path, url)) as port:
+            urllib.request.urlopen(urllib.request.Request(
+                f"http://127.0.0.1:{port}/v1/chat/completions",
+                data=json.dumps({"model": "qwen3-14b-local", "messages": [
+                    {"role": "user", "content": "hi"}]}).encode(),
+                headers={"Content-Type": "application/json",
+                         "Authorization": "Bearer secret-client-token"},
+                method="POST"), timeout=2.0).read()
+    assert "authorization" not in h.captured["headers"]
+
+
+def test_passthrough_false_keeps_the_legacy_text_only_path(tmp_path):
+    """Escape hatch: `passthrough: false` restores the old shaping — tools are
+    NOT forwarded (documented limitation of that path)."""
+    with _running_rich_engine() as (url, h):
+        reg = _pt_registry(tmp_path, url, ["passthrough: false"])
+        with _pt_server(reg) as port:
+            status, body = _post(port, "/v1/chat/completions", {
+                "model": "qwen3-14b-local", "tools": _PT_TOOLS,
+                "messages": [{"role": "user", "content": "hi"}]})
+    assert status == 200 and body["choices"][0]["message"]["content"] == "hello"
+    assert "tools" not in h.captured["body"]
+
+
+def test_think_entries_keep_the_legacy_path_where_splitting_lives(tmp_path):
+    with _running_rich_engine() as (url, h):
+        reg = _pt_registry(tmp_path, url, ["think: true"])
+        with _pt_server(reg) as port:
+            status, _ = _post(port, "/v1/chat/completions", {
+                "model": "qwen3-14b-local", "tools": _PT_TOOLS,
+                "messages": [{"role": "user", "content": "hi"}]})
+    assert status == 200 and "tools" not in h.captured["body"]
+
+
+def test_passthrough_default_max_tokens_is_an_opt_in_migration_lever(tmp_path):
+    """Off by default (fully faithful). When an operator sets it, it fills in ONLY
+    a missing max_tokens/max_completion_tokens — an explicit caller value wins."""
+    with _running_rich_engine() as (url, h):
+        reg = _pt_registry(tmp_path, url, ["default_max_tokens: 256"])
+        assert reg["qwen3-14b-local"].default_max_tokens == 256
+        with _pt_server(reg) as port:
+            msg = [{"role": "user", "content": "hi"}]
+            _post(port, "/v1/chat/completions", {"model": "qwen3-14b-local", "messages": msg})
+            assert h.captured["body"]["max_tokens"] == 256            # injected
+            _post(port, "/v1/chat/completions", {"model": "qwen3-14b-local", "messages": msg,
+                                                 "max_tokens": 900})
+            assert h.captured["body"]["max_tokens"] == 900            # caller wins
+            _post(port, "/v1/chat/completions", {"model": "qwen3-14b-local", "messages": msg,
+                                                 "max_completion_tokens": 50})
+            assert "max_tokens" not in h.captured["body"]             # other spelling respected
+    assert _pt_registry(tmp_path, "http://x:1")["qwen3-14b-local"].default_max_tokens is None
