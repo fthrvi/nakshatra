@@ -1,0 +1,188 @@
+"""A worker binds its gRPC port BEFORE it registers with the pillar and installs its peer-key resolver.
+
+Measured 2026-09-21 on a scale-to-zero cold start: the lifecycle saw a completed TLS handshake, declared the chain ready, and the
+first authenticated request died on "auth required but no peer resolver configured" - which Inference's blanket `except Exception`
+then rewrote into `INTERNAL: Inference stream error: ` (context.abort() signals by raising a bare Exception), so the log said
+"stream aborted:" and nothing else. Three fixes, three groups of tests:
+  1. while STARTING the worker answers UNAVAILABLE ("worker starting"), not UNAUTHENTICATED, on Info and on every authed RPC;
+  2. an abort() inside Inference keeps its own status instead of being rewritten to INTERNAL;
+  3. the lifecycle probe calls a real Info() (over TLS too), so a starting worker is NOT ready.
+"""
+import datetime
+import sys
+from concurrent import futures
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+
+grpc = pytest.importorskip("grpc")
+import nakshatra_pb2 as pb  # noqa: E402
+import nakshatra_pb2_grpc as pbg  # noqa: E402
+import serve_lifecycle as sl  # noqa: E402
+import worker  # noqa: E402
+
+
+class _Aborted(Exception):
+    """grpc's abort() raises a bare Exception after recording the status."""
+
+
+class _Ctx:
+    def __init__(self):
+        self._code = None
+        self._details = None
+
+    def invocation_metadata(self):
+        return []
+
+    def peer(self):
+        return "ipv4:127.0.0.1:1"
+
+    def set_code(self, code):
+        self._code = code
+
+    def set_details(self, details):
+        self._details = details
+
+    def code(self):
+        return self._code
+
+    def abort(self, code, details):
+        self._code, self._details = code, details
+        raise _Aborted()
+
+
+class _Daemon:
+    """Just enough DaemonClient for WorkerServicer.__init__; `boom` makes the first real call fail like a dead pipe."""
+    boom = None
+
+    def info(self):
+        return {"n_embd": 4, "n_layers": 4, "gpu_offload_status": {}}
+
+    def gpu_offload_status(self):
+        return {"uses_gpu": False, "n_offloaded": 0, "total_layers": 4, "backend_hints": []}
+
+    def acquire_session(self, *a, **k):
+        return True
+
+    def release_session(self, *a, **k):
+        pass
+
+    current_owner = None
+
+    def call(self, *a, **k):
+        raise self.boom
+
+
+def _servicer(*, auth_required=True, starting=False, resolver=None):
+    s = worker.WorkerServicer(daemon=_Daemon(), mode="last", layer_start=0, layer_end=14, model_id="m",
+                              idem_max_entries=8, idem_ttl_seconds=10.0, peer_resolver=resolver,
+                              auth_required=auth_required, refuse_unregistered_peers=False, refuse_unpinned_peers=False)
+    s.starting = starting
+    return s
+
+
+# -- 1. STARTING is UNAVAILABLE, not UNAUTHENTICATED -------------------------------------------------------------------
+
+def test_a_starting_worker_answers_info_unavailable():
+    ctx = _Ctx()
+    with pytest.raises(_Aborted):
+        _servicer(starting=True).Info(pb.InfoRequest(), ctx)
+    assert ctx._code == grpc.StatusCode.UNAVAILABLE and "starting" in ctx._details
+
+
+def test_a_starting_worker_answers_an_authenticated_call_unavailable_not_unauthenticated():
+    ctx = _Ctx()
+    with pytest.raises(_Aborted):
+        _servicer(starting=True)._check_grpc_auth(ctx, b"", method_path="/nakshatra.Nakshatra/Forward", is_streaming=False)
+    assert ctx._code == grpc.StatusCode.UNAVAILABLE
+
+
+def test_a_worker_that_is_not_starting_still_refuses_with_no_resolver():
+    """Control: the gate must not turn a genuinely unconfigured worker into a retryable one."""
+    ctx = _Ctx()
+    with pytest.raises(_Aborted):
+        _servicer(starting=False)._check_grpc_auth(ctx, b"", method_path="/nakshatra.Nakshatra/Forward", is_streaming=False)
+    assert ctx._code == grpc.StatusCode.UNAUTHENTICATED
+
+
+def test_info_is_unchanged_when_not_starting():
+    assert _servicer(starting=False).Info(pb.InfoRequest(), _Ctx()).model_id == "m"
+
+
+def test_a_worker_is_not_starting_by_default():
+    """Direct construction (tests, solo, Mode A) must behave exactly as before; only main() sets `starting`."""
+    assert worker.WorkerServicer(daemon=_Daemon(), mode="last", layer_start=0, layer_end=1, model_id="m").starting is False
+
+
+# -- 2. an abort keeps its status ------------------------------------------------------------------------------------
+
+def test_an_auth_abort_inside_inference_is_not_rewritten_to_internal():
+    ctx = _Ctx()
+    step = pb.InferenceStep(session_id="s", step_id="1")
+    with pytest.raises(_Aborted):
+        list(_servicer(starting=True).Inference(iter([step]), ctx))
+    assert ctx._code == grpc.StatusCode.UNAVAILABLE, ctx._code
+
+
+def test_a_real_failure_inside_inference_is_still_internal_and_now_names_its_type():
+    class _Dead(_Daemon):
+        boom = EOFError()  # str() is '' - exactly what made the original log line unreadable
+
+    s = _servicer(auth_required=False)
+    s.daemon = _Dead()
+    ctx = _Ctx()
+    step = pb.InferenceStep(session_id="s", step_id="1")
+    step.token_ids.ids.append(1)
+    list(s.Inference(iter([step]), ctx))
+    assert ctx._code == grpc.StatusCode.INTERNAL
+    assert "EOFError" in ctx._details
+
+
+# -- 3. the probe needs a real Info ----------------------------------------------------------------------------------
+
+def _selfsigned(tmp_path):
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "nakshatra.local")])
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name).public_key(key.public_key())
+            .serial_number(1).not_valid_before(now - datetime.timedelta(days=1))
+            .not_valid_after(now + datetime.timedelta(days=1))
+            .add_extension(x509.SubjectAlternativeName([x509.DNSName("nakshatra.local")]), critical=False)
+            .sign(key, hashes.SHA256()))
+    return (key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()),
+            cert.public_bytes(serialization.Encoding.PEM))
+
+
+class _Probe(sl.RemoteSshController):
+    def __init__(self, port):
+        super().__init__([sl.RemoteWorker(name="w", ssh="box", launch="x", probe=("127.0.0.1", port), stop_match="x",
+                                          probe_grpc=True)], log=lambda *_: None)
+
+
+def _tls_worker(tmp_path, servicer):
+    pytest.importorskip("cryptography")
+    key, cert = _selfsigned(tmp_path)
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
+    pbg.add_NakshatraServicer_to_server(servicer, server)
+    port = server.add_secure_port("127.0.0.1:0", grpc.ssl_server_credentials([(key, cert)]))
+    server.start()
+    return server, port
+
+
+def test_a_tls_worker_that_is_still_starting_is_NOT_ready_and_becomes_ready_when_it_finishes(tmp_path):
+    s = _servicer(auth_required=True, starting=True)
+    server, port = _tls_worker(tmp_path, s)
+    try:
+        probe = _Probe(port)
+        assert probe.is_ready() is False  # handshake works, Info says "starting"
+        s.starting = False
+        assert probe.is_ready() is True
+    finally:
+        server.stop(0)

@@ -923,6 +923,14 @@ class DaemonClient:
 IDEM_BYTES_PER_ENTRY = 10 * 1024
 
 
+def _grpc_call_aborted(context) -> bool:
+    """True iff this call already ended via context.abort() (a status code is set). Older grpc lacks code()."""
+    try:
+        return context.code() is not None
+    except Exception:
+        return False
+
+
 class WorkerServicer(pb_grpc.NakshatraServicer):
     def __init__(self, daemon: DaemonClient, mode: str, layer_start: int, layer_end: int, model_id: str,
                  idem_max_entries: int = 6400, idem_ttl_seconds: float = 60.0,
@@ -940,6 +948,11 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
         # resolves through this resolver.
         self.peer_resolver = peer_resolver
         self.auth_required = auth_required
+        # worker/cold-start-readiness: the gRPC port is bound BEFORE registration installs the peer-key resolver
+        # (sha256 of a 10 GB slice + pillar registration take seconds). Until main() flips this, an authenticated
+        # worker is STARTING - not "unauthenticated". Default False so every direct construction (tests, solo,
+        # Mode A) behaves exactly as before; main() sets True only when a pillar registration is still pending.
+        self.starting = False
         self.refuse_unregistered_peers = refuse_unregistered_peers
         # 2026-05-21 SPKI Phase 3.3: refuse outbound channels to peers
         # for which the pillar has not (yet) distributed a SPKI hash.
@@ -1229,6 +1242,12 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
         """
         if not self.auth_required:
             return None
+        if self.starting:
+            context.abort(
+                grpc.StatusCode.UNAVAILABLE,
+                "worker starting: peer-key resolver not installed yet (retry)",
+            )
+            return None  # unreachable; abort raises
         if not _GRPC_AUTH_AVAILABLE:
             self._authz_rejections += 1
             context.abort(
@@ -1267,6 +1286,11 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
             return None  # unreachable
 
     def Info(self, request, context):
+        # Info is auth-exempt, so it is what a readiness probe can call. While the worker is still registering it must
+        # NOT report healthy - a bound port + a TLS handshake was all a probe could see, and the first authenticated
+        # request then hit "no peer resolver configured" (2026-09-21 cold start).
+        if self.starting:
+            context.abort(grpc.StatusCode.UNAVAILABLE, "worker starting: registration with the pillar not finished")
         return pb.InfoResponse(
             protocol_version="0.1.0",
             backend="llamacpp-cpu-patched",
@@ -1958,9 +1982,16 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
             context.set_details(str(e))
             return
         except Exception as e:
-            sys.stderr.write(f"[inference] stream aborted: {e}\n")
+            # context.abort() signals by raising a bare Exception AFTER it set the status. Rewriting that into INTERNAL
+            # threw away UNAUTHENTICATED/UNAVAILABLE and left the client an unactionable "Inference stream error: ".
+            if _grpc_call_aborted(context):
+                raise
+            # type + traceback: str(e) is empty for queue.Empty / bare EOFError, which made a cold-start abort
+            # undiagnosable ("stream aborted:" and nothing else).
+            import traceback
+            sys.stderr.write(f"[inference] stream aborted: {type(e).__name__}: {e}\n{traceback.format_exc()}")
             context.set_code(grpc.StatusCode.INTERNAL)
-            context.set_details(f"Inference stream error: {e}")
+            context.set_details(f"Inference stream error: {type(e).__name__}: {e}")
             return
         finally:
             # worker/kv-session-ownership-gate: release on EVERY exit path —
@@ -3365,6 +3396,8 @@ def main():
                               auth_required=auth_required,
                               refuse_unregistered_peers=refuse_unregistered_peers,
                               refuse_unpinned_peers=refuse_unpinned_peers)
+    # Registration (and with it the peer-key resolver) happens AFTER the port is bound; until then report STARTING.
+    servicer.starting = bool(auth_required and args.pillar_url)
     print(f"[worker] idempotency cache: {args.idempotency_cache_mb} MB "
           f"(~{idem_max_entries} entries @ {IDEM_BYTES_PER_ENTRY//1024} KB), "
           f"ttl={args.idempotency_cache_ttl}s", flush=True)
@@ -3707,6 +3740,7 @@ def main():
                 "since there's no resolver. Did you forget --pillar-url?",
                 flush=True,
             )
+        servicer.starting = False  # registered and the resolver (if any) is installed: now ready
 
         # Phase C (2026-05-20): populate the HTTP auth state read by
         # FileServerHandler. Same resolver as gRPC auth (shared cache).

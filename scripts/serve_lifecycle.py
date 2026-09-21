@@ -102,15 +102,19 @@ class RemoteWorker:
 
 
 def _grpc_info_ok(host: str, port: int, timeout: float = 3.0) -> bool:
-    """True iff a real gRPC server is SERVING at host:port - not merely something accepting TCP.
+    """True iff a real gRPC worker is SERVING and READY at host:port - not merely something accepting TCP.
 
     A bare TCP accept is not readiness: blackwell's Windows portproxy accepts connections on 10.42.0.7:5562 whether or not the
     WSL worker behind it exists, so a TCP probe declared the chain ready ~3 s after launch and the first request died on a worker
-    that was not up yet (2026-09-21). Two proofs, either is enough:
-      * a plaintext gRPC Info() answers (Mode A workers; Info is exempt from worker auth), or
-      * a TLS handshake completes AND negotiates `h2` (workers registered with a pillar serve gRPC over TLS by default and refuse
-        plaintext). Certificate trust is deliberately NOT checked - this is liveness, not identity; the client pins SPKI itself.
-    A forwarder with no backend cannot complete either."""
+    that was not up yet (2026-09-21). A TLS handshake is not readiness either: a worker binds its port BEFORE it registers with
+    the pillar and installs its peer-key resolver, so the first authenticated request hit "no peer resolver configured" while the
+    handshake had long since succeeded. What proves it is a real Info() answer, which the worker withholds (UNAVAILABLE, "worker
+    starting") until registration is done:
+      * plaintext Info() (Mode A workers; Info is exempt from worker auth), else
+      * Info() over TLS, pinning the cert the server just presented (workers registered with a pillar serve TLS by default).
+    Certificate identity is deliberately NOT checked - this is liveness; the client pins SPKI itself. If TLS Info fails for a reason
+    other than "starting" (e.g. an operator cert with another name), a completed TLS handshake negotiating h2 still counts, as before.
+    A forwarder with no backend cannot complete any of these."""
     try:
         import grpc
         import nakshatra_pb2 as pb
@@ -128,9 +132,27 @@ def _grpc_info_ok(host: str, port: int, timeout: float = 3.0) -> bool:
         ctx.set_alpn_protocols(["h2"])
         with socket.create_connection((host, port), timeout=timeout) as raw, \
                 ctx.wrap_socket(raw, server_hostname=host) as tls:
-            return tls.selected_alpn_protocol() == "h2"
+            if tls.selected_alpn_protocol() != "h2":
+                return False
+            der = tls.getpeercert(binary_form=True)
     except Exception:
         return False
+    try:
+        import grpc
+        import nakshatra_pb2 as pb
+        import nakshatra_pb2_grpc as pbg
+        pem = ssl.DER_cert_to_PEM_cert(der).encode()
+        creds = grpc.ssl_channel_credentials(root_certificates=pem)
+        with grpc.secure_channel(f"{host}:{port}", creds,
+                                 options=[("grpc.ssl_target_name_override", "nakshatra.local")]) as channel:
+            pbg.NakshatraStub(channel).Info(pb.InfoRequest(), timeout=timeout)
+        return True
+    except Exception as e:  # noqa: BLE001
+        code = getattr(e, "code", None)
+        details = str(getattr(e, "details", lambda: "")() or "")
+        if callable(code) and "starting" in details:
+            return False  # the worker itself says it is not ready
+        return True  # TLS+h2 was proven above; Info was merely unreachable for another reason (cert name etc.)
 
 
 class RemoteSshController(ChainController):
