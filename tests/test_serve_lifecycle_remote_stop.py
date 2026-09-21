@@ -127,3 +127,53 @@ def test_the_json_loader_reads_probe_grpc(tmp_path):
         {"name": "b", "ssh": "h", "launch": "l", "probe": "h:2", "stop": "s"}]}))
     a, b = sl._remote_workers_from_json(str(cfg))
     assert (a.probe_grpc, b.probe_grpc) == (True, False)
+
+
+def _tls_h2_server(tmp_path):
+    """A self-signed TLS listener that negotiates h2 and then hangs up - a worker serving gRPC over TLS, as registered workers do."""
+    import datetime
+    import ssl
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "worker")])
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name).public_key(key.public_key())
+            .serial_number(1).not_valid_before(now - datetime.timedelta(days=1))
+            .not_valid_after(now + datetime.timedelta(days=1)).sign(key, hashes.SHA256()))
+    (tmp_path / "c.pem").write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    (tmp_path / "k.pem").write_bytes(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                                       serialization.NoEncryption()))
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(tmp_path / "c.pem", tmp_path / "k.pem")
+    ctx.set_alpn_protocols(["h2"])
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(8)
+
+    def _loop():
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            try:
+                ctx.wrap_socket(conn, server_side=True).close()
+            except Exception:
+                conn.close()
+
+    threading.Thread(target=_loop, daemon=True).start()
+    return srv, srv.getsockname()[1]
+
+
+def test_a_worker_serving_grpc_over_tls_is_ready(tmp_path):
+    """The shipped probe was plaintext-only, so it could NEVER succeed against a pillar-registered worker (TLS by default)."""
+    srv, port = _tls_h2_server(tmp_path)
+    try:
+        assert _Recorder([_w(probe=("127.0.0.1", port), probe_grpc=True)]).is_ready() is True
+    finally:
+        srv.close()

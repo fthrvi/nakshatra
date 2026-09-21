@@ -102,10 +102,15 @@ class RemoteWorker:
 
 
 def _grpc_info_ok(host: str, port: int, timeout: float = 3.0) -> bool:
-    """True iff a worker actually ANSWERS gRPC Info at host:port (Info is exempt from worker auth). A bare TCP accept is not
-    readiness: blackwell's Windows portproxy accepts connections on 10.42.0.7:5562 whether or not the WSL worker behind it
-    exists, so a TCP probe declared the chain ready ~3 s after launch and the first request died on a worker that was not
-    up yet (2026-09-21)."""
+    """True iff a real gRPC server is SERVING at host:port - not merely something accepting TCP.
+
+    A bare TCP accept is not readiness: blackwell's Windows portproxy accepts connections on 10.42.0.7:5562 whether or not the
+    WSL worker behind it exists, so a TCP probe declared the chain ready ~3 s after launch and the first request died on a worker
+    that was not up yet (2026-09-21). Two proofs, either is enough:
+      * a plaintext gRPC Info() answers (Mode A workers; Info is exempt from worker auth), or
+      * a TLS handshake completes AND negotiates `h2` (workers registered with a pillar serve gRPC over TLS by default and refuse
+        plaintext). Certificate trust is deliberately NOT checked - this is liveness, not identity; the client pins SPKI itself.
+    A forwarder with no backend cannot complete either."""
     try:
         import grpc
         import nakshatra_pb2 as pb
@@ -113,6 +118,17 @@ def _grpc_info_ok(host: str, port: int, timeout: float = 3.0) -> bool:
         with grpc.insecure_channel(f"{host}:{port}") as channel:
             pbg.NakshatraStub(channel).Info(pb.InfoRequest(), timeout=timeout)
         return True
+    except Exception:
+        pass
+    try:
+        import ssl
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        ctx.set_alpn_protocols(["h2"])
+        with socket.create_connection((host, port), timeout=timeout) as raw, \
+                ctx.wrap_socket(raw, server_hostname=host) as tls:
+            return tls.selected_alpn_protocol() == "h2"
     except Exception:
         return False
 
