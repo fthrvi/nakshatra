@@ -97,6 +97,7 @@ class RemoteWorker:
     launch: str                   # remote shell command (must self-detach)
     probe: tuple                  # (host, port) reachable from the orchestrator
     stop_match: str               # pkill -f pattern
+    stop: str = ""                # optional explicit remote stop command; empty = the `pkill -f stop_match` default
 
 
 class RemoteSshController(ChainController):
@@ -132,8 +133,8 @@ class RemoteSshController(ChainController):
             self._log(f"[lifecycle] reap remote {w.name} on {w.ssh} "
                       f"(returning the borrowed machine)")
             try:
-                self._ssh(w.ssh, f"pkill -f '{w.stop_match}' 2>/dev/null; "
-                                 f"pkill -f llama-nakshatra-worker 2>/dev/null; true")
+                self._ssh(w.ssh, w.stop or (f"pkill -f '{w.stop_match}' 2>/dev/null; "
+                                            f"pkill -f llama-nakshatra-worker 2>/dev/null; true"))
             except Exception as e:        # pragma: no cover - network
                 self._log(f"[lifecycle] reap {w.name} failed: {e}")
 
@@ -665,15 +666,21 @@ class ChainLifecycle:
 def _remote_workers_from_json(path: str) -> "list[RemoteWorker]":
     """Load remote worker specs from a JSON file:
       {"remote_workers": [
-        {"name","ssh","launch","probe":"host:port","stop_match"}, ...]}"""
+        {"name","ssh","launch","probe":"host:port","stop_match" and/or "stop"}, ...]}
+    `stop` is an explicit remote command (needed where the ssh login shell is not bash - a Windows/WSL node lands in
+    PowerShell, where `pkill -f '...' 2>/dev/null` does not exist); without it the pkill default applies, so `stop_match`
+    is then required."""
     import json
     data = json.loads(open(path).read())
     out = []
     for w in data.get("remote_workers", []):
+        if not w.get("stop") and not w.get("stop_match"):
+            raise ValueError(f"remote worker {w.get('name')!r} needs 'stop' or 'stop_match'")
         host, _, port = str(w["probe"]).rpartition(":")
         out.append(RemoteWorker(
             name=w["name"], ssh=w["ssh"], launch=w["launch"],
-            probe=(host or "127.0.0.1", int(port)), stop_match=w["stop_match"]))
+            probe=(host or "127.0.0.1", int(port)), stop_match=w.get("stop_match", ""),
+            stop=w.get("stop", "")))
     return out
 
 
