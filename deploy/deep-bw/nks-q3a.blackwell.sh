@@ -5,6 +5,15 @@ W=$HOME/.nakshatra-worker
 case "${1:-}" in
   start)
     systemctl --user is-active --quiet nks-q3-blackwell && exit 0
+    # The chain YIELDS to whatever already holds the 12 GB card (Biswa's Ollama coder takes ~10 GB; this stage needs ~6.5 GB plus
+    # KV/CUDA overhead). Starting anyway would OOM the worker after minutes, or evict the coder. Refuse at once: exit 75 -> the
+    # lifecycle (launch_must_succeed) fails the request immediately and stops the other stage. No nvidia-smi = no opinion = start.
+    MIN=${NKS_MIN_FREE_VRAM_MB:-7000}
+    FREE=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' \r')
+    if [ -n "$FREE" ] && [ "$FREE" -lt "$MIN" ] 2>/dev/null; then
+      echo "nks-q3a: refusing to start - only ${FREE} MiB of VRAM free (< ${MIN}); another model holds the GPU" >&2
+      exit 75
+    fi
     systemctl --user reset-failed nks-q3-blackwell 2>/dev/null
     systemd-run --user --unit=nks-q3-blackwell --collect \
       --setenv=PYTHONPATH=$W/nakshatra-scripts \

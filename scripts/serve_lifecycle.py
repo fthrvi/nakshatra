@@ -85,6 +85,11 @@ class SystemdLocalController(ChainController):
 from dataclasses import dataclass, field  # noqa: E402
 
 
+class ChainRefused(RuntimeError):
+    """A node declined to start its worker (its launch command exited non-zero and the worker is `launch_must_succeed`).
+    The lifecycle fails the request at once and returns anything already started, instead of waiting out the start timeout."""
+
+
 @dataclass
 class RemoteWorker:
     """One worker on a REMOTE node, summoned/reaped over SSH. `launch` is the full
@@ -99,6 +104,7 @@ class RemoteWorker:
     stop_match: str               # pkill -f pattern
     stop: str = ""                # optional explicit remote stop command; empty = the `pkill -f stop_match` default
     probe_grpc: bool = False      # readiness = a gRPC Info() answers, not just a TCP accept (see _grpc_info_ok)
+    launch_must_succeed: bool = False  # a NON-ZERO exit from `launch` means "refused" (e.g. the node's VRAM guard): fail the summon fast
 
 
 def _grpc_info_ok(host: str, port: int, timeout: float = 3.0) -> bool:
@@ -171,9 +177,15 @@ class RemoteSshController(ChainController):
         for w in self.workers:
             self._log(f"[lifecycle] summon remote {w.name} on {w.ssh}")
             try:
-                self._ssh(w.ssh, w.launch)
+                rc = self._ssh(w.ssh, w.launch)
             except Exception as e:        # pragma: no cover - network
                 self._log(f"[lifecycle] summon {w.name} failed: {e}")
+                continue
+            if rc != 0 and w.launch_must_succeed:
+                # Do not go on to launch the REST of the chain around a stage that will never come up.
+                self._log(f"[lifecycle] {w.name} on {w.ssh} refused to start (launch exit {rc})")
+                raise ChainRefused(f"{w.name} on {w.ssh} refused to start (launch exit {rc}) - "
+                                   f"e.g. another model holds its GPU; not summoning the rest of the chain")
 
     def stop(self) -> None:
         for w in self.workers:
@@ -599,9 +611,14 @@ class ChainLifecycle:
                     self._warm_slices()   # …then page-cache slices before the worker loads them
                     self._log("[lifecycle] chain idle/down — summoning workers…")
                     self.controller.start()
-                except BaseException:
+                except BaseException as e:
                     self._summoning = False
                     self._active = max(0, self._active - 1)
+                    if isinstance(e, ChainRefused):
+                        try:
+                            self.controller.stop()  # give back whatever DID start before the refusal
+                        except Exception as stop_err:  # noqa: BLE001
+                            self._log(f"[lifecycle] stop after refused summon failed: {stop_err}")
                     raise
         # wait for readiness OUTSIDE the lock (cold-start can take ~10-20s)
         deadline = time.monotonic() + self.start_timeout_s
@@ -791,7 +808,8 @@ def _remote_workers_from_json(path: str) -> "list[RemoteWorker]":
         out.append(RemoteWorker(
             name=w["name"], ssh=w["ssh"], launch=w["launch"],
             probe=(host or "127.0.0.1", int(port)), stop_match=w.get("stop_match", ""),
-            stop=w.get("stop", ""), probe_grpc=bool(w.get("probe_grpc", False))))
+            stop=w.get("stop", ""), probe_grpc=bool(w.get("probe_grpc", False)),
+            launch_must_succeed=bool(w.get("launch_must_succeed", False))))
     return out
 
 

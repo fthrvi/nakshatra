@@ -233,3 +233,62 @@ def test_the_lease_is_renewed_while_a_request_is_in_flight():
     assert _wait(lambda: lease.renews > before + 1)
     lc.stop_reaper()
     lc.end()
+
+
+# -- a node that refuses to start fails the request AT ONCE ------------------------------------------------------------------
+
+class _Ssh(sl.RemoteSshController):
+    def __init__(self, workers, rcs):
+        super().__init__(workers, log=lambda *_: None)
+        self.rcs = dict(rcs)
+        self.calls = []
+
+    def _ssh(self, uh, remote_cmd, timeout=30.0):
+        self.calls.append((uh, remote_cmd))
+        return self.rcs.get(remote_cmd, 0)
+
+
+def _rw(name, launch, **kw):
+    return sl.RemoteWorker(name=name, ssh=name, launch=launch, probe=("127.0.0.1", 1), stop_match="x", stop=f"stop-{name}", **kw)
+
+
+def test_a_refused_launch_raises_and_the_rest_of_the_chain_is_not_launched():
+    c = _Ssh([_rw("a", "start-a", launch_must_succeed=True), _rw("b", "start-b", launch_must_succeed=True)], {"start-a": 1})
+    try:
+        c.start()
+        raise AssertionError("expected ChainRefused")
+    except sl.ChainRefused as e:
+        assert "a on a refused" in str(e)
+    assert [cmd for _, cmd in c.calls] == ["start-a"], c.calls
+
+
+def test_a_nonzero_launch_is_still_ignored_for_workers_that_did_not_opt_in():
+    """Other configs (roster/unconscious) may return spurious non-zero from a nohup launch: behaviour unchanged for them."""
+    c = _Ssh([_rw("a", "start-a"), _rw("b", "start-b")], {"start-a": 1})
+    c.start()
+    assert [cmd for _, cmd in c.calls] == ["start-a", "start-b"]
+
+
+def test_begin_fails_at_once_on_a_refusal_and_returns_what_started():
+    c = _Ssh([_rw("a", "start-a", launch_must_succeed=True)], {"start-a": 75})
+    c.is_ready = lambda: False
+    lc = _lc(c, start_timeout_s=60)   # would wait a minute if the refusal were treated as "still coming up"
+    t0 = time.monotonic()
+    try:
+        lc.begin()
+        raise AssertionError("expected ChainRefused")
+    except sl.ChainRefused:
+        pass
+    assert time.monotonic() - t0 < 5
+    assert ("a", "stop-a") in c.calls, "the refused summon must stop whatever had started"
+    assert lc._summoning is False and lc._active == 0
+
+
+def test_the_json_loader_reads_launch_must_succeed(tmp_path):
+    import json
+    p = tmp_path / "l.json"
+    p.write_text(json.dumps({"remote_workers": [
+        {"name": "a", "ssh": "h", "launch": "x", "probe": "1.2.3.4:5", "stop": "y", "launch_must_succeed": True},
+        {"name": "b", "ssh": "h", "launch": "x", "probe": "1.2.3.4:6", "stop": "y"}]}))
+    a, b = sl._remote_workers_from_json(str(p))
+    assert a.launch_must_succeed is True and b.launch_must_succeed is False

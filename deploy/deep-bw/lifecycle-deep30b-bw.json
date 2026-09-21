@@ -12,7 +12,8 @@
       "launch": "powershell -NoProfile -ExecutionPolicy Bypass -File C:\\ProgramData\\nakshatra\\nks-wsl-portproxy.ps1; wsl -e bash /home/prithvi/nks-q3a.sh start",
       "probe": "10.42.0.7:5562",
       "stop": "wsl -e bash /home/prithvi/nks-q3a.sh stop",
-      "probe_grpc": true
+      "probe_grpc": true,
+      "launch_must_succeed": true
     },
     {
       "name": "ijru-q3b",
@@ -20,7 +21,8 @@
       "launch": "bash /home/prithviraj/nks-q3b.sh start",
       "probe": "10.51.0.14:5572",
       "stop": "bash /home/prithviraj/nks-q3b.sh stop",
-      "probe_grpc": true
+      "probe_grpc": true,
+      "launch_must_succeed": true
     }
   ]
 }
