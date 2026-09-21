@@ -1,0 +1,29 @@
+[Unit]
+Description=Nakshatra deep rung on blackwell+ijru - qwen3-30b-q3 chain planned + leased by Sthambha (:11601), scale-to-zero
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/prithvi/nakshatra
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# Both stages are REMOTE (blackwell + ijru): summoned over ssh on the first request, reaped when the pillar's lease expires.
+Environment=NAKSHATRA_LIFECYCLE_UNITS=
+Environment=NAKSHATRA_LIFECYCLE_PROBES=
+Environment=NAKSHATRA_LIFECYCLE_REMOTE_CONFIG=/home/prithvi/.nakshatra/lifecycle-deep30b-bw.json
+Environment=NAKSHATRA_LIFECYCLE_IDLE_GRACE_S=600
+Environment=NAKSHATRA_LIFECYCLE_START_TIMEOUT_S=360
+# Sthambha is the lease authority: the pillar owns the grace + the expiry clock, so this serve never reaps a chain another
+# consumer is using. Signs as `hub` (the hub's registered identity; this box's worker key IS that key).
+Environment=NAKSHATRA_LIFECYCLE_PILLAR_URL=http://10.42.0.3:7777
+Environment=NAKSHATRA_LIFECYCLE_LEASE_MODEL=qwen3-30b-q3
+Environment=NAKSHATRA_LIFECYCLE_LEASE_KEYID=hub
+# client.py: sign the registry GETs and the gRPC calls to the (authenticated) workers as `hub`.
+Environment=NKS_REGISTRY_KEYID=hub
+ExecStart=/home/prithvi/nakshatra/.venv/bin/python /home/prithvi/nakshatra/scripts/nakshatra_serve.py \
+  --port 11601 --bind 127.0.0.1 \
+  --models /home/prithvi/.nakshatra/serve_models.deepbw.yaml
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

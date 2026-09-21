@@ -170,10 +170,12 @@ def _tls_h2_server(tmp_path):
     return srv, srv.getsockname()[1]
 
 
-def test_a_worker_serving_grpc_over_tls_is_ready(tmp_path):
-    """The shipped probe was plaintext-only, so it could NEVER succeed against a pillar-registered worker (TLS by default)."""
+def test_a_tls_listener_that_only_completes_a_handshake_is_NOT_ready(tmp_path):
+    """A handshake is not readiness: a worker binds its port before it can authenticate anyone (2026-09-21 cold start), and the
+    old "TLS+h2 handshake still counts" fallback re-created that bug for ANY Info failure. A real TLS worker answering Info is
+    covered in test_worker_cold_start_readiness.py."""
     srv, port = _tls_h2_server(tmp_path)
     try:
-        assert _Recorder([_w(probe=("127.0.0.1", port), probe_grpc=True)]).is_ready() is True
+        assert _Recorder([_w(probe=("127.0.0.1", port), probe_grpc=True)]).is_ready() is False
     finally:
         srv.close()

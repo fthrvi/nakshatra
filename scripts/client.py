@@ -529,6 +529,33 @@ def _fetch_spki_index(registry_url: str) -> dict[str, str]:
     return index
 
 
+def info_with_startup_wait(stub, request, timeout: float = 10.0, *, wait_s: "float | None" = None,
+                           sleep=None, now=None):
+    """stub.Info(), retrying while the worker says it is still STARTING.
+
+    A worker binds its gRPC port before it has registered with the pillar and filled its key cache, and answers Info
+    UNAVAILABLE "worker starting: <why>" until it can authenticate callers. That is a transient of a cold start (the chain
+    lifecycle normally waits for it, but a driver can race a worker that was summoned a moment ago), so retry for up to
+    NKS_INFO_STARTUP_WAIT_S (default 30 s). Anything else - refused connection, auth failure, version mismatch - raises at once."""
+    import time as _time
+    import grpc
+    sleep = sleep or _time.sleep
+    now = now or _time.monotonic
+    if wait_s is None:
+        wait_s = float(os.environ.get("NKS_INFO_STARTUP_WAIT_S", "30"))
+    deadline = now() + wait_s
+    while True:
+        try:
+            return stub.Info(request, timeout=timeout)
+        except grpc.RpcError as e:
+            code = e.code() if callable(getattr(e, "code", None)) else None
+            details = str(e.details() if callable(getattr(e, "details", None)) else "")
+            if code != grpc.StatusCode.UNAVAILABLE or "starting" not in details or now() >= deadline:
+                raise
+            print(f"[chain] worker still starting ({details}); retrying Info", flush=True)
+            sleep(1.0)
+
+
 def _registry_urlopen(url: str, timeout: float = 10):
     """urlopen for a Sthambha registry GET. Since the pillar's auth hardening /chain and /peers need a signed
     `Authorization: Sthambha-Ed25519` header (an unsigned GET is a 401), so registry mode was silently broken.
@@ -887,7 +914,7 @@ def main():
                 addr, spec.get("peer_spki_hash") or None, args.tls_mode,
             )
             stub = pb_grpc.NakshatraStub(ch)
-            info = stub.Info(pb.InfoRequest(), timeout=10.0)
+            info = info_with_startup_wait(stub, pb.InfoRequest(), timeout=10.0)
             caps = list(info.protocol_capabilities)
             # v1.0 §7 — negotiate the control-protocol version on the same
             # handshake. Refuse to build a chain with a worker we can't speak

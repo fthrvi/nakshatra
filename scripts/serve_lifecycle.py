@@ -102,19 +102,18 @@ class RemoteWorker:
 
 
 def _grpc_info_ok(host: str, port: int, timeout: float = 3.0) -> bool:
-    """True iff a real gRPC worker is SERVING and READY at host:port - not merely something accepting TCP.
+    """True iff a real gRPC worker is SERVING and READY at host:port: its Info() answers. Nothing weaker counts.
 
-    A bare TCP accept is not readiness: blackwell's Windows portproxy accepts connections on 10.42.0.7:5562 whether or not the
-    WSL worker behind it exists, so a TCP probe declared the chain ready ~3 s after launch and the first request died on a worker
-    that was not up yet (2026-09-21). A TLS handshake is not readiness either: a worker binds its port BEFORE it registers with
-    the pillar and installs its peer-key resolver, so the first authenticated request hit "no peer resolver configured" while the
-    handshake had long since succeeded. What proves it is a real Info() answer, which the worker withholds (UNAVAILABLE, "worker
-    starting") until registration is done:
+    A TCP accept is not readiness (blackwell's Windows portproxy accepts on 10.42.0.7:5562 whether or not the WSL worker behind it
+    exists). A completed TLS handshake is not readiness either: a worker binds its port BEFORE it registers with the pillar and
+    fills its peer-key cache, so the first authenticated request died while the handshake had long succeeded. The worker withholds
+    Info (UNAVAILABLE, "worker starting: <why>") until it can actually authenticate callers, so only a real answer proves it:
       * plaintext Info() (Mode A workers; Info is exempt from worker auth), else
       * Info() over TLS, pinning the cert the server just presented (workers registered with a pillar serve TLS by default).
-    Certificate identity is deliberately NOT checked - this is liveness; the client pins SPKI itself. If TLS Info fails for a reason
-    other than "starting" (e.g. an operator cert with another name), a completed TLS handshake negotiating h2 still counts, as before.
-    A forwarder with no backend cannot complete any of these."""
+    Certificate identity is deliberately NOT checked - this is liveness; the client pins SPKI itself. There is NO "TLS handshake
+    is good enough" fallback: it silently reverted to the bug this probe exists to prevent for any Info failure (timeout, missing
+    stubs, a busy executor). The client dials with target name `nakshatra.local`, so a cert the probe cannot Info() against
+    is one the client could not use either."""
     try:
         import grpc
         import nakshatra_pb2 as pb
@@ -126,6 +125,9 @@ def _grpc_info_ok(host: str, port: int, timeout: float = 3.0) -> bool:
         pass
     try:
         import ssl
+        import grpc
+        import nakshatra_pb2 as pb
+        import nakshatra_pb2_grpc as pbg
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
@@ -135,24 +137,14 @@ def _grpc_info_ok(host: str, port: int, timeout: float = 3.0) -> bool:
             if tls.selected_alpn_protocol() != "h2":
                 return False
             der = tls.getpeercert(binary_form=True)
-    except Exception:
-        return False
-    try:
-        import grpc
-        import nakshatra_pb2 as pb
-        import nakshatra_pb2_grpc as pbg
         pem = ssl.DER_cert_to_PEM_cert(der).encode()
         creds = grpc.ssl_channel_credentials(root_certificates=pem)
         with grpc.secure_channel(f"{host}:{port}", creds,
                                  options=[("grpc.ssl_target_name_override", "nakshatra.local")]) as channel:
             pbg.NakshatraStub(channel).Info(pb.InfoRequest(), timeout=timeout)
         return True
-    except Exception as e:  # noqa: BLE001
-        code = getattr(e, "code", None)
-        details = str(getattr(e, "details", lambda: "")() or "")
-        if callable(code) and "starting" in details:
-            return False  # the worker itself says it is not ready
-        return True  # TLS+h2 was proven above; Info was merely unreachable for another reason (cert name etc.)
+    except Exception:
+        return False
 
 
 class RemoteSshController(ChainController):
@@ -548,6 +540,7 @@ class ChainLifecycle:
                  lease_client: "Optional[PillarLeaseClient]" = None,
                  warm_paths: "Optional[list[str]]" = None,
                  ensure_fn: "Optional[Callable[[], list[str]]]" = None,
+                 ready_cache_s: float = 30.0,
                  log: Callable[[str], None] = print):
         self.controller = controller
         # Node-local GGUF slice files to pre-read into the page cache on summon,
@@ -570,6 +563,11 @@ class ChainLifecycle:
         self._active = 0                 # in-flight requests
         self._last_active = 0.0          # last begin/end (monotonic)
         self._up = False                 # our belief about chain state
+        # A remote readiness probe is ~5 RTTs (about 1 s to a far node). Once the chain has answered, trust it for
+        # `ready_cache_s` instead of re-probing on EVERY request; 0 disables. Cleared on reap.
+        self.ready_cache_s = max(0.0, float(ready_cache_s))
+        self._ready_until = 0.0
+        self._summoning = False          # a cold start is in flight: concurrent requests wait for it, never launch again
         self._stop_evt = threading.Event()
         self._reaper: Optional[threading.Thread] = None
 
@@ -589,26 +587,63 @@ class ChainLifecycle:
         with self._lock:
             self._active += 1
             self._last_active = time.monotonic()
-            if self._up and self.controller.is_ready():
+            if self._up and self._chain_ready_cached():
                 return
-            # cold start
-            self._ensure_slices() # fetch-if-absent (cache→peer→origin) …
-            self._warm_slices()   # …then page-cache slices before the worker loads them
-            self._log("[lifecycle] chain idle/down — summoning workers…")
-            self.controller.start()
+            if self._summoning:
+                pass  # another request is already summoning: just wait for readiness below
+            else:
+                # cold start
+                self._summoning = True
+                try:
+                    self._ensure_slices() # fetch-if-absent (cache→peer→origin) …
+                    self._warm_slices()   # …then page-cache slices before the worker loads them
+                    self._log("[lifecycle] chain idle/down — summoning workers…")
+                    self.controller.start()
+                except BaseException:
+                    self._summoning = False
+                    self._active = max(0, self._active - 1)
+                    raise
         # wait for readiness OUTSIDE the lock (cold-start can take ~10-20s)
         deadline = time.monotonic() + self.start_timeout_s
         while time.monotonic() < deadline:
             if self.controller.is_ready():
                 with self._lock:
                     self._up = True
+                    self._summoning = False
+                    self._ready_until = time.monotonic() + self.ready_cache_s
                 self._log("[lifecycle] chain ready (summoned)")
+                self._lease_if_missing()
                 return
             self._stop_evt.wait(self.poll_s)
         with self._lock:
             self._active = max(0, self._active - 1)
+            self._summoning = False
         raise TimeoutError(
             f"chain not ready within {self.start_timeout_s}s of summon")
+
+    def _chain_ready_cached(self) -> bool:
+        """controller.is_ready(), but a positive answer is trusted for ready_cache_s (caller holds the lock)."""
+        if self.ready_cache_s and time.monotonic() < self._ready_until:
+            return True
+        if self.controller.is_ready():
+            self._ready_until = time.monotonic() + self.ready_cache_s
+            return True
+        self._ready_until = 0.0
+        return False
+
+    def _lease_if_missing(self) -> None:
+        """begin() leases BEFORE it summons, and a cold chain answers 409 (nothing online to plan from), so the first request of a
+        cold start ran with no lease and - with is_expired() False for "no lease" - could never be reaped. Now that the chain is
+        up, take the lease so the pillar knows it is being consumed. Best-effort."""
+        lc = self.lease_client
+        if lc is None or getattr(lc, "lease_id", None):
+            return
+        try:
+            info = lc.lease()
+            if info and info.get("idle_grace_s"):
+                self.idle_grace_s = float(info["idle_grace_s"])
+        except Exception as e:  # noqa: BLE001
+            self._log(f"[lease] post-summon lease failed (reaping falls back to the local idle clock): {e}")
 
     def end(self) -> None:
         with self._lock:
@@ -633,7 +668,7 @@ class ChainLifecycle:
                 self._log(f"[lease] warm renew failed (continuing): {e}")
         with self._lock:
             self._last_active = time.monotonic()
-            if self._up and self.controller.is_ready():
+            if self._up and self._chain_ready_cached():
                 return True
             self._ensure_slices() # fetch-if-absent (cache→peer→origin) …
             self._warm_slices()   # …then page-cache the slices before the worker loads them
@@ -696,27 +731,43 @@ class ChainLifecycle:
         while not self._stop_evt.is_set():
             self._stop_evt.wait(min(30.0, self.idle_grace_s / 2 or 30.0))
             with self._lock:
+                busy = self._active > 0
                 idle = time.monotonic() - self._last_active
-                local_due = (self._up and self._active == 0
-                             and idle >= self.idle_grace_s)
+                local_due = (self._up and not busy and idle >= self.idle_grace_s)
+            if busy and self.lease_client is not None:
+                # A request longer than the pillar's lease grace would otherwise let the lease lapse under it.
+                try:
+                    self.lease_client.renew()
+                except Exception:  # noqa: BLE001
+                    pass
             if not local_due:
                 continue
             # L3: when leased, the PILLAR decides (it sees all consumers). Only
             # reap if the pillar's lease has expired — never while another
             # consumer holds it. Fail-safe: a network blip keeps the chain up.
-            if self.lease_client is not None:
+            # No lease id (the pillar never granted one) means nobody else can be holding it through us: fall back to the local
+            # idle clock, or a chain that was up with no lease would hold its GPUs forever.
+            if self.lease_client is not None and getattr(self.lease_client, "lease_id", None):
                 try:
                     if not self.lease_client.is_expired():
                         continue
                 except Exception:
                     continue
-            self._log(f"[lifecycle] idle {idle:.0f}s ≥ grace — reaping chain "
-                      f"(freeing GPU; re-summoned on next request)")
-            try:
-                self.controller.stop()
-            finally:
-                with self._lock:
+            elif self.lease_client is not None:
+                self._log("[lifecycle] no pillar lease held - reaping on the local idle clock")
+            with self._lock:
+                # Re-check under the lock: a request may have arrived while we asked the pillar, and stopping OUTSIDE the lock
+                # let a begin() launch workers while this reap was still killing them.
+                if (not self._up or self._active > 0
+                        or time.monotonic() - self._last_active < self.idle_grace_s):
+                    continue
+                self._log(f"[lifecycle] idle {idle:.0f}s ≥ grace — reaping chain "
+                          f"(freeing GPU; re-summoned on next request)")
+                try:
+                    self.controller.stop()
+                finally:
                     self._up = False
+                    self._ready_until = 0.0
 
     def stop_reaper(self) -> None:
         self._stop_evt.set()

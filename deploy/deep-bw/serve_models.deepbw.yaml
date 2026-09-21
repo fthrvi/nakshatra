@@ -1,0 +1,9 @@
+# The deep rung on blackwell + ijru (2026-09-21). NO static chain: `registry_url` makes client.py ask the Sthambha pillar to plan
+# the chain from the workers' registered layer offerings (needs NKS_REGISTRY_KEYID so the request and the gRPC calls are signed).
+# Tokenizer: the Qwen3-30B-A3B vocab is quant-independent, so the existing ollama blob serves the Q3 chain (loaded vocab_only).
+models:
+  - name: qwen3-30b-q3
+    tokenizer_gguf: /usr/share/ollama/.ollama/models/blobs/sha256-58574f2e94b99fb9e4391408b57e5aeaaaec10f6384e9a699fc2cb43a5c8eabf
+    registry_url: http://10.42.0.3:7777
+    model_size_gb: 14
+    details: {family: qwen3moe, parameter_size: "30B-A3B-Instruct-2507", quantization_level: Q3_K_M}

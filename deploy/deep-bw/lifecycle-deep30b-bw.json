@@ -1,0 +1,26 @@
+{
+  "_comment": [
+    "Scale-to-zero remote arms for the blackwell+ijru qwen3-30b-q3 chain (2026-09-21).",
+    "Both stages are summoned over ssh and REGISTER THEMSELVES with Sthambha (blackwell-q3a / ijru-q3b); the pillar plans + leases the chain.",
+    "blackwell's ssh login shell is PowerShell, so it uses explicit launch/stop commands (no pkill). The launch first re-points the",
+    "Windows portproxy (10.42.0.7:5562 -> the WSL VM, whose address changes when WSL restarts), then starts the WSL worker."
+  ],
+  "remote_workers": [
+    {
+      "name": "blackwell-q3a",
+      "ssh": "blackwell",
+      "launch": "powershell -NoProfile -ExecutionPolicy Bypass -File C:\\ProgramData\\nakshatra\\nks-wsl-portproxy.ps1; wsl -e bash /home/prithvi/nks-q3a.sh start",
+      "probe": "10.42.0.7:5562",
+      "stop": "wsl -e bash /home/prithvi/nks-q3a.sh stop",
+      "probe_grpc": true
+    },
+    {
+      "name": "ijru-q3b",
+      "ssh": "ijru-nks",
+      "launch": "bash /home/prithviraj/nks-q3b.sh start",
+      "probe": "10.51.0.14:5572",
+      "stop": "bash /home/prithviraj/nks-q3b.sh stop",
+      "probe_grpc": true
+    }
+  ]
+}

@@ -186,3 +186,101 @@ def test_a_tls_worker_that_is_still_starting_is_NOT_ready_and_becomes_ready_when
         assert probe.is_ready() is True
     finally:
         server.stop(0)
+
+
+# -- 4. "ready" means registered AND able to read the key table, not "registration attempted" ---------------------------
+
+class _Resolver:
+    """PillarPeerKeyResolver stand-in: refresh_once() fills the cache from `feed` (a list of dicts, one consumed per call)."""
+
+    def __init__(self, feed=(), cache=None):
+        self.cache = dict(cache or {})
+        self.feed = list(feed)
+        self.refreshes = 0
+
+    def resolve(self, keyid):
+        return self.cache.get(keyid)
+
+    def refresh_once(self):
+        self.refreshes += 1
+        step = self.feed.pop(0) if self.feed else None
+        if isinstance(step, Exception):
+            raise step
+        if step:
+            self.cache.update(step)
+
+
+def test_blocker_is_empty_only_when_registered_and_our_own_key_is_readable():
+    b = worker._startup_blocker
+    assert "registration" in b(False, _Resolver(cache={"me": "k"}), "me")
+    assert "peer-key cache" in b(True, _Resolver(), "me")
+    assert b(True, _Resolver(cache={"me": "k"}), "me") == ""
+    assert b(True, None, "me") == ""  # no resolver: nothing more to prove
+
+
+def test_blocker_can_demand_a_consumer_key_too():
+    r = _Resolver(cache={"me": "k"})
+    assert "'hub'" in worker._startup_blocker(True, r, "me", ("hub",))
+    r.cache["hub"] = "k2"
+    assert worker._startup_blocker(True, r, "me", ("hub",)) == ""
+
+
+def _watch(servicer, register, resolver, *, registered=False, max_sleeps=50, required=()):
+    sleeps = []
+
+    def _sleep(_s):
+        sleeps.append(_s)
+        if len(sleeps) >= max_sleeps:
+            servicer.starting = False  # test escape hatch: a permanently blocked worker would loop forever by design
+    ready = worker._await_startup_ready(servicer, register, resolver, "me", required, registered=registered,
+                                        poll_s=0.0, sleep=_sleep)
+    return ready, len(sleeps)
+
+
+def test_a_failed_registration_keeps_the_worker_starting_and_is_retried_until_it_succeeds():
+    s = _servicer(starting=True)
+    calls = []
+
+    def register():
+        calls.append(1)
+        return len(calls) >= 3  # 401, 401, then accepted
+
+    resolver = _Resolver(feed=[{"me": "k"}], cache={})
+    ready, sleeps = _watch(s, register, resolver)
+    assert ready is True and s.starting is False and len(calls) == 3
+    assert s.starting_reason == ""
+
+
+def test_a_worker_whose_first_key_refresh_failed_stays_starting_until_a_refresh_works():
+    s = _servicer(starting=True)
+    resolver = _Resolver(feed=[OSError("pillar down"), None, {"me": "k"}])
+    ready, sleeps = _watch(s, lambda: True, resolver, registered=True)
+    assert ready is True and resolver.refreshes == 3 and sleeps == 2
+
+
+def test_a_worker_that_can_never_register_never_reports_ready():
+    s = _servicer(starting=True)
+    ready, sleeps = _watch(s, lambda: False, _Resolver(), max_sleeps=5)
+    assert ready is False and sleeps == 5
+    assert "registration" in s.starting_reason  # ...and says why
+
+
+def test_info_and_auth_abort_details_carry_the_reason():
+    s = _servicer(starting=True)
+    s.starting_reason = "registration with the pillar has not succeeded"
+    ctx = _Ctx()
+    with pytest.raises(_Aborted):
+        s.Info(pb.InfoRequest(), ctx)
+    assert "registration with the pillar has not succeeded" in ctx._details
+    ctx = _Ctx()
+    with pytest.raises(_Aborted):
+        s._check_grpc_auth(ctx, b"", method_path="/nakshatra.Nakshatra/Forward", is_streaming=False)
+    assert "registration with the pillar has not succeeded" in ctx._details
+
+
+def test_healthz_reports_starting_and_why():
+    s = _servicer(starting=True)
+    s.starting_reason = "peer-key cache does not hold 'me' yet"
+    st = s.auth_stats()
+    assert st["starting"] is True and "peer-key cache" in st["starting_reason"]
+    assert _servicer(starting=False).auth_stats()["starting"] is False

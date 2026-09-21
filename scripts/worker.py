@@ -931,6 +931,51 @@ def _grpc_call_aborted(context) -> bool:
         return False
 
 
+def _startup_blocker(registered: bool, resolver, node_id: str, required_keyids=()) -> str:
+    """Why this worker is NOT ready to authenticate callers yet ('' when it is).
+
+    Ready means the pillar accepted our registration AND our peer-key cache can read the pillar's key table - proven by the
+    cache resolving our OWN node id (the pillar only lists us after accepting the registration, and only a successful /peers
+    refresh fills the cache). Anything less used to be reported as ready: register_with_pillar's False (e.g. a 401 from a TOFU key
+    mismatch) was discarded and a failed first refresh was swallowed, so a worker that could authenticate NO ONE answered Info fine
+    and the first request died `unknown keyid`. `required_keyids` adds consumers that must already resolve (NAKSHATRA_READY_KEYIDS)."""
+    if not registered:
+        return "registration with the pillar has not succeeded"
+    if resolver is not None:
+        for keyid in (node_id, *required_keyids):
+            if keyid and resolver.resolve(keyid) is None:
+                return f"peer-key cache does not hold {keyid!r} yet"
+    return ""
+
+
+def _await_startup_ready(servicer, register, resolver, node_id: str, required_keyids=(), *, registered: bool = False,
+                         poll_s: float = 2.0, log_every_s: float = 30.0, sleep=time.sleep, now=time.monotonic) -> bool:
+    """Block until _startup_blocker() is empty, retrying registration and the /peers refresh; then clear `servicer.starting`.
+    Runs in a daemon thread when the first pass was not enough. Returns True once ready (False only if `servicer.starting`
+    was cleared by someone else first)."""
+    last_log = -log_every_s
+    while servicer.starting:
+        if not registered:
+            registered = bool(register())
+        if registered and resolver is not None and any(resolver.resolve(k) is None for k in (node_id, *required_keyids) if k):
+            try:
+                resolver.refresh_once()
+            except Exception:  # noqa: BLE001 - reported through the blocker below
+                pass
+        why = _startup_blocker(registered, resolver, node_id, required_keyids)
+        if not why:
+            servicer.starting_reason = ""
+            servicer.starting = False
+            print("[worker] ready: registered with the pillar and the peer-key cache is populated", flush=True)
+            return True
+        servicer.starting_reason = why
+        if now() - last_log >= log_every_s:
+            print(f"[worker] still starting: {why} (retrying)", flush=True)
+            last_log = now()
+        sleep(poll_s)
+    return False
+
+
 class WorkerServicer(pb_grpc.NakshatraServicer):
     def __init__(self, daemon: DaemonClient, mode: str, layer_start: int, layer_end: int, model_id: str,
                  idem_max_entries: int = 6400, idem_ttl_seconds: float = 60.0,
@@ -953,6 +998,7 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
         # worker is STARTING - not "unauthenticated". Default False so every direct construction (tests, solo,
         # Mode A) behaves exactly as before; main() sets True only when a pillar registration is still pending.
         self.starting = False
+        self.starting_reason = ""  # WHY it is not ready yet (shown in Info's abort details and /healthz)
         self.refuse_unregistered_peers = refuse_unregistered_peers
         # 2026-05-21 SPKI Phase 3.3: refuse outbound channels to peers
         # for which the pillar has not (yet) distributed a SPKI hash.
@@ -1220,6 +1266,8 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
         open layer (separate from authz/ssrf which are inbound)."""
         return {
             "auth_required": bool(self.auth_required),
+            "starting": bool(self.starting),
+            "starting_reason": self.starting_reason,
             "authz_rejections": self._authz_rejections,
             "ssrf_rejections": self._ssrf_rejections,
             "refuse_unpinned_peers": bool(self.refuse_unpinned_peers),
@@ -1245,7 +1293,7 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
         if self.starting:
             context.abort(
                 grpc.StatusCode.UNAVAILABLE,
-                "worker starting: peer-key resolver not installed yet (retry)",
+                "worker starting: " + (self.starting_reason or "peer-key resolver not installed yet") + " (retry)",
             )
             return None  # unreachable; abort raises
         if not _GRPC_AUTH_AVAILABLE:
@@ -1290,7 +1338,8 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
         # NOT report healthy - a bound port + a TLS handshake was all a probe could see, and the first authenticated
         # request then hit "no peer resolver configured" (2026-09-21 cold start).
         if self.starting:
-            context.abort(grpc.StatusCode.UNAVAILABLE, "worker starting: registration with the pillar not finished")
+            context.abort(grpc.StatusCode.UNAVAILABLE,
+                          "worker starting: " + (self.starting_reason or "registration with the pillar not finished"))
         return pb.InfoResponse(
             protocol_version="0.1.0",
             backend="llamacpp-cpu-patched",
@@ -2518,6 +2567,7 @@ class FileServerHandler(BaseHTTPRequestHandler):
             "layer_start": _HEALTH_STATE.get("layer_start", -1),
             "layer_end": _HEALTH_STATE.get("layer_end", -1),
             "uptime_seconds": round(time.time() - started_at, 1),
+            "starting": bool(getattr(_HEALTH_STATE.get("servicer"), "starting", False)),
             "protocol_version": "0.1.0",
         }
 
@@ -3703,9 +3753,9 @@ def main():
                 "but no worker Ed25519 key is available (auth module "
                 "missing or key load failed)."
             )
-        register_with_pillar(args.pillar_url, register_payload,
-                             priv_key=worker_priv, node_id=node_id,
-                             spki_hash=spki_hash)
+        registered_ok = bool(register_with_pillar(args.pillar_url, register_payload,
+                                                  priv_key=worker_priv, node_id=node_id,
+                                                  spki_hash=spki_hash))
 
         # Phase B (2026-05-20): start the peer-key resolver in the
         # background. The resolver caches the pillar's /peers projection
@@ -3740,7 +3790,22 @@ def main():
                 "since there's no resolver. Did you forget --pillar-url?",
                 flush=True,
             )
-        servicer.starting = False  # registered and the resolver (if any) is installed: now ready
+        # READY = registered AND the peer-key cache holds our own key (see _startup_blocker). Not merely "attempted".
+        _ready_keyids = tuple(k.strip() for k in os.environ.get("NAKSHATRA_READY_KEYIDS", "").split(",") if k.strip())
+        _blocker = _startup_blocker(registered_ok, resolver, node_id, _ready_keyids)
+        if not _blocker:
+            servicer.starting = False
+        elif servicer.starting:
+            servicer.starting_reason = _blocker
+            print(f"[worker] NOT ready yet: {_blocker} - answering UNAVAILABLE and retrying in the background", flush=True)
+            threading.Thread(
+                target=_await_startup_ready, name="startup-ready", daemon=True,
+                args=(servicer,
+                      lambda: register_with_pillar(args.pillar_url, register_payload, priv_key=worker_priv,
+                                                   node_id=node_id, spki_hash=spki_hash),
+                      resolver, node_id, _ready_keyids),
+                kwargs={"registered": registered_ok},
+            ).start()
 
         # Phase C (2026-05-20): populate the HTTP auth state read by
         # FileServerHandler. Same resolver as gRPC auth (shared cache).
