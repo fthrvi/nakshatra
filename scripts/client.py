@@ -33,6 +33,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import yaml
 
+from step_text import escape_step_text   # one token = one output line (see step_text.py)
 from edge_health import EdgeError, EdgeFailureKind   # #17 live seam: typed edge faults so the
 # recovery loop can swap a dead worker instead of the process dying. Pure stdlib (duck-types grpc).
 
@@ -1346,7 +1347,7 @@ def main():
                 if next_id in LLAMA3_EOS_IDS:
                     print(f"[chain] step {step+1}: EOS {next_id} — stopping")
                     break
-                print(f"[chain] step {step+1}: id={next_id} '{detok_one(llama, next_id)}'", flush=True)
+                print(f"[chain] step {step+1}: id={next_id} '{escape_step_text(detok_one(llama, next_id))}'", flush=True)
 
                 # v0.5 M0.5.4 v0: synthetic failure injection for testing.
                 # Triggers AFTER step `simulate_fail_step` completes, so the

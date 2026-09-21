@@ -1424,3 +1424,65 @@ def test_api_tags_advertises_engine_url_entry_without_tokenizer(tmp_path):
     assert tag["name"] == "qwen3-14b-local"
     assert tag["size"] == 0            # no local tokenizer_gguf to stat
     assert tag["details"]["parameter_size"] == "14B"
+
+
+# ── chain streaming: one token = one line ───────────────────────────
+# A generated token can contain a newline (`):\n`, `\n    `). Printed raw, that step spans several lines and the
+# serve's line-based stream parser dropped it: every newline vanished from a STREAMED reply (Aider always streams)
+# while the non-streaming reply was fine. Found 2026-09-21 through the blackwell+ijru chain.
+
+import subprocess as _subprocess
+import textwrap as _textwrap
+
+from step_text import escape_step_text, unescape_step_text
+
+_TOKENS = ["def", " snake_to_camel", "(s", "):\n", "    ", '"""Doc: it\'s \\ fine"""', "\n", "\n\n", "\\n", "\\", "a\r\nb", "é✓", ""]
+
+
+def test_step_text_round_trips_every_awkward_token():
+    for tok in _TOKENS:
+        assert unescape_step_text(escape_step_text(tok)) == tok, repr(tok)
+
+
+def test_an_escaped_token_is_always_exactly_one_physical_line():
+    for tok in _TOKENS:
+        esc = escape_step_text(tok)
+        assert "\n" not in esc and "\r" not in esc, repr(tok)
+
+
+def test_an_escaped_backslash_followed_by_n_is_not_turned_into_a_newline():
+    assert unescape_step_text(escape_step_text("\\n")) == "\\n"
+    assert unescape_step_text("\\\\n") == "\\n"
+
+
+def _fake_chain_client(tmp_path, *, escape):
+    script = tmp_path / "fake_client.py"
+    script.write_text(_textwrap.dedent(f"""
+        import sys
+        sys.path.insert(0, {str(Path(__file__).resolve().parents[1] / "scripts")!r})
+        from step_text import escape_step_text
+        toks = {_TOKENS[:5]!r}
+        print("[chain] 2 workers in config")
+        for i, t in enumerate(toks, 1):
+            text = escape_step_text(t) if {escape!r} else t
+            print(f"[chain] step {{i}}: id={{100 + i}} '{{text}}'", flush=True)
+        print("[chain] step 6: EOS 151645 - stopping")
+    """))
+    return script
+
+
+def _stream_with(script):
+    backend = ns.ChainChatBackend()
+    backend._cmd = lambda entry, prompt, max_tokens: [sys.executable, str(script)]
+    return "".join(backend.generate_stream(ns.ModelEntry(name="m", tokenizer_gguf="t", chain_yaml="c"), "p", 8, {}))
+
+
+def test_streamed_chain_text_keeps_its_newlines(tmp_path):
+    assert _stream_with(_fake_chain_client(tmp_path, escape=True)) == "".join(_TOKENS[:5])
+
+
+def test_the_old_raw_format_lost_the_newline_tokens(tmp_path):
+    """The control: this is the bug. Raw multi-line steps never match the one-line parser and are silently dropped."""
+    streamed = _stream_with(_fake_chain_client(tmp_path, escape=False))
+    assert streamed != "".join(_TOKENS[:5])
+    assert "):" not in streamed and "\n" not in streamed

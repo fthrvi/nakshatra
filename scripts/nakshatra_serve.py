@@ -48,6 +48,8 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 
+from step_text import unescape_step_text
+
 
 # ── Wire constants ──────────────────────────────────────────────────
 
@@ -340,7 +342,8 @@ class ChainChatBackend(ChatBackend):
     """
 
     # client.py prints `[chain] step N: id=<id> '<text>'` per generated
-    # token (flushed) — the streaming hook below parses the quoted text.
+    # token (flushed) — the streaming hook below parses the quoted text. The text is
+    # escaped (step_text.py) so a token containing a newline is still ONE line.
     _STEP_RE = re.compile(r"\[chain\] step \d+: id=\S+ '(.*)'\s*$")
 
     def __init__(self, scripts_dir: Optional[str] = None,
@@ -502,7 +505,7 @@ class ChainChatBackend(ChatBackend):
             for line in proc.stdout:
                 m = self._STEP_RE.search(line.rstrip("\n"))
                 if m:
-                    yield m.group(1)
+                    yield unescape_step_text(m.group(1))
         finally:
             proc.stdout.close()
             rc = proc.wait()
