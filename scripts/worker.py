@@ -1979,6 +1979,25 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
 _attestation_nonce: str = ""
 
 
+def decide_registered_backend(gpu_vram_gb, declared_backend, offload_status):
+    """(backend_to_register, offload_verified) for a worker that declared a GPU backend.
+
+    Downgrade to "cpu" ONLY on a positive report of zero layers offloaded (the daemon printed `offloaded 0/N`, i.e. the
+    binary really lacks that backend). A daemon that logged NO offload line at all (n_total == 0) is UNVERIFIED, not
+    "zero": newer llama.cpp builds are quiet on a successful load, and treating silence as zero registered a 12 GB RTX 5070
+    as a CPU node (2026-09-21). Unverified keeps the operator's declaration and is flagged so the pillar can tell.
+    """
+    declared_gpu = gpu_vram_gb > 0 and declared_backend != "cpu"
+    if not declared_gpu:
+        return declared_backend, True
+    total = offload_status.get("total_layers", 0)
+    if total > 0:
+        if offload_status.get("uses_gpu"):
+            return declared_backend, True
+        return "cpu", True
+    return declared_backend, False
+
+
 def register_with_pillar(pillar_url: str, payload: dict, log_prefix: str = "[worker]",
                           priv_key: Optional[bytes] = None,
                           node_id: Optional[str] = None,
@@ -3430,15 +3449,18 @@ def main():
         # declaration to "cpu" before posting to the pillar — better to be
         # truthful than to lie about capability.
         offload_status = daemon.gpu_offload_status()
-        actual_backend = args.gpu_backend
+        actual_backend, offload_verified = decide_registered_backend(
+            args.gpu_vram_gb, args.gpu_backend, offload_status)
         declared_gpu = (args.gpu_vram_gb > 0 and args.gpu_backend != "cpu")
-        if declared_gpu and not offload_status["uses_gpu"]:
+        if declared_gpu and not offload_verified and actual_backend == args.gpu_backend:
+            print(f"[worker] NOTE: declared --gpu-backend={args.gpu_backend} but the daemon logged no offload "
+                  f"line (a quiet build) - keeping the declaration, registering it as UNVERIFIED", flush=True)
+        elif declared_gpu and actual_backend != args.gpu_backend:
             print(f"[worker] WARNING: declared --gpu-backend={args.gpu_backend} "
                   f"but daemon offloaded {offload_status['n_offloaded']}/"
                   f"{offload_status['total_layers']} layers — daemon binary likely "
                   f"lacks {args.gpu_backend} support; downgrading registration to cpu",
                   flush=True)
-            actual_backend = "cpu"
         elif declared_gpu:
             print(f"[worker] verified: daemon offloaded "
                   f"{offload_status['n_offloaded']}/{offload_status['total_layers']} "
@@ -3453,6 +3475,7 @@ def main():
                 "vram_total_gb": args.gpu_vram_gb,
                 "backend": actual_backend,
                 "actual_layers_offloaded": offload_status["n_offloaded"],
+                "offload_verified": offload_verified,
                 "total_layers_loaded": offload_status["total_layers"],
             })
         hardware = {
