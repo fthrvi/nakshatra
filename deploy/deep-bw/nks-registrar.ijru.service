@@ -1,0 +1,22 @@
+[Unit]
+Description=Nakshatra pillar registrar (ijru) - advertise this node's idle GPU capacity to Sthambha
+After=network-online.target
+
+[Service]
+Type=simple
+# Same daemon the hub runs (trisul infra/connectors/pillar-registrar/registrar.py): a signed POST /peer heartbeat every 30 s with
+# free VRAM, so Sthambha knows an IDLE ijru exists instead of seeing it only while a chain worker runs. Node id `ijru` is the
+# NODE; `ijru-q3b` is the chain WORKER on it (they never share an id).
+Environment=NKS_NODE_ID=ijru
+Environment=NKS_NODE_ADDRESS=10.51.0.14:5560
+Environment=NKS_PILLAR_URL=http://10.42.0.3:7777
+Environment=NKS_SCRIPTS=/home/prithviraj/nakshatra/scripts
+Environment=NKS_OWNER_RESERVE_GB=0
+Environment=NKS_GPU_BACKEND=cuda
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -u /home/prithviraj/nks-registrar/registrar.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

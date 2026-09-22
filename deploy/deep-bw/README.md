@@ -19,6 +19,7 @@ request ─► nakshatra-deep-bw.service (hub :11601, scripts/nakshatra_serve.py
 | `nks-q3a.blackwell.sh` | blackwell WSL `~/nks-q3a.sh` |
 | `nks-wsl-portproxy.blackwell.ps1` | blackwell Windows `C:\ProgramData\nakshatra\nks-wsl-portproxy.ps1` |
 | `nks-q3b.ijru.sh` | ijru `~/nks-q3b.sh` |
+| `nks-registrar.ijru.service` | ijru `~/.config/systemd/user/` + `~/nks-registrar/registrar.py` (copy of trisul `infra/connectors/pillar-registrar/registrar.py`) — advertises IDLE capacity as node `ijru` (added 2026-09-21) |
 | `deploy-workers.sh` | run from any checkout: pushes the worker code to both nodes and verifies sha256 of every file the worker imports |
 
 ## Gotchas (each cost real time)
@@ -33,3 +34,5 @@ request ─► nakshatra-deep-bw.service (hub :11601, scripts/nakshatra_serve.py
   ⚠️ Nothing yet stops a summon while Ollama holds the card (open item: refuse in `nks-q3a.sh start` when free VRAM < 7 GB).
 - The hub's `launch`/`stop` strings are arbitrary shell on both nodes. Bounding that door (forced command) is a decision for the owner of
   each machine — see `infra/mesh-agent/install-agent-reach.sh` for the pattern.
+
+- **Idle capacity is advertised by a separate *registrar*, not by the chain worker.** The worker (`ijru-q3b`, `blackwell-q3a`) only exists while a chain runs; the registrar (node `ijru`, node `blackwell`) heartbeats free VRAM every 30 s so Sthambha knows an idle box exists. blackwell's registrar was already running (started by hand 2026-09-15 in WSL, `~/.nakshatra-worker/registrar/`, reserve 4 GB, advertises its Ollama models) - NOT a unit, so a WSL restart drops it. Never run a second one under the same node id: two processes alternate different values into one peer record.
