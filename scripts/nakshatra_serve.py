@@ -262,7 +262,12 @@ class ChainBackendError(RuntimeError):
 class _LifecycleColdStart(RuntimeError):
     """Scale-to-zero could not bring the chain up in time. Mapped to a 503 at
     the HTTP layer — distinct from a 502, because the right client response is
-    "retry shortly", not "this request was malformed or the chain is broken"."""
+    "retry shortly", not "this request was malformed or the chain is broken".
+    `refused` is set when the lifecycle raised ChainRefused (a node declined, or Sthambha refused the lease because another
+    workload holds a node): then "warming up; retry shortly" would be a lie, so the reason is surfaced instead."""
+    def __init__(self, msg: str = "", refused: bool = False):
+        super().__init__(msg)
+        self.refused = refused
 
 
 @dataclass
@@ -1064,9 +1069,9 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
 
         try:
             lc = self._begin_session()
-        except _LifecycleColdStart:
+        except _LifecycleColdStart as cs:
             self._json_error(HTTPStatus.SERVICE_UNAVAILABLE,
-                             "model is warming up; retry shortly")
+                             f"chain refused to start: {cs}" if cs.refused else "model is warming up; retry shortly")
             return 503
         try:
             if req.get("stream"):
@@ -1119,7 +1124,7 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
             lc.begin()
         except Exception as e:      # cold-start timed out / controller failed
             log.error("lifecycle summon failed: %s", e)
-            raise _LifecycleColdStart(str(e)) from e
+            raise _LifecycleColdStart(str(e), refused=type(e).__name__ == "ChainRefused") from e
         return lc
 
     def _stream_chat(self, entry, prompt, max_tokens, options, backend) -> int:
@@ -1209,9 +1214,9 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
             # route-whole entry: reverse-proxy to its engine, byte-faithful.
             try:
                 lc = self._begin_session()
-            except _LifecycleColdStart:
+            except _LifecycleColdStart as cs:
                 self._openai_error(HTTPStatus.SERVICE_UNAVAILABLE,
-                                   "reasoning tier is warming up; retry shortly",
+                                   f"chain refused to start: {cs}" if cs.refused else "reasoning tier is warming up; retry shortly",
                                    "server_error")
                 return 503
             try:
@@ -1237,9 +1242,9 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
 
         try:
             lc = self._begin_session()
-        except _LifecycleColdStart:
+        except _LifecycleColdStart as cs:
             self._openai_error(HTTPStatus.SERVICE_UNAVAILABLE,
-                               "reasoning tier is warming up; retry shortly",
+                               f"chain refused to start: {cs}" if cs.refused else "reasoning tier is warming up; retry shortly",
                                "server_error")
             return 503
         try:

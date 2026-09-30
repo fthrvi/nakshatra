@@ -87,7 +87,9 @@ from dataclasses import dataclass, field  # noqa: E402
 
 class ChainRefused(RuntimeError):
     """A node declined to start its worker (its launch command exited non-zero and the worker is `launch_must_succeed`).
-    The lifecycle fails the request at once and returns anything already started, instead of waiting out the start timeout."""
+    The lifecycle fails the request at once and returns anything already started, instead of waiting out the start timeout.
+    Also raised, BEFORE anything is started, when Sthambha refuses the chain's lease because a node is held by another workload
+    (a mesh_compute GPU job): two GPU workloads on one card is what hard-crashed blackwell on 2026-09-29."""
 
 
 @dataclass
@@ -475,6 +477,9 @@ class PillarLeaseClient:
         self.priv = priv_key
         self._log = log
         self.lease_id: Optional[str] = None
+        # Set when the pillar EXPLICITLY refused the chain (409 + node_conflicts: another workload holds one of its nodes);
+        # None otherwise. ChainLifecycle reads it to fail closed - see lease().
+        self.last_refusal: Optional[dict] = None
 
     def _call(self, method: str, path: str, body: Optional[dict] = None,
               timeout: float = 10.0):
@@ -501,12 +506,23 @@ class PillarLeaseClient:
 
     def lease(self, retries: int = 3) -> Optional[dict]:
         """Summon-or-renew the shared lease; returns the lease dict (incl.
-        idle_grace_s, chain) or None. Retries a transient 409."""
+        idle_grace_s, chain) or None. Retries a transient 409.
+
+        Two very different failures land here and must not be conflated:
+          * REFUSAL - 409 whose body carries `node_conflicts`: another workload (e.g. a mesh_compute GPU job lease) holds a node
+            of this chain. Not transient, so never retried; recorded in `last_refusal` and the caller MUST NOT start the chain.
+          * UNAVAILABLE - unreachable pillar (status 0), 5xx, or a plain 409 ("chain not ready", nothing online to plan from):
+            None with `last_refusal` unset. Callers fail OPEN on these - inference must not depend on the Pi being up."""
+        self.last_refusal = None
         for _ in range(max(1, retries)):
             st, b = self._call("POST", "/lease", {"model_id": self.model_id})
             if st == 200:
                 self.lease_id = b.get("lease_id")
                 return b
+            if st == 409 and isinstance(b, dict) and b.get("node_conflicts"):
+                self.last_refusal = {"node_conflicts": b["node_conflicts"], "error": b.get("error")}
+                self._log(f"[lease] REFUSED by pillar - node(s) held by another workload: {b['node_conflicts']}")
+                return None
             if st != 409:
                 self._log(f"[lease] POST /lease -> {st}: {b.get('error')}")
                 return None
@@ -518,8 +534,12 @@ class PillarLeaseClient:
             return self.lease()
         st, b = self._call("POST", f"/lease/{self.lease_id}/renew", {})
         if st == 200:
+            self.last_refusal = None
             return b
         if st == 404:                                # lease gone → re-lease
+            # Mid-serve this must not kill in-flight generations: the caller keeps serving; only a NEW cold start honours a
+            # refusal from the re-lease (ChainLifecycle._raise_if_lease_refused).
+            self._log(f"[lease] lease {self.lease_id} lost (renew -> 404); re-leasing")
             self.lease_id = None
             return self.lease()
         return None
@@ -583,6 +603,16 @@ class ChainLifecycle:
         self._stop_evt = threading.Event()
         self._reaper: Optional[threading.Thread] = None
 
+    def _raise_if_lease_refused(self) -> None:
+        """Fail CLOSED only on an explicit refusal (the pillar said a node of this chain is held by another workload).
+        Everything else - no lease client, pillar unreachable, 5xx, plain 409 - stays fail-OPEN (logged by the callers): the
+        availability of inference must not depend on the Pi being up. Called on the cold-start path only, before anything is
+        started, so an in-flight chain that loses its lease (renew 404) is never torn down by this."""
+        ref = getattr(self.lease_client, "last_refusal", None) if self.lease_client is not None else None
+        if ref:
+            raise ChainRefused(f"Sthambha refused the lease for this chain: node(s) held by another workload "
+                               f"{ref.get('node_conflicts')} - not starting")
+
     # request gate ----------------------------------------------------
     def begin(self) -> None:
         """Ensure the chain is up (cold-start + block until ready), then mark a
@@ -595,7 +625,7 @@ class ChainLifecycle:
                 if info and info.get("idle_grace_s"):
                     self.idle_grace_s = float(info["idle_grace_s"])
             except Exception as e:
-                self._log(f"[lease] renew failed (continuing): {e}")
+                self._log(f"[lease] renew failed (continuing, fail-open): {e}")
         with self._lock:
             self._active += 1
             self._last_active = time.monotonic()
@@ -604,7 +634,14 @@ class ChainLifecycle:
             if self._summoning:
                 pass  # another request is already summoning: just wait for readiness below
             else:
-                # cold start
+                # cold start. An explicit lease refusal starts NOTHING (so no controller.stop() either).
+                try:
+                    self._raise_if_lease_refused()
+                except ChainRefused:
+                    self._active = max(0, self._active - 1)
+                    raise
+                if self.lease_client is not None and not getattr(self.lease_client, "lease_id", None):
+                    self._log("[lifecycle] no pillar lease (pillar unreachable/not ready) - starting anyway (fail-open)")
                 self._summoning = True
                 try:
                     self._ensure_slices() # fetch-if-absent (cache→peer→origin) …
@@ -682,11 +719,12 @@ class ChainLifecycle:
                 if info and info.get("idle_grace_s"):
                     self.idle_grace_s = float(info["idle_grace_s"])
             except Exception as e:
-                self._log(f"[lease] warm renew failed (continuing): {e}")
+                self._log(f"[lease] warm renew failed (continuing, fail-open): {e}")
         with self._lock:
             self._last_active = time.monotonic()
             if self._up and self._chain_ready_cached():
                 return True
+            self._raise_if_lease_refused()   # explicit refusal: start nothing (raises ChainRefused)
             self._ensure_slices() # fetch-if-absent (cache→peer→origin) …
             self._warm_slices()   # …then page-cache the slices before the worker loads them
             self._log("[lifecycle] pre-warm: summoning workers ahead of demand…")
