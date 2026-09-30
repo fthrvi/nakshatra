@@ -162,3 +162,17 @@ def test_renew_404_relases_and_recovers():
         return 200, {"lease_id": "L2"}
     c._call = _call
     assert c.renew()["lease_id"] == "L2" and c.lease_id == "L2"
+
+
+def test_renew_410_expired_relases_and_recovers():
+    """Sthambha answers 410 Gone for an expired/released lease (2026-09-30) — that is a lost
+    lease exactly like 404, so the client re-leases instead of holding a dead id."""
+    c = _client([(200, {"lease_id": "L1"})])
+    c.lease()
+
+    def _call(m, p, b=None, timeout=10.0):
+        if "renew" in p:
+            return 410, {"error": "lease 'L1' is expired; re-lease", "state": "expired"}
+        return 200, {"lease_id": "L2"}
+    c._call = _call
+    assert c.renew()["lease_id"] == "L2" and c.lease_id == "L2"

@@ -536,10 +536,12 @@ class PillarLeaseClient:
         if st == 200:
             self.last_refusal = None
             return b
-        if st == 404:                                # lease gone → re-lease
-            # Mid-serve this must not kill in-flight generations: the caller keeps serving; only a NEW cold start honours a
+        if st in (404, 410):                         # lease gone (unknown / expired) → re-lease
+            # Sthambha answers 410 for an expired/released lease (2026-09-30; it used to say 200
+            # with state:"expired", which left a dead id held forever). Mid-serve this must not kill
+            # in-flight generations: the caller keeps serving; only a NEW cold start honours a
             # refusal from the re-lease (ChainLifecycle._raise_if_lease_refused).
-            self._log(f"[lease] lease {self.lease_id} lost (renew -> 404); re-leasing")
+            self._log(f"[lease] lease {self.lease_id} lost (renew -> {st}); re-leasing")
             self.lease_id = None
             return self.lease()
         return None
