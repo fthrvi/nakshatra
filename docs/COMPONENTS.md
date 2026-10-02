@@ -93,4 +93,5 @@ Unification work in progress (U1–U6): `trisul/plans/2026-10-03-nakshatra-unifi
 | Public release host | VPS :8960 (`nakshatra-releases`), `release/publish.sh` | LIVE |
 | meshd + relay | **from the signed release** (`nakshatra-meshd` / `nakshatra-relay`, opt-in per node via `~/.nakshatra/{meshd,relay}.env`) | LIVE on the hub since 0.8.0 (U6a) |
 | Units for a new release | written by the installer SHIPPED IN that release (`install.py write-units`), never the older running one | LIVE since 0.8.1 |
-| Inference gateway + GPU workers | still from the `~/nakshatra` working tree / hand-built stacks / unsigned worker tarballs | → U6b: the worker stack into the release (Biswa's go first: it is Prithvi's brain) |
+| Inference gateway (`nakshatra-unconscious`) | **from the signed release** with the `inference` profile (hash-locked grpcio/numpy/llama_cpp_python…), opt-in via `~/.nakshatra/{inference.env,unconscious.release}`; the hub's settings live in drop-ins | LIVE on the hub since 0.10.2 (U6b, 2026-10-03; cutover/rollback scripts in trisul `infra/nakshatra/`) |
+| GPU workers (llama.cpp daemon + `worker.py`) | the gateway still spawns them with `~/nakshatra/.venv` and the hand-built `~/llama.cpp/build/bin/llama-nakshatra-worker`; outsider workers use unsigned tarballs | → U6c: signed per-GPU worker builds (also unblocks U4's worker kind) |
