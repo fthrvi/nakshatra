@@ -37,6 +37,7 @@ import releasekit as rk  # noqa: E402
 
 DEFAULT_PREFIX = Path(os.environ.get("NAK_NODE_PREFIX", Path.home() / ".nakshatra-node"))
 UNIT_DIR = Path.home() / ".config" / "systemd" / "user"
+_THIS_FILE = Path(__file__).resolve()      # resolved at LOAD time, before any `current` switch
 
 
 class InstallError(Exception):
@@ -197,7 +198,11 @@ class Installer:
         it is this same file."""
         shipped = man.get("installer")
         new = (self.prefix / "current" / shipped) if shipped else None
-        if new is None or not new.exists() or new.resolve() == Path(__file__).resolve():
+        # Compare against where THIS installer lived when it was LOADED (_THIS_FILE), not Path(__file__)
+        # now: updates run us via current/..., and once `current` has switched, resolving __file__ lands
+        # in the NEW release — we then mistook the new installer for ourselves and wrote units with old
+        # code (2026-10-03: that wrote + restarted the live gateway unit; 44 s outage).
+        if new is None or not new.exists() or new.resolve() == _THIS_FILE:
             return self.write_units(man)
         args = [sys.executable, str(new), "--prefix", str(self.prefix), "write-units"]
         if not self.systemd:

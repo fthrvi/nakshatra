@@ -348,3 +348,21 @@ def test_the_gateway_service_needs_its_own_explicit_opt_in():
     gw = spec["services"]["nakshatra-unconscious"]
     assert gw["requires"].endswith("unconscious.release")      # NOT unconscious.env: no accidental cutover
     assert "--bind" in gw["exec"] and "${BIND}" in gw["exec"]
+
+
+def test_the_running_installer_recognises_the_new_one_even_after_current_switched(tmp_path, monkeypatch):
+    # Updates run via <prefix>/current/... ; after the switch `current` points at the NEW release. The
+    # running (old) installer must still see the new installer as a DIFFERENT file and hand over to it.
+    prefix = tmp_path / "node"
+    old_rel, new_rel = prefix / "releases" / "0.9.0" / "pkg", prefix / "releases" / "0.10.0" / "pkg"
+    for d in (old_rel, new_rel):
+        d.mkdir(parents=True)
+    (old_rel / "install.py").write_text("# old\n")
+    marker = tmp_path / "called"
+    (new_rel / "install.py").write_text(
+        "import json,sys\n" f"open({str(marker)!r},'w').write('new')\n" "print(json.dumps(['by-new']))\n")
+    (prefix / "current").symlink_to("releases/0.10.0")                 # already switched
+    monkeypatch.setattr(I, "_THIS_FILE", (old_rel / "install.py").resolve())   # we were loaded from 0.9.0
+    inst = I.Installer(prefix, systemd=False, make_venv=False, unit_dir=tmp_path / "units")
+    assert inst._write_units_by_new_installer({"installer": "pkg/install.py"}) == ["by-new"]
+    assert marker.read_text() == "new"
