@@ -97,6 +97,27 @@
    ],
    "restart": "always",
    "hardening": true
+  },
+  "nakshatra-unconscious": {
+   "description": "Nakshatra inference gateway (OpenAI /v1/chat/completions over the mesh)",
+   "requires": "{home}/.nakshatra/unconscious.release",
+   "env_file": "{home}/.nakshatra/unconscious.env",
+   "environment": {
+    "PORT": "11599",
+    "BIND": "127.0.0.1",
+    "MODELS": "{home}/.nakshatra/serve_models.unconscious.yaml"
+   },
+   "exec": [
+    "{python}",
+    "{prefix}/current/nakshatra/scripts/nakshatra_serve.py",
+    "--port",
+    "${PORT}",
+    "--bind",
+    "${BIND}",
+    "--models",
+    "${MODELS}"
+   ],
+   "restart": "always"
   }
  },
  "health": [
@@ -109,5 +130,22 @@
  "commands": {
   "nak": "network.nak",
   "nak-mcp": "network.nak_mcp"
+ },
+ "profiles": {
+  "inference": {
+   "description": "inference gateway + chain client (gRPC, numpy, tokenizer); opt in with ~/.nakshatra/inference.env",
+   "requires": "{home}/.nakshatra/inference.env",
+   "requirements": [
+    "grpcio==1.81.1",
+    "protobuf==6.33.6",
+    "numpy==1.26.4",
+    "PyYAML==6.0.3",
+    "gguf==0.19.0",
+    "llama_cpp_python==0.3.28",
+    "requests==2.34.2",
+    "websocket-client==1.9.0",
+    "diskcache==5.6.3"
+   ]
+  }
  }
 }

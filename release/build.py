@@ -78,6 +78,19 @@ def build(version: str, channel: str, refs: dict, key_path: Path, out_root: Path
     subprocess.run([str(uv_bin), "pip", "compile", str(req_in), "--generate-hashes", "--quiet",
                     "--python-version", SPEC["python"], "-o", str(lock)], check=True)
     req_in.unlink()
+    # Optional PROFILES (e.g. "inference"): each is the base requirements PLUS its own, resolved TOGETHER
+    # into one hash-locked file, so an opted-in node installs a single consistent environment instead of
+    # layering a second resolution on top of the first.
+    profiles = {}
+    for pname, prof in (SPEC.get("profiles") or {}).items():
+        p_in = out / f"requirements-{pname}.in"
+        p_in.write_text("\n".join(SPEC["requirements"] + prof["requirements"]) + "\n")
+        p_lock = out / f"requirements-{pname}.lock"
+        subprocess.run([str(uv_bin), "pip", "compile", str(p_in), "--generate-hashes", "--quiet",
+                        "--python-version", SPEC["python"], "-o", str(p_lock)], check=True)
+        p_in.unlink()
+        profiles[pname] = {"lock": {"file": p_lock.name, "sha256": rk.sha256_file(p_lock)},
+                           "requires": prof["requires"], "description": prof.get("description", "")}
     shutil.copy2(uv_bin, out / "uv")
     uv_version = subprocess.check_output([str(uv_bin), "--version"], text=True).split()[1]
     manifest = {"schema": rk.MANIFEST_SCHEMA, "name": SPEC["name"], "version": version, "channel": channel,
@@ -87,7 +100,7 @@ def build(version: str, channel: str, refs: dict, key_path: Path, out_root: Path
                 "uv": {"file": "uv", "sha256": rk.sha256_file(out / "uv"), "version": uv_version},
                 "services": SPEC["services"], "health": SPEC["health"],
                 "installer": SPEC.get("installer", ""), "commands": SPEC.get("commands", {}),
-                "bootstrap": bootstrap}
+                "bootstrap": bootstrap, "profiles": profiles}
     priv_hex = key_path.read_text().strip()
     signed = rk.sign(manifest, priv_hex)
     (out / "manifest.json").write_text(json.dumps(signed, indent=1, sort_keys=True))

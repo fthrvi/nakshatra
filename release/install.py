@@ -131,6 +131,7 @@ class Installer:
             raise InstallError("manifest names a different version or channel than requested")
         files = [(c["file"], c["sha256"]) for c in man["components"]]
         files += [(man["lock"]["file"], man["lock"]["sha256"]), (man["uv"]["file"], man["uv"]["sha256"])]
+        files += [(p["lock"]["file"], p["lock"]["sha256"]) for p in (man.get("profiles") or {}).values()]
         for name, want in files:
             if "/" in name or name.startswith("."):
                 raise InstallError(f"bad file name in manifest: {name}")
@@ -152,6 +153,15 @@ class Installer:
             with tarfile.open(work / c["file"]) as tf:
                 _safe_extract(tf, d)
         shutil.copy2(work / man["lock"]["file"], rel / "requirements.lock")
+        lock_to_install = rel / "requirements.lock"
+        for pname in self.active_profiles(man):
+            # The profile lock is the WHOLE environment (base + profile, resolved together): install it
+            # instead of the base lock. More than one active profile would need a combined lock; refuse.
+            if lock_to_install != rel / "requirements.lock":
+                raise InstallError("more than one release profile is active on this node; not supported yet")
+            pf = man["profiles"][pname]["lock"]["file"]
+            shutil.copy2(work / pf, rel / pf)
+            lock_to_install = rel / pf
         shutil.copy2(work / "uv", rel / "uv")
         os.chmod(rel / "uv", 0o755)
         (rel / "manifest.json").write_text(json.dumps(man, indent=1, sort_keys=True))
@@ -159,9 +169,16 @@ class Installer:
             uv = str(rel / "uv")
             env = dict(os.environ, UV_CACHE_DIR=str(self.prefix / "uv-cache"))
             subprocess.run([uv, "venv", str(rel / "venv"), "--python", man["python"], "--quiet"], check=True, env=env)
-            subprocess.run([uv, "pip", "install", "--quiet", "--require-hashes", "-r", str(rel / "requirements.lock"),
+            subprocess.run([uv, "pip", "install", "--quiet", "--require-hashes", "-r", str(lock_to_install),
                             "--python", str(rel / "venv" / "bin" / "python")], check=True, env=env)
         return rel
+
+    def active_profiles(self, man: dict) -> list:
+        """Release profiles this node opted into: each profile names a file (e.g. ~/.nakshatra/inference.env)
+        whose presence turns it on. Nodes that opt in to nothing get the lean base environment."""
+        ctx = {"home": Path.home(), "prefix": self.prefix}
+        return [n for n, p in sorted((man.get("profiles") or {}).items())
+                if Path(_render(p["requires"], ctx)).exists()]
 
     def _ctx(self, man: dict) -> dict:
         cur = self.prefix / "current"
@@ -219,6 +236,10 @@ class Installer:
         ctx, names = self._ctx(man), []
         self.unit_dir.mkdir(parents=True, exist_ok=True)
         for name, svc in man.get("services", {}).items():
+            # A node that has NOT opted into a service gets no unit file for it at all: writing one
+            # anyway would overwrite whatever (possibly hand-written, possibly live) unit carries that name.
+            if svc.get("requires") and not Path(_render(svc["requires"], ctx)).exists():
+                continue
             (self.unit_dir / f"{name}.service").write_text(self._unit_text(svc, ctx, man))
             names.append(name)
         bin_dir = self.prefix / "bin"

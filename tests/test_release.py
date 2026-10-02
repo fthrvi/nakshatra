@@ -310,3 +310,41 @@ def test_units_are_written_by_the_installer_shipped_in_the_new_release(tmp_path)
     assert inst._write_units_by_new_installer(man) == ["from-the-new-installer"]
     called = marker.read_text()
     assert "write-units" in called and "--no-systemd" in called and str(tmp_path / "units") in called
+
+
+def test_a_profile_lock_is_shipped_verified_and_installed_only_where_opted_in(env, monkeypatch, tmp_path):
+    monkeypatch.setitem(B.SPEC, "profiles", {"inference": {"requirements": ["numpy==1.26.4"],
+                                                           "requires": str(tmp_path / "inference.env")}})
+    _build(env, "0.1.0")
+    man = json.loads((env["dist"] / "canary" / "0.1.0" / "manifest.json").read_text())
+    assert man["profiles"]["inference"]["lock"]["file"] == "requirements-inference.lock"
+    inst = env["inst"]
+    assert inst.active_profiles(man) == []                       # not opted in → lean base env
+    (tmp_path / "inference.env").write_text("")
+    assert inst.active_profiles(man) == ["inference"]
+    msg = inst.install(str(env["dist"]), "canary", env["pub"])
+    assert "installed 0.1.0" in msg
+    assert (env["tmp"] / "node" / "releases" / "0.1.0" / "requirements-inference.lock").exists()
+
+
+def test_units_are_written_only_for_services_the_node_opted_into(tmp_path):
+    inst = I.Installer(tmp_path / "node", systemd=False, make_venv=False, unit_dir=tmp_path / "units")
+    (tmp_path / "node").mkdir()
+    opted = tmp_path / "meshd.env"
+    man = {"version": "0.1.0", "components": [{"name": "nakshatra", "pythonpath": "scripts"}], "services": {
+        "svc-on": {"description": "x", "requires": str(opted), "exec": ["{python}"]},
+        "svc-off": {"description": "y", "requires": str(tmp_path / "absent.env"), "exec": ["{python}"]},
+        "svc-always": {"description": "z", "exec": ["{python}"]}}}
+    opted.write_text("")
+    (tmp_path / "units").mkdir()
+    (tmp_path / "units" / "svc-off.service").write_text("HAND-WRITTEN, LIVE")
+    names = inst.write_units(man)
+    assert "svc-on" in names and "svc-always" in names and "svc-off" not in names
+    assert (tmp_path / "units" / "svc-off.service").read_text() == "HAND-WRITTEN, LIVE"   # untouched
+
+
+def test_the_gateway_service_needs_its_own_explicit_opt_in():
+    spec = json.loads((Path(__file__).resolve().parent.parent / "release" / "spec.json").read_text())
+    gw = spec["services"]["nakshatra-unconscious"]
+    assert gw["requires"].endswith("unconscious.release")      # NOT unconscious.env: no accidental cutover
+    assert "--bind" in gw["exec"] and "${BIND}" in gw["exec"]
