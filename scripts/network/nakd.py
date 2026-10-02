@@ -595,8 +595,10 @@ def main(argv=None) -> int:
     ap.add_argument("--agent", default=os.environ.get("NAK_AGENT", ""))
     ap.add_argument("--relay", default=os.environ.get("NAK_RELAY", f"{DEFAULT_RELAY[0]}:{DEFAULT_RELAY[1]}"))
     a = ap.parse_args(argv)
+    if not a.agent and (a.state / "agent").exists():
+        a.agent = (a.state / "agent").read_text().strip()      # set once per node: `echo prithvi > …/net/agent`
     if not a.agent:
-        raise SystemExit("--agent (or NAK_AGENT) is required: the delegated agent this node signs as")
+        raise SystemExit("--agent, NAK_AGENT or <state>/agent is required: the delegated agent this node signs as")
     host, port = a.relay.rsplit(":", 1)
     stop = threading.Event()
     node = Node(a.state, _load_node_key(a.node_key), SignerClient(a.signer), agent=a.agent,
