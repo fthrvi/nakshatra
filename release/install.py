@@ -334,18 +334,19 @@ def _systemd_user_ok() -> bool:
 def join(prefix: Path, code: str, name: str) -> int:
     inv = parse_invite(code)
     rel = inv["release"]
-    print(f"invite from {inv['inviter'][:16]}… is genuine; installing Nakshatra from {rel['url']} ({rel['channel']})")
+    print(f"invite from {inv['inviter'][:16]}… is genuine; installing Nakshatra from {rel['url']} ({rel['channel']})",
+          flush=True)
     if not _systemd_user_ok():
         raise InstallError("this machine has no systemd user session. On WSL put [boot] systemd=true in "
                            "/etc/wsl.conf and restart WSL, then paste the line again.")
     inst = Installer(prefix)
     if _current(prefix):
-        print(f"a node is already installed ({_current(prefix)}); keeping it and joining with it")
+        print(f"a node is already installed ({_current(prefix)}); keeping it and joining with it", flush=True)
         cfg = _load_config(prefix)
         if cfg.get("pubkey") and cfg["pubkey"] != rel["pubkey"]:
             raise InstallError("this node trusts a different release key than the invite names; refusing to mix")
     else:
-        print(inst.install(rel["url"], rel["channel"], rel["pubkey"]))
+        print(inst.install(rel["url"], rel["channel"], rel["pubkey"]), flush=True)
     man = json.loads((prefix / "current" / "manifest.json").read_text())
     env = dict(os.environ, PYTHONPATH=inst._pythonpath(man))
     py = str(prefix / "current" / "venv" / "bin" / "python")

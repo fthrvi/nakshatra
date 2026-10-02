@@ -56,7 +56,16 @@ def test_identity_setup_is_idempotent_and_grants_only_message_and_claim(tmp_path
         with pytest.raises(signer_mod.SignerError):
             signer_mod.verify_grant(grant, first["person"], cap=cap, node=first["node"])
     again = join_setup.ensure_identity(tmp_path)
-    assert again == dict(first, node_key="kept", person_key="kept", signer="kept", agent="kept")
+    assert again == dict(first, node_key="kept", person_key="kept", signer="kept", agent="'agent' kept")
+
+
+def test_existing_node_keeps_its_own_agent(tmp_path):
+    join_setup.ensure_identity(tmp_path)
+    net_dir = tmp_path / ".nakshatra" / "net"
+    (net_dir / "agent").write_text("bro-agent\n")       # a node that already signs as another agent
+    r = join_setup.ensure_identity(tmp_path)
+    assert r["agent"].startswith("'bro-agent'")
+    assert (tmp_path / ".sthambha" / "signer" / "agents" / "bro-agent.grant.json").exists()
 
 
 def test_join_end_to_end_request_reaches_the_inviter(net, tmp_path, monkeypatch, capsys):

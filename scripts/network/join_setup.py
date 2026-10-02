@@ -31,7 +31,7 @@ AGENT_CAPS = ("nak.msg", "nak.task.claim")
 AGENT_TTL_S = 90 * 86400
 
 
-def _say(msg: str) -> None:
+def _say(msg: str) -> None:  # noqa: D401
     print(f"  · {msg}", flush=True)
 
 
@@ -68,23 +68,26 @@ def ensure_identity(home: Path) -> dict:
         if (state / "person.pub").read_text().strip() != person_pub or (state / "node.pub").read_text().strip() != node_pub:
             raise SystemExit("the signer here belongs to a different person or node key; refusing to mix them")
         done["signer"] = "kept"
-    grant_path = state / "agents" / f"{AGENT}.grant.json"
+    net = home / ".nakshatra" / "net"
+    agent = AGENT
+    if (net / "agent").exists():                    # an existing node already signs as some agent: keep it
+        agent = (net / "agent").read_text().strip() or AGENT
+    grant_path = state / "agents" / f"{agent}.grant.json"
     fresh = False
     if grant_path.exists():
         g = json.loads(grant_path.read_text())
         fresh = g.get("expires_at", 0) > time.time() + 7 * 86400 and set(AGENT_CAPS) <= set(g.get("caps", []))
     if not fresh:
         agent_priv, agent_pub = S.new_key()
-        S.save_key(state / "agents" / f"{AGENT}.key", agent_priv)
-        grant = S.issue_grant(person_priv, AGENT, agent_pub, AGENT_CAPS, node=node_pub, ttl_s=AGENT_TTL_S)
+        S.save_key(state / "agents" / f"{agent}.key", agent_priv)
+        grant = S.issue_grant(person_priv, agent, agent_pub, AGENT_CAPS, node=node_pub, ttl_s=AGENT_TTL_S)
         grant_path.write_text(json.dumps(grant, indent=1))
-        done["agent"] = f"'{AGENT}' may {', '.join(AGENT_CAPS)} for 90 days"
+        done["agent"] = f"'{agent}' may {', '.join(AGENT_CAPS)} for 90 days"
     else:
-        done["agent"] = "kept"
-    net = home / ".nakshatra" / "net"
+        done["agent"] = f"'{agent}' kept"
     net.mkdir(parents=True, exist_ok=True, mode=0o700)
     if not (net / "agent").exists():
-        (net / "agent").write_text(AGENT + "\n")
+        (net / "agent").write_text(agent + "\n")
     done["person"], done["node"] = person_pub, node_pub
     return done
 
@@ -93,11 +96,14 @@ def start_services(sock: Path, timeout_s: float = 90) -> None:
     subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
     subprocess.run(["systemctl", "--user", "enable", "--now", "nak-signer.service", "nak-net.service"], check=False)
     subprocess.run(["systemctl", "--user", "restart", "nak-net.service"], check=False)
+    from network.client import NakClient, NakError
     end = time.time() + timeout_s
-    while time.time() < end:
-        if sock.exists():
+    while time.time() < end:                        # a leftover socket FILE proves nothing: wait for an answer
+        try:
+            NakClient(sock, timeout=5).status()
             return
-        time.sleep(1)
+        except NakError:
+            time.sleep(1)
     raise SystemExit("the messaging service did not come up; see: journalctl --user -u nak-net -n 30")
 
 
