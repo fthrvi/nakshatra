@@ -43,9 +43,12 @@ def test_a_modified_working_tree_is_rebuilt_not_trusted(tmp_path):
     assert _run(tmp_path / "src").returncode == 0
     f = tmp_path / "src" / "examples" / "nakshatra-spike" / "worker_daemon.cpp"
     f.write_text(f.read_text() + "\n// tampered after checkout\n")
+    (tmp_path / "src" / "build").mkdir()
+    (tmp_path / "src" / "build" / "CMakeCache.txt").write_text("CMAKE_PROJECT_INCLUDE:FILEPATH=/evil.cmake\n")
     r = _run(tmp_path / "src")
-    assert r.returncode == 0 and "already is the engine" not in r.stdout      # rebuilt from scratch
+    assert r.returncode == 0, r.stdout + r.stderr                             # rebuilt from scratch, every run
     assert "tampered after checkout" not in f.read_text()
+    assert not (tmp_path / "src" / "build").exists()                          # no stale build cache survives
 
 
 def test_caller_git_hooks_and_templates_cannot_run(tmp_path):

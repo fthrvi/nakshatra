@@ -119,7 +119,8 @@ elif [ ! -f "$LLAMA/examples/nakshatra-spike/worker_daemon.cpp" ]; then
   say "fetching patched llama.cpp source from $STACK_URL"
   curl -fsSL -o "$WORKER_DIR/stack.tgz" "$STACK_URL"
   _verify_or_die "$WORKER_DIR/stack.tgz" "${WORKER_STACK_SHA256:-}" "stack.tgz (the engine this box will BUILD AND RUN)"
-  mkdir -p "$LLAMA"; tar xzf "$WORKER_DIR/stack.tgz" -C "$LLAMA"; rm -f "$WORKER_DIR/stack.tgz"
+  rm -rf "$LLAMA"; mkdir -p "$LLAMA"            # never overlay a verified tarball onto stale files (Codex)
+  tar xzf "$WORKER_DIR/stack.tgz" -C "$LLAMA"; rm -f "$WORKER_DIR/stack.tgz"
 fi
 say "source ready at $LLAMA"
 

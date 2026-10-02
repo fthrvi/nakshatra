@@ -13,20 +13,14 @@ DEST="${1:?usage: source.sh DEST}"
 . "$HERE/BASE"
 UP="${ENGINE_UPSTREAM:-$UPSTREAM}"
 command -v git >/dev/null || { echo "[engine] REFUSING: git is required to build the verified engine source"; exit 1; }
-# Isolate git completely (Codex review 2026-10-03): no inherited GIT_* env, no global/system config, no
-# templates, no hooks — nothing from the caller's environment may run during fetch/checkout/am or change files.
-for v in $(env | grep -o '^GIT_[A-Z_]*' || true); do unset "$v"; done
+# Threat model: the SOURCE (upstream, a mirror, the network, a tarball) and stale or damaged LOCAL state
+# are untrusted. A local user who can already write these files could replace the built binary directly;
+# that is out of scope. So: NO fast path — every run builds a FRESH tree, verifies it, and atomically
+# REPLACES $DEST (any old checkout, git metadata and build cache go with it). (Codex review rounds 1+2.)
+# Isolate git completely: no inherited GIT_* variables, no global/system config, no templates, no hooks.
+while IFS= read -r v; do unset "$v"; done < <(compgen -e | grep '^GIT_' || true)
 export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0
-G() { git -c core.hooksPath=/dev/null -c core.fsmonitor=false -c protocol.file.allow=always "$@"; }
-# "Already the engine" means: the committed tree is TREE *and* the working tree is exactly that commit
-# (no modified, deleted or untracked files; ignored build output is fine). Anything else is rebuilt.
-is_engine() {
-  [ -d "$1/.git" ] && [ "$(G -C "$1" rev-parse 'HEAD^{tree}' 2>/dev/null)" = "$TREE" ] \
-    && [ -z "$(G -C "$1" status --porcelain 2>/dev/null)" ]
-}
-if is_engine "$DEST"; then
-  echo "[engine] $DEST already is the engine (tree ${TREE:0:12}, working tree clean)"; exit 0
-fi
+G() { git -c core.hooksPath=/dev/null -c core.fsmonitor=false "$@"; }
 rm -rf "$DEST.tmp"; mkdir -p "$DEST.tmp"
 G init -q --template= "$DEST.tmp"
 G -C "$DEST.tmp" fetch -q --depth 1 "$UP" "$COMMIT" 2>/dev/null || G -C "$DEST.tmp" fetch -q "$UP" "$COMMIT"
@@ -34,7 +28,8 @@ G -C "$DEST.tmp" checkout -q --detach FETCH_HEAD
 [ "$(G -C "$DEST.tmp" rev-parse HEAD)" = "$COMMIT" ] || { echo "[engine] REFUSING: upstream gave a different commit"; rm -rf "$DEST.tmp"; exit 1; }
 G -C "$DEST.tmp" -c user.email=engine@nakshatra -c user.name=engine am -q "$HERE"/patches/*.patch
 GOT="$(G -C "$DEST.tmp" rev-parse 'HEAD^{tree}')"
-if [ "$GOT" != "$TREE" ] || ! is_engine "$DEST.tmp"; then
+DIRTY="$(G -C "$DEST.tmp" status --porcelain --ignored --untracked-files=all)" || { echo "[engine] REFUSING: git status failed"; rm -rf "$DEST.tmp"; exit 1; }
+if [ "$GOT" != "$TREE" ] || [ -n "$DIRTY" ]; then
   echo "[engine] REFUSING: source tree $GOT is not the engine $TREE"; rm -rf "$DEST.tmp"; exit 1
 fi
 rm -rf "$DEST"; mv "$DEST.tmp" "$DEST"
