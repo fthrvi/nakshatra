@@ -1,8 +1,9 @@
 {
  "name": "nakshatra-node",
  "python": "3.12",
+ "installer": "nakshatra/release/install.py",
  "components": [
-  {"name": "nakshatra", "repo": "~/nakshatra", "paths": ["scripts", "proto"], "pythonpath": "scripts"},
+  {"name": "nakshatra", "repo": "~/nakshatra", "paths": ["scripts", "proto", "release"], "pythonpath": "scripts"},
   {"name": "sthambha", "repo": "~/sthambha", "paths": ["sthambha", "pyproject.toml"], "pythonpath": "."}
  ],
  "requirements": ["cryptography==46.0.6", "coincurve==21.0.0"],

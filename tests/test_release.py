@@ -173,3 +173,48 @@ def test_versions_are_immutable(env):
     _build(env, "0.1.0")
     with pytest.raises(SystemExit, match="immutable"):
         _build(env, "0.1.0")
+
+
+def test_update_run_from_the_installed_copy_works(env, monkeypatch):
+    # Regression (found on blackwell 2026-10-02): the update service runs the installer from the
+    # node's own copy; copying it "onto itself" crashed after `current` had already switched.
+    _build(env, "0.1.0")
+    env["inst"].install(str(env["dist"]), "canary", env["pub"])
+    monkeypatch.setattr(I, "HERE", env["tmp"] / "node" / "bin")
+    _commit(env["a"], "alpha", "OK = True\nV = 4\n")
+    _build(env, "0.1.1")
+    assert "installed 0.1.1" in env["inst"].update()
+
+
+def test_any_failure_after_switch_rolls_back(env, monkeypatch):
+    _build(env, "0.1.0")
+    env["inst"].install(str(env["dist"]), "canary", env["pub"])
+    _commit(env["a"], "alpha", "OK = True\nV = 5\n")
+    _build(env, "0.1.1")
+    real = I.Installer.write_units
+    calls = {"n": 0}
+
+    def flaky(self, man):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("disk full while writing units")
+        return real(self, man)
+
+    monkeypatch.setattr(I.Installer, "write_units", flaky)
+    with pytest.raises(I.InstallError, match="rolled back to 0.1.0"):
+        env["inst"].update()
+    assert os.readlink(env["tmp"] / "node" / "current") == "releases/0.1.0"
+
+
+def test_update_service_runs_the_installer_shipped_in_the_release(env, monkeypatch):
+    (env["a"] / "release").mkdir()
+    (env["a"] / "release" / "install.py").write_text("# shipped installer\n")
+    subprocess.run(["git", "-C", str(env["a"]), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(env["a"]), "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "r"], check=True)
+    spec = dict(B.SPEC, installer="alpha/release/install.py")
+    spec["components"] = [dict(spec["components"][0], paths=["pkg", "release"]), spec["components"][1]]
+    monkeypatch.setattr(B, "SPEC", spec)
+    _build(env, "0.1.0")
+    env["inst"].install(str(env["dist"]), "canary", env["pub"])
+    unit = (env["tmp"] / "units" / "nak-update.service").read_text()
+    assert "current/alpha/release/install.py" in unit and "update" in unit
