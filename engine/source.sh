@@ -21,16 +21,29 @@ command -v git >/dev/null || { echo "[engine] REFUSING: git is required to build
 while IFS= read -r v; do unset "$v"; done < <(compgen -e | grep '^GIT_' || true)
 export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0
 G() { git -c core.hooksPath=/dev/null -c core.fsmonitor=false "$@"; }
-rm -rf "$DEST.tmp"; mkdir -p "$DEST.tmp"
-G init -q --template= "$DEST.tmp"
-G -C "$DEST.tmp" fetch -q --depth 1 "$UP" "$COMMIT" 2>/dev/null || G -C "$DEST.tmp" fetch -q "$UP" "$COMMIT"
-G -C "$DEST.tmp" checkout -q --detach FETCH_HEAD
-[ "$(G -C "$DEST.tmp" rev-parse HEAD)" = "$COMMIT" ] || { echo "[engine] REFUSING: upstream gave a different commit"; rm -rf "$DEST.tmp"; exit 1; }
-G -C "$DEST.tmp" -c user.email=engine@nakshatra -c user.name=engine am -q "$HERE"/patches/*.patch
-GOT="$(G -C "$DEST.tmp" rev-parse 'HEAD^{tree}')"
-DIRTY="$(G -C "$DEST.tmp" status --porcelain --ignored --untracked-files=all)" || { echo "[engine] REFUSING: git status failed"; rm -rf "$DEST.tmp"; exit 1; }
+# One run at a time per DEST (mkdir is atomic everywhere, incl. macOS without flock); a UNIQUE staging
+# dir per run; both cleaned up on any exit. (Codex round 3: a shared DEST.tmp let concurrent runs mix trees.)
+mkdir -p "$(dirname "$DEST")"
+LOCK="$DEST.lock"
+if ! mkdir "$LOCK" 2>/dev/null; then echo "[engine] another engine build holds $LOCK (remove it if stale)"; exit 1; fi
+STAGE="$(mktemp -d "$DEST.stage.XXXXXX")"
+trap 'rm -rf "$STAGE"; rmdir "$LOCK" 2>/dev/null || true' EXIT
+G init -q --template= "$STAGE"
+G -C "$STAGE" fetch -q --depth 1 "$UP" "$COMMIT" 2>/dev/null || G -C "$STAGE" fetch -q "$UP" "$COMMIT"
+G -C "$STAGE" checkout -q --detach FETCH_HEAD
+[ "$(G -C "$STAGE" rev-parse HEAD)" = "$COMMIT" ] || { echo "[engine] REFUSING: upstream gave a different commit"; exit 1; }
+G -C "$STAGE" -c user.email=engine@nakshatra -c user.name=engine am -q "$HERE"/patches/*.patch
+GOT="$(G -C "$STAGE" rev-parse 'HEAD^{tree}')"
+DIRTY="$(G -C "$STAGE" status --porcelain --ignored --untracked-files=all)" || { echo "[engine] REFUSING: git status failed"; exit 1; }
 if [ "$GOT" != "$TREE" ] || [ -n "$DIRTY" ]; then
-  echo "[engine] REFUSING: source tree $GOT is not the engine $TREE"; rm -rf "$DEST.tmp"; exit 1
+  echo "[engine] REFUSING: source tree $GOT is not the engine $TREE"; exit 1
 fi
-rm -rf "$DEST"; mv "$DEST.tmp" "$DEST"
+# Commit: keep the old tree until the verified one is in place; put it back if the move fails.
+OLD=""
+if [ -e "$DEST" ] || [ -L "$DEST" ]; then OLD="$DEST.old.$$"; mv "$DEST" "$OLD"; fi
+if ! mv "$STAGE" "$DEST"; then
+  [ -n "$OLD" ] && mv "$OLD" "$DEST"
+  echo "[engine] REFUSING: could not move the verified tree into place; previous tree restored"; exit 1
+fi
+[ -n "$OLD" ] && rm -rf "$OLD"
 echo "[engine] $DEST = upstream ${COMMIT:0:12} + $(ls "$HERE"/patches/*.patch | wc -l) patches (tree ${TREE:0:12}, verified)"

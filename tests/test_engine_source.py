@@ -69,3 +69,15 @@ def test_caller_git_hooks_and_templates_cannot_run(tmp_path):
                        text=True, env=env, timeout=300)
     assert r.returncode == 0, r.stdout + r.stderr
     assert not marker.exists()
+
+
+def test_concurrent_runs_never_mix_trees(tmp_path):
+    import concurrent.futures as cf
+    with cf.ThreadPoolExecutor(3) as ex:
+        results = list(ex.map(lambda _: _run(tmp_path / "src"), range(3)))
+    assert any(r.returncode == 0 for r in results)                 # at least one built; others refused (lock)
+    base = dict(l.split("=", 1) for l in (ROOT / "engine" / "BASE").read_text().splitlines() if "=" in l and not l.startswith("#"))
+    got = subprocess.check_output(["git", "-C", str(tmp_path / "src"), "rev-parse", "HEAD^{tree}"], text=True).strip()
+    assert got == base["TREE"]
+    left = [p.name for p in tmp_path.iterdir() if p.name != "src"]
+    assert left == [], left                                         # no staging dirs, no lock, no .old left

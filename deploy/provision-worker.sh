@@ -120,7 +120,8 @@ elif [ ! -f "$LLAMA/examples/nakshatra-spike/worker_daemon.cpp" ]; then
   curl -fsSL -o "$WORKER_DIR/stack.tgz" "$STACK_URL"
   _verify_or_die "$WORKER_DIR/stack.tgz" "${WORKER_STACK_SHA256:-}" "stack.tgz (the engine this box will BUILD AND RUN)"
   rm -rf "$LLAMA"; mkdir -p "$LLAMA"            # never overlay a verified tarball onto stale files (Codex)
-  tar xzf "$WORKER_DIR/stack.tgz" -C "$LLAMA"; rm -f "$WORKER_DIR/stack.tgz"
+  tar xzf "$WORKER_DIR/stack.tgz" -C "$LLAMA" || { rm -rf "$LLAMA"; say "REFUSING: stack.tgz did not extract"; exit 1; }
+  rm -f "$WORKER_DIR/stack.tgz"
 fi
 say "source ready at $LLAMA"
 
