@@ -205,3 +205,66 @@ def test_control_socket_round_trip(net, tmp_path):
     with pytest.raises(SystemExit, match="not a contact"):
         nak.call(sock, {"op": "send", "to": "nobody", "text": "x"})
     stop.set()
+
+
+def _serve(node, tmp_path):
+    import threading
+    stop = threading.Event()
+    sock = tmp_path / f"{node.node[:8]}.sock"
+    threading.Thread(target=nakd.serve_control, args=(node, sock, stop), daemon=True).start()
+    assert wait(lambda: sock.exists())
+    return sock, stop
+
+
+def test_outbound_floor_refuses_secrets_and_invites(net):
+    a, b = _pair(net)
+    for bad in ("my key is sk-ant-" + "x" * 30, "-----BEGIN OPENSSH PRIVATE KEY-----", "A" * 200,
+                "join me: " + a.invite()):
+        with pytest.raises(ValueError):
+            a.node.send("b", bad)
+    a.node.send("b", "a normal note about dinner at 7, ok?")
+
+
+def test_mcp_front_door(net, tmp_path):
+    from network.client import NakClient
+    from network.nak_mcp import Server
+    a, b = _pair(net)
+    sock, stop = _serve(a.node, tmp_path)
+    srv = Server(NakClient(sock), allow_connect=False, aspect="whole")
+    init = srv.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}})
+    assert init["result"]["serverInfo"]["name"] == "nakshatra"
+    names = {t["name"] for t in srv.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})["result"]["tools"]}
+    assert names == {"nak_status", "nak_contacts", "nak_inbox", "nak_requests", "nak_send"}   # no connect tools
+    call = lambda n, args: srv.handle({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                                       "params": {"name": n, "arguments": args}})["result"]
+    r = call("nak_accept", {"id": "x"})
+    assert r["isError"] and "disabled" in r["content"][0]["text"]
+    r = call("nak_send", {"to": "stranger", "text": "hi"})
+    assert r["isError"] and "not a contact" in r["content"][0]["text"]
+    r = call("nak_send", {"to": "b", "text": "hello from the mcp"})
+    assert not r["isError"]
+    mid = r["content"][0]["text"].split("(id ")[1].split(")")[0]
+    assert wait(lambda: a.node.delivered(mid))
+    got = b.node.store.inbox()[0]
+    assert got["text"] == "hello from the mcp" and got["aspect"] == "whole"
+    # B's view of the inbox through its own front door is framed as untrusted
+    sock_b, stop_b = _serve(b.node, tmp_path)
+    inbox = Server(NakClient(sock_b)).call("nak_inbox", {})
+    assert inbox.startswith("UNTRUSTED EXTERNAL CONTENT") and "hello from the mcp" in inbox
+    stop.set(); stop_b.set()
+
+
+def test_mcp_stdio_process(net, tmp_path):
+    import subprocess
+    a = net("a")
+    sock, stop = _serve(a.node, tmp_path)
+    msgs = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "nak_status", "arguments": {}}}]
+    p = subprocess.run([sys.executable, str(_REPO / "scripts" / "network" / "nak_mcp.py"), "--sock", str(sock)],
+                       input="\n".join(json.dumps(m) for m in msgs) + "\n", capture_output=True, text=True, timeout=30,
+                       env=dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path)))
+    out = [json.loads(l) for l in p.stdout.splitlines()]
+    assert [o["id"] for o in out] == [1, 2]
+    assert a.person_pub[:16] in out[1]["result"]["content"][0]["text"]
+    stop.set()

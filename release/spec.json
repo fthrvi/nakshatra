@@ -58,5 +58,9 @@
    "-c",
    "import sthambha.signer, joincode, transport.secure_channel, transport.mux_tunnel, mesh.meshd, network.nakd"
   ]
- ]
+ ],
+ "commands": {
+  "nak": "network.nak",
+  "nak-mcp": "network.nak_mcp"
+ }
 }

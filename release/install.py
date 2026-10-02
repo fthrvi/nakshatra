@@ -175,6 +175,20 @@ class Installer:
             names.append(name)
         bin_dir = self.prefix / "bin"
         bin_dir.mkdir(exist_ok=True)
+        # Short commands (`nak`, `nak-mcp`): wrappers that always run the CURRENT release, so an update
+        # or rollback moves them too. Linked into ~/.local/bin only on a real (systemd) install, and never
+        # over a file that is not already our link.
+        for cmd, module in man.get("commands", {}).items():
+            w = bin_dir / cmd
+            w.write_text(f"#!/bin/sh\nPYTHONPATH={self._pythonpath(man)} exec {ctx['python']} -m {module} \"$@\"\n")
+            w.chmod(0o755)
+            if self.systemd:
+                link = Path.home() / ".local" / "bin" / cmd
+                link.parent.mkdir(parents=True, exist_ok=True)
+                if link.is_symlink() or not link.exists():
+                    if link.is_symlink():
+                        link.unlink()
+                    link.symlink_to(w)
         for f in ("install.py", "releasekit.py"):
             src, dst = HERE / f, bin_dir / f
             if not dst.exists() or src.resolve() != dst.resolve():

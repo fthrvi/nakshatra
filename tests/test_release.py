@@ -218,3 +218,14 @@ def test_update_service_runs_the_installer_shipped_in_the_release(env, monkeypat
     env["inst"].install(str(env["dist"]), "canary", env["pub"])
     unit = (env["tmp"] / "units" / "nak-update.service").read_text()
     assert "current/alpha/release/install.py" in unit and "update" in unit
+
+
+def test_command_wrappers_follow_current_release(env, monkeypatch):
+    monkeypatch.setitem(B.SPEC, "commands", {"nak": "alpha_mod"})
+    _build(env, "0.1.0")
+    env["inst"].install(str(env["dist"]), "canary", env["pub"])
+    w = env["tmp"] / "node" / "bin" / "nak"
+    body = w.read_text()
+    assert os.access(w, os.X_OK) and "current/venv/bin/python -m alpha_mod" in body and "releases/" not in body
+    # systemd=False (tests, dev) never touches the real ~/.local/bin
+    assert not (Path.home() / ".local" / "bin" / "nak").resolve().is_relative_to(env["tmp"])

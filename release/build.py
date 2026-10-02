@@ -72,7 +72,7 @@ def build(version: str, channel: str, refs: dict, key_path: Path, out_root: Path
                 "lock": {"file": lock.name, "sha256": rk.sha256_file(lock)},
                 "uv": {"file": "uv", "sha256": rk.sha256_file(out / "uv"), "version": uv_version},
                 "services": SPEC["services"], "health": SPEC["health"],
-                "installer": SPEC.get("installer", "")}
+                "installer": SPEC.get("installer", ""), "commands": SPEC.get("commands", {})}
     priv_hex = key_path.read_text().strip()
     signed = rk.sign(manifest, priv_hex)
     (out / "manifest.json").write_text(json.dumps(signed, indent=1, sort_keys=True))

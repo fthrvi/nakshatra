@@ -18,7 +18,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import socket
 import sys
 import time
 from pathlib import Path
@@ -29,21 +28,13 @@ if str(_SCRIPTS) not in sys.path:
 
 
 def call(sock_path: Path, req: dict) -> dict:
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    s.settimeout(60)
+    from network.client import NakClient, NakError
+    req = dict(req)
     try:
-        s.connect(str(sock_path))
-    except OSError as e:
-        raise SystemExit(f"nakd is not running ({sock_path}): {e}")
-    with s:
-        f = s.makefile("rwb")
-        f.write(json.dumps(req).encode() + b"\n")
-        f.flush()
-        line = f.readline()
-    r = json.loads(line) if line else {"ok": False, "error": "nakd closed the connection"}
-    if not r.get("ok"):
-        raise SystemExit(f"refused: {r.get('error')}")
-    return r
+        r = NakClient(sock_path).call(req.pop("op"), **req)
+    except NakError as e:
+        raise SystemExit(f"refused: {e}")
+    return dict(r, ok=True)
 
 
 def _ago(ts: int) -> str:
