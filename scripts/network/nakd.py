@@ -49,7 +49,8 @@ import joincode  # noqa: E402
 from mesh.pairing import pair_role  # noqa: E402
 from network.store import Store  # noqa: E402
 from network import tasks as T  # noqa: E402
-from network.settle import LedgerAdapter, SettlementError  # noqa: E402
+from network.settle import SettlementError  # noqa: E402
+import accounting as _accounting  # noqa: E402
 from transport.connect import open_channel  # noqa: E402
 from transport.secure_channel import SecureChannelError  # noqa: E402
 
@@ -167,7 +168,8 @@ class Node:
                  settlement=None):
         self.store = Store(state_dir)
         # Adapter #0 (local ledger, TEST units) unless a real one is passed; see network/settle.py.
-        self.settle = settlement or LedgerAdapter(Path(state_dir) / "settle.sqlite")
+        # THE accounting front door (accounting.py, U5) picks the escrow backend; tests may pass one.
+        self.settle = settlement or _accounting.escrow(Path(state_dir))
         self._key = node_key
         self.node = ed25519.Ed25519PrivateKey.from_private_bytes(node_key).public_key().public_bytes_raw().hex()
         self._signer = signer

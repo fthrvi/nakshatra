@@ -80,7 +80,7 @@ Unification work in progress (U1–U6): `trisul/plans/2026-10-03-nakshatra-unifi
 | Meter inference: `gate` / `settle(receipt)` | `ledger_client.py` → Neuron ledger | LIVE (`NAKSHATRA_CREDITS=1` → :8097) |
 | Settle once per run; tier credit limits | `settlekey.py`, `creditlimit.py` | BUILT / WIRED |
 | Task escrow: open / release / refund | `network/settle.py` (local ledger adapter) | LIVE (TEST units) |
-| → U5 puts metering and escrow under ONE interface | | |
+| **The front door for both halves** | **`scripts/accounting.py`**: `metering()` (the gateway's credit hook) and `escrow(state_dir)` (task escrow). New backends (Solana devnet escrow, the repaired Neuron ledger) are added HERE. | LIVE (U5, 2026-10-03) |
 | Ledger service | Neuron `python/ledger_server.py` :8097 | LIVE, **unauthenticated, racy, takes forged receipts** (fix before money) |
 | Chain | Neuron Substrate | LIVE, being stopped (Biswa 10-03) |
 

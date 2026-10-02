@@ -449,8 +449,8 @@ class ChainChatBackend(ChatBackend):
             try:
                 if self._scripts not in sys.path:
                     sys.path.insert(0, self._scripts)
-                from ledger_client import LedgerHook
-                h = LedgerHook()
+                from accounting import metering        # THE accounting front door (U5)
+                h = metering()
             except Exception:
                 from types import SimpleNamespace
                 h = SimpleNamespace(enabled=False, wants_receipt=False,
