@@ -81,3 +81,11 @@ def test_concurrent_runs_never_mix_trees(tmp_path):
     assert got == base["TREE"]
     left = [p.name for p in tmp_path.iterdir() if p.name != "src"]
     assert left == [], left                                         # no staging dirs, no lock, no .old left
+
+
+def test_a_stale_lock_from_a_dead_process_is_taken_over(tmp_path):
+    lock = tmp_path / "src.lock"
+    lock.mkdir()
+    (lock / "pid").write_text("999999\n")                          # no such process
+    r = _run(tmp_path / "src")
+    assert r.returncode == 0, r.stdout + r.stderr and not lock.exists()
