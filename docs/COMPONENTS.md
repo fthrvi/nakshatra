@@ -57,14 +57,22 @@ Unification work in progress (U1–U6): `trisul/plans/2026-10-03-nakshatra-unifi
 | sidecar key (`~/.config/nakshatra-sidecar/*.key`) | libp2p PeerId | `scripts/sidecar_key.py` writes it FROM the node key (same libp2p format). The live blackwell sidecar still has its own key, because switching changes its PeerId and Sutra's tunnel dials it: coordinate with that lane. |
 | `~/.nakshatra/keys/nostr.secp256k1` | Nostr transport only | another curve, required by Nostr. Already bound: the Nostr event carries the listing, and the listing is signed by the node key. |
 | person key (signer state) | the human; issues agent grants | separate on purpose: machine ≠ person |
+| `~/.nakshatra-worker/` key | outsider-GPU workers onboarded by trisul `worker.sh` | another node-key location → U4 folds it into the node key |
 
-## Joining
-| Who joins | Component | Status |
-|---|---|---|
-| A person (gets a node, asks a friend to connect) | `release/install.py join` (one pasted line) | LIVE (verified from zero) |
-| Your own machine into your fleet | `fabric/join.py` → Sthambha `/join` | WIRED |
-| An outsider's GPU, at a trust tier | `fabric/worker_join.py` + junction + trisul `infra/onboarding/worker.sh` | WIRED |
-| `scripts/join/` (`nakshatra join`) + legacy `encode_join` / `decode_join` | — | **DEAD** → U4 retires it |
+## Joining (who joins → the ONE live path for it today)
+| Who joins | Live path | Installer | Key | Status |
+|---|---|---|---|---|
+| Your own **device** onto your private mesh | trisul `infra/onboarding` `mesh-invite.sh` / knock (Biswa approves) → `onboard_server` `/redeem` | WireGuard `join.sh` | WireGuard | LIVE (VPS `onboard.service`) |
+| An **outsider's GPU** into your compute pool, at a trust tier | trisul `worker-invite.sh` → `worker.sh` → `onboard_server` `/worker-redeem` → `admission/peers.tsv` → junction | **unsigned** tarballs (`worker-llama-stack.tgz`, `worker-scripts.tgz`) | `~/.nakshatra-worker/` (a separate key location) | LIVE (blackwell's registrar came in this way) |
+| Your own **machine** into your fleet | `fabric/join.py` → Sthambha `/join` | by hand | node key | WIRED |
+| A **person**, as a contact | `release/install.py join` (one pasted line) | **signed release** | node key | LIVE |
+| (engine for the outsider-GPU path) | `scripts/join/` six-phase decision engine | — | — | BUILT: decisions tested, observation layer stubbed. **Not dead**: it is the planned engine for the worker kind. |
+
+**U4 (agreed direction): one invite, one installer, one key, several kinds.**
+- One installer: the signed release, everywhere. It retires the unsigned worker tarballs. The worker stack moves into the release first (U6).
+- One invite: the signed `nki1.` invite carries a `kind` (contact | worker | device). A worker invite also carries the one-time code from `onboard_server` (which stays the roster authority).
+- One node key: `~/.nakshatra/keys/worker.ed25519`, replacing `~/.nakshatra-worker/`.
+- Order: U6 (worker stack in the release) → the U4 worker kind → the device kind.
 
 ## Accounting
 | Job | Component | Status |
