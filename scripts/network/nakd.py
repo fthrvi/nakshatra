@@ -50,8 +50,8 @@ from mesh.pairing import pair_role  # noqa: E402
 from network.store import Store  # noqa: E402
 from network import tasks as T  # noqa: E402
 from network.settle import LedgerAdapter, SettlementError  # noqa: E402
-from transport.relay import connect as relay_connect  # noqa: E402
-from transport.secure_channel import SecureChannelError, secure_handshake  # noqa: E402
+from transport.connect import open_channel  # noqa: E402
+from transport.secure_channel import SecureChannelError  # noqa: E402
 
 try:
     from sthambha.signer import SignerError, canonical, verify_envelope
@@ -223,14 +223,9 @@ class Node:
         return r["envelope"]
 
     def _dial(self, rid: bytes, my_key: bytes, pin: str, initiator: bool, binding: bytes):
-        sock = relay_connect(self.relay[0], self.relay[1], rid, timeout=15)
-        sock.settimeout(WAIT_S)          # wait for the partner, then handshake
-        try:
-            ch = secure_handshake(sock, my_key, pin, initiator, binding)
-        except BaseException:
-            _close(sock)
-            raise
-        return sock, ch
+        # THE one way to reach a peer (transport/connect.py) — the same path meshd's tunnels use.
+        return open_channel(relay=self.relay, rendezvous_id=rid, my_key=my_key, peer_pub_hex=pin,
+                            initiator=initiator, binding=binding, connect_timeout=15, wait_timeout=WAIT_S)
 
     def _backoff(self, attempt: int) -> None:
         self._stop.wait(min(30.0, 0.3 * (2 ** min(attempt, 7))) * (0.5 + random.random()))

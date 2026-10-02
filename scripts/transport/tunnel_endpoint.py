@@ -23,8 +23,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from transport.relay import connect  # noqa: E402
-from transport.secure_channel import secure_handshake  # noqa: E402
+from transport.connect import open_channel  # noqa: E402
 from transport.mux_tunnel import MuxTunnel  # noqa: E402
 
 
@@ -37,10 +36,9 @@ def main() -> int:
 
     print(f"[tunnel] connecting OUT to relay {relay_host}:{relay_port} (rdv={sys.argv[4]})",
           flush=True)
-    sock = connect(relay_host, relay_port, rdv, timeout=30)
-    print("[tunnel] paired; running ENCRYPTED handshake (X25519 + pinned Ed25519)…", flush=True)
-    chan = secure_handshake(sock, my_priv, peer_pub, is_init,
-                            session_binding=b"tunnel:" + rdv)
+    _sock, chan = open_channel(relay=(relay_host, relay_port), rendezvous_id=rdv, my_key=my_priv,
+                               peer_pub_hex=peer_pub, initiator=is_init, binding=b"tunnel:" + rdv,
+                               connect_timeout=30)
     print(f"[tunnel] authenticated + encrypted to peer {chan.peer_pubkey_hex[:16]} — "
           f"tunnel UP (relay sees only ciphertext)", flush=True)
 

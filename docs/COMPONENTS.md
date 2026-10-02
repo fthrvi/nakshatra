@@ -38,7 +38,7 @@ Unification work in progress (U1–U6): `trisul/plans/2026-10-03-nakshatra-unifi
 | **Hole punching + relay fallback (libp2p DCUtR, circuit-relay-v2)** | `third_party/shard-libp2p-sidecar` | **LIVE**: VPS relay :29700 (+QUIC); blackwell exposes Ollama through it | VPS, blackwell |
 | Native UDP hole punch (HMAC-authenticated) | `mesh/direct_path.py` | BUILT, **not called** (proven 3.77× on WAN 2026-08-01) | — |
 | Relay / direct / IPv6 decision; NAT class | `pathchoice.py`, `ipv6.py`, `natclass.py`, `stunshape.py`, `mesh/path_probe.py` | BUILT, not called | — |
-| Dial a peer (relay + pinned handshake) | three copies today: `meshd._ensure_tunnel`, `network/nakd._dial`, `transport/tunnel_endpoint.py` | LIVE | → **U3 folds them into one** |
+| **Reach a peer** (relay + pinned handshake + purpose binding) | **`transport/connect.py` `open_channel`**: the ONE path. meshd, nakd and tunnel_endpoint all call it. Direct paths (direct_tunnel / direct_path / sidecar) plug in HERE (U3b). | LIVE | every node |
 
 ## People and their agents (added 2026-10)
 | Job | Component | Status | Runs where |

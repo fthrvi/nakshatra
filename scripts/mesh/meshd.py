@@ -55,8 +55,7 @@ from discovery.relay import FileRelay, pin_from_listing  # noqa: E402
 from discovery.wanted_tracker import WantedTracker  # noqa: E402
 from recovery.drift_aware import drift_compatible  # noqa: E402
 from discovery.provenance import provenance_from_daemon  # noqa: E402
-from transport.relay import connect as relay_connect  # noqa: E402
-from transport.secure_channel import secure_handshake  # noqa: E402
+from transport.connect import open_channel  # noqa: E402
 from transport.mux_tunnel import MuxTunnel  # noqa: E402
 from mesh.pairing import pair_role  # noqa: E402
 
@@ -339,11 +338,11 @@ class MeshNode:
 
         def run_tunnel():
             try:
-                sock = relay_connect(self.cfg.rendezvous_host,
-                                     self.cfg.rendezvous_port,
-                                     role.rendezvous_id, timeout=30)
-                chan = secure_handshake(sock, self.priv, pin.ed25519_pubkey_hex,
-                                        role.is_initiator, session_binding=binding)
+                _sock, chan = open_channel(
+                    relay=(self.cfg.rendezvous_host, self.cfg.rendezvous_port),
+                    rendezvous_id=role.rendezvous_id, my_key=self.priv,
+                    peer_pub_hex=pin.ed25519_pubkey_hex, initiator=role.is_initiator,
+                    binding=binding, connect_timeout=30)
                 mux = MuxTunnel(chan)
                 handle_box["mux"] = mux
                 if role.is_client:
