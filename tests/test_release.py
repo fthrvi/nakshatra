@@ -60,9 +60,9 @@ def env(tmp_path, monkeypatch):
                        {"name": "beta", "repo": str(b), "paths": ["pkg"], "pythonpath": "pkg"}],
         "services": {},
         "health": [[sys.executable, "-c", "import alpha_mod, beta_mod; assert alpha_mod.OK and beta_mod.OK"]]})
-    monkeypatch.setattr(I, "UNIT_DIR", tmp_path / "units")
+    monkeypatch.setattr(I, "UNIT_DIR", tmp_path / "units")   # belt and braces; the installer below is told explicitly
     dist = tmp_path / "dist"
-    inst = I.Installer(tmp_path / "node", systemd=False, make_venv=False)
+    inst = I.Installer(tmp_path / "node", systemd=False, make_venv=False, unit_dir=tmp_path / "units")
     return {"key": key, "pub": pub, "a": a, "b": b, "uv": fake_uv, "dist": dist, "inst": inst, "tmp": tmp_path}
 
 
@@ -235,12 +235,14 @@ def test_command_wrappers_follow_current_release(env, monkeypatch):
 def test_failed_first_install_leaves_nothing_half_installed(env, monkeypatch):
     _build(env, "0.1.0")
     inst = env["inst"]
-    monkeypatch.setattr(I.Installer, "health", lambda self, man: (_ for _ in ()).throw(I.InstallError("boom")))
-    with pytest.raises(I.InstallError, match="first install of 0.1.0 failed and was removed"):
-        inst.install(str(env["dist"]), "canary", env["pub"])
+    # NEVER monkeypatch.undo() here: it also undoes the fixture's patches (that is how this test once
+    # rewrote the hub's real systemd units). Scope the failure with a context instead.
+    with monkeypatch.context() as m:
+        m.setattr(I.Installer, "health", lambda self, man: (_ for _ in ()).throw(I.InstallError("boom")))
+        with pytest.raises(I.InstallError, match="first install of 0.1.0 failed and was removed"):
+            inst.install(str(env["dist"]), "canary", env["pub"])
     node = env["tmp"] / "node"
     assert not (node / "current").exists() and not (node / "releases" / "0.1.0").exists()
-    monkeypatch.undo()
     assert "installed 0.1.0" in inst.install(str(env["dist"]), "canary", env["pub"])     # retry works
 
 
@@ -262,3 +264,9 @@ def test_join_refuses_a_release_older_than_the_invite_names(env):
     _build(env, "0.1.0")
     with pytest.raises(I.InstallError, match="older than 0.2.0"):
         env["inst"].install(str(env["dist"]), "canary", env["pub"], min_version="0.2.0")
+
+
+def test_a_non_systemd_installer_can_never_write_real_units(tmp_path):
+    real = Path.home() / ".config" / "systemd" / "user"
+    inst = I.Installer(tmp_path / "node", systemd=False, make_venv=False)
+    assert inst.unit_dir == tmp_path / "node" / "units" and inst.unit_dir != real

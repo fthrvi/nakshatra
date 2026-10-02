@@ -99,10 +99,15 @@ def _current(prefix: Path):
 
 
 class Installer:
-    def __init__(self, prefix: Path = DEFAULT_PREFIX, *, systemd: bool = True, make_venv: bool = True):
+    def __init__(self, prefix: Path = DEFAULT_PREFIX, *, systemd: bool = True, make_venv: bool = True,
+                 unit_dir=None):
         self.prefix = Path(prefix)
         self.systemd = systemd
         self.make_venv = make_venv
+        # Decided ONCE, here. An installer that is not driving systemd (tests, dev) writes its units
+        # inside its own prefix and can NEVER touch the real ~/.config/systemd/user — on 2026-10-03 a
+        # test that undid a monkeypatch rewrote the hub's real nak-update.service to a pytest tmp dir.
+        self.unit_dir = Path(unit_dir) if unit_dir else (UNIT_DIR if systemd else self.prefix / "units")
 
     # ── fetch + verify ──
     def fetch_verified(self, source: str, channel: str, pubkey: str, version=None) -> tuple:
@@ -169,14 +174,14 @@ class Installer:
     # ── services + health ──
     def write_units(self, man: dict) -> list:
         ctx, names = self._ctx(man), []
-        UNIT_DIR.mkdir(parents=True, exist_ok=True)
+        self.unit_dir.mkdir(parents=True, exist_ok=True)
         for name, svc in man.get("services", {}).items():
             cond = f"ConditionPathExists={_render(svc['requires'], ctx)}\n" if svc.get("requires") else ""
             unit = (f"[Unit]\nDescription={svc['description']} (managed by nakshatra-node install.py)\n{cond}\n"
                     f"[Service]\nEnvironment=PYTHONPATH={self._pythonpath(man)}\n"
                     f"ExecStart={' '.join(_render(a, ctx) for a in svc['exec'])}\nRestart=on-failure\nRestartSec=5\n\n"
                     f"[Install]\nWantedBy=default.target\n")
-            (UNIT_DIR / f"{name}.service").write_text(unit)
+            (self.unit_dir / f"{name}.service").write_text(unit)
             names.append(name)
         bin_dir = self.prefix / "bin"
         bin_dir.mkdir(exist_ok=True)
@@ -203,10 +208,10 @@ class Installer:
         shipped = man.get("installer")
         cur_rel = self.prefix / "releases" / man["version"]
         updater = (self.prefix / "current" / shipped) if shipped and (cur_rel / shipped).exists() else bin_dir / "install.py"
-        (UNIT_DIR / "nak-update.service").write_text(
+        (self.unit_dir / "nak-update.service").write_text(
             "[Unit]\nDescription=Nakshatra node self-update (signed releases only)\n\n"
             f"[Service]\nType=oneshot\nExecStart={sys.executable} {updater} --prefix {self.prefix} update\n")
-        (UNIT_DIR / "nak-update.timer").write_text(
+        (self.unit_dir / "nak-update.timer").write_text(
             "[Unit]\nDescription=Hourly Nakshatra node update check\n\n"
             "[Timer]\nOnCalendar=hourly\nRandomizedDelaySec=600\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n")
         if self.systemd:

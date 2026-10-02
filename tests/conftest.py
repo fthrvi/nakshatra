@@ -85,3 +85,31 @@ from pathlib import Path as _Path
 _scripts = str(_Path(__file__).resolve().parents[1] / "scripts")
 if _scripts not in _sys.path:
     _sys.path.insert(0, _scripts)
+
+
+# ── real-machine guard (2026-10-03) ──────────────────────────────────────────────────────────────
+# A release test once rewrote the hub's REAL ~/.config/systemd/user/nak-update.service (a
+# monkeypatch.undo() also undid the fixture's tmp redirect). Fail the whole run if any test changes the
+# real node's units or messaging/signer state, instead of finding out from a broken updater.
+import hashlib as _hashlib
+from pathlib import Path as _Path
+
+
+def _real_state_digest():
+    home = _Path.home()
+    paths = sorted(list((home / ".config" / "systemd" / "user").glob("nak-*")) +
+                   [home / ".nakshatra" / "net" / "agent", home / ".nakshatra" / "net" / "release-url",
+                    home / ".sthambha" / "signer" / "person.pub", home / ".sthambha" / "signer" / "node.pub"])
+    h = _hashlib.sha256()
+    for p in paths:
+        if p.is_file():
+            h.update(str(p).encode() + p.read_bytes())
+    return h.hexdigest()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _never_touch_the_real_node():
+    before = _real_state_digest()
+    yield
+    assert _real_state_digest() == before, \
+        "a test modified the REAL node's systemd units or net/signer state (see tests/conftest.py guard)"
