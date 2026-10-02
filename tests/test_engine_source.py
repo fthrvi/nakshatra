@@ -37,3 +37,32 @@ def test_a_tampered_patch_is_refused_and_nothing_is_left(tmp_path):
 def test_the_stale_rebuild_script_refuses():
     r = subprocess.run(["bash", str(ROOT / "deploy" / "rebuild-worker.sh")], capture_output=True, text=True)
     assert r.returncode == 2 and "retired" in r.stderr
+
+
+def test_a_modified_working_tree_is_rebuilt_not_trusted(tmp_path):
+    assert _run(tmp_path / "src").returncode == 0
+    f = tmp_path / "src" / "examples" / "nakshatra-spike" / "worker_daemon.cpp"
+    f.write_text(f.read_text() + "\n// tampered after checkout\n")
+    r = _run(tmp_path / "src")
+    assert r.returncode == 0 and "already is the engine" not in r.stdout      # rebuilt from scratch
+    assert "tampered after checkout" not in f.read_text()
+
+
+def test_caller_git_hooks_and_templates_cannot_run(tmp_path):
+    hooks = tmp_path / "evil-hooks"
+    hooks.mkdir()
+    marker = tmp_path / "hook-ran"
+    for h in ("post-checkout", "applypatch-msg", "post-applypatch", "pre-applypatch"):
+        (hooks / h).write_text(f"#!/bin/sh\ntouch {marker}\n")
+        (hooks / h).chmod(0o755)
+    tmpl = tmp_path / "tmpl"
+    (tmpl / "hooks").mkdir(parents=True)
+    import shutil as _sh
+    for h in hooks.iterdir():
+        _sh.copy(h, tmpl / "hooks" / h.name)
+    env = {"PATH": "/usr/bin:/bin", "HOME": str(Path.home()), "ENGINE_UPSTREAM": str(LOCAL_UPSTREAM),
+           "GIT_TEMPLATE_DIR": str(tmpl), "GIT_CONFIG_PARAMETERS": f"'core.hooksPath={hooks}'"}
+    r = subprocess.run(["bash", str(ROOT / "engine" / "source.sh"), str(tmp_path / "src")], capture_output=True,
+                       text=True, env=env, timeout=300)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not marker.exists()

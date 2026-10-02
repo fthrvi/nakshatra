@@ -104,9 +104,17 @@ command -v cc >/dev/null 2>&1 || say "WARNING: no C compiler — the build will 
 # pinned commit + engine/patches, REFUSED unless the git tree hash matches engine/BASE TREE (every file).
 # Legacy fallback: the vendored tarball below (sha256-pinned). Never both, never neither.
 ENGINE_SRC_SH="$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)/engine/source.sh"
-if [ -x "$ENGINE_SRC_SH" ] && [ "${WORKER_SOURCE:-engine}" = "engine" ]; then
+if [ -f "$ENGINE_SRC_SH" ]; then
+  # A release always builds the verified engine: no switch turns this off (Codex review 2026-10-03).
+  command -v git >/dev/null || { say "REFUSING: git is required to build the verified engine (install git)"; exit 1; }
   say "building the engine source from the release's engine/ (verified tree)"
   bash "$ENGINE_SRC_SH" "$LLAMA"
+elif [ -f "$LLAMA/examples/nakshatra-spike/worker_daemon.cpp" ] && [ "${WORKER_TRUST_EXISTING_SOURCE:-}" != "1" ]; then
+  # Legacy (no engine/ beside this script): existing source was never verified. Do not build it silently.
+  say "REFUSING: $LLAMA holds engine source this script cannot verify (no engine/ next to it)."
+  say "  Run provision-worker.sh from a signed release (it builds the verified engine), or set"
+  say "  WORKER_TRUST_EXISTING_SOURCE=1 to build that source anyway (you vouch for it)."
+  exit 1
 elif [ ! -f "$LLAMA/examples/nakshatra-spike/worker_daemon.cpp" ]; then
   say "fetching patched llama.cpp source from $STACK_URL"
   curl -fsSL -o "$WORKER_DIR/stack.tgz" "$STACK_URL"
