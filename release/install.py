@@ -176,10 +176,17 @@ class Installer:
         bin_dir = self.prefix / "bin"
         bin_dir.mkdir(exist_ok=True)
         for f in ("install.py", "releasekit.py"):
-            shutil.copy2(HERE / f, bin_dir / f)
+            src, dst = HERE / f, bin_dir / f
+            if not dst.exists() or src.resolve() != dst.resolve():
+                shutil.copy2(src, dst)
+        # Updates run the installer that ships INSIDE the signed release, so the installer itself is
+        # updated through the same verified path; bin/ is only the bootstrap fallback.
+        shipped = man.get("installer")
+        cur_rel = self.prefix / "releases" / man["version"]
+        updater = (self.prefix / "current" / shipped) if shipped and (cur_rel / shipped).exists() else bin_dir / "install.py"
         (UNIT_DIR / "nak-update.service").write_text(
             "[Unit]\nDescription=Nakshatra node self-update (signed releases only)\n\n"
-            f"[Service]\nType=oneshot\nExecStart={sys.executable} {bin_dir / 'install.py'} update\n")
+            f"[Service]\nType=oneshot\nExecStart={sys.executable} {updater} --prefix {self.prefix} update\n")
         (UNIT_DIR / "nak-update.timer").write_text(
             "[Unit]\nDescription=Hourly Nakshatra node update check\n\n"
             "[Timer]\nOnCalendar=hourly\nRandomizedDelaySec=600\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n")
@@ -224,8 +231,8 @@ class Installer:
         finally:
             shutil.rmtree(work, ignore_errors=True)
         _switch(self.prefix, man["version"])
-        names = self.write_units(man)
         try:
+            names = self.write_units(man)
             self.health(man)
             self.restart(names)
         except Exception as e:
@@ -234,7 +241,7 @@ class Installer:
                 prev_man = json.loads((self.prefix / "releases" / prev / "manifest.json").read_text())
                 self.write_units(prev_man)
                 self.restart(list(prev_man.get("services", {})))
-                raise InstallError(f"{man['version']} failed its health check and was rolled back to {prev}: {e}")
+                raise InstallError(f"{man['version']} failed after switching and was rolled back to {prev}: {e}")
             raise
         cfg.update({"source": source, "channel": channel, "pubkey": pubkey, "current": man["version"],
                     "previous": prev, "updated": int(time.time())})
