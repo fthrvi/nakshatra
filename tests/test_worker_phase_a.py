@@ -38,8 +38,12 @@ import worker  # noqa: E402
 # ── A1: gRPC message-size cap is set as an explicit constant ─────────
 
 
-def test_a1_grpc_message_cap_constant_is_16mib():
-    assert worker.WORKER_GRPC_MAX_MESSAGE_BYTES == 16 * 1024 * 1024
+def test_a1_grpc_message_cap_constant_is_256mib():
+    # Raised from 16 MiB (a145384, 2026-06-25): a 2048-token prefill hidden state is
+    # n_tok × hidden × 4 B (2048 × 5120 × 4 ≈ 42 MB), so 16 MiB dropped real prompts with
+    # RESOURCE_EXHAUSTED. The test pins the value AND the reason it has to be at least that big.
+    assert worker.WORKER_GRPC_MAX_MESSAGE_BYTES == 256 * 1024 * 1024
+    assert worker.WORKER_GRPC_MAX_MESSAGE_BYTES >= 2048 * 5120 * 4
 
 
 # ── A2: _iter_with_idle_timeout ──────────────────────────────────────

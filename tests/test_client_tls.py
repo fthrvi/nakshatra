@@ -28,6 +28,20 @@ import nakshatra_tls as nt  # noqa: E402
 # ── _sanitize_spki ─────────────────────────────────────────────────────
 
 
+
+_CAP = 256 * 1024 * 1024
+
+
+def _assert_insecure_with_cap(mock_grpc, address):
+    """Insecure channels must carry the 256 MiB message cap (the 4 MiB gRPC default dropped any
+    real prefill; see client.open_chain_channel)."""
+    mock_grpc.insecure_channel.assert_called_once()
+    args, kwargs = mock_grpc.insecure_channel.call_args
+    assert args == (address,)
+    opts = dict(kwargs.get("options") or [])
+    assert opts.get("grpc.max_receive_message_length") == _CAP
+    assert opts.get("grpc.max_send_message_length") == _CAP
+
 def test_sanitize_spki_valid_lowercase():
     h = "a" * 64
     assert cli._sanitize_spki(h) == h
@@ -68,7 +82,7 @@ def test_open_chain_channel_tls_off_returns_insecure():
     with patch.object(cli, "grpc") as mock_grpc:
         with patch.object(cli, "_wtls") as mock_tls:
             cli._open_chain_channel("h:1", "a" * 64, "off")
-    mock_grpc.insecure_channel.assert_called_once_with("h:1")
+    _assert_insecure_with_cap(mock_grpc, "h:1")
     mock_tls.open_pinned_channel.assert_not_called()
 
 
@@ -80,7 +94,7 @@ def test_open_chain_channel_module_missing_falls_back_to_insecure():
     with patch.object(cli, "_TLS_AVAILABLE", False):
         with patch.object(cli, "grpc") as mock_grpc:
             cli._open_chain_channel("h:1", "a" * 64, "auto")
-    mock_grpc.insecure_channel.assert_called_once_with("h:1")
+    _assert_insecure_with_cap(mock_grpc, "h:1")
 
 
 def test_open_chain_channel_auto_with_hash_pins():
