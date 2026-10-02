@@ -49,6 +49,7 @@ import joincode  # noqa: E402
 from mesh.pairing import pair_role  # noqa: E402
 from network.store import Store  # noqa: E402
 from network import tasks as T  # noqa: E402
+from network.settle import LedgerAdapter, SettlementError  # noqa: E402
 from transport.relay import connect as relay_connect  # noqa: E402
 from transport.secure_channel import SecureChannelError, secure_handshake  # noqa: E402
 
@@ -64,6 +65,7 @@ except ImportError:  # the release ships both; a dev checkout may point at a sth
 MSG_DOMAIN = "nak-msg-v1"
 MAX_FRAME = 1 << 20
 MAX_TEXT = 8000
+SWEEP_S = 30.0          # how often expired tasks are swept (refund + notify)
 WAIT_S = 100.0          # under the relay's 120 s waiting TTL, so we re-register before it reaps us
 PING_S = 30.0
 IDLE_S = 95.0           # no frame (not even a ping) for this long = the peer is gone
@@ -161,8 +163,11 @@ class SignerClient:
 
 class Node:
     def __init__(self, state_dir: Path, node_key: bytes, signer: Callable[[dict], dict], *,
-                 agent: str, relay: tuple = DEFAULT_RELAY, log: Callable[[str], None] = lambda m: None):
+                 agent: str, relay: tuple = DEFAULT_RELAY, log: Callable[[str], None] = lambda m: None,
+                 settlement=None):
         self.store = Store(state_dir)
+        # Adapter #0 (local ledger, TEST units) unless a real one is passed; see network/settle.py.
+        self.settle = settlement or LedgerAdapter(Path(state_dir) / "settle.sqlite")
         self._key = node_key
         self.node = ed25519.Ed25519PrivateKey.from_private_bytes(node_key).public_key().public_bytes_raw().hex()
         self._signer = signer
@@ -190,6 +195,7 @@ class Node:
             self._spawn(f"invite:{inv['nonce']}", self._invite_loop, inv)
         for c in self.store.contacts():
             self._ensure_session(c["person"])
+        self._spawn("sweeper", self._sweep_loop)
         return self
 
     def stop(self) -> None:
@@ -537,11 +543,65 @@ class Node:
             raise ValueError(why)
         spec = T.make_spec(self.person, title, instructions, acceptance, reward=reward, deadline_s=deadline_s)
         h = T.task_hash(spec)
+        escrow = None
+        if spec["reward"]["amount"] > 0:
+            escrow = self._open_escrow(h, spec)            # raises if the signer or the ledger says no
         self.store.task_insert(h, "poster", "", spec, "posted", [c["person"] for c in targets])
         for c in targets:
             self._queue(c["person"], "task.post", {"task_hash": h, "spec": spec})
         self.log(f"posted task {h[:12]} '{title}' to {len(targets)} contact(s)")
-        return {"task_hash": h, "posted_to": [c["petname"] or c["person"][:12] for c in targets]}
+        return {"task_hash": h, "posted_to": [c["petname"] or c["person"][:12] for c in targets], "escrow": escrow}
+
+    def _open_escrow(self, h: str, spec: dict) -> dict:
+        amount, unit = spec["reward"]["amount"], spec["reward"]["unit"]
+        r = self._signer({"op": "approve_spend", "agent": self.agent, "task_hash": h, "epoch": 0,
+                          "amount": amount, "mint": unit, "to": "escrow"})
+        if not r.get("ok"):
+            raise ValueError(f"the signer refused the reward: {r.get('error')}")
+        if r.get("status") == "needs_human":
+            raise ValueError(f"this reward needs your person's approval (over the agent's cap): {r.get('description')}")
+        try:
+            return self.settle.open(h, self.person, amount, unit, spec["deadline"], r["authorisation"])
+        except SettlementError as e:
+            raise ValueError(f"escrow: {e}")
+
+    def _settle(self, h: str, spec: dict, how: str, party: str = "", reason: str = "") -> Optional[dict]:
+        """release|refund the task's escrow, if it has one. Exactly-once is the adapter's job."""
+        if spec["reward"]["amount"] <= 0:
+            return None
+        try:
+            return self.settle.release(h, party) if how == "release" else self.settle.refund(h, reason)
+        except SettlementError as e:
+            self.log(f"settlement {how} for {h[:12]} refused: {e}")
+            return {"error": str(e)}
+
+    def _sweep_loop(self) -> None:
+        while not self._stop.wait(SWEEP_S):
+            try:
+                self.sweep()
+            except Exception as e:  # noqa: BLE001 — a sweep bug must never kill the node
+                self.log(f"sweep failed: {e}")
+
+    def sweep(self, now: Optional[float] = None) -> int:
+        """Expire tasks whose deadline passed without an accepted result: refund the poster's escrow and
+        tell the assignee; mark this node's own offers/claims expired. Returns how many expired."""
+        now = time.time() if now is None else now
+        n = 0
+        for t in self.store.tasks(limit=500):
+            if t["spec"]["deadline"] > now:
+                continue
+            if t["role"] == "poster" and t["state"] in ("posted", "assigned"):
+                if self.store.task_cas(t["task_hash"], "poster", "", ("posted", "assigned"), state="expired",
+                                       verdict=json.dumps({"passed": False, "reasons": ["deadline passed"]})):
+                    self._settle(t["task_hash"], t["spec"], "refund", reason="expired")
+                    if t["assignee"]:
+                        self._queue(t["assignee"], "task.reject", {"task_hash": t["task_hash"], "epoch": t["epoch"],
+                                                                   "reasons": ["deadline passed"]})
+                    n += 1
+            elif t["role"] == "worker" and t["state"] in ("offered", "claimed", "assigned"):
+                n += self.store.task_cas(t["task_hash"], "worker", t["peer"], ("offered", "claimed", "assigned"),
+                                         state="expired")
+        return n
 
     def _worker_task(self, ref: str) -> dict:
         rows = [r for r in self.store.task_find(str(ref)) if r["role"] == "worker"]
@@ -565,6 +625,8 @@ class Node:
         why = outbound_problem(output)
         if why:
             raise ValueError(why)
+        if t["spec"]["deadline"] <= time.time():
+            raise ValueError("that task's deadline has passed; the poster will not take a result now")
         passed, reasons = T.evaluate(t["spec"], output)       # the worker can see it would fail first
         if not self.store.task_cas(t["task_hash"], "worker", t["peer"], ("assigned",),
                                    state="submitted", output=output):
@@ -614,6 +676,9 @@ class Node:
             t = self.store.task_get(h, "poster", "")
             if not t or t["assignee"] != c["person"] or body.get("epoch") != t["epoch"]:
                 raise ValueError("result for a task not assigned to you")
+            if t["spec"]["deadline"] <= time.time():
+                self.sweep()                                 # expire + refund now rather than at the next tick
+                raise ValueError("deadline passed; the task expired and its escrow was refunded")
             output = body.get("output")
             passed, reasons = T.evaluate(t["spec"], output)
             verdict = {"passed": passed, "reasons": reasons,
@@ -621,6 +686,11 @@ class Node:
             if not self.store.task_cas(h, "poster", "", ("assigned",), state="accepted" if passed else "rejected",
                                        output=output, verdict=json.dumps(verdict)):
                 raise ValueError("task is not awaiting a result")
+            receipt = self._settle(h, t["spec"], "release" if passed else "refund", party=c["person"],
+                                   reason="accepted" if passed else "rejected")
+            if receipt is not None:
+                verdict["settlement"] = receipt
+                self.store.task_cas(h, "poster", "", ("accepted", "rejected"), verdict=json.dumps(verdict))
             self.store.raw_log({"received": int(time.time()), "source": "nakshatra", "trust": "external",
                                 "from_person": c["person"], "envelope": env, "body": body})
             self._queue(c["person"], "task.accept" if passed else "task.reject",
@@ -632,9 +702,15 @@ class Node:
             if not t:
                 raise ValueError("no such task here")
             reasons = body.get("reasons") if isinstance(body.get("reasons"), list) else []
-            verdict = json.dumps({"passed": kind == "task.accept", "reasons": [str(r)[:300] for r in reasons][:12]})
+            v = {"passed": kind == "task.accept", "reasons": [str(r)[:300] for r in reasons][:12]}
+            if isinstance(body.get("settlement"), dict):       # the poster's receipt (verifiable on-chain later)
+                v["settlement"] = {k: body["settlement"].get(k) for k in ("adapter", "event", "amount", "unit")}
+            verdict = json.dumps(v)
             if body.get("epoch") == 0:
                 self.store.task_cas(h, "worker", c["person"], ("claimed",), state="lost", verdict=verdict)
+            elif kind == "task.reject" and v["reasons"] == ["deadline passed"]:
+                self.store.task_cas(h, "worker", c["person"], ("assigned", "submitted", "expired"),
+                                    state="expired", verdict=verdict)
             else:
                 self.store.task_cas(h, "worker", c["person"], ("submitted",),
                                     state="accepted" if kind == "task.accept" else "rejected", verdict=verdict)
@@ -673,7 +749,7 @@ def _hard_close(ch) -> None:
 # ── control socket (the CLI and, on Day 5, the MCP front door talk to this) ───────────────────
 
 OPS = {"status", "register_invite", "redeem", "requests", "accept", "decline", "contacts", "remove", "send",
-       "delivered", "inbox", "task_post", "tasks", "task_claim", "task_submit"}
+       "delivered", "inbox", "task_post", "tasks", "task_claim", "task_submit", "ledger"}
 
 
 def handle(node: Node, req: dict) -> dict:
@@ -712,6 +788,8 @@ def handle(node: Node, req: dict) -> dict:
                 r["peer_name"] = (c or {}).get("petname", "")
                 r["name_source"] = (c or {}).get("name_src") or "self-chosen"
             return {"ok": True, "tasks": rows}
+        if op == "ledger":
+            return {"ok": True, "adapter": node.settle.name, "journal": node.settle.journal(req.get("task") or None)}
         if op == "task_claim":
             return {"ok": True, **node.claim_task(req["task"])}
         if op == "task_submit":

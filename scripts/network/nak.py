@@ -60,6 +60,7 @@ def main(argv=None) -> int:
     p = sub.add_parser("send"); p.add_argument("to"); p.add_argument("text")
     p.add_argument("--aspect", default="")
     p = sub.add_parser("inbox"); p.add_argument("--limit", type=int, default=20)
+    sub.add_parser("ledger", help="escrow journal: open / released / refunded")
     p = sub.add_parser("task", help="post / list / claim / submit tasks")
     tsub = p.add_subparsers(dest="tcmd", required=True)
     q = tsub.add_parser("post"); q.add_argument("to"); q.add_argument("title"); q.add_argument("instructions")
@@ -103,12 +104,19 @@ def main(argv=None) -> int:
     elif a.cmd == "send":
         r = call(s, {"op": "send", "to": a.to, "text": a.text, "aspect": a.aspect})
         print(f"queued {r['queued']} to {r['to']}")
+    elif a.cmd == "ledger":
+        r = call(s, {"op": "ledger"})
+        print(f"settlement adapter: {r['adapter']}  (TEST units — no real money)")
+        for j in r["journal"]:
+            print(f"[{_ago(j['ts'])}] {j['task_hash'][:12]} {j['event']:9} {j['amount']} {j['unit']}"
+                  f"  {('→ ' + j['party'][:12]) if j['party'] else ''}")
     elif a.cmd == "task":
         if a.tcmd == "post":
             rules = [json.loads(r) for r in a.rule] or [{"max_words": 200}]
             r = call(s, {"op": "task_post", "to": a.to, "title": a.title, "instructions": a.instructions,
                          "acceptance": rules, "reward": a.reward, "deadline_s": a.deadline})
-            print(f"posted {r['task_hash'][:12]} to {', '.join(r['posted_to'])}")
+            esc = f"; escrow open {r['escrow']['amount']} {r['escrow']['unit']}" if r.get("escrow") else ""
+            print(f"posted {r['task_hash'][:12]} to {', '.join(r['posted_to'])}{esc}")
         elif a.tcmd == "list":
             from network.client import render_tasks
             print(render_tasks(call(s, {"op": "tasks", "role": a.role})["tasks"]))

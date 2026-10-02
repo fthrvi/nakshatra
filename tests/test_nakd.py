@@ -15,6 +15,12 @@ for cand in (os.environ.get("NAK_STHAMBHA_PATH", ""), str(Path.home() / "sthambh
              str(_REPO.parent / "sthambha")):
     if cand and (Path(cand) / "sthambha" / "signer.py").exists():
         sys.path.insert(0, cand)
+        # Another test (bench_partition) may already have imported `sthambha` from a checkout that has
+        # no signer yet; Python then never looks at this path for submodules. Put the signer's package
+        # dir first in the cached package's search path so `sthambha.signer` resolves here.
+        _pkg = sys.modules.get("sthambha")
+        if _pkg is not None and hasattr(_pkg, "__path__"):
+            _pkg.__path__.insert(0, str(Path(cand) / "sthambha"))
         break
 signer_mod = pytest.importorskip("sthambha.signer")
 
@@ -35,7 +41,7 @@ def wait(pred, timeout=20.0):
 
 
 class Party:
-    def __init__(self, root: Path, name: str, relay_port: int, caps=("nak.msg",)):
+    def __init__(self, root: Path, name: str, relay_port: int, caps=("nak.msg",), constraints=None):
         self.dir = root / name
         self.node_key = ed25519.Ed25519PrivateKey.generate().private_bytes_raw()
         node_pub = ed25519.Ed25519PrivateKey.from_private_bytes(self.node_key).public_key().public_bytes_raw().hex()
@@ -46,7 +52,7 @@ class Party:
         (sdir / "person.pub").write_text(self.person_pub)
         agent_priv, agent_pub = signer_mod.new_key()
         signer_mod.save_key(sdir / "agents" / "pa.key", agent_priv)
-        grant = signer_mod.issue_grant(self.person_priv, "pa", agent_pub, caps, node=node_pub)
+        grant = signer_mod.issue_grant(self.person_priv, "pa", agent_pub, caps, node=node_pub, constraints=constraints)
         (sdir / "agents" / "pa.grant.json").write_text(json.dumps(grant))
         self.signer = signer_mod.Signer(sdir, custody="test")
         self.node = nakd.Node(self.dir / "net", self.node_key, self.signer.handle, agent="pa",
@@ -284,7 +290,7 @@ def _connect(net, a, b):
 
 
 def test_task_post_claim_assign_result_accept(net):
-    a = net("poster", caps=("nak.msg", "nak.task.post"))
+    a = net("poster", caps=("nak.msg", "nak.task.post", "nak.pay"), constraints={"per_tx_cap": 10, "day_cap": 50})
     b = net("worker", caps=("nak.msg", "nak.task.claim"))
     _connect(net, a, b)
     r = a.node.post_task("worker", "capital", "What is the capital of Nepal? One line.",
