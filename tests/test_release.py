@@ -209,7 +209,9 @@ def test_any_failure_after_switch_rolls_back(env, monkeypatch):
 
 def test_update_service_runs_the_installer_shipped_in_the_release(env, monkeypatch):
     (env["a"] / "release").mkdir()
-    (env["a"] / "release" / "install.py").write_text("# shipped installer\n")
+    real = Path(__file__).resolve().parent.parent / "release"
+    for f in ("install.py", "releasekit.py"):        # ship the REAL installer: it writes the units now
+        (env["a"] / "release" / f).write_text((real / f).read_text())
     subprocess.run(["git", "-C", str(env["a"]), "add", "."], check=True)
     subprocess.run(["git", "-C", str(env["a"]), "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "r"], check=True)
     spec = dict(B.SPEC, installer="alpha/release/install.py")
@@ -292,3 +294,19 @@ def test_meshd_and_relay_ship_in_the_release_but_only_run_where_opted_in():
     for name in ("nakshatra-meshd", "nakshatra-relay"):
         svc = spec["services"][name]
         assert svc["requires"].endswith(".env") and svc["hardening"] is True and svc["restart"] == "always"
+
+
+def test_units_are_written_by_the_installer_shipped_in_the_new_release(tmp_path):
+    prefix = tmp_path / "node"
+    (prefix / "current" / "pkg").mkdir(parents=True)
+    (prefix / "current" / "manifest.json").write_text(json.dumps({"services": {}, "installer": "pkg/install.py"}))
+    marker = tmp_path / "called"
+    (prefix / "current" / "pkg" / "install.py").write_text(
+        "import json,sys\n"
+        f"open({str(marker)!r},'w').write(' '.join(sys.argv[1:]))\n"
+        "print(json.dumps(['from-the-new-installer']))\n")
+    inst = I.Installer(prefix, systemd=False, make_venv=False, unit_dir=tmp_path / "units")
+    man = json.loads((prefix / "current" / "manifest.json").read_text())
+    assert inst._write_units_by_new_installer(man) == ["from-the-new-installer"]
+    called = marker.read_text()
+    assert "write-units" in called and "--no-systemd" in called and str(tmp_path / "units") in called

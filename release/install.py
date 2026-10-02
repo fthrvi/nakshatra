@@ -172,6 +172,25 @@ class Installer:
         return ":".join(str(cur / c["name"] / c["pythonpath"]) for c in man["components"])
 
     # ── services + health ──
+    def _write_units_by_new_installer(self, man: dict) -> list:
+        """Units are written by the installer that SHIPS IN the release being installed, never by
+        whichever (older) installer happens to run the update — an older one does not know newer
+        unit fields (2026-10-03: 0.7.2's installer wrote 0.8.0's meshd unit without its env file, so
+        meshd crash-looped on empty args). Falls back to this installer when the release ships none or
+        it is this same file."""
+        shipped = man.get("installer")
+        new = (self.prefix / "current" / shipped) if shipped else None
+        if new is None or not new.exists() or new.resolve() == Path(__file__).resolve():
+            return self.write_units(man)
+        args = [sys.executable, str(new), "--prefix", str(self.prefix), "write-units"]
+        if not self.systemd:
+            args.append("--no-systemd")
+        args += ["--unit-dir", str(self.unit_dir)]      # always explicit: the child must write exactly here
+        out = subprocess.run(args, capture_output=True, text=True, timeout=120)
+        if out.returncode != 0:
+            raise InstallError(f"the new release's installer could not write units: {out.stderr.strip()[-300:]}")
+        return json.loads(out.stdout.strip().splitlines()[-1])
+
     def _unit_text(self, svc: dict, ctx: dict, man: dict) -> str:
         """One systemd unit from a spec entry. Optional keys (all from the SIGNED manifest):
         requires (opt-in per node: ConditionPathExists), after, env_file, environment {K: V},
@@ -287,7 +306,7 @@ class Installer:
             shutil.rmtree(work, ignore_errors=True)
         _switch(self.prefix, man["version"])
         try:
-            names = self.write_units(man)
+            names = self._write_units_by_new_installer(man)
             self.health(man)
             self.restart(names)
         except Exception as e:
@@ -413,12 +432,20 @@ def main(argv=None) -> int:
     p.add_argument("--pubkey", default="")
     p.add_argument("--version", default=None)
     sub.add_parser("update"); sub.add_parser("rollback"); sub.add_parser("status")
+    p = sub.add_parser("write-units", help="(internal) write this release's systemd units; prints their names")
+    p.add_argument("--no-systemd", action="store_true")
+    p.add_argument("--unit-dir", default=None)
     p = sub.add_parser("join", help="join Nakshatra with an invite a friend sent you")
     p.add_argument("invite")
     p.add_argument("--name", default="", help="what your friend will see you as")
     a = ap.parse_args(argv)
     inst = Installer(a.prefix)
     try:
+        if a.cmd == "write-units":
+            w = Installer(a.prefix, systemd=not a.no_systemd, unit_dir=a.unit_dir)
+            man = json.loads((a.prefix / "current" / "manifest.json").read_text())
+            print(json.dumps(w.write_units(man)))
+            return 0
         if a.cmd == "join":
             name = a.name or (input("Your name (what your friend will see): ").strip() if sys.stdin.isatty() else "")
             return join(a.prefix, a.invite, name or "friend")
