@@ -89,4 +89,6 @@ Unification work in progress (U1–U6): `trisul/plans/2026-10-03-nakshatra-unifi
 |---|---|---|
 | Signed releases, installer, rollback, hourly self-update, `nak` commands | `release/` | LIVE (0.7.0 from main) |
 | Public release host | VPS :8960 (`nakshatra-releases`), `release/publish.sh` | LIVE |
-| The hub's meshd / relay / serve | still run from the `~/nakshatra` working tree | → U6 moves them onto the release |
+| meshd + relay | **from the signed release** (`nakshatra-meshd` / `nakshatra-relay`, opt-in per node via `~/.nakshatra/{meshd,relay}.env`) | LIVE on the hub since 0.8.0 (U6a) |
+| Units for a new release | written by the installer SHIPPED IN that release (`install.py write-units`), never the older running one | LIVE since 0.8.1 |
+| Inference gateway + GPU workers | still from the `~/nakshatra` working tree / hand-built stacks / unsigned worker tarballs | → U6b: the worker stack into the release (Biswa's go first: it is Prithvi's brain) |
