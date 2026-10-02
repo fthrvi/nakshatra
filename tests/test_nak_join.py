@@ -103,6 +103,7 @@ def test_invite_line_checks_the_installer_fingerprint_before_running_it(tmp_path
                                                     "pubkey": "e" * 64}))
     (prefix / "current" / "manifest.json").write_text(json.dumps({"version": "0.6.0", "bootstrap": shas}))
     monkeypatch.setenv("NAK_NODE_PREFIX", str(prefix))
+    monkeypatch.setenv("NAK_NET_DIR", str(tmp_path / "no-net"))   # never read the real ~/.nakshatra/net
     release, line = nak._release_for_invite()
     assert release == REL and "http://10.42.0.1:8960/canary/0.6.0/install.py" in line and "{CODE}" in line
     check = line.split(" && ")[3]                    # the printf | sha256sum -c step, exactly as sent
