@@ -1,0 +1,17 @@
+# Serves signed node releases (read-only) to mesh nodes. Nodes verify every file against the pinned
+# release key, so this server is untrusted: it can withhold updates, never forge one.
+# Install on the release host: cp to ~/.config/systemd/user/ && systemctl --user enable --now nak-release-host
+[Unit]
+Description=Nakshatra signed release host (read-only static files on the mesh, :8960)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=%h/nakshatra-dist
+ExecStart=/usr/bin/python3 -m http.server 8960 --bind 10.42.0.1 --directory %h/nakshatra-dist
+# 10.42.0.1 only exists once WireGuard is up; keep retrying until it does
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
