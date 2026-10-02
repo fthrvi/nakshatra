@@ -96,7 +96,8 @@ import threading
 import time as _time
 
 INVITE_PREFIX = "nki1."
-_INVITE_KEYS = {"v", "inviter", "inviter_node", "peers", "nonce", "expires_at", "scope", "note", "ik", "release", "sig"}
+_INVITE_KEYS = {"v", "inviter", "inviter_node", "peers", "nonce", "expires_at", "scope", "note", "ik", "release",
+                "from_name", "sig"}
 _MAX_INVITE_LEN = 8192
 
 
@@ -115,7 +116,7 @@ def _unb64u(s: str) -> bytes:
 
 def encode_invite(person_priv, inviter_node: str, peers: list, *, ttl_s: int = 86400,
                   scope: str = "member", note: str = "", now: int | None = None,
-                  release: dict | None = None) -> str:
+                  release: dict | None = None, from_name: str = "") -> str:
     """person_priv: a cryptography Ed25519PrivateKey (the inviter's person key).
     peers: [{"node": <node pub hex>, "addrs": ["host:port", ...]}, ...] to dial first."""
     now = int(now if now is not None else _time.time())
@@ -130,6 +131,8 @@ def encode_invite(person_priv, inviter_node: str, peers: list, *, ttl_s: int = 8
            "nonce": secrets.token_hex(16), "expires_at": now + int(ttl_s), "scope": scope, "ik": ik}
     if note:
         inv["note"] = note
+    if from_name:
+        inv["from_name"] = str(from_name)[:40]        # what the inviter calls themselves (self-chosen)
     if release:
         # Where a NEW node gets Nakshatra and which release key it must pin. Signed with the rest of the
         # invite, so a newcomer trusts the release key because they trust the friend who invited them.
@@ -168,6 +171,8 @@ def decode_invite(code: str, *, now: int | None = None, trusted_inviters: set | 
     for p in peers:
         if not isinstance(p, dict) or not isinstance(p.get("node"), str) or not isinstance(p.get("addrs"), list):
             raise ValueError("invite peer entry is malformed")
+    if "from_name" in inv and (not isinstance(inv["from_name"], str) or len(inv["from_name"]) > 40):
+        raise ValueError("invite from_name is malformed")
     rel = inv.get("release")
     if rel is not None:
         if not isinstance(rel, dict) or set(rel) != {"url", "channel", "pubkey", "version"} or \

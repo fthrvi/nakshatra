@@ -126,11 +126,11 @@ def main(argv=None) -> int:
         r = NakClient(sock).redeem(a.invite, nickname=a.name[:40], wait_s=30)
     except NakError as e:
         raise SystemExit(f"could not send the connection request: {e}")
-    print(f"\nconnection request: {r['state']}.")
+    print(f"\nconnection request: {r['state']}. Your friend appears here as '{r.get('name') or '?'}'.")
     print("\nnext:")
     print("  1. ask your friend to accept you (they run: nak requests, then nak accept <id>)")
     print("  2. check:  nak contacts      (shows them as active once they accept)")
-    print("  3. talk:   nak send <their name> \"hello\"     ·   nak inbox")
+    print(f"  3. talk:   nak send '{r.get('name') or '<their name>'}' \"hello\"     ·   nak inbox")
     print("  4. plug in your AI (optional):")
     print("       OpenClaw: openclaw mcp add nakshatra --command ~/.local/bin/nak-mcp && openclaw config set tools.toolSearch false")
     print("       Hermes:   add an mcp_servers entry with command ~/.local/bin/nak-mcp")

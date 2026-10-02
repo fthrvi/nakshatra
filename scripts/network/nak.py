@@ -77,6 +77,7 @@ def main(argv=None) -> int:
     p.add_argument("--ttl", type=int, default=86400); p.add_argument("--note", default="")
     p.add_argument("--release-url", default="", help="where newcomers download Nakshatra (default: this node's source)")
     p.add_argument("--code-only", action="store_true", help="print just the invite code")
+    p.add_argument("--from", dest="from_name", default="", help="your name as your friend will see it (remembered)")
     p = sub.add_parser("redeem"); p.add_argument("code"); p.add_argument("--nickname", default="")
     p.add_argument("--as", dest="petname", default="")
     sub.add_parser("requests")
@@ -109,8 +110,15 @@ def main(argv=None) -> int:
         st = call(s, {"op": "status"})
         priv = ed25519.Ed25519PrivateKey.from_private_bytes(bytes.fromhex(a.person_key.read_text().strip()))
         release, line = _release_for_invite(a.release_url)
+        name_file = Path(os.environ.get("NAK_NET_DIR", Path.home() / ".nakshatra" / "net")) / "name"
+        from_name = a.from_name or (name_file.read_text().strip() if name_file.exists() else "")
+        if a.from_name:
+            name_file.write_text(a.from_name.strip()[:40] + "\n")
+        if not from_name:
+            print("tip: add --from <your name> so your friend sees who invited them (remembered after once)",
+                  file=sys.stderr)
         code = joincode.encode_invite(priv, st["node"], [{"node": st["node"], "addrs": [st["relay"]]}],
-                                      ttl_s=a.ttl, note=a.note, release=release)
+                                      ttl_s=a.ttl, note=a.note, release=release, from_name=from_name)
         call(s, {"op": "register_invite", "code": code})
         if a.code_only or not line:
             print(code)

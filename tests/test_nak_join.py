@@ -70,7 +70,7 @@ def test_existing_node_keeps_its_own_agent(tmp_path):
 
 def test_join_end_to_end_request_reaches_the_inviter(net, tmp_path, monkeypatch, capsys):
     a = net("inviter")
-    code = _invite(a, note="for rajesh")
+    code = _invite(a, note="for rajesh", from_name="Biswa")
     a.node.register_invite(code)
     home = tmp_path / "rajesh"
     join_setup.ensure_identity(home)                # what the installer's setup does first
@@ -84,7 +84,9 @@ def test_join_end_to_end_request_reaches_the_inviter(net, tmp_path, monkeypatch,
     monkeypatch.setenv("NAK_JOIN_NO_SYSTEMD", "1")
     assert join_setup.main(["--invite", code, "--name", "Rajesh", "--home", str(home)]) == 0
     out = capsys.readouterr().out
-    assert "request sent" in out and "nak accept" in out
+    assert "request sent" in out and "nak accept" in out and "appears here as 'Biswa'" in out
+    c = node.store.contact(a.person_pub)
+    assert c["petname"] == "Biswa" and c["name_src"] == "self-chosen"          # NOT the note "for rajesh"
     reqs = a.node.store.requests()
     assert len(reqs) == 1 and reqs[0]["nickname"] == "Rajesh"
     a.node.accept(reqs[0]["id"], petname="rajesh")

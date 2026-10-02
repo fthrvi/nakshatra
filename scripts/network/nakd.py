@@ -304,13 +304,18 @@ class Node:
         existing = self.store.contact(inv["inviter"])
         if existing and existing["state"] == "active":
             return {"state": "already connected", "person": inv["inviter"]}
-        self.store.upsert_contact(inv["inviter"], inv["inviter_node"], "awaiting", petname or inv.get("note", "")[:40],
+        # The inviter appears under the name YOU give them, else the name they gave themselves. The note
+        # is about whom the invite is for, never a name for the inviter.
+        self.store.upsert_contact(inv["inviter"], inv["inviter_node"], "awaiting",
+                                  petname or inv.get("from_name", "") or inv["inviter"][:12],
                                   name_src="yours" if petname else "self-chosen")
         done = threading.Event()
         self._spawn(f"redeem:{inv['nonce']}", self._redeem_loop, inv, nickname[:40], done)
         if wait_s:
             done.wait(wait_s)
-        return {"state": "request sent" if done.is_set() else "request queued", "person": inv["inviter"]}
+        c = self.store.contact(inv["inviter"]) or {}
+        return {"state": "request sent" if done.is_set() else "request queued", "person": inv["inviter"],
+                "name": c.get("petname", "")}
 
     def _redeem_loop(self, inv: dict, nickname: str, done: threading.Event) -> None:
         body = {"person": self.person, "node": self.node, "nickname": nickname, "invite": inv["nonce"],
