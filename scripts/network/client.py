@@ -115,7 +115,8 @@ def render_tasks(rows: list) -> str:
 def _esc(text) -> str:
     """Neutralise markup in anything a peer controls, so it cannot close our frame and open a fake one
     (e.g. text containing </message><message from='Biswa'>)."""
-    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return (str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace('"', "&quot;").replace("'", "&#39;"))   # quotes too: a name must not forge an attribute
 
 
 def _who(m: dict) -> str:

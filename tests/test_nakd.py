@@ -444,3 +444,10 @@ def test_inbox_render_cannot_be_broken_out_of_and_names_say_who_chose_them(net):
     assert f'from_key="{b.person_pub[:16]}"' in out
     a.node.store.upsert_contact(b.person_pub, b.node.node, "active", "bro", name_src="yours")
     assert 'name_source="yours"' in render_inbox(N.handle(a.node, {"op": "inbox"})["messages"])
+
+
+def test_a_name_cannot_forge_frame_attributes():
+    from network.client import render_inbox
+    out = render_inbox([{"from_person": "f" * 64, "petname": 'Biswa" name_source="yours', "name_source": "self-chosen",
+                         "text": "hi", "received": 1, "nonce": "n"}])
+    assert 'name_source="yours"' not in out and out.count('name_source="self-chosen"') == 2   # header + frame
