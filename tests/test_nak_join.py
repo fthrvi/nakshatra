@@ -113,3 +113,19 @@ def test_invite_line_checks_the_installer_fingerprint_before_running_it(tmp_path
     assert subprocess.run(["bash", "-c", check], cwd=d).returncode == 0
     (d / "install.py").write_bytes(b"print('tampered')\n")
     assert subprocess.run(["bash", "-c", check], cwd=d, capture_output=True).returncode != 0
+
+
+def test_invite_prefers_the_public_release_host(tmp_path, monkeypatch):
+    prefix = tmp_path / "node"
+    (prefix / "current").mkdir(parents=True)
+    (prefix / "config.json").write_text(json.dumps({"source": "http://10.42.0.1:8960", "channel": "canary",
+                                                    "pubkey": "e" * 64}))
+    (prefix / "current" / "manifest.json").write_text(json.dumps({"version": "0.6.3", "bootstrap": {
+        "install.py": "a" * 64, "releasekit.py": "b" * 64}}))
+    net_dir = tmp_path / "net"
+    net_dir.mkdir()
+    (net_dir / "release-url").write_text("http://45.63.109.137:8960\n")
+    monkeypatch.setenv("NAK_NODE_PREFIX", str(prefix))
+    monkeypatch.setenv("NAK_NET_DIR", str(net_dir))
+    release, line = nak._release_for_invite()
+    assert release["url"] == "http://45.63.109.137:8960" and "45.63.109.137:8960/canary/0.6.3/install.py" in line

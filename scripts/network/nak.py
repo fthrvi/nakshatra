@@ -47,7 +47,10 @@ def _release_for_invite(url_override: str = ""):
         man = json.loads((prefix / "current" / "manifest.json").read_text())
     except (OSError, ValueError):
         return None, ""
-    url = (url_override or cfg.get("source") or "").rstrip("/")
+    # A PUBLIC release host (if this node has one configured) beats the node's own source, which may be a
+    # private mesh address a friend outside the mesh can't reach: echo URL > ~/.nakshatra/net/release-url
+    pub = Path(os.environ.get("NAK_NET_DIR", Path.home() / ".nakshatra" / "net")) / "release-url"
+    url = (url_override or (pub.read_text().strip() if pub.exists() else "") or cfg.get("source") or "").rstrip("/")
     boot = man.get("bootstrap") or {}
     if not url.startswith(("http://", "https://")):
         return None, ""

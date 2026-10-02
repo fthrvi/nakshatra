@@ -1,0 +1,23 @@
+# Public, read-only release host for Nakshatra nodes (on the relay VPS). Untrusted by design: nodes
+# verify every file against the pinned release key. Serves ONE directory, as a throwaway user, with
+# no write access anywhere. Install: copy to /etc/systemd/system/, ufw allow 8960/tcp, enable --now.
+[Unit]
+Description=Nakshatra public release host (read-only static files, :8960)
+After=network-online.target
+
+[Service]
+DynamicUser=yes
+ExecStart=/usr/bin/python3 -m http.server 8960 --bind 0.0.0.0 --directory /srv/nakshatra-dist
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadOnlyPaths=/srv/nakshatra-dist
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6
+MemoryMax=128M
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
