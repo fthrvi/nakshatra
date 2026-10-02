@@ -27,7 +27,7 @@ mkdir -p "$(dirname "$DEST")"
 LOCK="$DEST.lock"; STAGE=""; OLD=""; HAVE_LOCK=""
 cleanup() {
   # An interrupted swap must never leave DEST missing: put the previous tree back.
-  if [ -n "$OLD" ] && [ -e "$OLD" ] && [ ! -e "$DEST" ]; then mv "$OLD" "$DEST"; fi
+  if [ -n "$OLD" ] && { [ -e "$OLD" ] || [ -L "$OLD" ]; } && [ ! -e "$DEST" ] && [ ! -L "$DEST" ]; then mv "$OLD" "$DEST"; fi
   [ -n "$STAGE" ] && rm -rf "$STAGE"
   [ -n "$HAVE_LOCK" ] && rm -rf "$LOCK"
 }
@@ -37,7 +37,8 @@ take_lock() { mkdir "$LOCK" 2>/dev/null && echo $$ > "$LOCK/pid" && HAVE_LOCK=1;
 if ! take_lock; then
   # A lock whose owner is gone (crash, kill -9, reboot) is stale: take it over; a live owner wins.
   owner="$(cat "$LOCK/pid" 2>/dev/null || true)"
-  if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then
+  # Live = its process exists AND the lock is younger than 2 h (a reused PID cannot pin it forever).
+  if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null && [ -n "$(find "$LOCK" -maxdepth 0 -mmin -120 2>/dev/null)" ]; then
     echo "[engine] another engine build (pid $owner) is running for $DEST"; exit 1
   fi
   rm -rf "$LOCK"; take_lock || { echo "[engine] could not take $LOCK"; exit 1; }
@@ -62,5 +63,14 @@ if ! mv "$STAGE" "$DEST"; then
   echo "[engine] REFUSING: could not move the verified tree into place; previous tree restored"; exit 1
 fi
 STAGE=""
+# The guarantee does NOT rest on the lock: re-verify what is now AT $DEST. Any race or interleaving that
+# left anything but the exact engine there is caught here, removed, and the previous tree put back.
+NOW_TREE="$(G -C "$DEST" rev-parse 'HEAD^{tree}' 2>/dev/null || echo none)"
+NOW_DIRTY="$(G -C "$DEST" status --porcelain --ignored --untracked-files=all 2>/dev/null || echo status-failed)"
+if [ "$NOW_TREE" != "$TREE" ] || [ -n "$NOW_DIRTY" ]; then
+  rm -rf "$DEST"
+  echo "[engine] REFUSING: $DEST was not the exact engine after the swap (concurrent run?); previous tree restored"
+  exit 1
+fi
 [ -n "$OLD" ] && rm -rf "$OLD"; OLD=""
 echo "[engine] $DEST = upstream ${COMMIT:0:12} + $(ls "$HERE"/patches/*.patch | wc -l) patches (tree ${TREE:0:12}, verified)"
