@@ -37,6 +37,30 @@ def call(sock_path: Path, req: dict) -> dict:
     return dict(r, ok=True)
 
 
+def _release_for_invite(url_override: str = ""):
+    """(release dict for the invite, the join one-liner with {CODE}) from THIS node's own install:
+    the same source, channel and pinned release key, and the sha256 of the installer files of the
+    exact version it runs (recorded in its signed manifest). ("", "") if not release-installed."""
+    prefix = Path(os.environ.get("NAK_NODE_PREFIX", Path.home() / ".nakshatra-node"))
+    try:
+        cfg = json.loads((prefix / "config.json").read_text())
+        man = json.loads((prefix / "current" / "manifest.json").read_text())
+    except (OSError, ValueError):
+        return None, ""
+    url = (url_override or cfg.get("source") or "").rstrip("/")
+    boot = man.get("bootstrap") or {}
+    if not url.startswith(("http://", "https://")):
+        return None, ""
+    release = {"url": url, "channel": cfg["channel"], "pubkey": cfg["pubkey"], "version": man["version"]}
+    if not {"install.py", "releasekit.py"} <= set(boot):
+        return release, ""
+    base = f"{url}/{cfg['channel']}/{man['version']}"
+    line = (f"mkdir -p ~/nak-join && cd ~/nak-join && curl -fsSO {base}/install.py -O {base}/releasekit.py && "
+            f"printf '%s  install.py\\n%s  releasekit.py\\n' {boot['install.py']} {boot['releasekit.py']} "
+            f"| sha256sum -c --quiet && python3 install.py join '{{CODE}}'")
+    return release, line
+
+
 def _ago(ts: int) -> str:
     d = int(time.time()) - int(ts)
     return f"{d}s ago" if d < 120 else f"{d // 60}m ago" if d < 7200 else f"{d // 3600}h ago"
@@ -48,8 +72,11 @@ def main(argv=None) -> int:
     ap.add_argument("--sock", type=Path, default=default_sock)
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("status")
-    p = sub.add_parser("invite"); p.add_argument("--person-key", type=Path, required=True)
+    p = sub.add_parser("invite"); p.add_argument("--person-key", type=Path,
+                                                 default=Path.home() / ".sthambha" / "person-TEST.key")
     p.add_argument("--ttl", type=int, default=86400); p.add_argument("--note", default="")
+    p.add_argument("--release-url", default="", help="where newcomers download Nakshatra (default: this node's source)")
+    p.add_argument("--code-only", action="store_true", help="print just the invite code")
     p = sub.add_parser("redeem"); p.add_argument("code"); p.add_argument("--nickname", default="")
     p.add_argument("--as", dest="petname", default="")
     sub.add_parser("requests")
@@ -81,12 +108,18 @@ def main(argv=None) -> int:
         from cryptography.hazmat.primitives.asymmetric import ed25519
         st = call(s, {"op": "status"})
         priv = ed25519.Ed25519PrivateKey.from_private_bytes(bytes.fromhex(a.person_key.read_text().strip()))
+        release, line = _release_for_invite(a.release_url)
         code = joincode.encode_invite(priv, st["node"], [{"node": st["node"], "addrs": [st["relay"]]}],
-                                      ttl_s=a.ttl, note=a.note)
-        r = call(s, {"op": "register_invite", "code": code})
-        print(code)
-        print(f"\nsingle use, expires in {a.ttl // 3600}h. Share it only with the person you are inviting.",
-              file=sys.stderr)
+                                      ttl_s=a.ttl, note=a.note, release=release)
+        call(s, {"op": "register_invite", "code": code})
+        if a.code_only or not line:
+            print(code)
+        else:
+            print("Send your friend this ONE line (single use, expires in "
+                  f"{a.ttl // 3600}h; it is a secret — only them):\n", file=sys.stderr)
+            print(line.replace("{CODE}", code))
+            print("\nThey paste it in a terminal (Linux or WSL with systemd). When their request arrives:"
+                  "  nak requests  →  nak accept <id> --as <name>", file=sys.stderr)
     elif a.cmd == "redeem":
         r = call(s, {"op": "redeem", "code": a.code, "nickname": a.nickname, "petname": a.petname, "wait_s": 20})
         print(f"{r['state']}. They have to accept before either of you can message.")

@@ -96,7 +96,7 @@ import threading
 import time as _time
 
 INVITE_PREFIX = "nki1."
-_INVITE_KEYS = {"v", "inviter", "inviter_node", "peers", "nonce", "expires_at", "scope", "note", "ik", "sig"}
+_INVITE_KEYS = {"v", "inviter", "inviter_node", "peers", "nonce", "expires_at", "scope", "note", "ik", "release", "sig"}
 _MAX_INVITE_LEN = 8192
 
 
@@ -114,7 +114,8 @@ def _unb64u(s: str) -> bytes:
 
 
 def encode_invite(person_priv, inviter_node: str, peers: list, *, ttl_s: int = 86400,
-                  scope: str = "member", note: str = "", now: int | None = None) -> str:
+                  scope: str = "member", note: str = "", now: int | None = None,
+                  release: dict | None = None) -> str:
     """person_priv: a cryptography Ed25519PrivateKey (the inviter's person key).
     peers: [{"node": <node pub hex>, "addrs": ["host:port", ...]}, ...] to dial first."""
     now = int(now if now is not None else _time.time())
@@ -129,6 +130,10 @@ def encode_invite(person_priv, inviter_node: str, peers: list, *, ttl_s: int = 8
            "nonce": secrets.token_hex(16), "expires_at": now + int(ttl_s), "scope": scope, "ik": ik}
     if note:
         inv["note"] = note
+    if release:
+        # Where a NEW node gets Nakshatra and which release key it must pin. Signed with the rest of the
+        # invite, so a newcomer trusts the release key because they trust the friend who invited them.
+        inv["release"] = {k: str(release[k]) for k in ("url", "channel", "pubkey", "version")}
     inv["sig"] = {"alg": "Ed25519", "keyid": inviter[:16],
                   "value": base64.b64encode(person_priv.sign(_canon(inv))).decode("ascii")}
     return INVITE_PREFIX + _b64u(json.dumps(inv, sort_keys=True, separators=(",", ":"),
@@ -163,6 +168,13 @@ def decode_invite(code: str, *, now: int | None = None, trusted_inviters: set | 
     for p in peers:
         if not isinstance(p, dict) or not isinstance(p.get("node"), str) or not isinstance(p.get("addrs"), list):
             raise ValueError("invite peer entry is malformed")
+    rel = inv.get("release")
+    if rel is not None:
+        if not isinstance(rel, dict) or set(rel) != {"url", "channel", "pubkey", "version"} or \
+                not all(isinstance(v, str) for v in rel.values()) or \
+                not rel["url"].startswith(("http://", "https://")) or \
+                len(rel["pubkey"]) != 64 or not all(c in "0123456789abcdef" for c in rel["pubkey"]):
+            raise ValueError("invite release entry is malformed")
     sig = inv.get("sig") or {}
     try:
         if sig.get("alg") != "Ed25519":

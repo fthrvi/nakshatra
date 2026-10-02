@@ -287,6 +287,71 @@ class Installer:
                 "source": cfg.get("source"), "release_key": (cfg.get("pubkey") or "")[:16]}
 
 
+# ── join: the one command a newcomer pastes ─────────────────────────────────────────────────────
+#
+#   python3 install.py join '<nki1… invite>' [--name "what your friend sees"]
+#
+# 1. checks the invite is signed by the friend who made it and has not expired
+# 2. installs the node from the release the invite names, pinning the release key the invite names
+# 3. runs the release's own setup: keys (TEST custody), signer, a delegated agent, services
+# 4. asks the friend to connect (they still have to accept)
+
+INVITE_PREFIX = "nki1."
+
+
+def parse_invite(code: str, now=None) -> dict:
+    """Verify an invite with no third-party crypto (releasekit's pure Ed25519). Raises InstallError."""
+    import base64
+    now = int(now if now is not None else time.time())
+    code = (code or "").strip()
+    if not code.startswith(INVITE_PREFIX) or len(code) > 8192:
+        raise InstallError("that is not a Nakshatra invite (it should start with nki1.)")
+    try:
+        body = code[len(INVITE_PREFIX):]
+        inv = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)).decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        raise InstallError("the invite is damaged (copy the whole line again)")
+    if not isinstance(inv, dict) or not isinstance(inv.get("inviter"), str) or len(inv["inviter"]) != 64:
+        raise InstallError("the invite is damaged (copy the whole line again)")
+    if not rk.verify(inv, inv["inviter"]):
+        raise InstallError("the invite's signature does not verify: it was changed or is not genuine")
+    if not isinstance(inv.get("expires_at"), int) or now >= inv["expires_at"]:
+        raise InstallError("the invite has expired: ask your friend for a new one")
+    rel = inv.get("release")
+    if not isinstance(rel, dict) or not all(isinstance(rel.get(k), str) for k in ("url", "channel", "pubkey")):
+        raise InstallError("the invite does not say where to get Nakshatra (your friend's node is too old)")
+    return inv
+
+
+def _systemd_user_ok() -> bool:
+    try:
+        return subprocess.run(["systemctl", "--user", "is-system-running"], capture_output=True,
+                              timeout=10).returncode in (0, 1)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def join(prefix: Path, code: str, name: str) -> int:
+    inv = parse_invite(code)
+    rel = inv["release"]
+    print(f"invite from {inv['inviter'][:16]}… is genuine; installing Nakshatra from {rel['url']} ({rel['channel']})")
+    if not _systemd_user_ok():
+        raise InstallError("this machine has no systemd user session. On WSL put [boot] systemd=true in "
+                           "/etc/wsl.conf and restart WSL, then paste the line again.")
+    inst = Installer(prefix)
+    if _current(prefix):
+        print(f"a node is already installed ({_current(prefix)}); keeping it and joining with it")
+        cfg = _load_config(prefix)
+        if cfg.get("pubkey") and cfg["pubkey"] != rel["pubkey"]:
+            raise InstallError("this node trusts a different release key than the invite names; refusing to mix")
+    else:
+        print(inst.install(rel["url"], rel["channel"], rel["pubkey"]))
+    man = json.loads((prefix / "current" / "manifest.json").read_text())
+    env = dict(os.environ, PYTHONPATH=inst._pythonpath(man))
+    py = str(prefix / "current" / "venv" / "bin" / "python")
+    return subprocess.run([py, "-m", "network.join_setup", "--invite", code, "--name", name], env=env).returncode
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Install or update a Nakshatra node from a signed release.")
     ap.add_argument("--prefix", type=Path, default=DEFAULT_PREFIX)
@@ -297,9 +362,15 @@ def main(argv=None) -> int:
     p.add_argument("--pubkey", default="")
     p.add_argument("--version", default=None)
     sub.add_parser("update"); sub.add_parser("rollback"); sub.add_parser("status")
+    p = sub.add_parser("join", help="join Nakshatra with an invite a friend sent you")
+    p.add_argument("invite")
+    p.add_argument("--name", default="", help="what your friend will see you as")
     a = ap.parse_args(argv)
     inst = Installer(a.prefix)
     try:
+        if a.cmd == "join":
+            name = a.name or (input("Your name (what your friend will see): ").strip() if sys.stdin.isatty() else "")
+            return join(a.prefix, a.invite, name or "friend")
         if a.cmd == "install":
             print(inst.install(a.source, a.channel, a.pubkey, a.version))
         elif a.cmd == "update":

@@ -58,6 +58,19 @@ def build(version: str, channel: str, refs: dict, key_path: Path, out_root: Path
         _archive(repo, commit, comp["paths"], f)
         components.append({"name": comp["name"], "commit": commit, "file": f.name,
                            "sha256": rk.sha256_file(f), "pythonpath": comp["pythonpath"]})
+    # The two installer files, standalone, from the SAME commit as the tarball: what a newcomer's
+    # pasted join line downloads and checks against the sha256 printed in their invite.
+    bootstrap = {}
+    for comp, built in zip(SPEC["components"], components):
+        repo = Path(os.path.expanduser(comp["repo"]))
+        for fname in ("install.py", "releasekit.py"):
+            r = subprocess.run(["git", "-C", str(repo), "show", f"{built['commit']}:release/{fname}"],
+                               capture_output=True)
+            if r.returncode == 0:
+                (out / fname).write_bytes(r.stdout)
+                bootstrap[fname] = rk.sha256_file(out / fname)
+        if bootstrap:
+            break
     req_in = out / "requirements.in"
     req_in.write_text("\n".join(SPEC["requirements"]) + "\n")
     lock = out / "requirements.lock"
@@ -72,7 +85,8 @@ def build(version: str, channel: str, refs: dict, key_path: Path, out_root: Path
                 "lock": {"file": lock.name, "sha256": rk.sha256_file(lock)},
                 "uv": {"file": "uv", "sha256": rk.sha256_file(out / "uv"), "version": uv_version},
                 "services": SPEC["services"], "health": SPEC["health"],
-                "installer": SPEC.get("installer", ""), "commands": SPEC.get("commands", {})}
+                "installer": SPEC.get("installer", ""), "commands": SPEC.get("commands", {}),
+                "bootstrap": bootstrap}
     priv_hex = key_path.read_text().strip()
     signed = rk.sign(manifest, priv_hex)
     (out / "manifest.json").write_text(json.dumps(signed, indent=1, sort_keys=True))
