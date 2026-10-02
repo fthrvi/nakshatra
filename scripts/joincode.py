@@ -96,7 +96,7 @@ import threading
 import time as _time
 
 INVITE_PREFIX = "nki1."
-_INVITE_KEYS = {"v", "inviter", "inviter_node", "peers", "nonce", "expires_at", "scope", "note", "sig"}
+_INVITE_KEYS = {"v", "inviter", "inviter_node", "peers", "nonce", "expires_at", "scope", "note", "ik", "sig"}
 _MAX_INVITE_LEN = 8192
 
 
@@ -119,8 +119,14 @@ def encode_invite(person_priv, inviter_node: str, peers: list, *, ttl_s: int = 8
     peers: [{"node": <node pub hex>, "addrs": ["host:port", ...]}, ...] to dial first."""
     now = int(now if now is not None else _time.time())
     inviter = person_priv.public_key().public_bytes_raw().hex()
+    # ik: a ONE-TIME invite key (Ed25519 private, hex). Whoever holds the invite uses it to complete the
+    # encrypted handshake with the inviter's node before the inviter knows their real key. It makes the
+    # invite a secret: share it only with the person you are inviting. Redeeming it only ASKS to
+    # connect; nothing is shared until the inviter accepts.
+    from cryptography.hazmat.primitives.asymmetric import ed25519 as _ed
+    ik = _ed.Ed25519PrivateKey.generate().private_bytes_raw().hex()
     inv = {"v": 1, "inviter": inviter, "inviter_node": inviter_node, "peers": peers,
-           "nonce": secrets.token_hex(16), "expires_at": now + int(ttl_s), "scope": scope}
+           "nonce": secrets.token_hex(16), "expires_at": now + int(ttl_s), "scope": scope, "ik": ik}
     if note:
         inv["note"] = note
     inv["sig"] = {"alg": "Ed25519", "keyid": inviter[:16],
@@ -145,7 +151,7 @@ def decode_invite(code: str, *, now: int | None = None, trusted_inviters: set | 
         raise ValueError("invite is not valid base64url JSON")
     if not isinstance(inv, dict) or set(inv) - _INVITE_KEYS:
         raise ValueError("invite has unknown fields")
-    for k in ("inviter", "inviter_node", "nonce"):
+    for k in ("inviter", "inviter_node", "nonce", "ik"):
         v = inv.get(k)
         if not isinstance(v, str) or not all(c in "0123456789abcdef" for c in v) or len(v) not in (32, 64):
             raise ValueError(f"invite field {k} is malformed")
@@ -189,3 +195,14 @@ class InviteBook:
                 return True
             except sqlite3.IntegrityError:
                 return False
+
+
+def invite_pub(inv: dict) -> str:
+    """Public half of the invite's one-time key: what the inviter's node pins while it waits."""
+    from cryptography.hazmat.primitives.asymmetric import ed25519 as _ed
+    return _ed.Ed25519PrivateKey.from_private_bytes(bytes.fromhex(inv["ik"])).public_key().public_bytes_raw().hex()
+
+
+def invite_rendezvous(inv: dict) -> bytes:
+    """Where the inviter waits on the relay for this invite (16 bytes, derived from the nonce)."""
+    return hashlib.sha256(b"nak-invite-v1|" + inv["nonce"].encode()).digest()[:16]
