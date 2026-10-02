@@ -298,7 +298,8 @@ class Node:
         existing = self.store.contact(inv["inviter"])
         if existing and existing["state"] == "active":
             return {"state": "already connected", "person": inv["inviter"]}
-        self.store.upsert_contact(inv["inviter"], inv["inviter_node"], "awaiting", petname or inv.get("note", "")[:40])
+        self.store.upsert_contact(inv["inviter"], inv["inviter_node"], "awaiting", petname or inv.get("note", "")[:40],
+                                  name_src="yours" if petname else "self-chosen")
         done = threading.Event()
         self._spawn(f"redeem:{inv['nonce']}", self._redeem_loop, inv, nickname[:40], done)
         if wait_s:
@@ -341,7 +342,8 @@ class Node:
         r = self.store.decide_request(req_id, True)
         if not r:
             raise ValueError("no pending request with that id")
-        self.store.upsert_contact(r["person"], r["node"], "active", petname or r["nickname"], r["nickname"])
+        self.store.upsert_contact(r["person"], r["node"], "active", petname or r["nickname"], r["nickname"],
+                                  name_src="yours" if petname else "self-chosen")
         self._queue(r["person"], "contact.accept", {"person": self.person, "node": self.node})
         self._ensure_session(r["person"])
         return {"person": r["person"], "petname": petname or r["nickname"]}
@@ -708,13 +710,17 @@ def handle(node: Node, req: dict) -> dict:
             for r in rows:
                 c = node.store.contact(r["peer"] or (r["assignee"] or ""))
                 r["peer_name"] = (c or {}).get("petname", "")
+                r["name_source"] = (c or {}).get("name_src") or "self-chosen"
             return {"ok": True, "tasks": rows}
         if op == "task_claim":
             return {"ok": True, **node.claim_task(req["task"])}
         if op == "task_submit":
             return {"ok": True, **node.submit_task(req["task"], req["output"])}
         if op == "inbox":
-            return {"ok": True, "messages": node.store.inbox(int(req.get("since", 0)), int(req.get("limit", 50)))}
+            msgs = node.store.inbox(int(req.get("since", 0)), int(req.get("limit", 50)))
+            for m in msgs:
+                m["name_source"] = (node.store.contact(m["from_person"]) or {}).get("name_src") or "self-chosen"
+            return {"ok": True, "messages": msgs}
     except (KeyError, ValueError, RuntimeError) as e:
         return {"ok": False, "error": str(e) if not isinstance(e, KeyError) else f"missing {e}"}
     return {"ok": False, "error": "unreachable"}

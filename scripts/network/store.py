@@ -42,6 +42,10 @@ class Store:
         self._db.executescript(SCHEMA)
         self._lock = threading.Lock()
         self._raw = self.dir / "inbox-raw.jsonl"
+        try:   # contacts.name_src: "yours" (the person named them) | "self-chosen" (their nickname / note)
+            self._db.execute("ALTER TABLE contacts ADD COLUMN name_src TEXT")
+        except sqlite3.OperationalError:
+            pass
         try:   # outbox.refused: a peer's terminal nack (added with tasks; older stores lack it)
             self._db.execute("ALTER TABLE outbox ADD COLUMN refused TEXT")
         except sqlite3.OperationalError:
@@ -103,21 +107,24 @@ class Store:
         return self._tx(fn)
 
     # contacts
-    def upsert_contact(self, person: str, node: str, state: str, petname: str = "", nickname: str = "") -> None:
-        self._q("INSERT INTO contacts VALUES (?,?,?,?,?,?) ON CONFLICT(person) DO UPDATE SET node=excluded.node, "
-                "state=excluded.state, petname=COALESCE(NULLIF(excluded.petname,''), contacts.petname)",
-                (person, node, petname, nickname, state, int(time.time())))
+    def upsert_contact(self, person: str, node: str, state: str, petname: str = "", nickname: str = "",
+                       name_src: str = "self-chosen") -> None:
+        self._q("INSERT INTO contacts (person, node, petname, nickname, state, added, name_src) VALUES (?,?,?,?,?,?,?) "
+                "ON CONFLICT(person) DO UPDATE SET node=excluded.node, state=excluded.state, "
+                "name_src=CASE WHEN excluded.petname<>'' THEN excluded.name_src ELSE contacts.name_src END, "
+                "petname=COALESCE(NULLIF(excluded.petname,''), contacts.petname)",
+                (person, node, petname, nickname, state, int(time.time()), name_src))
 
     def set_contact_state(self, person: str, state: str) -> None:
         self._q("UPDATE contacts SET state=? WHERE person=?", (state, person))
 
     def contact(self, person: str) -> Optional[dict]:
-        r = self._q("SELECT person, node, petname, nickname, state FROM contacts WHERE person=?", (person,))
-        return dict(zip(("person", "node", "petname", "nickname", "state"), r[0])) if r else None
+        r = self._q("SELECT person, node, petname, nickname, state, name_src FROM contacts WHERE person=?", (person,))
+        return dict(zip(("person", "node", "petname", "nickname", "state", "name_src"), r[0])) if r else None
 
     def contacts(self) -> list:
-        return [dict(zip(("person", "node", "petname", "nickname", "state"), r)) for r in
-                self._q("SELECT person, node, petname, nickname, state FROM contacts ORDER BY added")]
+        return [dict(zip(("person", "node", "petname", "nickname", "state", "name_src"), r)) for r in
+                self._q("SELECT person, node, petname, nickname, state, name_src FROM contacts ORDER BY added")]
 
     def resolve(self, who: str) -> Optional[dict]:
         """A petname or a person key (or its prefix of at least 8 hex chars)."""
