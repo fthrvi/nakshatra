@@ -24,6 +24,10 @@ CREATE TABLE IF NOT EXISTS invites (nonce TEXT PRIMARY KEY, ik TEXT NOT NULL, ex
 CREATE TABLE IF NOT EXISTS outbox (nonce TEXT PRIMARY KEY, to_person TEXT NOT NULL, frame TEXT NOT NULL,
     created INTEGER NOT NULL, acked INTEGER);
 CREATE TABLE IF NOT EXISTS seen (nonce TEXT PRIMARY KEY, ts INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS tasks (task_hash TEXT NOT NULL, role TEXT NOT NULL, peer TEXT NOT NULL,
+    spec TEXT NOT NULL, state TEXT NOT NULL, targets TEXT, assignee TEXT, epoch INTEGER NOT NULL DEFAULT 0,
+    output TEXT, verdict TEXT, created INTEGER NOT NULL, updated INTEGER NOT NULL,
+    PRIMARY KEY (task_hash, role, peer));
 CREATE TABLE IF NOT EXISTS inbox (nonce TEXT PRIMARY KEY, from_person TEXT NOT NULL, petname TEXT,
     author TEXT, aspect TEXT, text TEXT, received INTEGER NOT NULL);
 """
@@ -38,6 +42,10 @@ class Store:
         self._db.executescript(SCHEMA)
         self._lock = threading.Lock()
         self._raw = self.dir / "inbox-raw.jsonl"
+        try:   # outbox.refused: a peer's terminal nack (added with tasks; older stores lack it)
+            self._db.execute("ALTER TABLE outbox ADD COLUMN refused TEXT")
+        except sqlite3.OperationalError:
+            pass
 
     def _q(self, sql, args=()):
         with self._lock:
@@ -123,7 +131,8 @@ class Store:
 
     # outbox
     def queue(self, nonce: str, to_person: str, frame: dict) -> None:
-        self._q("INSERT INTO outbox VALUES (?,?,?,?,NULL)", (nonce, to_person, json.dumps(frame), int(time.time())))
+        self._q("INSERT INTO outbox (nonce, to_person, frame, created) VALUES (?,?,?,?)",
+                (nonce, to_person, json.dumps(frame), int(time.time())))
 
     def pending_for(self, person: str) -> list:
         return [json.loads(r[0]) for r in
@@ -131,6 +140,15 @@ class Store:
 
     def ack(self, nonce: str) -> None:
         self._q("UPDATE outbox SET acked=? WHERE nonce=?", (int(time.time()), nonce))
+
+    def refuse(self, nonce: str, why: str) -> None:
+        """The peer received it and said no (terminal): stop retrying, keep the reason."""
+        self._q("UPDATE outbox SET acked=?, refused=? WHERE nonce=? AND acked IS NULL",
+                (int(time.time()), str(why)[:300], nonce))
+
+    def refused(self, nonce: str) -> Optional[str]:
+        r = self._q("SELECT refused FROM outbox WHERE nonce=?", (nonce,))
+        return r[0][0] if r else None
 
     def delivered(self, nonce: str) -> bool:
         r = self._q("SELECT acked FROM outbox WHERE nonce=?", (nonce,))
@@ -140,6 +158,9 @@ class Store:
     def raw_log(self, record: dict) -> None:
         with self._lock, open(self._raw, "a") as f:
             f.write(json.dumps(record, sort_keys=True) + "\n")
+
+    def is_seen(self, nonce: str) -> bool:
+        return bool(self._q("SELECT 1 FROM seen WHERE nonce=?", (nonce,)))
 
     def first_time(self, nonce: str) -> bool:
         try:
@@ -157,3 +178,61 @@ class Store:
                 "source": "nakshatra", "trust": "external"} for r in
                 self._q("SELECT nonce, from_person, petname, author, aspect, text, received FROM inbox "
                         "WHERE received >= ? ORDER BY received DESC LIMIT ?", (since, limit))]
+
+    # tasks: one row per (task, my role, counterparty). Poster rows use peer "" (the assignee is a
+    # column); worker rows use the poster's person key as peer. Every transition is compare-and-set.
+    _TASK_COLS = ("task_hash", "role", "peer", "spec", "state", "targets", "assignee", "epoch", "output",
+                  "verdict", "created", "updated")
+
+    def task_insert(self, task_hash: str, role: str, peer: str, spec: dict, state: str,
+                    targets: Optional[list] = None) -> bool:
+        now = int(time.time())
+        try:
+            self._q("INSERT INTO tasks VALUES (?,?,?,?,?,?,NULL,0,NULL,NULL,?,?)",
+                    (task_hash, role, peer, json.dumps(spec), state,
+                     json.dumps(targets) if targets is not None else None, now, now))
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+    def task_cas(self, task_hash: str, role: str, peer: str, from_states: tuple, **fields) -> bool:
+        """Move a task out of one of `from_states`, setting `fields`, atomically. False if it was not
+        in one of those states (someone else won, or the step is out of order)."""
+        allowed = {"state", "assignee", "epoch", "output", "verdict"}
+        if set(fields) - allowed:
+            raise ValueError(f"bad task fields {set(fields) - allowed}")
+        sets = ", ".join(f"{k}=?" for k in fields) + ", updated=?"
+        marks = ",".join("?" * len(from_states))
+
+        def fn(db):
+            cur = db.execute(f"UPDATE tasks SET {sets} WHERE task_hash=? AND role=? AND peer=? AND state IN ({marks})",
+                             (*fields.values(), int(time.time()), task_hash, role, peer, *from_states))
+            return cur.rowcount == 1
+        return self._tx(fn)
+
+    def task_get(self, task_hash: str, role: str, peer: str = "") -> Optional[dict]:
+        r = self._q(f"SELECT {', '.join(self._TASK_COLS)} FROM tasks WHERE task_hash=? AND role=? AND peer=?",
+                    (task_hash, role, peer))
+        return self._task_row(r[0]) if r else None
+
+    def task_find(self, prefix: str) -> list:
+        if len(prefix) < 8:
+            return []
+        return [self._task_row(r) for r in self._q(
+            f"SELECT {', '.join(self._TASK_COLS)} FROM tasks WHERE task_hash LIKE ? ORDER BY updated DESC",
+            (prefix + "%",))]
+
+    def tasks(self, role: Optional[str] = None, limit: int = 50) -> list:
+        q = f"SELECT {', '.join(self._TASK_COLS)} FROM tasks"
+        args: tuple = ()
+        if role:
+            q, args = q + " WHERE role=?", (role,)
+        return [self._task_row(r) for r in self._q(q + " ORDER BY updated DESC LIMIT ?", (*args, limit))]
+
+    def _task_row(self, r) -> dict:
+        d = dict(zip(self._TASK_COLS, r))
+        d["spec"] = json.loads(d["spec"])
+        d["targets"] = json.loads(d["targets"]) if d["targets"] else None
+        d["verdict"] = json.loads(d["verdict"]) if d["verdict"] else None
+        return d
+

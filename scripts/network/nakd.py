@@ -48,6 +48,7 @@ from cryptography.hazmat.primitives.asymmetric import ed25519  # noqa: E402
 import joincode  # noqa: E402
 from mesh.pairing import pair_role  # noqa: E402
 from network.store import Store  # noqa: E402
+from network import tasks as T  # noqa: E402
 from transport.relay import connect as relay_connect  # noqa: E402
 from transport.secure_channel import SecureChannelError, secure_handshake  # noqa: E402
 
@@ -431,6 +432,9 @@ class Node:
                         send_frame(ch, self._receive(person, frame), lock)
                     elif t == "ack":
                         self.store.ack(str(frame.get("mid", "")))
+                    elif t == "nack":   # received and refused: terminal, stop retrying, keep why
+                        self.store.refuse(str(frame.get("mid", "")), str(frame.get("why", "")))
+                        self.log(f"{person[:12]} refused {str(frame.get('mid', ''))[:8]}: {frame.get('why')}")
             except (OSError, SecureChannelError, ValueError) as e:
                 self.log(f"session {person[:12]}: {e}")
             finally:
@@ -444,7 +448,14 @@ class Node:
                 if not self.store.contact(person):
                     return
                 for item in self.store.pending_for(person):
-                    env = self._sign(item["kind"], person, item["body"])
+                    try:
+                        env = self._sign(item["kind"], person, item["body"])
+                    except RuntimeError as e:
+                        # The signer said no (no delegation for this kind, revoked, expired). That is
+                        # terminal for THIS item; it must not take the whole contact session down.
+                        self.store.refuse(item["body"].get("mid", ""), f"not signed: {e}")
+                        self.log(f"{item['kind']} to {person[:12]} not sent: {e}")
+                        continue
                     send_frame(ch, {"t": "env", "env": env, "body": item["body"]}, lock)
                 if time.time() - last_ping > PING_S:
                     send_frame(ch, {"t": "ping"}, lock)
@@ -480,10 +491,19 @@ class Node:
                 self.store.set_contact_state(person, "active")
                 self.log(f"{c['petname'] or person[:12]} accepted the connection")
             return {"t": "ack", "mid": mid}
-        if kind != "msg":
-            return {"t": "nack", "mid": mid, "why": f"{kind} is not handled by messaging"}
         if c["state"] != "active":
             return {"t": "nack", "mid": mid, "why": "connection not accepted yet"}
+        if isinstance(kind, str) and kind.startswith("task."):
+            if self.store.is_seen(mid):
+                return {"t": "ack", "mid": mid}
+            try:
+                self._task_receive(c, kind, body, env)
+            except ValueError as e:
+                return {"t": "nack", "mid": mid, "why": str(e)[:300]}
+            self.store.first_time(mid)
+            return {"t": "ack", "mid": mid}
+        if kind != "msg":
+            return {"t": "nack", "mid": mid, "why": f"{kind} is not handled here"}
         text = body.get("text")
         if not isinstance(text, str) or len(text) > MAX_TEXT:
             return {"t": "nack", "mid": mid, "why": "bad text"}
@@ -492,6 +512,132 @@ class Node:
                                 "from_person": person, "envelope": env, "body": body})
             self.store.add_inbox(mid, person, c["petname"], env.get("author", ""), str(body.get("aspect", ""))[:32], text)
         return {"t": "ack", "mid": mid}
+
+    # ── tasks ────────────────────────────────────────────────────────────────────────────────
+    # Poster: post_task → (claim arrives) assign the first valid claimer → (result arrives) judge by
+    # the declared rules → accept/reject. Worker: offer arrives → claim_task → assign arrives →
+    # submit_task → verdict arrives. Every step is a signed envelope on the contact session.
+
+    def post_task(self, to, title: str, instructions: str, acceptance: list, reward: int = 0,
+                  deadline_s: int = 3600) -> dict:
+        names = to if isinstance(to, list) else [to]
+        contacts = [c for c in self.store.contacts() if c["state"] == "active"]
+        if names in (["*"], ["all"]):
+            targets = contacts
+        else:
+            targets = [c for n in names for c in [self.store.resolve(str(n))] if c and c["state"] == "active"]
+            if len(targets) != len(names):
+                raise ValueError("every target must be an accepted contact")
+        if not targets:
+            raise ValueError("no accepted contacts to post to")
+        why = outbound_problem(f"{title}\n{instructions}")
+        if why:
+            raise ValueError(why)
+        spec = T.make_spec(self.person, title, instructions, acceptance, reward=reward, deadline_s=deadline_s)
+        h = T.task_hash(spec)
+        self.store.task_insert(h, "poster", "", spec, "posted", [c["person"] for c in targets])
+        for c in targets:
+            self._queue(c["person"], "task.post", {"task_hash": h, "spec": spec})
+        self.log(f"posted task {h[:12]} '{title}' to {len(targets)} contact(s)")
+        return {"task_hash": h, "posted_to": [c["petname"] or c["person"][:12] for c in targets]}
+
+    def _worker_task(self, ref: str) -> dict:
+        rows = [r for r in self.store.task_find(str(ref)) if r["role"] == "worker"]
+        if len(rows) != 1:
+            raise ValueError("no single offered task matches that id")
+        return rows[0]
+
+    def claim_task(self, ref: str) -> dict:
+        t = self._worker_task(ref)
+        if t["spec"]["deadline"] <= time.time():
+            raise ValueError("that task's deadline has passed")
+        if not self.store.task_cas(t["task_hash"], "worker", t["peer"], ("offered",), state="claimed"):
+            raise ValueError(f"cannot claim a task that is {t['state']}")
+        self._queue(t["peer"], "task.claim", {"task_hash": t["task_hash"]})
+        return {"task_hash": t["task_hash"], "state": "claimed"}
+
+    def submit_task(self, ref: str, output: str) -> dict:
+        t = self._worker_task(ref)
+        if not isinstance(output, str) or not output or len(output) > T.MAX_OUTPUT:
+            raise ValueError(f"output must be 1-{T.MAX_OUTPUT} characters")
+        why = outbound_problem(output)
+        if why:
+            raise ValueError(why)
+        passed, reasons = T.evaluate(t["spec"], output)       # the worker can see it would fail first
+        if not self.store.task_cas(t["task_hash"], "worker", t["peer"], ("assigned",),
+                                   state="submitted", output=output):
+            raise ValueError(f"cannot submit a task that is {t['state']} (it must be assigned to you)")
+        self._queue(t["peer"], "task.result", {"task_hash": t["task_hash"], "epoch": t["epoch"], "output": output})
+        return {"task_hash": t["task_hash"], "state": "submitted", "precheck_passed": passed, "precheck": reasons}
+
+    def _task_receive(self, c: dict, kind: str, body: dict, env: dict) -> None:
+        """Apply one verified task envelope from an active contact. ValueError = refuse (nack)."""
+        h = body.get("task_hash")
+        if not (isinstance(h, str) and len(h) == 64):
+            raise ValueError("task_hash missing")
+        who = c["petname"] or c["person"][:12]
+        if kind == "task.post":
+            spec = body.get("spec")
+            T.validate_spec(spec)
+            if T.task_hash(spec) != h or spec["poster"] != c["person"]:
+                raise ValueError("task spec is not bound to its hash and poster")
+            if self.store.task_insert(h, "worker", c["person"], spec, "offered"):
+                self.store.raw_log({"received": int(time.time()), "source": "nakshatra", "trust": "external",
+                                    "from_person": c["person"], "envelope": env, "body": body})
+                self.log(f"task offer {h[:12]} '{spec['title']}' from {who}")
+            return
+        if kind == "task.claim":
+            t = self.store.task_get(h, "poster", "")
+            if not t:
+                raise ValueError("no such task")
+            if c["person"] not in (t["targets"] or []):
+                raise ValueError("this task was not offered to you")
+            if t["spec"]["deadline"] <= time.time():
+                raise ValueError("deadline passed")
+            if self.store.task_cas(h, "poster", "", ("posted",), state="assigned", assignee=c["person"], epoch=1):
+                self._queue(c["person"], "task.assign", {"task_hash": h, "epoch": 1, "worker": c["person"]})
+                self.log(f"task {h[:12]} assigned to {who}")
+            elif t["assignee"] != c["person"]:
+                self._queue(c["person"], "task.reject", {"task_hash": h, "epoch": 0,
+                                                         "reasons": ["already assigned to someone else"]})
+            return
+        if kind == "task.assign":
+            if body.get("worker") != self.person or not isinstance(body.get("epoch"), int):
+                raise ValueError("assignment is not for this node's person")
+            if not self.store.task_cas(h, "worker", c["person"], ("claimed",), state="assigned", epoch=body["epoch"]):
+                raise ValueError("assignment for a task this node did not claim")
+            self.log(f"task {h[:12]} assigned to us by {who}")
+            return
+        if kind == "task.result":
+            t = self.store.task_get(h, "poster", "")
+            if not t or t["assignee"] != c["person"] or body.get("epoch") != t["epoch"]:
+                raise ValueError("result for a task not assigned to you")
+            output = body.get("output")
+            passed, reasons = T.evaluate(t["spec"], output)
+            verdict = {"passed": passed, "reasons": reasons,
+                       "output_sha256": hashlib.sha256(str(output).encode("utf-8")).hexdigest()}
+            if not self.store.task_cas(h, "poster", "", ("assigned",), state="accepted" if passed else "rejected",
+                                       output=output, verdict=json.dumps(verdict)):
+                raise ValueError("task is not awaiting a result")
+            self.store.raw_log({"received": int(time.time()), "source": "nakshatra", "trust": "external",
+                                "from_person": c["person"], "envelope": env, "body": body})
+            self._queue(c["person"], "task.accept" if passed else "task.reject",
+                        {"task_hash": h, "epoch": t["epoch"], **verdict})
+            self.log(f"task {h[:12]} result from {who}: {'ACCEPTED' if passed else 'REJECTED ' + str(reasons)}")
+            return
+        if kind in ("task.accept", "task.reject"):
+            t = self.store.task_get(h, "worker", c["person"])
+            if not t:
+                raise ValueError("no such task here")
+            reasons = body.get("reasons") if isinstance(body.get("reasons"), list) else []
+            verdict = json.dumps({"passed": kind == "task.accept", "reasons": [str(r)[:300] for r in reasons][:12]})
+            if body.get("epoch") == 0:
+                self.store.task_cas(h, "worker", c["person"], ("claimed",), state="lost", verdict=verdict)
+            else:
+                self.store.task_cas(h, "worker", c["person"], ("submitted",),
+                                    state="accepted" if kind == "task.accept" else "rejected", verdict=verdict)
+            return
+        raise ValueError(f"unknown task step {kind}")
 
     # ── read side ────────────────────────────────────────────────────────────────────────────
     def status(self) -> dict:
@@ -525,7 +671,7 @@ def _hard_close(ch) -> None:
 # ── control socket (the CLI and, on Day 5, the MCP front door talk to this) ───────────────────
 
 OPS = {"status", "register_invite", "redeem", "requests", "accept", "decline", "contacts", "remove", "send",
-       "delivered", "inbox"}
+       "delivered", "inbox", "task_post", "tasks", "task_claim", "task_submit"}
 
 
 def handle(node: Node, req: dict) -> dict:
@@ -554,6 +700,19 @@ def handle(node: Node, req: dict) -> dict:
             return {"ok": True, **node.send(req["to"], req["text"], req.get("aspect", ""))}
         if op == "delivered":
             return {"ok": True, "delivered": node.delivered(req["mid"])}
+        if op == "task_post":
+            return {"ok": True, **node.post_task(req["to"], req["title"], req["instructions"], req["acceptance"],
+                                                 int(req.get("reward", 0)), int(req.get("deadline_s", 3600)))}
+        if op == "tasks":
+            rows = node.store.tasks(req.get("role") or None, int(req.get("limit", 50)))
+            for r in rows:
+                c = node.store.contact(r["peer"] or (r["assignee"] or ""))
+                r["peer_name"] = (c or {}).get("petname", "")
+            return {"ok": True, "tasks": rows}
+        if op == "task_claim":
+            return {"ok": True, **node.claim_task(req["task"])}
+        if op == "task_submit":
+            return {"ok": True, **node.submit_task(req["task"], req["output"])}
         if op == "inbox":
             return {"ok": True, "messages": node.store.inbox(int(req.get("since", 0)), int(req.get("limit", 50)))}
     except (KeyError, ValueError, RuntimeError) as e:

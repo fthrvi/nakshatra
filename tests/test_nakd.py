@@ -234,7 +234,8 @@ def test_mcp_front_door(net, tmp_path):
     init = srv.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}})
     assert init["result"]["serverInfo"]["name"] == "nakshatra"
     names = {t["name"] for t in srv.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})["result"]["tools"]}
-    assert names == {"nak_status", "nak_contacts", "nak_inbox", "nak_requests", "nak_send"}   # no connect tools
+    assert names == {"nak_status", "nak_contacts", "nak_inbox", "nak_requests", "nak_send",
+                     "nak_tasks", "nak_task_post", "nak_task_claim", "nak_task_submit"}   # no connect tools
     call = lambda n, args: srv.handle({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
                                        "params": {"name": n, "arguments": args}})["result"]
     r = call("nak_accept", {"id": "x"})
@@ -268,3 +269,135 @@ def test_mcp_stdio_process(net, tmp_path):
     assert [o["id"] for o in out] == [1, 2]
     assert a.person_pub[:16] in out[1]["result"]["content"][0]["text"]
     stop.set()
+
+
+# ── tasks ───────────────────────────────────────────────────────────────────────────────────
+
+def _worker_row(node, h):
+    return [r for r in node.store.tasks("worker") if r["task_hash"] == h]
+
+
+def _connect(net, a, b):
+    b.node.redeem(a.invite(), wait_s=15)
+    a.node.accept(a.node.store.requests()[0]["id"], petname=b.dir.name)
+    assert wait(lambda: (b.node.store.contact(a.person_pub) or {}).get("state") == "active")
+
+
+def test_task_post_claim_assign_result_accept(net):
+    a = net("poster", caps=("nak.msg", "nak.task.post"))
+    b = net("worker", caps=("nak.msg", "nak.task.claim"))
+    _connect(net, a, b)
+    r = a.node.post_task("worker", "capital", "What is the capital of Nepal? One line.",
+                         [{"max_words": 8}, {"contains_all": ["Kathmandu"]}], reward=5)
+    h = r["task_hash"]
+    assert wait(lambda: _worker_row(b.node, h))
+    offer = _worker_row(b.node, h)[0]
+    assert offer["state"] == "offered" and offer["spec"]["reward"] == {"amount": 5, "unit": "TEST"}
+    with pytest.raises(ValueError, match="assigned to you"):
+        b.node.submit_task(h[:12], "too early")
+    b.node.claim_task(h[:12])
+    assert wait(lambda: _worker_row(b.node, h)[0]["state"] == "assigned")
+    assert a.node.store.task_get(h, "poster")["assignee"] == b.person_pub
+    sub = b.node.submit_task(h[:12], "Kathmandu is the capital.")
+    assert sub["precheck_passed"]
+    assert wait(lambda: _worker_row(b.node, h)[0]["state"] == "accepted")
+    t = a.node.store.task_get(h, "poster")
+    assert t["state"] == "accepted" and t["verdict"]["passed"] and t["output"] == "Kathmandu is the capital."
+
+
+def test_task_result_failing_rules_is_rejected_with_reasons(net):
+    a = net("poster", caps=("nak.msg", "nak.task.post"))
+    b = net("worker", caps=("nak.msg", "nak.task.claim"))
+    _connect(net, a, b)
+    h = a.node.post_task("worker", "short", "Say hi.", [{"max_words": 2}])["task_hash"]
+    assert wait(lambda: _worker_row(b.node, h))
+    b.node.claim_task(h)
+    assert wait(lambda: _worker_row(b.node, h)[0]["state"] == "assigned")
+    assert not b.node.submit_task(h, "hello there my friend")["precheck_passed"]
+    assert wait(lambda: _worker_row(b.node, h)[0]["state"] == "rejected")
+    assert "4 words > max 2" in _worker_row(b.node, h)[0]["verdict"]["reasons"][0]
+
+
+def test_first_claim_wins_second_is_told_lost(net):
+    a = net("poster", caps=("nak.msg", "nak.task.post"))
+    b = net("w1", caps=("nak.msg", "nak.task.claim"))
+    c = net("w2", caps=("nak.msg", "nak.task.claim"))
+    _connect(net, a, b)
+    _connect(net, a, c)
+    h = a.node.post_task("*", "one job", "Do it.", [{"max_words": 3}])["task_hash"]
+    assert wait(lambda: _worker_row(b.node, h) and _worker_row(c.node, h))
+    b.node.claim_task(h)
+    assert wait(lambda: _worker_row(b.node, h)[0]["state"] == "assigned")
+    c.node.claim_task(h)
+    assert wait(lambda: _worker_row(c.node, h)[0]["state"] == "lost")
+    assert a.node.store.task_get(h, "poster")["assignee"] == b.person_pub
+
+
+def test_worker_without_claim_cap_cannot_claim(net):
+    a = net("poster", caps=("nak.msg", "nak.task.post"))
+    b = net("worker", caps=("nak.msg",))            # no nak.task.claim delegated
+    _connect(net, a, b)
+    h = a.node.post_task("worker", "x", "Do it.", [{"max_words": 3}])["task_hash"]
+    assert wait(lambda: _worker_row(b.node, h))
+    b.node.claim_task(h)                              # queued; the signer refuses to sign it
+    assert wait(lambda: any(b.node.store.refused(m) for m in _outbox_mids(b.node)))
+    assert a.node.store.task_get(h, "poster")["state"] == "posted"
+    # and the session with that contact still carries ordinary messages
+    mid = b.node.send(a.person_pub, "still here")["queued"]
+    assert wait(lambda: b.node.delivered(mid)) and not b.node.store.refused(mid)
+
+
+def _outbox_mids(node):
+    return [r[0] for r in node.store._q("SELECT nonce FROM outbox")]
+
+
+def test_poster_cannot_post_secrets_or_to_strangers(net):
+    a = net("poster", caps=("nak.msg", "nak.task.post"))
+    with pytest.raises(ValueError, match="no accepted contacts"):
+        a.node.post_task("*", "x", "y", [{"max_words": 3}])
+    b = net("worker", caps=("nak.msg", "nak.task.claim"))
+    _connect(net, a, b)
+    with pytest.raises(ValueError, match="secret"):
+        a.node.post_task("worker", "x", "use key sk-ant-" + "z" * 30, [{"max_words": 3}])
+    with pytest.raises(ValueError, match="accepted contact"):
+        a.node.post_task(["worker", "nobody"], "x", "y", [{"max_words": 3}])
+
+
+def test_forged_task_steps_are_refused(net):
+    a = net("poster", caps=("nak.msg", "nak.task.post"))
+    b = net("worker", caps=("nak.msg", "nak.task.claim"))
+    _connect(net, a, b)
+    h = a.node.post_task("worker", "x", "Do it.", [{"max_words": 3}])["task_hash"]
+    assert wait(lambda: _worker_row(b.node, h))
+    # a result without being assigned is refused at the poster
+    body = {"task_hash": h, "epoch": 1, "output": "done", "mid": "f1"}
+    env = b.node._sign("task.result", a.person_pub, body)
+    assert a.node._receive(b.person_pub, {"t": "env", "env": env, "body": body})["t"] == "nack"
+    # a spec whose poster field lies about who posted it is refused at the worker
+    from network import tasks as T
+    fake = T.make_spec(b.person_pub, "fake", "Do it.", [{"max_words": 3}])
+    body = {"task_hash": T.task_hash(fake), "spec": fake, "mid": "f2"}
+    env = a.node._sign("task.post", b.person_pub, body)
+    assert b.node._receive(a.person_pub, {"t": "env", "env": env, "body": body})["t"] == "nack"
+
+
+def test_mcp_task_tools_round_trip(net, tmp_path):
+    from network.client import NakClient
+    from network.nak_mcp import Server
+    a = net("poster", caps=("nak.msg", "nak.task.post"))
+    b = net("worker", caps=("nak.msg", "nak.task.claim"))
+    _connect(net, a, b)
+    sa, stop_a = _serve(a.node, tmp_path)
+    sb, stop_b = _serve(b.node, tmp_path)
+    pa, pb = Server(NakClient(sa)), Server(NakClient(sb))
+    out = pa.call("nak_task_post", {"to": "worker", "title": "greet", "instructions": "Say namaste.",
+                                    "acceptance": '[{"contains_all": ["namaste"]}]'})
+    h = out.split("task ")[1].split(" ")[0]
+    assert wait(lambda: "offered" in pb.call("nak_tasks", {}))
+    view = pb.call("nak_tasks", {})
+    assert "UNTRUSTED" in view and "<untrusted_request" in view and "must mention ['namaste']" in view
+    pb.call("nak_task_claim", {"task": h})
+    assert wait(lambda: "assigned" in pb.call("nak_tasks", {}))
+    assert "passes" in pb.call("nak_task_submit", {"task": h, "output": "Namaste!"})
+    assert wait(lambda: "ACCEPTED" in pa.call("nak_tasks", {"role": "poster"}))
+    stop_a.set(); stop_b.set()

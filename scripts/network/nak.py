@@ -60,6 +60,14 @@ def main(argv=None) -> int:
     p = sub.add_parser("send"); p.add_argument("to"); p.add_argument("text")
     p.add_argument("--aspect", default="")
     p = sub.add_parser("inbox"); p.add_argument("--limit", type=int, default=20)
+    p = sub.add_parser("task", help="post / list / claim / submit tasks")
+    tsub = p.add_subparsers(dest="tcmd", required=True)
+    q = tsub.add_parser("post"); q.add_argument("to"); q.add_argument("title"); q.add_argument("instructions")
+    q.add_argument("--rule", action="append", default=[], help='JSON rule, e.g. \'{"max_words": 60}\' (repeatable)')
+    q.add_argument("--reward", type=int, default=0); q.add_argument("--deadline", type=int, default=3600)
+    q = tsub.add_parser("list"); q.add_argument("--role", default="")
+    q = tsub.add_parser("claim"); q.add_argument("task")
+    q = tsub.add_parser("submit"); q.add_argument("task"); q.add_argument("output")
     a = ap.parse_args(argv)
     s = a.sock
 
@@ -95,6 +103,19 @@ def main(argv=None) -> int:
     elif a.cmd == "send":
         r = call(s, {"op": "send", "to": a.to, "text": a.text, "aspect": a.aspect})
         print(f"queued {r['queued']} to {r['to']}")
+    elif a.cmd == "task":
+        if a.tcmd == "post":
+            rules = [json.loads(r) for r in a.rule] or [{"max_words": 200}]
+            r = call(s, {"op": "task_post", "to": a.to, "title": a.title, "instructions": a.instructions,
+                         "acceptance": rules, "reward": a.reward, "deadline_s": a.deadline})
+            print(f"posted {r['task_hash'][:12]} to {', '.join(r['posted_to'])}")
+        elif a.tcmd == "list":
+            from network.client import render_tasks
+            print(render_tasks(call(s, {"op": "tasks", "role": a.role})["tasks"]))
+        elif a.tcmd == "claim":
+            print(json.dumps(call(s, {"op": "task_claim", "task": a.task})))
+        elif a.tcmd == "submit":
+            print(json.dumps(call(s, {"op": "task_submit", "task": a.task, "output": a.output})))
     elif a.cmd == "inbox":
         for m in reversed(call(s, {"op": "inbox", "limit": a.limit})["messages"]):
             print(f"[{_ago(m['received'])}] {m['petname'] or m['from_person'][:12]}: {m['text']}")
