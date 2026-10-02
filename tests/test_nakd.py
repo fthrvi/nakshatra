@@ -401,3 +401,27 @@ def test_mcp_task_tools_round_trip(net, tmp_path):
     assert "passes" in pb.call("nak_task_submit", {"task": h, "output": "Namaste!"})
     assert wait(lambda: "ACCEPTED" in pa.call("nak_tasks", {"role": "poster"}))
     stop_a.set(); stop_b.set()
+
+
+def test_mcp_forgives_guessed_param_names_and_waits_for_assignment(net, tmp_path):
+    from network.client import NakClient
+    from network.nak_mcp import Server
+    a = net("poster", caps=("nak.msg", "nak.task.post"))
+    b = net("worker", caps=("nak.msg", "nak.task.claim"))
+    _connect(net, a, b)
+    sb, stop_b = _serve(b.node, tmp_path)
+    srv = Server(NakClient(sb))
+    call = lambda n, args: srv.handle({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                                       "params": {"name": n, "arguments": args}})["result"]
+    # exactly what qwen3-8b sent on 2026-10-02
+    r = call("nak_send", {"message": "hi from the worker", "to": a.person_pub})
+    assert not r["isError"]
+    h = a.node.post_task("worker", "t", "Say ok.", [{"contains_all": ["ok"]}])["task_hash"]
+    assert wait(lambda: _worker_row(b.node, h))
+    r = call("nak_task_claim", {"claim": True, "task_id": f"[{h[:12]}]"})
+    assert not r["isError"] and "ASSIGNED" in r["content"][0]["text"]
+    r = call("nak_task_submit", {"task_id": h[:12]})
+    assert r["isError"] and "needs output" in r["content"][0]["text"] and "task, output" in r["content"][0]["text"]
+    r = call("nak_task_submit", {"task_id": h[:12], "answer": "ok"})
+    assert not r["isError"] and "passes" in r["content"][0]["text"]
+    stop_b.set()

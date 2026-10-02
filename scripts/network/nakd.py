@@ -786,8 +786,19 @@ def main(argv=None) -> int:
         raise SystemExit("--agent, NAK_AGENT or <state>/agent is required: the delegated agent this node signs as")
     host, port = a.relay.rsplit(":", 1)
     stop = threading.Event()
-    node = Node(a.state, _load_node_key(a.node_key), SignerClient(a.signer), agent=a.agent,
-                relay=(host, int(port)), log=lambda m: print(f"[nakd] {m}", flush=True)).start()
+    # The signer is a separate service and an update restarts both at once: wait for it (up to a
+    # minute) instead of dying on the race and leaving the node unreachable until systemd retries.
+    deadline = time.time() + 60
+    while True:
+        try:
+            node = Node(a.state, _load_node_key(a.node_key), SignerClient(a.signer), agent=a.agent,
+                        relay=(host, int(port)), log=lambda m: print(f"[nakd] {m}", flush=True)).start()
+            break
+        except (OSError, RuntimeError) as e:
+            if time.time() > deadline:
+                raise
+            print(f"[nakd] waiting for the signer: {e}", flush=True)
+            time.sleep(2)
     print(f"[nakd] node {node.node[:16]} person {node.person[:16]} relay {a.relay} custody {node.custody}", flush=True)
     import signal
     signal.signal(signal.SIGTERM, lambda *_: stop.set())

@@ -65,6 +65,32 @@ REQUIRED = {"nak_task_claim": ["task"], "nak_task_submit": ["task", "output"],
             "nak_task_post": ["to", "title", "instructions", "acceptance"], "nak_send": ["to", "text"], "nak_accept": ["id"], "nak_decline": ["id"], "nak_redeem": ["code"]}
 
 
+# Small local models guess parameter names ("message" for text, "task_id" for task). Accept the
+# obvious aliases rather than fail, and when something is still missing say exactly what is needed.
+ALIASES = {
+    "text": ("message", "body", "content", "msg"),
+    "to": ("contact", "recipient", "name", "who"),
+    "task": ("task_id", "id", "task_hash", "hash"),
+    "output": ("answer", "result", "text", "content", "response"),
+    "instructions": ("description", "body", "prompt", "details"),
+}
+CLAIM_WAIT_S = 20.0
+
+
+def normalize_args(name: str, args: dict) -> dict:
+    args = dict(args or {})
+    props = (READ_TOOLS.get(name) or CONNECT_TOOLS.get(name) or ("", {}))[1]
+    for key, alts in ALIASES.items():
+        if key in props and not args.get(key):
+            for alt in alts:
+                if alt != key and args.get(alt) not in (None, ""):
+                    args[key] = args[alt]
+                    break
+    if isinstance(args.get("task"), str):
+        args["task"] = args["task"].strip().strip("[]").strip()
+    return args
+
+
 class Server:
     def __init__(self, client: NakClient, allow_connect: bool = False, aspect: str = ""):
         self.client = client
@@ -101,7 +127,19 @@ class Server:
             return render_tasks(c.tasks(str(args.get("role") or "")))
         if name == "nak_task_claim":
             r = c.task_claim(str(args["task"]))
-            return f"Claimed {r['task_hash'][:12]}; it is yours once the poster assigns it (check nak_tasks)."
+            h = r["task_hash"]
+            import time as _t
+            end = _t.time() + CLAIM_WAIT_S
+            while _t.time() < end:
+                row = next((t for t in c.tasks("worker") if t["task_hash"] == h), None)
+                if row and row["state"] == "assigned":
+                    return (f"Claimed and ASSIGNED to you: {h[:12]}. Now do the task and submit the answer with "
+                            f"nak_task_submit(task=\"{h[:12]}\", output=\"...\").")
+                if row and row["state"] == "lost":
+                    return f"Claimed {h[:12]}, but the poster gave it to someone else. Nothing to do."
+                _t.sleep(1.0)
+            return (f"Claimed {h[:12]}; the poster has not assigned it yet (they may be offline). Check nak_tasks "
+                    f"later; submit only once it shows 'assigned'.")
         if name == "nak_task_submit":
             r = c.task_submit(str(args["task"]), str(args["output"]))
             pre = "passes the declared rules" if r["precheck_passed"] else f"would FAIL: {r['precheck']}"
@@ -139,14 +177,18 @@ class Server:
                 result = {"tools": self.list_tools()}
             elif method == "tools/call":
                 p = msg.get("params") or {}
-                name, args = p.get("name", ""), p.get("arguments") or {}
-                for k in REQUIRED.get(name, []):
-                    if not args.get(k):
-                        raise NakError(f"{k} is required")
-                try:
-                    text, err = self.call(name, args), False
-                except NakError as e:
-                    text, err = f"Refused: {e}", True
+                name = p.get("name", "")
+                args = normalize_args(name, p.get("arguments") or {})
+                missing = [k for k in REQUIRED.get(name, []) if not args.get(k)]
+                if missing:
+                    props = (READ_TOOLS.get(name) or CONNECT_TOOLS.get(name) or ("", {}))[1]
+                    text, err = (f"Not done: {name} needs {', '.join(missing)}. Its parameters are exactly: "
+                                 f"{', '.join(props)}. Call it again with those names."), True
+                else:
+                    try:
+                        text, err = self.call(name, args), False
+                    except NakError as e:
+                        text, err = f"Refused (nothing was done): {e}", True
                 result = {"content": [{"type": "text", "text": text}], "isError": err}
             else:
                 return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": f"no method {method}"}}
