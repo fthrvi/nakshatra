@@ -2,7 +2,7 @@
 
 > Distributed LLM inference across heterogeneous workers (NVIDIA / AMD / Apple Silicon / CPU). Splits one model by layer ranges; patched llama.cpp + gRPC chain protocol. (Inspired by [Petals](README_PETALS.md); v0.1 design is independent.)
 
-Status (2026-06): **v0.3 shipped, v0.5 protocol foundations in progress.** GPU acceleration (Metal + ROCm) is live on a 5-machine heterogeneous lab cluster; sub-GGUF auto-fetch, latency-aware chain assembly, and streaming KV-cache reuse are all shipped. Speculative decoding is proven on RDNA4 silicon (2.7× factual / 2.3× code, single-node). The original two-worker acceptance test — same top-1 token as a single-machine `llama-cli` reference — is in [`experiments/v0.0/m6_findings.md`](experiments/v0.0/m6_findings.md). See [Status — what's shipped, what's coming](#status--whats-shipped-whats-coming) below for the full breakdown.
+Status (2026-10): split inference across heterogeneous machines is **live** (gateway on the hub, placement, scale-to-zero, signed receipts); the network layer (signed discovery, encrypted relay tunnels, admission junction, libp2p hole-punch relay) is **live**; people-to-people messaging, tasks, signed releases and a one-line join landed in 2026-10. **What exists, what is wired and where it runs: [`docs/COMPONENTS.md`](docs/COMPONENTS.md) — read it before building anything.** The v0.3/v0.5 breakdown below is kept as history.
 
 **Paper:** [*Compute, Not the Wire: An Experience Report on Distributed LLM Inference over Heterogeneous Consumer AMD Radeon, RDNA4, and Mixed ROCm+Metal Clusters*](https://zenodo.org/records/20514967) (Bishwanath Bastola, 2026 — DOI [10.5281/zenodo.20514967](https://doi.org/10.5281/zenodo.20514967)). Earlier write-up: [Nakshatra: Vendor-Agnostic Distributed Inference on Heterogeneous Consumer Hardware](https://pnl.market/research/6a017d83b86a1bf1c69ea714).
 
@@ -237,6 +237,8 @@ scripts/
 Each worker is a Python gRPC process that spawns a long-lived C++ daemon (`llama-nakshatra-worker`). The daemon holds the model slice and KV cache, accepts framed binary messages over stdin/stdout, and runs `llama_decode` per request. The Python worker pumps gRPC requests through to the daemon and back. The client tokenizes the prompt locally, calls the first worker with token IDs, ferries the returned hidden state through any middle workers, and gets back a token id from the last worker. The v0.3 federation extends this with sub-GGUF auto-fetch (workers download missing slices from peers), latency-aware chain assembly via a pillar registry, and Metal / ROCm GPU offload across heterogeneous machines. **Outputs on GPU paths are reproducible *in distribution*, not byte-for-byte** — kernel-level non-determinism in current backends. Bit-identical reproducibility is available via CPU-only workers (`--gpu-backend cpu`), kept for regression tests. See `docs/v0.5-design-lock.md` for the full property statement.
 
 ## Status — what's shipped, what's coming
+
+> **Superseded as a current-state list (2026-10):** see [`docs/COMPONENTS.md`](docs/COMPONENTS.md). The text below is the v0.3/v0.5-era record.
 
 **Shipped (v0.1 → v0.3):**
 

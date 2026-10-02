@@ -105,6 +105,8 @@ enable-linger $USER` (one-time).
 
 ## What is still NOT auto-running (smaller, honest gaps)
 
+> **Updated 2026-10-03 (checked on the machines):** a standing PUBLIC rendezvous relay runs on the VPS (`45.63.109.137:51820`, `nakshatra-rendezvous`), as do the admission junction (:9778) and the libp2p hole-punch relay (`nakshatra-sidecar-relay`, :29700 + QUIC). Hole-punching code exists twice — libp2p DCUtR (LIVE via the sidecar) and native `mesh/direct_path.py` (BUILT, not called) — so the ⬜ below is **wiring, not building** (unification U3). Current list: [`COMPONENTS.md`](COMPONENTS.md).
+
 - 🟡 **Discovery substrate is FileRelay** (a shared/local directory of signed
   listings) by default — zero-dep and always-on, but local. `meshd --nostr-relay
   wss://…` swaps in a real **public Nostr** relay (signed-listing schema is
@@ -117,7 +119,7 @@ enable-linger $USER` (one-time).
 - 🟡 **O(t) productionization:** proven via the Forward-relay driver. Folding it
   into `client.py`'s recovery branch as the default, and the worker-push variant
   (worker-side cache + catch-up RPC + proto field), are staged.
-- ⬜ **Hole-punching** to skip the relay when a peer is directly reachable.
+- 🟡 **Hole-punching** to skip the relay: the code exists (libp2p sidecar LIVE; `direct_path.py` built) — not yet wired into meshd/nakd (U3).
 - ⬜ **Standing-relay hardening:** rendezvous-id allowlist + rate-limit; active
   liveness probe on idle tunnels (today a dead idle tunnel is reaped via the
   discovery TTL, not by sensing the broken pipe).
