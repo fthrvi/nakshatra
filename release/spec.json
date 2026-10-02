@@ -50,13 +50,60 @@
     "{home}/.nakshatra/net"
    ],
    "requires": "{home}/.nakshatra/net/agent"
+  },
+  "nakshatra-relay": {
+   "description": "Nakshatra rendezvous relay (untrusted byte-forwarder)",
+   "requires": "{home}/.nakshatra/relay.env",
+   "env_file": "{home}/.nakshatra/relay.env",
+   "environment": {
+    "NKS_RELAY_HOST": "::",
+    "NKS_RELAY_PORT": "51820"
+   },
+   "exec": [
+    "{python}",
+    "{prefix}/current/nakshatra/scripts/transport/relay.py",
+    "--host",
+    "${NKS_RELAY_HOST}",
+    "--port",
+    "${NKS_RELAY_PORT}"
+   ],
+   "restart": "always",
+   "hardening": true
+  },
+  "nakshatra-meshd": {
+   "description": "Nakshatra node daemon (publish + discover + auto-tunnel)",
+   "requires": "{home}/.nakshatra/meshd.env",
+   "env_file": "{home}/.nakshatra/meshd.env",
+   "after": [
+    "network-online.target",
+    "nakshatra-relay.service"
+   ],
+   "environment": {
+    "RELAY_DIR": "{home}/.nakshatra/relay",
+    "RENDEZVOUS": "45.63.109.137:51820",
+    "REFRESH": "30"
+   },
+   "exec": [
+    "{python}",
+    "{prefix}/current/nakshatra/scripts/mesh/meshd.py",
+    "--mesh-id=${MESH_ID}",
+    "--serving=${SERVING}",
+    "--relay-dir=${RELAY_DIR}",
+    "--rendezvous=${RENDEZVOUS}",
+    "--drift-class=${DRIFT_CLASS}",
+    "--worker-addr=${WORKER_ADDR}",
+    "--endpoint=${ENDPOINT_HINT}",
+    "--refresh=${REFRESH}"
+   ],
+   "restart": "always",
+   "hardening": true
   }
  },
  "health": [
   [
    "{python}",
    "-c",
-   "import sthambha.signer, joincode, transport.secure_channel, transport.mux_tunnel, mesh.meshd, network.nakd"
+   "import sthambha.signer, joincode, transport.secure_channel, transport.mux_tunnel, mesh.meshd, network.nakd, mesh.meshd, transport.relay"
   ]
  ],
  "commands": {

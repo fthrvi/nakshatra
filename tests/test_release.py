@@ -270,3 +270,25 @@ def test_a_non_systemd_installer_can_never_write_real_units(tmp_path):
     real = Path.home() / ".config" / "systemd" / "user"
     inst = I.Installer(tmp_path / "node", systemd=False, make_venv=False)
     assert inst.unit_dir == tmp_path / "node" / "units" and inst.unit_dir != real
+
+
+def test_hardened_opt_in_service_unit_renders_like_the_handwritten_one(tmp_path):
+    inst = I.Installer(tmp_path / "node", systemd=False, make_venv=False, unit_dir=tmp_path / "units")
+    svc = {"description": "meshd", "requires": "{home}/.nakshatra/meshd.env", "env_file": "{home}/.nakshatra/meshd.env",
+           "after": ["network-online.target"], "environment": {"RENDEZVOUS": "45.63.109.137:51820"},
+           "exec": ["{python}", "{prefix}/current/nakshatra/scripts/mesh/meshd.py", "--mesh-id=${MESH_ID}"],
+           "restart": "always", "hardening": True}
+    man = {"components": [{"name": "nakshatra", "pythonpath": "scripts"}]}
+    text = inst._unit_text(svc, inst._ctx(man), man)
+    home = str(Path.home())
+    for line in (f"ConditionPathExists={home}/.nakshatra/meshd.env", f"EnvironmentFile=-{home}/.nakshatra/meshd.env",
+                 "Environment=RENDEZVOUS=45.63.109.137:51820", "--mesh-id=${MESH_ID}", "Restart=always",
+                 "ProtectSystem=strict", f"ReadWritePaths={home}/.nakshatra", "After=network-online.target"):
+        assert line in text, line
+
+
+def test_meshd_and_relay_ship_in_the_release_but_only_run_where_opted_in():
+    spec = json.loads((Path(__file__).resolve().parent.parent / "release" / "spec.json").read_text())
+    for name in ("nakshatra-meshd", "nakshatra-relay"):
+        svc = spec["services"][name]
+        assert svc["requires"].endswith(".env") and svc["hardening"] is True and svc["restart"] == "always"

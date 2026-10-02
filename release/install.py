@@ -172,16 +172,35 @@ class Installer:
         return ":".join(str(cur / c["name"] / c["pythonpath"]) for c in man["components"])
 
     # ── services + health ──
+    def _unit_text(self, svc: dict, ctx: dict, man: dict) -> str:
+        """One systemd unit from a spec entry. Optional keys (all from the SIGNED manifest):
+        requires (opt-in per node: ConditionPathExists), after, env_file, environment {K: V},
+        restart (default on-failure), hardening (the meshd/relay sandbox: read-only home except
+        ~/.nakshatra). ${VARS} pass through to systemd, which expands them from the env file."""
+        unit = [f"Description={svc['description']} (managed by nakshatra-node install.py)"]
+        if svc.get("requires"):
+            unit.append(f"ConditionPathExists={_render(svc['requires'], ctx)}")
+        if svc.get("after"):
+            unit.append("After=" + " ".join(svc["after"]))
+        service = [f"Environment=PYTHONPATH={self._pythonpath(man)}"]
+        if svc.get("env_file"):
+            service.append(f"EnvironmentFile=-{_render(svc['env_file'], ctx)}")
+        for k, v in (svc.get("environment") or {}).items():
+            service.append(f"Environment={k}={_render(str(v), ctx)}")
+        service.append("ExecStart=" + " ".join(_render(a, ctx) for a in svc["exec"]))
+        service.append(f"Restart={svc.get('restart', 'on-failure')}")
+        service.append("RestartSec=5")
+        if svc.get("hardening"):
+            service += ["NoNewPrivileges=true", "PrivateTmp=true", "ProtectSystem=strict",
+                        "ProtectHome=read-only", f"ReadWritePaths={ctx['home']}/.nakshatra"]
+        return ("[Unit]\n" + "\n".join(unit) + "\n\n[Service]\n" + "\n".join(service) +
+                "\n\n[Install]\nWantedBy=default.target\n")
+
     def write_units(self, man: dict) -> list:
         ctx, names = self._ctx(man), []
         self.unit_dir.mkdir(parents=True, exist_ok=True)
         for name, svc in man.get("services", {}).items():
-            cond = f"ConditionPathExists={_render(svc['requires'], ctx)}\n" if svc.get("requires") else ""
-            unit = (f"[Unit]\nDescription={svc['description']} (managed by nakshatra-node install.py)\n{cond}\n"
-                    f"[Service]\nEnvironment=PYTHONPATH={self._pythonpath(man)}\n"
-                    f"ExecStart={' '.join(_render(a, ctx) for a in svc['exec'])}\nRestart=on-failure\nRestartSec=5\n\n"
-                    f"[Install]\nWantedBy=default.target\n")
-            (self.unit_dir / f"{name}.service").write_text(unit)
+            (self.unit_dir / f"{name}.service").write_text(self._unit_text(svc, ctx, man))
             names.append(name)
         bin_dir = self.prefix / "bin"
         bin_dir.mkdir(exist_ok=True)
