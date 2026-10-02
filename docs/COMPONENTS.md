@@ -53,9 +53,9 @@ Unification work in progress (U1–U6): `trisul/plans/2026-10-03-nakshatra-unifi
 | Key | Used by | Note |
 |---|---|---|
 | `~/.nakshatra/keys/worker.ed25519` | worker, pillar auth (`Sthambha-Ed25519`), nakd, signer's `node.pub` | **the node key** |
-| `~/.nakshatra/mesh.key` | meshd (`--identity-file` default) | a SECOND node identity → **U2 folds it into the node key** |
-| sidecar key (`~/.config/nakshatra-sidecar/*.key`) | libp2p PeerId | a third → U2 derives it from the node key |
-| `~/.nakshatra/keys/nostr.secp256k1` | Nostr discovery | another curve, required by Nostr; bind it to the node key in the listing |
+| ~~`~/.nakshatra/mesh.key`~~ | meshd, before U2 | **retired 2026-10-03**: meshd now defaults to the node key (file kept only for rollback) |
+| sidecar key (`~/.config/nakshatra-sidecar/*.key`) | libp2p PeerId | `scripts/sidecar_key.py` writes it FROM the node key (same libp2p format). The live blackwell sidecar still has its own key, because switching changes its PeerId and Sutra's tunnel dials it: coordinate with that lane. |
+| `~/.nakshatra/keys/nostr.secp256k1` | Nostr transport only | another curve, required by Nostr. Already bound: the Nostr event carries the listing, and the listing is signed by the node key. |
 | person key (signer state) | the human; issues agent grants | separate on purpose: machine ≠ person |
 
 ## Joining

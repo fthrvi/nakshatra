@@ -505,7 +505,11 @@ def _parse_args(argv=None) -> MeshConfig:
     ap.add_argument("--peer-ttl", type=float, default=0.0,
                     help="ignore peer listings older than this many seconds "
                          "(0 → auto: max(90, 4×refresh))")
-    ap.add_argument("--identity-file", default=str(home_nks / "mesh.key"))
+    # ONE node identity (unification U2, 2026-10-03): meshd signs listings and pins tunnels with the
+    # same key the worker, pillar auth, nakd and the signer use — not a separate mesh.key. Override only
+    # for tests or a deliberately separate identity.
+    from nakshatra_auth import WORKER_KEY_PATH  # noqa: PLC0415
+    ap.add_argument("--identity-file", default=str(WORKER_KEY_PATH))
     ap.add_argument("--status-file", default=str(home_nks / "mesh-status.json"))
     ap.add_argument("--once", action="store_true", help="run one loop then exit")
     a = ap.parse_args(argv)
