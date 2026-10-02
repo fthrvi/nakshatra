@@ -152,3 +152,31 @@ def test_mux_runs_over_secure_channel():
         got += d
     assert got == b"mux-over-encrypted"
     esrv.close()
+
+
+def test_oversized_record_header_rejected_before_reading_body():
+    # An admitted peer claims a 4 GiB record. The receiver must refuse on the header alone,
+    # without trying to read (or buffer) the body. Before the fix it looped on recv().
+    import struct as _struct
+    key_s, key_r = b"\x01" * 32, b"\x02" * 32
+    a, b = socket.socketpair()
+    a.sendall(_struct.pack(">I", 0xFFFFFFFF))     # header only; no body follows
+    receiver = SecureChannel(b, key_s, key_r)
+    b.settimeout(2)
+    with pytest.raises(SecureChannelError):
+        receiver.recv(4096)
+
+
+def test_max_size_record_still_accepted():
+    # The cap must not reject legitimate full-size records (plaintext MAX_RECORD + 16-byte tag).
+    from transport.secure_channel import MAX_RECORD
+    key = b"\x03" * 32
+    a, b = socket.socketpair()
+    sender, receiver = SecureChannel(a, key, key), SecureChannel(b, key, key)
+    payload = b"x" * MAX_RECORD
+    t = threading.Thread(target=sender.sendall, args=(payload,)); t.start()
+    got = b""
+    while len(got) < len(payload):
+        got += receiver.recv(len(payload) - len(got))
+    t.join(5)
+    assert got == payload

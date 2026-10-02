@@ -220,3 +220,81 @@ class TestJoinCode:
             decode_join(code, now=1000000000)
         except ValueError as e:
             assert token not in str(e), f"Token found in error message for non-URL coordinator: {str(e)}"
+
+# ── signed network invites ──
+import base64 as _b64
+import json as _json
+import threading as _th
+
+from cryptography.hazmat.primitives.asymmetric import ed25519 as _ed
+
+from joincode import encode_invite, decode_invite, InviteBook, INVITE_PREFIX  # noqa: E402
+
+_NODE = "ab" * 32
+_PEERS = [{"node": "cd" * 32, "addrs": ["203.0.113.5:4433"]}]
+
+
+def _person():
+    k = _ed.Ed25519PrivateKey.generate()
+    return k, k.public_key().public_bytes_raw().hex()
+
+
+def _reencode(inv):
+    return INVITE_PREFIX + _b64.urlsafe_b64encode(_json.dumps(inv, sort_keys=True, separators=(",", ":")).encode()).decode().rstrip("=")
+
+
+class TestSignedInvite:
+    def test_round_trip(self):
+        k, pub = _person()
+        inv = decode_invite(encode_invite(k, _NODE, _PEERS, ttl_s=60, now=1000), now=1010)
+        assert inv["inviter"] == pub and inv["peers"] == _PEERS and inv["inviter_node"] == _NODE
+
+    def test_tampered_peer_address_breaks_signature(self):
+        k, _ = _person()
+        inv = decode_invite(encode_invite(k, _NODE, _PEERS, now=1000), now=1001)
+        inv["peers"] = [{"node": "cd" * 32, "addrs": ["198.51.100.66:4433"]}]   # redirect the newcomer
+        with pytest.raises(ValueError, match="signature does not verify"):
+            decode_invite(_reencode(inv), now=1001)
+
+    def test_expired_and_untrusted_inviter(self):
+        k, pub = _person()
+        code = encode_invite(k, _NODE, _PEERS, ttl_s=60, now=1000)
+        with pytest.raises(ValueError, match="expired"):
+            decode_invite(code, now=1060)
+        with pytest.raises(ValueError, match="does not trust"):
+            decode_invite(code, now=1001, trusted_inviters={"ef" * 32})
+        assert decode_invite(code, now=1001, trusted_inviters={pub})
+
+    def test_rejects_unknown_fields_bad_peers_and_legacy_codes(self):
+        k, _ = _person()
+        inv = decode_invite(encode_invite(k, _NODE, _PEERS, now=1000), now=1001)
+        with pytest.raises(ValueError, match="unknown fields"):
+            decode_invite(_reencode(dict(inv, admin=True)), now=1001)
+        with pytest.raises(ValueError, match="1-16 peers"):
+            encode_and_decode_empty = encode_invite(k, _NODE, [], now=1000)
+            decode_invite(encode_and_decode_empty, now=1001)
+        with pytest.raises(ValueError, match="not a network invite"):
+            decode_invite(encode_join("https://example.com", "tok"), now=1001)
+
+    def test_legacy_join_code_still_decodes(self):
+        assert decode_join(encode_join("https://example.com", "tok"), now=1)["token"] == "tok"
+
+    def test_single_use_under_concurrency(self, tmp_path):
+        k, _ = _person()
+        inv = decode_invite(encode_invite(k, _NODE, _PEERS, now=1000), now=1001)
+        book = InviteBook(tmp_path / "invites.sqlite")
+        wins = []
+        ts = [_th.Thread(target=lambda i=i: wins.append(book.consume(inv, f"{i:064x}"))) for i in range(10)]
+        for t in ts: t.start()
+        for t in ts: t.join()
+        assert wins.count(True) == 1 and wins.count(False) == 9
+
+
+    def test_invite_carries_a_one_time_key(self):
+        from joincode import invite_pub, invite_rendezvous
+        k, _ = _person()
+        a = decode_invite(encode_invite(k, _NODE, _PEERS, now=1000), now=1001)
+        b = decode_invite(encode_invite(k, _NODE, _PEERS, now=1000), now=1001)
+        assert len(a["ik"]) == 64 and a["ik"] != b["ik"]
+        assert len(invite_pub(a)) == 64 and len(invite_rendezvous(a)) == 16
+        assert invite_rendezvous(a) != invite_rendezvous(b)

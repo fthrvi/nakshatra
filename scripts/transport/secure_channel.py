@@ -44,6 +44,7 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 HS_TAG = b"nakshatra-secure-v1"
 NONCE_LEN = 32
 MAX_RECORD = 64 * 1024
+_TAG_LEN = 16  # ChaCha20-Poly1305 authentication tag
 _LEN = struct.Struct(">I")
 
 
@@ -179,6 +180,10 @@ class SecureChannel:
                 return False
             hdr += more
         n = _LEN.unpack(hdr)[0]
+        # Refuse on the header alone: a valid record is at most MAX_RECORD plaintext + the 16-byte
+        # Poly1305 tag. Without this an admitted peer could declare 4 GiB and pin us in recv().
+        if n > MAX_RECORD + _TAG_LEN:
+            raise SecureChannelError(f"record length {n} exceeds max {MAX_RECORD + _TAG_LEN}")
         ct = b""
         while len(ct) < n:
             more = self._sock.recv(n - len(ct))

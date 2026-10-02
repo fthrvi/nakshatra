@@ -1,0 +1,66 @@
+{
+ "name": "nakshatra-node",
+ "python": "3.12",
+ "installer": "nakshatra/release/install.py",
+ "components": [
+  {
+   "name": "nakshatra",
+   "repo": "~/nakshatra",
+   "paths": [
+    "scripts",
+    "proto",
+    "release"
+   ],
+   "pythonpath": "scripts"
+  },
+  {
+   "name": "sthambha",
+   "repo": "~/sthambha",
+   "paths": [
+    "sthambha",
+    "pyproject.toml"
+   ],
+   "pythonpath": "."
+  }
+ ],
+ "requirements": [
+  "cryptography==46.0.6",
+  "coincurve==21.0.0"
+ ],
+ "services": {
+  "nak-signer": {
+   "description": "Nakshatra personal signer (Sthambha)",
+   "exec": [
+    "{python}",
+    "-m",
+    "sthambha.signer",
+    "serve",
+    "--state",
+    "{home}/.sthambha/signer"
+   ],
+   "requires": "{home}/.sthambha/signer/person.pub"
+  },
+  "nak-net": {
+   "description": "Nakshatra messaging node (nakd): contacts + messages",
+   "exec": [
+    "{python}",
+    "-m",
+    "network.nakd",
+    "--state",
+    "{home}/.nakshatra/net"
+   ],
+   "requires": "{home}/.nakshatra/net/agent"
+  }
+ },
+ "health": [
+  [
+   "{python}",
+   "-c",
+   "import sthambha.signer, joincode, transport.secure_channel, transport.mux_tunnel, mesh.meshd, network.nakd"
+  ]
+ ],
+ "commands": {
+  "nak": "network.nak",
+  "nak-mcp": "network.nak_mcp"
+ }
+}
