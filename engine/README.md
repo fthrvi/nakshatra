@@ -18,3 +18,16 @@ Now:
 Build it for this machine's GPU with `deploy/provision-worker.sh`; it detects CUDA, ROCm, Vulkan, Metal or CPU, and needs no sudo. It ships in every signed release.
 
 Change the engine: commit on the fork → `git format-patch <COMMIT>..HEAD -o engine/patches` → update `TREE` → release.
+
+## Review record and residual risk
+Independent review by Codex, 5 rounds (2026-10-03). Each finding was fixed in turn:
+- the fast-path trust removed entirely;
+- git isolated: no inherited env or config, no hooks or templates;
+- no unverified fallback;
+- per-run staging, a lock, a safe swap;
+- re-verification of DEST after the swap.
+
+Residual, accepted: two *simultaneous* runs on the same DEST (the lock prevents it; the only caller is
+`provision-worker.sh`, once per machine) can race so that one fails or a build starts mid-swap. Neither
+can produce a non-pinned engine, because every run installs only the verified tree or restores the previous one.
+Out of scope: a local user who can write these files (they could replace the compiled binary directly).
