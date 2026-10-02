@@ -1,0 +1,6 @@
+# The Nakshatra engine = upstream llama.cpp at this commit + engine/patches/*.patch (git am, in order).
+# engine/source.sh rebuilds it and REFUSES unless the result is exactly TREE (git tree hash = every file).
+UPSTREAM=https://github.com/ggml-org/llama.cpp
+COMMIT=6eddde06a4f25d55d538b5d15628dcc2b6882147
+TAG=b9992
+TREE=6d5b567d598666d20281db6548bbefd582d26f05

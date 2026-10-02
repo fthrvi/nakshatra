@@ -99,8 +99,15 @@ command -v cc >/dev/null 2>&1 || say "WARNING: no C compiler — the build will 
 [ -d "$WORKER_DIR/venv" ] && [ ! -x "$WORKER_DIR/venv/bin/pip" ] && {
   say "clearing a half-created venv from a previous run"; rm -rf "$WORKER_DIR/venv"; }
 
-# 2. fetch + unpack the EXACT patched llama.cpp source (vendored - no clone+patch drift) -----------
-if [ ! -f "$LLAMA/examples/nakshatra-spike/worker_daemon.cpp" ]; then
+# 2. the EXACT engine source --------------------------------------------------------------------------
+# Preferred (U6c, 2026-10-03): engine/ shipped in the signed release next to this script — upstream @ the
+# pinned commit + engine/patches, REFUSED unless the git tree hash matches engine/BASE TREE (every file).
+# Legacy fallback: the vendored tarball below (sha256-pinned). Never both, never neither.
+ENGINE_SRC_SH="$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)/engine/source.sh"
+if [ -x "$ENGINE_SRC_SH" ] && [ "${WORKER_SOURCE:-engine}" = "engine" ]; then
+  say "building the engine source from the release's engine/ (verified tree)"
+  bash "$ENGINE_SRC_SH" "$LLAMA"
+elif [ ! -f "$LLAMA/examples/nakshatra-spike/worker_daemon.cpp" ]; then
   say "fetching patched llama.cpp source from $STACK_URL"
   curl -fsSL -o "$WORKER_DIR/stack.tgz" "$STACK_URL"
   _verify_or_die "$WORKER_DIR/stack.tgz" "${WORKER_STACK_SHA256:-}" "stack.tgz (the engine this box will BUILD AND RUN)"

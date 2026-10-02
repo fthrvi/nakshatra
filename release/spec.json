@@ -9,7 +9,9 @@
    "paths": [
     "scripts",
     "proto",
-    "release"
+    "release",
+    "engine",
+    "deploy/provision-worker.sh"
    ],
    "pythonpath": "scripts"
   },

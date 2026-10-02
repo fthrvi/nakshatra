@@ -1,0 +1,2559 @@
+From 3b160c307f7d11f262f50e7357836303aaa03bd4 Mon Sep 17 00:00:00 2001
+From: Bishwanath Bastola <bishwa.bastola123@gmail.com>
+Date: Mon, 13 Jul 2026 21:44:54 -0600
+Subject: [PATCH 1/2] =?UTF-8?q?nakshatra:=20engine=20=E2=80=94=20partial-l?=
+ =?UTF-8?q?oad/forward=20(llama,=20qwen3,=20qwen3moe)=20+=20worker=20daemo?=
+ =?UTF-8?q?n?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Squash of e767388 + cd9a8c0 for a single-pass rebase onto b9992.
+Slice-range gguf load via nakshatra.* metadata keys, slice-only forward
+graphs emitting/accepting hidden states at the seam, and the
+examples/nakshatra-spike/ worker daemon family. Backend-agnostic.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012ZuWvcQXZJoP1Xp4h5x335
+---
+ examples/CMakeLists.txt                       |   1 +
+ examples/nakshatra-spike/CMakeLists.txt       |  76 ++
+ examples/nakshatra-spike/README.md            |  95 +++
+ examples/nakshatra-spike/m4_chain.cpp         | 147 ++++
+ examples/nakshatra-spike/shm_ring.hpp         | 297 ++++++++
+ examples/nakshatra-spike/spike.cpp            | 210 ++++++
+ examples/nakshatra-spike/worker_daemon.cpp    | 714 ++++++++++++++++++
+ .../nakshatra-spike/worker_daemon_specdec.cpp | 508 +++++++++++++
+ src/llama-graph.cpp                           |  15 +
+ src/llama-model-loader.cpp                    |   2 +
+ src/llama-model.cpp                           |  22 +
+ src/llama-model.h                             |   8 +
+ src/models/llama.cpp                          |  68 +-
+ src/models/qwen3.cpp                          |  68 +-
+ src/models/qwen3moe.cpp                       |  66 +-
+ 15 files changed, 2235 insertions(+), 62 deletions(-)
+ create mode 100644 examples/nakshatra-spike/CMakeLists.txt
+ create mode 100644 examples/nakshatra-spike/README.md
+ create mode 100644 examples/nakshatra-spike/m4_chain.cpp
+ create mode 100644 examples/nakshatra-spike/shm_ring.hpp
+ create mode 100644 examples/nakshatra-spike/spike.cpp
+ create mode 100644 examples/nakshatra-spike/worker_daemon.cpp
+ create mode 100644 examples/nakshatra-spike/worker_daemon_specdec.cpp
+
+diff --git a/examples/CMakeLists.txt b/examples/CMakeLists.txt
+index 39f802d2..9c546564 100644
+--- a/examples/CMakeLists.txt
++++ b/examples/CMakeLists.txt
+@@ -18,6 +18,7 @@ else()
+     add_subdirectory(debug)
+     add_subdirectory(embedding)
+     add_subdirectory(eval-callback)
++    add_subdirectory(nakshatra-spike)
+ 
+     add_subdirectory(gguf-hash)
+     add_subdirectory(gguf)
+diff --git a/examples/nakshatra-spike/CMakeLists.txt b/examples/nakshatra-spike/CMakeLists.txt
+new file mode 100644
+index 00000000..448b0615
+--- /dev/null
++++ b/examples/nakshatra-spike/CMakeLists.txt
+@@ -0,0 +1,76 @@
++# 2026-05-30 fabric C++ Phase B — drop-in CMakeLists for the
++# llama.cpp examples/nakshatra-spike/ dir. Appends a new sibling
++# target `llama-nakshatra-worker-fabric` alongside the existing
++# spike / m4_chain / nakshatra-worker targets WITHOUT touching them,
++# so the production binary on each cluster machine stays the same
++# bit-for-bit (live :5530 v0.1 70B cluster, daemon skew workarounds
++# still in place, etc.).
++#
++# Compile-time version stamps drive scripts/smoke_daemon_version.py:
++#
++#   cmake -S . -B build \
++#       -DNAKSHATRA_FABRIC_SHA=<git sha from nakshatra repo> \
++#       -DNAKSHATRA_FABRIC_BUILD_HOST=<hostname>
++#   cmake --build build --target llama-nakshatra-worker-fabric
++#   ./build/.../llama-nakshatra-worker-fabric --version
++#       sha        <git sha>
++#       built_on   <hostname>
++#       built_at   <__DATE__> <__TIME__>
++#
++# Defaults to "unknown" when the defines aren't passed (e.g. a manual
++# cmake --build without --reconfigure) — the smoke catches that as a
++# loud failure.
++
++set(TARGET llama-nakshatra-spike)
++add_executable(${TARGET} spike.cpp)
++install(TARGETS ${TARGET} RUNTIME)
++target_link_libraries(${TARGET} PRIVATE llama-common llama ${CMAKE_THREAD_LIBS_INIT})
++target_compile_features(${TARGET} PRIVATE cxx_std_17)
++
++set(TARGET2 llama-m4-chain)
++add_executable(${TARGET2} m4_chain.cpp)
++install(TARGETS ${TARGET2} RUNTIME)
++target_link_libraries(${TARGET2} PRIVATE llama-common llama ${CMAKE_THREAD_LIBS_INIT})
++target_compile_features(${TARGET2} PRIVATE cxx_std_17)
++
++set(TARGET3 llama-nakshatra-worker)
++add_executable(${TARGET3} worker_daemon.cpp)
++install(TARGETS ${TARGET3} RUNTIME)
++target_link_libraries(${TARGET3} PRIVATE llama-common llama ${CMAKE_THREAD_LIBS_INIT})
++target_compile_features(${TARGET3} PRIVATE cxx_std_17)
++
++# 2026-05-30 fabric C++ Phase A.3 / B — sibling target so the original
++# llama-nakshatra-worker binary (used by the live v0.1 70B cluster on
++# :5530) stays untouched. Same source file with --fabric-shm-req +
++# --fabric-shm-resp argv flags; falls back to stdio when absent.
++set(TARGET4 llama-nakshatra-worker-fabric)
++add_executable(${TARGET4} worker_daemon.cpp)
++install(TARGETS ${TARGET4} RUNTIME)
++target_link_libraries(${TARGET4} PRIVATE llama-common llama ${CMAKE_THREAD_LIBS_INIT})
++target_compile_features(${TARGET4} PRIVATE cxx_std_17)
++
++# Compile-time version stamp — empty string defaults trigger the
++# "unknown" fallback in worker_daemon.cpp so a build that forgot the
++# -D defines surfaces loudly via --version (smoke catches it).
++if(NOT DEFINED NAKSHATRA_FABRIC_SHA)
++    set(NAKSHATRA_FABRIC_SHA "")
++endif()
++if(NOT DEFINED NAKSHATRA_FABRIC_BUILD_HOST)
++    set(NAKSHATRA_FABRIC_BUILD_HOST "")
++endif()
++target_compile_definitions(${TARGET4} PRIVATE
++    NAKSHATRA_FABRIC_SHA="${NAKSHATRA_FABRIC_SHA}"
++    NAKSHATRA_FABRIC_BUILD_HOST="${NAKSHATRA_FABRIC_BUILD_HOST}"
++)
++
++# 2026-06-19 speed-stack #6 — spec-decode daemon (D1 multi-position argmax + D2
++# KV_TRUNCATE). SEPARATE source + target so the live llama-nakshatra-worker stays
++# byte-identical; this binary is used ONLY by the spec-decode gate test chain.
++set(TARGET5 llama-nakshatra-worker-specdec)
++add_executable(${TARGET5} worker_daemon_specdec.cpp)
++install(TARGETS ${TARGET5} RUNTIME)
++target_link_libraries(${TARGET5} PRIVATE llama-common llama ${CMAKE_THREAD_LIBS_INIT})
++target_compile_features(${TARGET5} PRIVATE cxx_std_17)
++target_compile_definitions(${TARGET5} PRIVATE
++    NAKSHATRA_FABRIC_SHA="specdec-09b466e"
++    NAKSHATRA_FABRIC_BUILD_HOST="gpu-gfx1201")
+diff --git a/examples/nakshatra-spike/README.md b/examples/nakshatra-spike/README.md
+new file mode 100644
+index 00000000..63a57ad6
+--- /dev/null
++++ b/examples/nakshatra-spike/README.md
+@@ -0,0 +1,95 @@
++# llama.cpp/examples/eval-callback
++
++A simple example which demonstrates how to use callback during the inference.
++It simply prints to the console all operations and tensor data.
++
++Usage:
++
++```shell
++llama-eval-callback \
++  --hf-repo ggml-org/models \
++  --hf-file phi-2/ggml-model-q4_0.gguf \
++  --model phi-2-q4_0.gguf \
++  --prompt hello \
++  --seed 42 \
++  -ngl 33
++```
++
++Will print:
++
++```shell
++llm_load_tensors: offloaded 33/33 layers to GPU
++...
++llama_new_context_with_model: n_ctx      = 512
++...
++llama_new_context_with_model:      CUDA0 compute buffer size =   105.00 MiB
++llama_new_context_with_model:  CUDA_Host compute buffer size =     6.01 MiB
++llama_new_context_with_model: graph nodes  = 1225
++llama_new_context_with_model: graph splits = 2
++ggml_debug:                 inp_embd = (f32)   GET_ROWS(token_embd.weight{2560, 51200, 1, 1}, inp_tokens{1, 1, 1, 1}}) = {2560, 1, 1, 1}
++                                     [
++                                      [
++                                       [ -0.0181,   0.0272,   0.0272, ...],
++                                      ],
++                                     ]
++ggml_debug:                   norm-0 = (f32)       NORM(CUDA0#inp_embd#0{2560, 1, 1, 1}, }) = {2560, 1, 1, 1}
++                                     [
++                                      [
++                                       [ -0.6989,   1.0636,   1.0636, ...],
++                                      ],
++                                     ]
++ggml_debug:                 norm_w-0 = (f32)        MUL(norm-0{2560, 1, 1, 1}, blk.0.attn_norm.weight{2560, 1, 1, 1}}) = {2560, 1, 1, 1}
++                                     [
++                                      [
++                                       [ -0.1800,   0.2817,   0.2632, ...],
++                                      ],
++                                     ]
++ggml_debug:              attn_norm-0 = (f32)        ADD(norm_w-0{2560, 1, 1, 1}, blk.0.attn_norm.bias{2560, 1, 1, 1}}) = {2560, 1, 1, 1}
++                                     [
++                                      [
++                                       [ -0.1863,   0.2970,   0.2604, ...],
++                                      ],
++                                     ]
++ggml_debug:                   wqkv-0 = (f32)    MUL_MAT(blk.0.attn_qkv.weight{2560, 7680, 1, 1}, attn_norm-0{2560, 1, 1, 1}}) = {7680, 1, 1, 1}
++                                     [
++                                      [
++                                       [ -1.1238,   1.2876,  -1.8086, ...],
++                                      ],
++                                     ]
++ggml_debug:                   bqkv-0 = (f32)        ADD(wqkv-0{7680, 1, 1, 1}, blk.0.attn_qkv.bias{7680, 1, 1, 1}}) = {7680, 1, 1, 1}
++                                     [
++                                      [
++                                       [ -1.1135,   1.4604,  -1.9226, ...],
++                                      ],
++                                     ]
++ggml_debug:            bqkv-0 (view) = (f32)       VIEW(bqkv-0{7680, 1, 1, 1}, }) = {2560, 1, 1, 1}
++                                     [
++                                      [
++                                       [ -1.1135,   1.4604,  -1.9226, ...],
++                                      ],
++                                     ]
++ggml_debug:                   Qcur-0 = (f32)       CONT(bqkv-0 (view){2560, 1, 1, 1}, }) = {2560, 1, 1, 1}
++                                     [
++                                      [
++                                       [ -1.1135,   1.4604,  -1.9226, ...],
++                                      ],
++                                     ]
++ggml_debug:        Qcur-0 (reshaped) = (f32)    RESHAPE(Qcur-0{2560, 1, 1, 1}, }) = {80, 32, 1, 1}
++                                     [
++                                      [
++                                       [ -1.1135,   1.4604,  -1.9226, ...],
++                                       [ -0.3608,   0.5076,  -1.8866, ...],
++                                       [  1.7643,   0.0273,  -2.1065, ...],
++                                       ...
++                                      ],
++                                     ]
++ggml_debug:                   Qcur-0 = (f32)       ROPE(Qcur-0 (reshaped){80, 32, 1, 1}, CUDA0#inp_pos#0{1, 1, 1, 1}}) = {80, 32, 1, 1}
++                                     [
++                                      [
++                                       [ -1.1135,   1.4604,  -1.9226, ...],
++                                       [ -0.3608,   0.5076,  -1.8866, ...],
++                                       [  1.7643,   0.0273,  -2.1065, ...],
++                                       ...
++                                      ],
++                                     ]
++```
+diff --git a/examples/nakshatra-spike/m4_chain.cpp b/examples/nakshatra-spike/m4_chain.cpp
+new file mode 100644
+index 00000000..722acee3
+--- /dev/null
++++ b/examples/nakshatra-spike/m4_chain.cpp
+@@ -0,0 +1,147 @@
++// M4 step 4+5 chain test: validate the patched llama.cpp can run a two-worker
++// chain in a single process.
++//
++//   Worker A: w0 sub-GGUF (layers [0,N1), has token_embd, no lm_head).
++//     Input:  prompt tokens via batch.token.
++//     Output: residual stream after layer N1-1, read via llama_get_embeddings.
++//
++//   Worker B: wlast sub-GGUF (layers [N1,N), has lm_head, has token_embd
++//             for tied-embed fallback).
++//     Input:  worker A's hidden state via batch.embd (no batch.token).
++//     Output: logits via llama_get_logits_ith.
++//
++// We argmax the logits and compare to a single-machine reference top-1 token.
++// Both should produce the same token if the chain is correct.
++
++#include "common.h"
++#include "llama.h"
++
++#include <cassert>
++#include <clocale>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <vector>
++
++struct WorkerCtx {
++    llama_model   * model = nullptr;
++    llama_context * ctx   = nullptr;
++};
++
++static WorkerCtx load_worker(const std::string & path, int n_ctx) {
++    WorkerCtx w;
++    auto mp = llama_model_default_params();
++    mp.n_gpu_layers = 0;
++    w.model = llama_model_load_from_file(path.c_str(), mp);
++    if (!w.model) {
++        fprintf(stderr, "[chain] failed to load model: %s\n", path.c_str());
++        exit(2);
++    }
++    auto cp = llama_context_default_params();
++    cp.n_ctx     = n_ctx;
++    cp.n_batch   = n_ctx;
++    cp.embeddings = true;
++    w.ctx = llama_init_from_model(w.model, cp);
++    if (!w.ctx) {
++        fprintf(stderr, "[chain] failed to init context for: %s\n", path.c_str());
++        exit(3);
++    }
++    return w;
++}
++
++int main(int argc, char ** argv) {
++    setlocale(LC_NUMERIC, "C");
++
++    std::string w0_path    = argc > 1 ? argv[1] : "/tmp/cuts/w0_v2.gguf";
++    std::string wlast_path = argc > 2 ? argv[2] : "/tmp/cuts/wlast_v2.gguf";
++    std::string prompt     = argc > 3 ? argv[3] : "The capital of France is";
++
++    common_init();
++    llama_backend_init();
++
++    fprintf(stderr, "[chain] loading worker A: %s\n", w0_path.c_str());
++    WorkerCtx wa = load_worker(w0_path, 256);
++    int n_embd = llama_model_n_embd(wa.model);
++    fprintf(stderr, "[chain] worker A loaded; hidden_size=%d\n", n_embd);
++
++    // Tokenize via worker A's vocab
++    const llama_vocab * vocab_a = llama_model_get_vocab(wa.model);
++    bool add_bos = llama_vocab_get_add_bos(vocab_a);
++    std::vector<llama_token> tokens = common_tokenize(wa.ctx, prompt, add_bos);
++    fprintf(stderr, "[chain] %zu tokens for prompt %s\n", tokens.size(), prompt.c_str());
++
++    // Worker A: decode with tokens
++    int rc = llama_decode(wa.ctx, llama_batch_get_one(tokens.data(), tokens.size()));
++    fprintf(stderr, "[chain] worker A decode rc=%d\n", rc);
++    if (rc != 0) return 4;
++
++    float * embd_a_all = llama_get_embeddings(wa.ctx);
++    if (!embd_a_all) {
++        fprintf(stderr, "[chain] worker A: llama_get_embeddings returned null\n");
++        return 5;
++    }
++    fprintf(stderr, "[chain] worker A hidden[:4] = %.4f %.4f %.4f %.4f\n",
++            embd_a_all[0], embd_a_all[1], embd_a_all[2], embd_a_all[3]);
++
++    // Stash a copy because loading worker B may invalidate worker A's context buffer
++    std::vector<float> hidden_in(tokens.size() * n_embd);
++    memcpy(hidden_in.data(), embd_a_all, hidden_in.size() * sizeof(float));
++
++    fprintf(stderr, "[chain] loading worker B: %s\n", wlast_path.c_str());
++    WorkerCtx wb = load_worker(wlast_path, 256);
++    int n_embd_b = llama_model_n_embd(wb.model);
++    int n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(wb.model));
++    fprintf(stderr, "[chain] worker B loaded; hidden_size=%d vocab=%d\n", n_embd_b, n_vocab);
++    if (n_embd_b != n_embd) {
++        fprintf(stderr, "[chain] hidden_size mismatch: A=%d B=%d\n", n_embd, n_embd_b);
++        return 6;
++    }
++
++    // Worker B: decode with hidden_in via batch.embd
++    int n_tokens = (int)tokens.size();
++    llama_batch batch_b = llama_batch_init(n_tokens, n_embd, 1);
++    batch_b.n_tokens = n_tokens;
++    memcpy(batch_b.embd, hidden_in.data(), hidden_in.size() * sizeof(float));
++    for (int i = 0; i < n_tokens; ++i) {
++        batch_b.pos[i] = i;
++        batch_b.n_seq_id[i] = 1;
++        batch_b.seq_id[i][0] = 0;
++        batch_b.logits[i] = (i == n_tokens - 1) ? 1 : 0;
++    }
++    rc = llama_decode(wb.ctx, batch_b);
++    fprintf(stderr, "[chain] worker B decode rc=%d\n", rc);
++    if (rc != 0) {
++        llama_batch_free(batch_b);
++        return 7;
++    }
++
++    float * logits = llama_get_logits_ith(wb.ctx, -1);
++    if (!logits) {
++        fprintf(stderr, "[chain] worker B: llama_get_logits_ith returned null\n");
++        llama_batch_free(batch_b);
++        return 8;
++    }
++    int top = 0;
++    float top_v = logits[0];
++    for (int i = 1; i < n_vocab; ++i) {
++        if (logits[i] > top_v) { top_v = logits[i]; top = i; }
++    }
++
++    char tokbuf[64] = {0};
++    int n = llama_token_to_piece(llama_model_get_vocab(wb.model),
++                                 (llama_token)top, tokbuf, sizeof(tokbuf) - 1, 0, true);
++    if (n < 0) n = 0;
++    tokbuf[n] = '\0';
++
++    fprintf(stderr, "[chain] argmax token id=%d str='%s' logit=%.4f\n", top, tokbuf, top_v);
++    fprintf(stdout, "TOPTOK_CHAIN %d %s\n", top, tokbuf);
++
++    llama_batch_free(batch_b);
++    llama_free(wb.ctx);
++    llama_model_free(wb.model);
++    llama_free(wa.ctx);
++    llama_model_free(wa.model);
++    llama_backend_free();
++    return 0;
++}
+diff --git a/examples/nakshatra-spike/shm_ring.hpp b/examples/nakshatra-spike/shm_ring.hpp
+new file mode 100644
+index 00000000..5e579aea
+--- /dev/null
++++ b/examples/nakshatra-spike/shm_ring.hpp
+@@ -0,0 +1,297 @@
++// Nakshatra fabric shm ring — C++ side of the Phase A primitive.
++//
++// Mirrors `scripts/fabric/shm_ring.py` byte-for-byte: same 64-byte
++// header at the same offsets, same framed-message layout (u32 length
++// prefix + payload), same wrap-aware read/write. The Python side
++// creates the file + writes the header; the C++ side attaches to it.
++//
++// Single producer / single consumer per ring. The daemon uses one
++// ring for receiving (Python writes / daemon reads) and one for
++// sending (daemon writes / Python reads). Monotonic u64 cursors —
++// ~584 years of headroom at 1 GB/s before wrap.
++//
++// Memory ordering relies on x86 TSO + ARM acquire/release semantics
++// on aligned u64 loads/stores; we use GCC __atomic_* builtins to make
++// the intent explicit (acquire on cursor read, release on cursor
++// write — so the consumer never observes a cursor advance before the
++// payload write that caused it).
++//
++// C++17 single-header. No external dependencies beyond POSIX
++// <sys/mman.h>, <fcntl.h>, <unistd.h>.
++//
++// Header-only so the existing CMakeLists.txt (which builds
++// worker_daemon.cpp as a single executable target) needs no new
++// translation units — just an #include in worker_daemon.cpp.
++
++#pragma once
++
++#include <atomic>
++#include <cerrno>
++#include <cstdint>
++#include <cstring>
++#include <fcntl.h>
++#include <stdexcept>
++#include <string>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <time.h>
++#include <unistd.h>
++#include <vector>
++
++namespace nakshatra { namespace fabric {
++
++// ── Wire constants (MUST match scripts/fabric/shm_ring.py) ─────────
++
++constexpr size_t SHM_HEADER_SIZE = 64;
++constexpr uint32_t SHM_VERSION_MAJOR = 1;
++
++// "RING" — first 4 header bytes. Python's MAGIC = b"RING".
++constexpr uint8_t SHM_MAGIC[4] = { 'R', 'I', 'N', 'G' };
++
++// Header field offsets — explicit so Python + C++ never drift.
++constexpr size_t SHM_OFF_MAGIC = 0;          // 4 bytes
++constexpr size_t SHM_OFF_VERSION = 4;        // 4 bytes (u32 LE)
++constexpr size_t SHM_OFF_CAPACITY = 8;       // 8 bytes (u64 LE)
++constexpr size_t SHM_OFF_WRITE_CURSOR = 16;  // 8 bytes (u64 LE)
++constexpr size_t SHM_OFF_READ_CURSOR = 24;   // 8 bytes (u64 LE)
++
++constexpr size_t SHM_LENGTH_PREFIX_SIZE = 4; // u32 LE
++
++// Default poll interval — matches the Python side. 50µs is well
++// below typical daemon decode latencies and avoids burning a CPU
++// in a tight spin loop while waiting on the producer.
++constexpr long SHM_POLL_INTERVAL_NS = 50 * 1000;  // 50 µs
++
++
++class ShmRingError : public std::runtime_error {
++public:
++    explicit ShmRingError(const std::string& msg)
++        : std::runtime_error(msg) {}
++};
++
++
++class ShmRing {
++public:
++    // Attach to an existing ring at `path`. Parent (Python) created
++    // it; we just open + mmap + validate the header.
++    //
++    // Throws ShmRingError on bad magic, unsupported version, or
++    // any I/O error.
++    static ShmRing attach(const std::string& path) {
++        int fd = ::open(path.c_str(), O_RDWR);
++        if (fd < 0) {
++            throw ShmRingError(
++                "ShmRing::attach: open(" + path + ") failed: "
++                + std::strerror(errno));
++        }
++        struct stat st;
++        if (::fstat(fd, &st) != 0) {
++            int e = errno;
++            ::close(fd);
++            throw ShmRingError(
++                "ShmRing::attach: fstat failed: " + std::string(std::strerror(e)));
++        }
++        size_t size = (size_t)st.st_size;
++        if (size < SHM_HEADER_SIZE) {
++            ::close(fd);
++            throw ShmRingError(
++                "ShmRing::attach: file too small for header: "
++                + std::to_string(size));
++        }
++        void* map = ::mmap(nullptr, size, PROT_READ | PROT_WRITE,
++                            MAP_SHARED, fd, 0);
++        if (map == MAP_FAILED) {
++            int e = errno;
++            ::close(fd);
++            throw ShmRingError(
++                "ShmRing::attach: mmap failed: " + std::string(std::strerror(e)));
++        }
++        uint8_t* base = (uint8_t*)map;
++        // Magic check.
++        if (std::memcmp(base + SHM_OFF_MAGIC, SHM_MAGIC, 4) != 0) {
++            ::munmap(map, size);
++            ::close(fd);
++            throw ShmRingError(
++                "ShmRing::attach: bad magic at " + path);
++        }
++        // Version check — v1 only; v2 is forbidden (mirrors Python).
++        uint32_t version;
++        std::memcpy(&version, base + SHM_OFF_VERSION, 4);
++        if (version != SHM_VERSION_MAJOR) {
++            ::munmap(map, size);
++            ::close(fd);
++            throw ShmRingError(
++                "ShmRing::attach: unsupported version " + std::to_string(version));
++        }
++        uint64_t capacity;
++        std::memcpy(&capacity, base + SHM_OFF_CAPACITY, 8);
++        return ShmRing(fd, base, size, (size_t)capacity);
++    }
++
++    // Move-only.
++    ShmRing(ShmRing&& other) noexcept
++        : fd_(other.fd_), base_(other.base_), size_(other.size_),
++          capacity_(other.capacity_) {
++        other.fd_ = -1;
++        other.base_ = nullptr;
++        other.size_ = 0;
++        other.capacity_ = 0;
++    }
++    ShmRing& operator=(ShmRing&& other) noexcept {
++        if (this != &other) {
++            release();
++            fd_ = other.fd_;
++            base_ = other.base_;
++            size_ = other.size_;
++            capacity_ = other.capacity_;
++            other.fd_ = -1;
++            other.base_ = nullptr;
++            other.size_ = 0;
++            other.capacity_ = 0;
++        }
++        return *this;
++    }
++    ShmRing(const ShmRing&) = delete;
++    ShmRing& operator=(const ShmRing&) = delete;
++    ~ShmRing() { release(); }
++
++    size_t capacity() const noexcept { return capacity_; }
++
++    // Non-blocking read. Returns true + fills `out` on success;
++    // returns false when empty or producer hasn't committed yet.
++    // Throws on a corrupt length header (catches the rare case where
++    // a bug in the producer would otherwise read past the buffer).
++    bool try_read_message(std::vector<uint8_t>& out) {
++        uint64_t r = load_read_cursor();
++        uint64_t w = load_write_cursor();
++        uint64_t avail = w - r;
++        if (avail < SHM_LENGTH_PREFIX_SIZE) return false;
++        uint32_t length;
++        buf_read(r, (uint8_t*)&length, SHM_LENGTH_PREFIX_SIZE);
++        if ((uint64_t)length > (uint64_t)capacity_ - SHM_LENGTH_PREFIX_SIZE) {
++            throw ShmRingError(
++                "ShmRing::try_read_message: corrupt length "
++                + std::to_string(length));
++        }
++        if (avail < SHM_LENGTH_PREFIX_SIZE + length) return false;
++        out.resize(length);
++        if (length > 0) {
++            buf_read(r + SHM_LENGTH_PREFIX_SIZE, out.data(), length);
++        }
++        store_read_cursor(r + SHM_LENGTH_PREFIX_SIZE + length);
++        return true;
++    }
++
++    // Blocking read — spin with short sleeps until a message arrives.
++    // `should_exit`, if provided, is checked between polls so callers
++    // can break out cleanly on signal / shutdown.
++    void read_message_blocking(std::vector<uint8_t>& out,
++                                const volatile bool* should_exit = nullptr) {
++        struct timespec ts;
++        ts.tv_sec = 0;
++        ts.tv_nsec = SHM_POLL_INTERVAL_NS;
++        while (true) {
++            if (try_read_message(out)) return;
++            if (should_exit && *should_exit) {
++                throw ShmRingError("read aborted by should_exit");
++            }
++            ::nanosleep(&ts, nullptr);
++        }
++    }
++
++    // Non-blocking write. Returns true on success; false when ring
++    // lacks space (caller retries). Throws on oversize message —
++    // that's a misconfigured ring size, never recoverable in a loop.
++    bool try_write_message(const uint8_t* data, size_t n) {
++        size_t needed = SHM_LENGTH_PREFIX_SIZE + n;
++        if (needed > (size_t)capacity_) {
++            throw ShmRingError(
++                "ShmRing::try_write_message: message size "
++                + std::to_string(needed) + " exceeds capacity "
++                + std::to_string(capacity_));
++        }
++        uint64_t r = load_read_cursor();
++        uint64_t w = load_write_cursor();
++        size_t free_bytes = capacity_ - (size_t)(w - r);
++        if (needed > free_bytes) return false;
++        uint32_t length = (uint32_t)n;
++        buf_write(w, (const uint8_t*)&length, SHM_LENGTH_PREFIX_SIZE);
++        if (n > 0) buf_write(w + SHM_LENGTH_PREFIX_SIZE, data, n);
++        // Cursor advance IS the publication barrier — the consumer
++        // either sees the old cursor (no message) or the new cursor
++        // along with all payload bytes that preceded it.
++        store_write_cursor(w + needed);
++        return true;
++    }
++
++    // Blocking write — spin with short sleeps until space appears.
++    void write_message_blocking(const uint8_t* data, size_t n) {
++        struct timespec ts;
++        ts.tv_sec = 0;
++        ts.tv_nsec = SHM_POLL_INTERVAL_NS;
++        while (!try_write_message(data, n)) {
++            ::nanosleep(&ts, nullptr);
++        }
++    }
++
++private:
++    ShmRing(int fd, uint8_t* base, size_t size, size_t capacity)
++        : fd_(fd), base_(base), size_(size), capacity_(capacity) {}
++
++    void release() noexcept {
++        if (base_) { ::munmap(base_, size_); base_ = nullptr; }
++        if (fd_ >= 0) { ::close(fd_); fd_ = -1; }
++    }
++
++    // Cursor access — acquire/release semantics so the payload bytes
++    // ordered before the cursor store are visible after the cursor
++    // load on the consumer side.
++    uint64_t load_read_cursor() const {
++        uint64_t* p = (uint64_t*)(base_ + SHM_OFF_READ_CURSOR);
++        return __atomic_load_n(p, __ATOMIC_ACQUIRE);
++    }
++    uint64_t load_write_cursor() const {
++        uint64_t* p = (uint64_t*)(base_ + SHM_OFF_WRITE_CURSOR);
++        return __atomic_load_n(p, __ATOMIC_ACQUIRE);
++    }
++    void store_read_cursor(uint64_t v) {
++        uint64_t* p = (uint64_t*)(base_ + SHM_OFF_READ_CURSOR);
++        __atomic_store_n(p, v, __ATOMIC_RELEASE);
++    }
++    void store_write_cursor(uint64_t v) {
++        uint64_t* p = (uint64_t*)(base_ + SHM_OFF_WRITE_CURSOR);
++        __atomic_store_n(p, v, __ATOMIC_RELEASE);
++    }
++
++    // Wrap-aware payload area access. `cursor` is the monotonic u64;
++    // we mod into capacity_ here.
++    void buf_write(uint64_t cursor, const uint8_t* data, size_t n) {
++        size_t offset = (size_t)(cursor % capacity_);
++        size_t end = offset + n;
++        if (end <= capacity_) {
++            std::memcpy(base_ + SHM_HEADER_SIZE + offset, data, n);
++            return;
++        }
++        size_t first = capacity_ - offset;
++        std::memcpy(base_ + SHM_HEADER_SIZE + offset, data, first);
++        std::memcpy(base_ + SHM_HEADER_SIZE, data + first, n - first);
++    }
++    void buf_read(uint64_t cursor, uint8_t* out, size_t n) {
++        size_t offset = (size_t)(cursor % capacity_);
++        size_t end = offset + n;
++        if (end <= capacity_) {
++            std::memcpy(out, base_ + SHM_HEADER_SIZE + offset, n);
++            return;
++        }
++        size_t first = capacity_ - offset;
++        std::memcpy(out, base_ + SHM_HEADER_SIZE + offset, first);
++        std::memcpy(out + first, base_ + SHM_HEADER_SIZE, n - first);
++    }
++
++    int fd_;
++    uint8_t* base_;
++    size_t size_;
++    size_t capacity_;
++};
++
++} } // namespace nakshatra::fabric
+diff --git a/examples/nakshatra-spike/spike.cpp b/examples/nakshatra-spike/spike.cpp
+new file mode 100644
+index 00000000..28415977
+--- /dev/null
++++ b/examples/nakshatra-spike/spike.cpp
+@@ -0,0 +1,210 @@
++// Phase 0b spike: ferry hidden state at a target tensor name between two
++// processes via localhost TCP. Both processes load the full model; one
++// sends its target-tensor data after capture, the other overwrites its own
++// tensor with the received bytes mid-decode and continues to logits.
++//
++// Validates the orchestration protocol BEFORE paying v0.1's C++ cost on a
++// patched llama_decode + partial-model loading.
++
++#include "arg.h"
++#include "common.h"
++#include "log.h"
++#include "llama.h"
++#include "llama-cpp.h"
++
++#include <cerrno>
++#include <clocale>
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <string>
++#include <vector>
++
++#include <arpa/inet.h>
++#include <netinet/in.h>
++#include <sys/socket.h>
++#include <unistd.h>
++
++enum class SpikeMode { NONE, SEND, RECV, OBSERVE };
++
++struct SpikeData {
++    SpikeMode mode = SpikeMode::NONE;
++    std::string target_name = "l_out-13";
++    int port = 5555;
++    int socket_fd = -1;
++    int conn_fd = -1;
++    bool fired = false;
++    long long bytes_sent = 0;
++    long long bytes_received = 0;
++    bool ok = true;
++};
++
++static bool send_all(int fd, const void* buf, size_t len) {
++    const char* p = (const char*)buf;
++    size_t total = 0;
++    while (total < len) {
++        ssize_t n = write(fd, p + total, len - total);
++        if (n < 0) { if (errno == EINTR) continue; fprintf(stderr, "[spike] send: %s\n", strerror(errno)); return false; }
++        total += (size_t)n;
++    }
++    return true;
++}
++
++static bool recv_all(int fd, void* buf, size_t len) {
++    char* p = (char*)buf;
++    size_t total = 0;
++    while (total < len) {
++        ssize_t n = read(fd, p + total, len - total);
++        if (n < 0) { if (errno == EINTR) continue; fprintf(stderr, "[spike] recv: %s\n", strerror(errno)); return false; }
++        if (n == 0) { fprintf(stderr, "[spike] recv eof at %zu/%zu\n", total, len); return false; }
++        total += (size_t)n;
++    }
++    return true;
++}
++
++static uint64_t fnv1a(const void* p, size_t n) {
++    const uint8_t* b = (const uint8_t*)p;
++    uint64_t h = 14695981039346656037ull;
++    for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ull; }
++    return h;
++}
++
++static bool spike_cb(struct ggml_tensor * t, bool ask, void * user_data) {
++    SpikeData* sd = (SpikeData*)user_data;
++    const char* name = ggml_get_name(t);
++    if (!name || strcmp(name, sd->target_name.c_str()) != 0) return false;
++    if (ask) return true;
++    if (sd->fired) return false;
++    sd->fired = true;
++
++    size_t nbytes = ggml_nbytes(t);
++    fprintf(stderr, "[spike] target '%s' fired: type=%d ne=[%lld,%lld,%lld,%lld] nbytes=%zu\n",
++            name, (int)t->type,
++            (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2], (long long)t->ne[3],
++            nbytes);
++
++    if (sd->mode == SpikeMode::OBSERVE) {
++        uint64_t h = fnv1a(t->data, nbytes);
++        fprintf(stderr, "[spike] OBSERVE %zu bytes (fnv1a=0x%016llx) — no I/O\n", nbytes, (unsigned long long)h);
++    } else if (sd->mode == SpikeMode::SEND) {
++        uint64_t h = fnv1a(t->data, nbytes);
++        uint32_t len = (uint32_t)nbytes;
++        if (!send_all(sd->conn_fd, &len, sizeof(len))) { sd->ok = false; return false; }
++        if (!send_all(sd->conn_fd, t->data, nbytes)) { sd->ok = false; return false; }
++        sd->bytes_sent = (long long)nbytes;
++        fprintf(stderr, "[spike] sent %zu bytes (fnv1a=0x%016llx)\n", nbytes, (unsigned long long)h);
++    } else if (sd->mode == SpikeMode::RECV) {
++        uint32_t len = 0;
++        if (!recv_all(sd->conn_fd, &len, sizeof(len))) { sd->ok = false; return false; }
++        if ((size_t)len != nbytes) { fprintf(stderr, "[spike] size mismatch peer=%u local=%zu\n", len, nbytes); sd->ok = false; return false; }
++        uint64_t pre = fnv1a(t->data, nbytes);
++        if (!recv_all(sd->conn_fd, t->data, nbytes)) { sd->ok = false; return false; }
++        uint64_t post = fnv1a(t->data, nbytes);
++        sd->bytes_received = (long long)nbytes;
++        fprintf(stderr, "[spike] recv %zu bytes  pre_hash=0x%016llx  post_hash=0x%016llx  %s\n",
++                nbytes, (unsigned long long)pre, (unsigned long long)post,
++                pre == post ? "(byte-equal local vs remote)" : "(REMOTE OVERWROTE LOCAL)");
++    }
++    return false;
++}
++
++static int argmax_logits(llama_context* ctx, const llama_vocab* vocab) {
++    const int n_vocab = llama_vocab_n_tokens(vocab);
++    float* logits = llama_get_logits_ith(ctx, -1);
++    if (!logits) return -1;
++    int best = 0; float best_v = logits[0];
++    for (int i = 1; i < n_vocab; ++i) if (logits[i] > best_v) { best_v = logits[i]; best = i; }
++    return best;
++}
++
++int main(int argc, char ** argv) {
++    SpikeData sd;
++    std::vector<char*> clean;
++    clean.push_back(argv[0]);
++    for (int i = 1; i < argc; ++i) {
++        if (!strcmp(argv[i], "--spike-mode") && i+1 < argc) {
++            std::string m = argv[++i];
++            sd.mode = (m == "send") ? SpikeMode::SEND : (m == "recv") ? SpikeMode::RECV : (m == "observe") ? SpikeMode::OBSERVE : SpikeMode::NONE;
++        } else if (!strcmp(argv[i], "--spike-port") && i+1 < argc) {
++            sd.port = atoi(argv[++i]);
++        } else if (!strcmp(argv[i], "--spike-target") && i+1 < argc) {
++            sd.target_name = argv[++i];
++        } else if (!strcmp(argv[i], "--spike-none")) {
++            sd.mode = SpikeMode::NONE;  // reference run: no socket, no intercept
++        } else {
++            clean.push_back(argv[i]);
++        }
++    }
++
++    setlocale(LC_NUMERIC, "C");
++
++    if (sd.mode == SpikeMode::OBSERVE) {
++        fprintf(stderr, "[spike] OBSERVE mode (no socket), target=%s\n", sd.target_name.c_str());
++    } else if (sd.mode == SpikeMode::SEND) {
++        sd.conn_fd = socket(AF_INET, SOCK_STREAM, 0);
++        sockaddr_in a = {}; a.sin_family = AF_INET; a.sin_port = htons(sd.port); a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
++        for (int t = 0; ; ++t) {
++            if (connect(sd.conn_fd, (sockaddr*)&a, sizeof(a)) == 0) break;
++            if (t > 40) { fprintf(stderr, "[spike] connect timeout\n"); return 1; }
++            usleep(250000);
++        }
++        fprintf(stderr, "[spike] SEND mode connected to localhost:%d, target=%s\n", sd.port, sd.target_name.c_str());
++    } else if (sd.mode == SpikeMode::RECV) {
++        sd.socket_fd = socket(AF_INET, SOCK_STREAM, 0);
++        int yes = 1; setsockopt(sd.socket_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
++        sockaddr_in a = {}; a.sin_family = AF_INET; a.sin_port = htons(sd.port); a.sin_addr.s_addr = htonl(INADDR_ANY);
++        if (bind(sd.socket_fd, (sockaddr*)&a, sizeof(a)) < 0) { fprintf(stderr, "bind: %s\n", strerror(errno)); return 1; }
++        listen(sd.socket_fd, 1);
++        fprintf(stderr, "[spike] RECV mode listening on :%d, target=%s\n", sd.port, sd.target_name.c_str());
++        sd.conn_fd = accept(sd.socket_fd, nullptr, nullptr);
++        if (sd.conn_fd < 0) { fprintf(stderr, "accept: %s\n", strerror(errno)); return 1; }
++        fprintf(stderr, "[spike] RECV accepted connection\n");
++    } else {
++        fprintf(stderr, "[spike] reference mode (no socket, no intercept)\n");
++    }
++
++    int new_argc = (int)clean.size();
++    char** new_argv = clean.data();
++    common_params params;
++    if (!common_params_parse(new_argc, new_argv, params, LLAMA_EXAMPLE_COMMON)) return 1;
++
++    common_init();
++    llama_backend_init();
++    llama_numa_init(params.numa);
++
++    if (sd.mode != SpikeMode::NONE) {
++        params.cb_eval = spike_cb;
++        params.cb_eval_user_data = &sd;
++    }
++    params.warmup = false;
++
++    auto llama_init = common_init_from_params(params);
++    auto * model = llama_init->model();
++    auto * ctx   = llama_init->context();
++    if (!model || !ctx) { fprintf(stderr, "init failed\n"); return 1; }
++
++    const llama_vocab* vocab = llama_model_get_vocab(model);
++    bool add_bos = llama_vocab_get_add_bos(vocab);
++    std::vector<llama_token> tokens = common_tokenize(ctx, params.prompt, add_bos);
++    if (tokens.empty()) { fprintf(stderr, "[spike] no tokens for prompt\n"); return 1; }
++    fprintf(stderr, "[spike] tokenized to %zu tokens\n", tokens.size());
++
++    int rc = llama_decode(ctx, llama_batch_get_one(tokens.data(), tokens.size()));
++    fprintf(stderr, "[spike] decode rc=%d  fired=%s  sent=%lld  recv=%lld  ok=%d\n",
++            rc, sd.fired ? "yes" : "no", sd.bytes_sent, sd.bytes_received, sd.ok ? 1 : 0);
++
++    int top = argmax_logits(ctx, vocab);
++    char tokbuf[64] = {0};
++    if (top >= 0) {
++        int n = llama_token_to_piece(vocab, (llama_token)top, tokbuf, sizeof(tokbuf) - 1, 0, true);
++        if (n < 0) n = 0;
++        tokbuf[n] = '\0';
++    }
++    fprintf(stderr, "[spike] top-1 token id=%d str='%s'\n", top, tokbuf);
++    fprintf(stdout, "TOPTOK %d %s\n", top, tokbuf);
++
++    if (sd.conn_fd >= 0) close(sd.conn_fd);
++    if (sd.socket_fd >= 0) close(sd.socket_fd);
++    llama_backend_free();
++    return sd.ok ? 0 : 2;
++}
+diff --git a/examples/nakshatra-spike/worker_daemon.cpp b/examples/nakshatra-spike/worker_daemon.cpp
+new file mode 100644
+index 00000000..69874dcb
+--- /dev/null
++++ b/examples/nakshatra-spike/worker_daemon.cpp
+@@ -0,0 +1,714 @@
++// Nakshatra worker daemon (M5).
++//
++// Long-lived process spawned by the Python gRPC worker. Loads a sub-GGUF at
++// startup, then reads framed binary messages from stdin and writes framed
++// responses to stdout. One message = one llama_decode call.
++//
++// Wire format (all little-endian):
++//   request:  u32 cmd | u32 n_tokens | u32 start_pos | u32 flags | u32 payload_bytes | bytes payload
++//   response: u32 status | u32 payload_bytes | bytes payload
++//
++// 2026-05-30 fabric C++ Phase A.3 — alternate shm transport. Same wire
++// envelope as stdio; the request/response bytes ride two SPSC shared-memory
++// rings instead of stdin/stdout. Activated when both --fabric-shm-req <path>
++// and --fabric-shm-resp <path> are passed on argv (after the positional
++// args). Stdio path stays the default; existing callers unchanged.
++//
++// Flags:
++//   bit 0 (0x1) = keep_kv. If set, daemon skips llama_memory_clear before
++//                 decode (streaming generation). Tokens are placed in KV
++//                 cache at positions [start_pos, start_pos + n_tokens).
++//                 If unset, daemon clears KV first (single-shot prefill).
++//   bit 1 (0x2) = all_logits (speculative verify). If set, request per-position
++//                 logits for EVERY token in the batch, not just the last. On the
++//                 LAST worker the response is result_type=2 followed by int32
++//                 top_token[n_tokens] — the greedy argmax at each position — so a
++//                 speculative-decode coordinator can verify K+1 candidate tokens
++//                 in one chain traversal. Unset → legacy single-final-token
++//                 behaviour, byte-for-byte unchanged. (Non-last workers ignore it;
++//                 they already return hidden states for all positions.)
++//
++// Commands:
++//   1 = TOKEN_DECODE  payload = int32 token_ids[n_tokens]
++//                     response payload = float32 hidden[n_tokens * n_embd]
++//                                                         (worker 0/middle)
++//                                       OR int32 top_token (last worker —
++//                                       caller can detect by payload size)
++//   2 = EMBD_DECODE   payload = float32 hidden[n_tokens * n_embd]
++//                     response payload = same shape as TOKEN_DECODE response
++//   3 = INFO          payload empty
++//                     response payload = int32 n_layer_start, n_layer_end,
++//                                              n_embd, has_token_embd,
++//                                              has_lm_head, n_vocab
++//   4 = KV_TRUNCATE   payload = u32 n_keep
++//                     Discards a rejected speculative tail: removes KV for seq 0
++//                     at positions [n_keep, end), keeping [0, n_keep). No decode.
++//                     response payload empty.
++//
++// Response result_type (first 4 bytes of a decode payload):
++//   0 = hidden[n_tokens*n_embd]   1 = single top_token   2 = top_token[n_tokens]
++//
++// Status codes: 0 = ok, 1 = decode error, 2 = wire format error, 3 = arch
++// not supported.
++
++#include "common.h"
++#include "llama.h"
++
++#include "shm_ring.hpp"
++
++#include <cassert>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <ctime>
++#include <string>
++#include <vector>
++#include <unistd.h>
++#include <cstring>
++#include "ggml-backend.h"
++
++// ── EAGLE-3 hidden-state capture (cmd=5 EAGLE_HIDDEN) ─────────────────
++// The draft head needs the target's hidden_states[0,1,2] = ggml tensors
++// {embd, l_out-0, l_out-1} (discovered via llama-eval-callback on this build).
++// cb_eval grabs them during decode ONLY when armed (g_eagle_cap.on); off => the
++// callback returns false immediately => zero overhead on normal decodes.
++struct EagleCapture {
++    bool on = false;
++    std::vector<float> h[3];
++    bool got[3] = {false, false, false};
++};
++static EagleCapture g_eagle_cap;
++static int eagle_idx(const char* nm) {
++    if (std::strcmp(nm, "embd")    == 0) return 0;   // hidden_states[0]
++    if (std::strcmp(nm, "l_out-0") == 0) return 1;   // hidden_states[1]
++    if (std::strcmp(nm, "l_out-1") == 0) return 2;   // hidden_states[2]
++    return -1;
++}
++static bool eagle_cb_eval(struct ggml_tensor* t, bool ask, void* ud) {
++    EagleCapture* cap = (EagleCapture*) ud;
++    if (!cap->on) return false;
++    int idx = eagle_idx(t->name);
++    if (ask) return idx >= 0;
++    if (idx < 0) return true;
++    size_t ne = ggml_nelements(t);
++    cap->h[idx].resize(ne);
++    if (ggml_backend_buffer_is_host(t->buffer)) {
++        std::memcpy(cap->h[idx].data(), t->data, ne * sizeof(float));
++    } else {
++        ggml_backend_tensor_get(t, cap->h[idx].data(), 0, ne * sizeof(float));
++    }
++    cap->got[idx] = true;
++    return true;
++}
++
++#include <cmath>
++// ── Activation quant (int8 per-token absmax) for the worker->worker hidden
++// crossing — ~4x fewer wire bytes (fp32->int8+scale). Per-token: float32 scale,
++// then int8[n_embd]. Lever for deep splits over slow links.
++static const int QBL = 32;   // quant block size (per-block scale contains outliers)
++static inline size_t qrow_bytes(int n_embd) {            // bytes per token, block-wise
++    int nb = (n_embd + QBL - 1) / QBL;
++    return (size_t)nb * (sizeof(float) + QBL);
++}
++static void quant_hidden_i8(const float* h, uint32_t n_tokens, int n_embd,
++                            std::vector<uint8_t>& out) {
++    const size_t row = qrow_bytes(n_embd);
++    out.resize((size_t)n_tokens * row);
++    for (uint32_t t = 0; t < n_tokens; ++t) {
++        const float* r = h + (size_t)t * n_embd;
++        uint8_t* prow = out.data() + (size_t)t * row;
++        for (int b = 0; b * QBL < n_embd; ++b) {
++            int s = b * QBL, e = std::min(s + QBL, n_embd);
++            float amax = 0.0f;
++            for (int i = s; i < e; ++i) { float a = std::fabs(r[i]); if (a > amax) amax = a; }
++            float scale = amax > 0.0f ? amax / 127.0f : 1.0f;
++            uint8_t* p = prow + (size_t)b * (sizeof(float) + QBL);
++            *(float*)p = scale;
++            int8_t* q = (int8_t*)(p + sizeof(float));
++            float inv = 1.0f / scale;
++            for (int i = s; i < e; ++i) {
++                int v = (int)std::lrint(r[i] * inv);
++                q[i - s] = (int8_t)(v < -127 ? -127 : (v > 127 ? 127 : v));
++            }
++        }
++    }
++}
++static void dequant_hidden_i8(const uint8_t* in, uint32_t n_tokens, int n_embd, float* out) {
++    const size_t row = qrow_bytes(n_embd);
++    for (uint32_t t = 0; t < n_tokens; ++t) {
++        const uint8_t* prow = in + (size_t)t * row;
++        float* o = out + (size_t)t * n_embd;
++        for (int b = 0; b * QBL < n_embd; ++b) {
++            int s = b * QBL, e = std::min(s + QBL, n_embd);
++            const uint8_t* p = prow + (size_t)b * (sizeof(float) + QBL);
++            float scale = *(const float*)p;
++            const int8_t* q = (const int8_t*)(p + sizeof(float));
++            for (int i = s; i < e; ++i) o[i] = q[i - s] * scale;
++        }
++    }
++}
++
++// 2026-05-30 fabric C++ Phase C.1 — timing instrumentation. Set
++// NAKSHATRA_FABRIC_TIMING=1 in the daemon's environment to print
++// per-decode wall-time breakdown to stderr. Off by default —
++// production decodes pay no overhead.
++static inline uint64_t now_ns() {
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
++}
++static bool fabric_timing_enabled() {
++    const char* v = getenv("NAKSHATRA_FABRIC_TIMING");
++    return v && (v[0] == '1' || v[0] == 't' || v[0] == 'T');
++}
++
++// ── Transport: stdio (default) or shm (--fabric-shm-{req,resp}) ────
++
++// When non-null, daemon uses shm transport instead of stdio. Owned by
++// main() — globals here are fine because there's exactly one daemon
++// process per worker and the transport choice is set once at startup.
++static nakshatra::fabric::ShmRing* g_shm_req = nullptr;
++static nakshatra::fabric::ShmRing* g_shm_resp = nullptr;
++
++static int read_all_fd(int fd, void* buf, size_t n) {
++    char* p = (char*)buf;
++    size_t total = 0;
++    while (total < n) {
++        ssize_t r = read(fd, p + total, n - total);
++        if (r < 0 && errno == EINTR) continue;
++        if (r <= 0) return -1;
++        total += (size_t)r;
++    }
++    return 0;
++}
++
++static int write_all_fd(int fd, const void* buf, size_t n) {
++    const char* p = (const char*)buf;
++    size_t total = 0;
++    while (total < n) {
++        ssize_t w = write(fd, p + total, n - total);
++        if (w < 0 && errno == EINTR) continue;
++        if (w <= 0) return -1;
++        total += (size_t)w;
++    }
++    return 0;
++}
++
++// Read one full request frame. In stdio mode: 5 u32 header reads
++// followed by a payload read. In shm mode: one framed read off the
++// request ring. Returns 0 on success, -1 on EOF / error.
++static int read_request(uint32_t& cmd, uint32_t& n_tokens,
++                          uint32_t& start_pos, uint32_t& flags,
++                          std::vector<uint8_t>& payload) {
++    if (g_shm_req) {
++        std::vector<uint8_t> frame;
++        try {
++            g_shm_req->read_message_blocking(frame);
++        } catch (const nakshatra::fabric::ShmRingError& e) {
++            fprintf(stderr, "[daemon] shm req error: %s\n", e.what());
++            return -1;
++        }
++        if (frame.size() < 20) {
++            fprintf(stderr, "[daemon] shm request frame too short: %zu\n", frame.size());
++            return -1;
++        }
++        std::memcpy(&cmd,       frame.data() + 0,  4);
++        std::memcpy(&n_tokens,  frame.data() + 4,  4);
++        std::memcpy(&start_pos, frame.data() + 8,  4);
++        std::memcpy(&flags,     frame.data() + 12, 4);
++        uint32_t payload_bytes;
++        std::memcpy(&payload_bytes, frame.data() + 16, 4);
++        if (frame.size() != 20 + (size_t)payload_bytes) {
++            fprintf(stderr, "[daemon] shm request payload size mismatch: "
++                            "declared %u, frame has %zu\n",
++                    payload_bytes, frame.size() - 20);
++            return -1;
++        }
++        payload.assign(frame.begin() + 20, frame.end());
++        return 0;
++    }
++    // Stdio path — unchanged from the pre-A.3 daemon.
++    uint32_t payload_bytes;
++    if (read_all_fd(0, &cmd,           4) != 0) return -1;
++    if (read_all_fd(0, &n_tokens,      4) != 0) return -1;
++    if (read_all_fd(0, &start_pos,     4) != 0) return -1;
++    if (read_all_fd(0, &flags,         4) != 0) return -1;
++    if (read_all_fd(0, &payload_bytes, 4) != 0) return -1;
++    payload.resize(payload_bytes);
++    if (payload_bytes > 0 &&
++        read_all_fd(0, payload.data(), payload_bytes) != 0) {
++        return -1;
++    }
++    return 0;
++}
++
++static void send_response(uint32_t status, const void* payload,
++                            uint32_t payload_bytes) {
++    if (g_shm_resp) {
++        // Build the response frame (8-byte header + payload) and
++        // ship it as ONE framed shm message. The ring's own length
++        // prefix wraps the daemon's wire envelope; the wire bytes
++        // stay byte-identical to the stdio path so a Python consumer
++        // can parse them the same way.
++        std::vector<uint8_t> frame(8 + payload_bytes);
++        std::memcpy(frame.data() + 0, &status,        4);
++        std::memcpy(frame.data() + 4, &payload_bytes, 4);
++        if (payload_bytes > 0) {
++            std::memcpy(frame.data() + 8, payload, payload_bytes);
++        }
++        g_shm_resp->write_message_blocking(frame.data(), frame.size());
++        return;
++    }
++    // Stdio path — unchanged.
++    write_all_fd(1, &status,        4);
++    write_all_fd(1, &payload_bytes, 4);
++    if (payload_bytes > 0) write_all_fd(1, payload, payload_bytes);
++    fflush(stdout);
++}
++
++// 2026-05-30 Phase B — compile-time version stamping for cluster-wide
++// version-lock. CMake passes -DNAKSHATRA_FABRIC_SHA + -D...BUILD_HOST
++// at build time; daemon prints them on --version. scripts/smoke_
++// daemon_version.py SSH's each cluster machine + asserts the SHAs
++// match — closes the long-standing daemon-skew finding from 2026-05-21.
++#ifndef NAKSHATRA_FABRIC_SHA
++#define NAKSHATRA_FABRIC_SHA "unknown"
++#endif
++#ifndef NAKSHATRA_FABRIC_BUILD_HOST
++#define NAKSHATRA_FABRIC_BUILD_HOST "unknown"
++#endif
++
++int main(int argc, char ** argv) {
++    // --version short-circuits before any model loading / arg
++    // validation, so the version-lock smoke can probe a binary
++    // without needing a model file on hand.
++    if (argc == 2 && strcmp(argv[1], "--version") == 0) {
++        printf("nakshatra-fabric-worker\n");
++        printf("  sha        %s\n", NAKSHATRA_FABRIC_SHA);
++        printf("  built_on   %s\n", NAKSHATRA_FABRIC_BUILD_HOST);
++        printf("  built_at   %s %s\n", __DATE__, __TIME__);
++        return 0;
++    }
++    if (argc < 3) {
++        fprintf(stderr, "usage: %s <sub_gguf_path> <mode: first|middle|last> [n_ctx] [n_threads] [n_gpu_layers] [--fabric-shm-req <path> --fabric-shm-resp <path>]\n", argv[0]);
++        fprintf(stderr, "       %s --version\n", argv[0]);
++        return 1;
++    }
++    std::string sub_gguf = argv[1];
++    std::string mode_str = argv[2];
++    bool mode_last  = (mode_str == "last");
++    bool mode_first = (mode_str == "first");
++    bool mode_mid   = (mode_str == "middle");
++    if (!mode_last && !mode_first && !mode_mid) {
++        fprintf(stderr, "[daemon] bad mode '%s' (expected first|middle|last)\n", mode_str.c_str());
++        return 1;
++    }
++    int n_ctx        = argc > 3 ? atoi(argv[3]) : 256;
++    int n_threads    = argc > 4 ? atoi(argv[4]) : 0;  // 0 = leave llama.cpp's default
++    int n_gpu_layers = argc > 5 ? atoi(argv[5]) : 0;  // 0 = CPU only; 99 = all GPU
++
++    // 2026-05-30 Phase A.3 — parse the optional shm transport flags.
++    // They appear after the positional args. When both are present,
++    // attach both rings + flip into shm mode. Absent → stdio (legacy).
++    std::string shm_req_path, shm_resp_path;
++    for (int i = 6; i < argc; i++) {
++        if (strcmp(argv[i], "--fabric-shm-req") == 0 && i + 1 < argc) {
++            shm_req_path = argv[++i];
++        } else if (strcmp(argv[i], "--fabric-shm-resp") == 0 && i + 1 < argc) {
++            shm_resp_path = argv[++i];
++        }
++    }
++    bool shm_mode = !shm_req_path.empty() && !shm_resp_path.empty();
++    if (shm_mode) {
++        try {
++            // Heap-allocate so global pointers can outlive the local
++            // attach() return values via move construction.
++            g_shm_req  = new nakshatra::fabric::ShmRing(
++                nakshatra::fabric::ShmRing::attach(shm_req_path));
++            g_shm_resp = new nakshatra::fabric::ShmRing(
++                nakshatra::fabric::ShmRing::attach(shm_resp_path));
++            fprintf(stderr, "[daemon] shm transport attached: req=%s resp=%s "
++                            "capacity=%zu\n",
++                    shm_req_path.c_str(), shm_resp_path.c_str(),
++                    g_shm_req->capacity());
++        } catch (const std::exception& e) {
++            fprintf(stderr, "[daemon] shm attach failed: %s\n", e.what());
++            return 4;
++        }
++    }
++
++    common_init();
++    llama_backend_init();
++
++    // 2026-06-21 sleep-mode — model/ctx are now RELOADABLE so the daemon can
++    // free the GPU on idle (cmd=6 SLEEP) and re-acquire it on demand (cmd=7
++    // WAKE / first request) WITHOUT a process respawn or ROCm backend re-init.
++    // The slice stays warm in the host page cache (slice_warm), so wake is a
++    // host→GPU re-upload of a few seconds, not a cold ~7.5s summon. vLLM's
++    // "sleep mode" idea, in llama.cpp terms. load_mc() is the single load path.
++    llama_model* model = nullptr;
++    llama_context* ctx = nullptr;
++    int n_embd = 0, n_layer = 0, n_vocab = 0;
++    const llama_vocab* vocab = nullptr;
++    auto load_mc = [&]() -> int {
++        auto mp = llama_model_default_params();
++        mp.n_gpu_layers = n_gpu_layers;
++        model = llama_model_load_from_file(sub_gguf.c_str(), mp);
++        if (!model) {
++            fprintf(stderr, "[daemon] failed to load model: %s\n", sub_gguf.c_str());
++            return 2;
++        }
++        auto cp = llama_context_default_params();
++        cp.n_ctx     = n_ctx;
++        cp.n_batch   = n_ctx;
++        cp.n_seq_max = 2;            // seq 0 = serving/verify, seq 1 = EAGLE draft scratch
++        cp.embeddings = true;
++        cp.cb_eval = eagle_cb_eval;
++        cp.cb_eval_user_data = &g_eagle_cap;
++        if (n_threads > 0) {
++            cp.n_threads       = n_threads;
++            cp.n_threads_batch = n_threads;
++        }
++        ctx = llama_init_from_model(model, cp);
++        if (!ctx) {
++            fprintf(stderr, "[daemon] failed to init context\n");
++            return 3;
++        }
++        n_embd  = llama_model_n_embd(model);
++        n_layer = llama_model_n_layer(model);
++        vocab   = llama_model_get_vocab(model);
++        n_vocab = llama_vocab_n_tokens(vocab);
++        return 0;
++    };
++    { int rc0 = load_mc(); if (rc0 != 0) return rc0; }
++    bool sleeping = false;
++
++    // The Nakshatra fields live on the model — reach in via llama.cpp's pubic
++    // accessors where possible; for partial-load metadata we expose the
++    // model-level KVs we wrote in partial_gguf.py via direct GGUF reads.
++    // For M5 simplicity we rely on the patched loader having populated
++    // layers correctly, and we trust the cluster config rather than
++    // round-tripping the metadata. The INFO response surfaces what we know.
++
++    fprintf(stderr, "[daemon] ready: %s n_embd=%d n_layer=%d n_vocab=%d n_ctx=%d n_gpu_layers=%d transport=%s\n",
++            sub_gguf.c_str(), n_embd, n_layer, n_vocab, n_ctx, n_gpu_layers,
++            shm_mode ? "shm" : "stdio");
++
++    bool timing_on = fabric_timing_enabled();
++    if (timing_on) {
++        fprintf(stderr, "[daemon] timing instrumentation enabled "
++                        "(NAKSHATRA_FABRIC_TIMING=1)\n");
++    }
++
++    // Main message loop
++    while (true) {
++        uint32_t cmd, n_tokens, start_pos, flags;
++        std::vector<uint8_t> payload;
++        uint64_t t_recv_start = timing_on ? now_ns() : 0;
++        if (read_request(cmd, n_tokens, start_pos, flags, payload) != 0) break;
++        uint64_t t_recv_done = timing_on ? now_ns() : 0;
++        uint32_t payload_bytes = (uint32_t)payload.size();
++
++        const bool keep_kv    = (flags & 0x1) != 0;
++        const bool all_logits = (flags & 0x2) != 0;   // speculative verify: argmax at every position
++
++        // 2026-06-21 sleep-mode commands.
++        if (cmd == 6) {
++            // SLEEP — free the GPU (context + model weights) but keep the
++            // process + ROCm backend resident. Idempotent. The cached n_embd/
++            // n_layer/n_vocab survive so INFO still answers while asleep.
++            if (!sleeping) {
++                if (ctx)   { llama_free(ctx);             ctx   = nullptr; }
++                if (model) { llama_model_free(model);     model = nullptr; }
++                sleeping = true;
++                fprintf(stderr, "[daemon] sleep: GPU released, process resident\n");
++            }
++            send_response(0, nullptr, 0);
++            continue;
++        }
++        if (cmd == 7) {
++            // WAKE — re-acquire the GPU by reloading from the (warm) slice.
++            // No respawn, no backend re-init. Reports the wake latency.
++            if (sleeping) {
++                uint64_t tw0 = now_ns();
++                if (load_mc() != 0) { send_response(2, nullptr, 0); continue; }
++                sleeping = false;
++                fprintf(stderr, "[daemon] wake: reloaded in %.3f s\n",
++                        (now_ns() - tw0) / 1e9);
++            }
++            send_response(0, nullptr, 0);
++            continue;
++        }
++        // Transparent auto-wake: any model/ctx-touching command issued while
++        // asleep wakes first (the lifecycle "summon" path — first request pays
++        // the one-time wake). INFO (3) answers from cached metadata, no wake.
++        if (sleeping && (cmd == 1 || cmd == 2 || cmd == 4 || cmd == 5)) {
++            uint64_t tw0 = now_ns();
++            if (load_mc() != 0) { send_response(2, nullptr, 0); continue; }
++            sleeping = false;
++            fprintf(stderr, "[daemon] auto-wake (cmd=%u): reloaded in %.3f s\n",
++                    cmd, (now_ns() - tw0) / 1e9);
++        }
++
++        if (cmd == 4) {
++            // KV_TRUNCATE — discard a rejected speculative tail. Keep [0, n_keep),
++            // remove [n_keep, end) for seq 0. The only KV-rewind primitive (decode
++            // otherwise only ever appends). No model forward.
++            if (payload_bytes != sizeof(uint32_t)) { send_response(2, nullptr, 0); continue; }
++            uint32_t n_keep;
++            std::memcpy(&n_keep, payload.data(), 4);
++            llama_memory_seq_rm(llama_get_memory(ctx), 0, (llama_pos)n_keep, -1);
++            send_response(0, nullptr, 0);
++            continue;
++        }
++
++        if (cmd == 3) {
++            // INFO
++            int32_t info[6];
++            info[0] = 0;          // n_layer_start  — not directly accessible from public API
++            info[1] = n_layer;    // n_layer_end    — same
++            info[2] = n_embd;
++            info[3] = 1;          // has_token_embd — assume true; client validates via cluster yaml
++            info[4] = 1;          // has_lm_head    — same
++            info[5] = n_vocab;
++            send_response(0, info, sizeof(info));
++            continue;
++        }
++
++        int rc = -1;
++        // Streaming KV reuse: skip the clear when caller asserts keep_kv.
++        // First step in a session always sends keep_kv=false (cold prefill);
++        // subsequent steps send keep_kv=true with start_pos = prefix_length
++        // so the new tokens append to the existing KV cache.
++        if (cmd == 5) {
++            // EAGLE→live KV ISOLATION (2026-06-21): the draft-hidden capture runs
++            // on a SCRATCH sequence (1), never seq 0. The serving/verify path owns
++            // seq 0; touching it would corrupt the speculative KV (M3 fusion).
++            // INCREMENTAL (2026-06-21): cmd=5 now honors keep_kv on seq 1 —
++            //   keep_kv=0 (cold): wipe seq 1, decode the prefix from pos 0;
++            //   keep_kv=1 (incremental): APPEND the new tokens at start_pos, reusing
++            //     the accumulated seq-1 KV → O(1)/step instead of re-forwarding the
++            //     whole prefix every step (kills the O(S^2) target cost). The hidden
++            //     captured is identical to a cold re-forward (same causal attention).
++            if (!keep_kv) llama_memory_seq_rm(llama_get_memory(ctx), 1, -1, -1);
++        } else if (!keep_kv) {
++            llama_memory_clear(llama_get_memory(ctx), true);
++        } else {
++            // M3 spec-decode FUSION (2026-06-21): a keep_kv forward implicitly
++            // TRUNCATES the KV to start_pos before appending — discarding any
++            // rejected speculative tail left by the previous step. This folds the
++            // old separate TruncateKV (cmd=4) round-trip into the next verify, so a
++            // speculative step costs ONE round-trip, not two (RT/token 2.0 -> 1.0).
++            // On a normal keep_kv decode start_pos == current KV length, so the
++            // seq_rm is a no-op; only after a partial-accept (start_pos = n_keep <
++            // KV length) does it trim. cmd=4 remains for explicit/legacy callers.
++            llama_memory_seq_rm(llama_get_memory(ctx), 0, (llama_pos)start_pos, -1);
++        }
++
++        uint64_t t_decode_start = 0, t_decode_done = 0;
++        if (cmd == 1 || cmd == 5) {
++            if (cmd == 5) { g_eagle_cap.on = true;
++                            g_eagle_cap.got[0]=g_eagle_cap.got[1]=g_eagle_cap.got[2]=false; }
++            // TOKEN_DECODE — use llama_batch_init so we can set explicit
++            // positions (start_pos + i) instead of relying on the auto-zeroed
++            // positions of llama_batch_get_one.
++            if (payload_bytes != n_tokens * sizeof(int32_t)) {
++                send_response(2, nullptr, 0); continue;
++            }
++            const int32_t* tok = (const int32_t*) payload.data();
++            // cmd=5 (EAGLE draft) is isolated on scratch seq 1 at pos 0..; cmd=1
++            // (serving/verify) is on seq 0 at start_pos.. — see KV-isolation note.
++            const bool eagle = (cmd == 5);
++            const int32_t kv_seq = eagle ? 1 : 0;
++            llama_batch batch = llama_batch_init(n_tokens, 0, 1);
++            batch.n_tokens = n_tokens;
++            for (uint32_t i = 0; i < n_tokens; ++i) {
++                batch.token[i] = (llama_token) tok[i];
++                // both paths use caller start_pos (cold cmd=5 sends start_pos=0;
++                // incremental cmd=5 sends the current seq-1 length).
++                batch.pos[i] = (int32_t)(start_pos + i);
++                batch.n_seq_id[i] = 1;
++                batch.seq_id[i][0] = kv_seq;
++                batch.logits[i] = (all_logits || i == n_tokens - 1) ? 1 : 0;
++            }
++            if (timing_on) t_decode_start = now_ns();
++            rc = llama_decode(ctx, batch);
++            if (timing_on) t_decode_done = now_ns();
++            llama_batch_free(batch);
++            if (cmd == 5) g_eagle_cap.on = false;
++        } else if (cmd == 2) {
++            // EMBD_DECODE (flag 0x8 = quantized int8 input from previous worker)
++            const bool quant_in = (flags & 0x8) != 0;
++            const uint32_t need = quant_in
++                ? (uint32_t)((size_t)n_tokens * qrow_bytes(n_embd))
++                : n_tokens * (uint32_t)n_embd * sizeof(float);
++            if (payload_bytes != need) {
++                send_response(2, nullptr, 0); continue;
++            }
++            llama_batch batch = llama_batch_init(n_tokens, n_embd, 1);
++            batch.n_tokens = n_tokens;
++            if (quant_in) dequant_hidden_i8(payload.data(), n_tokens, n_embd, batch.embd);
++            else memcpy(batch.embd, payload.data(), payload_bytes);
++            for (uint32_t i = 0; i < n_tokens; ++i) {
++                batch.pos[i] = (int32_t)(start_pos + i);
++                batch.n_seq_id[i] = 1;
++                batch.seq_id[i][0] = 0;
++                batch.logits[i] = (all_logits || i == n_tokens - 1) ? 1 : 0;
++            }
++            if (timing_on) t_decode_start = now_ns();
++            rc = llama_decode(ctx, batch);
++            if (timing_on) t_decode_done = now_ns();
++            llama_batch_free(batch);
++        } else {
++            send_response(2, nullptr, 0);
++            continue;
++        }
++
++        if (rc != 0) {
++            g_eagle_cap.on = false;
++            send_response(1, nullptr, 0);
++            continue;
++        }
++
++        if (cmd == 5) {
++            // EAGLE_HIDDEN — per token, concat the 3 captured layers:
++            // payload float32[n_tokens * 3 * n_embd], result_type=3. Only the
++            // FIRST worker (holds embd + layers 0,1) can serve this.
++            if (!(g_eagle_cap.got[0] && g_eagle_cap.got[1] && g_eagle_cap.got[2])) {
++                send_response(1, nullptr, 0); continue;
++            }
++            const size_t per = (size_t) n_embd;
++            std::vector<uint8_t> out(4 + (size_t)n_tokens * 3 * per * sizeof(float));
++            *(uint32_t*)out.data() = 3;     // result_type = eagle hidden3
++            float* dst = (float*)(out.data() + 4);
++            for (uint32_t tk = 0; tk < n_tokens; ++tk) {
++                for (int L = 0; L < 3; ++L) {
++                    std::memcpy(dst, g_eagle_cap.h[L].data() + (size_t)tk * per,
++                                per * sizeof(float));
++                    dst += per;
++                }
++            }
++            send_response(0, out.data(), (uint32_t)out.size());
++            continue;
++        }
++
++        // Caller specified mode at startup; respect it.
++        // Response payload: first 4 bytes = result_type (0=hidden, 1=token).
++        // C.1 timing — split post_send into get_embeddings + memcpy +
++        // shm-write to identify which dominates on GPU mode.
++        // D.1 hypothesis test — force a llama_synchronize BEFORE
++        // get_embeddings so the timing splits "GPU pipeline wait"
++        // from "DMA + host alloc". Enabled by env NAKSHATRA_FABRIC_
++        // PROBE_SYNC=1; off by default so production decodes are
++        // unchanged.
++        static const bool probe_sync_enabled = []() {
++            const char* v = getenv("NAKSHATRA_FABRIC_PROBE_SYNC");
++            return v && (v[0] == '1' || v[0] == 't' || v[0] == 'T');
++        }();
++        uint64_t t_sync_start = 0, t_sync_done = 0;
++        if (probe_sync_enabled) {
++            t_sync_start = now_ns();
++            llama_synchronize(ctx);
++            t_sync_done = now_ns();
++        }
++        uint64_t t_get_embd_start = timing_on ? now_ns() : 0;
++        uint64_t t_get_embd_done = 0, t_memcpy_done = 0;
++        if (mode_last && all_logits) {
++            // Speculative verify: greedy argmax at EVERY position → top_token[n_tokens].
++            // Position p's logits are valid because all_logits set batch.logits[p]=1.
++            std::vector<uint8_t> out(4 + (size_t)n_tokens * sizeof(int32_t));
++            *(uint32_t*)out.data() = 2;     // result_type = tokens[]
++            int32_t* toks = (int32_t*)(out.data() + 4);
++            bool ok = true;
++            for (uint32_t p = 0; p < n_tokens; ++p) {
++                float* logits = llama_get_logits_ith(ctx, (int32_t)p);
++                if (!logits) { ok = false; break; }
++                int top = 0; float top_v = logits[0];
++                for (int i = 1; i < n_vocab; ++i) if (logits[i] > top_v) { top_v = logits[i]; top = i; }
++                toks[p] = top;
++            }
++            if (!ok) { send_response(1, nullptr, 0); continue; }
++            send_response(0, out.data(), (uint32_t)out.size());
++        } else if (mode_last) {
++            float* logits = llama_get_logits_ith(ctx, -1);
++            if (!logits) { send_response(1, nullptr, 0); continue; }
++            int top = 0; float top_v = logits[0];
++            for (int i = 1; i < n_vocab; ++i) if (logits[i] > top_v) { top_v = logits[i]; top = i; }
++            uint8_t buf[8];
++            *(uint32_t*)(buf + 0) = 1;      // result_type = token
++            *(int32_t *)(buf + 4) = top;
++            send_response(0, buf, 8);
++        } else {
++            // first/middle: return hidden state
++            float* hidden = llama_get_embeddings(ctx);
++            if (timing_on) t_get_embd_done = now_ns();
++            if (!hidden) { send_response(1, nullptr, 0); continue; }
++            if ((flags & 0x4) != 0) {       // quant_out: int8-quantize the crossing
++                std::vector<uint8_t> q; quant_hidden_i8(hidden, n_tokens, n_embd, q);
++                std::vector<uint8_t> out(4 + q.size());
++                *(uint32_t*)out.data() = 4;  // result_type = quantized hidden (int8)
++                memcpy(out.data() + 4, q.data(), q.size());
++                if (timing_on) t_memcpy_done = now_ns();
++                send_response(0, out.data(), (uint32_t)out.size());
++            } else {
++                size_t hbytes = (size_t)n_tokens * (size_t)n_embd * sizeof(float);
++                std::vector<uint8_t> out(4 + hbytes);
++                *(uint32_t*)out.data() = 0;     // result_type = hidden
++                memcpy(out.data() + 4, hidden, hbytes);
++                if (timing_on) t_memcpy_done = now_ns();
++                send_response(0, out.data(), (uint32_t)out.size());
++            }
++        }
++        if (timing_on) {
++            uint64_t t_send_done = now_ns();
++            // recv_wait: time blocked in read_message_blocking
++            //            (request poll latency)
++            // pre_decode: time after request arrived, before
++            //             llama_decode entry (batch setup, KV clear)
++            // decode:     time inside llama_decode
++            // post_decode_send: time after decode, including
++            //                   response packing + shm write
++            uint64_t recv_wait_ns        = t_recv_done - t_recv_start;
++            uint64_t pre_decode_ns       = t_decode_start - t_recv_done;
++            uint64_t decode_ns           = t_decode_done - t_decode_start;
++            uint64_t post_decode_send_ns = t_send_done - t_decode_done;
++            uint64_t total_ns            = t_send_done - t_recv_start;
++            // Sub-timings for the post-decode phase. Only populated
++            // on mode != last (hidden-state return path); zero on
++            // mode_last (which goes through the logits→token path).
++            uint64_t get_embd_ns = (t_get_embd_done && t_get_embd_start)
++                                    ? t_get_embd_done - t_get_embd_start : 0;
++            uint64_t memcpy_ns   = (t_memcpy_done && t_get_embd_done)
++                                    ? t_memcpy_done - t_get_embd_done : 0;
++            uint64_t shm_send_ns = (t_send_done && t_memcpy_done)
++                                    ? t_send_done - t_memcpy_done : 0;
++            uint64_t sync_ns = (t_sync_done && t_sync_start)
++                                ? t_sync_done - t_sync_start : 0;
++            fprintf(stderr,
++                    "[timing] cmd=%u n=%u total=%.3fms "
++                    "recv_wait=%.3fms pre_decode=%.3fms "
++                    "decode=%.3fms post_send=%.3fms "
++                    "[sync=%.3fms get_embd=%.3fms memcpy=%.3fms "
++                    "shm_send=%.3fms]\n",
++                    cmd, n_tokens,
++                    total_ns / 1e6,
++                    recv_wait_ns / 1e6,
++                    pre_decode_ns / 1e6,
++                    decode_ns / 1e6,
++                    post_decode_send_ns / 1e6,
++                    sync_ns / 1e6,
++                    get_embd_ns / 1e6,
++                    memcpy_ns / 1e6,
++                    shm_send_ns / 1e6);
++        }
++    }
++
++    fprintf(stderr, "[daemon] eof, shutting down\n");
++    if (g_shm_req)  { delete g_shm_req;  g_shm_req  = nullptr; }
++    if (g_shm_resp) { delete g_shm_resp; g_shm_resp = nullptr; }
++    llama_free(ctx);
++    llama_model_free(model);
++    llama_backend_free();
++    return 0;
++}
+diff --git a/examples/nakshatra-spike/worker_daemon_specdec.cpp b/examples/nakshatra-spike/worker_daemon_specdec.cpp
+new file mode 100644
+index 00000000..a33252e6
+--- /dev/null
++++ b/examples/nakshatra-spike/worker_daemon_specdec.cpp
+@@ -0,0 +1,508 @@
++// Nakshatra worker daemon (M5).
++//
++// Long-lived process spawned by the Python gRPC worker. Loads a sub-GGUF at
++// startup, then reads framed binary messages from stdin and writes framed
++// responses to stdout. One message = one llama_decode call.
++//
++// Wire format (all little-endian):
++//   request:  u32 cmd | u32 n_tokens | u32 start_pos | u32 flags | u32 payload_bytes | bytes payload
++//   response: u32 status | u32 payload_bytes | bytes payload
++//
++// 2026-05-30 fabric C++ Phase A.3 — alternate shm transport. Same wire
++// envelope as stdio; the request/response bytes ride two SPSC shared-memory
++// rings instead of stdin/stdout. Activated when both --fabric-shm-req <path>
++// and --fabric-shm-resp <path> are passed on argv (after the positional
++// args). Stdio path stays the default; existing callers unchanged.
++//
++// Flags:
++//   bit 0 (0x1) = keep_kv. If set, daemon skips llama_memory_clear before
++//                 decode (streaming generation). Tokens are placed in KV
++//                 cache at positions [start_pos, start_pos + n_tokens).
++//                 If unset, daemon clears KV first (single-shot prefill).
++//   bit 1 (0x2) = all_logits (speculative verify). If set, request per-position
++//                 logits for EVERY token in the batch, not just the last. On the
++//                 LAST worker the response is result_type=2 followed by int32
++//                 top_token[n_tokens] — the greedy argmax at each position — so a
++//                 speculative-decode coordinator can verify K+1 candidate tokens
++//                 in one chain traversal. Unset → legacy single-final-token
++//                 behaviour, byte-for-byte unchanged. (Non-last workers ignore it;
++//                 they already return hidden states for all positions.)
++//
++// Commands:
++//   1 = TOKEN_DECODE  payload = int32 token_ids[n_tokens]
++//                     response payload = float32 hidden[n_tokens * n_embd]
++//                                                         (worker 0/middle)
++//                                       OR int32 top_token (last worker —
++//                                       caller can detect by payload size)
++//   2 = EMBD_DECODE   payload = float32 hidden[n_tokens * n_embd]
++//                     response payload = same shape as TOKEN_DECODE response
++//   3 = INFO          payload empty
++//                     response payload = int32 n_layer_start, n_layer_end,
++//                                              n_embd, has_token_embd,
++//                                              has_lm_head, n_vocab
++//   4 = KV_TRUNCATE   payload = u32 n_keep
++//                     Discards a rejected speculative tail: removes KV for seq 0
++//                     at positions [n_keep, end), keeping [0, n_keep). No decode.
++//                     response payload empty.
++//
++// Response result_type (first 4 bytes of a decode payload):
++//   0 = hidden[n_tokens*n_embd]   1 = single top_token   2 = top_token[n_tokens]
++//
++// Status codes: 0 = ok, 1 = decode error, 2 = wire format error, 3 = arch
++// not supported.
++
++#include "common.h"
++#include "llama.h"
++
++#include "shm_ring.hpp"
++
++#include <cassert>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <ctime>
++#include <string>
++#include <vector>
++#include <unistd.h>
++
++// 2026-05-30 fabric C++ Phase C.1 — timing instrumentation. Set
++// NAKSHATRA_FABRIC_TIMING=1 in the daemon's environment to print
++// per-decode wall-time breakdown to stderr. Off by default —
++// production decodes pay no overhead.
++static inline uint64_t now_ns() {
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
++}
++static bool fabric_timing_enabled() {
++    const char* v = getenv("NAKSHATRA_FABRIC_TIMING");
++    return v && (v[0] == '1' || v[0] == 't' || v[0] == 'T');
++}
++
++// ── Transport: stdio (default) or shm (--fabric-shm-{req,resp}) ────
++
++// When non-null, daemon uses shm transport instead of stdio. Owned by
++// main() — globals here are fine because there's exactly one daemon
++// process per worker and the transport choice is set once at startup.
++static nakshatra::fabric::ShmRing* g_shm_req = nullptr;
++static nakshatra::fabric::ShmRing* g_shm_resp = nullptr;
++
++static int read_all_fd(int fd, void* buf, size_t n) {
++    char* p = (char*)buf;
++    size_t total = 0;
++    while (total < n) {
++        ssize_t r = read(fd, p + total, n - total);
++        if (r < 0 && errno == EINTR) continue;
++        if (r <= 0) return -1;
++        total += (size_t)r;
++    }
++    return 0;
++}
++
++static int write_all_fd(int fd, const void* buf, size_t n) {
++    const char* p = (const char*)buf;
++    size_t total = 0;
++    while (total < n) {
++        ssize_t w = write(fd, p + total, n - total);
++        if (w < 0 && errno == EINTR) continue;
++        if (w <= 0) return -1;
++        total += (size_t)w;
++    }
++    return 0;
++}
++
++// Read one full request frame. In stdio mode: 5 u32 header reads
++// followed by a payload read. In shm mode: one framed read off the
++// request ring. Returns 0 on success, -1 on EOF / error.
++static int read_request(uint32_t& cmd, uint32_t& n_tokens,
++                          uint32_t& start_pos, uint32_t& flags,
++                          std::vector<uint8_t>& payload) {
++    if (g_shm_req) {
++        std::vector<uint8_t> frame;
++        try {
++            g_shm_req->read_message_blocking(frame);
++        } catch (const nakshatra::fabric::ShmRingError& e) {
++            fprintf(stderr, "[daemon] shm req error: %s\n", e.what());
++            return -1;
++        }
++        if (frame.size() < 20) {
++            fprintf(stderr, "[daemon] shm request frame too short: %zu\n", frame.size());
++            return -1;
++        }
++        std::memcpy(&cmd,       frame.data() + 0,  4);
++        std::memcpy(&n_tokens,  frame.data() + 4,  4);
++        std::memcpy(&start_pos, frame.data() + 8,  4);
++        std::memcpy(&flags,     frame.data() + 12, 4);
++        uint32_t payload_bytes;
++        std::memcpy(&payload_bytes, frame.data() + 16, 4);
++        if (frame.size() != 20 + (size_t)payload_bytes) {
++            fprintf(stderr, "[daemon] shm request payload size mismatch: "
++                            "declared %u, frame has %zu\n",
++                    payload_bytes, frame.size() - 20);
++            return -1;
++        }
++        payload.assign(frame.begin() + 20, frame.end());
++        return 0;
++    }
++    // Stdio path — unchanged from the pre-A.3 daemon.
++    uint32_t payload_bytes;
++    if (read_all_fd(0, &cmd,           4) != 0) return -1;
++    if (read_all_fd(0, &n_tokens,      4) != 0) return -1;
++    if (read_all_fd(0, &start_pos,     4) != 0) return -1;
++    if (read_all_fd(0, &flags,         4) != 0) return -1;
++    if (read_all_fd(0, &payload_bytes, 4) != 0) return -1;
++    payload.resize(payload_bytes);
++    if (payload_bytes > 0 &&
++        read_all_fd(0, payload.data(), payload_bytes) != 0) {
++        return -1;
++    }
++    return 0;
++}
++
++static void send_response(uint32_t status, const void* payload,
++                            uint32_t payload_bytes) {
++    if (g_shm_resp) {
++        // Build the response frame (8-byte header + payload) and
++        // ship it as ONE framed shm message. The ring's own length
++        // prefix wraps the daemon's wire envelope; the wire bytes
++        // stay byte-identical to the stdio path so a Python consumer
++        // can parse them the same way.
++        std::vector<uint8_t> frame(8 + payload_bytes);
++        std::memcpy(frame.data() + 0, &status,        4);
++        std::memcpy(frame.data() + 4, &payload_bytes, 4);
++        if (payload_bytes > 0) {
++            std::memcpy(frame.data() + 8, payload, payload_bytes);
++        }
++        g_shm_resp->write_message_blocking(frame.data(), frame.size());
++        return;
++    }
++    // Stdio path — unchanged.
++    write_all_fd(1, &status,        4);
++    write_all_fd(1, &payload_bytes, 4);
++    if (payload_bytes > 0) write_all_fd(1, payload, payload_bytes);
++    fflush(stdout);
++}
++
++// 2026-05-30 Phase B — compile-time version stamping for cluster-wide
++// version-lock. CMake passes -DNAKSHATRA_FABRIC_SHA + -D...BUILD_HOST
++// at build time; daemon prints them on --version. scripts/smoke_
++// daemon_version.py SSH's each cluster machine + asserts the SHAs
++// match — closes the long-standing daemon-skew finding from 2026-05-21.
++#ifndef NAKSHATRA_FABRIC_SHA
++#define NAKSHATRA_FABRIC_SHA "unknown"
++#endif
++#ifndef NAKSHATRA_FABRIC_BUILD_HOST
++#define NAKSHATRA_FABRIC_BUILD_HOST "unknown"
++#endif
++
++int main(int argc, char ** argv) {
++    // --version short-circuits before any model loading / arg
++    // validation, so the version-lock smoke can probe a binary
++    // without needing a model file on hand.
++    if (argc == 2 && strcmp(argv[1], "--version") == 0) {
++        printf("nakshatra-fabric-worker\n");
++        printf("  sha        %s\n", NAKSHATRA_FABRIC_SHA);
++        printf("  built_on   %s\n", NAKSHATRA_FABRIC_BUILD_HOST);
++        printf("  built_at   %s %s\n", __DATE__, __TIME__);
++        return 0;
++    }
++    if (argc < 3) {
++        fprintf(stderr, "usage: %s <sub_gguf_path> <mode: first|middle|last> [n_ctx] [n_threads] [n_gpu_layers] [--fabric-shm-req <path> --fabric-shm-resp <path>]\n", argv[0]);
++        fprintf(stderr, "       %s --version\n", argv[0]);
++        return 1;
++    }
++    std::string sub_gguf = argv[1];
++    std::string mode_str = argv[2];
++    bool mode_last  = (mode_str == "last");
++    bool mode_first = (mode_str == "first");
++    bool mode_mid   = (mode_str == "middle");
++    if (!mode_last && !mode_first && !mode_mid) {
++        fprintf(stderr, "[daemon] bad mode '%s' (expected first|middle|last)\n", mode_str.c_str());
++        return 1;
++    }
++    int n_ctx        = argc > 3 ? atoi(argv[3]) : 256;
++    int n_threads    = argc > 4 ? atoi(argv[4]) : 0;  // 0 = leave llama.cpp's default
++    int n_gpu_layers = argc > 5 ? atoi(argv[5]) : 0;  // 0 = CPU only; 99 = all GPU
++
++    // 2026-05-30 Phase A.3 — parse the optional shm transport flags.
++    // They appear after the positional args. When both are present,
++    // attach both rings + flip into shm mode. Absent → stdio (legacy).
++    std::string shm_req_path, shm_resp_path;
++    for (int i = 6; i < argc; i++) {
++        if (strcmp(argv[i], "--fabric-shm-req") == 0 && i + 1 < argc) {
++            shm_req_path = argv[++i];
++        } else if (strcmp(argv[i], "--fabric-shm-resp") == 0 && i + 1 < argc) {
++            shm_resp_path = argv[++i];
++        }
++    }
++    bool shm_mode = !shm_req_path.empty() && !shm_resp_path.empty();
++    if (shm_mode) {
++        try {
++            // Heap-allocate so global pointers can outlive the local
++            // attach() return values via move construction.
++            g_shm_req  = new nakshatra::fabric::ShmRing(
++                nakshatra::fabric::ShmRing::attach(shm_req_path));
++            g_shm_resp = new nakshatra::fabric::ShmRing(
++                nakshatra::fabric::ShmRing::attach(shm_resp_path));
++            fprintf(stderr, "[daemon] shm transport attached: req=%s resp=%s "
++                            "capacity=%zu\n",
++                    shm_req_path.c_str(), shm_resp_path.c_str(),
++                    g_shm_req->capacity());
++        } catch (const std::exception& e) {
++            fprintf(stderr, "[daemon] shm attach failed: %s\n", e.what());
++            return 4;
++        }
++    }
++
++    common_init();
++    llama_backend_init();
++
++    auto mp = llama_model_default_params();
++    mp.n_gpu_layers = n_gpu_layers;
++    llama_model* model = llama_model_load_from_file(sub_gguf.c_str(), mp);
++    if (!model) {
++        fprintf(stderr, "[daemon] failed to load model: %s\n", sub_gguf.c_str());
++        return 2;
++    }
++    auto cp = llama_context_default_params();
++    cp.n_ctx     = n_ctx;
++    cp.n_batch   = n_ctx;
++    cp.embeddings = true;
++    if (n_threads > 0) {
++        cp.n_threads       = n_threads;
++        cp.n_threads_batch = n_threads;
++    }
++    llama_context* ctx = llama_init_from_model(model, cp);
++    if (!ctx) {
++        fprintf(stderr, "[daemon] failed to init context\n");
++        return 3;
++    }
++    int n_embd  = llama_model_n_embd(model);
++    int n_layer = llama_model_n_layer(model);
++    const llama_vocab* vocab = llama_model_get_vocab(model);
++    int n_vocab = llama_vocab_n_tokens(vocab);
++
++    // The Nakshatra fields live on the model — reach in via llama.cpp's pubic
++    // accessors where possible; for partial-load metadata we expose the
++    // model-level KVs we wrote in partial_gguf.py via direct GGUF reads.
++    // For M5 simplicity we rely on the patched loader having populated
++    // layers correctly, and we trust the cluster config rather than
++    // round-tripping the metadata. The INFO response surfaces what we know.
++
++    fprintf(stderr, "[daemon] ready: %s n_embd=%d n_layer=%d n_vocab=%d n_ctx=%d n_gpu_layers=%d transport=%s\n",
++            sub_gguf.c_str(), n_embd, n_layer, n_vocab, n_ctx, n_gpu_layers,
++            shm_mode ? "shm" : "stdio");
++
++    bool timing_on = fabric_timing_enabled();
++    if (timing_on) {
++        fprintf(stderr, "[daemon] timing instrumentation enabled "
++                        "(NAKSHATRA_FABRIC_TIMING=1)\n");
++    }
++
++    // Main message loop
++    while (true) {
++        uint32_t cmd, n_tokens, start_pos, flags;
++        std::vector<uint8_t> payload;
++        uint64_t t_recv_start = timing_on ? now_ns() : 0;
++        if (read_request(cmd, n_tokens, start_pos, flags, payload) != 0) break;
++        uint64_t t_recv_done = timing_on ? now_ns() : 0;
++        uint32_t payload_bytes = (uint32_t)payload.size();
++
++        const bool keep_kv    = (flags & 0x1) != 0;
++        const bool all_logits = (flags & 0x2) != 0;   // speculative verify: argmax at every position
++
++        if (cmd == 4) {
++            // KV_TRUNCATE — discard a rejected speculative tail. Keep [0, n_keep),
++            // remove [n_keep, end) for seq 0. The only KV-rewind primitive (decode
++            // otherwise only ever appends). No model forward.
++            if (payload_bytes != sizeof(uint32_t)) { send_response(2, nullptr, 0); continue; }
++            uint32_t n_keep;
++            std::memcpy(&n_keep, payload.data(), 4);
++            llama_memory_seq_rm(llama_get_memory(ctx), 0, (llama_pos)n_keep, -1);
++            send_response(0, nullptr, 0);
++            continue;
++        }
++
++        if (cmd == 3) {
++            // INFO
++            int32_t info[6];
++            info[0] = 0;          // n_layer_start  — not directly accessible from public API
++            info[1] = n_layer;    // n_layer_end    — same
++            info[2] = n_embd;
++            info[3] = 1;          // has_token_embd — assume true; client validates via cluster yaml
++            info[4] = 1;          // has_lm_head    — same
++            info[5] = n_vocab;
++            send_response(0, info, sizeof(info));
++            continue;
++        }
++
++        int rc = -1;
++        // Streaming KV reuse: skip the clear when caller asserts keep_kv.
++        // First step in a session always sends keep_kv=false (cold prefill);
++        // subsequent steps send keep_kv=true with start_pos = prefix_length
++        // so the new tokens append to the existing KV cache.
++        if (!keep_kv) {
++            llama_memory_clear(llama_get_memory(ctx), true);
++        }
++
++        uint64_t t_decode_start = 0, t_decode_done = 0;
++        if (cmd == 1) {
++            // TOKEN_DECODE — use llama_batch_init so we can set explicit
++            // positions (start_pos + i) instead of relying on the auto-zeroed
++            // positions of llama_batch_get_one.
++            if (payload_bytes != n_tokens * sizeof(int32_t)) {
++                send_response(2, nullptr, 0); continue;
++            }
++            const int32_t* tok = (const int32_t*) payload.data();
++            llama_batch batch = llama_batch_init(n_tokens, 0, 1);
++            batch.n_tokens = n_tokens;
++            for (uint32_t i = 0; i < n_tokens; ++i) {
++                batch.token[i] = (llama_token) tok[i];
++                batch.pos[i] = (int32_t)(start_pos + i);
++                batch.n_seq_id[i] = 1;
++                batch.seq_id[i][0] = 0;
++                batch.logits[i] = (all_logits || i == n_tokens - 1) ? 1 : 0;
++            }
++            if (timing_on) t_decode_start = now_ns();
++            rc = llama_decode(ctx, batch);
++            if (timing_on) t_decode_done = now_ns();
++            llama_batch_free(batch);
++        } else if (cmd == 2) {
++            // EMBD_DECODE
++            if (payload_bytes != n_tokens * (uint32_t)n_embd * sizeof(float)) {
++                send_response(2, nullptr, 0); continue;
++            }
++            llama_batch batch = llama_batch_init(n_tokens, n_embd, 1);
++            batch.n_tokens = n_tokens;
++            memcpy(batch.embd, payload.data(), payload_bytes);
++            for (uint32_t i = 0; i < n_tokens; ++i) {
++                batch.pos[i] = (int32_t)(start_pos + i);
++                batch.n_seq_id[i] = 1;
++                batch.seq_id[i][0] = 0;
++                batch.logits[i] = (all_logits || i == n_tokens - 1) ? 1 : 0;
++            }
++            if (timing_on) t_decode_start = now_ns();
++            rc = llama_decode(ctx, batch);
++            if (timing_on) t_decode_done = now_ns();
++            llama_batch_free(batch);
++        } else {
++            send_response(2, nullptr, 0);
++            continue;
++        }
++
++        if (rc != 0) {
++            send_response(1, nullptr, 0);
++            continue;
++        }
++
++        // Caller specified mode at startup; respect it.
++        // Response payload: first 4 bytes = result_type (0=hidden, 1=token).
++        // C.1 timing — split post_send into get_embeddings + memcpy +
++        // shm-write to identify which dominates on GPU mode.
++        // D.1 hypothesis test — force a llama_synchronize BEFORE
++        // get_embeddings so the timing splits "GPU pipeline wait"
++        // from "DMA + host alloc". Enabled by env NAKSHATRA_FABRIC_
++        // PROBE_SYNC=1; off by default so production decodes are
++        // unchanged.
++        static const bool probe_sync_enabled = []() {
++            const char* v = getenv("NAKSHATRA_FABRIC_PROBE_SYNC");
++            return v && (v[0] == '1' || v[0] == 't' || v[0] == 'T');
++        }();
++        uint64_t t_sync_start = 0, t_sync_done = 0;
++        if (probe_sync_enabled) {
++            t_sync_start = now_ns();
++            llama_synchronize(ctx);
++            t_sync_done = now_ns();
++        }
++        uint64_t t_get_embd_start = timing_on ? now_ns() : 0;
++        uint64_t t_get_embd_done = 0, t_memcpy_done = 0;
++        if (mode_last && all_logits) {
++            // Speculative verify: greedy argmax at EVERY position → top_token[n_tokens].
++            // Position p's logits are valid because all_logits set batch.logits[p]=1.
++            std::vector<uint8_t> out(4 + (size_t)n_tokens * sizeof(int32_t));
++            *(uint32_t*)out.data() = 2;     // result_type = tokens[]
++            int32_t* toks = (int32_t*)(out.data() + 4);
++            bool ok = true;
++            for (uint32_t p = 0; p < n_tokens; ++p) {
++                float* logits = llama_get_logits_ith(ctx, (int32_t)p);
++                if (!logits) { ok = false; break; }
++                int top = 0; float top_v = logits[0];
++                for (int i = 1; i < n_vocab; ++i) if (logits[i] > top_v) { top_v = logits[i]; top = i; }
++                toks[p] = top;
++            }
++            if (!ok) { send_response(1, nullptr, 0); continue; }
++            send_response(0, out.data(), (uint32_t)out.size());
++        } else if (mode_last) {
++            float* logits = llama_get_logits_ith(ctx, -1);
++            if (!logits) { send_response(1, nullptr, 0); continue; }
++            int top = 0; float top_v = logits[0];
++            for (int i = 1; i < n_vocab; ++i) if (logits[i] > top_v) { top_v = logits[i]; top = i; }
++            uint8_t buf[8];
++            *(uint32_t*)(buf + 0) = 1;      // result_type = token
++            *(int32_t *)(buf + 4) = top;
++            send_response(0, buf, 8);
++        } else {
++            // first/middle: return hidden state
++            float* hidden = llama_get_embeddings(ctx);
++            if (timing_on) t_get_embd_done = now_ns();
++            if (!hidden) { send_response(1, nullptr, 0); continue; }
++            size_t hbytes = (size_t)n_tokens * (size_t)n_embd * sizeof(float);
++            std::vector<uint8_t> out(4 + hbytes);
++            *(uint32_t*)out.data() = 0;     // result_type = hidden
++            memcpy(out.data() + 4, hidden, hbytes);
++            if (timing_on) t_memcpy_done = now_ns();
++            send_response(0, out.data(), (uint32_t)out.size());
++        }
++        if (timing_on) {
++            uint64_t t_send_done = now_ns();
++            // recv_wait: time blocked in read_message_blocking
++            //            (request poll latency)
++            // pre_decode: time after request arrived, before
++            //             llama_decode entry (batch setup, KV clear)
++            // decode:     time inside llama_decode
++            // post_decode_send: time after decode, including
++            //                   response packing + shm write
++            uint64_t recv_wait_ns        = t_recv_done - t_recv_start;
++            uint64_t pre_decode_ns       = t_decode_start - t_recv_done;
++            uint64_t decode_ns           = t_decode_done - t_decode_start;
++            uint64_t post_decode_send_ns = t_send_done - t_decode_done;
++            uint64_t total_ns            = t_send_done - t_recv_start;
++            // Sub-timings for the post-decode phase. Only populated
++            // on mode != last (hidden-state return path); zero on
++            // mode_last (which goes through the logits→token path).
++            uint64_t get_embd_ns = (t_get_embd_done && t_get_embd_start)
++                                    ? t_get_embd_done - t_get_embd_start : 0;
++            uint64_t memcpy_ns   = (t_memcpy_done && t_get_embd_done)
++                                    ? t_memcpy_done - t_get_embd_done : 0;
++            uint64_t shm_send_ns = (t_send_done && t_memcpy_done)
++                                    ? t_send_done - t_memcpy_done : 0;
++            uint64_t sync_ns = (t_sync_done && t_sync_start)
++                                ? t_sync_done - t_sync_start : 0;
++            fprintf(stderr,
++                    "[timing] cmd=%u n=%u total=%.3fms "
++                    "recv_wait=%.3fms pre_decode=%.3fms "
++                    "decode=%.3fms post_send=%.3fms "
++                    "[sync=%.3fms get_embd=%.3fms memcpy=%.3fms "
++                    "shm_send=%.3fms]\n",
++                    cmd, n_tokens,
++                    total_ns / 1e6,
++                    recv_wait_ns / 1e6,
++                    pre_decode_ns / 1e6,
++                    decode_ns / 1e6,
++                    post_decode_send_ns / 1e6,
++                    sync_ns / 1e6,
++                    get_embd_ns / 1e6,
++                    memcpy_ns / 1e6,
++                    shm_send_ns / 1e6);
++        }
++    }
++
++    fprintf(stderr, "[daemon] eof, shutting down\n");
++    if (g_shm_req)  { delete g_shm_req;  g_shm_req  = nullptr; }
++    if (g_shm_resp) { delete g_shm_resp; g_shm_resp = nullptr; }
++    llama_free(ctx);
++    llama_model_free(model);
++    llama_backend_free();
++    return 0;
++}
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index c8ecb0a2..93e33459 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2165,6 +2165,21 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
+     cb(inp->embd, "inp_embd", -1);
+     ggml_set_input(inp->embd);
+ 
++    if (tok_embd == nullptr) {
++        ggml_tensor * cur = inp->embd;
++        if (n_embd_inp != n_embd) {
++            cur = ggml_view_2d(ctx0, cur, n_embd, n_tokens, cur->nb[1], 0);
++        }
++        res->t_inp_embd = cur;
++        if (hparams.f_embedding_scale != 0.0f) {
++            cur = ggml_scale(ctx0, cur, hparams.f_embedding_scale);
++        }
++        cb(cur, "embd", -1);
++        res->add_input(std::move(inp));
++        ggml_build_forward_expand(gf, cur);
++        return cur;
++    }
++
+     // select one of the 2 inputs, based on the batch contents
+     // ref: https://github.com/ggml-org/llama.cpp/pull/18550
+     std::array<ggml_tensor *, 2> inps;
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 28f8bb79..d58306c7 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -427,6 +427,8 @@ namespace GGUFMeta {
+     template bool llama_model_loader::get_key<float>      (enum llm_kv kid, float & result,       bool required);
+     template bool llama_model_loader::get_key<uint32_t>   (enum llm_kv kid, uint32_t & result,    bool required);
+     template bool llama_model_loader::get_key<std::string>(enum llm_kv kid, std::string & result, bool required);
++    template bool llama_model_loader::get_key<bool>    (const std::string & key, bool & result,     bool required);
++    template bool llama_model_loader::get_key<uint32_t>(const std::string & key, uint32_t & result, bool required);
+ 
+     template<>
+     bool llama_model_loader::get_key(enum llm_kv kid, enum llama_pooling_type & result, bool required) {
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index d8748138..118a42e7 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1227,6 +1227,28 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
+ }
+ 
+ bool llama_model_base::load_tensors(llama_model_loader & ml) {
++    {
++        uint32_t nks_start_u = 0, nks_end_u = (uint32_t) hparams.n_layer();
++        bool found =
++            ml.get_key(std::string("nakshatra.layer_range_start"), nks_start_u, false)
++         && ml.get_key(std::string("nakshatra.layer_range_end"),   nks_end_u,   false);
++        if (found) {
++            this->nks_partial        = true;
++            this->nks_layer_start    = (int) nks_start_u;
++            this->nks_layer_end      = (int) nks_end_u;
++            this->nks_has_token_embd = (this->nks_layer_start == 0);
++            this->nks_has_lm_head    = (this->nks_layer_end   >= (int) hparams.n_layer());
++            ml.get_key(std::string("nakshatra.has_token_embd"), this->nks_has_token_embd, false);
++            ml.get_key(std::string("nakshatra.has_lm_head"),    this->nks_has_lm_head,    false);
++            LLAMA_LOG_INFO("%s: nakshatra partial-load: layers [%d, %d) of %d, embd=%d lm_head=%d\n",
++                           __func__, this->nks_layer_start, this->nks_layer_end,
++                           (int) hparams.n_layer(),
++                           (int) this->nks_has_token_embd,
++                           (int) this->nks_has_lm_head);
++        } else {
++            this->nks_layer_end = (int) hparams.n_layer();
++        }
++    }
+     const auto & split_mode   = params.split_mode;
+     const auto & use_mlock    = params.use_mlock;
+     const auto & tensor_split = params.tensor_split;
+diff --git a/src/llama-model.h b/src/llama-model.h
+index 45b054ce..716e073f 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -604,6 +604,14 @@ struct llama_model {
+ 
+     std::vector<llama_layer> layers;
+ 
++    // ===== NAKSHATRA M4: partial-load layout =====
++    int  nks_layer_start    = 0;
++    int  nks_layer_end      = 0;
++    bool nks_has_token_embd = true;
++    bool nks_has_lm_head    = true;
++    bool nks_partial        = false;
++    // =============================================
++
+     //Dense linear projections for SentenceTransformers models like embeddinggemma
+     // For Sentence Transformers models structure see
+     // https://sbert.net/docs/sentence_transformer/usage/custom_models.html#structure-of-sentence-transformer-models
+diff --git a/src/models/llama.cpp b/src/models/llama.cpp
+index 4bfebc88..13b94c0e 100644
+--- a/src/models/llama.cpp
++++ b/src/models/llama.cpp
+@@ -34,18 +34,31 @@ void llama_model_llama::load_arch_hparams(llama_model_loader & ml) {
+ void llama_model_llama::load_arch_tensors(llama_model_loader &) {
+     LLAMA_LOAD_LOCALS;
+ 
+-    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
++    // nakshatra partial-load: this slice carries only [nks_start,nks_end) +
++    // token_embd (first worker) / output* (last worker).
++    const int nks_start = this->nks_layer_start;
++    const int nks_end   = this->nks_layer_end > 0 ? this->nks_layer_end : n_layer;
++    const bool nks_has_embd = this->nks_has_token_embd;
++    const bool nks_has_lm   = this->nks_has_lm_head;
++
++    if (nks_has_embd) {
++        tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
++    }
+ 
+-    // output
+-    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
+-    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
++    // output (last worker only)
++    if (nks_has_lm) {
++        output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
++        output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
+ 
+-    // if output is NULL, init from the input tok embed
+-    if (output == NULL) {
+-        output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_DUPLICATED);
++        // if output is NULL, init from the input tok embed (tied)
++        if (output == NULL) {
++            output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab},
++                                   nks_has_embd ? TENSOR_DUPLICATED : 0);
++        }
+     }
+ 
+     for (int i = 0; i < n_layer; ++i) {
++        if (i < nks_start || i >= nks_end) continue;
+         auto & layer = layers[i];
+ 
+         layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
+@@ -121,9 +134,14 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
+ 
+     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f/sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
+ 
+-    ggml_tensor * inp_out_ids = build_inp_out_ids();
++    ggml_tensor * inp_out_ids = model.nks_has_lm_head ? build_inp_out_ids() : nullptr;
++
++    // ===== NAKSHATRA M4 step 3: iterate only this worker's layer range =====
++    const int nks_il_start = model.nks_layer_start;
++    const int nks_il_end   = model.nks_layer_end > 0 ? model.nks_layer_end : n_layer;
++    // ========================================================================
+ 
+-    for (int il = 0; il < n_layer; ++il) {
++    for (int il = nks_il_start; il < nks_il_end; ++il) {
+         res->t_layer_inp[il] = inpL;
+ 
+         ggml_tensor * inpSA = inpL;
+@@ -171,7 +189,7 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
+                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+             cb(cur, "attn_out", il);
+         }
+-        if (il == n_layer - 1 && inp_out_ids) {
++        if (il == nks_il_end - 1 && inp_out_ids && model.nks_has_lm_head) {
+             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
+             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
+         }
+@@ -228,19 +246,29 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
+     }
+     cur = inpL;
+ 
+-    cur = build_norm(cur,
+-            model.output_norm, NULL,
+-            LLM_NORM_RMS, -1);
++    if (model.nks_has_lm_head) {
++        cur = build_norm(cur,
++                model.output_norm, NULL,
++                LLM_NORM_RMS, -1);
+ 
+-    cb(cur, "result_norm", -1);
+-    res->t_embd = cur;
++        cb(cur, "result_norm", -1);
++        res->t_embd = cur;
+ 
+-    if constexpr (!embed) {
+-        // lm_head
+-        cur = build_lora_mm(model.output, cur, model.output_s);
++        if constexpr (!embed) {
++            // lm_head
++            cur = build_lora_mm(model.output, cur, model.output_s);
+ 
+-        cb(cur, "result_output", -1);
+-        res->t_logits = cur;
++            cb(cur, "result_output", -1);
++            res->t_logits = cur;
++        }
++    } else {
++        // ===== NAKSHATRA M4 step 3: middle/first worker — no norm, no lm_head.
++        // Terminal tensor is the residual stream output of the last layer in
++        // this worker's range; downstream worker will receive it as its
++        // input hidden state via ubatch.embd.
++        cb(cur, "result_partial_hidden", -1);
++        res->t_embd = cur;
++        // ===========================================================================
+     }
+ 
+     ggml_build_forward_expand(gf, cur);
+diff --git a/src/models/qwen3.cpp b/src/models/qwen3.cpp
+index f4b2a2ae..5432681d 100644
+--- a/src/models/qwen3.cpp
++++ b/src/models/qwen3.cpp
+@@ -15,20 +15,33 @@ void llama_model_qwen3::load_arch_hparams(llama_model_loader & ml) {
+ void llama_model_qwen3::load_arch_tensors(llama_model_loader &) {
+     LLAMA_LOAD_LOCALS;
+ 
+-    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
+-
+-    // output
+-    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
+-    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
+-    // if output is NULL, init from the input tok embed
+-    if (output == NULL) {
+-        output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_DUPLICATED);
++    // nakshatra partial-load: this slice carries only [nks_start,nks_end) +
++    // token_embd (first worker) / output* (last worker).
++    const int nks_start = this->nks_layer_start;
++    const int nks_end   = this->nks_layer_end > 0 ? this->nks_layer_end : n_layer;
++    const bool nks_has_embd = this->nks_has_token_embd;
++    const bool nks_has_lm   = this->nks_has_lm_head;
++
++    if (nks_has_embd) {
++        tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
+     }
+ 
+-    // output rerank head
+-    cls_out = create_tensor(tn(LLM_TENSOR_CLS_OUT, "weight"), {n_embd, hparams.n_cls_out}, TENSOR_NOT_REQUIRED);
++    // output (last worker only)
++    if (nks_has_lm) {
++        output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
++        output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
++        // if output is NULL, init from the input tok embed (tied)
++        if (output == NULL) {
++            output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab},
++                                   nks_has_embd ? TENSOR_DUPLICATED : 0);
++        }
++
++        // output rerank head
++        cls_out = create_tensor(tn(LLM_TENSOR_CLS_OUT, "weight"), {n_embd, hparams.n_cls_out}, TENSOR_NOT_REQUIRED);
++    }
+ 
+     for (int i = 0; i < n_layer; ++i) {
++        if (i < nks_start || i >= nks_end) continue;
+         auto & layer = layers[i];
+ 
+         layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
+@@ -66,9 +79,13 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
+ 
+     auto * inp_attn = build_attn_inp_kv();
+ 
+-    ggml_tensor * inp_out_ids = build_inp_out_ids();
++    ggml_tensor * inp_out_ids = model.nks_has_lm_head ? build_inp_out_ids() : nullptr;
+ 
+-    for (int il = 0; il < n_layer; ++il) {
++    // NAKSHATRA partial-forward: build only this worker's layer range (mirrors qwen3moe).
++    const int nks_il_start = model.nks_layer_start;
++    const int nks_il_end   = model.nks_layer_end > 0 ? model.nks_layer_end : n_layer;
++
++    for (int il = nks_il_start; il < nks_il_end; ++il) {
+         res->t_layer_inp[il] = inpL;
+ 
+         ggml_tensor * inpSA = inpL;
+@@ -111,7 +128,7 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
+                     model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
+                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
+         }
+-        if (il == n_layer - 1 && inp_out_ids) {
++        if (il == nks_il_end - 1 && inp_out_ids && model.nks_has_lm_head) {
+             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
+             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
+         }
+@@ -142,18 +159,25 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
+     }
+     cur = inpL;
+ 
+-    cur = build_norm(cur,
+-            model.output_norm, NULL,
+-            LLM_NORM_RMS, -1);
++    if (model.nks_has_lm_head) {
++        cur = build_norm(cur,
++                model.output_norm, NULL,
++                LLM_NORM_RMS, -1);
+ 
+-    cb(cur, "result_norm", -1);
+-    res->t_embd = cur;
++        cb(cur, "result_norm", -1);
++        res->t_embd = cur;
+ 
+-    // lm_head
+-    cur = build_lora_mm(model.output, cur, model.output_s);
++        // lm_head
++        cur = build_lora_mm(model.output, cur, model.output_s);
+ 
+-    cb(cur, "result_output", -1);
+-    res->t_logits = cur;
++        cb(cur, "result_output", -1);
++        res->t_logits = cur;
++    } else {
++        // NAKSHATRA partial-forward: first/middle worker — emit the last in-range layer's
++        // residual hidden state; the next worker takes it as input.
++        cb(cur, "result_partial_hidden", -1);
++        res->t_embd = cur;
++    }
+ 
+     ggml_build_forward_expand(gf, cur);
+ }
+diff --git a/src/models/qwen3moe.cpp b/src/models/qwen3moe.cpp
+index 6f6df539..3125ed18 100644
+--- a/src/models/qwen3moe.cpp
++++ b/src/models/qwen3moe.cpp
+@@ -14,17 +14,30 @@ void llama_model_qwen3moe::load_arch_hparams(llama_model_loader & ml) {
+ void llama_model_qwen3moe::load_arch_tensors(llama_model_loader &) {
+     LLAMA_LOAD_LOCALS;
+ 
+-    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
+-
+-    // output
+-    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
+-    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
+-    // if output is NULL, init from the input tok embed
+-    if (output == NULL) {
+-        output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_DUPLICATED);
++    // nakshatra partial-load: this slice carries only [nks_start,nks_end) +
++    // token_embd (first worker) / output* (last worker).
++    const int nks_start = this->nks_layer_start;
++    const int nks_end   = this->nks_layer_end > 0 ? this->nks_layer_end : n_layer;
++    const bool nks_has_embd = this->nks_has_token_embd;
++    const bool nks_has_lm   = this->nks_has_lm_head;
++
++    if (nks_has_embd) {
++        tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
++    }
++
++    // output (last worker only)
++    if (nks_has_lm) {
++        output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
++        output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
++        // if output is NULL, init from the input tok embed (tied)
++        if (output == NULL) {
++            output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab},
++                                   nks_has_embd ? TENSOR_DUPLICATED : 0);
++        }
+     }
+ 
+     for (int i = 0; i < n_layer; ++i) {
++        if (i < nks_start || i >= nks_end) continue;
+         auto & layer = layers[i];
+ 
+         layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
+@@ -75,9 +88,15 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
+ 
+     auto * inp_attn = build_attn_inp_kv();
+ 
+-    ggml_tensor * inp_out_ids = build_inp_out_ids();
++    ggml_tensor * inp_out_ids = model.nks_has_lm_head ? build_inp_out_ids() : nullptr;
+ 
+-    for (int il = 0; il < n_layer; ++il) {
++    // NAKSHATRA partial-forward: build the graph for ONLY this worker's layer range
++    // (mirrors the patched llama graph). build_inp_embd already yields a hidden-state
++    // input for non-first workers (model.tok_embd is null there).
++    const int nks_il_start = model.nks_layer_start;
++    const int nks_il_end   = model.nks_layer_end > 0 ? model.nks_layer_end : n_layer;
++
++    for (int il = nks_il_start; il < nks_il_end; ++il) {
+         res->t_layer_inp[il] = inpL;
+ 
+         ggml_tensor * inpSA = inpL;
+@@ -120,7 +139,7 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
+                     model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
+                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
+         }
+-        if (il == n_layer - 1 && inp_out_ids) {
++        if (il == nks_il_end - 1 && inp_out_ids && model.nks_has_lm_head) {
+             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
+             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
+         }
+@@ -162,18 +181,25 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
+     }
+     cur = inpL;
+ 
+-    cur = build_norm(cur,
+-            model.output_norm, NULL,
+-            LLM_NORM_RMS, -1);
++    if (model.nks_has_lm_head) {
++        cur = build_norm(cur,
++                model.output_norm, NULL,
++                LLM_NORM_RMS, -1);
+ 
+-    cb(cur, "result_norm", -1);
+-    res->t_embd = cur;
++        cb(cur, "result_norm", -1);
++        res->t_embd = cur;
+ 
+-    // lm_head
+-    cur = build_lora_mm(model.output, cur, model.output_s);
++        // lm_head
++        cur = build_lora_mm(model.output, cur, model.output_s);
+ 
+-    cb(cur, "result_output", -1);
+-    res->t_logits = cur;
++        cb(cur, "result_output", -1);
++        res->t_logits = cur;
++    } else {
++        // NAKSHATRA partial-forward: first/middle worker — no final norm, no lm_head. Emit the
++        // last in-range layer's residual hidden state; the next worker takes it as input (ubatch.embd).
++        cb(cur, "result_partial_hidden", -1);
++        res->t_embd = cur;
++    }
+ 
+     ggml_build_forward_expand(gf, cur);
+ }
+-- 
+2.43.0
+

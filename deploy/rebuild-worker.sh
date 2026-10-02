@@ -12,6 +12,15 @@
 # Usage:   bash rebuild-worker.sh                  # hub ROCm build (~/llama.cpp/build)
 #          BUILD=~/llama.cpp/build-cuda bash rebuild-worker.sh   # ijru CUDA build
 set -euo pipefail
+# ⛔ RETIRED 2026-10-03 (unification U6c). This copied experiments/v0.0/worker_daemon.cpp OVER the engine —
+# but that "canonical" file is STALE (June; no `solo` mode), the live engine is newer (Sep 12). Running it
+# would have silently removed solo mode. The engine's one source of truth is now engine/ (verified patch
+# series); build it with deploy/provision-worker.sh. Set I_KNOW_THIS_REGRESSES=1 only to reproduce history.
+if [ "${I_KNOW_THIS_REGRESSES:-}" != "1" ]; then
+  echo "rebuild-worker.sh is retired: it would overwrite the engine with a stale daemon (no solo mode)." >&2
+  echo "Use: engine/source.sh DEST  (verified source)  then  deploy/provision-worker.sh  (build for this GPU)." >&2
+  exit 2
+fi
 LLAMA="${LLAMA:-$HOME/llama.cpp}"
 BUILD="${BUILD:-$LLAMA/build}"
 SRC="${SRC:-$HOME/nakshatra/experiments/v0.0}"

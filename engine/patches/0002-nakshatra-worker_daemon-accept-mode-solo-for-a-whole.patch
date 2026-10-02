@@ -1,0 +1,65 @@
+From aa447a7929190ca97edee802c6e7ebe9685bbda9 Mon Sep 17 00:00:00 2001
+From: Bishwanath Bastola <bishwa.bastola123@gmail.com>
+Date: Sat, 12 Sep 2026 03:13:24 -0600
+Subject: [PATCH 2/2] nakshatra worker_daemon: accept mode "solo" for a
+ whole-model worker
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Companion to the nakshatra repo's worker.py fix (same day): NKS_SMART_PLACEMENT
+started producing route-whole chains for the first time today (after fixing
+two identity bugs that had kept it dead since 2026-07-14), and placement.py's
+route-whole planner emits mode="solo" for the single worker holding the whole
+model. This daemon rejected it outright: "[daemon] bad mode 'solo' (expected
+first|middle|last)" — exit 1 before ever loading the model or opening a port.
+
+mode_last is the only one of the three parsed mode flags actually read
+anywhere past the validation block (mode_first is checked once and never
+again; has_token_embd/has_lm_head a few lines down are hardcoded true
+regardless of mode, per their own comment — "client validates via cluster
+yaml"). So solo only needs to also satisfy mode_last (drives the final-logits
+output path) — set both mode_last and mode_first true for "solo" for
+correctness/future-proofing even though only the former currently matters.
+Purely additive: existing first/middle/last behavior is untouched.
+
+Rebuilt llama-nakshatra-worker + llama-nakshatra-worker-fabric (same source).
+Verified standalone before touching the live binary: loads the real
+32-layer whole-model slice, prints "[daemon] ready", clean shutdown. Previous
+binary backed up as llama-nakshatra-worker.pre-solo-mode.bak.
+
+Claude-Session: https://claude.ai/code/session_019iS9L5sCYHFtg16AbMyFem
+---
+ examples/nakshatra-spike/worker_daemon.cpp | 14 +++++++++++---
+ 1 file changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/examples/nakshatra-spike/worker_daemon.cpp b/examples/nakshatra-spike/worker_daemon.cpp
+index 69874dcb..2c7eac89 100644
+--- a/examples/nakshatra-spike/worker_daemon.cpp
++++ b/examples/nakshatra-spike/worker_daemon.cpp
+@@ -297,11 +297,19 @@ int main(int argc, char ** argv) {
+     }
+     std::string sub_gguf = argv[1];
+     std::string mode_str = argv[2];
+-    bool mode_last  = (mode_str == "last");
+-    bool mode_first = (mode_str == "first");
++    // 2026-09-12 (placement lane): "solo" — a whole-model worker holding EVERY layer, emitted by
++    // placement.py's route-whole planner (assignment_from_plan: mode="solo" when n==1). Runs the
++    // SAME final-logits path as "last" (mode_last is the only one of these three flags actually
++    // read anywhere below this block — mode_first is checked here and never again; has_token_embd
++    // /has_lm_head above are hardcoded true regardless of mode). Never accepted before today:
++    // NKS_SMART_PLACEMENT never produced a route-whole chain end to end until 2026-09-12, so this
++    // value was never exercised — first symptom was worker.py's OWN argparse (choices=[...])
++    // rejecting it before the daemon was ever reached; fixed there too, same day.
++    bool mode_last  = (mode_str == "last" || mode_str == "solo");
++    bool mode_first = (mode_str == "first" || mode_str == "solo");
+     bool mode_mid   = (mode_str == "middle");
+     if (!mode_last && !mode_first && !mode_mid) {
+-        fprintf(stderr, "[daemon] bad mode '%s' (expected first|middle|last)\n", mode_str.c_str());
++        fprintf(stderr, "[daemon] bad mode '%s' (expected first|middle|last|solo)\n", mode_str.c_str());
+         return 1;
+     }
+     int n_ctx        = argc > 3 ? atoi(argv[3]) : 256;
+-- 
+2.43.0
+
