@@ -51,7 +51,7 @@ from network.store import Store  # noqa: E402
 from network import tasks as T  # noqa: E402
 from network.settle import SettlementError  # noqa: E402
 import accounting as _accounting  # noqa: E402
-from transport.connect import open_channel  # noqa: E402
+from transport.connect import accept_direct, local_endpoints, open_channel, open_direct  # noqa: E402
 from transport.secure_channel import SecureChannelError  # noqa: E402
 
 try:
@@ -67,6 +67,7 @@ MSG_DOMAIN = "nak-msg-v1"
 MAX_FRAME = 1 << 20
 MAX_TEXT = 8000
 SWEEP_S = 30.0          # how often expired tasks are swept (refund + notify)
+DIRECT_WAIT_S = 8.0     # the non-dialing side waits this long for a direct call before using the relay
 WAIT_S = 100.0          # under the relay's 120 s waiting TTL, so we re-register before it reaps us
 PING_S = 30.0
 IDLE_S = 95.0           # no frame (not even a ping) for this long = the peer is gone
@@ -165,7 +166,7 @@ class SignerClient:
 class Node:
     def __init__(self, state_dir: Path, node_key: bytes, signer: Callable[[dict], dict], *,
                  agent: str, relay: tuple = DEFAULT_RELAY, log: Callable[[str], None] = lambda m: None,
-                 settlement=None):
+                 settlement=None, direct_port: Optional[int] = None):
         self.store = Store(state_dir)
         # Adapter #0 (local ledger, TEST units) unless a real one is passed; see network/settle.py.
         # THE accounting front door (accounting.py, U5) picks the escrow backend; tests may pass one.
@@ -185,6 +186,9 @@ class Node:
             raise RuntimeError(f"the signer has no delegation for agent {agent!r}")
         self.person = who["person"]
         self.custody = who.get("custody", "")
+        self.direct_port = direct_port        # U3b: listen for direct connections (opt-in, per node)
+        self._paths: dict[str, str] = {}      # contact person -> "direct" | "relay" for the live session
+        self._listener = None
         self._stop = threading.Event()
         self._threads: dict[str, threading.Thread] = {}       # key -> worker thread
         self._sessions: dict[str, tuple] = {}                 # contact person -> (channel, send lock)
@@ -198,10 +202,17 @@ class Node:
         for c in self.store.contacts():
             self._ensure_session(c["person"])
         self._spawn("sweeper", self._sweep_loop)
+        if self.direct_port:
+            self._spawn("direct-listener", self._listen_loop)
         return self
 
     def stop(self) -> None:
         self._stop.set()
+        if self._listener is not None:
+            try:
+                self._listener.close()
+            except OSError:
+                pass
         for ev in list(self._wake.values()):
             ev.set()
         with self._lock:
@@ -410,26 +421,58 @@ class Node:
             c = self.store.contact(person)
             if not c:
                 return
-            role = pair_role(self.node, c["node"], MSG_DOMAIN)
-            try:
-                sock, ch = self._dial(role.rendezvous_id, self._key, c["node"], role.is_initiator,
-                                      MSG_DOMAIN.encode())
-            except (OSError, SecureChannelError):
-                attempt += 1
-                self._backoff(attempt)
+            if person in self._sessions:          # e.g. they reached us directly: one session per contact
+                self._stop.wait(1.0)
                 continue
-            self.log(f"session up with {c['petname'] or person[:12]}")
+            sock = ch = None
+            path = "relay"
+            role0 = pair_role(self.node, c["node"], MSG_DOMAIN)
+            if c.get("direct") and c.get("direct_hint") and not role0.is_initiator:
+                # Exactly ONE side dials direct (the pairing initiator, as on the relay); the other waits
+                # briefly for that call before falling back, so the two never cross and refuse each other.
+                end = time.time() + DIRECT_WAIT_S
+                while time.time() < end and person not in self._sessions and not self._stop.is_set():
+                    self._stop.wait(0.2)
+                if person in self._sessions:
+                    continue
+            if c.get("direct") and c.get("direct_hint") and role0.is_initiator:
+                try:
+                    sock, ch = open_direct(c["direct_hint"], my_key=self._key, peer_pub_hex=c["node"],
+                                           purpose=MSG_DOMAIN.encode())
+                    path = "direct"
+                except (OSError, SecureChannelError) as e:
+                    self.log(f"direct to {c['petname'] or person[:12]} failed ({e}); using the relay")
+            if ch is None:
+                role = pair_role(self.node, c["node"], MSG_DOMAIN)
+                try:
+                    sock, ch = self._dial(role.rendezvous_id, self._key, c["node"], role.is_initiator,
+                                          MSG_DOMAIN.encode())
+                except (OSError, SecureChannelError):
+                    attempt += 1
+                    self._backoff(attempt)
+                    continue
+            self.log(f"session up with {c['petname'] or person[:12]} ({path})")
             started = time.time()
-            self._run_session(person, sock, ch)
+            self._run_session(person, sock, ch, path=path)
             # A session that drops at once is a failure, not a success: keep backing off unless it
             # actually lasted (a peer that accepts and hangs up must not drive a tight loop).
             attempt = 0 if time.time() - started > 60 else attempt + 1
             self._backoff(attempt)
 
-    def _run_session(self, person: str, sock, ch) -> None:
+    def _run_session(self, person: str, sock, ch, path: str = "relay") -> None:
         lock = threading.Lock()
         with self._lock:
+            if person in self._sessions:          # lost a race with another path: keep the first
+                _hard_close(ch)
+                return
             self._sessions[person] = (ch, lock)
+            self._paths[person] = path
+        c0 = self.store.contact(person) or {}
+        if c0.get("direct") and self.direct_port:
+            try:                                  # our direct addresses, ONLY to a contact we opted in for
+                send_frame(ch, {"t": "addr", "endpoints": local_endpoints(self.direct_port)}, lock)
+            except (OSError, SecureChannelError):
+                pass
         wake = self._wake.setdefault(person, threading.Event())
         down = threading.Event()
         sock.settimeout(IDLE_S)
@@ -445,6 +488,14 @@ class Node:
                         send_frame(ch, self._receive(person, frame), lock)
                     elif t == "ack":
                         self.store.ack(str(frame.get("mid", "")), person)
+                    elif t == "addr?":  # they ask for our endpoints; answer only if we opted them in
+                        cc = self.store.contact(person) or {}
+                        if cc.get("direct") and self.direct_port:
+                            send_frame(ch, {"t": "addr", "endpoints": local_endpoints(self.direct_port)}, lock)
+                    elif t == "addr":   # their direct endpoints; kept only if WE opted this contact in
+                        hint = frame.get("endpoints")
+                        if isinstance(hint, str) and len(hint) <= 1000:
+                            self.store.set_direct_hint(person, hint)
                     elif t == "nack":   # received and refused: terminal, stop retrying, keep why
                         self.store.refuse(str(frame.get("mid", "")), str(frame.get("why", "")), person)
                         self.log(f"{person[:12]} refused {str(frame.get('mid', ''))[:8]}: {frame.get('why')}")
@@ -483,6 +534,7 @@ class Node:
             with self._lock:
                 if self._sessions.get(person, (None,))[0] is ch:
                     del self._sessions[person]
+                    self._paths.pop(person, None)
             _hard_close(ch)
 
     def _receive(self, person: str, frame: dict) -> dict:
@@ -537,6 +589,68 @@ class Node:
                                 "from_person": person, "envelope": env, "body": body})
             self.store.add_inbox(mid, person, c["petname"], env.get("author", ""), str(body.get("aspect", ""))[:32], text)
         return {"t": "ack", "mid": mid}
+
+    # ── direct paths (U3b) ───────────────────────────────────────────────────────────────────
+    def set_direct(self, who: str, on: bool) -> dict:
+        """Opt a contact in/out of direct connections. On means: we tell THEM our LAN/IPv6 addresses
+        (inside the encrypted session) and accept their direct connections. It reveals where we are,
+        so it is per contact and off by default. A direct path is used only if BOTH sides opted in."""
+        c = self.store.resolve(who)
+        if not c or c["state"] != "active":
+            raise ValueError("direct paths are only for accepted contacts")
+        self.store.set_direct(c["person"], on)
+        with self._lock:
+            sess = self._sessions.get(c["person"])
+        if on and sess:
+            try:
+                if self.direct_port:
+                    send_frame(sess[0], {"t": "addr", "endpoints": local_endpoints(self.direct_port)}, sess[1])
+                # They may have sent theirs before we opted in (we dropped it): ask again. They answer
+                # only if they opted in for us too.
+                send_frame(sess[0], {"t": "addr?"}, sess[1])
+            except (OSError, SecureChannelError):
+                pass
+        return {"person": c["person"], "direct": bool(on), "listening": bool(self.direct_port)}
+
+    def _listen_loop(self) -> None:
+        srv = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            srv.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)   # one socket for v4 + v6
+        except OSError:
+            pass
+        srv.bind(("::", int(self.direct_port)))
+        srv.listen(16)
+        srv.settimeout(1.0)
+        self._listener = srv
+        self.log(f"accepting direct connections on port {self.direct_port}")
+        while not self._stop.is_set():
+            try:
+                conn, _ = srv.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            threading.Thread(target=self._direct_incoming, args=(conn,), daemon=True).start()
+
+    def _direct_incoming(self, conn) -> None:
+        by_node = {}
+
+        def allow(peer_node: str) -> bool:
+            for c in self.store.contacts():
+                if c["node"] == peer_node and c["state"] == "active" and c.get("direct") \
+                        and c["person"] not in self._sessions:
+                    by_node[peer_node] = c
+                    return True
+            return False
+        try:
+            peer, ch = accept_direct(conn, my_key=self._key, purpose=MSG_DOMAIN.encode(), allow=allow)
+        except (OSError, SecureChannelError, PermissionError) as e:
+            self.log(f"refused a direct connection: {e}")
+            return
+        c = by_node[peer]
+        self.log(f"session up with {c['petname'] or c['person'][:12]} (direct, incoming)")
+        self._run_session(c["person"], conn, ch, path="direct")
 
     # ── tasks ────────────────────────────────────────────────────────────────────────────────
     # Poster: post_task → (claim arrives) assign the first valid claimer → (result arrives) judge by
@@ -759,7 +873,9 @@ class Node:
             online = set(self._sessions)
         return {"person": self.person, "node": self.node, "custody": self.custody,
                 "relay": f"{self.relay[0]}:{self.relay[1]}",
-                "contacts": [dict(c, online=c["person"] in online) for c in self.store.contacts()],
+                "contacts": [dict(c, online=c["person"] in online, path=self._paths.get(c["person"], ""))
+                             for c in self.store.contacts()],
+                "direct_port": self.direct_port,
                 "pending_requests": len(self.store.requests()),
                 "open_invites": len(self.store.open_invites())}
 
@@ -785,7 +901,7 @@ def _hard_close(ch) -> None:
 # ── control socket (the CLI and, on Day 5, the MCP front door talk to this) ───────────────────
 
 OPS = {"status", "register_invite", "redeem", "requests", "accept", "decline", "contacts", "remove", "send",
-       "delivered", "inbox", "task_post", "tasks", "task_claim", "task_submit", "ledger"}
+       "delivered", "inbox", "task_post", "tasks", "task_claim", "task_submit", "ledger", "direct"}
 
 
 def handle(node: Node, req: dict) -> dict:
@@ -824,6 +940,8 @@ def handle(node: Node, req: dict) -> dict:
                 r["peer_name"] = (c or {}).get("petname", "")
                 r["name_source"] = (c or {}).get("name_src") or "self-chosen"
             return {"ok": True, "tasks": rows}
+        if op == "direct":
+            return {"ok": True, **node.set_direct(req["who"], bool(req.get("on")))}
         if op == "ledger":
             return {"ok": True, "adapter": node.settle.name, "journal": node.settle.journal(req.get("task") or None)}
         if op == "task_claim":
@@ -911,8 +1029,11 @@ def main(argv=None) -> int:
     deadline = time.time() + 60
     while True:
         try:
+            dp_file = a.state / "direct-port"                # opt-in: `nak direct-listen 51830`
+            direct_port = int(dp_file.read_text().strip()) if dp_file.exists() else None
             node = Node(a.state, _load_node_key(a.node_key), SignerClient(a.signer), agent=a.agent,
-                        relay=(host, int(port)), log=lambda m: print(f"[nakd] {m}", flush=True)).start()
+                        relay=(host, int(port)), log=lambda m: print(f"[nakd] {m}", flush=True),
+                        direct_port=direct_port).start()
             break
         except (OSError, RuntimeError) as e:
             if time.time() > deadline:

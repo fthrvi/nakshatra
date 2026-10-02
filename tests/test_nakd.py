@@ -41,7 +41,8 @@ def wait(pred, timeout=20.0):
 
 
 class Party:
-    def __init__(self, root: Path, name: str, relay_port: int, caps=("nak.msg",), constraints=None):
+    def __init__(self, root: Path, name: str, relay_port: int, caps=("nak.msg",), constraints=None,
+                 direct_port=None):
         self.dir = root / name
         self.node_key = ed25519.Ed25519PrivateKey.generate().private_bytes_raw()
         node_pub = ed25519.Ed25519PrivateKey.from_private_bytes(self.node_key).public_key().public_bytes_raw().hex()
@@ -56,7 +57,7 @@ class Party:
         (sdir / "agents" / "pa.grant.json").write_text(json.dumps(grant))
         self.signer = signer_mod.Signer(sdir, custody="test")
         self.node = nakd.Node(self.dir / "net", self.node_key, self.signer.handle, agent="pa",
-                              relay=("127.0.0.1", relay_port)).start()
+                              relay=("127.0.0.1", relay_port), direct_port=direct_port).start()
 
     def invite(self, ttl=600, note=""):
         code = joincode.encode_invite(self.person_priv, self.node.node,
@@ -75,6 +76,7 @@ def net(tmp_path):
         p = Party(tmp_path, name, port, **kw)
         parties.append(p)
         return p
+    make.relay = relay
     yield make
     for p in parties:
         p.node.stop()

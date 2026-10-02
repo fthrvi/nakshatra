@@ -38,7 +38,9 @@ Unification work in progress (U1–U6): `trisul/plans/2026-10-03-nakshatra-unifi
 | **Hole punching + relay fallback (libp2p DCUtR, circuit-relay-v2)** | `third_party/shard-libp2p-sidecar` | **LIVE**: VPS relay :29700 (+QUIC); blackwell exposes Ollama through it | VPS, blackwell |
 | Native UDP hole punch (HMAC-authenticated) | `mesh/direct_path.py` | BUILT, **not called** (proven 3.77× on WAN 2026-08-01) | — |
 | Relay / direct / IPv6 decision; NAT class | `pathchoice.py`, `ipv6.py`, `natclass.py`, `stunshape.py`, `mesh/path_probe.py` | BUILT, not called | — |
-| **Reach a peer** (relay + pinned handshake + purpose binding) | **`transport/connect.py` `open_channel`**: the ONE path. meshd, nakd and tunnel_endpoint all call it. Direct paths (direct_tunnel / direct_path / sidecar) plug in HERE (U3b). | LIVE | every node |
+| **Reach a peer** (relay + pinned handshake + purpose binding) | **`transport/connect.py`**: `open_channel` (relay), `open_direct` / `accept_direct` (direct TCP over LAN or IPv6, using `mesh/direct_tunnel` and its SSRF filter). meshd, nakd and tunnel_endpoint all use it. | LIVE | every node |
+| Direct connections between contacts (U3b) | nakd: opt-in per contact on BOTH sides (`nak direct <name> on`) and per node (`nak direct-listen 51830`). Addresses are swapped only inside the encrypted session. One dialer (the pairing initiator); the same pinned handshake with a direct-only binding; the relay is the fallback. | LIVE (0.9.0) | contacts who opt in |
+| UDP hole punch for both-NAT pairs | `mesh/direct_path.py` (needs a reliable stream on top) and the libp2p sidecar | BUILT / LIVE for Sutra only | → next |
 
 ## People and their agents (added 2026-10)
 | Job | Component | Status | Runs where |

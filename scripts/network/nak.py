@@ -92,6 +92,10 @@ def main(argv=None) -> int:
     p.add_argument("--aspect", default="")
     p = sub.add_parser("inbox"); p.add_argument("--limit", type=int, default=20)
     sub.add_parser("ledger", help="escrow journal: open / released / refunded")
+    p = sub.add_parser("direct", help="allow/stop direct connections with a contact (reveals your LAN/IPv6)")
+    p.add_argument("who"); p.add_argument("onoff", choices=["on", "off"])
+    p = sub.add_parser("direct-listen", help="accept direct connections on this port (or 'off'); restarts nak-net")
+    p.add_argument("port")
     p = sub.add_parser("task", help="post / list / claim / submit tasks")
     tsub = p.add_subparsers(dest="tcmd", required=True)
     q = tsub.add_parser("post"); q.add_argument("to"); q.add_argument("title"); q.add_argument("instructions")
@@ -142,12 +146,32 @@ def main(argv=None) -> int:
         print(json.dumps(r))
     elif a.cmd == "contacts":
         for c in call(s, {"op": "contacts"})["contacts"]:
-            print(f"{c['petname'] or '-':16} {c['state']:9} {'online' if c['online'] else 'offline':8} {c['person'][:16]}…")
+            via = f" via {c['path']}" if c.get("path") else ""
+            d = " [direct ok]" if c.get("direct") else ""
+            print(f"{c['petname'] or '-':16} {c['state']:9} {('online' + via) if c['online'] else 'offline':16} "
+                  f"{c['person'][:16]}…{d}")
     elif a.cmd == "remove":
         print(json.dumps(call(s, {"op": "remove", "who": a.who})))
     elif a.cmd == "send":
         r = call(s, {"op": "send", "to": a.to, "text": a.text, "aspect": a.aspect})
         print(f"queued {r['queued']} to {r['to']}")
+    elif a.cmd == "direct":
+        r = call(s, {"op": "direct", "who": a.who, "on": a.onoff == "on"})
+        if a.onoff == "on":
+            print("direct ON for this contact: they will learn your LAN/IPv6 addresses (not via the relay any "
+                  "more). Used only if they turn it on for you too." +
+                  ("" if r.get("listening") else " Note: this node is not listening; run: nak direct-listen 51830"))
+        else:
+            print("direct OFF: their addresses are forgotten; traffic goes through the relay")
+    elif a.cmd == "direct-listen":
+        import subprocess as _sp
+        f = Path(os.environ.get("NAK_NET_DIR", Path.home() / ".nakshatra" / "net")) / "direct-port"
+        if a.port == "off":
+            f.unlink(missing_ok=True)
+        else:
+            f.write_text(str(int(a.port)) + "\n")
+        _sp.run(["systemctl", "--user", "restart", "nak-net.service"], check=False)
+        print(f"direct listener {'off' if a.port == 'off' else 'on port ' + a.port}; nak-net restarted")
     elif a.cmd == "ledger":
         r = call(s, {"op": "ledger"})
         print(f"settlement adapter: {r['adapter']}  (TEST units — no real money)")
