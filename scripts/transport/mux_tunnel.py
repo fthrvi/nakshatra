@@ -21,9 +21,13 @@ Pure stdlib, no deps. One reader thread demuxes; writes are serialized by a lock
 Hardening (2026-10-02 design council), wire format unchanged so old peers still interoperate:
 - MAX_FRAME: a frame longer than this closes the tunnel before its body is read.
 - MAX_STREAMS: OPENs beyond this are refused with CLOSE.
-- No head-of-line blocking: the reader never writes into a local socket. Each stream has a
-  bounded queue (MAX_QUEUED bytes) drained by its own writer thread; a stream whose consumer
-  falls that far behind is closed instead of stalling every other stream on the tunnel.
+- The reader never writes into a local socket: each stream has a queue drained by its own writer
+  thread, so one slow consumer no longer stalls the others until it is MAX_QUEUED bytes behind.
+  Past that the reader PAUSES (backpressure, as the old direct-write code did). A stream that is
+  slow but still draining is never dropped; one that makes NO progress for STALL_S while over the
+  cap is stuck, and is closed so the rest of the tunnel can move again.
+- A peer's CLOSE is graceful: it is queued BEHIND the stream's data, and the writer closes the
+  socket only after delivering everything (data-then-close is the normal request/response shape).
 - Dials for incoming OPENs run off the reader thread.
 Still no credit-based windows (that needs a protocol change); production = WireGuard/QUIC.
 """
@@ -33,6 +37,7 @@ import queue
 import socket
 import struct
 import threading
+import time
 from typing import Optional
 
 _HDR = struct.Struct(">IBI")
@@ -40,7 +45,9 @@ OPEN, DATA, CLOSE = 1, 2, 3
 _CHUNK = 65536
 MAX_FRAME = 1 << 20            # senders emit <= _CHUNK; anything over 1 MiB is hostile or broken
 MAX_STREAMS = 256
-MAX_QUEUED = 4 << 20           # bytes buffered per stream before it is closed as too slow
+MAX_QUEUED = 4 << 20           # bytes buffered per stream before the reader waits for it to drain
+_FIN = object()                # queue marker: deliver what is queued, then close (graceful CLOSE)
+STALL_S = 30.0                 # over the cap AND no drain progress this long = stuck, not slow: close it
 
 
 class MuxTunnel:
@@ -51,6 +58,7 @@ class MuxTunnel:
         self._queues: dict[int, "queue.Queue[Optional[bytes]]"] = {}
         self._qbytes: dict[int, int] = {}
         self._slock = threading.Lock()
+        self._drained = threading.Condition(self._slock)   # writers signal the paused reader
         self._next_id = 1
         self._closed = threading.Event()
 
@@ -110,10 +118,13 @@ class MuxTunnel:
             return
         threading.Thread(target=self._writer, args=(sid, sock, q), daemon=True).start()
 
-    def _writer(self, sid: int, sock: socket.socket, q: "queue.Queue[Optional[bytes]]") -> None:
+    def _writer(self, sid: int, sock: socket.socket, q) -> None:
         while True:
             data = q.get()
-            if data is None:
+            if data is None:                 # aborted (error path): _drop already closed the socket
+                return
+            if data is _FIN:                 # the peer closed: everything before it is delivered
+                self._drop(sid)
                 return
             try:
                 sock.sendall(data)
@@ -124,12 +135,15 @@ class MuxTunnel:
             with self._slock:
                 if sid in self._qbytes:
                     self._qbytes[sid] -= len(data)
+                self._drained.notify_all()
 
     def _drop(self, sid: int) -> None:
+        """Abort a stream NOW (errors, refusals, our own side ending). Queued data is discarded."""
         with self._slock:
             s = self._streams.pop(sid, None)
             q = self._queues.pop(sid, None)
             self._qbytes.pop(sid, None)
+            self._drained.notify_all()
         if q is not None:
             q.put(None)
         if s:
@@ -163,20 +177,34 @@ class MuxTunnel:
                     self._register(sid)          # queue first: DATA may arrive before the dial ends
                     threading.Thread(target=on_open, args=(sid,), daemon=True).start()
             elif typ == DATA:
-                too_slow = False
+                stuck = False
                 with self._slock:
-                    q = self._queues.get(sid)
+                    # Backpressure: wait for this stream's writer to drain below the cap. The wait
+                    # ends if the stream is dropped, the tunnel closes, or the stream is STUCK (no
+                    # progress for STALL_S). A slow-but-moving stream is never cut.
+                    last, since = self._qbytes.get(sid), time.monotonic()
+                    while (sid in self._queues and self._qbytes[sid] > 0
+                           and self._qbytes[sid] + len(payload) > MAX_QUEUED
+                           and not self._closed.is_set()):
+                        self._drained.wait(timeout=0.5)
+                        now_q = self._qbytes.get(sid)
+                        if now_q != last:
+                            last, since = now_q, time.monotonic()
+                        elif time.monotonic() - since > STALL_S:
+                            stuck = True
+                            break
+                    q = None if stuck else self._queues.get(sid)
                     if q is not None:
-                        if self._qbytes[sid] + len(payload) > MAX_QUEUED:
-                            too_slow = True
-                        else:
-                            self._qbytes[sid] += len(payload)
-                            q.put(payload)
-                if too_slow:
+                        self._qbytes[sid] += len(payload)
+                        q.put(payload)
+                if stuck:
                     self._send(sid, CLOSE)
                     self._drop(sid)
             elif typ == CLOSE:
-                self._drop(sid)
+                with self._slock:
+                    q = self._queues.get(sid)
+                if q is not None:
+                    q.put(_FIN)   # graceful: the writer closes after the queued data (or once dialed)
         self._closed.set()
 
     # ── client side: listen locally, each conn → a stream ──
@@ -224,6 +252,8 @@ class MuxTunnel:
 
     def close(self) -> None:
         self._closed.set()
+        with self._slock:
+            self._drained.notify_all()
         try:
             self._pipe.close()
         except OSError:

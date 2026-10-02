@@ -122,7 +122,7 @@ def evaluate(spec: dict, output: str) -> tuple[bool, list]:
         elif k == "json_keys":
             try:
                 obj = json.loads(output)
-            except ValueError:
+            except (ValueError, RecursionError):      # deeply nested input from an untrusted worker
                 obj = None
             if not isinstance(obj, dict):
                 fails.append("output is not a JSON object")

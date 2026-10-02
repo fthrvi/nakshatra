@@ -421,10 +421,13 @@ class Node:
                 attempt += 1
                 self._backoff(attempt)
                 continue
-            attempt = 0
             self.log(f"session up with {c['petname'] or person[:12]}")
+            started = time.time()
             self._run_session(person, sock, ch)
-            self._backoff(0)
+            # A session that drops at once is a failure, not a success: keep backing off unless it
+            # actually lasted (a peer that accepts and hangs up must not drive a tight loop).
+            attempt = 0 if time.time() - started > 60 else attempt + 1
+            self._backoff(attempt)
 
     def _run_session(self, person: str, sock, ch) -> None:
         lock = threading.Lock()
@@ -444,9 +447,9 @@ class Node:
                     if t == "env":
                         send_frame(ch, self._receive(person, frame), lock)
                     elif t == "ack":
-                        self.store.ack(str(frame.get("mid", "")))
+                        self.store.ack(str(frame.get("mid", "")), person)
                     elif t == "nack":   # received and refused: terminal, stop retrying, keep why
-                        self.store.refuse(str(frame.get("mid", "")), str(frame.get("why", "")))
+                        self.store.refuse(str(frame.get("mid", "")), str(frame.get("why", "")), person)
                         self.log(f"{person[:12]} refused {str(frame.get('mid', ''))[:8]}: {frame.get('why')}")
             except (OSError, SecureChannelError, ValueError) as e:
                 self.log(f"session {person[:12]}: {e}")
@@ -486,8 +489,20 @@ class Node:
             _hard_close(ch)
 
     def _receive(self, person: str, frame: dict) -> dict:
-        """Verify one inbound envelope from a contact. Returns the ack/nack to send back."""
+        """Verify one inbound envelope from a contact. Returns the ack/nack to send back. Anything a
+        peer sends that makes processing blow up is refused, never allowed to kill the session."""
+        try:
+            return self._receive_checked(person, frame)
+        except Exception as e:  # noqa: BLE001 — peer-controlled input; refuse, keep the reader alive
+            body = frame.get("body") if isinstance(frame, dict) else None
+            mid = str(body.get("mid", "")) if isinstance(body, dict) else ""
+            self.log(f"refused malformed frame from {person[:12]}: {type(e).__name__}")
+            return {"t": "nack", "mid": mid, "why": "malformed"}
+
+    def _receive_checked(self, person: str, frame: dict) -> dict:
         env, body = frame.get("env") or {}, frame.get("body") or {}
+        if not isinstance(env, dict) or not isinstance(body, dict):
+            return {"t": "nack", "mid": "", "why": "malformed"}
         c = self.store.contact(person)
         mid = str(body.get("mid", "")) if isinstance(body, dict) else ""
         if not c or not mid:
@@ -587,12 +602,31 @@ class Node:
             except Exception as e:  # noqa: BLE001 — a sweep bug must never kill the node
                 self.log(f"sweep failed: {e}")
 
+    def reconcile_escrow(self) -> int:
+        """Settle escrow left OPEN for a task already in a final state (a crash between the state
+        change and the settlement). The ledger's own CAS keeps this exactly-once. Returns how many."""
+        fixed = 0
+        for t in self.store.tasks_in_states(("accepted", "rejected", "expired"), role="poster"):
+            if t["spec"]["reward"]["amount"] <= 0:
+                continue
+            st = self.settle.status(t["task_hash"])
+            if not st or st["state"] != "open":
+                continue
+            if t["state"] == "accepted" and t["assignee"]:
+                self._settle(t["task_hash"], t["spec"], "release", party=t["assignee"])
+            else:
+                self._settle(t["task_hash"], t["spec"], "refund", reason=t["state"])
+            fixed += 1
+            self.log(f"reconciled stranded escrow for {t['task_hash'][:12]} ({t['state']})")
+        return fixed
+
     def sweep(self, now: Optional[float] = None) -> int:
         """Expire tasks whose deadline passed without an accepted result: refund the poster's escrow and
         tell the assignee; mark this node's own offers/claims expired. Returns how many expired."""
         now = time.time() if now is None else now
         n = 0
-        for t in self.store.tasks(limit=500):
+        self.reconcile_escrow()
+        for t in self.store.tasks_in_states(("posted", "assigned", "offered", "claimed")):
             if t["spec"]["deadline"] > now:
                 continue
             if t["role"] == "poster" and t["state"] in ("posted", "assigned"):

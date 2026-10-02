@@ -29,6 +29,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import releasekit as rk  # noqa: E402
 
+LATEST_TTL_S = 60 * 86400        # the signed "latest" pointer is refused after this (republish to extend)
 SPEC = json.loads((Path(__file__).resolve().parent / "spec.json").read_text())
 
 
@@ -90,8 +91,10 @@ def build(version: str, channel: str, refs: dict, key_path: Path, out_root: Path
     priv_hex = key_path.read_text().strip()
     signed = rk.sign(manifest, priv_hex)
     (out / "manifest.json").write_text(json.dumps(signed, indent=1, sort_keys=True))
+    # expires_at: a host can't replay an old pointer forever; a release must be republished within it.
     latest = rk.sign({"schema": "nak-release-latest/1", "channel": channel, "version": version,
-                      "manifest_sha256": rk.sha256_file(out / "manifest.json"), "created": now}, priv_hex)
+                      "manifest_sha256": rk.sha256_file(out / "manifest.json"), "created": now,
+                      "expires_at": now + LATEST_TTL_S}, priv_hex)
     (out_root / channel / "latest.json").write_text(json.dumps(latest, indent=1, sort_keys=True))
     return out
 

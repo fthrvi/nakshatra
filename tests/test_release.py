@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import io
 import json
+import time
 import os
 import subprocess
 import sys
@@ -229,3 +230,35 @@ def test_command_wrappers_follow_current_release(env, monkeypatch):
     assert os.access(w, os.X_OK) and "current/venv/bin/python -m alpha_mod" in body and "releases/" not in body
     # systemd=False (tests, dev) never touches the real ~/.local/bin
     assert not (Path.home() / ".local" / "bin" / "nak").resolve().is_relative_to(env["tmp"])
+
+
+def test_failed_first_install_leaves_nothing_half_installed(env, monkeypatch):
+    _build(env, "0.1.0")
+    inst = env["inst"]
+    monkeypatch.setattr(I.Installer, "health", lambda self, man: (_ for _ in ()).throw(I.InstallError("boom")))
+    with pytest.raises(I.InstallError, match="first install of 0.1.0 failed and was removed"):
+        inst.install(str(env["dist"]), "canary", env["pub"])
+    node = env["tmp"] / "node"
+    assert not (node / "current").exists() and not (node / "releases" / "0.1.0").exists()
+    monkeypatch.undo()
+    assert "installed 0.1.0" in inst.install(str(env["dist"]), "canary", env["pub"])     # retry works
+
+
+def test_a_stale_current_link_without_a_recorded_install_is_retried(env):
+    _build(env, "0.1.0")
+    node = env["tmp"] / "node"
+    (node / "releases" / "0.1.0").mkdir(parents=True)
+    (node / "current").symlink_to("releases/0.1.0")      # the half state older installers could leave
+    assert "installed 0.1.0" in env["inst"].install(str(env["dist"]), "canary", env["pub"])
+
+
+def test_expired_latest_pointer_is_refused(env):
+    _build(env, "0.1.0", now=int(time.time()) - 61 * 86400)      # signed 61 days ago, TTL 60 days
+    with pytest.raises(I.InstallError, match="expired latest.json"):
+        env["inst"].install(str(env["dist"]), "canary", env["pub"])
+
+
+def test_join_refuses_a_release_older_than_the_invite_names(env):
+    _build(env, "0.1.0")
+    with pytest.raises(I.InstallError, match="older than 0.2.0"):
+        env["inst"].install(str(env["dist"]), "canary", env["pub"], min_version="0.2.0")

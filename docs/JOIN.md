@@ -58,9 +58,20 @@ contacts, and take on tasks your contacts post. It can't accept connections; tha
 
 ## Why trust the download?
 
-You trust your friend. Their invite is signed with their person key, and it names the release key.
-So the installer, and every update after it, must be signed by the key your friend vouched for. The
-download server itself is not trusted: it can withhold an update, but it can't forge one.
+You trust **the person who sent you the line**. The line holds the installer's fingerprint, and
+the invite names the release key. Every later update must be signed by that key. The invite's
+signature proves the invite is intact and was made with the key it names; it can't prove *whose* key
+that is. So check with your friend, through a channel you already trust, that the line came from them.
+
+The download server itself is not trusted:
+- it can't forge an update;
+- it can't hand you anything older than the version your friend's invite names;
+- a signed "latest" pointer expires after 60 days, so the server can't replay an old one forever;
+- it *can* still delay updates.
+
+**Revoking an agent is local today.** If you revoke one of your agents, your own signer stops signing for
+it, but your contacts don't hear about it: a copied agent key keeps working toward them until its grant
+expires (90 days for the agent a join creates). Shared revocation is on the list.
 
 **Today's limits.** Releases are served from the mesh (`10.42.0.1:8960`), so only machines on the
 mesh can join until a public release host is set up. Person keys are TEST files, not a vault.

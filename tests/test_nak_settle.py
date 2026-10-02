@@ -125,3 +125,34 @@ def test_poster_offline_result_waits_in_the_outbox_and_settles_on_return(net):
     a.node = nakd.Node(a.dir / "net", a.node_key, a.signer.handle, agent="pa", relay=b.node.relay).start()
     assert wait(lambda: _worker_row(b.node, h)[0]["state"] == "accepted", timeout=40)
     assert events(a, h) == ["open", "released"]
+
+
+def test_hostile_frames_are_refused_not_fatal(net):
+    a, b = _pair(net)
+    h = _assigned(a, b, rules=[{"json_keys": ["k"]}])
+    deep = {"task_hash": h, "epoch": 1, "output": "[" * 60000, "mid": "deep-1"}
+    env = b.node._sign("task.result", a.person_pub, deep)
+    r = a.node._receive(b.person_pub, {"t": "env", "env": env, "body": deep})
+    assert r["t"] in ("ack", "nack")                                   # answered, not raised
+    for junk in ({"t": "env", "env": "not a dict", "body": {}}, {"t": "env", "env": {}, "body": ["x"]}):
+        assert a.node._receive(b.person_pub, junk)["t"] == "nack"
+
+
+def test_a_contact_can_only_ack_its_own_messages(net):
+    a, b = _pair(net)
+    a.node.store.queue("m-for-b", b.person_pub, {"kind": "msg", "body": {"mid": "m-for-b", "text": "x"}})
+    a.node.store.ack("m-for-b", "someone-else")
+    assert not a.node.store.delivered("m-for-b")
+    a.node.store.ack("m-for-b", b.person_pub)
+    assert a.node.store.delivered("m-for-b")
+
+
+def test_stranded_escrow_is_reconciled(net):
+    a, b = _pair(net)
+    h = _assigned(a, b)
+    # simulate a crash between "accepted" and the payout: state final, escrow still open
+    assert a.node.store.task_cas(h, "poster", "", ("assigned",), state="accepted")
+    assert a.node.settle.status(h)["state"] == "open"
+    assert a.node.reconcile_escrow() == 1
+    assert a.node.settle.status(h)["state"] == "released" and events(a, h) == ["open", "released"]
+    assert a.node.reconcile_escrow() == 0

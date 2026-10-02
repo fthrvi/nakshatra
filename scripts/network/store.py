@@ -145,13 +145,19 @@ class Store:
         return [json.loads(r[0]) for r in
                 self._q("SELECT frame FROM outbox WHERE to_person=? AND acked IS NULL ORDER BY created", (person,))]
 
-    def ack(self, nonce: str) -> None:
-        self._q("UPDATE outbox SET acked=? WHERE nonce=?", (int(time.time()), nonce))
+    def ack(self, nonce: str, to_person: str) -> None:
+        """Only the contact a message was FOR can acknowledge it."""
+        self._q("UPDATE outbox SET acked=? WHERE nonce=? AND to_person=?", (int(time.time()), nonce, to_person))
 
-    def refuse(self, nonce: str, why: str) -> None:
-        """The peer received it and said no (terminal): stop retrying, keep the reason."""
-        self._q("UPDATE outbox SET acked=?, refused=? WHERE nonce=? AND acked IS NULL",
-                (int(time.time()), str(why)[:300], nonce))
+    def refuse(self, nonce: str, why: str, to_person: Optional[str] = None) -> None:
+        """The peer received it and said no (terminal): stop retrying, keep the reason. A peer can
+        only refuse what was sent TO it; a local refusal (signer said no) passes no person."""
+        if to_person is None:
+            self._q("UPDATE outbox SET acked=?, refused=? WHERE nonce=? AND acked IS NULL",
+                    (int(time.time()), str(why)[:300], nonce))
+        else:
+            self._q("UPDATE outbox SET acked=?, refused=? WHERE nonce=? AND to_person=? AND acked IS NULL",
+                    (int(time.time()), str(why)[:300], nonce, to_person))
 
     def refused(self, nonce: str) -> Optional[str]:
         r = self._q("SELECT refused FROM outbox WHERE nonce=?", (nonce,))
@@ -228,6 +234,15 @@ class Store:
         return [self._task_row(r) for r in self._q(
             f"SELECT {', '.join(self._TASK_COLS)} FROM tasks WHERE task_hash LIKE ? ORDER BY updated DESC",
             (prefix + "%",))]
+
+    def tasks_in_states(self, states: tuple, role: Optional[str] = None) -> list:
+        """Every task in these states (no limit: the sweeper must never miss an old one)."""
+        marks = ",".join("?" * len(states))
+        q = f"SELECT {', '.join(self._TASK_COLS)} FROM tasks WHERE state IN ({marks})"
+        args: tuple = tuple(states)
+        if role:
+            q, args = q + " AND role=?", args + (role,)
+        return [self._task_row(r) for r in self._q(q, args)]
 
     def tasks(self, role: Optional[str] = None, limit: int = 50) -> list:
         q = f"SELECT {', '.join(self._TASK_COLS)} FROM tasks"

@@ -112,6 +112,11 @@ class Installer:
             latest = json.loads((work / "latest.json").read_text())
             if not rk.verify(latest, pubkey) or latest.get("channel") != channel:
                 raise InstallError("latest.json is not signed by the pinned release key")
+            # A host could replay an OLD signed latest.json forever (audit 2026-10-03, finding 1):
+            # a signed pointer carries an expiry, and a stale one is refused.
+            exp = latest.get("expires_at")
+            if isinstance(exp, int) and time.time() > exp:
+                raise InstallError("the release host is serving an expired latest.json (stale or replayed)")
             version = latest["version"]
         _fetch(source, f"{channel}/{version}/manifest.json", work / "manifest.json")
         man = json.loads((work / "manifest.json").read_text())
@@ -223,7 +228,8 @@ class Installer:
                 raise InstallError(f"health check failed: {' '.join(cmd)}\n{(r.stderr or r.stdout)[-800:]}")
 
     # ── the operations ──
-    def install(self, source: str, channel: str, pubkey: str, version=None, *, allow_downgrade=False) -> str:
+    def install(self, source: str, channel: str, pubkey: str, version=None, *, allow_downgrade=False,
+                min_version: str = "") -> str:
         self.prefix.mkdir(parents=True, exist_ok=True)
         cfg = _load_config(self.prefix)
         pinned = cfg.get("pubkey")
@@ -233,15 +239,26 @@ class Installer:
         if not pubkey:
             raise InstallError("first install needs --pubkey (the release key to trust)")
         man, work = self.fetch_verified(source, channel, pubkey, version)
-        prev = _current(self.prefix)
+        if min_version and _vt(man["version"]) < _vt(min_version):
+            shutil.rmtree(work, ignore_errors=True)
+            raise InstallError(f"the release host offers {man['version']}, older than {min_version} which your "
+                               f"friend's invite names; refusing (stale or malicious host)")
+        # Installed = a COMPLETED install recorded in config.json, not merely a `current` link: a
+        # first install that died half-way must be retried, not reported as "already at X".
+        prev = _current(self.prefix) if cfg.get("current") else None
         if prev:
             if _vt(man["version"]) <= _vt(prev) and not allow_downgrade:
                 shutil.rmtree(work, ignore_errors=True)
                 return f"already at {prev}; {man['version']} is not newer"
             if _vt(man["version"])[0] != _vt(prev)[0]:
                 raise InstallError(f"{man['version']} is a different major version than {prev}; install it explicitly")
+        new_dir = self.prefix / "releases" / man["version"]
         try:
             self.unpack(man, work)
+        except Exception:
+            if man["version"] != prev:
+                shutil.rmtree(new_dir, ignore_errors=True)
+            raise
         finally:
             shutil.rmtree(work, ignore_errors=True)
         _switch(self.prefix, man["version"])
@@ -256,7 +273,14 @@ class Installer:
                 self.write_units(prev_man)
                 self.restart(list(prev_man.get("services", {})))
                 raise InstallError(f"{man['version']} failed after switching and was rolled back to {prev}: {e}")
-            raise
+            # First install failed: leave NO half-installed node behind (no `current`, no release dir),
+            # so the next attempt starts clean instead of believing it is already installed.
+            try:
+                (self.prefix / "current").unlink()
+            except OSError:
+                pass
+            shutil.rmtree(new_dir, ignore_errors=True)
+            raise InstallError(f"first install of {man['version']} failed and was removed: {e}")
         cfg.update({"source": source, "channel": channel, "pubkey": pubkey, "current": man["version"],
                     "previous": prev, "updated": int(time.time())})
         _save_config(self.prefix, cfg)
@@ -334,19 +358,21 @@ def _systemd_user_ok() -> bool:
 def join(prefix: Path, code: str, name: str) -> int:
     inv = parse_invite(code)
     rel = inv["release"]
-    print(f"invite from {inv['inviter'][:16]}… is genuine; installing Nakshatra from {rel['url']} ({rel['channel']})",
-          flush=True)
+    # The signature proves the invite is intact and was made with the key it names — NOT who that is.
+    # Trust comes from the person who sent you the line (and the installer fingerprint inside it).
+    print(f"invite is intact and signed by key {inv['inviter'][:16]}… (check with your friend that "
+          f"this is theirs); installing Nakshatra from {rel['url']} ({rel['channel']})", flush=True)
     if not _systemd_user_ok():
         raise InstallError("this machine has no systemd user session. On WSL put [boot] systemd=true in "
                            "/etc/wsl.conf and restart WSL, then paste the line again.")
     inst = Installer(prefix)
-    if _current(prefix):
+    if _current(prefix) and _load_config(prefix).get("current"):
         print(f"a node is already installed ({_current(prefix)}); keeping it and joining with it", flush=True)
         cfg = _load_config(prefix)
         if cfg.get("pubkey") and cfg["pubkey"] != rel["pubkey"]:
             raise InstallError("this node trusts a different release key than the invite names; refusing to mix")
     else:
-        print(inst.install(rel["url"], rel["channel"], rel["pubkey"]), flush=True)
+        print(inst.install(rel["url"], rel["channel"], rel["pubkey"], min_version=rel.get("version", "")), flush=True)
     man = json.loads((prefix / "current" / "manifest.json").read_text())
     env = dict(os.environ, PYTHONPATH=inst._pythonpath(man))
     py = str(prefix / "current" / "venv" / "bin" / "python")
