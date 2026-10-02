@@ -288,3 +288,13 @@ class TestSignedInvite:
         for t in ts: t.start()
         for t in ts: t.join()
         assert wins.count(True) == 1 and wins.count(False) == 9
+
+
+    def test_invite_carries_a_one_time_key(self):
+        from joincode import invite_pub, invite_rendezvous
+        k, _ = _person()
+        a = decode_invite(encode_invite(k, _NODE, _PEERS, now=1000), now=1001)
+        b = decode_invite(encode_invite(k, _NODE, _PEERS, now=1000), now=1001)
+        assert len(a["ik"]) == 64 and a["ik"] != b["ik"]
+        assert len(invite_pub(a)) == 64 and len(invite_rendezvous(a)) == 16
+        assert invite_rendezvous(a) != invite_rendezvous(b)
