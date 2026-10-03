@@ -27,9 +27,10 @@ A Go `go-libp2p` daemon that runs beside a node's engine and gives it, for free:
 Interface (`main.go`):
 - `-key <path>` — persist the node key (stable PeerId across restarts).
 - `-inbound HOST:PORT` — inbound libp2p streams are dialed to the local engine here (a **worker**: its gRPC port).
+- `-nakd-inbound HOST:PORT` — direct-only nakd streams are dialed to nakd here; unlike activation streams, limited relay circuits are refused.
 - `-forward LOCAL=PEER_MULTIADDR` — listen on a LOCAL tcp port, carry each conn to PEER (a **coordinator**: one per upstream worker, repeatable).
 - `-relay` — also be a public relay + AutoNAT server (run on a reachable box).
-- `-dial-listen PATH` — accept `DIAL <peerid>` from nakd on a mode-0600 UNIX socket and return only a direct stream.
+- `-dial-listen PATH` — accept `DIAL <peerid>` from nakd on a mode-0600 UNIX socket, open the dedicated nakd protocol, and return only a direct stream.
 
 ## How it plugs into nakshatra (the wiring — next step, needs Go to build)
 The beauty: **nothing in our engine changes.** We only rewrite the chain's worker *addresses* to

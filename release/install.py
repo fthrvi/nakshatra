@@ -13,9 +13,10 @@ What it guarantees:
   * nothing is unpacked or run unless manifest.json verifies against the PINNED release key and every
     file matches the sha256 the manifest lists (the check covers everything that ships);
   * releases install side by side (releases/<version>/); `current` is switched atomically;
-  * after switching it runs the release's health checks and restarts its services; if anything fails
-    it switches back to the previous release and says so;
-  * update never installs an older or equal version, and never a different major version.
+  * after switching it runs the release's health checks, then drains and restarts changed services;
+    pre-restart failures roll back, while a service that fails after restart is recorded for retry;
+  * update never installs an older version (an equal version is touched only to retry pending/failed services),
+    and never installs a different major version.
 """
 from __future__ import annotations
 
@@ -40,6 +41,7 @@ UNIT_DIR = Path.home() / ".config" / "systemd" / "user"
 _THIS_FILE = Path(__file__).resolve()      # resolved at LOAD time, before any `current` switch
 UNIT_MARKER = "# Managed by nakshatra-node install.py"
 SERVICE_ACTIVE_TIMEOUT_S = 20.0
+SERVICE_STABILITY_S = 5.0
 
 
 class InstallError(Exception):
@@ -125,6 +127,32 @@ class Installer:
         # inside its own prefix and can NEVER touch the real ~/.config/systemd/user — on 2026-10-03 a
         # test that undid a monkeypatch rewrote the hub's real nak-update.service to a pytest tmp dir.
         self.unit_dir = Path(unit_dir) if unit_dir else (UNIT_DIR if systemd else self.prefix / "units")
+
+    @property
+    def _service_state_path(self) -> Path:
+        return self.prefix / "state" / "services.json"
+
+    def _record_service_issue(self, name: str, status: str, detail: str) -> None:
+        state = _load_json(self._service_state_path)
+        services = state.setdefault("services", {})
+        services[name] = {"status": status, "detail": detail, "updated": int(time.time())}
+        _save_json(self._service_state_path, state)
+
+    def _clear_service_issue(self, name: str) -> None:
+        state = _load_json(self._service_state_path)
+        services = state.get("services", {})
+        if name in services:
+            del services[name]
+            _save_json(self._service_state_path, state)
+
+    def _service_issue_summary(self) -> str:
+        services = _load_json(self._service_state_path).get("services", {})
+        if not services:
+            return ""
+        grouped = {}
+        for name, issue in services.items():
+            grouped.setdefault(issue.get("status", "failed"), []).append(name)
+        return "; " + "; ".join(f"{status}: {', '.join(sorted(names))}" for status, names in sorted(grouped.items()))
 
     # ── fetch + verify ──
     def fetch_verified(self, source: str, channel: str, pubkey: str, version=None) -> tuple:
@@ -286,9 +314,14 @@ class Installer:
                 unit_path = self.unit_dir / f"{name}.service"
                 if unit_path.exists() and self._managed_unit(unit_path):
                     if self.systemd:
-                        subprocess.run(["systemctl", "--user", "disable", "--now", f"{name}.service"],
-                                       check=False)
+                        stopped = subprocess.run(
+                            ["systemctl", "--user", "disable", "--now", f"{name}.service"], check=False)
+                        if stopped.returncode != 0:
+                            self._record_service_issue(
+                                name, "removal-failed", "systemctl disable --now failed; managed unit retained")
+                            continue
                     unit_path.unlink()
+                    self._clear_service_issue(name)
                 continue
             (self.unit_dir / f"{name}.service").write_text(self._unit_text(svc, ctx, man))
             names.append(name)
@@ -336,7 +369,10 @@ class Installer:
         - a service with `drain: {port, max_wait_s}` waits until nothing is connected to that port (up to
           max_wait_s), THEN restarts — a live Prithvi turn is not cut off. Code under current/ has already
           switched, so the wait is bounded: mixed versions must not linger.
-        force=True (rollback) restarts everything. Returns the names actually restarted."""
+        force=True (rollback) restarts every supplied name and keeps rollback's strict failure behavior.
+        During a normal update, a post-restart process failure is recorded, never raised: rolling an
+        otherwise valid release back would restart unrelated live services.
+        Returns the names for which a restart was actually requested."""
         if not (self.systemd and names):
             return []
         fps = _load_json(self.prefix / "state" / "fingerprints.json")
@@ -345,21 +381,35 @@ class Installer:
         for n in names:
             fp = self._fingerprint(n, man) if man else None
             if not force and fp and fps.get(n) == fp and self._active(n):
+                self._clear_service_issue(n)
                 continue
             todo.append((n, fp))
         if todo:
             subprocess.run(["systemctl", "--user", "enable", *[f"{n}.service" for n, _ in todo]], check=False)
+        restarted = []
         for n, fp in todo:
             drain = services.get(n, {}).get("drain") if not force else None
             if drain:
-                self._wait_idle(int(drain["port"]), float(drain.get("max_wait_s", 900)))
-            subprocess.run(["systemctl", "--user", "restart", f"{n}.service"], check=False)
-            if not self._wait_active(n, SERVICE_ACTIVE_TIMEOUT_S):
-                raise InstallError(f"{n}.service did not become active after restart")
-            if fp:
+                if not self._wait_idle(int(drain["port"]), float(drain.get("max_wait_s", 900))):
+                    self._record_service_issue(
+                        n, "pending", f"drain timed out on port {drain['port']}; restart deferred")
+                    continue
+            result = subprocess.run(["systemctl", "--user", "restart", f"{n}.service"], check=False)
+            restarted.append(n)
+            if result.returncode == 0:
+                healthy, detail = self._wait_stable(n, SERVICE_ACTIVE_TIMEOUT_S, SERVICE_STABILITY_S)
+            else:
+                healthy, detail = False, f"systemctl restart failed with exit status {result.returncode}"
+            if healthy:
+                self._clear_service_issue(n)
+            else:
+                self._record_service_issue(n, "failed", detail)
+                if force:
+                    raise InstallError(f"{n}.service {detail}")
+            if healthy and fp:
                 fps[n] = fp
         _save_json(self.prefix / "state" / "fingerprints.json", fps)
-        return [n for n, _ in todo]
+        return restarted
 
     def _fingerprint(self, name: str, man: dict) -> str:
         import hashlib
@@ -392,6 +442,40 @@ class Installer:
             if time.monotonic() >= deadline:
                 return False
             time.sleep(0.5)
+
+    def _service_runtime(self, name: str):
+        r = subprocess.run(
+            ["systemctl", "--user", "show", f"{name}.service", "--property=ActiveState,MainPID,NRestarts"],
+            capture_output=True, text=True)
+        if r.returncode != 0:
+            return None
+        props = dict(line.split("=", 1) for line in r.stdout.splitlines() if "=" in line)
+        try:
+            return props.get("ActiveState"), int(props.get("MainPID", "0")), int(props.get("NRestarts", "0"))
+        except ValueError:
+            return None
+
+    def _wait_stable(self, name: str, timeout_s: float, stability_s: float) -> tuple[bool, str]:
+        deadline = time.monotonic() + timeout_s
+        first = None
+        while True:
+            snap = self._service_runtime(name)
+            if snap and snap[0] == "active" and snap[1] > 0:
+                first = snap
+                break
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.5)
+        if first is None:
+            return False, "did not become active after restart"
+        time.sleep(stability_s)
+        second = self._service_runtime(name)
+        if second is None or second[0] != "active":
+            return False, "did not remain active during the stability window"
+        if second[1] != first[1] or second[2] != first[2]:
+            return False, (f"restarted during the stability window "
+                           f"(MainPID {first[1]}->{second[1]}, NRestarts {first[2]}->{second[2]})")
+        return True, ""
 
     def _wait_idle(self, port: int, max_wait_s: float) -> bool:
         """True once nothing is connected to `port` (checked twice, 2 s apart), False at the time limit."""
@@ -433,7 +517,17 @@ class Installer:
         # first install that died half-way must be retried, not reported as "already at X".
         prev = _current(self.prefix) if cfg.get("current") else None
         if prev:
-            if _vt(man["version"]) <= _vt(prev) and not allow_downgrade:
+            if man["version"] == prev and not allow_downgrade:
+                issues = _load_json(self._service_state_path).get("services", {})
+                retry = {name for name, issue in issues.items()
+                         if issue.get("status") in ("failed", "pending")}
+                shutil.rmtree(work, ignore_errors=True)
+                if issues:
+                    names = self._write_units_by_new_installer(man)
+                    self.restart([name for name in names if name in retry], man)
+                    return f"retried services for {prev}" + self._service_issue_summary()
+                return f"already at {prev}; {man['version']} is not newer"
+            if _vt(man["version"]) < _vt(prev) and not allow_downgrade:
                 shutil.rmtree(work, ignore_errors=True)
                 return f"already at {prev}; {man['version']} is not newer"
             if _vt(man["version"])[0] != _vt(prev)[0]:
@@ -456,8 +550,8 @@ class Installer:
             if prev:
                 _switch(self.prefix, prev)
                 prev_man = json.loads((self.prefix / "releases" / prev / "manifest.json").read_text())
-                self.write_units(prev_man)
-                self.restart(list(prev_man.get("services", {})), prev_man, force=True)
+                prev_names = self.write_units(prev_man)
+                self.restart(prev_names, prev_man, force=True)
                 raise InstallError(f"{man['version']} failed after switching and was rolled back to {prev}: {e}")
             # First install failed: leave NO half-installed node behind (no `current`, no release dir),
             # so the next attempt starts clean instead of believing it is already installed.
@@ -470,7 +564,8 @@ class Installer:
         cfg.update({"source": source, "channel": channel, "pubkey": pubkey, "current": man["version"],
                     "previous": prev, "updated": int(time.time())})
         _save_config(self.prefix, cfg)
-        return f"installed {man['version']} ({channel})" + (f", previous {prev}" if prev else "")
+        return (f"installed {man['version']} ({channel})" + (f", previous {prev}" if prev else "") +
+                self._service_issue_summary())
 
     def update(self) -> str:
         cfg = _load_config(self.prefix)
@@ -489,12 +584,13 @@ class Installer:
         self.restart(self.write_units(man), man, force=True)
         cfg.update({"current": prev, "previous": cur, "updated": int(time.time())})
         _save_config(self.prefix, cfg)
-        return f"rolled back to {prev}"
+        return f"rolled back to {prev}" + self._service_issue_summary()
 
     def status(self) -> dict:
         cfg = _load_config(self.prefix)
         return {"current": _current(self.prefix), "previous": cfg.get("previous"), "channel": cfg.get("channel"),
-                "source": cfg.get("source"), "release_key": (cfg.get("pubkey") or "")[:16]}
+                "source": cfg.get("source"), "release_key": (cfg.get("pubkey") or "")[:16],
+                "service_issues": _load_json(self._service_state_path).get("services", {})}
 
 
 # ── join: the one command a newcomer pastes ─────────────────────────────────────────────────────

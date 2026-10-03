@@ -13,6 +13,7 @@
 // Modes:
 //
 //	-inbound HOST:PORT            tunnel: dial the local engine for each inbound stream
+//	-nakd-inbound HOST:PORT       direct-only tunnel: dial nakd for each nakd stream
 //	-forward LOCAL=PEER_MULTIADDR tunnel: listen LOCAL, carry each conn to PEER (repeatable)
 //	-peer PEER_MULTIADDR          self-test: round-trip one frame to a listener (connectivity check)
 //	(none)                        self-test listener: echo one frame back
@@ -50,6 +51,7 @@ import (
 // activationProto is the stream protocol carrying inter-stage traffic (and the self-test).
 const (
 	activationProto       = "/shard/activation/1.0.0"
+	nakdProto             = "/nakshatra/nakd/1.0.0"
 	activationRelayReason = "shard activation stream"
 	maxDialLine           = 512
 )
@@ -239,6 +241,7 @@ func main() {
 	addrFile := flag.String("addrfile", "", "write this host's dial multiaddr here (for scripting)")
 	listenAddr := flag.String("listen", "/ip4/0.0.0.0/tcp/0", "libp2p listen multiaddr; pin the port for cross-box reach, e.g. /ip4/0.0.0.0/tcp/29600")
 	inbound := flag.String("inbound", "", "tunnel: dial this local engine addr (host:port) for each inbound libp2p stream")
+	nakdInbound := flag.String("nakd-inbound", "", "direct-only tunnel: dial this local nakd addr for each nakd libp2p stream")
 	dialListen := flag.String("dial-listen", "", "listen on this user-only UNIX socket for DIAL <peerid> requests that require a direct libp2p path")
 	directWait := flag.Duration("direct-wait", 15*time.Second, "maximum time to wait for a direct (non-relayed) connection")
 	var forwards stringList
@@ -369,9 +372,12 @@ func main() {
 	// Tunnel mode: a transparent TCP<->libp2p bridge. The engine keeps its own socket
 	// code and just talks to localhost; the sidecar carries each connection to/from the
 	// right ring neighbour over libp2p. This is what replaces wire.py's TCP.
-	if *inbound != "" || *dialListen != "" || len(forwards) > 0 {
+	if *inbound != "" || *nakdInbound != "" || *dialListen != "" || len(forwards) > 0 {
 		if *inbound != "" {
 			runInbound(h, *inbound)
+		}
+		if *nakdInbound != "" {
+			runNakdInbound(h, *nakdInbound)
 		}
 		if *dialListen != "" {
 			ln, err := listenDialSocket(*dialListen)
@@ -387,7 +393,7 @@ func main() {
 			}
 			go runForward(h, pp[0], pp[1])
 		}
-		log.Printf("tunnel up (inbound=%q dial-listen=%q forwards=%v)", *inbound, *dialListen, []string(forwards))
+		log.Printf("tunnel up (inbound=%q nakd-inbound=%q dial-listen=%q forwards=%v)", *inbound, *nakdInbound, *dialListen, []string(forwards))
 		select {}
 	}
 
@@ -601,13 +607,13 @@ func waitDirect(ctx context.Context, h host.Host, p peer.ID, relays []peer.AddrI
 	}
 }
 
-func openDirectActivationStream(ctx context.Context, h host.Host, p peer.ID, relays []peer.AddrInfo) (network.Stream, error) {
+func openDirectNakdStream(ctx context.Context, h host.Host, p peer.ID, relays []peer.AddrInfo) (network.Stream, error) {
 	if err := waitDirect(ctx, h, p, relays); err != nil {
 		return nil, err
 	}
 	// Unlike openActivationStream, this intentionally does NOT call WithAllowLimitedConn. A relay
 	// circuit is a limited/transient connection and may rendezvous DCUtR, but may never carry nakd data.
-	s, err := h.NewStream(ctx, p, activationProto)
+	s, err := h.NewStream(ctx, p, nakdProto)
 	if err != nil {
 		return nil, err
 	}
@@ -641,7 +647,7 @@ func handleDialConn(h host.Host, c net.Conn, relays []peer.AddrInfo, directWait 
 	_ = c.SetDeadline(time.Time{})
 	ctx, cancel := context.WithTimeout(context.Background(), directWait)
 	defer cancel()
-	s, err := openDirectActivationStream(ctx, h, p, relays)
+	s, err := openDirectNakdStream(ctx, h, p, relays)
 	if err != nil {
 		writeDialError(c, err)
 		c.Close()
@@ -740,14 +746,29 @@ func runForward(h host.Host, listenAddr, peerMaddr string) {
 // engine — so the engine accepts on localhost, fed by its ring neighbours.
 func runInbound(h host.Host, engineAddr string) {
 	h.SetStreamHandler(activationProto, func(s network.Stream) {
-		if !isDirectConn(s.Conn()) {
-			log.Printf("refused inbound activation stream over limited/relayed connection from %s", s.Conn().RemotePeer())
-			_ = s.Reset()
-			return
-		}
 		c, err := net.Dial("tcp", engineAddr)
 		if err != nil {
 			log.Printf("inbound -> engine %s: %v", engineAddr, err)
+			s.Reset()
+			return
+		}
+		pipe(s, c)
+	})
+}
+
+// runNakdInbound is deliberately separate from the activation tunnel. Inference activation streams
+// are allowed to fall back to circuit relay; nakd already has its own relay fallback, so carrying its
+// bytes over a limited circuit would waste the rendezvous relay's tight data allowance.
+func runNakdInbound(h host.Host, nakdAddr string) {
+	h.SetStreamHandler(nakdProto, func(s network.Stream) {
+		if !isDirectConn(s.Conn()) {
+			log.Printf("refused inbound nakd stream over limited/relayed connection from %s", s.Conn().RemotePeer())
+			_ = s.Reset()
+			return
+		}
+		c, err := net.Dial("tcp", nakdAddr)
+		if err != nil {
+			log.Printf("inbound -> nakd %s: %v", nakdAddr, err)
 			s.Reset()
 			return
 		}

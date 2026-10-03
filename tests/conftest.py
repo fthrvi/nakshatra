@@ -92,6 +92,7 @@ if _scripts not in _sys.path:
 # monkeypatch.undo() also undid the fixture's tmp redirect). Fail the whole run if any test changes the
 # real node's units or messaging/signer state, instead of finding out from a broken updater.
 import hashlib as _hashlib
+import subprocess as _subprocess
 from pathlib import Path as _Path
 
 
@@ -120,6 +121,18 @@ def _real_state_digest():
             h.update(p.read_bytes())
         elif p.is_symlink():
             h.update(str(p.readlink()).encode())
+    # Files alone cannot reveal a test that stopped or restarted a live user unit. Ask systemd for
+    # every matching unit in one read-only call and pin both identity and process-generation fields.
+    # Stripped-down containers may have no systemctl/user bus; that is intentionally a silent skip.
+    try:
+        runtime = _subprocess.run(
+            ["systemctl", "--user", "show", "nak-*.service", "nakshatra-*.service",
+             "--property=Id,MainPID,NRestarts,ActiveEnterTimestampMonotonic"],
+            capture_output=True, timeout=10)
+        if runtime.returncode == 0:
+            h.update(runtime.stdout)
+    except (OSError, _subprocess.TimeoutExpired):
+        pass
     return h.hexdigest()
 
 

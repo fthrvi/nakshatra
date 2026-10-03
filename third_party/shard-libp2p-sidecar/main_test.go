@@ -60,6 +60,18 @@ func TestOpenActivationStreamAllowsLimitedRelay(t *testing.T) {
 	}
 }
 
+func TestNakdUsesDistinctDirectOnlyProtocol(t *testing.T) {
+	if nakdProto == activationProto {
+		t.Fatal("nakd must not share the relay-capable activation protocol")
+	}
+	if directPathAllowed(true, "/ip4/127.0.0.1/tcp/1") {
+		t.Fatal("nakd accepted a limited relay connection")
+	}
+	if directPathAllowed(false, "/ip4/1.2.3.4/tcp/1/p2p-circuit") {
+		t.Fatal("nakd accepted a circuit multiaddr")
+	}
+}
+
 func TestDialSocketIsUserOnly(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "nakshatra")
 	path := filepath.Join(dir, "p2p.sock")
@@ -95,7 +107,7 @@ func mustMode(t *testing.T, path string) os.FileMode {
 	return info.Mode().Perm()
 }
 
-func TestInboundActivationRequiresDirectConnection(t *testing.T) {
+func TestNakdInboundRequiresDirectConnection(t *testing.T) {
 	for _, tc := range []struct {
 		limited bool
 		addr    string
@@ -199,7 +211,7 @@ func TestDialListenerDirectRoundTrip(t *testing.T) {
 			go func() { defer c.Close(); _, _ = io.Copy(c, c) }()
 		}
 	}()
-	runInbound(b, echo.Addr().String())
+	runNakdInbound(b, echo.Addr().String())
 
 	sockPath := filepath.Join(t.TempDir(), "nakshatra", "p2p.sock")
 	ln, err := listenDialSocket(sockPath)

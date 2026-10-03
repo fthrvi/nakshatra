@@ -152,7 +152,7 @@
     "-listen",
     "/ip4/0.0.0.0/tcp/0",
     "-quic",
-    "-inbound=127.0.0.1:${NAK_DIRECT_PORT}",
+    "-nakd-inbound=127.0.0.1:${NAK_DIRECT_PORT}",
     "-dial-listen=${XDG_RUNTIME_DIR}/nakshatra/p2p.sock",
     "-relays=${P2P_RELAYS}"
    ],

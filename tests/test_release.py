@@ -147,6 +147,26 @@ def test_manual_rollback(env):
     assert os.readlink(env["tmp"] / "node" / "current") == "releases/0.1.0"
 
 
+def test_rollback_restarts_only_units_returned_by_write_units(tmp_path, monkeypatch):
+    prefix = tmp_path / "node"
+    old = prefix / "releases" / "0.1.0"
+    new = prefix / "releases" / "0.1.1"
+    old.mkdir(parents=True)
+    new.mkdir(parents=True)
+    old_man = {"version": "0.1.0", "services": {"kept": {}, "opted-out": {}}}
+    (old / "manifest.json").write_text(json.dumps(old_man))
+    (prefix / "current").symlink_to("releases/0.1.1")
+    (prefix / "config.json").write_text(json.dumps({"current": "0.1.1", "previous": "0.1.0"}))
+    inst = I.Installer(prefix, systemd=True, make_venv=False, unit_dir=tmp_path / "units")
+    restarted = []
+    monkeypatch.setattr(inst, "write_units", lambda man: ["kept"])
+    monkeypatch.setattr(inst, "restart", lambda names, man, force=False: restarted.append((names, force)) or names)
+
+    inst.rollback()
+
+    assert restarted == [(["kept"], True)]
+
+
 def test_archive_escaping_install_dir_refused(env):
     out = _build(env, "0.1.0")
     evil = io.BytesIO()
@@ -301,7 +321,7 @@ def test_p2p_sidecar_service_is_opt_in_and_uses_the_release_binary(tmp_path):
     svc = spec["services"]["nakshatra-p2p"]
     assert svc["requires"].endswith("/.nakshatra/p2p.env")
     assert svc["exec"][0] == "{prefix}/current/nakshatra/bin/nakshatra-sidecar"
-    assert "-quic" in svc["exec"] and "-inbound=127.0.0.1:${NAK_DIRECT_PORT}" in svc["exec"]
+    assert "-quic" in svc["exec"] and "-nakd-inbound=127.0.0.1:${NAK_DIRECT_PORT}" in svc["exec"]
     assert "-dial-listen=${XDG_RUNTIME_DIR}/nakshatra/p2p.sock" in svc["exec"] and "-relays=${P2P_RELAYS}" in svc["exec"]
     pre = svc["exec_start_pre"][0]
     assert "scripts/sidecar_key.py" in " ".join(pre) and "--if-missing" in pre
@@ -491,6 +511,25 @@ def test_removed_opt_in_stops_disables_and_removes_only_managed_unit(tmp_path, m
     assert ["systemctl", "--user", "disable", "--now", "operator.service"] not in calls
 
 
+def test_removed_opt_in_retains_managed_unit_when_disable_fails(tmp_path, monkeypatch):
+    units = tmp_path / "units"
+    units.mkdir()
+    (tmp_path / "node").mkdir()
+    inst = I.Installer(tmp_path / "node", systemd=True, make_venv=False, unit_dir=units)
+    svc = {"description": "managed", "requires": str(tmp_path / "gone.env"), "exec": ["{python}"]}
+    man = {"version": "0.1.0", "components": [], "services": {"managed": svc}}
+    unit = units / "managed.service"
+    unit.write_text(inst._unit_text(svc, inst._ctx(man), man))
+    monkeypatch.setattr(I.subprocess, "run", lambda args, **kw:
+                        type("R", (), {"returncode": 1, "stdout": "", "stderr": "bus error"})())
+
+    inst.write_units(man)
+
+    assert unit.exists()
+    issue = inst.status()["service_issues"]["managed"]
+    assert issue["status"] == "removal-failed"
+
+
 def test_the_gateway_service_needs_its_own_explicit_opt_in():
     spec = json.loads((Path(__file__).resolve().parent.parent / "release" / "spec.json").read_text())
     gw = spec["services"]["nakshatra-unconscious"]
@@ -528,8 +567,12 @@ def _svc_man(commits, lock="L1"):
 def test_restart_only_services_whose_inputs_changed_and_drain_busy_ones(tmp_path, monkeypatch):
     inst = I.Installer(tmp_path / "node", systemd=True, make_venv=False, unit_dir=tmp_path / "units")
     calls, waited = [], []
-    monkeypatch.setattr(I.subprocess, "run", lambda args, **kw: calls.append(args) or
-                        type("R", (), {"returncode": 0, "stdout": ""})())
+    def systemctl(args, **kw):
+        calls.append(args)
+        stdout = "ActiveState=active\nMainPID=42\nNRestarts=0\n" if "show" in args else ""
+        return type("R", (), {"returncode": 0, "stdout": stdout})()
+    monkeypatch.setattr(I.subprocess, "run", systemctl)
+    monkeypatch.setattr(I, "SERVICE_STABILITY_S", 0)
     monkeypatch.setattr(I.Installer, "_wait_idle", lambda self, port, mx: waited.append(port) or True)
     restarted = lambda: [a[-1] for a in calls if a[:3] == ["systemctl", "--user", "restart"]]
     assert sorted(inst.restart(["sig", "gw"], _svc_man(["n1", "s1"]))) == ["gw", "sig"]   # first time: both
@@ -541,7 +584,7 @@ def test_restart_only_services_whose_inputs_changed_and_drain_busy_ones(tmp_path
     assert inst.restart(["sig", "gw"], _svc_man(["n2", "s1"]), force=True) == ["sig", "gw"]   # rollback: all
 
 
-def test_inactive_restarted_service_triggers_existing_rollback(env, monkeypatch):
+def test_unstable_restarted_service_is_reported_without_release_rollback(env, monkeypatch):
     monkeypatch.setitem(B.SPEC, "services", {
         "svc": {"description": "test service", "exec": ["{python}"], "components": ["alpha"]}})
     _build(env, "0.1.0")
@@ -550,23 +593,58 @@ def test_inactive_restarted_service_triggers_existing_rollback(env, monkeypatch)
     inst = env["inst"]
     inst.systemd = True
     monkeypatch.setattr(I, "SERVICE_ACTIVE_TIMEOUT_S", 0)
+    monkeypatch.setattr(I, "SERVICE_STABILITY_S", 0)
     calls = []
 
     def systemctl(args, **kwargs):
         calls.append(args)
         rc = 0
-        if args[:4] == ["systemctl", "--user", "is-active", "--quiet"]:
-            # The new release's service never becomes active; the previous release does during rollback.
-            rc = 3 if os.readlink(env["tmp"] / "node" / "current").endswith("0.1.1") else 0
-        return type("R", (), {"returncode": rc, "stdout": "", "stderr": ""})()
+        stdout = ""
+        if "show" in args:
+            if os.readlink(env["tmp"] / "node" / "current").endswith("0.1.0"):
+                stdout = "ActiveState=active\nMainPID=41\nNRestarts=0\n"
+            else:
+                rc = 3
+        return type("R", (), {"returncode": rc, "stdout": stdout, "stderr": ""})()
 
     monkeypatch.setattr(I.subprocess, "run", systemctl)
     inst.install(str(env["dist"]), "canary", env["pub"], version="0.1.0")
-    with pytest.raises(I.InstallError, match="rolled back to 0.1.0"):
-        inst.update()
-    assert os.readlink(env["tmp"] / "node" / "current") == "releases/0.1.0"
+    old_fp = json.loads((env["tmp"] / "node" / "state" / "fingerprints.json").read_text())["svc"]
+    msg = inst.update()
+    assert "failed: svc" in msg
+    assert os.readlink(env["tmp"] / "node" / "current") == "releases/0.1.1"
+    assert inst.status()["service_issues"]["svc"]["status"] == "failed"
+    assert json.loads((env["tmp"] / "node" / "state" / "fingerprints.json").read_text())["svc"] == old_fp
     restarts = [a[-1] for a in calls if a[:3] == ["systemctl", "--user", "restart"]]
-    assert restarts.count("svc.service") >= 3       # initial install, failed update, successful rollback
+    assert restarts.count("svc.service") == 2       # initial install + failed update; no rollback restart
+
+
+def test_drain_timeout_defers_restart_and_fingerprint(tmp_path, monkeypatch):
+    inst = I.Installer(tmp_path / "node", systemd=True, make_venv=False, unit_dir=tmp_path / "units")
+    calls = []
+    monkeypatch.setattr(I.subprocess, "run", lambda args, **kw: calls.append(args) or
+                        type("R", (), {"returncode": 0, "stdout": ""})())
+    monkeypatch.setattr(I.Installer, "_wait_idle", lambda self, port, mx: False)
+
+    assert inst.restart(["gw"], _svc_man(["n1", "s1"])) == []
+
+    assert not any(a[:3] == ["systemctl", "--user", "restart"] for a in calls)
+    assert inst.status()["service_issues"]["gw"]["status"] == "pending"
+    assert "gw" not in json.loads((tmp_path / "node" / "state" / "fingerprints.json").read_text())
+
+
+def test_service_health_requires_stable_pid_and_restart_count(tmp_path, monkeypatch):
+    inst = I.Installer(tmp_path / "node", systemd=True, make_venv=False, unit_dir=tmp_path / "units")
+    snapshots = iter([
+        "ActiveState=active\nMainPID=41\nNRestarts=0\n",
+        "ActiveState=active\nMainPID=42\nNRestarts=1\n",
+    ])
+    monkeypatch.setattr(I.subprocess, "run", lambda args, **kw:
+                        type("R", (), {"returncode": 0, "stdout": next(snapshots)})())
+
+    healthy, detail = inst._wait_stable("svc", 0.1, 0)
+
+    assert not healthy and "MainPID 41->42" in detail and "NRestarts 0->1" in detail
 
 
 def test_the_gateway_drains_before_restart_in_the_shipped_spec():
