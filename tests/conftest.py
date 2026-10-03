@@ -97,13 +97,29 @@ from pathlib import Path as _Path
 
 def _real_state_digest():
     home = _Path.home()
-    paths = sorted(list((home / ".config" / "systemd" / "user").glob("nak-*")) +
-                   [home / ".nakshatra" / "net" / "agent", home / ".nakshatra" / "net" / "release-url",
-                    home / ".sthambha" / "signer" / "person.pub", home / ".sthambha" / "signer" / "node.pub"])
+    systemd = home / ".config" / "systemd" / "user"
+    paths = {
+        home / ".nakshatra" / "net" / name
+        for name in ("agent", "release-url", "name", "direct-port", "p2p-dial")
+    }
+    paths.update({home / ".sthambha" / "signer" / "person.pub",
+                  home / ".sthambha" / "signer" / "node.pub"})
+    for root in (home / ".nakshatra" / "keys", home / ".config" / "nakshatra-sidecar"):
+        if root.exists():
+            paths.update(p for p in root.rglob("*") if p.is_file() or p.is_symlink())
+    for pattern in ("nak-*.service*", "nakshatra-*.service*"):
+        for root in systemd.glob(pattern):
+            if root.is_dir():
+                paths.update(p for p in root.rglob("*") if p.is_file() or p.is_symlink())
+            else:
+                paths.add(root)
     h = _hashlib.sha256()
-    for p in paths:
+    for p in sorted(paths):
+        h.update(str(p).encode())
         if p.is_file():
-            h.update(str(p).encode() + p.read_bytes())
+            h.update(p.read_bytes())
+        elif p.is_symlink():
+            h.update(str(p.readlink()).encode())
     return h.hexdigest()
 
 

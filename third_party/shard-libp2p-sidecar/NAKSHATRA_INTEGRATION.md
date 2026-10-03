@@ -15,7 +15,7 @@
 > per relay that re-reserves at half the granted TTL (with a 30s retry backoff on failure), for
 > as long as the process runs. Verified against a real relay with a deliberately short TTL
 > (15s) — the reservation renewed continuously across multiple cycles with no gap. The second patch
-> adds the loopback-only `-dial-listen` protocol used by nakd: relay circuits rendezvous DCUtR, but
+> adds the uid-gated UNIX-socket `-dial-listen` protocol used by nakd: relay circuits rendezvous DCUtR, but
 > contact bytes are accepted only on the resulting direct connection. Both patches have Go tests.
 
 ## What it is
@@ -29,7 +29,7 @@ Interface (`main.go`):
 - `-inbound HOST:PORT` — inbound libp2p streams are dialed to the local engine here (a **worker**: its gRPC port).
 - `-forward LOCAL=PEER_MULTIADDR` — listen on a LOCAL tcp port, carry each conn to PEER (a **coordinator**: one per upstream worker, repeatable).
 - `-relay` — also be a public relay + AutoNAT server (run on a reachable box).
-- `-dial-listen 127.0.0.1:PORT` — accept `DIAL <peerid>` from nakd and return only a direct stream.
+- `-dial-listen PATH` — accept `DIAL <peerid>` from nakd on a mode-0600 UNIX socket and return only a direct stream.
 
 ## How it plugs into nakshatra (the wiring — next step, needs Go to build)
 The beauty: **nothing in our engine changes.** We only rewrite the chain's worker *addresses* to

@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -58,15 +60,51 @@ func TestOpenActivationStreamAllowsLimitedRelay(t *testing.T) {
 	}
 }
 
-func TestDialListenMustBeLoopback(t *testing.T) {
-	for _, good := range []string{"127.0.0.1:51831", "[::1]:51831"} {
-		if err := validateDialListen(good); err != nil {
-			t.Fatalf("%s: %v", good, err)
-		}
+func TestDialSocketIsUserOnly(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "nakshatra")
+	path := filepath.Join(dir, "p2p.sock")
+	ln, err := listenDialSocket(path)
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, bad := range []string{"0.0.0.0:51831", "[::]:51831", "192.168.1.2:51831", "localhost:51831", "51831"} {
-		if err := validateDialListen(bad); err == nil {
-			t.Fatalf("accepted non-literal/non-loopback bind %q", bad)
+	defer ln.Close()
+	if got := mustMode(t, dir); got != 0o700 {
+		t.Fatalf("directory mode = %o, want 700", got)
+	}
+	if got := mustMode(t, path); got != 0o600 {
+		t.Fatalf("socket mode = %o, want 600", got)
+	}
+	if _, err := listenDialSocket("relative.sock"); err == nil {
+		t.Fatal("accepted a relative socket path")
+	}
+	bad := filepath.Join(t.TempDir(), "not-a-socket")
+	if err := os.WriteFile(bad, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := listenDialSocket(bad); err == nil {
+		t.Fatal("replaced a non-socket path")
+	}
+}
+
+func mustMode(t *testing.T, path string) os.FileMode {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return info.Mode().Perm()
+}
+
+func TestInboundActivationRequiresDirectConnection(t *testing.T) {
+	for _, tc := range []struct {
+		limited bool
+		addr    string
+		want    bool
+	}{{false, "/ip4/127.0.0.1/tcp/1", true},
+		{true, "/ip4/127.0.0.1/tcp/1", false},
+		{false, "/ip4/1.2.3.4/tcp/1/p2p-circuit", false}} {
+		if got := directPathAllowed(tc.limited, tc.addr); got != tc.want {
+			t.Fatalf("directPathAllowed(%v, %q) = %v, want %v", tc.limited, tc.addr, got, tc.want)
 		}
 	}
 }
@@ -163,13 +201,14 @@ func TestDialListenerDirectRoundTrip(t *testing.T) {
 	}()
 	runInbound(b, echo.Addr().String())
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	sockPath := filepath.Join(t.TempDir(), "nakshatra", "p2p.sock")
+	ln, err := listenDialSocket(sockPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer ln.Close()
 	go serveDialListener(a, ln, nil, 5*time.Second)
-	c, err := net.Dial("tcp", ln.Addr().String())
+	c, err := net.Dial("unix", sockPath)
 	if err != nil {
 		t.Fatal(err)
 	}

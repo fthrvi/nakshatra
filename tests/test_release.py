@@ -302,7 +302,7 @@ def test_p2p_sidecar_service_is_opt_in_and_uses_the_release_binary(tmp_path):
     assert svc["requires"].endswith("/.nakshatra/p2p.env")
     assert svc["exec"][0] == "{prefix}/current/nakshatra/bin/nakshatra-sidecar"
     assert "-quic" in svc["exec"] and "-inbound=127.0.0.1:${NAK_DIRECT_PORT}" in svc["exec"]
-    assert "-dial-listen=127.0.0.1:51831" in svc["exec"] and "-relays=${P2P_RELAYS}" in svc["exec"]
+    assert "-dial-listen=${XDG_RUNTIME_DIR}/nakshatra/p2p.sock" in svc["exec"] and "-relays=${P2P_RELAYS}" in svc["exec"]
     pre = svc["exec_start_pre"][0]
     assert "scripts/sidecar_key.py" in " ".join(pre) and "--if-missing" in pre
     assert spec["binaries"] == [{"name": "nakshatra-sidecar", "file": "nakshatra-sidecar",
@@ -326,12 +326,14 @@ def test_go_sidecar_is_hash_covered_verified_and_installed(env, monkeypatch):
     monkeypatch.setitem(B.SPEC, "binaries", [{"name": "nakshatra-sidecar", "file": "nakshatra-sidecar",
                                                "component": "alpha", "source": "sidecar"}])
     fake_go = env["tmp"] / "go"
-    fake_go.write_text("#!/bin/sh\nwhile [ $# -gt 0 ]; do if [ \"$1\" = \"-o\" ]; then "
+    fake_go.write_text("#!/bin/sh\nif [ \"$1\" = version ]; then echo 'go version go1.25.7 linux/amd64'; exit 0; fi\n"
+                       "while [ $# -gt 0 ]; do if [ \"$1\" = \"-o\" ]; then "
                        "printf sidecar-binary > \"$2\"; exit 0; fi; shift; done\nexit 2\n")
     fake_go.chmod(0o755)
     out = _build(env, "0.1.0", go_bin=fake_go)
     man = json.loads((out / "manifest.json").read_text())
     artifact = man["artifacts"][0]
+    assert man["toolchains"]["go"]["version"] == "go1.25.7"
     assert artifact["path"] == "bin/nakshatra-sidecar"
     with tarfile.open(next(out.glob("alpha-*.tar.gz"))) as tf:
         assert "bin/nakshatra-sidecar" in tf.getnames()  # current/older installers already verify this archive
@@ -352,7 +354,8 @@ def test_tampered_go_sidecar_is_refused(env, monkeypatch):
     monkeypatch.setitem(B.SPEC, "binaries", [{"name": "nakshatra-sidecar", "file": "nakshatra-sidecar",
                                                "component": "alpha", "source": "sidecar"}])
     fake_go = env["tmp"] / "go"
-    fake_go.write_text("#!/bin/sh\nwhile [ $# -gt 0 ]; do if [ \"$1\" = \"-o\" ]; then "
+    fake_go.write_text("#!/bin/sh\nif [ \"$1\" = version ]; then echo 'go version go1.25.7 linux/amd64'; exit 0; fi\n"
+                       "while [ $# -gt 0 ]; do if [ \"$1\" = \"-o\" ]; then "
                        "printf sidecar > \"$2\"; exit 0; fi; shift; done\nexit 2\n")
     fake_go.chmod(0o755)
     out = _build(env, "0.1.0", go_bin=fake_go)
@@ -372,6 +375,50 @@ def test_tampered_go_sidecar_is_refused(env, monkeypatch):
     (out / "manifest.json").write_text(json.dumps(man))
     with pytest.raises(I.InstallError, match="installed artifact nakshatra-sidecar does not match"):
         env["inst"].install(str(env["dist"]), "canary", env["pub"])
+
+
+def test_go_build_uses_only_pinned_hermetic_environment(env, monkeypatch):
+    source = env["a"] / "sidecar"
+    source.mkdir()
+    (source / "go.mod").write_text("module test/sidecar\n\ngo 1.25\n")
+    (source / "main.go").write_text("package main\nfunc main() {}\n")
+    subprocess.run(["git", "-C", str(env["a"]), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(env["a"]), "-c", "user.email=t@t", "-c", "user.name=t",
+                    "commit", "-qm", "sidecar"], check=True)
+    commit = subprocess.check_output(["git", "-C", str(env["a"]), "rev-parse", "HEAD"], text=True).strip()
+    capture, fake_go = env["tmp"] / "go.env", env["tmp"] / "go"
+    fake_go.write_text("#!/bin/sh\n"
+                       "if [ \"$1\" = version ]; then echo 'go version go1.25.7 linux/amd64'; exit 0; fi\n"
+                       f"/usr/bin/env | /usr/bin/sort > {capture}\n"
+                       "while [ $# -gt 0 ]; do if [ \"$1\" = -o ]; then printf binary > \"$2\"; exit 0; fi; shift; done\n"
+                       "exit 2\n")
+    fake_go.chmod(0o755)
+    for key, value in {"GOFLAGS": "-modfile=evil.mod", "GOENV": "/tmp/evil", "GOAMD64": "v4",
+                       "GOTOOLCHAIN": "auto", "SECRET_BUILD_INPUT": "leak"}.items():
+        monkeypatch.setenv(key, value)
+    out = env["tmp"] / "sidecar-bin"
+    assert B._build_go_binary(env["a"], commit, "sidecar", out, fake_go) == "go1.25.7"
+    got = dict(line.split("=", 1) for line in capture.read_text().splitlines() if "=" in line)
+    assert got["GOENV"] == "off" and got["GOFLAGS"] == "-mod=readonly"
+    assert got["GOAMD64"] == "v1" and got["CGO_ENABLED"] == "0" and got["GOTOOLCHAIN"] == "local"
+    assert got["GOOS"] == "linux" and got["GOARCH"] == "amd64"
+    assert "nak-go-build-" in got["GOCACHE"] and "nak-go-build-" in got["GOMODCACHE"]
+    assert "nak-go-build-" in got["GOPATH"] and "SECRET_BUILD_INPUT" not in got
+
+
+def test_go_build_refuses_unpinned_toolchain(env):
+    source = env["a"] / "sidecar"
+    source.mkdir()
+    (source / "main.go").write_text("package main\nfunc main() {}\n")
+    subprocess.run(["git", "-C", str(env["a"]), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(env["a"]), "-c", "user.email=t@t", "-c", "user.name=t",
+                    "commit", "-qm", "sidecar"], check=True)
+    commit = subprocess.check_output(["git", "-C", str(env["a"]), "rev-parse", "HEAD"], text=True).strip()
+    fake_go = env["tmp"] / "wrong-go"
+    fake_go.write_text("#!/bin/sh\necho 'go version go1.25.6 linux/amd64'\n")
+    fake_go.chmod(0o755)
+    with pytest.raises(RuntimeError, match="require go1.25.7"):
+        B._build_go_binary(env["a"], commit, "sidecar", env["tmp"] / "out", fake_go)
 
 
 def test_units_are_written_by_the_installer_shipped_in_the_new_release(tmp_path):
@@ -419,6 +466,29 @@ def test_units_are_written_only_for_services_the_node_opted_into(tmp_path):
     names = inst.write_units(man)
     assert "svc-on" in names and "svc-always" in names and "svc-off" not in names
     assert (tmp_path / "units" / "svc-off.service").read_text() == "HAND-WRITTEN, LIVE"   # untouched
+
+
+def test_removed_opt_in_stops_disables_and_removes_only_managed_unit(tmp_path, monkeypatch):
+    units = tmp_path / "units"
+    units.mkdir()
+    (tmp_path / "node").mkdir()
+    inst = I.Installer(tmp_path / "node", systemd=True, make_venv=False, unit_dir=units)
+    man = {"version": "0.1.0", "components": [{"name": "nakshatra", "pythonpath": "scripts"}],
+           "services": {
+               "managed": {"description": "managed", "requires": str(tmp_path / "gone.env"),
+                           "exec": ["{python}"]},
+               "operator": {"description": "operator", "requires": str(tmp_path / "also-gone.env"),
+                            "exec": ["{python}"]}}}
+    (units / "managed.service").write_text(inst._unit_text(man["services"]["managed"], inst._ctx(man), man))
+    (units / "operator.service").write_text("[Service]\nExecStart=/operator/owned\n")
+    calls = []
+    monkeypatch.setattr(I.subprocess, "run", lambda args, **kw: calls.append(args) or
+                        type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})())
+    inst.write_units(man)
+    assert not (units / "managed.service").exists()
+    assert (units / "operator.service").read_text() == "[Service]\nExecStart=/operator/owned\n"
+    assert ["systemctl", "--user", "disable", "--now", "managed.service"] in calls
+    assert ["systemctl", "--user", "disable", "--now", "operator.service"] not in calls
 
 
 def test_the_gateway_service_needs_its_own_explicit_opt_in():
@@ -469,6 +539,34 @@ def test_restart_only_services_whose_inputs_changed_and_drain_busy_ones(tmp_path
     calls.clear()
     assert inst.restart(["sig", "gw"], _svc_man(["n2", "s1"])) == []        # nothing changed: nothing restarted
     assert inst.restart(["sig", "gw"], _svc_man(["n2", "s1"]), force=True) == ["sig", "gw"]   # rollback: all
+
+
+def test_inactive_restarted_service_triggers_existing_rollback(env, monkeypatch):
+    monkeypatch.setitem(B.SPEC, "services", {
+        "svc": {"description": "test service", "exec": ["{python}"], "components": ["alpha"]}})
+    _build(env, "0.1.0")
+    _commit(env["a"], "alpha", "OK = True\nV = 9\n")
+    _build(env, "0.1.1")
+    inst = env["inst"]
+    inst.systemd = True
+    monkeypatch.setattr(I, "SERVICE_ACTIVE_TIMEOUT_S", 0)
+    calls = []
+
+    def systemctl(args, **kwargs):
+        calls.append(args)
+        rc = 0
+        if args[:4] == ["systemctl", "--user", "is-active", "--quiet"]:
+            # The new release's service never becomes active; the previous release does during rollback.
+            rc = 3 if os.readlink(env["tmp"] / "node" / "current").endswith("0.1.1") else 0
+        return type("R", (), {"returncode": rc, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(I.subprocess, "run", systemctl)
+    inst.install(str(env["dist"]), "canary", env["pub"], version="0.1.0")
+    with pytest.raises(I.InstallError, match="rolled back to 0.1.0"):
+        inst.update()
+    assert os.readlink(env["tmp"] / "node" / "current") == "releases/0.1.0"
+    restarts = [a[-1] for a in calls if a[:3] == ["systemctl", "--user", "restart"]]
+    assert restarts.count("svc.service") >= 3       # initial install, failed update, successful rollback
 
 
 def test_the_gateway_drains_before_restart_in_the_shipped_spec():

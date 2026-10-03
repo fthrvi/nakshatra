@@ -33,6 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import releasekit as rk  # noqa: E402
 
 LATEST_TTL_S = 60 * 86400        # the signed "latest" pointer is refused after this (republish to extend)
+PINNED_GO_VERSION = "go1.25.7"
 SPEC = json.loads((Path(__file__).resolve().parent / "spec.json").read_text())
 
 
@@ -59,18 +60,45 @@ def _archive(repo: Path, commit: str, paths: list, out: Path, overlays=()) -> No
     out.write_bytes(gz)
 
 
-def _build_go_binary(repo: Path, commit: str, source: str, out: Path, go_bin: Path) -> None:
+def _hermetic_go_env(root: Path) -> dict[str, str]:
+    """The complete Go build environment: no ambient GOENV/GOFLAGS/modfile/toolchain tuning leaks in."""
+    cache = root / "go-cache"
+    modcache = root / "go-mod-cache"
+    gopath = root / "go-path"
+    for path in (cache, modcache, gopath):
+        path.mkdir(parents=True, exist_ok=True)
+    return {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": os.environ.get("HOME", str(Path.home())),
+        "GOCACHE": str(cache),
+        "GOMODCACHE": str(modcache),
+        "GOPATH": str(gopath),
+        "GOENV": "off",
+        "GOFLAGS": "-mod=readonly",
+        "GOAMD64": "v1",
+        "CGO_ENABLED": "0",
+        "GOOS": "linux",
+        "GOARCH": "amd64",
+        "GOTOOLCHAIN": "local",
+    }
+
+
+def _build_go_binary(repo: Path, commit: str, source: str, out: Path, go_bin: Path) -> str:
     """Compile from the exact archived commit, never from a possibly dirty checkout."""
     archive = subprocess.check_output(["git", "-C", str(repo), "archive", "--format=tar", commit, source])
     with tempfile.TemporaryDirectory(prefix="nak-go-build-") as td:
         root = Path(td)
         with tarfile.open(fileobj=io.BytesIO(archive)) as tf:
             tf.extractall(root, filter="data")
-        env = dict(os.environ, CGO_ENABLED="0", GOOS="linux", GOARCH="amd64")
-        # The source is an archive of the already-recorded commit, with no .git directory. Disable
-        # Go's redundant VCS probe explicitly (some builders force it through GOFLAGS).
+        env = _hermetic_go_env(root)
+        version = subprocess.run([str(go_bin), "version"], env=env, capture_output=True, text=True, check=True)
+        fields = version.stdout.strip().split()
+        if len(fields) < 3 or fields[:2] != ["go", "version"] or fields[2] != PINNED_GO_VERSION:
+            raise RuntimeError(f"Go toolchain is {version.stdout.strip()!r}; require {PINNED_GO_VERSION}")
+        # The source is an archive of the already-recorded commit, with no .git directory.
         subprocess.run([str(go_bin), "build", "-buildvcs=false", "-trimpath", "-o", str(out), "."],
                        cwd=root / source, env=env, check=True)
+        return fields[2]
 
 
 def build(version: str, channel: str, refs: dict, key_path: Path, out_root: Path,
@@ -86,13 +114,14 @@ def build(version: str, channel: str, refs: dict, key_path: Path, out_root: Path
         commit = _git(repo, "rev-parse", f"{refs.get(comp['name'], comp.get('default_ref', 'HEAD'))}^{{commit}}")
         f = out / f"{comp['name']}-{commit[:12]}.tar.gz"
         resolved.append((comp, repo, commit, f))
-    components, artifacts, overlays = [], [], {}
+    components, artifacts, overlays, toolchains = [], [], {}, {}
     with tempfile.TemporaryDirectory(prefix="nak-release-binaries-") as td:
         for binary in SPEC.get("binaries", []):
             comp, repo, commit, _ = next(r for r in resolved if r[0]["name"] == binary["component"])
             built = Path(td) / binary["file"]
-            _build_go_binary(repo, commit, binary["source"], built,
-                             Path(go_bin or shutil.which("go") or "go"))
+            go_version = _build_go_binary(repo, commit, binary["source"], built,
+                                          Path(go_bin or shutil.which("go") or "go"))
+            toolchains["go"] = {"version": go_version}
             install_path = binary.get("install_path", f"bin/{binary['file']}")
             overlays.setdefault(comp["name"], []).append((install_path, built, 0o755))
             artifacts.append({"name": binary["name"], "path": install_path,
@@ -143,6 +172,7 @@ def build(version: str, channel: str, refs: dict, key_path: Path, out_root: Path
                 "lock": {"file": lock.name, "sha256": rk.sha256_file(lock)},
                 "uv": {"file": "uv", "sha256": rk.sha256_file(out / "uv"), "version": uv_version},
                 "services": SPEC["services"], "health": SPEC["health"],
+                "toolchains": toolchains,
                 "installer": SPEC.get("installer", ""), "commands": SPEC.get("commands", {}),
                 "bootstrap": bootstrap, "profiles": profiles}
     priv_hex = key_path.read_text().strip()

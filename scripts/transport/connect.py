@@ -13,6 +13,7 @@ the libp2p sidecar (unification U3b). Whatever the path, the security is the sam
 from __future__ import annotations
 
 import ipaddress
+import os
 import socket
 import sys
 from pathlib import Path
@@ -108,21 +109,15 @@ def open_via_sidecar(dial_addr: str, peer_node_pub_hex: str, *, my_key: bytes, p
     """Ask the local libp2p sidecar for a hole-punched/direct stream, then run the exact same pinned
     Nakshatra handshake as :func:`open_direct`. Relay circuits may rendezvous DCUtR but the sidecar
     returns ``OK direct`` only after it has opened a non-relayed stream."""
-    from mesh.direct_tunnel import parse_hint  # noqa: PLC0415
     from sidecar_key import peer_id_from_node_pub  # noqa: PLC0415
 
-    candidates = parse_hint(dial_addr)
-    if len(candidates) != 1:
-        raise OSError("p2p dial address must be one loopback host:port")
-    host, port = candidates[0]
-    try:
-        if not ipaddress.ip_address(host).is_loopback:
-            raise OSError("p2p dial address must be loopback")
-    except ValueError as e:
-        raise OSError("p2p dial address must use a literal loopback IP") from e
-    sock = socket.create_connection((host, port), timeout=timeout)
+    path = Path(dial_addr)
+    if not path.is_absolute() or len(os.fsencode(path)) > 100:
+        raise OSError("p2p dial address must be an absolute UNIX socket path")
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         sock.settimeout(timeout)
+        sock.connect(str(path))
         sock.sendall(f"DIAL {peer_id_from_node_pub(peer_node_pub_hex)}\n".encode("ascii"))
         reply = bytearray()
         while b"\n" not in reply:

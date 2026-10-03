@@ -31,7 +31,9 @@ import (
 	"log"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/libp2p/go-libp2p"
@@ -237,7 +239,7 @@ func main() {
 	addrFile := flag.String("addrfile", "", "write this host's dial multiaddr here (for scripting)")
 	listenAddr := flag.String("listen", "/ip4/0.0.0.0/tcp/0", "libp2p listen multiaddr; pin the port for cross-box reach, e.g. /ip4/0.0.0.0/tcp/29600")
 	inbound := flag.String("inbound", "", "tunnel: dial this local engine addr (host:port) for each inbound libp2p stream")
-	dialListen := flag.String("dial-listen", "", "listen on loopback for DIAL <peerid> requests that require a direct libp2p path")
+	dialListen := flag.String("dial-listen", "", "listen on this user-only UNIX socket for DIAL <peerid> requests that require a direct libp2p path")
 	directWait := flag.Duration("direct-wait", 15*time.Second, "maximum time to wait for a direct (non-relayed) connection")
 	var forwards stringList
 	flag.Var(&forwards, "forward", "tunnel: localAddr=peerMultiaddr — listen localAddr, carry each conn to the peer (repeatable)")
@@ -250,9 +252,6 @@ func main() {
 	verify := flag.String("verify", "", "identity binding: verify a proof 'peerid,nonce,b64sig' -> OK/FAIL (reference for c0mpute)")
 	flag.Parse()
 	if *dialListen != "" {
-		if err := validateDialListen(*dialListen); err != nil {
-			log.Fatalf("dial-listen: %v", err)
-		}
 		if *directWait <= 0 {
 			log.Fatalf("direct-wait must be positive")
 		}
@@ -375,7 +374,7 @@ func main() {
 			runInbound(h, *inbound)
 		}
 		if *dialListen != "" {
-			ln, err := net.Listen("tcp", *dialListen)
+			ln, err := listenDialSocket(*dialListen)
 			if err != nil {
 				log.Fatalf("dial-listen %s: %v", *dialListen, err)
 			}
@@ -471,19 +470,52 @@ func openStream(h host.Host, peerAddr string) (network.Stream, error) {
 	return openActivationStream(ctx, info.ID, h.NewStream)
 }
 
-// validateDialListen keeps the small local DIAL protocol local. It deliberately accepts only
-// literal loopback IPs: a hostname can be rebound, and a wildcard silently exposes a peer-dial
-// primitive to the LAN.
-func validateDialListen(addr string) error {
-	hostPart, _, err := net.SplitHostPort(addr)
+// listenDialSocket keeps the peer-dial primitive scoped to this Unix uid. The containing directory
+// is private, must be owned by us, and the socket itself is mode 0600. Refuse pre-existing non-socket
+// paths rather than unlinking an arbitrary file selected through configuration.
+func listenDialSocket(path string) (net.Listener, error) {
+	if path == "" || !filepath.IsAbs(path) {
+		return nil, fmt.Errorf("want an absolute UNIX socket path")
+	}
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, fmt.Errorf("create socket directory: %w", err)
+	}
+	info, err := os.Lstat(dir)
 	if err != nil {
-		return fmt.Errorf("want loopback host:port: %w", err)
+		return nil, fmt.Errorf("inspect socket directory: %w", err)
 	}
-	ip := net.ParseIP(strings.Trim(hostPart, "[]"))
-	if ip == nil || !ip.IsLoopback() {
-		return fmt.Errorf("refusing non-loopback bind %q", addr)
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return nil, fmt.Errorf("socket directory is not a real directory")
 	}
-	return nil
+	if int(stat.Uid) != os.Getuid() {
+		return nil, fmt.Errorf("socket directory is owned by uid %d, not us", stat.Uid)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return nil, fmt.Errorf("make socket directory private: %w", err)
+	}
+	if old, err := os.Lstat(path); err == nil {
+		oldStat, owned := old.Sys().(*syscall.Stat_t)
+		if old.Mode()&os.ModeSocket == 0 || !owned || int(oldStat.Uid) != os.Getuid() {
+			return nil, fmt.Errorf("refusing to replace non-owned/non-socket path")
+		}
+		if err := os.Remove(path); err != nil {
+			return nil, fmt.Errorf("remove stale socket: %w", err)
+		}
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("inspect socket path: %w", err)
+	}
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		ln.Close()
+		_ = os.Remove(path)
+		return nil, fmt.Errorf("make socket private: %w", err)
+	}
+	return ln, nil
 }
 
 func parseDialLine(line []byte) (peer.ID, error) {
@@ -514,8 +546,12 @@ func writeDialError(w io.Writer, err error) {
 	_, _ = fmt.Fprintf(w, "ERR %s\n", reason)
 }
 
+func directPathAllowed(limited bool, remoteAddr string) bool {
+	return !limited && !strings.Contains(remoteAddr, "p2p-circuit")
+}
+
 func isDirectConn(c network.Conn) bool {
-	return !c.Stat().Limited && !strings.Contains(c.RemoteMultiaddr().String(), "p2p-circuit")
+	return directPathAllowed(c.Stat().Limited, c.RemoteMultiaddr().String())
 }
 
 func directConn(h host.Host, p peer.ID) network.Conn {
@@ -704,6 +740,11 @@ func runForward(h host.Host, listenAddr, peerMaddr string) {
 // engine — so the engine accepts on localhost, fed by its ring neighbours.
 func runInbound(h host.Host, engineAddr string) {
 	h.SetStreamHandler(activationProto, func(s network.Stream) {
+		if !isDirectConn(s.Conn()) {
+			log.Printf("refused inbound activation stream over limited/relayed connection from %s", s.Conn().RemotePeer())
+			_ = s.Reset()
+			return
+		}
 		c, err := net.Dial("tcp", engineAddr)
 		if err != nil {
 			log.Printf("inbound -> engine %s: %v", engineAddr, err)

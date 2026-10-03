@@ -69,6 +69,13 @@ def _ago(ts: int) -> str:
     return f"{d}s ago" if d < 120 else f"{d // 60}m ago" if d < 7200 else f"{d // 3600}h ago"
 
 
+def _default_p2p_socket() -> Path:
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if not runtime:
+        raise SystemExit("XDG_RUNTIME_DIR is not set; pass `nak p2p on --socket /absolute/path/p2p.sock`")
+    return Path(runtime) / "nakshatra" / "p2p.sock"
+
+
 def main(argv=None) -> int:
     default_sock = Path(os.environ.get("NAK_NET_DIR", Path.home() / ".nakshatra" / "net")) / "nakd.sock"
     ap = argparse.ArgumentParser(prog="nak", description=__doc__.split("\n")[0])
@@ -98,6 +105,7 @@ def main(argv=None) -> int:
     p.add_argument("port")
     p = sub.add_parser("p2p", help="use the local libp2p sidecar for both-NAT direct paths; restarts nak-net")
     p.add_argument("onoff", choices=["on", "off"])
+    p.add_argument("--socket", type=Path, help="sidecar UNIX socket (default: $XDG_RUNTIME_DIR/nakshatra/p2p.sock)")
     p = sub.add_parser("task", help="post / list / claim / submit tasks")
     tsub = p.add_subparsers(dest="tcmd", required=True)
     q = tsub.add_parser("post"); q.add_argument("to"); q.add_argument("title"); q.add_argument("instructions")
@@ -182,9 +190,12 @@ def main(argv=None) -> int:
         if a.onoff == "off":
             f.unlink(missing_ok=True)
         else:
-            f.write_text("127.0.0.1:51831\n")
+            dial = a.socket or _default_p2p_socket()
+            if not dial.is_absolute():
+                raise SystemExit("--socket must be an absolute path")
+            f.write_text(str(dial) + "\n")
         _sp.run(["systemctl", "--user", "restart", "nak-net.service"], check=False)
-        print(f"p2p {'OFF' if a.onoff == 'off' else 'ON via 127.0.0.1:51831'}; nak-net restarted")
+        print(f"p2p {'OFF' if a.onoff == 'off' else 'ON via ' + str(dial)}; nak-net restarted")
     elif a.cmd == "ledger":
         r = call(s, {"op": "ledger"})
         print(f"settlement adapter: {r['adapter']}  (TEST units — no real money)")

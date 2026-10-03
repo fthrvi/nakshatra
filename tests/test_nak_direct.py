@@ -71,15 +71,35 @@ def test_one_sided_opt_in_never_reveals_or_dials(net, loopback_ok):
     assert wait(lambda: a.node._paths.get(b.person_pub) == "relay", timeout=40)
 
 
+def test_one_sided_opt_in_sends_only_capability_without_endpoints(net, loopback_ok, monkeypatch):
+    a, b = _pair_direct(net)
+    sent = []
+    real_send = nakd.send_frame
+
+    def capture(ch, frame, lock=None):
+        if frame.get("t") in ("addr?", "addr"):
+            sent.append(dict(frame))
+        return real_send(ch, frame, lock)
+
+    monkeypatch.setattr(nakd, "send_frame", capture)
+    a.node.set_direct("b", True)
+    time.sleep(0.5)
+    assert {"t": "addr?", "direct": True} in sent
+    assert not any(f.get("t") == "addr" and f.get("endpoints") for f in sent)
+
+
 def test_turning_direct_off_forgets_addresses_and_falls_back_to_the_relay(net, loopback_ok):
     a, b = _pair_direct(net)
     a.node.set_direct("b", True)
     b.node.set_direct(a.person_pub, True)
     assert wait(lambda: (b.node.store.contact(a.person_pub) or {}).get("direct_hint"))
+    _drop(a.node, b.person_pub)
+    assert wait(lambda: a.node._paths.get(b.person_pub) == "direct" and b.node._paths.get(a.person_pub) == "direct",
+                timeout=40)
     b.node.set_direct(a.person_pub, False)
     assert not b.node.store.contact(a.person_pub).get("direct_hint")
-    _drop(b.node, a.person_pub)
     assert wait(lambda: b.node._paths.get(a.person_pub) == "relay", timeout=40)
+    assert wait(lambda: not (a.node.store.contact(b.person_pub) or {}).get("direct_hint"))
 
 
 def test_listener_refuses_a_stranger_and_a_wrong_key(net, loopback_ok):
@@ -94,8 +114,9 @@ def test_listener_refuses_a_stranger_and_a_wrong_key(net, loopback_ok):
 
 
 def test_both_p2p_advertisements_try_sidecar_after_endpoint_then_before_relay(net, loopback_ok, monkeypatch):
-    a = net("a", direct_port=_free_port(), p2p={"dial": "127.0.0.1:51831"})
-    b = net("b", direct_port=_free_port(), p2p={"dial": "127.0.0.1:51831"})
+    monkeypatch.setattr(nakd.Node, "_p2p_available", lambda self: bool(self.p2p))
+    a = net("a", direct_port=_free_port(), p2p={"dial": "/tmp/test-a-p2p.sock"})
+    b = net("b", direct_port=_free_port(), p2p={"dial": "/tmp/test-b-p2p.sock"})
     _connect(net, a, b)
     assert wait(lambda: a.node._paths.get(b.person_pub) == "relay" and b.node._paths.get(a.person_pub) == "relay")
     a.node.set_direct("b", True)
@@ -118,15 +139,43 @@ def test_both_p2p_advertisements_try_sidecar_after_endpoint_then_before_relay(ne
     assert wait(lambda: a.node._paths.get(b.person_pub) == "p2p" and b.node._paths.get(a.person_pub) == "p2p",
                 timeout=40)
     assert calls and net.relay.paired == paired
+    b.node.set_direct(a.person_pub, False)
+    assert wait(lambda: a.node._paths.get(b.person_pub) == "relay" and b.node._paths.get(a.person_pub) == "relay",
+                timeout=40)
+    assert not (a.node.store.contact(b.person_pub) or {}).get("p2p")
+
+
+def test_failed_p2p_attempt_clears_cached_capability_on_both_peers(net, loopback_ok, monkeypatch):
+    monkeypatch.setattr(nakd.Node, "_p2p_available", lambda self: bool(self.p2p))
+    a = net("a", direct_port=_free_port(), p2p={"dial": "/tmp/test-a-p2p.sock"})
+    b = net("b", direct_port=_free_port(), p2p={"dial": "/tmp/test-b-p2p.sock"})
+    _connect(net, a, b)
+    assert wait(lambda: a.node._paths.get(b.person_pub) == "relay" and b.node._paths.get(a.person_pub) == "relay")
+    a.node.set_direct("b", True)
+    b.node.set_direct(a.person_pub, True)
+    assert wait(lambda: (a.node.store.contact(b.person_pub) or {}).get("p2p")
+                and (b.node.store.contact(a.person_pub) or {}).get("p2p"))
+    monkeypatch.setattr(nakd, "open_direct", lambda *a, **kw: (_ for _ in ()).throw(OSError("direct failed")))
+    monkeypatch.setattr(nakd, "open_via_sidecar",
+                        lambda *a, **kw: (_ for _ in ()).throw(OSError("peer unavailable")))
+    paired = net.relay.paired
+    _drop(a.node, b.person_pub)
+    assert wait(lambda: net.relay.paired > paired and a.node._paths.get(b.person_pub) == "relay"
+                and b.node._paths.get(a.person_pub) == "relay",
+                timeout=40)
+    assert wait(lambda: all(not (node.store.contact(person) or {}).get("direct_hint")
+                            and not (node.store.contact(person) or {}).get("p2p")
+                            for node, person in ((a.node, b.person_pub), (b.node, a.person_pub))))
 
 
 def test_nak_p2p_toggle_uses_only_the_test_state_dir(tmp_path, monkeypatch):
     from network import nak
     calls = []
     monkeypatch.setenv("NAK_NET_DIR", str(tmp_path))
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "run"))
     monkeypatch.setattr(subprocess, "run", lambda args, **kwargs: calls.append(args))
     assert nak.main(["p2p", "on"]) == 0
-    assert (tmp_path / "p2p-dial").read_text() == "127.0.0.1:51831\n"
+    assert (tmp_path / "p2p-dial").read_text() == f"{tmp_path}/run/nakshatra/p2p.sock\n"
     assert calls[-1] == ["systemctl", "--user", "restart", "nak-net.service"]
     assert nak.main(["p2p", "off"]) == 0
     assert not (tmp_path / "p2p-dial").exists()

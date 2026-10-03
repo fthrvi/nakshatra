@@ -77,10 +77,11 @@ def test_wrong_pinned_key_fails(relay):
     assert isinstance(out["a"], (SecureChannelError, OSError))
 
 
-def test_sidecar_socket_uses_the_same_direct_pinned_handshake():
+def test_sidecar_socket_uses_the_same_direct_pinned_handshake(tmp_path):
     a, b = _key(), _key()
-    listener = socket.socket()
-    listener.bind(("127.0.0.1", 0))
+    path = tmp_path / "p2p.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(path))
     listener.listen(1)
     out = {}
 
@@ -98,7 +99,7 @@ def test_sidecar_socket_uses_the_same_direct_pinned_handshake():
 
     t = threading.Thread(target=server)
     t.start()
-    sock, ch = open_via_sidecar(f"127.0.0.1:{listener.getsockname()[1]}", b[1], my_key=a[0],
+    sock, ch = open_via_sidecar(str(path), b[1], my_key=a[0],
                                 purpose=b"nak-msg-v1", timeout=5)
     ch.sendall(b"hello")
     assert ch.recv(5) == b"world"
@@ -109,16 +110,17 @@ def test_sidecar_socket_uses_the_same_direct_pinned_handshake():
     assert out == {"dial": f"DIAL {peer_id_from_node_pub(b[1])}\n".encode(), "peer": a[1], "body": b"hello"}
 
 
-def test_sidecar_dial_address_must_be_loopback():
+def test_sidecar_dial_address_must_be_an_absolute_unix_socket():
     a, b = _key(), _key()
-    with pytest.raises(OSError, match="loopback"):
-        open_via_sidecar("192.0.2.1:51831", b[1], my_key=a[0], purpose=b"x", timeout=0.1)
+    with pytest.raises(OSError, match="absolute UNIX"):
+        open_via_sidecar("relative.sock", b[1], my_key=a[0], purpose=b"x", timeout=0.1)
 
 
-def test_sidecar_must_explicitly_confirm_a_direct_stream():
+def test_sidecar_must_explicitly_confirm_a_direct_stream(tmp_path):
     a, b = _key(), _key()
-    listener = socket.socket()
-    listener.bind(("127.0.0.1", 0))
+    path = tmp_path / "p2p.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(path))
     listener.listen(1)
 
     def server():
@@ -131,7 +133,7 @@ def test_sidecar_must_explicitly_confirm_a_direct_stream():
     t = threading.Thread(target=server)
     t.start()
     with pytest.raises(OSError, match="ERR no direct connection"):
-        open_via_sidecar(f"127.0.0.1:{listener.getsockname()[1]}", b[1], my_key=a[0],
+        open_via_sidecar(str(path), b[1], my_key=a[0],
                          purpose=b"x", timeout=2)
     t.join(2)
     listener.close()

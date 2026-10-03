@@ -150,6 +150,10 @@ class Store:
         self._q("UPDATE contacts SET direct_hint=?, p2p=? WHERE person=? AND direct=1",
                 (hint, int(bool(p2p)), person))
 
+    def clear_direct_addr(self, person: str) -> None:
+        """Forget a peer's withdrawn/failed direct capability without changing our own opt-in."""
+        self._q("UPDATE contacts SET direct_hint=NULL, p2p=0 WHERE person=?", (person,))
+
     def remove_contact(self, person: str) -> None:
         self._q("DELETE FROM contacts WHERE person=?", (person,))
 

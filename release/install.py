@@ -38,6 +38,8 @@ import releasekit as rk  # noqa: E402
 DEFAULT_PREFIX = Path(os.environ.get("NAK_NODE_PREFIX", Path.home() / ".nakshatra-node"))
 UNIT_DIR = Path.home() / ".config" / "systemd" / "user"
 _THIS_FILE = Path(__file__).resolve()      # resolved at LOAD time, before any `current` switch
+UNIT_MARKER = "# Managed by nakshatra-node install.py"
+SERVICE_ACTIVE_TIMEOUT_S = 20.0
 
 
 class InstallError(Exception):
@@ -262,8 +264,17 @@ class Installer:
                         "ProtectHome=read-only"]
             paths = svc.get("read_write_paths") or ["{home}/.nakshatra"]
             service += [f"ReadWritePaths={_render(p, ctx)}" for p in paths]
-        return ("[Unit]\n" + "\n".join(unit) + "\n\n[Service]\n" + "\n".join(service) +
+        return (UNIT_MARKER + "\n[Unit]\n" + "\n".join(unit) + "\n\n[Service]\n" + "\n".join(service) +
                 "\n\n[Install]\nWantedBy=default.target\n")
+
+    @staticmethod
+    def _managed_unit(path: Path) -> bool:
+        try:
+            head = path.read_text()[:1000]
+        except OSError:
+            return False
+        # The Description marker recognizes units written by pre-marker installers during upgrade.
+        return UNIT_MARKER in head or "(managed by nakshatra-node install.py)" in head
 
     def write_units(self, man: dict) -> list:
         ctx, names = self._ctx(man), []
@@ -272,6 +283,12 @@ class Installer:
             # A node that has NOT opted into a service gets no unit file for it at all: writing one
             # anyway would overwrite whatever (possibly hand-written, possibly live) unit carries that name.
             if svc.get("requires") and not Path(_render(svc["requires"], ctx)).exists():
+                unit_path = self.unit_dir / f"{name}.service"
+                if unit_path.exists() and self._managed_unit(unit_path):
+                    if self.systemd:
+                        subprocess.run(["systemctl", "--user", "disable", "--now", f"{name}.service"],
+                                       check=False)
+                    unit_path.unlink()
                 continue
             (self.unit_dir / f"{name}.service").write_text(self._unit_text(svc, ctx, man))
             names.append(name)
@@ -337,6 +354,8 @@ class Installer:
             if drain:
                 self._wait_idle(int(drain["port"]), float(drain.get("max_wait_s", 900)))
             subprocess.run(["systemctl", "--user", "restart", f"{n}.service"], check=False)
+            if not self._wait_active(n, SERVICE_ACTIVE_TIMEOUT_S):
+                raise InstallError(f"{n}.service did not become active after restart")
             if fp:
                 fps[n] = fp
         _save_json(self.prefix / "state" / "fingerprints.json", fps)
@@ -364,6 +383,15 @@ class Installer:
 
     def _active(self, name: str) -> bool:
         return subprocess.run(["systemctl", "--user", "is-active", "--quiet", f"{name}.service"]).returncode == 0
+
+    def _wait_active(self, name: str, timeout_s: float) -> bool:
+        deadline = time.monotonic() + timeout_s
+        while True:
+            if self._active(name):
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.5)
 
     def _wait_idle(self, port: int, max_wait_s: float) -> bool:
         """True once nothing is connected to `port` (checked twice, 2 s apart), False at the time limit."""

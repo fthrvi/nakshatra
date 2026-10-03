@@ -191,7 +191,7 @@ class Node:
         self.person = who["person"]
         self.custody = who.get("custody", "")
         self.direct_port = direct_port        # U3b: listen for direct connections (opt-in, per node)
-        self.p2p = dict(p2p) if p2p else None  # {"dial": "127.0.0.1:51831"}; sidecar is opt-in
+        self.p2p = dict(p2p) if p2p else None  # {"dial": "/run/user/<uid>/nakshatra/p2p.sock"}
         self._paths: dict[str, str] = {}      # contact person -> "direct" | "p2p" | "relay"
         self._listener = None
         self._stop = threading.Event()
@@ -420,6 +420,13 @@ class Node:
         self._wake.setdefault(person, threading.Event())
         self._spawn(f"session:{person}", self._session_loop, person)
 
+    def _p2p_available(self) -> bool:
+        """Advertise/use p2p only while the opted-in sidecar's uid-gated socket actually exists."""
+        try:
+            return bool(self.p2p and Path(str(self.p2p.get("dial", ""))).is_socket())
+        except OSError:
+            return False
+
     def _session_loop(self, person: str) -> None:
         attempt = 0
         while not self._stop.is_set():
@@ -431,8 +438,9 @@ class Node:
                 continue
             sock = ch = None
             path = "relay"
+            p2p_failed = False
             role0 = pair_role(self.node, c["node"], MSG_DOMAIN)
-            can_p2p = bool(c.get("direct") and c.get("p2p") and self.p2p)
+            can_p2p = bool(c.get("direct") and c.get("p2p") and self._p2p_available())
             if c.get("direct") and (c.get("direct_hint") or can_p2p) and not role0.is_initiator:
                 # Exactly ONE side dials direct (the pairing initiator, as on the relay); the other waits
                 # briefly for that call before falling back, so the two never cross and refuse each other.
@@ -454,6 +462,10 @@ class Node:
                                                 purpose=MSG_DOMAIN.encode(), timeout=P2P_TIMEOUT_S)
                     path = "p2p"
                 except (OSError, SecureChannelError, ValueError) as e:
+                    # A failed attempt means the cached capability may be stale. Forget it locally and
+                    # mark it negative to the peer once the relay fallback is established.
+                    self.store.clear_direct_addr(person)
+                    p2p_failed = True
                     self.log(f"direct (p2p) to {c['petname'] or person[:12]} failed ({e}); using the relay")
             if ch is None:
                 role = pair_role(self.node, c["node"], MSG_DOMAIN)
@@ -467,13 +479,13 @@ class Node:
             path_label = "direct (p2p)" if path == "p2p" else path
             self.log(f"session up with {c['petname'] or person[:12]} ({path_label})")
             started = time.time()
-            self._run_session(person, sock, ch, path=path)
+            self._run_session(person, sock, ch, path=path, p2p_failed=p2p_failed)
             # A session that drops at once is a failure, not a success: keep backing off unless it
             # actually lasted (a peer that accepts and hangs up must not drive a tight loop).
             attempt = 0 if time.time() - started > 60 else attempt + 1
             self._backoff(attempt)
 
-    def _run_session(self, person: str, sock, ch, path: str = "relay") -> None:
+    def _run_session(self, person: str, sock, ch, path: str = "relay", p2p_failed: bool = False) -> None:
         lock = threading.Lock()
         with self._lock:
             if person in self._sessions:          # lost a race with another path: keep the first
@@ -481,11 +493,30 @@ class Node:
                 return
             self._sessions[person] = (ch, lock)
             self._paths[person] = path
+        advertised = False
+
+        def advertise_endpoints_once() -> None:
+            # Endpoint disclosure happens only after the peer has proved its opt-in by sending either
+            # {t:addr?, direct:true} or its own addr frame. Older addr? frames remain parse-compatible,
+            # but cannot trigger disclosure because they carry no affirmative capability bit.
+            nonlocal advertised
+            cc = self.store.contact(person) or {}
+            if p2p_failed or advertised or not (cc.get("direct") and self.direct_port):
+                return
+            send_frame(ch, {"t": "addr", "endpoints": local_endpoints(self.direct_port),
+                            "p2p": self._p2p_available()}, lock)
+            advertised = True
+
         c0 = self.store.contact(person) or {}
-        if c0.get("direct") and self.direct_port:
-            try:                                  # our direct addresses, ONLY to a contact we opted in for
-                send_frame(ch, {"t": "addr", "endpoints": local_endpoints(self.direct_port),
-                                "p2p": bool(self.p2p)}, lock)
+        if p2p_failed:
+            try:
+                send_frame(ch, {"t": "addr", "endpoints": [], "p2p": False, "failed": True}, lock)
+            except (OSError, SecureChannelError):
+                pass
+        elif c0.get("direct"):
+            try:
+                # Capability first, with no endpoints. Both peers must opt in before either reveals any.
+                send_frame(ch, {"t": "addr?", "direct": True}, lock)
             except (OSError, SecureChannelError):
                 pass
         wake = self._wake.setdefault(person, threading.Event())
@@ -503,15 +534,20 @@ class Node:
                         send_frame(ch, self._receive(person, frame), lock)
                     elif t == "ack":
                         self.store.ack(str(frame.get("mid", "")), person)
-                    elif t == "addr?":  # they ask for our endpoints; answer only if we opted them in
+                    elif t == "addr?":  # a direct:true capability proves their side opted in
                         cc = self.store.contact(person) or {}
-                        if cc.get("direct") and self.direct_port:
-                            send_frame(ch, {"t": "addr", "endpoints": local_endpoints(self.direct_port),
-                                            "p2p": bool(self.p2p)}, lock)
+                        if frame.get("direct") is True and cc.get("direct"):
+                            advertise_endpoints_once()
                     elif t == "addr":   # their direct endpoints; kept only if WE opted this contact in
                         hint = frame.get("endpoints")
-                        if isinstance(hint, str) and len(hint) <= 1000:
+                        cc = self.store.contact(person) or {}
+                        if hint == [] and frame.get("p2p") is False:
+                            self.store.clear_direct_addr(person)
+                        elif not p2p_failed and cc.get("direct") and isinstance(hint, str) and len(hint) <= 1000:
                             self.store.set_direct_addr(person, hint, frame.get("p2p") is True)
+                            # A positive advertisement also proves remote opt-in. This completes the
+                            # exchange when our earlier capability arrived before they enabled direct.
+                            advertise_endpoints_once()
                     elif t == "nack":   # received and refused: terminal, stop retrying, keep why
                         self.store.refuse(str(frame.get("mid", "")), str(frame.get("why", "")), person)
                         self.log(f"{person[:12]} refused {str(frame.get('mid', ''))[:8]}: {frame.get('why')}")
@@ -617,16 +653,19 @@ class Node:
         self.store.set_direct(c["person"], on)
         with self._lock:
             sess = self._sessions.get(c["person"])
-        if on and sess:
+            path = self._paths.get(c["person"])
+        if sess:
             try:
-                if self.direct_port:
-                    send_frame(sess[0], {"t": "addr", "endpoints": local_endpoints(self.direct_port),
-                                         "p2p": bool(self.p2p)}, sess[1])
-                # They may have sent theirs before we opted in (we dropped it): ask again. They answer
-                # only if they opted in for us too.
-                send_frame(sess[0], {"t": "addr?"}, sess[1])
+                if on:
+                    # No endpoints here: the peer must answer with its own direct:true capability first.
+                    send_frame(sess[0], {"t": "addr?", "direct": True}, sess[1])
+                else:
+                    send_frame(sess[0], {"t": "addr", "endpoints": [], "p2p": False}, sess[1])
             except (OSError, SecureChannelError):
                 pass
+            if not on and path in ("direct", "p2p"):
+                # Revocation takes effect immediately. The session loops reconnect over the relay.
+                _hard_close(sess[0])
         return {"person": c["person"], "direct": bool(on), "listening": bool(self.direct_port)}
 
     def _listen_loop(self) -> None:
@@ -1048,7 +1087,7 @@ def main(argv=None) -> int:
     ap.add_argument("--agent", default=os.environ.get("NAK_AGENT", ""))
     ap.add_argument("--relay", default=os.environ.get("NAK_RELAY", f"{DEFAULT_RELAY[0]}:{DEFAULT_RELAY[1]}"))
     ap.add_argument("--direct-port", type=int, help="direct listener port (overrides <state>/direct-port)")
-    ap.add_argument("--p2p-dial", help="local sidecar DIAL address (overrides <state>/p2p-dial)")
+    ap.add_argument("--p2p-dial", help="local sidecar UNIX socket path (overrides <state>/p2p-dial)")
     a = ap.parse_args(argv)
     if not a.agent and (a.state / "agent").exists():
         a.agent = (a.state / "agent").read_text().strip()      # set once per node: `echo prithvi > …/net/agent`

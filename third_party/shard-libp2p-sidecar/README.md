@@ -59,7 +59,8 @@ intact. No `SHARD_PSK` anywhere.
 
 ## Nakd direct-path socket
 
-`-dial-listen 127.0.0.1:51831` enables the loopback-only protocol used by nakd. A local client
+`-dial-listen "$XDG_RUNTIME_DIR/nakshatra/p2p.sock"` enables the uid-gated UNIX-socket protocol used by nakd. The
+directory and socket are forced to modes 0700 and 0600, and a directory owned by another uid is refused. A local client
 writes `DIAL <peerid>\n`. The sidecar may use a configured `-relays` circuit to rendezvous DCUtR,
 but waits up to `-direct-wait` (15 s by default) for a non-relayed connection and opens the stream
 only there. It replies `OK direct\n` before piping bytes, or `ERR <reason>\n` and closes. User data

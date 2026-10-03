@@ -57,11 +57,19 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--node-key", type=Path, default=WORKER_KEY_PATH)
     ap.add_argument("--out", type=Path, required=True)
-    ap.add_argument("--if-missing", action="store_true", help="leave an existing sidecar key unchanged")
+    ap.add_argument("--if-missing", action="store_true",
+                    help="leave an existing key only when it already derives from the current node key")
     a = ap.parse_args(argv)
-    if a.if_missing and a.out.exists():
-        return 0
     blob = libp2p_ed25519_private(a.node_key.read_bytes())
+    if a.if_missing and a.out.exists():
+        try:
+            if a.out.read_bytes() == blob:
+                return 0
+        except OSError:
+            pass
+        backup = a.out.with_name(a.out.name + ".bak")
+        os.replace(a.out, backup)
+        print(f"backed up mismatched/corrupt key to {backup}")
     a.out.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(a.out), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "wb") as f:

@@ -41,3 +41,23 @@ def test_sidecar_peer_id_matches_go_libp2p_fixed_vector():
     # RFC 8032 test key; expected value is also derived with peer.IDFromPublicKey in the sidecar's Go tests.
     pub = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
     assert peer_id_from_node_pub(pub) == "12D3KooWQK1wnefoLrcVHbbnf5tLzbopUd3K3bFAoJpA7YJgL5pV"
+
+
+def test_sidecar_if_missing_repairs_mismatched_or_corrupt_key_and_keeps_backup(tmp_path):
+    import os
+    from sidecar_key import libp2p_ed25519_private, main
+    node_key, out = tmp_path / "node.key", tmp_path / "sidecar" / "node.key"
+    seed = os.urandom(32)
+    node_key.write_bytes(seed)
+    out.parent.mkdir()
+    out.write_bytes(b"truncated legacy key")
+    assert main(["--node-key", str(node_key), "--out", str(out), "--if-missing"]) == 0
+    assert out.read_bytes() == libp2p_ed25519_private(seed)
+    assert out.with_name("node.key.bak").read_bytes() == b"truncated legacy key"
+
+    # A valid key for a different node is also repaired, not accepted just because it parses/exists.
+    wrong = libp2p_ed25519_private(os.urandom(32))
+    out.write_bytes(wrong)
+    assert main(["--node-key", str(node_key), "--out", str(out), "--if-missing"]) == 0
+    assert out.read_bytes() == libp2p_ed25519_private(seed)
+    assert out.with_name("node.key.bak").read_bytes() == wrong
