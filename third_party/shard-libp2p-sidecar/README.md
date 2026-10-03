@@ -56,3 +56,11 @@ libp2p, no `SHARD_PSK`, bit-identical to the trusted-wire receipt
 
 `ROUND-TRIP OK` with two distinct PeerIds = the transport is up, authenticated by key, and
 intact. No `SHARD_PSK` anywhere.
+
+## Nakd direct-path socket
+
+`-dial-listen 127.0.0.1:51831` enables the loopback-only protocol used by nakd. A local client
+writes `DIAL <peerid>\n`. The sidecar may use a configured `-relays` circuit to rendezvous DCUtR,
+but waits up to `-direct-wait` (15 s by default) for a non-relayed connection and opens the stream
+only there. It replies `OK direct\n` before piping bytes, or `ERR <reason>\n` and closes. User data
+is never carried over the relay circuit.

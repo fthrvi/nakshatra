@@ -36,11 +36,11 @@ Unification work in progress (U1–U6): `trisul/plans/2026-10-03-nakshatra-unifi
 | Many streams over one channel | `transport/mux_tunnel.py` | LIVE | meshd tunnels |
 | Admission-gated relay (default deny, trust tiers) | `transport/junction.py` + trisul `infra/control-plane/admission.py` | LIVE | VPS :9778 |
 | **Hole punching + relay fallback (libp2p DCUtR, circuit-relay-v2)** | `third_party/shard-libp2p-sidecar` | **LIVE**: VPS relay :29700 (+QUIC); blackwell exposes Ollama through it | VPS, blackwell |
-| Native UDP hole punch (HMAC-authenticated) | `mesh/direct_path.py` | BUILT, **not called** (proven 3.77× on WAN 2026-08-01) | — |
+| Native UDP hole punch (HMAC-authenticated; retained for the WireGuard/inference path) | `mesh/direct_path.py` | BUILT, **not called** (proven 3.77× on WAN 2026-08-01) | — |
 | Relay / direct / IPv6 decision; NAT class | `pathchoice.py`, `ipv6.py`, `natclass.py`, `stunshape.py`, `mesh/path_probe.py` | BUILT, not called | — |
 | **Reach a peer** (relay + pinned handshake + purpose binding) | **`transport/connect.py`**: `open_channel` (relay), `open_direct` / `accept_direct` (direct TCP over LAN or IPv6, using `mesh/direct_tunnel` and its SSRF filter). meshd, nakd and tunnel_endpoint all use it. | LIVE | every node |
-| Direct connections between contacts (U3b) | nakd: opt-in per contact on BOTH sides (`nak direct <name> on`) and per node (`nak direct-listen 51830`). Addresses are swapped only inside the encrypted session. One dialer (the pairing initiator); the same pinned handshake with a direct-only binding; the relay is the fallback. | LIVE (0.9.0) | contacts who opt in |
-| UDP hole punch for both-NAT pairs | `mesh/direct_path.py` (needs a reliable stream on top) and the libp2p sidecar | BUILT / LIVE for Sutra only | → next |
+| Direct connections between contacts (U3b) | nakd: opt-in per contact on BOTH sides (`nak direct <name> on`) and per node (`nak direct-listen 51830`). Addresses and the p2p capability are swapped only inside the encrypted session. One dialer tries LAN/IPv6, then the sidecar, then the relay; every path uses the same pinned handshake and direct-only binding. | LIVE | contacts who opt in |
+| UDP hole punch for both-NAT contacts | `third_party/shard-libp2p-sidecar` DCUtR via its circuit-relay-v2 rendezvous; `-dial-listen` gives nakd only a non-relayed stream, and the signed release ships it as opt-in `nakshatra-p2p` | LIVE | contacts with direct + p2p on at both ends |
 
 ## People and their agents (added 2026-10)
 | Job | Component | Status | Runs where |

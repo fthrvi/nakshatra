@@ -52,7 +52,7 @@ contacts, and take on tasks your contacts post. It can't accept connections; tha
 
 | Who | Sees |
 |---|---|
-| Your friend | your person key, node key, the name you chose. **Not** your IP address, unless you BOTH turn on direct connections for each other (`nak direct <name> on`): then they learn your LAN/IPv6 addresses and traffic skips the relay. |
+| Your friend | your person key, node key, the name you chose. **Not** your IP address, unless you BOTH turn on direct connections for each other (`nak direct <name> on`): then they learn your LAN/IPv6 addresses. If p2p is also on, the hole-punch connection exposes your public IP to that contact. |
 | The relay operator | that two IP addresses met. Everything else is encrypted. |
 | Anyone else | nothing. They can't reach you without an accepted connection. |
 

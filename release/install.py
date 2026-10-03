@@ -167,6 +167,16 @@ class Installer:
             d.mkdir()
             with tarfile.open(work / c["file"]) as tf:
                 _safe_extract(tf, d)
+        component_names = {c["name"] for c in man["components"]}
+        for artifact in man.get("artifacts", []):
+            parts = Path(artifact["path"]).parts
+            if artifact.get("component") not in component_names or not parts or Path(artifact["path"]).is_absolute() \
+                    or ".." in parts:
+                raise InstallError(f"bad artifact path in manifest: {artifact.get('path')}")
+            dst = rel / artifact["component"] / artifact["path"]
+            if not dst.is_file() or rk.sha256_file(dst) != artifact["sha256"]:
+                raise InstallError(f"installed artifact {artifact['name']} does not match its signed sha256")
+            os.chmod(dst, int(artifact.get("mode", "0644"), 8))
         shutil.copy2(work / man["lock"]["file"], rel / "requirements.lock")
         lock_to_install = rel / "requirements.lock"
         for pname in self.active_profiles(man):
@@ -242,12 +252,16 @@ class Installer:
             service.append(f"EnvironmentFile=-{_render(svc['env_file'], ctx)}")
         for k, v in (svc.get("environment") or {}).items():
             service.append(f"Environment={k}={_render(str(v), ctx)}")
+        for command in svc.get("exec_start_pre", []):
+            service.append("ExecStartPre=" + " ".join(_render(a, ctx) for a in command))
         service.append("ExecStart=" + " ".join(_render(a, ctx) for a in svc["exec"]))
         service.append(f"Restart={svc.get('restart', 'on-failure')}")
         service.append("RestartSec=5")
         if svc.get("hardening"):
             service += ["NoNewPrivileges=true", "PrivateTmp=true", "ProtectSystem=strict",
-                        "ProtectHome=read-only", f"ReadWritePaths={ctx['home']}/.nakshatra"]
+                        "ProtectHome=read-only"]
+            paths = svc.get("read_write_paths") or ["{home}/.nakshatra"]
+            service += [f"ReadWritePaths={_render(p, ctx)}" for p in paths]
         return ("[Unit]\n" + "\n".join(unit) + "\n\n[Service]\n" + "\n".join(service) +
                 "\n\n[Install]\nWantedBy=default.target\n")
 

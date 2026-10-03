@@ -12,6 +12,7 @@ the libp2p sidecar (unification U3b). Whatever the path, the security is the sam
 """
 from __future__ import annotations
 
+import ipaddress
 import socket
 import sys
 from pathlib import Path
@@ -71,19 +72,15 @@ def _pub_of(key: bytes) -> str:
     return ed25519.Ed25519PrivateKey.from_private_bytes(key).public_key().public_bytes_raw().hex()
 
 
-def open_direct(hint: str, *, my_key: bytes, peer_pub_hex: str, purpose: bytes,
-                timeout: float = 10.0) -> Tuple[socket.socket, SecureChannel]:
-    """Dial the peer directly using its endpoint hint (filtered: no loopback, link-local, multicast or
-    DNS names; see mesh/direct_tunnel.py) and run the pinned handshake as initiator. Raises on failure."""
-    from mesh.direct_tunnel import dial_direct  # noqa: PLC0415
-    sock, why = dial_direct(hint)
-    if sock is None:
-        raise OSError(f"no direct path: {why}")
+def _handshake_direct_socket(sock: socket.socket, *, my_key: bytes, peer_pub_hex: str, purpose: bytes,
+                             timeout: float) -> Tuple[socket.socket, SecureChannel]:
+    """Finish the one direct protocol after TCP or the sidecar has supplied its socket."""
     try:
+        my_pub = _pub_of(my_key)
         sock.settimeout(timeout)
-        sock.sendall(DIRECT_MAGIC + bytes.fromhex(_pub_of(my_key)))
+        sock.sendall(DIRECT_MAGIC + bytes.fromhex(my_pub))
         chan = secure_handshake(sock, my_key, peer_pub_hex, True,
-                                direct_binding(purpose, _pub_of(my_key), peer_pub_hex))
+                                direct_binding(purpose, my_pub, peer_pub_hex))
         sock.settimeout(None)
         return sock, chan
     except BaseException:
@@ -92,6 +89,63 @@ def open_direct(hint: str, *, my_key: bytes, peer_pub_hex: str, purpose: bytes,
         except OSError:
             pass
         raise
+
+
+def open_direct(hint: str, *, my_key: bytes, peer_pub_hex: str, purpose: bytes,
+                timeout: float = 10.0) -> Tuple[socket.socket, SecureChannel]:
+    """Dial the peer directly using its endpoint hint (filtered: no loopback, link-local, multicast or
+    DNS names; see mesh/direct_tunnel.py) and run the pinned handshake as initiator. Raises on failure."""
+    from mesh.direct_tunnel import dial_direct  # noqa: PLC0415
+    sock, why = dial_direct(hint)
+    if sock is None:
+        raise OSError(f"no direct path: {why}")
+    return _handshake_direct_socket(sock, my_key=my_key, peer_pub_hex=peer_pub_hex,
+                                    purpose=purpose, timeout=timeout)
+
+
+def open_via_sidecar(dial_addr: str, peer_node_pub_hex: str, *, my_key: bytes, purpose: bytes,
+                     timeout: float) -> Tuple[socket.socket, SecureChannel]:
+    """Ask the local libp2p sidecar for a hole-punched/direct stream, then run the exact same pinned
+    Nakshatra handshake as :func:`open_direct`. Relay circuits may rendezvous DCUtR but the sidecar
+    returns ``OK direct`` only after it has opened a non-relayed stream."""
+    from mesh.direct_tunnel import parse_hint  # noqa: PLC0415
+    from sidecar_key import peer_id_from_node_pub  # noqa: PLC0415
+
+    candidates = parse_hint(dial_addr)
+    if len(candidates) != 1:
+        raise OSError("p2p dial address must be one loopback host:port")
+    host, port = candidates[0]
+    try:
+        if not ipaddress.ip_address(host).is_loopback:
+            raise OSError("p2p dial address must be loopback")
+    except ValueError as e:
+        raise OSError("p2p dial address must use a literal loopback IP") from e
+    sock = socket.create_connection((host, port), timeout=timeout)
+    try:
+        sock.settimeout(timeout)
+        sock.sendall(f"DIAL {peer_id_from_node_pub(peer_node_pub_hex)}\n".encode("ascii"))
+        reply = bytearray()
+        while b"\n" not in reply:
+            chunk = sock.recv(256)
+            if not chunk:
+                raise OSError("p2p sidecar closed before replying")
+            reply += chunk
+            if len(reply) > 512:
+                raise OSError("p2p sidecar reply is too long")
+        line, extra = bytes(reply).split(b"\n", 1)
+        if extra:
+            raise OSError("p2p sidecar sent data before the direct stream was ready")
+        if line != b"OK direct":
+            reason = line.decode("utf-8", "replace")
+            raise OSError(f"p2p sidecar refused direct stream: {reason}")
+    except BaseException:
+        try:
+            sock.close()
+        except OSError:
+            pass
+        raise
+    return _handshake_direct_socket(sock, my_key=my_key, peer_pub_hex=peer_node_pub_hex,
+                                    purpose=purpose, timeout=timeout)
 
 
 def accept_direct(conn: socket.socket, *, my_key: bytes, purpose: bytes, allow) -> Tuple[str, SecureChannel]:

@@ -11,6 +11,7 @@
     "proto",
     "release",
     "engine",
+    "third_party/shard-libp2p-sidecar",
     "deploy/provision-worker.sh"
    ],
    "pythonpath": "scripts"
@@ -23,6 +24,15 @@
     "pyproject.toml"
    ],
    "pythonpath": "."
+  }
+ ],
+ "binaries": [
+  {
+   "name": "nakshatra-sidecar",
+   "file": "nakshatra-sidecar",
+   "install_path": "bin/nakshatra-sidecar",
+   "component": "nakshatra",
+   "source": "third_party/shard-libp2p-sidecar"
   }
  ],
  "requirements": [
@@ -109,6 +119,49 @@
    ],
    "restart": "always",
    "hardening": true,
+   "components": [
+    "nakshatra"
+   ]
+  },
+  "nakshatra-p2p": {
+   "description": "Nakshatra libp2p direct-path sidecar (DCUtR hole punching)",
+   "requires": "{home}/.nakshatra/p2p.env",
+   "env_file": "{home}/.nakshatra/p2p.env",
+   "after": [
+    "network-online.target",
+    "nak-net.service"
+   ],
+   "environment": {
+    "NAK_DIRECT_PORT": "51830"
+   },
+   "exec_start_pre": [
+    [
+     "{python}",
+     "{prefix}/current/nakshatra/scripts/sidecar_key.py",
+     "--node-key",
+     "{home}/.nakshatra/keys/worker.ed25519",
+     "--out",
+     "{home}/.config/nakshatra-sidecar/node.key",
+     "--if-missing"
+    ]
+   ],
+   "exec": [
+    "{prefix}/current/nakshatra/bin/nakshatra-sidecar",
+    "-key",
+    "{home}/.config/nakshatra-sidecar/node.key",
+    "-listen",
+    "/ip4/0.0.0.0/tcp/0",
+    "-quic",
+    "-inbound=127.0.0.1:${NAK_DIRECT_PORT}",
+    "-dial-listen=127.0.0.1:51831",
+    "-relays=${P2P_RELAYS}"
+   ],
+   "restart": "always",
+   "hardening": true,
+   "read_write_paths": [
+    "{home}/.nakshatra",
+    "{home}/.config"
+   ],
    "components": [
     "nakshatra"
    ]

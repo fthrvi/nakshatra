@@ -34,3 +34,10 @@ def test_sidecar_key_is_the_node_key_in_libp2p_form():
     assert blob[:4] == bytes([0x08, 0x01, 0x12, 64]) and len(blob) == 68
     assert blob[4:36] == seed
     assert blob[36:] == ed25519.Ed25519PrivateKey.from_private_bytes(seed).public_key().public_bytes_raw()
+
+
+def test_sidecar_peer_id_matches_go_libp2p_fixed_vector():
+    from sidecar_key import peer_id_from_node_pub
+    # RFC 8032 test key; expected value is also derived with peer.IDFromPublicKey in the sidecar's Go tests.
+    pub = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+    assert peer_id_from_node_pub(pub) == "12D3KooWQK1wnefoLrcVHbbnf5tLzbopUd3K3bFAoJpA7YJgL5pV"

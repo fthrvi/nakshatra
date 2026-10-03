@@ -96,6 +96,8 @@ def main(argv=None) -> int:
     p.add_argument("who"); p.add_argument("onoff", choices=["on", "off"])
     p = sub.add_parser("direct-listen", help="accept direct connections on this port (or 'off'); restarts nak-net")
     p.add_argument("port")
+    p = sub.add_parser("p2p", help="use the local libp2p sidecar for both-NAT direct paths; restarts nak-net")
+    p.add_argument("onoff", choices=["on", "off"])
     p = sub.add_parser("task", help="post / list / claim / submit tasks")
     tsub = p.add_subparsers(dest="tcmd", required=True)
     q = tsub.add_parser("post"); q.add_argument("to"); q.add_argument("title"); q.add_argument("instructions")
@@ -111,6 +113,8 @@ def main(argv=None) -> int:
         r = call(s, {"op": "status"})
         print(f"person {r['person'][:16]}…  node {r['node'][:16]}…  custody {r['custody']}  relay {r['relay']}")
         print(f"{len(r['contacts'])} contacts, {r['pending_requests']} pending requests, {r['open_invites']} open invites")
+        print(f"direct listener {r.get('direct_port') or 'off'}  p2p "
+              f"{(r.get('p2p') or {}).get('dial', 'off')}")
     elif a.cmd == "invite":
         import joincode
         from cryptography.hazmat.primitives.asymmetric import ed25519
@@ -172,6 +176,15 @@ def main(argv=None) -> int:
             f.write_text(str(int(a.port)) + "\n")
         _sp.run(["systemctl", "--user", "restart", "nak-net.service"], check=False)
         print(f"direct listener {'off' if a.port == 'off' else 'on port ' + a.port}; nak-net restarted")
+    elif a.cmd == "p2p":
+        import subprocess as _sp
+        f = Path(os.environ.get("NAK_NET_DIR", Path.home() / ".nakshatra" / "net")) / "p2p-dial"
+        if a.onoff == "off":
+            f.unlink(missing_ok=True)
+        else:
+            f.write_text("127.0.0.1:51831\n")
+        _sp.run(["systemctl", "--user", "restart", "nak-net.service"], check=False)
+        print(f"p2p {'OFF' if a.onoff == 'off' else 'ON via 127.0.0.1:51831'}; nak-net restarted")
     elif a.cmd == "ledger":
         r = call(s, {"op": "ledger"})
         print(f"settlement adapter: {r['adapter']}  (TEST units — no real money)")

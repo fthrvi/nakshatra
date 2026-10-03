@@ -3,6 +3,7 @@ dialer (the pairing initiator), the same pinned handshake, the relay as the fall
 from __future__ import annotations
 
 import socket
+import subprocess
 import time
 
 import pytest
@@ -90,3 +91,42 @@ def test_listener_refuses_a_stranger_and_a_wrong_key(net, loopback_ok):
         C.open_direct(f"127.0.0.1:{a.node.direct_port}", my_key=stranger, peer_pub_hex=a.node.node,
                       purpose=nakd.MSG_DOMAIN.encode(), timeout=5)
     assert b.person_pub not in a.node._sessions or a.node._paths.get(b.person_pub) == "relay"
+
+
+def test_both_p2p_advertisements_try_sidecar_after_endpoint_then_before_relay(net, loopback_ok, monkeypatch):
+    a = net("a", direct_port=_free_port(), p2p={"dial": "127.0.0.1:51831"})
+    b = net("b", direct_port=_free_port(), p2p={"dial": "127.0.0.1:51831"})
+    _connect(net, a, b)
+    assert wait(lambda: a.node._paths.get(b.person_pub) == "relay" and b.node._paths.get(a.person_pub) == "relay")
+    a.node.set_direct("b", True)
+    b.node.set_direct(a.person_pub, True)
+    assert wait(lambda: (a.node.store.contact(b.person_pub) or {}).get("p2p")
+                and (b.node.store.contact(a.person_pub) or {}).get("p2p"))
+
+    real_open = C.open_direct
+    targets = {a.node.node: a.node.direct_port, b.node.node: b.node.direct_port}
+    calls = []
+    monkeypatch.setattr(nakd, "open_direct", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("blocked")))
+
+    def via(dial, peer_node_pub_hex, **kwargs):
+        calls.append((dial, peer_node_pub_hex))
+        return real_open(f"127.0.0.1:{targets[peer_node_pub_hex]}", peer_pub_hex=peer_node_pub_hex, **kwargs)
+
+    monkeypatch.setattr(nakd, "open_via_sidecar", via)
+    paired = net.relay.paired
+    _drop(a.node, b.person_pub)
+    assert wait(lambda: a.node._paths.get(b.person_pub) == "p2p" and b.node._paths.get(a.person_pub) == "p2p",
+                timeout=40)
+    assert calls and net.relay.paired == paired
+
+
+def test_nak_p2p_toggle_uses_only_the_test_state_dir(tmp_path, monkeypatch):
+    from network import nak
+    calls = []
+    monkeypatch.setenv("NAK_NET_DIR", str(tmp_path))
+    monkeypatch.setattr(subprocess, "run", lambda args, **kwargs: calls.append(args))
+    assert nak.main(["p2p", "on"]) == 0
+    assert (tmp_path / "p2p-dial").read_text() == "127.0.0.1:51831\n"
+    assert calls[-1] == ["systemctl", "--user", "restart", "nak-net.service"]
+    assert nak.main(["p2p", "off"]) == 0
+    assert not (tmp_path / "p2p-dial").exists()

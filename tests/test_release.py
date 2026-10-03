@@ -296,6 +296,84 @@ def test_meshd_and_relay_ship_in_the_release_but_only_run_where_opted_in():
         assert svc["requires"].endswith(".env") and svc["hardening"] is True and svc["restart"] == "always"
 
 
+def test_p2p_sidecar_service_is_opt_in_and_uses_the_release_binary(tmp_path):
+    spec = json.loads((Path(__file__).resolve().parent.parent / "release" / "spec.json").read_text())
+    svc = spec["services"]["nakshatra-p2p"]
+    assert svc["requires"].endswith("/.nakshatra/p2p.env")
+    assert svc["exec"][0] == "{prefix}/current/nakshatra/bin/nakshatra-sidecar"
+    assert "-quic" in svc["exec"] and "-inbound=127.0.0.1:${NAK_DIRECT_PORT}" in svc["exec"]
+    assert "-dial-listen=127.0.0.1:51831" in svc["exec"] and "-relays=${P2P_RELAYS}" in svc["exec"]
+    pre = svc["exec_start_pre"][0]
+    assert "scripts/sidecar_key.py" in " ".join(pre) and "--if-missing" in pre
+    assert spec["binaries"] == [{"name": "nakshatra-sidecar", "file": "nakshatra-sidecar",
+                                 "install_path": "bin/nakshatra-sidecar",
+                                 "component": "nakshatra", "source": "third_party/shard-libp2p-sidecar"}]
+    inst = I.Installer(tmp_path / "node", systemd=False, make_venv=False)
+    text = inst._unit_text(svc, inst._ctx({"components": [{"name": "nakshatra", "pythonpath": "scripts"}]}),
+                           {"components": [{"name": "nakshatra", "pythonpath": "scripts"}]})
+    assert "ExecStartPre=" in text and "sidecar_key.py" in text
+    assert f"ReadWritePaths={Path.home()}/.config" in text
+
+
+def test_go_sidecar_is_hash_covered_verified_and_installed(env, monkeypatch):
+    source = env["a"] / "sidecar"
+    source.mkdir()
+    (source / "go.mod").write_text("module test/sidecar\n\ngo 1.22\n")
+    (source / "main.go").write_text("package main\nfunc main() {}\n")
+    subprocess.run(["git", "-C", str(env["a"]), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(env["a"]), "-c", "user.email=t@t", "-c", "user.name=t",
+                    "commit", "-qm", "sidecar"], check=True)
+    monkeypatch.setitem(B.SPEC, "binaries", [{"name": "nakshatra-sidecar", "file": "nakshatra-sidecar",
+                                               "component": "alpha", "source": "sidecar"}])
+    fake_go = env["tmp"] / "go"
+    fake_go.write_text("#!/bin/sh\nwhile [ $# -gt 0 ]; do if [ \"$1\" = \"-o\" ]; then "
+                       "printf sidecar-binary > \"$2\"; exit 0; fi; shift; done\nexit 2\n")
+    fake_go.chmod(0o755)
+    out = _build(env, "0.1.0", go_bin=fake_go)
+    man = json.loads((out / "manifest.json").read_text())
+    artifact = man["artifacts"][0]
+    assert artifact["path"] == "bin/nakshatra-sidecar"
+    with tarfile.open(next(out.glob("alpha-*.tar.gz"))) as tf:
+        assert "bin/nakshatra-sidecar" in tf.getnames()  # current/older installers already verify this archive
+    assert not (out / "nakshatra-sidecar").exists()     # no new top-level file an older updater would skip
+    env["inst"].install(str(env["dist"]), "canary", env["pub"])
+    installed = env["tmp"] / "node" / "current" / "alpha" / "bin" / "nakshatra-sidecar"
+    assert artifact["sha256"] == rk.sha256_file(installed)
+    assert installed.read_bytes() == b"sidecar-binary" and os.access(installed, os.X_OK)
+
+
+def test_tampered_go_sidecar_is_refused(env, monkeypatch):
+    source = env["a"] / "sidecar"
+    source.mkdir()
+    (source / "main.go").write_text("package main\nfunc main() {}\n")
+    subprocess.run(["git", "-C", str(env["a"]), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(env["a"]), "-c", "user.email=t@t", "-c", "user.name=t",
+                    "commit", "-qm", "sidecar"], check=True)
+    monkeypatch.setitem(B.SPEC, "binaries", [{"name": "nakshatra-sidecar", "file": "nakshatra-sidecar",
+                                               "component": "alpha", "source": "sidecar"}])
+    fake_go = env["tmp"] / "go"
+    fake_go.write_text("#!/bin/sh\nwhile [ $# -gt 0 ]; do if [ \"$1\" = \"-o\" ]; then "
+                       "printf sidecar > \"$2\"; exit 0; fi; shift; done\nexit 2\n")
+    fake_go.chmod(0o755)
+    out = _build(env, "0.1.0", go_bin=fake_go)
+    archive = next(out.glob("alpha-*.tar.gz"))
+    unpacked = env["tmp"] / "tampered-component"
+    with tarfile.open(archive) as tf:
+        tf.extractall(unpacked, filter="data")
+    (unpacked / "bin" / "nakshatra-sidecar").write_bytes(b"tampered")
+    with tarfile.open(archive, "w:gz") as tf:
+        for path in sorted(unpacked.rglob("*")):
+            tf.add(path, arcname=path.relative_to(unpacked))
+    man = json.loads((out / "manifest.json").read_text())
+    for component in man["components"]:
+        if component["name"] == "alpha":
+            component["sha256"] = rk.sha256_file(archive)  # outer archive is valid; inner hash is not
+    man = rk.sign({k: v for k, v in man.items() if k != "sig"}, env["key"].read_text().strip())
+    (out / "manifest.json").write_text(json.dumps(man))
+    with pytest.raises(I.InstallError, match="installed artifact nakshatra-sidecar does not match"):
+        env["inst"].install(str(env["dist"]), "canary", env["pub"])
+
+
 def test_units_are_written_by_the_installer_shipped_in_the_new_release(tmp_path):
     prefix = tmp_path / "node"
     (prefix / "current" / "pkg").mkdir(parents=True)

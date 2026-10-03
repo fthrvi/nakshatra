@@ -11,13 +11,15 @@
 // about $ZERO, accounts, payments, or the orchestrator — only peers and bytes.
 //
 // Modes:
-//   -inbound HOST:PORT            tunnel: dial the local engine for each inbound stream
-//   -forward LOCAL=PEER_MULTIADDR tunnel: listen LOCAL, carry each conn to PEER (repeatable)
-//   -peer PEER_MULTIADDR          self-test: round-trip one frame to a listener (connectivity check)
-//   (none)                        self-test listener: echo one frame back
+//
+//	-inbound HOST:PORT            tunnel: dial the local engine for each inbound stream
+//	-forward LOCAL=PEER_MULTIADDR tunnel: listen LOCAL, carry each conn to PEER (repeatable)
+//	-peer PEER_MULTIADDR          self-test: round-trip one frame to a listener (connectivity check)
+//	(none)                        self-test listener: echo one frame back
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -37,6 +39,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/peerstore"
 	"github.com/libp2p/go-libp2p/core/protocol"
 	relayclient "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/client"
 	"github.com/multiformats/go-multiaddr"
@@ -46,6 +49,7 @@ import (
 const (
 	activationProto       = "/shard/activation/1.0.0"
 	activationRelayReason = "shard activation stream"
+	maxDialLine           = 512
 )
 
 // openActivationStream opts into circuit-relay connections. go-libp2p marks
@@ -233,6 +237,8 @@ func main() {
 	addrFile := flag.String("addrfile", "", "write this host's dial multiaddr here (for scripting)")
 	listenAddr := flag.String("listen", "/ip4/0.0.0.0/tcp/0", "libp2p listen multiaddr; pin the port for cross-box reach, e.g. /ip4/0.0.0.0/tcp/29600")
 	inbound := flag.String("inbound", "", "tunnel: dial this local engine addr (host:port) for each inbound libp2p stream")
+	dialListen := flag.String("dial-listen", "", "listen on loopback for DIAL <peerid> requests that require a direct libp2p path")
+	directWait := flag.Duration("direct-wait", 15*time.Second, "maximum time to wait for a direct (non-relayed) connection")
 	var forwards stringList
 	flag.Var(&forwards, "forward", "tunnel: localAddr=peerMultiaddr — listen localAddr, carry each conn to the peer (repeatable)")
 	size := flag.Int("size", 1<<20, "self-test frame size in bytes (default 1 MiB)")
@@ -243,6 +249,14 @@ func main() {
 	prove := flag.String("prove", "", "identity binding: sign this challenge with the node key; print PEERID + SIG")
 	verify := flag.String("verify", "", "identity binding: verify a proof 'peerid,nonce,b64sig' -> OK/FAIL (reference for c0mpute)")
 	flag.Parse()
+	if *dialListen != "" {
+		if err := validateDialListen(*dialListen); err != nil {
+			log.Fatalf("dial-listen: %v", err)
+		}
+		if *directWait <= 0 {
+			log.Fatalf("direct-wait must be positive")
+		}
+	}
 
 	// Identity-binding verify: prove a PeerId controls its key, from (peerid, nonce, sig)
 	// alone — no node key needed. This is the check c0mpute runs (ported to TS) before it
@@ -356,9 +370,16 @@ func main() {
 	// Tunnel mode: a transparent TCP<->libp2p bridge. The engine keeps its own socket
 	// code and just talks to localhost; the sidecar carries each connection to/from the
 	// right ring neighbour over libp2p. This is what replaces wire.py's TCP.
-	if *inbound != "" || len(forwards) > 0 {
+	if *inbound != "" || *dialListen != "" || len(forwards) > 0 {
 		if *inbound != "" {
 			runInbound(h, *inbound)
+		}
+		if *dialListen != "" {
+			ln, err := net.Listen("tcp", *dialListen)
+			if err != nil {
+				log.Fatalf("dial-listen %s: %v", *dialListen, err)
+			}
+			go serveDialListener(h, ln, staticRelays, *directWait)
 		}
 		for _, f := range forwards {
 			pp := strings.SplitN(f, "=", 2)
@@ -367,7 +388,7 @@ func main() {
 			}
 			go runForward(h, pp[0], pp[1])
 		}
-		log.Printf("tunnel up (inbound=%q forwards=%v)", *inbound, []string(forwards))
+		log.Printf("tunnel up (inbound=%q dial-listen=%q forwards=%v)", *inbound, *dialListen, []string(forwards))
 		select {}
 	}
 
@@ -448,6 +469,166 @@ func openStream(h host.Host, peerAddr string) (network.Stream, error) {
 		return nil, err
 	}
 	return openActivationStream(ctx, info.ID, h.NewStream)
+}
+
+// validateDialListen keeps the small local DIAL protocol local. It deliberately accepts only
+// literal loopback IPs: a hostname can be rebound, and a wildcard silently exposes a peer-dial
+// primitive to the LAN.
+func validateDialListen(addr string) error {
+	hostPart, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("want loopback host:port: %w", err)
+	}
+	ip := net.ParseIP(strings.Trim(hostPart, "[]"))
+	if ip == nil || !ip.IsLoopback() {
+		return fmt.Errorf("refusing non-loopback bind %q", addr)
+	}
+	return nil
+}
+
+func parseDialLine(line []byte) (peer.ID, error) {
+	if len(line) > maxDialLine {
+		return "", fmt.Errorf("DIAL line too long")
+	}
+	line = bytes.TrimSuffix(line, []byte("\n"))
+	line = bytes.TrimSuffix(line, []byte("\r"))
+	if !bytes.HasPrefix(line, []byte("DIAL ")) || len(line) == len("DIAL ") {
+		return "", fmt.Errorf("want DIAL <peerid>")
+	}
+	value := string(line[len("DIAL "):])
+	if strings.ContainsAny(value, " \t\r\n") {
+		return "", fmt.Errorf("want one peer id")
+	}
+	p, err := peer.Decode(value)
+	if err != nil {
+		return "", fmt.Errorf("bad peer id: %w", err)
+	}
+	return p, nil
+}
+
+func writeDialError(w io.Writer, err error) {
+	reason := strings.NewReplacer("\r", " ", "\n", " ").Replace(err.Error())
+	if len(reason) > 300 {
+		reason = reason[:300]
+	}
+	_, _ = fmt.Fprintf(w, "ERR %s\n", reason)
+}
+
+func isDirectConn(c network.Conn) bool {
+	return !c.Stat().Limited && !strings.Contains(c.RemoteMultiaddr().String(), "p2p-circuit")
+}
+
+func directConn(h host.Host, p peer.ID) network.Conn {
+	for _, c := range h.Network().ConnsToPeer(p) {
+		if isDirectConn(c) {
+			return c
+		}
+	}
+	return nil
+}
+
+// addRelayCircuitAddrs teaches the host how to reach p through each configured relay. The circuit is
+// rendezvous only: waitDirect refuses it for the user's stream and waits for DCUtR to produce a
+// separate non-relayed connection.
+func addRelayCircuitAddrs(h host.Host, p peer.ID, relays []peer.AddrInfo) {
+	for _, relay := range relays {
+		for _, addr := range relay.Addrs {
+			full := addr.Encapsulate(multiaddr.StringCast("/p2p/" + relay.ID.String()))
+			full = full.Encapsulate(multiaddr.StringCast("/p2p-circuit/p2p/" + p.String()))
+			info, err := peer.AddrInfoFromP2pAddr(full)
+			if err == nil {
+				h.Peerstore().AddAddrs(p, info.Addrs, peerstore.TempAddrTTL)
+			}
+		}
+	}
+}
+
+func waitDirect(ctx context.Context, h host.Host, p peer.ID, relays []peer.AddrInfo) error {
+	if directConn(h, p) != nil {
+		return nil
+	}
+	addRelayCircuitAddrs(h, p, relays)
+	if err := h.Connect(ctx, peer.AddrInfo{ID: p, Addrs: h.Peerstore().Addrs(p)}); err != nil {
+		return fmt.Errorf("connect: %w", err)
+	}
+	tick := time.NewTicker(50 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		if directConn(h, p) != nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("no direct connection before timeout")
+		case <-tick.C:
+		}
+	}
+}
+
+func openDirectActivationStream(ctx context.Context, h host.Host, p peer.ID, relays []peer.AddrInfo) (network.Stream, error) {
+	if err := waitDirect(ctx, h, p, relays); err != nil {
+		return nil, err
+	}
+	// Unlike openActivationStream, this intentionally does NOT call WithAllowLimitedConn. A relay
+	// circuit is a limited/transient connection and may rendezvous DCUtR, but may never carry nakd data.
+	s, err := h.NewStream(ctx, p, activationProto)
+	if err != nil {
+		return nil, err
+	}
+	if !isDirectConn(s.Conn()) {
+		s.Reset()
+		return nil, fmt.Errorf("libp2p selected a relayed connection")
+	}
+	return s, nil
+}
+
+func handleDialConn(h host.Host, c net.Conn, relays []peer.AddrInfo, directWait time.Duration) {
+	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	reader := bufio.NewReaderSize(c, maxDialLine+1)
+	line, err := reader.ReadSlice('\n')
+	if err == bufio.ErrBufferFull || len(line) > maxDialLine {
+		writeDialError(c, fmt.Errorf("DIAL line too long"))
+		c.Close()
+		return
+	}
+	if err != nil {
+		writeDialError(c, fmt.Errorf("read DIAL line: %w", err))
+		c.Close()
+		return
+	}
+	p, err := parseDialLine(line)
+	if err != nil {
+		writeDialError(c, err)
+		c.Close()
+		return
+	}
+	_ = c.SetDeadline(time.Time{})
+	ctx, cancel := context.WithTimeout(context.Background(), directWait)
+	defer cancel()
+	s, err := openDirectActivationStream(ctx, h, p, relays)
+	if err != nil {
+		writeDialError(c, err)
+		c.Close()
+		return
+	}
+	if _, err := io.WriteString(c, "OK direct\n"); err != nil {
+		s.Reset()
+		c.Close()
+		return
+	}
+	log.Printf("DIAL %s: DIRECT via %s", p, s.Conn().RemoteMultiaddr())
+	pipe(c, s)
+}
+
+func serveDialListener(h host.Host, ln net.Listener, relays []peer.AddrInfo, directWait time.Duration) {
+	log.Printf("dial listener on %s (direct wait %s)", ln.Addr(), directWait)
+	for {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		go handleDialConn(h, c, relays, directWait)
+	}
 }
 
 // monitorConns logs each new connection and whether it's via a relay or DIRECT — so we

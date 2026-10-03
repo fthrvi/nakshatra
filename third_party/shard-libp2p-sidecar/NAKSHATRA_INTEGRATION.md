@@ -7,16 +7,16 @@
 > transparent TCP↔libp2p tunnel that doesn't care what runs on the wire, so it carries our
 > existing gRPC/fabric without engine changes.
 >
-> ⚠️ **No longer unmodified as of 2026-09-07.** One deliberate, narrow patch in `main.go`:
+> ⚠️ **No longer unmodified as of 2026-09-07.** Nakshatra carries two deliberate patches in `main.go`:
 > upstream's relay-reservation loop calls `relayclient.Reserve()` exactly once per process and
 > never again — a reservation silently expires (~1hr TTL observed) with nothing here to notice,
 > and the first sign of trouble is a downstream dial failing `NO_RESERVATION` on the relay's
 > side, potentially much later. Added `renewRelayReservation`/`halfLife`: a background goroutine
 > per relay that re-reserves at half the granted TTL (with a 30s retry backoff on failure), for
 > as long as the process runs. Verified against a real relay with a deliberately short TTL
-> (15s) — the reservation renewed continuously across multiple cycles with no gap; see the
-> commit for the full test transcript. Every other line in this directory is still exactly
-> `e2469732`'s.
+> (15s) — the reservation renewed continuously across multiple cycles with no gap. The second patch
+> adds the loopback-only `-dial-listen` protocol used by nakd: relay circuits rendezvous DCUtR, but
+> contact bytes are accepted only on the resulting direct connection. Both patches have Go tests.
 
 ## What it is
 A Go `go-libp2p` daemon that runs beside a node's engine and gives it, for free:
@@ -29,6 +29,7 @@ Interface (`main.go`):
 - `-inbound HOST:PORT` — inbound libp2p streams are dialed to the local engine here (a **worker**: its gRPC port).
 - `-forward LOCAL=PEER_MULTIADDR` — listen on a LOCAL tcp port, carry each conn to PEER (a **coordinator**: one per upstream worker, repeatable).
 - `-relay` — also be a public relay + AutoNAT server (run on a reachable box).
+- `-dial-listen 127.0.0.1:PORT` — accept `DIAL <peerid>` from nakd and return only a direct stream.
 
 ## How it plugs into nakshatra (the wiring — next step, needs Go to build)
 The beauty: **nothing in our engine changes.** We only rewrite the chain's worker *addresses* to
@@ -58,6 +59,6 @@ Needs Go (≥1.25 per `go.mod`): `cd third_party/shard-libp2p-sidecar && go buil
 Then a systemd `--user` unit per role, like `neuron-ledger.service`.
 
 ## Status
-Vendored + documented (this commit). **Remaining:** install Go → build → a `sidecar.service` per
-node → rewrite a from-roster chain to tunnel endpoints → prove our gRPC tunnels over libp2p between
-two NAT'd boxes (wants the **2nd box**). Then strangers can join the permissionless tier.
+The signed node release builds the pinned source as a static linux/amd64 artifact and ships the
+opt-in `nakshatra-p2p` service. Nakd uses it for both-NAT contact sessions after both contacts enable
+direct paths and advertise p2p; inference-chain tunnel configuration remains a separate deployment.

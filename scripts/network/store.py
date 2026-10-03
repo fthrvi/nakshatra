@@ -46,7 +46,8 @@ class Store:
             self._db.execute("ALTER TABLE contacts ADD COLUMN name_src TEXT")
         except sqlite3.OperationalError:
             pass
-        for col in ("direct INTEGER NOT NULL DEFAULT 0", "direct_hint TEXT"):   # U3b: opt-in direct paths
+        for col in ("direct INTEGER NOT NULL DEFAULT 0", "direct_hint TEXT",
+                    "p2p INTEGER NOT NULL DEFAULT 0"):   # U3b: opt-in direct paths
             try:
                 self._db.execute(f"ALTER TABLE contacts ADD COLUMN {col}")
             except sqlite3.OperationalError:
@@ -124,12 +125,12 @@ class Store:
         self._q("UPDATE contacts SET state=? WHERE person=?", (state, person))
 
     def contact(self, person: str) -> Optional[dict]:
-        r = self._q("SELECT person, node, petname, nickname, state, name_src, direct, direct_hint FROM contacts WHERE person=?", (person,))
-        return dict(zip(("person", "node", "petname", "nickname", "state", "name_src", "direct", "direct_hint"), r[0])) if r else None
+        r = self._q("SELECT person, node, petname, nickname, state, name_src, direct, direct_hint, p2p FROM contacts WHERE person=?", (person,))
+        return dict(zip(("person", "node", "petname", "nickname", "state", "name_src", "direct", "direct_hint", "p2p"), r[0])) if r else None
 
     def contacts(self) -> list:
-        return [dict(zip(("person", "node", "petname", "nickname", "state", "name_src", "direct", "direct_hint"), r)) for r in
-                self._q("SELECT person, node, petname, nickname, state, name_src, direct, direct_hint FROM contacts ORDER BY added")]
+        return [dict(zip(("person", "node", "petname", "nickname", "state", "name_src", "direct", "direct_hint", "p2p"), r)) for r in
+                self._q("SELECT person, node, petname, nickname, state, name_src, direct, direct_hint, p2p FROM contacts ORDER BY added")]
 
     def resolve(self, who: str) -> Optional[dict]:
         """A petname or a person key (or its prefix of at least 8 hex chars)."""
@@ -143,10 +144,11 @@ class Store:
         if on:
             self._q("UPDATE contacts SET direct=1 WHERE person=?", (person,))
         else:
-            self._q("UPDATE contacts SET direct=0, direct_hint=NULL WHERE person=?", (person,))
+            self._q("UPDATE contacts SET direct=0, direct_hint=NULL, p2p=0 WHERE person=?", (person,))
 
-    def set_direct_hint(self, person: str, hint: str) -> None:
-        self._q("UPDATE contacts SET direct_hint=? WHERE person=? AND direct=1", (hint, person))
+    def set_direct_addr(self, person: str, hint: str, p2p: bool) -> None:
+        self._q("UPDATE contacts SET direct_hint=?, p2p=? WHERE person=? AND direct=1",
+                (hint, int(bool(p2p)), person))
 
     def remove_contact(self, person: str) -> None:
         self._q("DELETE FROM contacts WHERE person=?", (person,))
@@ -272,4 +274,3 @@ class Store:
         d["targets"] = json.loads(d["targets"]) if d["targets"] else None
         d["verdict"] = json.loads(d["verdict"]) if d["verdict"] else None
         return d
-

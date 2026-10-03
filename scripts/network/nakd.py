@@ -51,7 +51,8 @@ from network.store import Store  # noqa: E402
 from network import tasks as T  # noqa: E402
 from network.settle import SettlementError  # noqa: E402
 import accounting as _accounting  # noqa: E402
-from transport.connect import accept_direct, local_endpoints, open_channel, open_direct  # noqa: E402
+from transport.connect import (accept_direct, local_endpoints, open_channel, open_direct,  # noqa: E402
+                               open_via_sidecar)
 from transport.secure_channel import SecureChannelError  # noqa: E402
 
 try:
@@ -67,7 +68,10 @@ MSG_DOMAIN = "nak-msg-v1"
 MAX_FRAME = 1 << 20
 MAX_TEXT = 8000
 SWEEP_S = 30.0          # how often expired tasks are swept (refund + notify)
-DIRECT_WAIT_S = 8.0     # the non-dialing side waits this long for a direct call before using the relay
+# Worst case is 5 advertised endpoints × 3 s, a 10 s handshake, then the sidecar's 15 s DCUtR wait
+# plus its pinned handshake. Fifty seconds covers that sequence; only both-sides direct opt-ins wait.
+DIRECT_WAIT_S = 50.0
+P2P_TIMEOUT_S = 20.0
 WAIT_S = 100.0          # under the relay's 120 s waiting TTL, so we re-register before it reaps us
 PING_S = 30.0
 IDLE_S = 95.0           # no frame (not even a ping) for this long = the peer is gone
@@ -166,7 +170,7 @@ class SignerClient:
 class Node:
     def __init__(self, state_dir: Path, node_key: bytes, signer: Callable[[dict], dict], *,
                  agent: str, relay: tuple = DEFAULT_RELAY, log: Callable[[str], None] = lambda m: None,
-                 settlement=None, direct_port: Optional[int] = None):
+                 settlement=None, direct_port: Optional[int] = None, p2p: Optional[dict] = None):
         self.store = Store(state_dir)
         # Adapter #0 (local ledger, TEST units) unless a real one is passed; see network/settle.py.
         # THE accounting front door (accounting.py, U5) picks the escrow backend; tests may pass one.
@@ -187,7 +191,8 @@ class Node:
         self.person = who["person"]
         self.custody = who.get("custody", "")
         self.direct_port = direct_port        # U3b: listen for direct connections (opt-in, per node)
-        self._paths: dict[str, str] = {}      # contact person -> "direct" | "relay" for the live session
+        self.p2p = dict(p2p) if p2p else None  # {"dial": "127.0.0.1:51831"}; sidecar is opt-in
+        self._paths: dict[str, str] = {}      # contact person -> "direct" | "p2p" | "relay"
         self._listener = None
         self._stop = threading.Event()
         self._threads: dict[str, threading.Thread] = {}       # key -> worker thread
@@ -427,7 +432,8 @@ class Node:
             sock = ch = None
             path = "relay"
             role0 = pair_role(self.node, c["node"], MSG_DOMAIN)
-            if c.get("direct") and c.get("direct_hint") and not role0.is_initiator:
+            can_p2p = bool(c.get("direct") and c.get("p2p") and self.p2p)
+            if c.get("direct") and (c.get("direct_hint") or can_p2p) and not role0.is_initiator:
                 # Exactly ONE side dials direct (the pairing initiator, as on the relay); the other waits
                 # briefly for that call before falling back, so the two never cross and refuse each other.
                 end = time.time() + DIRECT_WAIT_S
@@ -441,7 +447,14 @@ class Node:
                                            purpose=MSG_DOMAIN.encode())
                     path = "direct"
                 except (OSError, SecureChannelError) as e:
-                    self.log(f"direct to {c['petname'] or person[:12]} failed ({e}); using the relay")
+                    self.log(f"direct to {c['petname'] or person[:12]} failed ({e})")
+            if ch is None and can_p2p and role0.is_initiator:
+                try:
+                    sock, ch = open_via_sidecar(self.p2p["dial"], c["node"], my_key=self._key,
+                                                purpose=MSG_DOMAIN.encode(), timeout=P2P_TIMEOUT_S)
+                    path = "p2p"
+                except (OSError, SecureChannelError, ValueError) as e:
+                    self.log(f"direct (p2p) to {c['petname'] or person[:12]} failed ({e}); using the relay")
             if ch is None:
                 role = pair_role(self.node, c["node"], MSG_DOMAIN)
                 try:
@@ -451,7 +464,8 @@ class Node:
                     attempt += 1
                     self._backoff(attempt)
                     continue
-            self.log(f"session up with {c['petname'] or person[:12]} ({path})")
+            path_label = "direct (p2p)" if path == "p2p" else path
+            self.log(f"session up with {c['petname'] or person[:12]} ({path_label})")
             started = time.time()
             self._run_session(person, sock, ch, path=path)
             # A session that drops at once is a failure, not a success: keep backing off unless it
@@ -470,7 +484,8 @@ class Node:
         c0 = self.store.contact(person) or {}
         if c0.get("direct") and self.direct_port:
             try:                                  # our direct addresses, ONLY to a contact we opted in for
-                send_frame(ch, {"t": "addr", "endpoints": local_endpoints(self.direct_port)}, lock)
+                send_frame(ch, {"t": "addr", "endpoints": local_endpoints(self.direct_port),
+                                "p2p": bool(self.p2p)}, lock)
             except (OSError, SecureChannelError):
                 pass
         wake = self._wake.setdefault(person, threading.Event())
@@ -491,11 +506,12 @@ class Node:
                     elif t == "addr?":  # they ask for our endpoints; answer only if we opted them in
                         cc = self.store.contact(person) or {}
                         if cc.get("direct") and self.direct_port:
-                            send_frame(ch, {"t": "addr", "endpoints": local_endpoints(self.direct_port)}, lock)
+                            send_frame(ch, {"t": "addr", "endpoints": local_endpoints(self.direct_port),
+                                            "p2p": bool(self.p2p)}, lock)
                     elif t == "addr":   # their direct endpoints; kept only if WE opted this contact in
                         hint = frame.get("endpoints")
                         if isinstance(hint, str) and len(hint) <= 1000:
-                            self.store.set_direct_hint(person, hint)
+                            self.store.set_direct_addr(person, hint, frame.get("p2p") is True)
                     elif t == "nack":   # received and refused: terminal, stop retrying, keep why
                         self.store.refuse(str(frame.get("mid", "")), str(frame.get("why", "")), person)
                         self.log(f"{person[:12]} refused {str(frame.get('mid', ''))[:8]}: {frame.get('why')}")
@@ -604,7 +620,8 @@ class Node:
         if on and sess:
             try:
                 if self.direct_port:
-                    send_frame(sess[0], {"t": "addr", "endpoints": local_endpoints(self.direct_port)}, sess[1])
+                    send_frame(sess[0], {"t": "addr", "endpoints": local_endpoints(self.direct_port),
+                                         "p2p": bool(self.p2p)}, sess[1])
                 # They may have sent theirs before we opted in (we dropped it): ask again. They answer
                 # only if they opted in for us too.
                 send_frame(sess[0], {"t": "addr?"}, sess[1])
@@ -649,8 +666,10 @@ class Node:
             self.log(f"refused a direct connection: {e}")
             return
         c = by_node[peer]
-        self.log(f"session up with {c['petname'] or c['person'][:12]} (direct, incoming)")
-        self._run_session(c["person"], conn, ch, path="direct")
+        incoming_path = "p2p" if self.p2p and _is_loopback_peer(conn) else "direct"
+        label = "direct (p2p)" if incoming_path == "p2p" else "direct, incoming"
+        self.log(f"session up with {c['petname'] or c['person'][:12]} ({label})")
+        self._run_session(c["person"], conn, ch, path=incoming_path)
 
     # ── tasks ────────────────────────────────────────────────────────────────────────────────
     # Poster: post_task → (claim arrives) assign the first valid claimer → (result arrives) judge by
@@ -876,6 +895,7 @@ class Node:
                 "contacts": [dict(c, online=c["person"] in online, path=self._paths.get(c["person"], ""))
                              for c in self.store.contacts()],
                 "direct_port": self.direct_port,
+                "p2p": self.p2p,
                 "pending_requests": len(self.store.requests()),
                 "open_invites": len(self.store.open_invites())}
 
@@ -885,6 +905,16 @@ def _close(sock) -> None:
         sock.close()
     except OSError:
         pass
+
+
+def _is_loopback_peer(sock) -> bool:
+    """The sidecar's -inbound arrives from loopback; ordinary production direct dials do not."""
+    import ipaddress
+    try:
+        ip = ipaddress.ip_address(sock.getpeername()[0].split("%", 1)[0])
+        return ip.is_loopback or bool(getattr(ip, "ipv4_mapped", None) and ip.ipv4_mapped.is_loopback)
+    except (OSError, ValueError, TypeError, IndexError):
+        return False
 
 
 def _hard_close(ch) -> None:
@@ -1017,6 +1047,8 @@ def main(argv=None) -> int:
         "NAK_SIGNER_SOCK", home / ".sthambha" / "signer" / "signer.sock")))
     ap.add_argument("--agent", default=os.environ.get("NAK_AGENT", ""))
     ap.add_argument("--relay", default=os.environ.get("NAK_RELAY", f"{DEFAULT_RELAY[0]}:{DEFAULT_RELAY[1]}"))
+    ap.add_argument("--direct-port", type=int, help="direct listener port (overrides <state>/direct-port)")
+    ap.add_argument("--p2p-dial", help="local sidecar DIAL address (overrides <state>/p2p-dial)")
     a = ap.parse_args(argv)
     if not a.agent and (a.state / "agent").exists():
         a.agent = (a.state / "agent").read_text().strip()      # set once per node: `echo prithvi > …/net/agent`
@@ -1030,10 +1062,13 @@ def main(argv=None) -> int:
     while True:
         try:
             dp_file = a.state / "direct-port"                # opt-in: `nak direct-listen 51830`
-            direct_port = int(dp_file.read_text().strip()) if dp_file.exists() else None
+            direct_port = a.direct_port if a.direct_port is not None else \
+                (int(dp_file.read_text().strip()) if dp_file.exists() else None)
+            p2p_file = a.state / "p2p-dial"                  # opt-in: `nak p2p on`
+            p2p_dial = a.p2p_dial or (p2p_file.read_text().strip() if p2p_file.exists() else "")
             node = Node(a.state, _load_node_key(a.node_key), SignerClient(a.signer), agent=a.agent,
                         relay=(host, int(port)), log=lambda m: print(f"[nakd] {m}", flush=True),
-                        direct_port=direct_port).start()
+                        direct_port=direct_port, p2p={"dial": p2p_dial} if p2p_dial else None).start()
             break
         except (OSError, RuntimeError) as e:
             if time.time() > deadline:

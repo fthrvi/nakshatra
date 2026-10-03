@@ -1,5 +1,6 @@
 """U3: one way to reach a peer — open_channel over a real local relay, both roles, binding enforced."""
 import os
+import socket
 import sys
 import threading
 from pathlib import Path
@@ -9,7 +10,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 from cryptography.hazmat.primitives.asymmetric import ed25519  # noqa: E402
 
-from transport.connect import open_channel  # noqa: E402
+from transport.connect import accept_direct, open_channel, open_via_sidecar  # noqa: E402
 from transport.relay import RendezvousRelay  # noqa: E402
 from transport.secure_channel import SecureChannelError  # noqa: E402
 
@@ -74,3 +75,63 @@ def test_wrong_pinned_key_fails(relay):
     [t.start() for t in ts]
     [t.join(15) for t in ts]
     assert isinstance(out["a"], (SecureChannelError, OSError))
+
+
+def test_sidecar_socket_uses_the_same_direct_pinned_handshake():
+    a, b = _key(), _key()
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    out = {}
+
+    def server():
+        conn, _ = listener.accept()
+        line = b""
+        while not line.endswith(b"\n"):
+            line += conn.recv(1)
+        out["dial"] = line
+        conn.sendall(b"OK direct\n")
+        peer, ch = accept_direct(conn, my_key=b[0], purpose=b"nak-msg-v1", allow=lambda p: p == a[1])
+        out["peer"] = peer
+        out["body"] = ch.recv(5)
+        ch.sendall(b"world")
+
+    t = threading.Thread(target=server)
+    t.start()
+    sock, ch = open_via_sidecar(f"127.0.0.1:{listener.getsockname()[1]}", b[1], my_key=a[0],
+                                purpose=b"nak-msg-v1", timeout=5)
+    ch.sendall(b"hello")
+    assert ch.recv(5) == b"world"
+    sock.close()
+    t.join(5)
+    listener.close()
+    from sidecar_key import peer_id_from_node_pub
+    assert out == {"dial": f"DIAL {peer_id_from_node_pub(b[1])}\n".encode(), "peer": a[1], "body": b"hello"}
+
+
+def test_sidecar_dial_address_must_be_loopback():
+    a, b = _key(), _key()
+    with pytest.raises(OSError, match="loopback"):
+        open_via_sidecar("192.0.2.1:51831", b[1], my_key=a[0], purpose=b"x", timeout=0.1)
+
+
+def test_sidecar_must_explicitly_confirm_a_direct_stream():
+    a, b = _key(), _key()
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+
+    def server():
+        conn, _ = listener.accept()
+        while not conn.recv(1).endswith(b"\n"):
+            pass
+        conn.sendall(b"ERR no direct connection before timeout\n")
+        conn.close()
+
+    t = threading.Thread(target=server)
+    t.start()
+    with pytest.raises(OSError, match="ERR no direct connection"):
+        open_via_sidecar(f"127.0.0.1:{listener.getsockname()[1]}", b[1], my_key=a[0],
+                         purpose=b"x", timeout=2)
+    t.join(2)
+    listener.close()

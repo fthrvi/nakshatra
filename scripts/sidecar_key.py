@@ -30,11 +30,37 @@ def libp2p_ed25519_private(seed: bytes) -> bytes:
     return bytes([0x08, 0x01, 0x12, len(data)]) + data       # field1 varint 1 (Ed25519), field2 bytes(64)
 
 
+def _base58btc(data: bytes) -> str:
+    alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+    zeroes = len(data) - len(data.lstrip(b"\0"))
+    n, out = int.from_bytes(data, "big"), ""
+    while n:
+        n, digit = divmod(n, 58)
+        out = alphabet[digit] + out
+    return "1" * zeroes + out
+
+
+def peer_id_from_node_pub(pub_hex: str) -> str:
+    """The identity-multihash PeerId go-libp2p derives from a 32-byte Ed25519 node key."""
+    try:
+        pub = bytes.fromhex(pub_hex)
+    except (TypeError, ValueError) as e:
+        raise ValueError("node public key must be 32-byte hex") from e
+    if len(pub) != 32:
+        raise ValueError("node public key must be 32-byte hex")
+    public_key_proto = bytes([0x08, 0x01, 0x12, 0x20]) + pub
+    identity_multihash = bytes([0x00, len(public_key_proto)]) + public_key_proto
+    return _base58btc(identity_multihash)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--node-key", type=Path, default=WORKER_KEY_PATH)
     ap.add_argument("--out", type=Path, required=True)
+    ap.add_argument("--if-missing", action="store_true", help="leave an existing sidecar key unchanged")
     a = ap.parse_args(argv)
+    if a.if_missing and a.out.exists():
+        return 0
     blob = libp2p_ed25519_private(a.node_key.read_bytes())
     a.out.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(a.out), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
