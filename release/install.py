@@ -56,6 +56,20 @@ def _fetch(source: str, rel: str, dest: Path) -> None:
         shutil.copyfile(Path(source) / rel, dest)
 
 
+def _load_json(p: Path) -> dict:
+    try:
+        return json.loads(p.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_json(p: Path, d: dict) -> None:
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(d, indent=1, sort_keys=True))
+    os.replace(tmp, p)
+
+
 def _load_config(prefix: Path) -> dict:
     p = prefix / "config.json"
     return json.loads(p.read_text()) if p.exists() else {}
@@ -283,10 +297,61 @@ class Installer:
             subprocess.run(["systemctl", "--user", "enable", "--now", "nak-update.timer"], check=False)
         return names
 
-    def restart(self, names: list) -> None:
-        if self.systemd and names:
-            subprocess.run(["systemctl", "--user", "enable", *[f"{n}.service" for n in names]], check=False)
-            subprocess.run(["systemctl", "--user", "restart", *[f"{n}.service" for n in names]], check=False)
+    def restart(self, names: list, man: dict | None = None, *, force: bool = False) -> list:
+        """Restart services only when needed, and never in the middle of a request (2026-10-03):
+        - a service whose FINGERPRINT (its unit text + the commits of the components it runs + the env lock)
+          is unchanged and that is already running is left alone (e.g. a Nakshatra-only release never
+          restarts the Sthambha-only signer);
+        - a service with `drain: {port, max_wait_s}` waits until nothing is connected to that port (up to
+          max_wait_s), THEN restarts — a live Prithvi turn is not cut off. Code under current/ has already
+          switched, so the wait is bounded: mixed versions must not linger.
+        force=True (rollback) restarts everything. Returns the names actually restarted."""
+        if not (self.systemd and names):
+            return []
+        fps = _load_json(self.prefix / "state" / "fingerprints.json")
+        services = (man or {}).get("services", {})
+        todo = []
+        for n in names:
+            fp = self._fingerprint(n, man) if man else None
+            if not force and fp and fps.get(n) == fp and self._active(n):
+                continue
+            todo.append((n, fp))
+        if todo:
+            subprocess.run(["systemctl", "--user", "enable", *[f"{n}.service" for n, _ in todo]], check=False)
+        for n, fp in todo:
+            drain = services.get(n, {}).get("drain") if not force else None
+            if drain:
+                self._wait_idle(int(drain["port"]), float(drain.get("max_wait_s", 900)))
+            subprocess.run(["systemctl", "--user", "restart", f"{n}.service"], check=False)
+            if fp:
+                fps[n] = fp
+        _save_json(self.prefix / "state" / "fingerprints.json", fps)
+        return [n for n, _ in todo]
+
+    def _fingerprint(self, name: str, man: dict) -> str:
+        import hashlib
+        svc = man.get("services", {}).get(name, {})
+        wanted = svc.get("components") or [c["name"] for c in man.get("components", [])]
+        commits = sorted(f"{c['name']}={c['commit']}" for c in man.get("components", []) if c["name"] in wanted)
+        locks = [man.get("lock", {}).get("sha256", "")] + [
+            man["profiles"][p]["lock"]["sha256"] for p in self.active_profiles(man)]
+        unit = self._unit_text(svc, self._ctx(man), man) if svc else ""
+        return hashlib.sha256("\n".join([unit, *commits, *locks]).encode()).hexdigest()
+
+    def _active(self, name: str) -> bool:
+        return subprocess.run(["systemctl", "--user", "is-active", "--quiet", f"{name}.service"]).returncode == 0
+
+    def _wait_idle(self, port: int, max_wait_s: float) -> bool:
+        """True once nothing is connected to `port` (checked twice, 2 s apart), False at the time limit."""
+        end, quiet = time.time() + max_wait_s, 0
+        while time.time() < end:
+            out = subprocess.run(["ss", "-Htn", "state", "established", f"( sport = :{port} )"],
+                                 capture_output=True, text=True).stdout
+            quiet = quiet + 1 if not out.strip() else 0
+            if quiet >= 2:
+                return True
+            time.sleep(2)
+        return False
 
     def health(self, man: dict) -> None:
         ctx = self._ctx(man)
@@ -334,13 +399,13 @@ class Installer:
         try:
             names = self._write_units_by_new_installer(man)
             self.health(man)
-            self.restart(names)
+            self.restart(names, man)
         except Exception as e:
             if prev:
                 _switch(self.prefix, prev)
                 prev_man = json.loads((self.prefix / "releases" / prev / "manifest.json").read_text())
                 self.write_units(prev_man)
-                self.restart(list(prev_man.get("services", {})))
+                self.restart(list(prev_man.get("services", {})), prev_man, force=True)
                 raise InstallError(f"{man['version']} failed after switching and was rolled back to {prev}: {e}")
             # First install failed: leave NO half-installed node behind (no `current`, no release dir),
             # so the next attempt starts clean instead of believing it is already installed.
@@ -369,7 +434,7 @@ class Installer:
         cur = _current(self.prefix)
         _switch(self.prefix, prev)
         man = json.loads((self.prefix / "releases" / prev / "manifest.json").read_text())
-        self.restart(self.write_units(man))
+        self.restart(self.write_units(man), man, force=True)
         cfg.update({"current": prev, "previous": cur, "updated": int(time.time())})
         _save_config(self.prefix, cfg)
         return f"rolled back to {prev}"

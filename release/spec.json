@@ -40,7 +40,10 @@
     "--state",
     "{home}/.sthambha/signer"
    ],
-   "requires": "{home}/.sthambha/signer/person.pub"
+   "requires": "{home}/.sthambha/signer/person.pub",
+   "components": [
+    "sthambha"
+   ]
   },
   "nak-net": {
    "description": "Nakshatra messaging node (nakd): contacts + messages",
@@ -51,7 +54,11 @@
     "--state",
     "{home}/.nakshatra/net"
    ],
-   "requires": "{home}/.nakshatra/net/agent"
+   "requires": "{home}/.nakshatra/net/agent",
+   "components": [
+    "nakshatra",
+    "sthambha"
+   ]
   },
   "nakshatra-relay": {
    "description": "Nakshatra rendezvous relay (untrusted byte-forwarder)",
@@ -70,7 +77,10 @@
     "${NKS_RELAY_PORT}"
    ],
    "restart": "always",
-   "hardening": true
+   "hardening": true,
+   "components": [
+    "nakshatra"
+   ]
   },
   "nakshatra-meshd": {
    "description": "Nakshatra node daemon (publish + discover + auto-tunnel)",
@@ -98,7 +108,10 @@
     "--refresh=${REFRESH}"
    ],
    "restart": "always",
-   "hardening": true
+   "hardening": true,
+   "components": [
+    "nakshatra"
+   ]
   },
   "nakshatra-unconscious": {
    "description": "Nakshatra inference gateway (OpenAI /v1/chat/completions over the mesh)",
@@ -119,7 +132,14 @@
     "--models",
     "${MODELS}"
    ],
-   "restart": "always"
+   "restart": "always",
+   "components": [
+    "nakshatra"
+   ],
+   "drain": {
+    "port": 11599,
+    "max_wait_s": 900
+   }
   }
  },
  "health": [

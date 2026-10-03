@@ -366,3 +366,34 @@ def test_the_running_installer_recognises_the_new_one_even_after_current_switche
     inst = I.Installer(prefix, systemd=False, make_venv=False, unit_dir=tmp_path / "units")
     assert inst._write_units_by_new_installer({"installer": "pkg/install.py"}) == ["by-new"]
     assert marker.read_text() == "new"
+
+
+def _svc_man(commits, lock="L1"):
+    return {"version": "0.1.0", "lock": {"sha256": lock}, "profiles": {},
+            "components": [{"name": "nakshatra", "commit": commits[0], "pythonpath": "scripts"},
+                           {"name": "sthambha", "commit": commits[1], "pythonpath": "."}],
+            "services": {"sig": {"description": "s", "exec": ["{python}"], "components": ["sthambha"]},
+                         "gw": {"description": "g", "exec": ["{python}"], "components": ["nakshatra"],
+                                "drain": {"port": 11599, "max_wait_s": 30}}}}
+
+
+def test_restart_only_services_whose_inputs_changed_and_drain_busy_ones(tmp_path, monkeypatch):
+    inst = I.Installer(tmp_path / "node", systemd=True, make_venv=False, unit_dir=tmp_path / "units")
+    calls, waited = [], []
+    monkeypatch.setattr(I.subprocess, "run", lambda args, **kw: calls.append(args) or
+                        type("R", (), {"returncode": 0, "stdout": ""})())
+    monkeypatch.setattr(I.Installer, "_wait_idle", lambda self, port, mx: waited.append(port) or True)
+    restarted = lambda: [a[-1] for a in calls if a[:3] == ["systemctl", "--user", "restart"]]
+    assert sorted(inst.restart(["sig", "gw"], _svc_man(["n1", "s1"]))) == ["gw", "sig"]   # first time: both
+    assert waited == [11599]                                                              # gw drained first
+    calls.clear(); waited.clear()
+    assert inst.restart(["sig", "gw"], _svc_man(["n2", "s1"])) == ["gw"]    # nakshatra-only release: signer left alone
+    calls.clear()
+    assert inst.restart(["sig", "gw"], _svc_man(["n2", "s1"])) == []        # nothing changed: nothing restarted
+    assert inst.restart(["sig", "gw"], _svc_man(["n2", "s1"]), force=True) == ["sig", "gw"]   # rollback: all
+
+
+def test_the_gateway_drains_before_restart_in_the_shipped_spec():
+    spec = json.loads((Path(__file__).resolve().parent.parent / "release" / "spec.json").read_text())
+    assert spec["services"]["nakshatra-unconscious"]["drain"]["port"] == 11599
+    assert spec["services"]["nak-signer"]["components"] == ["sthambha"]
