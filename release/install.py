@@ -333,8 +333,18 @@ class Installer:
         svc = man.get("services", {}).get(name, {})
         wanted = svc.get("components") or [c["name"] for c in man.get("components", [])]
         commits = sorted(f"{c['name']}={c['commit']}" for c in man.get("components", []) if c["name"] in wanted)
-        locks = [man.get("lock", {}).get("sha256", "")] + [
-            man["profiles"][p]["lock"]["sha256"] for p in self.active_profiles(man)]
+        # The env lock by CONTENT (comments stripped): older locks carry build-path comments that differ
+        # every build and made identical releases look changed (2026-10-03).
+        rel = self.prefix / "releases" / man.get("version", "")
+        lock_files = [man.get("lock", {}).get("file", "requirements.lock")] + [
+            man["profiles"][p]["lock"]["file"] for p in self.active_profiles(man)]
+        locks = []
+        for lf in lock_files:
+            try:
+                body = "\n".join(l for l in (rel / lf).read_text().splitlines() if l.strip() and not l.lstrip().startswith("#"))
+            except OSError:
+                body = lf
+            locks.append(hashlib.sha256(body.encode()).hexdigest())
         unit = self._unit_text(svc, self._ctx(man), man) if svc else ""
         return hashlib.sha256("\n".join([unit, *commits, *locks]).encode()).hexdigest()
 

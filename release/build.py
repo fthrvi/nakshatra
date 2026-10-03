@@ -75,7 +75,7 @@ def build(version: str, channel: str, refs: dict, key_path: Path, out_root: Path
     req_in = out / "requirements.in"
     req_in.write_text("\n".join(SPEC["requirements"]) + "\n")
     lock = out / "requirements.lock"
-    subprocess.run([str(uv_bin), "pip", "compile", str(req_in), "--generate-hashes", "--quiet",
+    subprocess.run([str(uv_bin), "pip", "compile", str(req_in), "--generate-hashes", "--quiet", "--no-header", "--no-annotate",
                     "--python-version", SPEC["python"], "-o", str(lock)], check=True)
     req_in.unlink()
     # Optional PROFILES (e.g. "inference"): each is the base requirements PLUS its own, resolved TOGETHER
@@ -86,7 +86,7 @@ def build(version: str, channel: str, refs: dict, key_path: Path, out_root: Path
         p_in = out / f"requirements-{pname}.in"
         p_in.write_text("\n".join(SPEC["requirements"] + prof["requirements"]) + "\n")
         p_lock = out / f"requirements-{pname}.lock"
-        subprocess.run([str(uv_bin), "pip", "compile", str(p_in), "--generate-hashes", "--quiet",
+        subprocess.run([str(uv_bin), "pip", "compile", str(p_in), "--generate-hashes", "--quiet", "--no-header", "--no-annotate",
                         "--python-version", SPEC["python"], "-o", str(p_lock)], check=True)
         p_in.unlink()
         profiles[pname] = {"lock": {"file": p_lock.name, "sha256": rk.sha256_file(p_lock)},

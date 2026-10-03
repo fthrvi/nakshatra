@@ -397,3 +397,14 @@ def test_the_gateway_drains_before_restart_in_the_shipped_spec():
     spec = json.loads((Path(__file__).resolve().parent.parent / "release" / "spec.json").read_text())
     assert spec["services"]["nakshatra-unconscious"]["drain"]["port"] == 11599
     assert spec["services"]["nak-signer"]["components"] == ["sthambha"]
+
+
+def test_identical_releases_fingerprint_the_same_despite_lock_comments(tmp_path):
+    inst = I.Installer(tmp_path / "node", systemd=False, make_venv=False, unit_dir=tmp_path / "units")
+    for v, path in (("0.1.0", "/dist/0.1.0"), ("0.1.1", "/dist/0.1.1")):
+        rel = tmp_path / "node" / "releases" / v
+        rel.mkdir(parents=True)
+        (rel / "requirements.lock").write_text(f"# uv pip compile {path}/requirements.in\ncffi==2.1.1 \\\n"
+                                               f"    --hash=sha256:aa\n    # via -r {path}/requirements.in\n")
+    man = lambda v: dict(_svc_man(["n1", "s1"]), version=v, lock={"file": "requirements.lock", "sha256": v})
+    assert inst._fingerprint("gw", man("0.1.0")) == inst._fingerprint("gw", man("0.1.1"))
