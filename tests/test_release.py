@@ -670,3 +670,42 @@ def test_drain_fails_closed_when_ss_fails(tmp_path, monkeypatch):
     monkeypatch.setattr(I.subprocess, "run", lambda *a, **k: type("R", (), {"returncode": 1, "stdout": ""})())
     monkeypatch.setattr(I.time, "sleep", lambda s: None)
     assert inst._wait_idle(11599, 0.05) is False
+
+
+def test_prune_keeps_current_previous_and_newest(tmp_path):
+    import os as _os
+    inst = I.Installer(tmp_path / "node", systemd=False, make_venv=False, unit_dir=tmp_path / "units")
+    rel = tmp_path / "node" / "releases"
+    for i, v in enumerate(["0.1.0", "0.2.0", "0.3.0", "0.4.0", "0.5.0", "0.6.0"]):
+        (rel / v).mkdir(parents=True)
+        _os.utime(rel / v, (1000 + i, 1000 + i))
+    removed = inst.prune(keep=("0.6.0", "0.1.0"))
+    assert sorted(removed) == ["0.2.0", "0.3.0"]
+    assert sorted(p.name for p in rel.iterdir()) == ["0.1.0", "0.4.0", "0.5.0", "0.6.0"]
+
+
+def test_prune_never_deletes_a_release_a_live_process_runs_from(tmp_path, monkeypatch):
+    inst = I.Installer(tmp_path / "node", systemd=False, make_venv=False, unit_dir=tmp_path / "units")
+    rel = tmp_path / "node" / "releases"
+    import os as _os
+    for i, v in enumerate(["0.1.0", "0.2.0", "0.3.0", "0.4.0", "0.5.0"]):
+        (rel / v).mkdir(parents=True)
+        _os.utime(rel / v, (1000 + i, 1000 + i))
+    monkeypatch.setattr(I, "_releases_in_use", lambda r: {"0.1.0"})     # e.g. the unrestarted signer
+    inst.KEEP_RELEASES = 1
+    inst.prune(keep=("0.5.0",))
+    assert sorted(p.name for p in rel.iterdir()) == ["0.1.0", "0.5.0"]
+
+
+def test_releases_in_use_finds_this_process(tmp_path):
+    rel = tmp_path / "releases"
+    (rel / "9.9.9").mkdir(parents=True)
+    lib = rel / "9.9.9" / "x.bin"
+    lib.write_bytes(b"\0" * 4096)
+    import mmap
+    with open(lib, "rb") as f:
+        m = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        try:
+            assert "9.9.9" in I._releases_in_use(rel)
+        finally:
+            m.close()

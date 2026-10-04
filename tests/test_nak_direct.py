@@ -173,9 +173,18 @@ def test_nak_p2p_toggle_uses_only_the_test_state_dir(tmp_path, monkeypatch):
     calls = []
     monkeypatch.setenv("NAK_NET_DIR", str(tmp_path))
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "run"))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))                 # never the real ~/.nakshatra
+    prefix = tmp_path / "node"
+    (prefix / "current" / "nakshatra" / "release").mkdir(parents=True)
+    (prefix / "current" / "nakshatra" / "release" / "install.py").write_text("")
+    monkeypatch.setenv("NAK_NODE_PREFIX", str(prefix))
     monkeypatch.setattr(subprocess, "run", lambda args, **kwargs: calls.append(args))
     assert nak.main(["p2p", "on"]) == 0
     assert (tmp_path / "p2p-dial").read_text() == f"{tmp_path}/run/nakshatra/p2p.sock\n"
+    env = (tmp_path / "home" / ".nakshatra" / "p2p.env").read_text()   # one step: opted in with the relay
+    assert env.startswith("P2P_RELAYS=/ip4/45.63.109.137/udp/29700/quic-v1/p2p/12D3KooWDfHFt")
+    assert ["systemctl", "--user", "enable", "--now", "nakshatra-p2p.service"] in calls
+    assert any(c[-1] == "write-units" for c in calls)
     assert calls[-1] == ["systemctl", "--user", "restart", "nak-net.service"]
     assert nak.main(["p2p", "off"]) == 0
     assert not (tmp_path / "p2p-dial").exists()

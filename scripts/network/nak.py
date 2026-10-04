@@ -69,6 +69,29 @@ def _ago(ts: int) -> str:
     return f"{d}s ago" if d < 120 else f"{d // 60}m ago" if d < 7200 else f"{d // 3600}h ago"
 
 
+# The public circuit relay (VPS). Its PeerId is the relay's identity: a sidecar refuses any other key there.
+DEFAULT_P2P_RELAY_ID = "12D3KooWDfHFtM8PP7TV46nssrix2hTL3kzMkv7kKMhULDakFGB7"
+DEFAULT_P2P_RELAYS = (f"/ip4/45.63.109.137/udp/29700/quic-v1/p2p/{DEFAULT_P2P_RELAY_ID},"
+                      f"/ip4/45.63.109.137/tcp/29700/p2p/{DEFAULT_P2P_RELAY_ID}")
+
+
+def _enable_p2p_service(_sp) -> None:
+    """Opt this node into the release's `nakshatra-p2p` service (the opt-in file IS the consent), write
+    the units with the release's own installer, and start the sidecar. Existing settings are kept."""
+    env = Path.home() / ".nakshatra" / "p2p.env"
+    if not env.exists():
+        env.parent.mkdir(parents=True, exist_ok=True)
+        env.write_text(f"P2P_RELAYS={DEFAULT_P2P_RELAYS}\n")
+    prefix = Path(os.environ.get("NAK_NODE_PREFIX", Path.home() / ".nakshatra-node"))
+    installer = prefix / "current" / "nakshatra" / "release" / "install.py"
+    if not installer.exists():
+        raise SystemExit(f"no installed release at {prefix}; p2p needs the signed release (install it first)")
+    _sp.run([sys.executable, str(installer), "--prefix", str(prefix), "write-units"], check=True,
+            stdout=_sp.DEVNULL)
+    _sp.run(["systemctl", "--user", "daemon-reload"], check=True)
+    _sp.run(["systemctl", "--user", "enable", "--now", "nakshatra-p2p.service"], check=True)
+
+
 def _default_p2p_socket() -> Path:
     runtime = os.environ.get("XDG_RUNTIME_DIR")
     if not runtime:
@@ -193,6 +216,8 @@ def main(argv=None) -> int:
             dial = a.socket or _default_p2p_socket()
             if not dial.is_absolute():
                 raise SystemExit("--socket must be an absolute path")
+            if a.socket is None:
+                _enable_p2p_service(_sp)       # one step: opt the sidecar service in, then point nakd at it
             f.write_text(str(dial) + "\n")
         _sp.run(["systemctl", "--user", "restart", "nak-net.service"], check=False)
         print(f"p2p {'OFF' if a.onoff == 'off' else 'ON via ' + str(dial)}; nak-net restarted")

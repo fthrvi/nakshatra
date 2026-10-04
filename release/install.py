@@ -112,6 +112,26 @@ def _switch(prefix: Path, version: str) -> None:
     os.replace(tmp, prefix / "current")
 
 
+def _releases_in_use(rel: Path) -> set:
+    """Release dir names that any of this user's processes has mapped or runs from (/proc maps + cmdline)."""
+    import re
+    pat = re.compile(re.escape(str(rel.resolve())) + r"/([^/\s]+)/")
+    used, uid = set(), os.getuid()
+    for pid in os.listdir("/proc") if os.path.isdir("/proc") else []:
+        if not pid.isdigit():
+            continue
+        try:
+            if os.stat(f"/proc/{pid}").st_uid != uid:
+                continue
+            with open(f"/proc/{pid}/maps", errors="replace") as f:
+                used.update(pat.findall(f.read()))
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                used.update(pat.findall(f.read().replace(b"\0", b" ").decode(errors="replace")))
+        except OSError:
+            continue
+    return used
+
+
 def _current(prefix: Path):
     c = prefix / "current"
     return os.readlink(c).split("/")[-1] if c.is_symlink() else None
@@ -567,8 +587,33 @@ class Installer:
         cfg.update({"source": source, "channel": channel, "pubkey": pubkey, "current": man["version"],
                     "previous": prev, "updated": int(time.time())})
         _save_config(self.prefix, cfg)
+        self.prune(keep=(man["version"], prev))
         return (f"installed {man['version']} ({channel})" + (f", previous {prev}" if prev else "") +
                 self._service_issue_summary())
+
+    KEEP_RELEASES = 3
+
+    def prune(self, keep=()) -> list:
+        """Delete old release dirs: always keep `current`, `previous` and the newest KEEP_RELEASES.
+        (2026-10-04: the hub had 28 releases, 1.9 GB.) Never fails an install."""
+        rel = self.prefix / "releases"
+        try:
+            dirs = sorted((d for d in rel.iterdir() if d.is_dir()), key=lambda d: d.stat().st_mtime, reverse=True)
+        except OSError:
+            return []
+        protect = {k for k in keep if k} | {d.name for d in dirs[:self.KEEP_RELEASES]}
+        cur = _current(self.prefix)
+        if cur:
+            protect.add(cur)
+        # A service that was NOT restarted (its inputs did not change) still runs from an older release dir;
+        # deleting it would break that process's next lazy import (the hub's signer ran from 0.10.8 under 0.11.0).
+        protect |= _releases_in_use(rel)
+        removed = []
+        for d in dirs:
+            if d.name not in protect:
+                shutil.rmtree(d, ignore_errors=True)
+                removed.append(d.name)
+        return removed
 
     def update(self) -> str:
         cfg = _load_config(self.prefix)
