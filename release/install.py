@@ -357,7 +357,9 @@ class Installer:
             "[Unit]\nDescription=Hourly Nakshatra node update check\n\n"
             "[Timer]\nOnCalendar=hourly\nRandomizedDelaySec=600\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n")
         if self.systemd:
-            subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+            if subprocess.run(["systemctl", "--user", "daemon-reload"], check=False).returncode != 0:
+                # Restarting now would run systemd's cached OLD unit against the new release.
+                raise InstallError("systemctl --user daemon-reload failed; not restarting anything")
             subprocess.run(["systemctl", "--user", "enable", "--now", "nak-update.timer"], check=False)
         return names
 
@@ -481,9 +483,10 @@ class Installer:
         """True once nothing is connected to `port` (checked twice, 2 s apart), False at the time limit."""
         end, quiet = time.time() + max_wait_s, 0
         while time.time() < end:
-            out = subprocess.run(["ss", "-Htn", "state", "established", f"( sport = :{port} )"],
-                                 capture_output=True, text=True).stdout
-            quiet = quiet + 1 if not out.strip() else 0
+            r = subprocess.run(["ss", "-Htn", "state", "established", f"( sport = :{port} )"],
+                               capture_output=True, text=True)
+            # Fail CLOSED: if ss itself fails we cannot tell, so the port counts as busy.
+            quiet = quiet + 1 if (r.returncode == 0 and not (r.stdout or "").strip()) else 0
             if quiet >= 2:
                 return True
             time.sleep(2)

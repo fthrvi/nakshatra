@@ -97,3 +97,10 @@ Unification work in progress (U1–U6): `trisul/plans/2026-10-03-nakshatra-unifi
 | Inference gateway (`nakshatra-unconscious`) | **from the signed release** with the `inference` profile (hash-locked grpcio/numpy/llama_cpp_python…), opt-in via `~/.nakshatra/{inference.env,unconscious.release}`; the hub's settings live in drop-ins | LIVE on the hub since 0.10.2 (U6b, 2026-10-03; cutover/rollback scripts in trisul `infra/nakshatra/`) |
 | **The engine (patched llama.cpp)**: ONE source of truth | **`engine/`**: upstream b9992 + a patch series; `engine/source.sh` rebuilds it and refuses unless the tree hash matches exactly. Shipped in every release. Retired copies: the hub-only fork branch (now exported), the stale `experiments/v0.0` daemon (no `solo` mode), and `rebuild-worker.sh`, which would have reverted to it. | LIVE in releases since 0.10.3 (U6c); compiled from it on the hub |
 | Build the worker for this GPU | `deploy/provision-worker.sh` (CUDA/ROCm/Vulkan/Metal/CPU, no sudo), building from `engine/` when run from a release | BUILT. The hub's live binary is still the one hand-built 09-12 from the identical tree; rebuild through this path at the next worker change. |
+
+## Known installer follow-ups (Codex review, 2026-10-03; NOT regressions of p2p, all pre-existing)
+- `current` switches before services drain, so an in-flight gateway request can spawn helpers from the new release.
+- Rollback (automatic or explicit) restarts the previous release's services without draining.
+- "Healthy" = stable process for 5 s; there is no readiness probe (e.g. the gateway's /v1/models, the sidecar's relay reservation).
+- A request arriving between the last idle sample and the restart is cut (a narrow race).
+- An interruption between the switch and saving the config leaves an unvalidated release active until the next run.

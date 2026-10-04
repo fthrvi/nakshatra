@@ -521,7 +521,8 @@ def test_removed_opt_in_retains_managed_unit_when_disable_fails(tmp_path, monkey
     unit = units / "managed.service"
     unit.write_text(inst._unit_text(svc, inst._ctx(man), man))
     monkeypatch.setattr(I.subprocess, "run", lambda args, **kw:
-                        type("R", (), {"returncode": 1, "stdout": "", "stderr": "bus error"})())
+                        type("R", (), {"returncode": 1 if "disable" in args else 0,
+                                       "stdout": "", "stderr": "bus error"})())
 
     inst.write_units(man)
 
@@ -662,3 +663,10 @@ def test_identical_releases_fingerprint_the_same_despite_lock_comments(tmp_path)
                                                f"    --hash=sha256:aa\n    # via -r {path}/requirements.in\n")
     man = lambda v: dict(_svc_man(["n1", "s1"]), version=v, lock={"file": "requirements.lock", "sha256": v})
     assert inst._fingerprint("gw", man("0.1.0")) == inst._fingerprint("gw", man("0.1.1"))
+
+
+def test_drain_fails_closed_when_ss_fails(tmp_path, monkeypatch):
+    inst = I.Installer(tmp_path / "node", systemd=True, make_venv=False, unit_dir=tmp_path / "units")
+    monkeypatch.setattr(I.subprocess, "run", lambda *a, **k: type("R", (), {"returncode": 1, "stdout": ""})())
+    monkeypatch.setattr(I.time, "sleep", lambda s: None)
+    assert inst._wait_idle(11599, 0.05) is False
