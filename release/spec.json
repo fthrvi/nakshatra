@@ -164,7 +164,8 @@
    ],
    "components": [
     "nakshatra"
-   ]
+   ],
+   "runtime_directory": "nakshatra"
   },
   "nakshatra-unconscious": {
    "description": "Nakshatra inference gateway (OpenAI /v1/chat/completions over the mesh)",

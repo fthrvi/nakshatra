@@ -400,6 +400,10 @@ class Installer:
                         "ProtectHome=read-only"]
             paths = svc.get("read_write_paths") or ["{home}/.nakshatra"]
             service += [f"ReadWritePaths={_render(p, ctx)}" for p in paths]
+        if svc.get("runtime_directory"):
+            # ProtectHome=read-only also makes /run/user/<uid> read-only; systemd creates this one writable,
+            # private (0700) and owned by the user (2026-10-04: bro's sidecar could not create its socket dir).
+            service += [f"RuntimeDirectory={svc['runtime_directory']}", "RuntimeDirectoryMode=0700"]
         return (UNIT_MARKER + "\n[Unit]\n" + "\n".join(unit) + "\n\n[Service]\n" + "\n".join(service) +
                 "\n\n[Install]\nWantedBy=default.target\n")
 

@@ -846,3 +846,14 @@ def test_disable_failure_retains_managed_unit_but_removes_opt_in(tmp_path, monke
         inst.disable("nakshatra-p2p")
     assert not opt_in.exists()
     assert (units / "nakshatra-p2p.service").exists()
+
+
+def test_p2p_unit_gets_a_writable_private_runtime_dir():
+    spec = json.loads((Path(__file__).resolve().parent.parent / "release" / "spec.json").read_text())
+    svc = spec["services"]["nakshatra-p2p"]
+    assert svc["runtime_directory"] == "nakshatra" and svc.get("hardening")
+    inst = I.Installer(Path("/nonexistent-prefix"), systemd=False, make_venv=False, unit_dir=Path("/nonexistent-units"))
+    man = {"version": "0.1.0", "components": [], "services": {"nakshatra-p2p": svc}, "profiles": {}}
+    text = inst._unit_text(svc, inst._ctx(man), man)
+    assert "RuntimeDirectory=nakshatra" in text and "RuntimeDirectoryMode=0700" in text
+    assert "ProtectHome=read-only" in text
