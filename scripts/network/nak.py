@@ -16,6 +16,8 @@ it does — nothing is shared until you accept).
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import json
 import os
 import sys
@@ -75,21 +77,56 @@ DEFAULT_P2P_RELAYS = (f"/ip4/45.63.109.137/udp/29700/quic-v1/p2p/{DEFAULT_P2P_RE
                       f"/ip4/45.63.109.137/tcp/29700/p2p/{DEFAULT_P2P_RELAY_ID}")
 
 
+def _p2p_installer(_sp, action: str) -> None:
+    """Ask the signed release's installer to operate on exactly the P2P sidecar service."""
+    prefix = Path(os.environ.get("NAK_NODE_PREFIX", Path.home() / ".nakshatra-node"))
+    installer = _verified_release_installer(prefix)
+    try:
+        _sp.run([sys.executable, str(installer), "--prefix", str(prefix), action, "nakshatra-p2p"], check=True)
+    except (OSError, _sp.CalledProcessError) as e:
+        raise SystemExit(f"could not {action} nakshatra-p2p: {e}")
+
+
+def _verified_release_installer(prefix: Path) -> Path:
+    """Verify the current manifest against the pinned key and the installer against its signed hash."""
+    from cryptography.exceptions import InvalidSignature
+    try:
+        cfg = json.loads((prefix / "config.json").read_text())
+        man = json.loads((prefix / "current" / "manifest.json").read_text())
+        sig = man["sig"]
+        if sig.get("alg") != "Ed25519" or man.get("version") != cfg.get("current"):
+            raise ValueError("release identity mismatch")
+        body = {k: v for k, v in man.items() if k != "sig"}
+        canonical = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+        from cryptography.hazmat.primitives.asymmetric import ed25519
+        ed25519.Ed25519PublicKey.from_public_bytes(bytes.fromhex(cfg["pubkey"])).verify(
+            base64.b64decode(sig["value"], validate=True), canonical)
+        relpath = Path(man["installer"])
+        if relpath.is_absolute() or ".." in relpath.parts or relpath.name != "install.py":
+            raise ValueError("unsafe installer path")
+        installer = prefix / "current" / relpath
+        expected = man["bootstrap"]["install.py"]
+        if hashlib.sha256(installer.read_bytes()).hexdigest() != expected:
+            raise ValueError("installer hash mismatch")
+    except (OSError, ValueError, KeyError, TypeError, InvalidSignature) as e:
+        raise SystemExit(f"installed release at {prefix} is missing, stale, or fails signature verification: {e}")
+    return installer
+
+
 def _enable_p2p_service(_sp) -> None:
-    """Opt this node into the release's `nakshatra-p2p` service (the opt-in file IS the consent), write
-    the units with the release's own installer, and start the sidecar. Existing settings are kept."""
+    """Create the opt-in if needed, then atomically hand the one-service enable to the installer."""
     env = Path.home() / ".nakshatra" / "p2p.env"
+    created = False
     if not env.exists():
         env.parent.mkdir(parents=True, exist_ok=True)
         env.write_text(f"P2P_RELAYS={DEFAULT_P2P_RELAYS}\n")
-    prefix = Path(os.environ.get("NAK_NODE_PREFIX", Path.home() / ".nakshatra-node"))
-    installer = prefix / "current" / "nakshatra" / "release" / "install.py"
-    if not installer.exists():
-        raise SystemExit(f"no installed release at {prefix}; p2p needs the signed release (install it first)")
-    _sp.run([sys.executable, str(installer), "--prefix", str(prefix), "write-units"], check=True,
-            stdout=_sp.DEVNULL)
-    _sp.run(["systemctl", "--user", "daemon-reload"], check=True)
-    _sp.run(["systemctl", "--user", "enable", "--now", "nakshatra-p2p.service"], check=True)
+        created = True
+    try:
+        _p2p_installer(_sp, "enable")
+    except (Exception, SystemExit):
+        if created:
+            env.unlink(missing_ok=True)
+        raise
 
 
 def _default_p2p_socket() -> Path:
@@ -212,14 +249,15 @@ def main(argv=None) -> int:
         f = Path(os.environ.get("NAK_NET_DIR", Path.home() / ".nakshatra" / "net")) / "p2p-dial"
         if a.onoff == "off":
             f.unlink(missing_ok=True)
+            _sp.run(["systemctl", "--user", "restart", "nak-net.service"], check=False)
+            _p2p_installer(_sp, "disable")
         else:
             dial = a.socket or _default_p2p_socket()
             if not dial.is_absolute():
                 raise SystemExit("--socket must be an absolute path")
-            if a.socket is None:
-                _enable_p2p_service(_sp)       # one step: opt the sidecar service in, then point nakd at it
+            _enable_p2p_service(_sp)
             f.write_text(str(dial) + "\n")
-        _sp.run(["systemctl", "--user", "restart", "nak-net.service"], check=False)
+            _sp.run(["systemctl", "--user", "restart", "nak-net.service"], check=False)
         print(f"p2p {'OFF' if a.onoff == 'off' else 'ON via ' + str(dial)}; nak-net restarted")
     elif a.cmd == "ledger":
         r = call(s, {"op": "ledger"})

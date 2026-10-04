@@ -2,8 +2,12 @@
 dialer (the pairing initiator), the same pinned handshake, the relay as the fallback."""
 from __future__ import annotations
 
+import base64
+import hashlib
+import json
 import socket
 import subprocess
+import sys
 import time
 
 import pytest
@@ -11,6 +15,23 @@ import pytest
 from test_nakd import _connect, net, wait  # noqa: F401  (net is a fixture)
 from network import nakd
 from transport import connect as C
+
+
+def _fake_installed_release(prefix):
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+    installer = prefix / "current" / "nakshatra" / "release" / "install.py"
+    installer.parent.mkdir(parents=True)
+    installer.write_text("# signed test installer\n")
+    key = ed25519.Ed25519PrivateKey.generate()
+    pub = key.public_key().public_bytes_raw().hex()
+    man = {"version": "1.2.3", "installer": "nakshatra/release/install.py",
+           "bootstrap": {"install.py": hashlib.sha256(installer.read_bytes()).hexdigest()}}
+    canonical = json.dumps(man, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    man["sig"] = {"alg": "Ed25519", "keyid": pub[:16],
+                  "value": base64.b64encode(key.sign(canonical)).decode()}
+    (prefix / "current" / "manifest.json").write_text(json.dumps(man))
+    (prefix / "config.json").write_text(json.dumps({"current": "1.2.3", "pubkey": pub}))
+    return installer
 
 
 def _free_port():
@@ -175,16 +196,67 @@ def test_nak_p2p_toggle_uses_only_the_test_state_dir(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "run"))
     monkeypatch.setenv("HOME", str(tmp_path / "home"))                 # never the real ~/.nakshatra
     prefix = tmp_path / "node"
-    (prefix / "current" / "nakshatra" / "release").mkdir(parents=True)
-    (prefix / "current" / "nakshatra" / "release" / "install.py").write_text("")
+    installer = _fake_installed_release(prefix)
     monkeypatch.setenv("NAK_NODE_PREFIX", str(prefix))
     monkeypatch.setattr(subprocess, "run", lambda args, **kwargs: calls.append(args))
     assert nak.main(["p2p", "on"]) == 0
     assert (tmp_path / "p2p-dial").read_text() == f"{tmp_path}/run/nakshatra/p2p.sock\n"
     env = (tmp_path / "home" / ".nakshatra" / "p2p.env").read_text()   # one step: opted in with the relay
     assert env.startswith("P2P_RELAYS=/ip4/45.63.109.137/udp/29700/quic-v1/p2p/12D3KooWDfHFt")
-    assert ["systemctl", "--user", "enable", "--now", "nakshatra-p2p.service"] in calls
-    assert any(c[-1] == "write-units" for c in calls)
+    assert [sys.executable, str(installer), "--prefix", str(prefix), "enable", "nakshatra-p2p"] in calls
+    assert not any(c[:3] == ["systemctl", "--user", "enable"] for c in calls)
     assert calls[-1] == ["systemctl", "--user", "restart", "nak-net.service"]
     assert nak.main(["p2p", "off"]) == 0
     assert not (tmp_path / "p2p-dial").exists()
+    assert calls[-2] == ["systemctl", "--user", "restart", "nak-net.service"]
+    assert calls[-1] == [sys.executable, str(installer), "--prefix", str(prefix),
+                         "disable", "nakshatra-p2p"]
+
+
+@pytest.mark.parametrize("preexisting_env", [False, True])
+def test_nak_p2p_enable_failure_never_changes_dial_or_restarts(tmp_path, monkeypatch, preexisting_env):
+    from network import nak
+    home, prefix = tmp_path / "home", tmp_path / "node"
+    _fake_installed_release(prefix)
+    dial = tmp_path / "net" / "p2p-dial"
+    dial.parent.mkdir()
+    dial.write_text("existing.sock\n")
+    env = home / ".nakshatra" / "p2p.env"
+    if preexisting_env:
+        env.parent.mkdir(parents=True)
+        env.write_text("P2P_RELAYS=custom\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("NAK_NET_DIR", str(dial.parent))
+    monkeypatch.setenv("NAK_NODE_PREFIX", str(prefix))
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "run"))
+    calls = []
+
+    def fail_enable(args, **kwargs):
+        calls.append(args)
+        if "enable" in args:
+            raise subprocess.CalledProcessError(1, args)
+
+    monkeypatch.setattr(subprocess, "run", fail_enable)
+    with pytest.raises(SystemExit, match="could not enable"):
+        nak.main(["p2p", "on"])
+    assert dial.read_text() == "existing.sock\n"
+    assert env.exists() is preexisting_env
+    assert not any(c[:3] == ["systemctl", "--user", "restart"] for c in calls)
+
+
+def test_nak_p2p_refuses_a_tampered_installer_before_subprocess(tmp_path, monkeypatch):
+    from network import nak
+    prefix = tmp_path / "node"
+    installer = _fake_installed_release(prefix)
+    installer.write_text("# tampered\n")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("NAK_NET_DIR", str(tmp_path / "net"))
+    monkeypatch.setenv("NAK_NODE_PREFIX", str(prefix))
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "run"))
+    calls = []
+    monkeypatch.setattr(subprocess, "run", lambda args, **kwargs: calls.append(args))
+    with pytest.raises(SystemExit, match="fails signature verification"):
+        nak.main(["p2p", "on"])
+    assert calls == []
+    assert not (tmp_path / "home" / ".nakshatra" / "p2p.env").exists()
+    assert not (tmp_path / "net" / "p2p-dial").exists()

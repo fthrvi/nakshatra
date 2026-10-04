@@ -672,14 +672,16 @@ def test_drain_fails_closed_when_ss_fails(tmp_path, monkeypatch):
     assert inst._wait_idle(11599, 0.05) is False
 
 
-def test_prune_keeps_current_previous_and_newest(tmp_path):
+def test_prune_reads_current_previous_and_keeps_newest_from_config(tmp_path):
     import os as _os
     inst = I.Installer(tmp_path / "node", systemd=False, make_venv=False, unit_dir=tmp_path / "units")
     rel = tmp_path / "node" / "releases"
     for i, v in enumerate(["0.1.0", "0.2.0", "0.3.0", "0.4.0", "0.5.0", "0.6.0"]):
         (rel / v).mkdir(parents=True)
         _os.utime(rel / v, (1000 + i, 1000 + i))
-    removed = inst.prune(keep=("0.6.0", "0.1.0"))
+    (tmp_path / "node" / "current").symlink_to("releases/0.6.0")
+    I._save_config(tmp_path / "node", {"current": "0.6.0", "previous": "0.1.0"})
+    removed = inst.prune()
     assert sorted(removed) == ["0.2.0", "0.3.0"]
     assert sorted(p.name for p in rel.iterdir()) == ["0.1.0", "0.4.0", "0.5.0", "0.6.0"]
 
@@ -709,3 +711,138 @@ def test_releases_in_use_finds_this_process(tmp_path):
             assert "9.9.9" in I._releases_in_use(rel)
         finally:
             m.close()
+
+
+def test_releases_in_use_resolves_pure_python_argv_through_current(tmp_path):
+    import subprocess as _sp
+    rel = tmp_path / "node" / "releases"
+    app = rel / "9.9.9" / "app"
+    app.mkdir(parents=True)
+    script = app / "stay.py"
+    script.write_text("import time\ntime.sleep(30)\n")
+    (tmp_path / "node" / "current").symlink_to("releases/9.9.9")
+    proc = _sp.Popen([sys.executable, str(tmp_path / "node" / "current" / "app" / "stay.py")])
+    try:
+        for _ in range(100):
+            if proc.poll() is not None or "9.9.9" in I._releases_in_use(rel):
+                break
+            time.sleep(0.01)
+        assert proc.poll() is None
+        assert "9.9.9" in I._releases_in_use(rel)
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
+def test_prune_restores_release_that_becomes_live_during_quarantine(tmp_path, monkeypatch):
+    inst = I.Installer(tmp_path / "node", systemd=False, make_venv=False, unit_dir=tmp_path / "units")
+    inst.KEEP_RELEASES = 1
+    rel = tmp_path / "node" / "releases"
+    for stamp, v in enumerate(("0.1.0", "0.2.0"), start=1):
+        (rel / v).mkdir(parents=True)
+        os.utime(rel / v, (stamp, stamp))
+
+    def live_after_rename(root):
+        quarantined = [p.name for p in root.iterdir() if p.name.startswith(".prune-0.1.0-")]
+        return set(quarantined)
+
+    monkeypatch.setattr(I, "_releases_in_use", live_after_rename)
+    assert inst.prune() == []
+    assert (rel / "0.1.0").is_dir()
+    assert not any(p.name.startswith(".prune-") for p in rel.iterdir())
+
+
+def test_installer_lock_times_out_a_second_caller(tmp_path, monkeypatch):
+    first = I.Installer(tmp_path / "node", systemd=False, make_venv=False)
+    second = I.Installer(tmp_path / "node", systemd=False, make_venv=False)
+    monkeypatch.setattr(I, "INSTALL_LOCK_TIMEOUT_S", 0)
+    with first._install_lock():
+        with pytest.raises(I.InstallError, match="another installer operation"):
+            second.prune()
+
+
+def _one_service_install(tmp_path, *, managed=True):
+    prefix, units = tmp_path / "node", tmp_path / "units"
+    release = prefix / "releases" / "1.2.3"
+    release.mkdir(parents=True)
+    opt_in = tmp_path / "home" / ".nakshatra" / "p2p.env"
+    svc = {"description": "p2p", "requires": str(opt_in), "exec": ["{prefix}/current/bin/p2p"]}
+    man = {"version": "1.2.3", "components": [], "services": {
+        "nakshatra-p2p": svc,
+        "unrelated": {"description": "other", "requires": str(tmp_path / "other.env"),
+                      "exec": ["/do/not/touch"]},
+    }}
+    (release / "manifest.json").write_text(json.dumps(man))
+    (prefix / "current").symlink_to("releases/1.2.3")
+    units.mkdir()
+    inst = I.Installer(prefix, systemd=True, make_venv=False, unit_dir=units)
+    if managed:
+        (units / "nakshatra-p2p.service").write_text(inst._unit_text(svc, inst._ctx(man), man))
+    return inst, man, opt_in, units
+
+
+def test_enable_writes_starts_and_checks_only_requested_opt_in_service(tmp_path, monkeypatch):
+    inst, _man, opt_in, units = _one_service_install(tmp_path, managed=False)
+    opt_in.parent.mkdir(parents=True)
+    opt_in.write_text("P2P_RELAYS=test\n")
+    (units / "unrelated.service").write_text("operator owned\n")
+    calls = []
+
+    def systemctl(args, **kwargs):
+        calls.append(args)
+        stdout = "ActiveState=active\nMainPID=42\nNRestarts=0\n" if "show" in args else ""
+        return type("R", (), {"returncode": 0, "stdout": stdout, "stderr": ""})()
+
+    monkeypatch.setattr(I.subprocess, "run", systemctl)
+    monkeypatch.setattr(I, "SERVICE_STABILITY_S", 0)
+    assert inst.enable("nakshatra-p2p") == "enabled nakshatra-p2p.service"
+    assert I.UNIT_MARKER in (units / "nakshatra-p2p.service").read_text()
+    assert (units / "unrelated.service").read_text() == "operator owned\n"
+    assert calls[0] == ["systemctl", "--user", "daemon-reload"]
+    assert calls[1] == ["systemctl", "--user", "enable", "--now", "nakshatra-p2p.service"]
+    assert all("unrelated" not in " ".join(c) for c in calls)
+
+
+def test_enable_refuses_missing_opt_in_and_daemon_reload_failure(tmp_path, monkeypatch):
+    inst, _man, opt_in, units = _one_service_install(tmp_path, managed=False)
+    with pytest.raises(I.InstallError, match="not opted in"):
+        inst.enable("nakshatra-p2p")
+    opt_in.parent.mkdir(parents=True)
+    opt_in.write_text("")
+    calls = []
+    monkeypatch.setattr(I.subprocess, "run", lambda args, **kw: calls.append(args) or
+                        type("R", (), {"returncode": 1, "stdout": "", "stderr": ""})())
+    with pytest.raises(I.InstallError, match="daemon-reload failed"):
+        inst.enable("nakshatra-p2p")
+    assert calls == [["systemctl", "--user", "daemon-reload"]]
+    assert (units / "nakshatra-p2p.service").exists()
+
+
+def test_disable_stops_removes_only_managed_unit_and_opt_in(tmp_path, monkeypatch):
+    inst, _man, opt_in, units = _one_service_install(tmp_path)
+    opt_in.parent.mkdir(parents=True)
+    opt_in.write_text("")
+    (units / "unrelated.service").write_text("operator owned\n")
+    calls = []
+    monkeypatch.setattr(I.subprocess, "run", lambda args, **kw: calls.append(args) or
+                        type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})())
+    assert inst.disable("nakshatra-p2p") == "disabled nakshatra-p2p.service"
+    assert not opt_in.exists()
+    assert not (units / "nakshatra-p2p.service").exists()
+    assert (units / "unrelated.service").read_text() == "operator owned\n"
+    assert calls == [
+        ["systemctl", "--user", "disable", "--now", "nakshatra-p2p.service"],
+        ["systemctl", "--user", "daemon-reload"],
+    ]
+
+
+def test_disable_failure_retains_managed_unit_but_removes_opt_in(tmp_path, monkeypatch):
+    inst, _man, opt_in, units = _one_service_install(tmp_path)
+    opt_in.parent.mkdir(parents=True)
+    opt_in.write_text("")
+    monkeypatch.setattr(I.subprocess, "run", lambda args, **kw:
+                        type("R", (), {"returncode": 1, "stdout": "", "stderr": ""})())
+    with pytest.raises(I.InstallError, match="could not fully disable"):
+        inst.disable("nakshatra-p2p")
+    assert not opt_in.exists()
+    assert (units / "nakshatra-p2p.service").exists()

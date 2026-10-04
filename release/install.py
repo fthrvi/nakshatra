@@ -21,6 +21,9 @@ What it guarantees:
 from __future__ import annotations
 
 import argparse
+import errno
+import fcntl
+import functools
 import json
 import os
 import shutil
@@ -28,6 +31,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -42,6 +46,7 @@ _THIS_FILE = Path(__file__).resolve()      # resolved at LOAD time, before any `
 UNIT_MARKER = "# Managed by nakshatra-node install.py"
 SERVICE_ACTIVE_TIMEOUT_S = 20.0
 SERVICE_STABILITY_S = 5.0
+INSTALL_LOCK_TIMEOUT_S = 600.0
 
 
 class InstallError(Exception):
@@ -112,21 +117,54 @@ def _switch(prefix: Path, version: str) -> None:
     os.replace(tmp, prefix / "current")
 
 
+def _locked_operation(fn):
+    """Serialize a complete public installer operation on this prefix."""
+    @functools.wraps(fn)
+    def locked(self, *args, **kwargs):
+        with self._install_lock():
+            return fn(self, *args, **kwargs)
+    return locked
+
+
 def _releases_in_use(rel: Path) -> set:
-    """Release dir names that any of this user's processes has mapped or runs from (/proc maps + cmdline)."""
+    """Release dirs referenced by this uid's processes.
+
+    Resolve argv entries while ``current`` still names their release, and inspect cwd/fd links as well as
+    maps.  Pure-Python programs need not retain a mapped file after startup, so maps alone is insufficient.
+    """
     import re
-    pat = re.compile(re.escape(str(rel.resolve())) + r"/([^/\s]+)/")
+    root = str(rel.resolve())
+    pat = re.compile(re.escape(root) + r"/([^/\s]+)(?:/|$)")
     used, uid = set(), os.getuid()
+
+    def remember(value) -> None:
+        if not value:
+            return
+        value = os.path.realpath(os.fsdecode(value)).removesuffix(" (deleted)")
+        used.update(pat.findall(value))
+
     for pid in os.listdir("/proc") if os.path.isdir("/proc") else []:
         if not pid.isdigit():
             continue
+        proc = Path("/proc") / pid
         try:
-            if os.stat(f"/proc/{pid}").st_uid != uid:
+            if proc.stat().st_uid != uid:
                 continue
-            with open(f"/proc/{pid}/maps", errors="replace") as f:
+            cwd = os.path.realpath(proc / "cwd")
+            remember(cwd)
+            with open(proc / "maps", errors="replace") as f:
                 used.update(pat.findall(f.read()))
-            with open(f"/proc/{pid}/cmdline", "rb") as f:
-                used.update(pat.findall(f.read().replace(b"\0", b" ").decode(errors="replace")))
+            with open(proc / "cmdline", "rb") as f:
+                argv = f.read().split(b"\0")
+            for arg in argv:
+                text = os.fsdecode(arg)
+                # Keep direct release paths even if a file has since disappeared, and resolve paths
+                # containing `current` before an install retargets that symlink.
+                used.update(pat.findall(text))
+                if text and (text.startswith("/") or "/" in text):
+                    remember(text if text.startswith("/") else os.path.join(cwd, text))
+            for fd in (proc / "fd").iterdir():
+                remember(fd)
         except OSError:
             continue
     return used
@@ -147,6 +185,56 @@ class Installer:
         # inside its own prefix and can NEVER touch the real ~/.config/systemd/user — on 2026-10-03 a
         # test that undid a monkeypatch rewrote the hub's real nak-update.service to a pytest tmp dir.
         self.unit_dir = Path(unit_dir) if unit_dir else (UNIT_DIR if systemd else self.prefix / "units")
+        self._lock_depth = 0
+        self._lock_owner = None
+
+    class _Lock:
+        def __init__(self, installer):
+            self.installer = installer
+            self.file = None
+
+        def __enter__(self):
+            inst = self.installer
+            owner = threading.get_ident()
+            if inst._lock_depth and inst._lock_owner == owner:
+                inst._lock_depth += 1
+                return self
+            inst.prefix.mkdir(parents=True, exist_ok=True)
+            lock = inst.prefix / ".install.lock"
+            fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+            self.file = os.fdopen(fd, "r+")
+            deadline = time.monotonic() + INSTALL_LOCK_TIMEOUT_S
+            while True:
+                try:
+                    fcntl.flock(self.file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError as e:
+                    if e.errno not in (errno.EACCES, errno.EAGAIN):
+                        self.file.close()
+                        raise
+                    if time.monotonic() >= deadline:
+                        self.file.close()
+                        raise InstallError(
+                            f"another installer operation still holds {lock} after "
+                            f"{INSTALL_LOCK_TIMEOUT_S:g}s")
+                    time.sleep(0.1)
+            inst._lock_depth = 1
+            inst._lock_owner = owner
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            inst = self.installer
+            inst._lock_depth -= 1
+            if self.file is not None:
+                try:
+                    fcntl.flock(self.file, fcntl.LOCK_UN)
+                finally:
+                    self.file.close()
+                    inst._lock_owner = None
+            return False
+
+    def _install_lock(self):
+        return self._Lock(self)
 
     @property
     def _service_state_path(self) -> Path:
@@ -383,6 +471,75 @@ class Installer:
             subprocess.run(["systemctl", "--user", "enable", "--now", "nak-update.timer"], check=False)
         return names
 
+    def _current_service(self, name: str) -> tuple[dict, dict, Path]:
+        """Return the current signed-release manifest entry and its rendered opt-in path."""
+        version = _current(self.prefix)
+        if not version:
+            raise InstallError("no current installed release")
+        manifest_path = self.prefix / "current" / "manifest.json"
+        try:
+            man = json.loads(manifest_path.read_text())
+        except (OSError, ValueError) as e:
+            raise InstallError(f"cannot read the current release manifest: {e}")
+        if man.get("version") != version:
+            raise InstallError("current release manifest does not match the current symlink")
+        svc = (man.get("services") or {}).get(name)
+        if not isinstance(svc, dict):
+            raise InstallError(f"service {name!r} is not in the current release manifest")
+        if not svc.get("requires"):
+            raise InstallError(f"service {name!r} is not an opt-in service")
+        requires = Path(_render(svc["requires"], self._ctx(man)))
+        return man, svc, requires
+
+    @_locked_operation
+    def enable(self, name: str) -> str:
+        """Write and start exactly one current-release opt-in service."""
+        man, svc, requires = self._current_service(name)
+        if not requires.exists():
+            raise InstallError(f"{name} is not opted in: required file does not exist: {requires}")
+        self.unit_dir.mkdir(parents=True, exist_ok=True)
+        unit = self.unit_dir / f"{name}.service"
+        if unit.exists() and not self._managed_unit(unit):
+            raise InstallError(f"refusing to replace operator-owned unit {unit}")
+        unit.write_text(self._unit_text(svc, self._ctx(man), man))
+        if subprocess.run(["systemctl", "--user", "daemon-reload"], check=False).returncode != 0:
+            raise InstallError("systemctl --user daemon-reload failed; service was not enabled")
+        started = subprocess.run(
+            ["systemctl", "--user", "enable", "--now", f"{name}.service"], check=False)
+        if started.returncode != 0:
+            raise InstallError(f"systemctl enable --now {name}.service failed with exit status {started.returncode}")
+        healthy, detail = self._wait_stable(name, SERVICE_ACTIVE_TIMEOUT_S, SERVICE_STABILITY_S)
+        if not healthy:
+            self._record_service_issue(name, "failed", detail)
+            raise InstallError(f"{name}.service {detail}")
+        self._clear_service_issue(name)
+        return f"enabled {name}.service"
+
+    @_locked_operation
+    def disable(self, name: str) -> str:
+        """Stop and remove exactly one managed opt-in service, then remove its opt-in file."""
+        _man, _svc, requires = self._current_service(name)
+        unit = self.unit_dir / f"{name}.service"
+        failure = None
+        removed = False
+        if unit.exists() and self._managed_unit(unit):
+            stopped = subprocess.run(
+                ["systemctl", "--user", "disable", "--now", f"{name}.service"], check=False)
+            if stopped.returncode == 0:
+                unit.unlink()
+                removed = True
+            else:
+                failure = f"systemctl disable --now failed with exit status {stopped.returncode}"
+                self._record_service_issue(name, "removal-failed", failure + "; managed unit retained")
+        requires.unlink(missing_ok=True)
+        if removed and subprocess.run(["systemctl", "--user", "daemon-reload"], check=False).returncode != 0:
+            failure = "systemctl --user daemon-reload failed after removing the unit"
+            self._record_service_issue(name, "removal-failed", failure)
+        if failure:
+            raise InstallError(f"could not fully disable {name}.service: {failure}")
+        self._clear_service_issue(name)
+        return f"disabled {name}.service"
+
     def restart(self, names: list, man: dict | None = None, *, force: bool = False) -> list:
         """Restart services only when needed, and never in the middle of a request (2026-10-03):
         - a service whose FINGERPRINT (its unit text + the commits of the components it runs + the env lock)
@@ -521,6 +678,7 @@ class Installer:
                 raise InstallError(f"health check failed: {' '.join(cmd)}\n{(r.stderr or r.stdout)[-800:]}")
 
     # ── the operations ──
+    @_locked_operation
     def install(self, source: str, channel: str, pubkey: str, version=None, *, allow_downgrade=False,
                 min_version: str = "") -> str:
         self.prefix.mkdir(parents=True, exist_ok=True)
@@ -564,6 +722,9 @@ class Installer:
             raise
         finally:
             shutil.rmtree(work, ignore_errors=True)
+        # Resolve `current/...` argv while it still points to the old release. A pure-Python service
+        # can have no old-release mmap/fd left by the time current is switched.
+        pre_switch_used = _releases_in_use(self.prefix / "releases")
         _switch(self.prefix, man["version"])
         try:
             names = self._write_units_by_new_installer(man)
@@ -587,21 +748,26 @@ class Installer:
         cfg.update({"source": source, "channel": channel, "pubkey": pubkey, "current": man["version"],
                     "previous": prev, "updated": int(time.time())})
         _save_config(self.prefix, cfg)
-        self.prune(keep=(man["version"], prev))
+        self.prune(keep=(man["version"], prev, *pre_switch_used))
         return (f"installed {man['version']} ({channel})" + (f", previous {prev}" if prev else "") +
                 self._service_issue_summary())
 
     KEEP_RELEASES = 3
 
+    @_locked_operation
     def prune(self, keep=()) -> list:
         """Delete old release dirs: always keep `current`, `previous` and the newest KEEP_RELEASES.
         (2026-10-04: the hub had 28 releases, 1.9 GB.) Never fails an install."""
         rel = self.prefix / "releases"
         try:
-            dirs = sorted((d for d in rel.iterdir() if d.is_dir()), key=lambda d: d.stat().st_mtime, reverse=True)
+            dirs = sorted((d for d in rel.iterdir() if d.is_dir() and not d.name.startswith(".prune-")),
+                          key=lambda d: d.stat().st_mtime, reverse=True)
         except OSError:
             return []
-        protect = {k for k in keep if k} | {d.name for d in dirs[:self.KEEP_RELEASES]}
+        cfg = _load_config(self.prefix)
+        protect = ({k for k in keep if k} | {cfg.get("current"), cfg.get("previous")} |
+                   {d.name for d in dirs[:self.KEEP_RELEASES]})
+        protect.discard(None)
         cur = _current(self.prefix)
         if cur:
             protect.add(cur)
@@ -610,17 +776,37 @@ class Installer:
         protect |= _releases_in_use(rel)
         removed = []
         for d in dirs:
-            if d.name not in protect:
-                shutil.rmtree(d, ignore_errors=True)
+            if d.name in protect or not d.exists():
+                continue
+            # Rename first: after this atomic step no new process can enter via the release's old
+            # pathname. Re-scan while quarantined; cwd/fd/maps expose the quarantine name and argv
+            # still exposes the original one. Restore instead of deleting if either is observed.
+            quarantine = rel / f".prune-{d.name}-{os.getpid()}-{time.time_ns()}"
+            try:
+                os.replace(d, quarantine)
+                live = _releases_in_use(rel)
+                if d.name in live or quarantine.name in live:
+                    os.replace(quarantine, d)
+                    protect.add(d.name)
+                    continue
+                shutil.rmtree(quarantine)
                 removed.append(d.name)
+            except OSError:
+                if quarantine.exists() and not d.exists():
+                    try:
+                        os.replace(quarantine, d)
+                    except OSError:
+                        pass
         return removed
 
+    @_locked_operation
     def update(self) -> str:
         cfg = _load_config(self.prefix)
         if not cfg:
             raise InstallError("not installed yet; run install first")
         return self.install(cfg["source"], cfg["channel"], cfg["pubkey"])
 
+    @_locked_operation
     def rollback(self) -> str:
         cfg = _load_config(self.prefix)
         prev = cfg.get("previous")
@@ -722,6 +908,10 @@ def main(argv=None) -> int:
     p = sub.add_parser("write-units", help="(internal) write this release's systemd units; prints their names")
     p.add_argument("--no-systemd", action="store_true")
     p.add_argument("--unit-dir", default=None)
+    p = sub.add_parser("enable", help="write and start one current-release opt-in service")
+    p.add_argument("service")
+    p = sub.add_parser("disable", help="stop and remove one current-release opt-in service")
+    p.add_argument("service")
     p = sub.add_parser("join", help="join Nakshatra with an invite a friend sent you")
     p.add_argument("invite")
     p.add_argument("--name", default="", help="what your friend will see you as")
@@ -742,6 +932,10 @@ def main(argv=None) -> int:
             print(inst.update())
         elif a.cmd == "rollback":
             print(inst.rollback())
+        elif a.cmd == "enable":
+            print(inst.enable(a.service))
+        elif a.cmd == "disable":
+            print(inst.disable(a.service))
         else:
             print(json.dumps(inst.status(), indent=1))
         return 0
