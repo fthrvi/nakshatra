@@ -124,6 +124,11 @@ def _enable_p2p_service(_sp) -> None:
     try:
         _p2p_installer(_sp, "enable")
     except (Exception, SystemExit):
+        # A failed enable may have started the unit before its stability check failed: stop it again.
+        try:
+            _p2p_installer(_sp, "disable")
+        except (Exception, SystemExit):
+            pass
         if created:
             env.unlink(missing_ok=True)
         raise
@@ -250,12 +255,14 @@ def main(argv=None) -> int:
         if a.onoff == "off":
             f.unlink(missing_ok=True)
             _sp.run(["systemctl", "--user", "restart", "nak-net.service"], check=False)
-            _p2p_installer(_sp, "disable")
+            if a.socket is None:              # a custom --socket means a sidecar we don't manage
+                _p2p_installer(_sp, "disable")
         else:
             dial = a.socket or _default_p2p_socket()
             if not dial.is_absolute():
                 raise SystemExit("--socket must be an absolute path")
-            _enable_p2p_service(_sp)
+            if a.socket is None:              # the bundled sidecar listens on the default socket only
+                _enable_p2p_service(_sp)
             f.write_text(str(dial) + "\n")
             _sp.run(["systemctl", "--user", "restart", "nak-net.service"], check=False)
         print(f"p2p {'OFF' if a.onoff == 'off' else 'ON via ' + str(dial)}; nak-net restarted")

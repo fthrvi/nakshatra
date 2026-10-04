@@ -260,3 +260,33 @@ def test_nak_p2p_refuses_a_tampered_installer_before_subprocess(tmp_path, monkey
     assert calls == []
     assert not (tmp_path / "home" / ".nakshatra" / "p2p.env").exists()
     assert not (tmp_path / "net" / "p2p-dial").exists()
+
+
+def test_failed_p2p_enable_stops_the_service_and_removes_a_new_opt_in(tmp_path, monkeypatch):
+    from network import nak
+    monkeypatch.setenv("NAK_NET_DIR", str(tmp_path))
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "run"))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    actions = []
+
+    def fake_installer(_sp, action):
+        actions.append(action)
+        if action == "enable":
+            raise SystemExit("could not enable nakshatra-p2p: unstable")
+    monkeypatch.setattr(nak, "_p2p_installer", fake_installer)
+    monkeypatch.setattr(subprocess, "run", lambda args, **kw: None)
+    with pytest.raises(SystemExit):
+        nak.main(["p2p", "on"])
+    assert actions == ["enable", "disable"]
+    assert not (tmp_path / "home" / ".nakshatra" / "p2p.env").exists()
+    assert not (tmp_path / "p2p-dial").exists()
+
+
+def test_custom_socket_never_manages_the_bundled_sidecar(tmp_path, monkeypatch):
+    from network import nak
+    monkeypatch.setenv("NAK_NET_DIR", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(nak, "_p2p_installer", lambda _sp, action: pytest.fail("touched the bundled sidecar"))
+    monkeypatch.setattr(subprocess, "run", lambda args, **kw: None)
+    assert nak.main(["p2p", "on", "--socket", str(tmp_path / "s.sock")]) == 0
+    assert nak.main(["p2p", "off", "--socket", str(tmp_path / "s.sock")]) == 0
