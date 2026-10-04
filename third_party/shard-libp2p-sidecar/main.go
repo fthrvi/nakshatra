@@ -33,6 +33,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -46,6 +47,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/protocol"
 	relayclient "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/client"
 	"github.com/multiformats/go-multiaddr"
+	manet "github.com/multiformats/go-multiaddr/net"
 )
 
 // activationProto is the stream protocol carrying inter-stage traffic (and the self-test).
@@ -53,7 +55,11 @@ const (
 	activationProto       = "/shard/activation/1.0.0"
 	nakdProto             = "/nakshatra/nakd/1.0.0"
 	activationRelayReason = "shard activation stream"
+	forceDirectReason     = "nakd direct path"
 	maxDialLine           = 512
+	directDialRetries     = 3
+	directDialRetryDelay  = 250 * time.Millisecond
+	directDialAttemptMax  = 3 * time.Second
 )
 
 // openActivationStream opts into circuit-relay connections. go-libp2p marks
@@ -121,10 +127,15 @@ func readFrame(r io.Reader) ([]byte, error) {
 }
 
 type natOpts struct {
-	quic         bool
-	relayService bool
-	announce     string
-	staticRelays []peer.AddrInfo
+	quic                bool
+	relayService        bool
+	disableHolePunching bool
+	announce            string
+	staticRelays        []peer.AddrInfo
+	// ipv6Listen is a test seam for hosts where binding IPv6 fails. Production uses
+	// h.Network().Listen. IPv6 is deliberately added after the IPv4 host starts so a
+	// kernel or container without IPv6 cannot take the sidecar down.
+	ipv6Listen func(multiaddr.Multiaddr) error
 }
 
 // tcpToQuic derives a QUIC listen addr from a TCP one: /ip4/x/tcp/P -> /ip4/x/udp/P/quic-v1.
@@ -140,6 +151,32 @@ func tcpToQuic(maddr string) string {
 	return maddr[:i] + "/udp/" + port + "/quic-v1"
 }
 
+// wildcardIPv6ListenAddrs mirrors an IPv4 wildcard TCP listener onto IPv6. A fixed
+// port stays fixed; port zero deliberately remains zero so the kernel can choose it.
+func wildcardIPv6ListenAddrs(listen string, quic bool) []multiaddr.Multiaddr {
+	addr, err := multiaddr.NewMultiaddr(listen)
+	if err != nil {
+		return nil
+	}
+	ip4, err := addr.ValueForProtocol(multiaddr.P_IP4)
+	if err != nil || ip4 != "0.0.0.0" {
+		return nil
+	}
+	port, err := addr.ValueForProtocol(multiaddr.P_TCP)
+	if err != nil {
+		return nil
+	}
+	strings := []string{"/ip6/::/tcp/" + port}
+	if quic {
+		strings = append(strings, "/ip6/::/udp/"+port+"/quic-v1")
+	}
+	out := make([]multiaddr.Multiaddr, 0, len(strings))
+	for _, s := range strings {
+		out = append(out, multiaddr.StringCast(s))
+	}
+	return out
+}
+
 func newHost(priv crypto.PrivKey, listen string, n natOpts) (host.Host, error) {
 	// libp2p defaults give Noise/TLS encryption + a stream muxer; every link is
 	// authenticated to the peer's key. The NAT stack (DCUtR hole-punching + circuit
@@ -153,7 +190,9 @@ func newHost(priv crypto.PrivKey, listen string, n natOpts) (host.Host, error) {
 	opts := []libp2p.Option{
 		libp2p.Identity(priv),
 		libp2p.ListenAddrStrings(listens...),
-		libp2p.EnableHolePunching(), // DCUtR: punch a direct hole between two NAT'd peers
+	}
+	if !n.disableHolePunching {
+		opts = append(opts, libp2p.EnableHolePunching()) // DCUtR: punch a direct hole between two NAT'd peers
 	}
 	if n.announce != "" {
 		// libp2p only sees container-internal addrs behind Vast's port mapping; advertise
@@ -176,7 +215,22 @@ func newHost(priv crypto.PrivKey, listen string, n natOpts) (host.Host, error) {
 	// observed-address manager (from several observer peers) determine reachability — so
 	// DCUtR can hole-punch when the NAT is cone-type. Forcing private here is wrong: it
 	// leaves holepunch with no public address to offer ("waiting for a public address").
-	return libp2p.New(opts...)
+	h, err := libp2p.New(opts...)
+	if err != nil {
+		return nil, err
+	}
+	listenIPv6 := n.ipv6Listen
+	if listenIPv6 == nil {
+		listenIPv6 = func(addr multiaddr.Multiaddr) error {
+			return h.Network().Listen(addr)
+		}
+	}
+	for _, addr := range wildcardIPv6ListenAddrs(listen, n.quic) {
+		if err := listenIPv6(addr); err != nil {
+			log.Printf("IPv6 listen %s: %v (continuing)", addr, err)
+		}
+	}
+	return h, nil
 }
 
 // fullAddrs returns this host's dialable /p2p multiaddrs (addr + /p2p/<peerid>).
@@ -569,6 +623,108 @@ func directConn(h host.Host, p peer.ID) network.Conn {
 	return nil
 }
 
+// preferredDirectDialAddrs selects the peer's safe, non-relay IP endpoints and puts
+// same-LAN addresses first, then globally routable IPv6, then other public IPs. DNS
+// names are intentionally omitted: without resolving them first we could not uphold
+// the rule that this path never dials a peer-supplied loopback or link-local endpoint.
+func preferredDirectDialAddrs(addrs []multiaddr.Multiaddr) []multiaddr.Multiaddr {
+	out := make([]multiaddr.Multiaddr, 0, len(addrs))
+	for _, addr := range addrs {
+		if !safeDirectDialAddr(addr) {
+			continue
+		}
+		out = append(out, addr)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		pi, pj := directDialPriority(out[i]), directDialPriority(out[j])
+		if pi != pj {
+			return pi < pj
+		}
+		return out[i].String() < out[j].String()
+	})
+	return out
+}
+
+func safeDirectDialAddr(addr multiaddr.Multiaddr) bool {
+	if _, err := addr.ValueForProtocol(multiaddr.P_CIRCUIT); err == nil {
+		return false
+	}
+	ip, err := manet.ToIP(addr)
+	return err == nil && !ip.IsLoopback() && !ip.IsUnspecified() && !ip.IsLinkLocalUnicast() && !ip.IsLinkLocalMulticast() && !ip.IsMulticast()
+}
+
+// removeUnsafeDirectDialAddrs makes the safety filter effective inside go-libp2p too:
+// Host.Connect absorbs the supplied AddrInfo but the swarm ultimately reads every address
+// already in the peerstore. Circuit addresses stay for rendezvous; unsafe direct endpoints do not.
+func removeUnsafeDirectDialAddrs(h host.Host, p peer.ID) {
+	for _, addr := range h.Peerstore().Addrs(p) {
+		if _, err := addr.ValueForProtocol(multiaddr.P_CIRCUIT); err == nil {
+			continue
+		}
+		if !safeDirectDialAddr(addr) {
+			h.Peerstore().SetAddr(p, addr, 0)
+		}
+	}
+}
+
+func directDialPriority(addr multiaddr.Multiaddr) int {
+	if manet.IsPrivateAddr(addr) {
+		return 0
+	}
+	if _, err := addr.ValueForProtocol(multiaddr.P_IP6); err == nil && manet.IsPublicAddr(addr) {
+		return 1
+	}
+	return 2
+}
+
+func directPathKind(addr multiaddr.Multiaddr) string {
+	if manet.IsPrivateAddr(addr) {
+		return "lan"
+	}
+	if _, err := addr.ValueForProtocol(multiaddr.P_IP6); err == nil && manet.IsPublicAddr(addr) {
+		return "ipv6"
+	}
+	return "punched"
+}
+
+// retryDirectDials complements DCUtR. Once the relay connection's Identify exchange has
+// populated the peerstore, explicitly try those advertised LAN/global-IPv6 addresses.
+// WithForceDirectDial prevents an existing limited relay connection from satisfying Connect.
+func retryDirectDials(ctx context.Context, h host.Host, p peer.ID) {
+	for attempt := 0; attempt < directDialRetries; attempt++ {
+		if directConn(h, p) != nil || ctx.Err() != nil {
+			return
+		}
+		addrs := preferredDirectDialAddrs(h.Peerstore().Addrs(p))
+		if len(addrs) > 0 {
+			attemptTimeout := directDialAttemptMax
+			if deadline, ok := ctx.Deadline(); ok {
+				remaining := time.Until(deadline)
+				if remaining <= 0 {
+					return
+				}
+				share := remaining / time.Duration(directDialRetries-attempt)
+				if share < attemptTimeout {
+					attemptTimeout = share
+				}
+			}
+			attemptCtx, cancel := context.WithTimeout(ctx, attemptTimeout)
+			_ = h.Connect(network.WithForceDirectDial(attemptCtx, forceDirectReason), peer.AddrInfo{ID: p, Addrs: addrs})
+			cancel()
+		}
+		if attempt+1 == directDialRetries || directConn(h, p) != nil {
+			return
+		}
+		timer := time.NewTimer(directDialRetryDelay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+	}
+}
+
 // addRelayCircuitAddrs teaches the host how to reach p through each configured relay. The circuit is
 // rendezvous only: waitDirect refuses it for the user's stream and waits for DCUtR to produce a
 // separate non-relayed connection.
@@ -590,9 +746,14 @@ func waitDirect(ctx context.Context, h host.Host, p peer.ID, relays []peer.AddrI
 		return nil
 	}
 	addRelayCircuitAddrs(h, p, relays)
+	removeUnsafeDirectDialAddrs(h, p)
 	if err := h.Connect(ctx, peer.AddrInfo{ID: p, Addrs: h.Peerstore().Addrs(p)}); err != nil {
 		return fmt.Errorf("connect: %w", err)
 	}
+	removeUnsafeDirectDialAddrs(h, p)
+	dialCtx, cancelDirectDials := context.WithCancel(ctx)
+	defer cancelDirectDials()
+	go retryDirectDials(dialCtx, h, p)
 	tick := time.NewTicker(50 * time.Millisecond)
 	defer tick.Stop()
 	for {
@@ -658,7 +819,7 @@ func handleDialConn(h host.Host, c net.Conn, relays []peer.AddrInfo, directWait 
 		c.Close()
 		return
 	}
-	log.Printf("DIAL %s: DIRECT via %s", p, s.Conn().RemoteMultiaddr())
+	log.Printf("DIAL %s: DIRECT via %s (%s)", p, s.Conn().RemoteMultiaddr(), directPathKind(s.Conn().RemoteMultiaddr()))
 	pipe(c, s)
 }
 

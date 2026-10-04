@@ -5,7 +5,8 @@ On create add a row (status=active, owner). On merge flip to `merged→<sha>`.
 
 | branch | sector | description | base | status | owner |
 |---|---|---|---|---|---|
-| net/p2p-punch | network | Wire the existing libp2p DCUtR sidecar into nakd as a both-sides-opt-in direct path, and ship it in signed releases. | main@37d8667 | active | codex |
+| net/p2p-direct-dial | network | Prefer identified LAN/global-IPv6 peer addresses while waiting for DCUtR, and add best-effort dual-stack listeners. | main@c0e989b | active | codex |
+| net/p2p-punch | network | Wire the existing libp2p DCUtR sidecar into nakd as a both-sides-opt-in direct path, and ship it in signed releases. | main@37d8667 | merged→4b79f4d | codex |
 | release/v0 | release | **Signed node releases + installer** (hackathon day 3): `release/build.py` (deterministic git archives, hash-locked deps via uv, bundled uv, signed manifest + latest.json), `release/install.py` (stdlib; pinned release key, sha256 per file, side-by-side, atomic `current`, health check, rollback on ANY failure after switch, hourly self-update running the installer shipped in the release). 13 tests. Worktree `~/nakshatra-release`. Not merged. | main@fc3374e | merged→c20f757 | claude/trisul-aa (hub) |
 | msg/v0 | network | **Messaging node `nakd`** (`scripts/network/`, hackathon day 4): invite → pending request → accept/decline → contacts-only encrypted messages over the relay; agent-signed envelopes; outbox+ack; inbound = untrusted external (raw log, trust=external); `nak` CLI. 9 tests; suite 1867 passed. Worktree `~/nakshatra-msg`. Not merged. | net/hackathon@7173d89 | merged→c20f757 | claude/trisul-aa (hub) |
 | net/hackathon | integration | **Hackathon integration branch** = transport/harden-record-cap + join/signed-invite + release/v0 (merged, no conflicts); what node releases are built from. Suite 1866 passed. Worktree `~/nakshatra-net`. Not merged to main. | main@fc3374e | merged→c20f757 | claude/trisul-aa (hub) |
