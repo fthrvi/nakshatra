@@ -42,6 +42,12 @@ Unification work in progress (U1–U6): `trisul/plans/2026-10-03-nakshatra-unifi
 | Direct connections between contacts (U3b) | nakd: opt-in per contact on BOTH sides (`nak direct <name> on`) and per node (`nak direct-listen 51830`). Addresses and the p2p capability are swapped only inside the encrypted session. One dialer tries LAN/IPv6, then the sidecar, then the relay; every path uses the same pinned handshake and direct-only binding. | LIVE | contacts who opt in |
 | UDP hole punch for both-NAT contacts | `third_party/shard-libp2p-sidecar` DCUtR via its circuit-relay-v2 rendezvous; `-dial-listen` gives nakd only a non-relayed stream, and the signed release ships it as opt-in `nakshatra-p2p` | LIVE | contacts with direct + p2p on at both ends |
 
+**P2P live check (2026-10-08, 0.11.3):** both the hub and bro run `nakshatra-p2p` (`nak p2p on`) with relay reservations. A
+hub→bro `DIAL` returned `OK direct` in 0.6 s, `DIRECT via /ip6/…/quic-v1 (ipv6)`. Before 0.11.3 it timed out:
+DCUtR alone cannot join two peers behind the same NAT. The sidecar now also dials the peer's identified LAN/IPv6
+addresses, under a connection gater (no loopback, link-local or multicast) and with work caps. Not yet tested: two
+different NATs over IPv4 only (needs a second network).
+
 ## People and their agents (added 2026-10)
 | Job | Component | Status | Runs where |
 |---|---|---|---|
