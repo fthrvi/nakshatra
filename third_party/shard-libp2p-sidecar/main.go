@@ -35,10 +35,13 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/libp2p/go-libp2p"
+	"github.com/libp2p/go-libp2p/core/connmgr"
+	"github.com/libp2p/go-libp2p/core/control"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
@@ -58,6 +61,8 @@ const (
 	forceDirectReason     = "nakd direct path"
 	maxDialLine           = 512
 	directDialRetries     = 3
+	maxDirectDialAddrs    = 8
+	maxConcurrentDials    = 16
 	directDialRetryDelay  = 250 * time.Millisecond
 	directDialAttemptMax  = 3 * time.Second
 )
@@ -132,10 +137,146 @@ type natOpts struct {
 	disableHolePunching bool
 	announce            string
 	staticRelays        []peer.AddrInfo
+	dialPolicy          *outboundDialPolicy
 	// ipv6Listen is a test seam for hosts where binding IPv6 fails. Production uses
 	// h.Network().Listen. IPv6 is deliberately added after the IPv4 host starts so a
 	// kernel or container without IPv6 cannot take the sidecar down.
 	ipv6Listen func(multiaddr.Multiaddr) error
+}
+
+// outboundDialPolicy is the host-wide SSRF boundary for peer-supplied addresses.
+// Identify and Identify Push can replace peerstore entries at any time, so filtering
+// the peerstore is only hygiene; the connection gater is the enforcement point.
+// Peers named by an operator flag are exempt so explicitly configured loopback test,
+// forward, and relay endpoints continue to work exactly as supplied.
+type outboundDialPolicy struct {
+	explicitPeers       map[peer.ID]struct{}
+	explicitRelayRoutes []string
+	dialMu              sync.RWMutex
+	dialCandidates      map[peer.ID]map[string]struct{}
+	dialLocks           [32]sync.Mutex
+}
+
+var _ connmgr.ConnectionGater = (*outboundDialPolicy)(nil)
+
+func newOutboundDialPolicy(relays []peer.AddrInfo, forwards []string, selfTestPeer string) (*outboundDialPolicy, error) {
+	p := &outboundDialPolicy{
+		explicitPeers:  make(map[peer.ID]struct{}),
+		dialCandidates: make(map[peer.ID]map[string]struct{}),
+	}
+	for _, relay := range relays {
+		p.explicitPeers[relay.ID] = struct{}{}
+		for _, addr := range relay.Addrs {
+			route := addr.Encapsulate(multiaddr.StringCast("/p2p/" + relay.ID.String()))
+			route = route.Encapsulate(multiaddr.StringCast("/p2p-circuit"))
+			p.explicitRelayRoutes = append(p.explicitRelayRoutes, route.String())
+		}
+	}
+	for _, forward := range forwards {
+		parts := strings.SplitN(forward, "=", 2)
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("bad -forward %q (want localAddr=peerMultiaddr)", forward)
+		}
+		if err := p.addExplicitPeer(parts[1]); err != nil {
+			return nil, fmt.Errorf("bad -forward %q: %w", forward, err)
+		}
+	}
+	if selfTestPeer != "" {
+		if err := p.addExplicitPeer(selfTestPeer); err != nil {
+			return nil, fmt.Errorf("bad -peer: %w", err)
+		}
+	}
+	return p, nil
+}
+
+func (p *outboundDialPolicy) addExplicitPeer(value string) error {
+	addr, err := multiaddr.NewMultiaddr(value)
+	if err != nil {
+		return err
+	}
+	info, err := peer.AddrInfoFromP2pAddr(addr)
+	if err != nil {
+		return err
+	}
+	p.explicitPeers[info.ID] = struct{}{}
+	return nil
+}
+
+func (p *outboundDialPolicy) InterceptPeerDial(id peer.ID) bool {
+	// Peer identity alone has no network location to classify. Every actual outbound
+	// address is checked below after libp2p has resolved it.
+	return id != ""
+}
+
+func (p *outboundDialPolicy) InterceptAddrDial(id peer.ID, addr multiaddr.Multiaddr) bool {
+	value := addr.String()
+	p.dialMu.RLock()
+	candidates, bounded := p.dialCandidates[id]
+	_, selected := candidates[value]
+	p.dialMu.RUnlock()
+	if bounded {
+		// Entries are installed only from the safe direct selector or from routes
+		// derived from operator-configured relays.
+		return selected
+	}
+	for _, route := range p.explicitRelayRoutes {
+		if value == route || strings.HasPrefix(value, route+"/") {
+			return true
+		}
+	}
+	if _, ok := p.explicitPeers[id]; ok {
+		return true
+	}
+	ip, err := manet.ToIP(addr)
+	if err != nil {
+		return false
+	}
+	if !safeOutboundIP(ip) {
+		return false
+	}
+	return true
+}
+
+// withDialCandidates constrains the swarm itself, which otherwise re-reads every
+// peerstore address even when Host.Connect receives a shorter AddrInfo. Dials to the
+// same peer are serialized while the gater exposes exactly this attempt's candidates.
+func (p *outboundDialPolicy) withDialCandidates(id peer.ID, addrs []multiaddr.Multiaddr, dial func() error) error {
+	var shard byte
+	for _, b := range []byte(id) {
+		shard ^= b
+	}
+	lock := &p.dialLocks[int(shard)%len(p.dialLocks)]
+	lock.Lock()
+	defer lock.Unlock()
+
+	selected := make(map[string]struct{}, len(addrs))
+	for _, addr := range addrs {
+		selected[addr.String()] = struct{}{}
+	}
+	p.dialMu.Lock()
+	p.dialCandidates[id] = selected
+	p.dialMu.Unlock()
+	defer func() {
+		p.dialMu.Lock()
+		delete(p.dialCandidates, id)
+		p.dialMu.Unlock()
+	}()
+	return dial()
+}
+
+func safeOutboundIP(ip net.IP) bool {
+	return ip.IsGlobalUnicast() && !ip.IsLoopback() && !ip.IsUnspecified() &&
+		!ip.IsLinkLocalUnicast() && !ip.IsLinkLocalMulticast() && !ip.IsMulticast()
+}
+
+func (p *outboundDialPolicy) InterceptAccept(network.ConnMultiaddrs) bool { return true }
+
+func (p *outboundDialPolicy) InterceptSecured(network.Direction, peer.ID, network.ConnMultiaddrs) bool {
+	return true
+}
+
+func (p *outboundDialPolicy) InterceptUpgraded(network.Conn) (bool, control.DisconnectReason) {
+	return true, 0
 }
 
 // tcpToQuic derives a QUIC listen addr from a TCP one: /ip4/x/tcp/P -> /ip4/x/udp/P/quic-v1.
@@ -191,6 +332,11 @@ func newHost(priv crypto.PrivKey, listen string, n natOpts) (host.Host, error) {
 		libp2p.Identity(priv),
 		libp2p.ListenAddrStrings(listens...),
 	}
+	dialPolicy := n.dialPolicy
+	if dialPolicy == nil {
+		dialPolicy, _ = newOutboundDialPolicy(n.staticRelays, nil, "")
+	}
+	opts = append(opts, libp2p.ConnectionGater(dialPolicy))
 	if !n.disableHolePunching {
 		opts = append(opts, libp2p.EnableHolePunching()) // DCUtR: punch a direct hole between two NAT'd peers
 	}
@@ -375,7 +521,11 @@ func main() {
 		}
 		staticRelays = append(staticRelays, *ai)
 	}
-	h, err := newHost(priv, *listenAddr, natOpts{quic: *useQuic, relayService: *relaySvc, announce: *announce, staticRelays: staticRelays})
+	dialPolicy, err := newOutboundDialPolicy(staticRelays, forwards, *peerAddr)
+	if err != nil {
+		log.Fatal(err)
+	}
+	h, err := newHost(priv, *listenAddr, natOpts{quic: *useQuic, relayService: *relaySvc, announce: *announce, staticRelays: staticRelays, dialPolicy: dialPolicy})
 	if err != nil {
 		log.Fatalf("host: %v", err)
 	}
@@ -438,7 +588,7 @@ func main() {
 			if err != nil {
 				log.Fatalf("dial-listen %s: %v", *dialListen, err)
 			}
-			go serveDialListener(h, ln, staticRelays, *directWait)
+			go serveDialListener(h, ln, staticRelays, *directWait, dialPolicy)
 		}
 		for _, f := range forwards {
 			pp := strings.SplitN(f, "=", 2)
@@ -642,6 +792,9 @@ func preferredDirectDialAddrs(addrs []multiaddr.Multiaddr) []multiaddr.Multiaddr
 		}
 		return out[i].String() < out[j].String()
 	})
+	if len(out) > maxDirectDialAddrs {
+		out = out[:maxDirectDialAddrs]
+	}
 	return out
 }
 
@@ -650,7 +803,7 @@ func safeDirectDialAddr(addr multiaddr.Multiaddr) bool {
 		return false
 	}
 	ip, err := manet.ToIP(addr)
-	return err == nil && !ip.IsLoopback() && !ip.IsUnspecified() && !ip.IsLinkLocalUnicast() && !ip.IsLinkLocalMulticast() && !ip.IsMulticast()
+	return err == nil && safeOutboundIP(ip)
 }
 
 // removeUnsafeDirectDialAddrs makes the safety filter effective inside go-libp2p too:
@@ -690,45 +843,84 @@ func directPathKind(addr multiaddr.Multiaddr) string {
 // retryDirectDials complements DCUtR. Once the relay connection's Identify exchange has
 // populated the peerstore, explicitly try those advertised LAN/global-IPv6 addresses.
 // WithForceDirectDial prevents an existing limited relay connection from satisfying Connect.
-func retryDirectDials(ctx context.Context, h host.Host, p peer.ID) {
-	for attempt := 0; attempt < directDialRetries; attempt++ {
-		if directConn(h, p) != nil || ctx.Err() != nil {
+func retryDirectDialAttempts(
+	ctx context.Context,
+	p peer.ID,
+	maxAttempts int,
+	directConnected func() bool,
+	addresses func() []multiaddr.Multiaddr,
+	connect func(context.Context, peer.AddrInfo) error,
+) {
+	for attempt := 0; attempt < maxAttempts; {
+		if directConnected() || ctx.Err() != nil {
 			return
 		}
-		addrs := preferredDirectDialAddrs(h.Peerstore().Addrs(p))
-		if len(addrs) > 0 {
-			attemptTimeout := directDialAttemptMax
-			if deadline, ok := ctx.Deadline(); ok {
-				remaining := time.Until(deadline)
-				if remaining <= 0 {
-					return
-				}
-				share := remaining / time.Duration(directDialRetries-attempt)
-				if share < attemptTimeout {
-					attemptTimeout = share
-				}
+		addrs := preferredDirectDialAddrs(addresses())
+		if len(addrs) == 0 {
+			if !waitForDirectRetry(ctx) {
+				return
 			}
-			attemptCtx, cancel := context.WithTimeout(ctx, attemptTimeout)
-			_ = h.Connect(network.WithForceDirectDial(attemptCtx, forceDirectReason), peer.AddrInfo{ID: p, Addrs: addrs})
-			cancel()
+			continue
 		}
-		if attempt+1 == directDialRetries || directConn(h, p) != nil {
+		attemptTimeout := directDialAttemptMax
+		if deadline, ok := ctx.Deadline(); ok {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				return
+			}
+			share := remaining / time.Duration(maxAttempts-attempt)
+			if share < attemptTimeout {
+				attemptTimeout = share
+			}
+		}
+		attemptCtx, cancel := context.WithTimeout(ctx, attemptTimeout)
+		_ = connect(network.WithForceDirectDial(attemptCtx, forceDirectReason), peer.AddrInfo{ID: p, Addrs: addrs})
+		cancel()
+		attempt++
+		if attempt == maxAttempts || directConnected() {
 			return
 		}
-		timer := time.NewTimer(directDialRetryDelay)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
+		if !waitForDirectRetry(ctx) {
 			return
-		case <-timer.C:
 		}
 	}
+}
+
+func waitForDirectRetry(ctx context.Context) bool {
+	timer := time.NewTimer(directDialRetryDelay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func retryDirectDials(ctx context.Context, h host.Host, p peer.ID, maxAttempts int, policy *outboundDialPolicy) {
+	connect := h.Connect
+	if policy != nil {
+		connect = func(ctx context.Context, info peer.AddrInfo) error {
+			return policy.withDialCandidates(info.ID, info.Addrs, func() error {
+				return h.Connect(ctx, info)
+			})
+		}
+	}
+	retryDirectDialAttempts(
+		ctx,
+		p,
+		maxAttempts,
+		func() bool { return directConn(h, p) != nil },
+		func() []multiaddr.Multiaddr { return h.Peerstore().Addrs(p) },
+		connect,
+	)
 }
 
 // addRelayCircuitAddrs teaches the host how to reach p through each configured relay. The circuit is
 // rendezvous only: waitDirect refuses it for the user's stream and waits for DCUtR to produce a
 // separate non-relayed connection.
-func addRelayCircuitAddrs(h host.Host, p peer.ID, relays []peer.AddrInfo) {
+func addRelayCircuitAddrs(h host.Host, p peer.ID, relays []peer.AddrInfo) []multiaddr.Multiaddr {
+	var added []multiaddr.Multiaddr
 	for _, relay := range relays {
 		for _, addr := range relay.Addrs {
 			full := addr.Encapsulate(multiaddr.StringCast("/p2p/" + relay.ID.String()))
@@ -736,24 +928,42 @@ func addRelayCircuitAddrs(h host.Host, p peer.ID, relays []peer.AddrInfo) {
 			info, err := peer.AddrInfoFromP2pAddr(full)
 			if err == nil {
 				h.Peerstore().AddAddrs(p, info.Addrs, peerstore.TempAddrTTL)
+				added = append(added, info.Addrs...)
 			}
 		}
 	}
+	return added
 }
 
-func waitDirect(ctx context.Context, h host.Host, p peer.ID, relays []peer.AddrInfo) error {
+func waitDirect(ctx context.Context, h host.Host, p peer.ID, relays []peer.AddrInfo, policy *outboundDialPolicy) error {
 	if directConn(h, p) != nil {
 		return nil
 	}
-	addRelayCircuitAddrs(h, p, relays)
+	circuitAddrs := addRelayCircuitAddrs(h, p, relays)
 	removeUnsafeDirectDialAddrs(h, p)
-	if err := h.Connect(ctx, peer.AddrInfo{ID: p, Addrs: h.Peerstore().Addrs(p)}); err != nil {
-		return fmt.Errorf("connect: %w", err)
+	dialCtx, cancelDials := context.WithCancel(ctx)
+	defer cancelDials()
+	directAttempts := directDialRetries
+	if len(circuitAddrs) > 0 {
+		directAttempts-- // the bounded relay rendezvous is this DIAL request's first attempt
+		// Only routes derived from operator-configured relays enter this bounded first
+		// attempt. The remaining two attempts can use newly identified direct addresses.
+		go func() {
+			attemptCtx, cancel := context.WithTimeout(dialCtx, directDialAttemptMax)
+			defer cancel()
+			connect := func() error { return h.Connect(attemptCtx, peer.AddrInfo{ID: p, Addrs: circuitAddrs}) }
+			var err error
+			if policy != nil {
+				err = policy.withDialCandidates(p, circuitAddrs, connect)
+			} else {
+				err = connect()
+			}
+			if err != nil && dialCtx.Err() == nil {
+				log.Printf("relay rendezvous %s: %v", p, err)
+			}
+		}()
 	}
-	removeUnsafeDirectDialAddrs(h, p)
-	dialCtx, cancelDirectDials := context.WithCancel(ctx)
-	defer cancelDirectDials()
-	go retryDirectDials(dialCtx, h, p)
+	go retryDirectDials(dialCtx, h, p, directAttempts, policy)
 	tick := time.NewTicker(50 * time.Millisecond)
 	defer tick.Stop()
 	for {
@@ -768,8 +978,8 @@ func waitDirect(ctx context.Context, h host.Host, p peer.ID, relays []peer.AddrI
 	}
 }
 
-func openDirectNakdStream(ctx context.Context, h host.Host, p peer.ID, relays []peer.AddrInfo) (network.Stream, error) {
-	if err := waitDirect(ctx, h, p, relays); err != nil {
+func openDirectNakdStream(ctx context.Context, h host.Host, p peer.ID, relays []peer.AddrInfo, policy *outboundDialPolicy) (network.Stream, error) {
+	if err := waitDirect(ctx, h, p, relays, policy); err != nil {
 		return nil, err
 	}
 	// Unlike openActivationStream, this intentionally does NOT call WithAllowLimitedConn. A relay
@@ -785,7 +995,7 @@ func openDirectNakdStream(ctx context.Context, h host.Host, p peer.ID, relays []
 	return s, nil
 }
 
-func handleDialConn(h host.Host, c net.Conn, relays []peer.AddrInfo, directWait time.Duration) {
+func handleDialConn(h host.Host, c net.Conn, relays []peer.AddrInfo, directWait time.Duration, policy *outboundDialPolicy) {
 	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
 	reader := bufio.NewReaderSize(c, maxDialLine+1)
 	line, err := reader.ReadSlice('\n')
@@ -808,7 +1018,7 @@ func handleDialConn(h host.Host, c net.Conn, relays []peer.AddrInfo, directWait 
 	_ = c.SetDeadline(time.Time{})
 	ctx, cancel := context.WithTimeout(context.Background(), directWait)
 	defer cancel()
-	s, err := openDirectNakdStream(ctx, h, p, relays)
+	s, err := openDirectNakdStream(ctx, h, p, relays, policy)
 	if err != nil {
 		writeDialError(c, err)
 		c.Close()
@@ -823,14 +1033,30 @@ func handleDialConn(h host.Host, c net.Conn, relays []peer.AddrInfo, directWait 
 	pipe(c, s)
 }
 
-func serveDialListener(h host.Host, ln net.Listener, relays []peer.AddrInfo, directWait time.Duration) {
+func serveDialListener(h host.Host, ln net.Listener, relays []peer.AddrInfo, directWait time.Duration, policy *outboundDialPolicy) {
 	log.Printf("dial listener on %s (direct wait %s)", ln.Addr(), directWait)
+	slots := make(chan struct{}, maxConcurrentDials)
 	for {
 		c, err := ln.Accept()
 		if err != nil {
 			return
 		}
-		go handleDialConn(h, c, relays, directWait)
+		dispatchDialConn(c, slots, func(c net.Conn) {
+			handleDialConn(h, c, relays, directWait, policy)
+		})
+	}
+}
+
+func dispatchDialConn(c net.Conn, slots chan struct{}, handle func(net.Conn)) {
+	select {
+	case slots <- struct{}{}:
+		go func() {
+			defer func() { <-slots }()
+			handle(c)
+		}()
+	default:
+		writeDialError(c, fmt.Errorf("busy"))
+		_ = c.Close()
 	}
 }
 

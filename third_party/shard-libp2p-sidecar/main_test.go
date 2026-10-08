@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,6 +22,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/peerstore"
 	"github.com/libp2p/go-libp2p/core/protocol"
 	relayclient "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/client"
+	"github.com/libp2p/go-libp2p/p2p/protocol/identify"
 	"github.com/multiformats/go-multiaddr"
 	manet "github.com/multiformats/go-multiaddr/net"
 )
@@ -190,6 +192,162 @@ func TestPreferredDirectDialAddresses(t *testing.T) {
 	}
 }
 
+func TestPreferredDirectDialAddressesAreCapped(t *testing.T) {
+	var input []multiaddr.Multiaddr
+	for i := 1; i <= 24; i++ {
+		input = append(input, multiaddr.StringCast(fmt.Sprintf("/ip4/10.0.0.%d/tcp/1", i)))
+	}
+	got := preferredDirectDialAddrs(input)
+	if len(got) != maxDirectDialAddrs {
+		t.Fatalf("candidate count = %d, want %d: %v", len(got), maxDirectDialAddrs, got)
+	}
+}
+
+func TestOutboundDialPolicy(t *testing.T) {
+	newPeer := func() peer.ID {
+		t.Helper()
+		priv, _, err := crypto.GenerateEd25519Key(rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		id, err := peer.IDFromPrivateKey(priv)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	relayID, forwardID, otherID := newPeer(), newPeer(), newPeer()
+	relay := peer.AddrInfo{ID: relayID, Addrs: []multiaddr.Multiaddr{multiaddr.StringCast("/ip4/127.0.0.1/tcp/4001")}}
+	forward := "127.0.0.1:1=/ip4/127.0.0.1/tcp/4002/p2p/" + forwardID.String()
+	policy, err := newOutboundDialPolicy([]peer.AddrInfo{relay}, []string{forward}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, addr := range []string{
+		"/ip4/127.0.0.1/tcp/1",
+		"/ip4/0.0.0.0/tcp/1",
+		"/ip4/169.254.1.1/tcp/1",
+		"/ip4/224.0.0.1/udp/1/quic-v1",
+		"/ip6/::/tcp/1",
+		"/ip6/::1/tcp/1",
+		"/ip6/fe80::1/tcp/1",
+		"/ip6/ff02::1/udp/1/quic-v1",
+	} {
+		if policy.InterceptAddrDial(otherID, multiaddr.StringCast(addr)) {
+			t.Errorf("allowed unsafe address %s", addr)
+		}
+	}
+	for _, addr := range []string{
+		"/ip4/192.168.1.10/tcp/1",
+		"/ip6/fd00::10/tcp/1",
+		"/ip4/8.8.8.8/tcp/1",
+		"/ip6/2606:4700:4700::1111/tcp/1",
+	} {
+		if !policy.InterceptAddrDial(otherID, multiaddr.StringCast(addr)) {
+			t.Errorf("blocked allowed address %s", addr)
+		}
+	}
+	if !policy.InterceptAddrDial(forwardID, multiaddr.StringCast("/ip4/127.0.0.1/tcp/4002")) {
+		t.Fatal("blocked operator-configured forward target")
+	}
+	relayRoute := multiaddr.StringCast("/ip4/127.0.0.1/tcp/4001/p2p/" + relayID.String() + "/p2p-circuit")
+	if !policy.InterceptAddrDial(otherID, relayRoute) {
+		t.Fatal("blocked route through operator-configured relay")
+	}
+	var all []multiaddr.Multiaddr
+	for i := 1; i <= 20; i++ {
+		all = append(all, multiaddr.StringCast(fmt.Sprintf("/ip4/10.2.0.%d/tcp/1", i)))
+	}
+	selected := preferredDirectDialAddrs(all)
+	allowed := 0
+	if err := policy.withDialCandidates(otherID, selected, func() error {
+		for _, addr := range all {
+			if policy.InterceptAddrDial(otherID, addr) {
+				allowed++
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if allowed != maxDirectDialAddrs {
+		t.Fatalf("gater allowed %d direct candidates, want %d", allowed, maxDirectDialAddrs)
+	}
+}
+
+func TestDirectDialAttemptsAreCapped(t *testing.T) {
+	priv, _, err := crypto.GenerateEd25519Key(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := peer.IDFromPrivateKey(priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var candidates []multiaddr.Multiaddr
+	for i := 1; i <= 20; i++ {
+		candidates = append(candidates, multiaddr.StringCast(fmt.Sprintf("/ip4/10.1.0.%d/tcp/1", i)))
+	}
+	var attempts atomic.Int32
+	retryDirectDialAttempts(
+		context.Background(),
+		id,
+		directDialRetries,
+		func() bool { return false },
+		func() []multiaddr.Multiaddr { return candidates },
+		func(_ context.Context, info peer.AddrInfo) error {
+			attempts.Add(1)
+			if len(info.Addrs) != maxDirectDialAddrs {
+				t.Fatalf("attempt got %d candidates, want %d", len(info.Addrs), maxDirectDialAddrs)
+			}
+			return errors.New("unreachable")
+		},
+	)
+	if got := attempts.Load(); got != directDialRetries {
+		t.Fatalf("attempts = %d, want %d", got, directDialRetries)
+	}
+}
+
+func TestDialHandlerConcurrencyCap(t *testing.T) {
+	slots := make(chan struct{}, maxConcurrentDials)
+	release := make(chan struct{})
+	started := make(chan struct{}, maxConcurrentDials)
+	clients := make([]net.Conn, 0, maxConcurrentDials)
+	for i := 0; i < maxConcurrentDials; i++ {
+		server, client := net.Pipe()
+		clients = append(clients, client)
+		dispatchDialConn(server, slots, func(c net.Conn) {
+			started <- struct{}{}
+			<-release
+			_ = c.Close()
+		})
+	}
+	for i := 0; i < maxConcurrentDials; i++ {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("handler did not start")
+		}
+	}
+	extraServer, extraClient := net.Pipe()
+	dispatched := make(chan struct{})
+	go func() {
+		dispatchDialConn(extraServer, slots, func(net.Conn) { t.Error("busy handler was started") })
+		close(dispatched)
+	}()
+	_ = extraClient.SetReadDeadline(time.Now().Add(time.Second))
+	line, err := bufio.NewReader(extraClient).ReadString('\n')
+	if err != nil || line != "ERR busy\n" {
+		t.Fatalf("busy reply = %q, %v", line, err)
+	}
+	<-dispatched
+	_ = extraClient.Close()
+	close(release)
+	for _, client := range clients {
+		_ = client.Close()
+	}
+}
+
 func TestPeerIDFixedVector(t *testing.T) {
 	pub, err := crypto.UnmarshalPublicKey(append([]byte{0x08, 0x01, 0x12, 0x20}, []byte{
 		0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7, 0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64, 0x07, 0x3a,
@@ -210,7 +368,7 @@ func TestPeerIDFixedVector(t *testing.T) {
 func TestDialProtocolRejectsBadAndOverlongLines(t *testing.T) {
 	for _, line := range []string{"DIAL not-a-peer-id\n", "NOPE x\n", "DIAL " + strings.Repeat("x", maxDialLine) + "\n"} {
 		server, client := net.Pipe()
-		go handleDialConn(nil, server, nil, time.Second)
+		go handleDialConn(nil, server, nil, time.Second, nil)
 		go func() { _, _ = io.WriteString(client, line) }()
 		got, err := bufio.NewReader(client).ReadString('\n')
 		client.Close()
@@ -242,6 +400,104 @@ func TestRelayCircuitAddressesAreAddedForPeerOnlyDial(t *testing.T) {
 	addrs := a.Peerstore().Addrs(target)
 	if len(addrs) == 0 || !strings.Contains(addrs[0].String(), "/p2p/"+relay.ID().String()+"/p2p-circuit") {
 		t.Fatalf("missing relay circuit address for %s: %v", target, addrs)
+	}
+}
+
+func TestIdentifyPushCannotBypassOutboundDialPolicy(t *testing.T) {
+	newKey := func() crypto.PrivKey {
+		t.Helper()
+		priv, _, err := crypto.GenerateEd25519Key(rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return priv
+	}
+	relay, err := newHost(newKey(), "/ip4/127.0.0.1/tcp/0", natOpts{relayService: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer relay.Close()
+	relayInfo := peer.AddrInfo{ID: relay.ID(), Addrs: relay.Addrs()}
+	policyA, err := newOutboundDialPolicy([]peer.AddrInfo{relayInfo}, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	policyB, err := newOutboundDialPolicy([]peer.AddrInfo{relayInfo}, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := newHost(newKey(), "/ip4/127.0.0.1/tcp/0", natOpts{disableHolePunching: true, dialPolicy: policyA})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, err := newHost(newKey(), "/ip4/127.0.0.1/tcp/0", natOpts{disableHolePunching: true, dialPolicy: policyB})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := b.Connect(ctx, relayInfo); err != nil {
+		t.Fatalf("B connect relay: %v", err)
+	}
+	if _, err := relayclient.Reserve(ctx, b, relayInfo); err != nil {
+		t.Fatalf("B reserve relay: %v", err)
+	}
+	circuitAddrs := addRelayCircuitAddrs(a, b.ID(), []peer.AddrInfo{relayInfo})
+	if err := a.Connect(ctx, peer.AddrInfo{ID: b.ID(), Addrs: circuitAddrs}); err != nil {
+		t.Fatalf("A connect B through relay: %v", err)
+	}
+	conn := a.Network().ConnsToPeer(b.ID())[0]
+	ids := a.(interface{ IDService() identify.IDService }).IDService()
+	select {
+	case <-ids.IdentifyWait(conn):
+	case <-ctx.Done():
+		t.Fatal("initial identify timed out")
+	}
+
+	before := make(map[string]struct{})
+	for _, addr := range b.Addrs() {
+		before[addr.String()] = struct{}{}
+	}
+	if err := b.Network().Listen(multiaddr.StringCast("/ip4/127.0.0.1/tcp/0")); err != nil {
+		t.Fatal(err)
+	}
+	var pushed multiaddr.Multiaddr
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, addr := range a.Peerstore().Addrs(b.ID()) {
+			if !manet.IsIPLoopback(addr) {
+				continue
+			}
+			if _, existed := before[addr.String()]; !existed {
+				pushed = addr
+				break
+			}
+		}
+		if pushed != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if pushed == nil {
+		t.Fatalf("loopback address was not received through Identify Push; peerstore: %v", a.Peerstore().Addrs(b.ID()))
+	}
+
+	if err := a.Network().ClosePeer(b.ID()); err != nil {
+		t.Fatal(err)
+	}
+	a.Peerstore().ClearAddrs(b.ID())
+	a.Peerstore().AddAddr(b.ID(), pushed, peerstore.PermanentAddrTTL)
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), time.Second)
+	defer dialCancel()
+	err = a.Connect(network.WithForceDirectDial(dialCtx, forceDirectReason), peer.AddrInfo{ID: b.ID(), Addrs: []multiaddr.Multiaddr{pushed}})
+	if err == nil {
+		t.Fatalf("connected to peer-supplied loopback address %s", pushed)
+	}
+	if directConn(a, b.ID()) != nil {
+		t.Fatalf("peer-supplied loopback address %s produced a direct connection", pushed)
 	}
 }
 
@@ -292,7 +548,7 @@ func TestDialListenerDirectRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ln.Close()
-	go serveDialListener(a, ln, nil, 5*time.Second)
+	go serveDialListener(a, ln, nil, 5*time.Second, nil)
 	c, err := net.Dial("unix", sockPath)
 	if err != nil {
 		t.Fatal(err)
@@ -370,7 +626,7 @@ func TestWaitDirectUsesAddressesLearnedThroughRelay(t *testing.T) {
 
 	directCtx, directCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer directCancel()
-	if err := waitDirect(directCtx, a, b.ID(), []peer.AddrInfo{relayInfo}); err != nil {
+	if err := waitDirect(directCtx, a, b.ID(), []peer.AddrInfo{relayInfo}, nil); err != nil {
 		t.Fatal(err)
 	}
 	conn := directConn(a, b.ID())
