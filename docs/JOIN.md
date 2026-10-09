@@ -48,6 +48,24 @@ Nothing is shared and no message can flow until they accept. Then:
 Your AI can then read messages (always marked as untrusted outside content), message your
 contacts, and take on tasks your contacts post. It can't accept connections; that stays with you.
 
+## Sharing compute
+
+An operator can make a signed worker invite with the same installer and identity path:
+
+    nak invite --kind worker --tier known --note "GPU box"
+
+The command stages a one-time admission code with the onboard service (using
+`NAK_ONBOARD_TOKEN`, or `~/.nakshatra/onboard.token` if that file is mode `0600`) and seals the
+code, tier, and redeem URL inside the signed invite. The joining box creates the normal node and
+contact identity first, then proves possession of that node key to redeem its worker standing. It
+prints the admitted tier and junction. If the onboard service is temporarily unavailable, contact
+setup remains complete and the box can retry while the code is valid:
+
+    nak worker-redeem
+
+Worker execution itself still uses the existing `worker.sh` runtime until phase B; phase A unifies
+the signed invite, installer, admission proof, and node key.
+
 ## What each side can see
 
 | Who | Sees |

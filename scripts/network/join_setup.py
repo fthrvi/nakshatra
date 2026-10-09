@@ -17,10 +17,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import stat
 import subprocess
 import sys
 import time
 from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 _SCRIPTS = Path(__file__).resolve().parent.parent
 if str(_SCRIPTS) not in sys.path:
@@ -29,10 +32,114 @@ if str(_SCRIPTS) not in sys.path:
 AGENT = "agent"
 AGENT_CAPS = ("nak.msg", "nak.task.claim")
 AGENT_TTL_S = 90 * 86400
+WORKER_RETRY_FILE = Path(".nakshatra") / "worker-invite.json"
+
+
+class WorkerRedeemError(RuntimeError):
+    pass
 
 
 def _say(msg: str) -> None:  # noqa: D401
     print(f"  · {msg}", flush=True)
+
+
+def _http_post_json(url: str, body: dict) -> dict:
+    req = Request(url, data=json.dumps(body, sort_keys=True, separators=(",", ":")).encode(),
+                  headers={"content-type": "application/json"}, method="POST")
+    try:
+        with urlopen(req, timeout=30) as response:
+            result = json.loads(response.read().decode())
+    except HTTPError as e:
+        try:
+            detail = json.loads(e.read().decode()).get("error", "")
+        except (ValueError, AttributeError):
+            detail = ""
+        raise WorkerRedeemError(f"onboard server refused worker admission ({e.code})" +
+                                (f": {detail}" if detail else ""))
+    except (OSError, URLError, ValueError) as e:
+        raise WorkerRedeemError(f"could not reach the onboard server: {e}")
+    if not isinstance(result, dict):
+        raise WorkerRedeemError("onboard server returned an invalid worker response")
+    return result
+
+
+def _store_worker_invite(home: Path, code: str, name: str) -> Path:
+    path = home / WORKER_RETRY_FILE
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump({"invite": code, "name": name[:40]}, f, separators=(",", ":"))
+            f.write("\n")
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+    return path
+
+
+def _load_worker_invite(home: Path) -> dict:
+    path = home / WORKER_RETRY_FILE
+    try:
+        info = path.lstat()
+        if path.is_symlink() or not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
+            raise WorkerRedeemError(f"refusing {path}: stored worker invite must be a regular 0600 file")
+        saved = json.loads(path.read_text())
+    except WorkerRedeemError:
+        raise
+    except (OSError, ValueError) as e:
+        raise WorkerRedeemError(f"could not read a stored worker invite at {path}: {e}")
+    if not isinstance(saved, dict) or not isinstance(saved.get("invite"), str) or \
+            not isinstance(saved.get("name"), str):
+        raise WorkerRedeemError(f"stored worker invite at {path} is malformed")
+    return saved
+
+
+def redeem_worker_invite(home: Path, code: str, name: str, *, http_post=None,
+                         capabilities_fn=None, now: int | None = None) -> dict:
+    """Redeem the worker half of a signed invite with proof of possession of the node key."""
+    import joincode
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+    from fabric.worker_join import detect_capabilities
+    try:
+        inv = joincode.decode_invite(code, now=now)
+    except ValueError as e:
+        raise WorkerRedeemError(str(e))
+    if inv.get("kind", "contact") != "worker":
+        raise WorkerRedeemError("stored invite is not a worker invite")
+    node_key = home / ".nakshatra" / "keys" / "worker.ed25519"
+    try:
+        priv = ed25519.Ed25519PrivateKey.from_private_bytes(node_key.read_bytes())
+    except (OSError, ValueError) as e:
+        raise WorkerRedeemError(f"could not read the node key at {node_key}: {e}")
+    body = {"v": 2, "code": inv["worker"]["code"],
+            "pubkey": priv.public_key().public_bytes_raw().hex(), "name": name[:40],
+            "capabilities": (capabilities_fn or detect_capabilities)(),
+            "ts": int(now if now is not None else time.time())}
+    canonical = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    body["sig"] = priv.sign(canonical).hex()
+    result = (http_post or _http_post_json)(inv["worker"]["redeem"].rstrip("/") + "/worker-redeem", body)
+    if not isinstance(result, dict) or not isinstance(result.get("tier"), str) or \
+            not isinstance(result.get("junction"), str):
+        raise WorkerRedeemError("onboard server returned no worker standing")
+    if result["tier"] != inv["worker"]["tier"]:
+        raise WorkerRedeemError("onboard server returned a different tier than the signed invite")
+    return result
+
+
+def retry_worker_redeem(home: Path, *, name: str = "", http_post=None) -> dict:
+    """CLI entry point: retry the persisted invite and delete it only after admission succeeds."""
+    try:
+        saved = _load_worker_invite(home)
+    except WorkerRedeemError as e:
+        raise SystemExit(f"worker redeem failed: {e}")
+    try:
+        result = redeem_worker_invite(home, saved["invite"], name or saved["name"], http_post=http_post)
+    except WorkerRedeemError as e:
+        raise SystemExit(f"worker redeem failed: {e}. The invite is still stored; retry: nak worker-redeem")
+    (home / WORKER_RETRY_FILE).unlink()
+    print(f"worker standing: tier {result['tier']}, junction {result['junction']}")
+    return result
 
 
 def ensure_identity(home: Path) -> dict:
@@ -127,6 +234,22 @@ def main(argv=None) -> int:
     except NakError as e:
         raise SystemExit(f"could not send the connection request: {e}")
     print(f"\nconnection request: {r['state']}. Your friend appears here as '{r.get('name') or '?'}'.")
+    import joincode
+    try:
+        inv = joincode.decode_invite(a.invite)
+    except ValueError as e:
+        raise SystemExit(f"invite became invalid during setup: {e}")
+    if inv.get("kind", "contact") == "worker":
+        retry_path = _store_worker_invite(a.home, a.invite, a.name)
+        try:
+            standing = redeem_worker_invite(a.home, a.invite, a.name)
+        except WorkerRedeemError as e:
+            print(f"\nworker redeem failed: {e}", file=sys.stderr)
+            print(f"contact setup is complete. The worker invite remains at {retry_path}.", file=sys.stderr)
+            print("retry while its one-time code is valid:  nak worker-redeem", file=sys.stderr)
+        else:
+            retry_path.unlink()
+            print(f"worker standing: tier {standing['tier']}, junction {standing['junction']}")
     print("\nnext:")
     print("  1. ask your friend to accept you (they run: nak requests, then nak accept <id>)")
     print("  2. check:  nak contacts      (shows them as active once they accept)")

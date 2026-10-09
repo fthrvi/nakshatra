@@ -846,6 +846,7 @@ INVITE_PREFIX = "nki1."
 def parse_invite(code: str, now=None) -> dict:
     """Verify an invite with no third-party crypto (releasekit's pure Ed25519). Raises InstallError."""
     import base64
+    from urllib.parse import urlsplit
     now = int(now if now is not None else time.time())
     code = (code or "").strip()
     if not code.startswith(INVITE_PREFIX) or len(code) > 8192:
@@ -861,6 +862,23 @@ def parse_invite(code: str, now=None) -> dict:
         raise InstallError("the invite's signature does not verify: it was changed or is not genuine")
     if not isinstance(inv.get("expires_at"), int) or now >= inv["expires_at"]:
         raise InstallError("the invite has expired: ask your friend for a new one")
+    kind = inv.get("kind", "contact")
+    worker = inv.get("worker")
+    if kind not in {"contact", "worker"}:
+        raise InstallError("the invite kind is not supported by this installer")
+    if kind == "contact" and worker is not None:
+        raise InstallError("the contact invite contains unexpected worker details")
+    if kind == "worker":
+        if not isinstance(worker, dict) or set(worker) != {"redeem", "code", "tier"}:
+            raise InstallError("the worker invite details are malformed")
+        try:
+            redeem = urlsplit(worker.get("redeem"))
+        except (TypeError, ValueError):
+            redeem = None
+        if redeem is None or redeem.scheme not in {"http", "https"} or not redeem.netloc or \
+                not isinstance(worker.get("code"), str) or not worker["code"].strip() or \
+                len(worker["code"]) > 64 or worker.get("tier") not in {"stranger", "known", "trusted"}:
+            raise InstallError("the worker invite details are malformed")
     rel = inv.get("release")
     if not isinstance(rel, dict) or not all(isinstance(rel.get(k), str) for k in ("url", "channel", "pubkey")):
         raise InstallError("the invite does not say where to get Nakshatra (your friend's node is too old)")

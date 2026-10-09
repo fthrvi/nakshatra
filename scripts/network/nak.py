@@ -20,9 +20,13 @@ import base64
 import hashlib
 import json
 import os
+import stat
 import sys
 import time
 from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit
+from urllib.request import Request, urlopen
 
 _SCRIPTS = Path(__file__).resolve().parent.parent
 if str(_SCRIPTS) not in sys.path:
@@ -75,6 +79,60 @@ def _ago(ts: int) -> str:
 DEFAULT_P2P_RELAY_ID = "12D3KooWDfHFtM8PP7TV46nssrix2hTL3kzMkv7kKMhULDakFGB7"
 DEFAULT_P2P_RELAYS = (f"/ip4/45.63.109.137/udp/29700/quic-v1/p2p/{DEFAULT_P2P_RELAY_ID},"
                       f"/ip4/45.63.109.137/tcp/29700/p2p/{DEFAULT_P2P_RELAY_ID}")
+DEFAULT_ONBOARD_BASE = "https://prithviloka.net/onboard"
+
+
+def _http_post_json(url: str, body: dict) -> dict:
+    req = Request(url, data=json.dumps(body, separators=(",", ":")).encode(),
+                  headers={"content-type": "application/json"}, method="POST")
+    try:
+        with urlopen(req, timeout=20) as response:
+            result = json.loads(response.read().decode())
+    except HTTPError as e:
+        try:
+            detail = json.loads(e.read().decode()).get("error", "")
+        except (ValueError, AttributeError):
+            detail = ""
+        raise SystemExit(f"onboard server refused the request ({e.code})" + (f": {detail}" if detail else ""))
+    except (OSError, URLError, ValueError) as e:
+        raise SystemExit(f"could not reach the onboard server: {e}")
+    if not isinstance(result, dict):
+        raise SystemExit("onboard server returned an invalid response")
+    return result
+
+
+def _onboard_token() -> str:
+    token = os.environ.get("NAK_ONBOARD_TOKEN")
+    if token is not None:
+        token = token.strip()
+        if not token:
+            raise SystemExit("NAK_ONBOARD_TOKEN is empty")
+        return token
+    path = Path.home() / ".nakshatra" / "onboard.token"
+    try:
+        info = path.lstat()
+    except OSError as e:
+        raise SystemExit(f"worker invites need NAK_ONBOARD_TOKEN or {path}: {e}")
+    if path.is_symlink() or not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
+        raise SystemExit(f"refusing {path}: operator token file must be a regular 0600 file")
+    token = path.read_text().strip()
+    if not token:
+        raise SystemExit(f"refusing {path}: operator token is empty")
+    return token
+
+
+def _stage_worker(redeem: str, tier: str, http_post) -> dict:
+    try:
+        parsed = urlsplit(redeem)
+    except (TypeError, ValueError):
+        parsed = None
+    if parsed is None or parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise SystemExit("worker redeem URL must be an http(s) base URL")
+    result = http_post(redeem.rstrip("/") + "/worker-stage", {"token": _onboard_token(), "tier": tier})
+    code = result.get("code") if isinstance(result, dict) else None
+    if not isinstance(code, str) or not code.strip() or len(code) > 64:
+        raise SystemExit("onboard server returned an invalid worker code")
+    return {"redeem": redeem.rstrip("/"), "code": code, "tier": tier}
 
 
 def _p2p_installer(_sp, action: str) -> None:
@@ -141,7 +199,7 @@ def _default_p2p_socket() -> Path:
     return Path(runtime) / "nakshatra" / "p2p.sock"
 
 
-def main(argv=None) -> int:
+def main(argv=None, *, http_post=None) -> int:
     default_sock = Path(os.environ.get("NAK_NET_DIR", Path.home() / ".nakshatra" / "net")) / "nakd.sock"
     ap = argparse.ArgumentParser(prog="nak", description=__doc__.split("\n")[0])
     ap.add_argument("--sock", type=Path, default=default_sock)
@@ -153,8 +211,14 @@ def main(argv=None) -> int:
     p.add_argument("--release-url", default="", help="where newcomers download Nakshatra (default: this node's source)")
     p.add_argument("--code-only", action="store_true", help="print just the invite code")
     p.add_argument("--from", dest="from_name", default="", help="your name as your friend will see it (remembered)")
+    p.add_argument("--kind", choices=["contact", "worker"], default="contact")
+    p.add_argument("--tier", choices=["stranger", "known", "trusted"], default="known",
+                   help="worker trust tier (self is never granted by an invite)")
+    p.add_argument("--redeem", default=DEFAULT_ONBOARD_BASE, help="onboard server base URL for a worker invite")
     p = sub.add_parser("redeem"); p.add_argument("code"); p.add_argument("--nickname", default="")
     p.add_argument("--as", dest="petname", default="")
+    p = sub.add_parser("worker-redeem", help="retry the stored worker admission while its code is valid")
+    p.add_argument("--name", default="", help="override the worker name stored during join")
     sub.add_parser("requests")
     p = sub.add_parser("accept"); p.add_argument("id"); p.add_argument("--as", dest="petname", default="")
     p = sub.add_parser("decline"); p.add_argument("id")
@@ -191,6 +255,7 @@ def main(argv=None) -> int:
     elif a.cmd == "invite":
         import joincode
         from cryptography.hazmat.primitives.asymmetric import ed25519
+        http_post = http_post or _http_post_json
         st = call(s, {"op": "status"})
         priv = ed25519.Ed25519PrivateKey.from_private_bytes(bytes.fromhex(a.person_key.read_text().strip()))
         release, line = _release_for_invite(a.release_url)
@@ -201,8 +266,10 @@ def main(argv=None) -> int:
         if not from_name:
             print("tip: add --from <your name> so your friend sees who invited them (remembered after once)",
                   file=sys.stderr)
+        worker = _stage_worker(a.redeem, a.tier, http_post) if a.kind == "worker" else None
         code = joincode.encode_invite(priv, st["node"], [{"node": st["node"], "addrs": [st["relay"]]}],
-                                      ttl_s=a.ttl, note=a.note, release=release, from_name=from_name)
+                                      ttl_s=a.ttl, note=a.note, release=release, from_name=from_name,
+                                      kind=a.kind, worker=worker)
         call(s, {"op": "register_invite", "code": code})
         if a.code_only or not line:
             print(code)
@@ -215,6 +282,9 @@ def main(argv=None) -> int:
     elif a.cmd == "redeem":
         r = call(s, {"op": "redeem", "code": a.code, "nickname": a.nickname, "petname": a.petname, "wait_s": 20})
         print(f"{r['state']}. They have to accept before either of you can message.")
+    elif a.cmd == "worker-redeem":
+        from network import join_setup
+        join_setup.retry_worker_redeem(Path.home(), name=a.name, http_post=http_post)
     elif a.cmd == "requests":
         for q in call(s, {"op": "requests"})["requests"] or []:
             print(f"{q['id']}  {q['nickname'] or '(no nickname)'}  person {q['person'][:16]}…  {_ago(q['received'])}")

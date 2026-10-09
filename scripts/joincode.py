@@ -94,11 +94,13 @@ import secrets
 import sqlite3
 import threading
 import time as _time
+from urllib.parse import urlsplit
 
 INVITE_PREFIX = "nki1."
 _INVITE_KEYS = {"v", "inviter", "inviter_node", "peers", "nonce", "expires_at", "scope", "note", "ik", "release",
-                "from_name", "sig"}
+                "from_name", "kind", "worker", "sig"}
 _MAX_INVITE_LEN = 8192
+_WORKER_TIERS = {"stranger", "known", "trusted"}
 
 
 def _canon(obj: dict) -> bytes:
@@ -114,9 +116,35 @@ def _unb64u(s: str) -> bytes:
     return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
 
 
+def _validate_invite_kind(inv: dict) -> None:
+    """Validate the U4 discriminator while treating pre-U4 invites as contacts."""
+    kind = inv.get("kind", "contact")
+    if kind not in {"contact", "worker"}:
+        raise ValueError("invite kind is unsupported")
+    worker = inv.get("worker")
+    if kind == "contact":
+        if worker is not None:
+            raise ValueError("contact invite must not contain worker details")
+        return
+    if not isinstance(worker, dict) or set(worker) != {"redeem", "code", "tier"}:
+        raise ValueError("worker invite details are malformed")
+    redeem, code, tier = worker.get("redeem"), worker.get("code"), worker.get("tier")
+    try:
+        parsed = urlsplit(redeem)
+    except (TypeError, ValueError):
+        parsed = None
+    if parsed is None or parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("worker redeem URL must be http(s)")
+    if not isinstance(code, str) or not code.strip() or len(code) > 64:
+        raise ValueError("worker invite code is malformed")
+    if tier not in _WORKER_TIERS:
+        raise ValueError("worker invite tier is malformed")
+
+
 def encode_invite(person_priv, inviter_node: str, peers: list, *, ttl_s: int = 86400,
                   scope: str = "member", note: str = "", now: int | None = None,
-                  release: dict | None = None, from_name: str = "") -> str:
+                  release: dict | None = None, from_name: str = "", kind: str = "contact",
+                  worker: dict | None = None) -> str:
     """person_priv: a cryptography Ed25519PrivateKey (the inviter's person key).
     peers: [{"node": <node pub hex>, "addrs": ["host:port", ...]}, ...] to dial first."""
     now = int(now if now is not None else _time.time())
@@ -137,6 +165,11 @@ def encode_invite(person_priv, inviter_node: str, peers: list, *, ttl_s: int = 8
         # Where a NEW node gets Nakshatra and which release key it must pin. Signed with the rest of the
         # invite, so a newcomer trusts the release key because they trust the friend who invited them.
         inv["release"] = {k: str(release[k]) for k in ("url", "channel", "pubkey", "version")}
+    if kind != "contact":
+        inv["kind"] = kind
+    if worker is not None:
+        inv["worker"] = dict(worker)
+    _validate_invite_kind(inv)
     inv["sig"] = {"alg": "Ed25519", "keyid": inviter[:16],
                   "value": base64.b64encode(person_priv.sign(_canon(inv))).decode("ascii")}
     return INVITE_PREFIX + _b64u(json.dumps(inv, sort_keys=True, separators=(",", ":"),
@@ -165,6 +198,7 @@ def decode_invite(code: str, *, now: int | None = None, trusted_inviters: set | 
             raise ValueError(f"invite field {k} is malformed")
     if inv.get("v") != 1:
         raise ValueError("unsupported invite version")
+    _validate_invite_kind(inv)
     peers = inv.get("peers")
     if not isinstance(peers, list) or not peers or len(peers) > 16:
         raise ValueError("invite must list 1-16 peers")

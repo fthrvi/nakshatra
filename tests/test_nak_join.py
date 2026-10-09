@@ -7,6 +7,7 @@ import subprocess
 import sys
 import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -41,6 +42,9 @@ def test_installer_verifies_invites_without_cryptography(net):
     plain = joincode.encode_invite(a.person_priv, a.node.node, [{"node": a.node.node, "addrs": []}])
     with pytest.raises(I.InstallError, match="where to get Nakshatra"):
         I.parse_invite(plain)
+    worker = _invite(a, kind="worker", worker={
+        "redeem": "https://onboard.example/base", "code": "one-time", "tier": "trusted"})
+    assert I.parse_invite(worker)["worker"]["tier"] == "trusted"
     with pytest.raises(I.InstallError, match="not a Nakshatra invite"):
         I.parse_invite("hello")
 
@@ -130,3 +134,129 @@ def test_invite_prefers_the_public_release_host(tmp_path, monkeypatch):
     monkeypatch.setenv("NAK_NET_DIR", str(net_dir))
     release, line = nak._release_for_invite()
     assert release["url"] == "http://45.63.109.137:8960" and "45.63.109.137:8960/canary/0.6.3/install.py" in line
+
+
+def test_nak_worker_invite_stages_code_with_injected_http(tmp_path, monkeypatch, capsys):
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+    person = ed25519.Ed25519PrivateKey.generate()
+    person_path = tmp_path / "person.key"
+    person_path.write_text(person.private_bytes_raw().hex())
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("NAK_NET_DIR", str(tmp_path / "net"))
+    monkeypatch.setenv("NAK_ONBOARD_TOKEN", "operator-secret")
+    monkeypatch.setattr(nak, "_release_for_invite", lambda _url="": (REL, ""))
+    registered = []
+
+    def fake_call(_sock, req):
+        if req["op"] == "status":
+            return {"node": "a" * 64, "relay": "relay.example:51820"}
+        registered.append(req["code"])
+        return {}
+
+    posted = []
+
+    def fake_post(url, body):
+        posted.append((url, body))
+        return {"code": "staged-once"}
+
+    monkeypatch.setattr(nak, "call", fake_call)
+    assert nak.main(["invite", "--person-key", str(person_path), "--kind", "worker", "--tier", "known",
+                     "--redeem", "https://onboard.example/base", "--code-only"], http_post=fake_post) == 0
+    code = capsys.readouterr().out.strip()
+    inv = joincode.decode_invite(code)
+    assert posted == [("https://onboard.example/base/worker-stage",
+                       {"token": "operator-secret", "tier": "known"})]
+    assert inv["worker"] == {"redeem": "https://onboard.example/base", "code": "staged-once", "tier": "known"}
+    assert registered == [code]
+
+
+def test_worker_token_file_must_be_0600(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("NAK_ONBOARD_TOKEN", raising=False)
+    token = tmp_path / ".nakshatra" / "onboard.token"
+    token.parent.mkdir()
+    token.write_text("secret\n")
+    token.chmod(0o644)
+    with pytest.raises(SystemExit, match="0600"):
+        nak._onboard_token()
+    token.chmod(0o600)
+    assert nak._onboard_token() == "secret"
+
+
+def test_worker_redeem_without_stored_invite_is_a_clear_cli_error(tmp_path):
+    with pytest.raises(SystemExit, match="could not read a stored worker invite"):
+        join_setup.retry_worker_redeem(tmp_path)
+
+
+class _WorkerOnboardHandler(BaseHTTPRequestHandler):
+    failures_left = 1
+    seen = []
+
+    def do_POST(self):  # noqa: N802
+        from cryptography.hazmat.primitives.asymmetric import ed25519
+        size = int(self.headers.get("content-length", "0"))
+        body = json.loads(self.rfile.read(size))
+        unsigned = {k: v for k, v in body.items() if k != "sig"}
+        canonical = json.dumps(unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+        ed25519.Ed25519PublicKey.from_public_bytes(bytes.fromhex(body["pubkey"])).verify(
+            bytes.fromhex(body["sig"]), canonical)
+        type(self).seen.append(body)
+        if type(self).failures_left:
+            type(self).failures_left -= 1
+            payload, status = {"error": "temporary outage"}, 503
+        else:
+            payload, status = {"tier": "known", "junction": "junction.example:7443", "tenant": "op-deadbeef"}, 200
+        raw = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def log_message(self, _format, *_args):
+        pass
+
+
+def test_worker_join_failure_keeps_contact_and_retry_uses_signed_node_key(net, tmp_path, monkeypatch, capsys):
+    from fabric import worker_join
+    _WorkerOnboardHandler.failures_left = 1
+    _WorkerOnboardHandler.seen = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _WorkerOnboardHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    a = net("inviter")
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    code = _invite(a, kind="worker", worker={"redeem": base, "code": "one-use", "tier": "known"})
+    a.node.register_invite(code)
+    home = tmp_path / "worker"
+    join_setup.ensure_identity(home)
+    sg = signer_mod.Signer(home / ".sthambha" / "signer", custody="test")
+    node_key = (home / ".nakshatra" / "keys" / "worker.ed25519").read_bytes()
+    node = nakd.Node(home / ".nakshatra" / "net", node_key, sg.handle, agent="agent", relay=a.node.relay).start()
+    stop = threading.Event()
+    sock = home / ".nakshatra" / "net" / "nakd.sock"
+    threading.Thread(target=nakd.serve_control, args=(node, sock, stop), daemon=True).start()
+    assert wait(lambda: sock.exists())
+    monkeypatch.setenv("NAK_JOIN_NO_SYSTEMD", "1")
+    monkeypatch.setattr(worker_join, "detect_capabilities",
+                        lambda: {"gpu": "fake-gpu", "vram_mb": 12345, "backend": "test", "kind": "gpu-worker"})
+    try:
+        assert join_setup.main(["--invite", code, "--name", "GPU Friend", "--home", str(home)]) == 0
+        output = capsys.readouterr()
+        assert "contact setup is complete" in output.err and "nak worker-redeem" in output.err
+        retry = home / join_setup.WORKER_RETRY_FILE
+        assert retry.exists() and (retry.stat().st_mode & 0o777) == 0o600
+        assert (node.store.contact(a.person_pub) or {})["state"] == "awaiting"
+
+        result = join_setup.retry_worker_redeem(home)
+        assert result["tier"] == "known" and result["junction"] == "junction.example:7443"
+        assert not retry.exists()
+        body = _WorkerOnboardHandler.seen[-1]
+        assert body["v"] == 2 and body["code"] == "one-use" and body["name"] == "GPU Friend"
+        assert body["pubkey"] == node.node and body["capabilities"]["gpu"] == "fake-gpu"
+        assert len(body["sig"]) == 128 and abs(int(time.time()) - body["ts"]) <= 10
+    finally:
+        stop.set()
+        node.stop()
+        server.shutdown()
+        server.server_close()

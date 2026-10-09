@@ -248,6 +248,30 @@ class TestSignedInvite:
         k, pub = _person()
         inv = decode_invite(encode_invite(k, _NODE, _PEERS, ttl_s=60, now=1000), now=1010)
         assert inv["inviter"] == pub and inv["peers"] == _PEERS and inv["inviter_node"] == _NODE
+        assert "kind" not in inv and inv.get("kind", "contact") == "contact"  # pre-U4 shape stays valid
+
+    def test_worker_round_trip_and_fields_are_signed(self):
+        k, _ = _person()
+        worker = {"redeem": "https://onboard.example/base", "code": "one-time", "tier": "known"}
+        inv = decode_invite(encode_invite(k, _NODE, _PEERS, kind="worker", worker=worker, now=1000), now=1001)
+        assert inv["kind"] == "worker" and inv["worker"] == worker
+        inv["worker"]["tier"] = "trusted"
+        with pytest.raises(ValueError, match="signature does not verify"):
+            decode_invite(_reencode(inv), now=1001)
+
+    @pytest.mark.parametrize("kind,worker,reason", [
+        ("device", None, "kind"),
+        ("contact", {"redeem": "https://x", "code": "c", "tier": "known"}, "must not"),
+        ("worker", None, "details"),
+        ("worker", {"redeem": "file:///tmp/x", "code": "c", "tier": "known"}, "http"),
+        ("worker", {"redeem": "https://x", "code": "", "tier": "known"}, "code"),
+        ("worker", {"redeem": "https://x", "code": "x" * 65, "tier": "known"}, "code"),
+        ("worker", {"redeem": "https://x", "code": "c", "tier": "self"}, "tier"),
+    ])
+    def test_worker_shape_is_strict(self, kind, worker, reason):
+        k, _ = _person()
+        with pytest.raises(ValueError, match=reason):
+            encode_invite(k, _NODE, _PEERS, kind=kind, worker=worker, now=1000)
 
     def test_tampered_peer_address_breaks_signature(self):
         k, _ = _person()
