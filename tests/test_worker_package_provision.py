@@ -73,3 +73,12 @@ def test_worker_provision_fail_closed_on_corruption(package_dir, tmp_path):
     frag.write_bytes(data)
     with pytest.raises(PackageError, match="SHA-256 mismatch"):
         worker.provision_from_package(str(package_dir), 0, N_LAYERS, str(tmp_path / "x.gguf"))
+
+
+def test_worker_public_remote_package_requires_pinned_signer(tmp_path):
+    """Policy refusal happens before worker.py attempts any network access."""
+    with pytest.raises(PackageError, match="pinned --package-trusted-pubkey"):
+        worker.provision_from_package(
+            "https://models.example/package", 0, 1,
+            str(tmp_path / "x.gguf"),
+        )

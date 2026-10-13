@@ -8,7 +8,7 @@ Covers the four cheap-wins commit:
   A4 — STHAMBHA_PILLAR_SPKI_SHA256 length validation
   A5 — STHAMBHA_REFUSE_UNSIGNED startup gate
   A6 — math.isfinite guard on recent_rpc_ms (safe_rpc_ms helper)
-  A7 — STHAMBHA_REFUSE_UNVERIFIED_FETCH gate (default true in Mode C)
+  A7 — mandatory pillar-attested SHA-256 for every remote peer fetch
   A8 — concurrent slice cap + reduced subprocess timeout
 
 The pure-function helpers (A4, A5, A6, A7) test directly. The stateful
@@ -257,11 +257,16 @@ def test_a7_refuse_unverified_allows_valid_sha():
     assert worker.should_refuse_unverified_fetch("false", sha) is False
 
 
-def test_a7_refuse_unverified_opt_out():
-    """Operators can set the env to false to allow unverified fetch."""
-    assert worker.should_refuse_unverified_fetch("false", "") is False
-    assert worker.should_refuse_unverified_fetch("0", "") is False
-    assert worker.should_refuse_unverified_fetch("no", "") is False
+def test_a7_refuse_unverified_cannot_be_opted_out():
+    """U4 B3 retires the environment bypass for every remote peer fetch."""
+    assert worker.should_refuse_unverified_fetch("false", "") is True
+    assert worker.should_refuse_unverified_fetch("0", "") is True
+    assert worker.should_refuse_unverified_fetch("no", "") is True
+
+
+@pytest.mark.parametrize("bad", ["abc", "g" * 64, "a" * 63, "a" * 65])
+def test_a7_refuse_malformed_sha_before_downloading(bad):
+    assert worker.should_refuse_unverified_fetch(None, bad) is True
 
 
 def test_a7_refuse_unverified_explicit_true():

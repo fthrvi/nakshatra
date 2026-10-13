@@ -39,12 +39,18 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from typing import NamedTuple, Optional
 from urllib import request as urlrequest, error as urlerror
+from urllib.parse import urlencode
 
 sys.path.insert(0, str(Path(__file__).parent))
 
 import grpc
 import nakshatra_pb2 as pb
 import nakshatra_pb2_grpc as pb_grpc
+from worker_service import (
+    DEFAULT_TRUSTED_PILLAR_NETS,
+    WorkerServiceError,
+    validate_pillar_transport,
+)
 
 # Phase F (worker hardening sprint, 2026-05-19): Ed25519-signed pillar
 # requests + optional TLS SPKI pinning. cryptography is a runtime dep
@@ -513,15 +519,44 @@ def safe_rpc_ms(ms: float) -> Optional[float]:
 def should_refuse_unverified_fetch(
     refuse_env: Optional[str], expected_sha: Optional[str]
 ) -> bool:
-    """Phase A7 — STHAMBHA_REFUSE_UNVERIFIED_FETCH gate.
+    """Phase A7 / U4 B3 — refuse a missing or malformed expected SHA-256.
 
-    Default true (refuse when pillar omits model_sha256). A malicious
-    pillar can serve poisoned weights by omitting the hash. Mode A/B
-    operators can opt out with STHAMBHA_REFUSE_UNVERIFIED_FETCH=false.
+    ``refuse_env`` is retained in the signature so older callers/tests fail
+    safely, but it can no longer disable verification.  Every remotely fetched
+    peer slice must have a complete SHA-256 attested by the pillar.
     """
-    val = (refuse_env if refuse_env is not None else "true").strip().lower()
-    refuse = val in ("true", "1", "yes")
-    return refuse and not (expected_sha or "").strip()
+    del refuse_env
+    value = (expected_sha or "").strip()
+    if len(value) != 64:
+        return True
+    try:
+        bytes.fromhex(value)
+    except ValueError:
+        return True
+    return False
+
+
+def validate_local_dev_fetch_policy(*, local_dev: bool, skip_sha256: bool,
+                                    package_url: str, auto_fetch: bool) -> None:
+    """Validate the narrowly-scoped local-development escape hatch.
+
+    Skipping the worker's local registration hash is never a production mode.
+    It requires ``--local-dev``; that mode may only consume an existing local
+    slice or a filesystem/loopback package and cannot use pillar peer-fetch.
+    """
+    if skip_sha256 and not local_dev:
+        raise ValueError("--skip-sha256 requires explicit --local-dev")
+    if not local_dev:
+        return
+    from packaging.fetch_package import is_local_package_location
+
+    if auto_fetch:
+        raise ValueError(
+            "--local-dev refuses --auto-fetch because peer slices are remote")
+    if package_url and not is_local_package_location(package_url):
+        raise ValueError(
+            "--local-dev package source must be a local path, file:// URI, "
+            "localhost, or a literal loopback address")
 
 
 def _iter_with_idle_timeout(it, idle_seconds: float):
@@ -2998,7 +3033,8 @@ def _control_version_caps() -> list:
 
 def provision_from_package(package_url: str, layer_start: int, layer_end: int,
                            dest_path: str, *, require_signature: bool = False,
-                           trusted_pubkeys: Optional[set] = None) -> str:
+                           trusted_pubkeys: Optional[set] = None,
+                           local_dev: bool = False) -> str:
     """v1.0 §5 (P2) — provision this worker's assigned layer range from a
     content-addressed layer package instead of fetching a whole pre-cut sub-GGUF
     from a peer.
@@ -3018,7 +3054,8 @@ def provision_from_package(package_url: str, layer_start: int, layer_end: int,
     from packaging.fetch_package import fetch_and_assemble
     fetch_and_assemble(package_url, layer_start, layer_end, dest_path,
                        require_signature=require_signature,
-                       trusted_pubkeys=trusted_pubkeys)
+                       trusted_pubkeys=trusted_pubkeys,
+                       local_dev=local_dev)
     _audit("package_provision_completed", dest=dest_path)
     return dest_path
 
@@ -3027,11 +3064,14 @@ def fetch_sub_gguf_from_peer(pillar_url: str, model_id: str,
                               layer_start: int, layer_end: int,
                               dest_path: str,
                               own_node_id: str = "",
-                              spki_hash: Optional[str] = None) -> str:
+                              priv_key: Optional[bytes] = None,
+                              spki_hash: Optional[str] = None,
+                              verified_sha_out: Optional[dict] = None) -> str:
     """Query Sthambha for a peer with the requested file and download it.
 
     Returns the local path on success; raises RuntimeError on failure.
-    Verifies SHA-256 against the pillar's recorded hash if present.
+    Verifies SHA-256 against the pillar's recorded hash.  Missing or malformed
+    hashes are refused before any peer bytes are fetched.
 
     Skips candidates whose node_id matches `own_node_id` (don't fetch
     from yourself). Retries the next candidate on connection failure
@@ -3040,13 +3080,36 @@ def fetch_sub_gguf_from_peer(pillar_url: str, model_id: str,
     _audit("fetch_started", model_id=model_id,
            layer_start=layer_start, layer_end=layer_end,
            dest_path=dest_path)
-    # 1. Ask the pillar for the file index
-    files_url = f"{pillar_url.rstrip('/')}/files?model={model_id}"
+    # 1. Ask the pillar for the file index.  This bootstrap request has the
+    # same authentication contract as registration/heartbeats: it is always
+    # signed by the persistent worker identity, and HTTPS uses the configured
+    # pillar SPKI pin.  There is deliberately no unsigned fallback.
+    if not _AUTH_AVAILABLE:
+        raise RuntimeError(
+            "authenticated pillar /files query requires nakshatra_auth")
+    if not priv_key or not own_node_id:
+        raise RuntimeError(
+            "authenticated pillar /files query requires the worker key and node id")
     try:
-        if not _AUTH_AVAILABLE:
-            raise RuntimeError("pillar requests require nakshatra_auth")
+        validate_pillar_transport(
+            pillar_url,
+            spki_hash or "",
+            os.environ.get("TRUSTED_PILLAR_NETS", DEFAULT_TRUSTED_PILLAR_NETS),
+        )
+    except WorkerServiceError as e:
+        raise RuntimeError(
+            f"refusing untrusted pillar transport for /files: {e}"
+        ) from e
+    query = urlencode({"model": model_id})
+    files_path = f"/files?{query}"
+    files_url = f"{pillar_url.rstrip('/')}{files_path}"
+    auth_header, _ts = _wauth.build_signed_envelope(
+        priv_key, own_node_id, "GET", files_path, b"")
+    headers = {"Authorization": auth_header}
+    req = urlrequest.Request(files_url, headers=headers, method="GET")
+    try:
         with _wauth.open_pillar_url(
-            files_url, timeout=10, expected_spki_hash=spki_hash,
+            req, timeout=10, expected_spki_hash=spki_hash,
         ) as resp:
             data = json.loads(resp.read())
     except Exception as e:
@@ -3070,21 +3133,18 @@ def fetch_sub_gguf_from_peer(pillar_url: str, model_id: str,
             f" — file not available on the network"
         )
 
-    # Phase A7 (2026-05-20): refuse unverified fetch when the pillar
-    # omits model_sha256. A malicious pillar can serve poisoned weights
-    # by simply not declaring a hash. Default behaviour is to refuse;
-    # Mode A/B operators can opt out with the env var.
-    refuse_env = os.environ.get("STHAMBHA_REFUSE_UNVERIFIED_FETCH")
+    # Phase A7 / U4 B3: the pillar's model_sha256 is the trust anchor for
+    # peer slices.  The old STHAMBHA_REFUSE_UNVERIFIED_FETCH=false escape
+    # hatch is intentionally ignored: outsider workers never execute bytes
+    # whose expected digest was omitted or malformed.
     verified_candidates = [
         c for c in candidates
-        if not should_refuse_unverified_fetch(refuse_env, c.get("model_sha256", ""))
+        if not should_refuse_unverified_fetch(None, c.get("model_sha256", ""))
     ]
     if not verified_candidates:
         raise RuntimeError(
             f"refusing to fetch {model_id} layers [{layer_start},{layer_end})"
-            f": no candidate peer has a pillar-attested model_sha256"
-            f" (set STHAMBHA_REFUSE_UNVERIFIED_FETCH=false to allow"
-            f" unverified Mode-A/B fetch)"
+            f": no candidate peer has a valid pillar-attested model_sha256"
         )
     candidates = verified_candidates
 
@@ -3098,7 +3158,7 @@ def fetch_sub_gguf_from_peer(pillar_url: str, model_id: str,
         host, _, port_str = addr.rpartition(":")
         grpc_port = int(port_str)
         file_port = grpc_port + 1000  # convention: file server on grpc_port + 1000
-        expected_sha = chosen.get("model_sha256", "")
+        expected_sha = chosen["model_sha256"].strip().lower()
         src_basename = Path(chosen.get("file_path", "")).name or f"w-{layer_start}-{layer_end}.gguf"
 
         fetch_url = f"http://{host}:{file_port}/file/{src_basename}"
@@ -3133,9 +3193,9 @@ def fetch_sub_gguf_from_peer(pillar_url: str, model_id: str,
             last_error = str(e)
             continue
 
-        # Verify SHA-256 if the pillar gave us one
+        # Verify the streamed SHA-256 before the temporary file can become live.
         actual_sha = h.hexdigest()
-        if expected_sha and actual_sha != expected_sha:
+        if actual_sha != expected_sha:
             print(f"[fetch] {chosen.get('node_id')} sha mismatch (got {actual_sha[:12]}, expected {expected_sha[:12]}); trying next", flush=True)
             try: os.unlink(tmp_path)
             except Exception: pass
@@ -3144,6 +3204,10 @@ def fetch_sub_gguf_from_peer(pillar_url: str, model_id: str,
 
         # Atomic move into place
         os.rename(tmp_path, dest_path)
+        if verified_sha_out is not None:
+            # Let main() reuse the digest accumulated during download when it
+            # registers the slice; do not read a multi-GB file a second time.
+            verified_sha_out["sha256"] = actual_sha
         elapsed = time.time() - t0
         print(f"[fetch] saved {dest_path} ({bytes_received:,} bytes, sha={actual_sha[:12]}..., "
               f"{elapsed:.1f}s, {(bytes_received/1e6)/max(elapsed,0.001):.1f} MB/s) from {chosen.get('node_id')}", flush=True)
@@ -3426,7 +3490,12 @@ def main():
                     help="Idle seconds before the pillar reaps this node's lease. "
                          "0 = pillar uses the ownership-class default.")
     ap.add_argument("--skip-sha256", action="store_true",
-                    help="Skip SHA-256 of sub-GGUF (for fast restarts; cached_files lacks hash).")
+                    help="LOCAL DEVELOPMENT ONLY: skip the local sub-GGUF hash. "
+                         "Requires --local-dev and refuses remote package/peer fetches.")
+    ap.add_argument("--local-dev", action="store_true",
+                    help="Explicit local-development mode. May only use an existing "
+                         "local slice or a local/file/loopback package source; never "
+                         "use on an outsider worker.")
     ap.add_argument("--file-server-port", type=int, default=0,
                     help="Phase 4: HTTP file-server port for peer-to-peer fetch. "
                          "Default = grpc port + 1000 (e.g. 5530 → 6530).")
@@ -3471,17 +3540,34 @@ def main():
     args = ap.parse_args()
 
     try:
+        validate_local_dev_fetch_policy(
+            local_dev=args.local_dev,
+            skip_sha256=args.skip_sha256,
+            package_url=args.package_url,
+            auto_fetch=args.auto_fetch,
+        )
         spki_hash = validate_spki_hash_env(
             os.environ.get("STHAMBHA_PILLAR_SPKI_SHA256")
         )
     except ValueError as e:
-        sys.exit(f"[worker] startup refused: {e}")
+        ap.error(str(e))
     if args.pillar_url.startswith("https://") and not spki_hash:
         if _release_service_running():
             sys.exit("[worker] startup refused: signed-release HTTPS pillar has no SPKI pin")
         print(f"[worker] WARN: HTTPS pillar URL but no SPKI hash pinned "
               f"via STHAMBHA_PILLAR_SPKI_SHA256; cert identity NOT verified",
               flush=True)
+    if args.local_dev:
+        print(
+            "[worker] !!! LOCAL DEVELOPMENT MODE !!! Only local/file/loopback "
+            "model sources are permitted; do not use this mode on an outsider worker.",
+            flush=True,
+        )
+    if args.skip_sha256:
+        print(
+            "[worker] !!! SHA-256 REGISTRATION HASH DISABLED FOR LOCAL DEVELOPMENT !!!",
+            flush=True,
+        )
 
     # Phase D5 (2026-05-20): initialise the audit log singleton early so
     # every event in main() (start, fetch, slice, register, auth fail)
@@ -3500,9 +3586,29 @@ def main():
             print(f"[worker] audit init failed (continuing without forensic log): {e}",
                   flush=True)
 
+    # Establish the persistent worker identity before any bootstrap request.
+    # A fresh slice may require a signed pillar /files query before the daemon
+    # or registration path exists, so credentials cannot be initialized later.
+    node_id = args.node_id or f"{socket.gethostname()}-{args.port}"
+    worker_priv: Optional[bytes] = None
+    worker_pub_hex = ""
+    if args.pillar_url:
+        if _AUTH_AVAILABLE:
+            try:
+                worker_priv, worker_pub_hex = _wauth.load_or_create_worker_key()
+            except Exception as e:
+                print(f"[worker] WARN: could not load worker key ({e}); "
+                      f"registration will be unsigned and authenticated bootstrap "
+                      f"fetches will be refused.", flush=True)
+        else:
+            print(f"[worker] WARN: nakshatra_auth import failed "
+                  f"({_AUTH_IMPORT_ERR}); registration will be unsigned and "
+                  f"authenticated bootstrap fetches will be refused", flush=True)
+
     # Phase 4: if sub-GGUF is missing AND we have a pillar to ask, fetch it
     # before doing anything else. This is what lets a fresh machine bootstrap
     # without manual scp.
+    provisioned_sha256 = ""
     if not os.path.exists(args.sub_gguf):
         if args.package_url:
             package_log_location = package_location_for_log(args.package_url)
@@ -3517,21 +3623,30 @@ def main():
                     args.package_url, args.layer_start, args.layer_end, args.sub_gguf,
                     require_signature=args.package_require_signature,
                     trusted_pubkeys=trusted,
+                    local_dev=args.local_dev,
                 )
             except Exception as e:
                 detail = str(e).replace(args.package_url, package_log_location)
                 sys.exit(f"[worker] package provisioning failed: {detail}")
         elif args.auto_fetch and args.pillar_url:
             print(f"[worker] sub-gguf missing at {args.sub_gguf}; auto-fetching from peer", flush=True)
-            own_node_id = args.node_id or f"{socket.gethostname()}-{args.port}"
+            if not worker_priv:
+                sys.exit(
+                    "[worker] auto-fetch refused: authenticated pillar /files "
+                    "query requires a usable worker key"
+                )
+            fetch_result = {}
             try:
                 fetch_sub_gguf_from_peer(
                     args.pillar_url, args.model_id,
                     args.layer_start, args.layer_end,
                     args.sub_gguf,
-                    own_node_id=own_node_id,
+                    own_node_id=node_id,
+                    priv_key=worker_priv,
                     spki_hash=spki_hash,
+                    verified_sha_out=fetch_result,
                 )
+                provisioned_sha256 = fetch_result.get("sha256", "")
             except Exception as e:
                 sys.exit(f"[worker] auto-fetch failed: {e}")
         else:
@@ -3611,7 +3726,6 @@ def main():
     # pre-shipped — they query the pillar's file index, find a peer that has
     # the file, and download it. Convention: file-server port = grpc port + 1000.
     file_server_port = args.file_server_port or (args.port + 1000)
-    node_id = args.node_id or f"{socket.gethostname()}-{args.port}"
     _HEALTH_STATE.update({
         "daemon": daemon,
         "servicer": servicer,
@@ -3650,10 +3764,18 @@ def main():
         try:
             sub_gguf_size = os.path.getsize(args.sub_gguf)
             if not args.skip_sha256:
-                t0 = time.time()
-                print(f"[worker] computing sha256 of {args.sub_gguf} ({sub_gguf_size/1e9:.1f} GB)…", flush=True)
-                sub_gguf_sha256 = sha256_of_file(args.sub_gguf)
-                print(f"[worker] sha256={sub_gguf_sha256[:16]}... ({time.time()-t0:.1f}s)", flush=True)
+                if provisioned_sha256:
+                    sub_gguf_sha256 = provisioned_sha256
+                    print(
+                        f"[worker] reusing download sha256={sub_gguf_sha256[:16]}... "
+                        "for pillar registration",
+                        flush=True,
+                    )
+                else:
+                    t0 = time.time()
+                    print(f"[worker] computing sha256 of {args.sub_gguf} ({sub_gguf_size/1e9:.1f} GB)…", flush=True)
+                    sub_gguf_sha256 = sha256_of_file(args.sub_gguf)
+                    print(f"[worker] sha256={sub_gguf_sha256[:16]}... ({time.time()-t0:.1f}s)", flush=True)
         except Exception as e:
             print(f"[worker] sub-GGUF inspection failed (continuing without hash): {e}", flush=True)
 
@@ -3753,11 +3875,17 @@ def main():
         # just the one this worker is serving). Any peer with multiple
         # cached files advertises them all — natural redundancy.
         cached_files = []
-        if not args.no_cache_scan:
+        if not args.no_cache_scan and not args.skip_sha256:
             cache_dir = args.cache_dir or str(Path(args.sub_gguf).resolve().parent)
             sha_seed = {str(Path(args.sub_gguf).resolve()): sub_gguf_sha256} if sub_gguf_sha256 else {}
             cached_files = scan_cache_dir(cache_dir, args.model_id, sha_cache=sha_seed)
             print(f"[worker] cache-scan found {len(cached_files)} sub-GGUF(s) in {cache_dir}", flush=True)
+        elif args.skip_sha256:
+            print(
+                "[worker] local-dev --skip-sha256 also disables cache scanning "
+                "so no model file is hashed indirectly",
+                flush=True,
+            )
 
         # Fallback: if scan found nothing (legacy / non-Nakshatra files),
         # advertise just the one we're serving.
@@ -3851,25 +3979,11 @@ def main():
         if sandbox_summary:
             register_payload["sandbox_compliance"] = sandbox_summary
 
-        # Phase F2: load or create the worker's persistent Ed25519
-        # keypair; include public_key_hex in the FIRST registration so
-        # the pillar locks it via TOFU. Subsequent heartbeats sign with
-        # the same key but omit public_key_hex from the body.
-        worker_priv: Optional[bytes] = None
-        worker_pub_hex = ""
-        if _AUTH_AVAILABLE:
-            try:
-                worker_priv, worker_pub_hex = _wauth.load_or_create_worker_key()
-                register_payload["public_key_hex"] = worker_pub_hex
-            except Exception as e:
-                print(f"[worker] WARN: could not load worker key ({e}); "
-                      f"requests will go unsigned. This will fail against "
-                      f"any pillar with STHAMBHA_AUTH_REQUIRED=true.",
-                      flush=True)
-        else:
-            print(f"[worker] WARN: nakshatra_auth import failed "
-                  f"({_AUTH_IMPORT_ERR}); requests will go unsigned",
-                  flush=True)
+        # Phase F2: the persistent Ed25519 key was loaded before bootstrap
+        # provisioning so /files could never race ahead unsigned. Include its
+        # public half in the first registration for the pillar's TOFU lock.
+        if worker_pub_hex:
+            register_payload["public_key_hex"] = worker_pub_hex
         # Phase A5 (2026-05-20): refuse-unsigned startup gate. Operators
         # opt in with STHAMBHA_REFUSE_UNSIGNED=true; default keeps the
         # legacy lenient bringup (worker WARNs and proceeds).

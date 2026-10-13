@@ -20,6 +20,8 @@ Wiring (env on the serve; absent ⇒ feature OFF, legacy always-on behaviour):
   NAKSHATRA_LIFECYCLE_IDLE_GRACE_S idle seconds before reaping (default 600 on a
                                    dedicated box; set SHORT — ~90 — for borrowed nodes)
   NAKSHATRA_LIFECYCLE_START_TIMEOUT_S  max wait for cold-start readiness (default 90)
+  NAKSHATRA_PACKAGE_TRUSTED_PUBKEY operator-pinned Ed25519 signer for remote
+                                   roster package manifests (required remotely)
 """
 from __future__ import annotations
 
@@ -244,6 +246,7 @@ class RosterWorkerSpec:
     model_id: str
     hidden_size: int
     package_location: str
+    package_trusted_pubkey: str = ""
     num_layers: Optional[int] = None
     daemon_bin: str = str(__import__("pathlib").Path.home() / "llama.cpp" / "build" / "bin" / "llama-nakshatra-worker")
     python_bin: str = ""                   # which python runs worker.py (default: this interpreter)
@@ -275,6 +278,9 @@ class RosterWorkerController(ChainController):
         self._probes: "list[tuple[str, int]]" = []
         self._adopted_ports: "list[int]" = []
         self.chain_yaml: Optional[str] = None
+        # Reject an unusable remote-package configuration when lifecycle is
+        # assembled, before planning can launch any workers.
+        self._package_trust_args()
 
     def _plan(self):
         if self._plan_fn is not None:
@@ -307,10 +313,35 @@ class RosterWorkerController(ChainController):
                "--model-id", self.spec.model_id, "--daemon-bin", self.spec.daemon_bin,
                "--n-ctx", str(self.spec.n_ctx), "--n-gpu-layers", str(self.spec.n_gpu_layers),
                "--node-id", f"roster-{w['id']}"]
+        cmd.extend(self._package_trust_args())
         # start_new_session → own process group, so stop() can reap the worker AND its
         # spawned daemon (the GPU-VRAM holder) in one killpg, not orphan the daemon.
         return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                 env=env, start_new_session=True)
+
+    def _package_trust_args(self) -> list[str]:
+        """Validate roster package trust before any worker is launched."""
+        from packaging.fetch_package import package_location_requires_trusted_key
+
+        key = (self.spec.package_trusted_pubkey or "").strip().lower()
+        if package_location_requires_trusted_key(self.spec.package_location) and not key:
+            raise ChainRefused(
+                "remote roster package requires an operator-pinned signing key; "
+                "set NAKSHATRA_PACKAGE_TRUSTED_PUBKEY"
+            )
+        if not key:
+            return []
+        try:
+            raw = bytes.fromhex(key)
+        except ValueError as e:
+            raise ChainRefused(
+                "NAKSHATRA_PACKAGE_TRUSTED_PUBKEY must be 64 hex characters"
+            ) from e
+        if len(raw) != 32:
+            raise ChainRefused(
+                "NAKSHATRA_PACKAGE_TRUSTED_PUBKEY must be 64 hex characters"
+            )
+        return ["--package-trusted-pubkey", key]
 
     def _lifecycle_placement(self):
         """Consult the 3-state lifecycle (operator toggle + owned-hardware presence) using the SAME
@@ -351,6 +382,9 @@ class RosterWorkerController(ChainController):
                 self._probes = []
                 self._adopted_ports = []
                 return
+        # Preflight before planning or launching so a remote package without an
+        # operator trust anchor cannot leave a partially started chain behind.
+        self._package_trust_args()
         chain = self._plan()
         self._probes = []
         self._adopted_ports = []          # LOCAL ports already served by a PRIOR process
@@ -884,6 +918,8 @@ def from_env(log: Callable[[str], None] = print) -> Optional[ChainLifecycle]:
             model_id=roster_model,
             hidden_size=int(os.environ["NAKSHATRA_LIFECYCLE_ROSTER_HIDDEN_SIZE"]),
             package_location=os.environ.get("NAKSHATRA_LIFECYCLE_ROSTER_PACKAGE", ""),
+            package_trusted_pubkey=os.environ.get(
+                "NAKSHATRA_PACKAGE_TRUSTED_PUBKEY", ""),
             num_layers=int(os.environ["NAKSHATRA_LIFECYCLE_ROSTER_NUM_LAYERS"])
             if os.environ.get("NAKSHATRA_LIFECYCLE_ROSTER_NUM_LAYERS") else None,
             daemon_bin=os.environ.get("NAKSHATRA_LIFECYCLE_DAEMON_BIN")

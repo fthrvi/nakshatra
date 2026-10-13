@@ -29,7 +29,7 @@ sudo ip route replace 10.51.0.0/24 dev prithvi-wg0
      --port 5540 --sub-gguf ~/slices/a.gguf --package-url ~/pkg --mode first \
      --layer-start 0 --layer-end 16 --model-id dsr1-8b \
      --daemon-bin ~/llama-nak/build/bin/llama-nakshatra-worker \
-     --n-ctx 2048 --n-gpu-layers 0 --node-id mac4-a --no-file-server --skip-sha256 &'
+     --n-ctx 2048 --n-gpu-layers 0 --node-id mac4-a --no-file-server --local-dev --skip-sha256 &'
    # ...and a `last` worker (layers 16-32) on another Mac (or same Mac, port 5541).
    ```
    NOTE: cross-Mac (worker→worker push, or client→multiple Macs) needs the Pi to forward

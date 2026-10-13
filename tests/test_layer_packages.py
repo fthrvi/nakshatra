@@ -234,3 +234,67 @@ def test_untrusted_signer_refused(source_gguf, tmp_path):
     with pytest.raises(PackageError, match="untrusted"):
         fetch_and_assemble(str(out), 0, 2, str(tmp_path / "no.gguf"),
                            require_signature=True, trusted_pubkeys={other_pub})
+
+
+def test_public_remote_manifest_requires_and_accepts_pinned_signer(
+        source_gguf, tmp_path, monkeypatch):
+    """Exercise the public-URL trust policy without making a network request."""
+    import packaging.fetch_package as fetch_module
+    from packaging.package_gguf import package_gguf
+
+    priv, pub = generate_keypair()
+    package_dir = tmp_path / "signed-remote"
+    package_gguf(source_gguf, package_dir, "test-tiny", sign_priv=priv)
+    pkg = NakshatraPackage.from_json((package_dir / "package.json").read_text())
+    pkg.validate()
+    monkeypatch.setattr(
+        fetch_module,
+        "_read_manifest",
+        lambda _location, **_kwargs: (pkg, str(package_dir)),
+    )
+
+    dest = tmp_path / "remote.gguf"
+    fetch_module.fetch_and_assemble(
+        "https://models.example/test-tiny", 0, 2, str(dest),
+        trusted_pubkeys={pub},
+    )
+    assert dest.exists()
+
+
+def test_local_dev_redirect_cannot_escape_loopback():
+    import packaging.fetch_package as fetch_module
+
+    handler = fetch_module._LocalDevRedirectHandler()
+    req = fetch_module.urlrequest.Request("http://127.0.0.1/package.json")
+    with pytest.raises(PackageError, match="non-loopback"):
+        handler.redirect_request(
+            req, None, 302, "Found", {},
+            "https://models.example/package.json",
+        )
+
+
+@pytest.mark.parametrize("location", [
+    r"\\server\share\package",
+    "//server/share/package",
+    "file:////server/share/package",
+    "file://server/share/package",
+])
+def test_unc_package_locations_are_remote(location, tmp_path):
+    import packaging.fetch_package as fetch_module
+
+    assert fetch_module.is_local_package_location(location) is False
+    with pytest.raises(PackageError, match="local-development package fetch refused"):
+        fetch_module.fetch_and_assemble(
+            location, 0, 1, str(tmp_path / "slice.gguf"), local_dev=True,
+        )
+    with pytest.raises(PackageError, match="pinned --package-trusted-pubkey"):
+        fetch_module.fetch_and_assemble(
+            location, 0, 1, str(tmp_path / "slice.gguf"),
+        )
+
+
+@pytest.mark.parametrize("location", [r"C:\models\package", "D:/models/package"])
+def test_windows_drive_package_locations_remain_local(location):
+    import packaging.fetch_package as fetch_module
+
+    assert fetch_module.is_local_package_location(location) is True

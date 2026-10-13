@@ -5,6 +5,7 @@ slots (those belong to the mesh/SSH controller), skips already-serving ports, te
 and from_env assembles it when NAKSHATRA_LIFECYCLE_ROSTER_MODEL is set."""
 import sys
 from pathlib import Path
+import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 import serve_lifecycle as sl
 
@@ -101,6 +102,48 @@ def test_launches_one_local_worker_per_slot():
     assert len(launched) == 2
     assert {p.w["port"] for p in launched} == {5560, 5561}
     assert c._probes == [("127.0.0.1", 5560), ("127.0.0.1", 5561)]
+
+
+def test_remote_package_launch_passes_operator_pinned_signer(monkeypatch):
+    key = "ab" * 32
+    spec = sl.RosterWorkerSpec(
+        model_id="dsr1", hidden_size=4096,
+        package_location="https://models.example/dsr1",
+        package_trusted_pubkey=key, num_layers=32,
+    )
+    worker = {"id": "a", "address": "127.0.0.1", "port": 5560,
+              "layer_range": [0, 32], "mode": "solo"}
+    launched = []
+
+    def fake_popen(cmd, **kwargs):
+        launched.append((cmd, kwargs))
+        return _FakeProc(worker)
+
+    monkeypatch.setattr(sl.subprocess, "Popen", fake_popen)
+    c = sl.RosterWorkerController(spec, plan_fn=lambda: _chain([worker]))
+    c._port_open = staticmethod(lambda host, port: False)
+    c.start()
+
+    cmd = launched[0][0]
+    i = cmd.index("--package-trusted-pubkey")
+    assert cmd[i + 1] == key
+
+
+def test_remote_package_without_operator_pin_refuses_before_launch():
+    spec = sl.RosterWorkerSpec(
+        model_id="dsr1", hidden_size=4096,
+        package_location="https://models.example/dsr1", num_layers=32,
+    )
+    worker = {"id": "a", "address": "127.0.0.1", "port": 5560,
+              "layer_range": [0, 32], "mode": "solo"}
+    launched = []
+    with pytest.raises(sl.ChainRefused, match="NAKSHATRA_PACKAGE_TRUSTED_PUBKEY"):
+        sl.RosterWorkerController(
+            spec, plan_fn=lambda: _chain([worker]),
+            launch_fn=lambda w: launched.append(w),
+        )
+
+    assert launched == []
 
 
 def test_skips_remote_slots():
@@ -225,10 +268,12 @@ def test_from_env_builds_roster_controller(monkeypatch):
     monkeypatch.setenv("NAKSHATRA_LIFECYCLE_ROSTER_HIDDEN_SIZE", "4096")
     monkeypatch.setenv("NAKSHATRA_LIFECYCLE_ROSTER_NUM_LAYERS", "32")
     monkeypatch.setenv("NAKSHATRA_LIFECYCLE_ROSTER_PACKAGE", "/pkg")
+    monkeypatch.setenv("NAKSHATRA_PACKAGE_TRUSTED_PUBKEY", "cd" * 32)
     lc = sl.from_env(log=lambda *_: None)
     assert lc is not None
     assert isinstance(lc.controller, sl.RosterWorkerController)
     assert lc.controller.spec.model_id == "dsr1" and lc.controller.spec.hidden_size == 4096
+    assert lc.controller.spec.package_trusted_pubkey == "cd" * 32
 
 
 if __name__ == "__main__":

@@ -298,14 +298,19 @@ say "venv: $PYV ($("$PYV/bin/python" -c 'import grpc;print("grpcio",grpc.__versi
 cat > "$WORKER_DIR/serve-worker.sh" <<SERVE
 #!/usr/bin/env bash
 # serve-worker.sh <port> <first|middle|last> <layer-start> <layer-end> <package-url> [model-id]
+# Public package URLs also require NKS_PACKAGE_TRUSTED_PUBKEY=<Ed25519 hex>.
 set -euo pipefail
 cd "$SCRIPTS"
+TRUST_ARGS=()
+if [ -n "\${NKS_PACKAGE_TRUSTED_PUBKEY:-}" ]; then
+  TRUST_ARGS=(--package-trusted-pubkey "\$NKS_PACKAGE_TRUSTED_PUBKEY")
+fi
 exec "$PYV/bin/python" worker.py --port "\${1:?port}" --sub-gguf "$WORKER_DIR/slice.gguf" \\
   --package-url "\${5:?package-url}" --mode "\${2:?mode}" --layer-start "\${3:?start}" --layer-end "\${4:?end}" \\
   --model-id "\${6:-model}" --daemon-bin "$DAEMON" --n-ctx 2048 \\
   --gpu-backend "\${NKS_GPU_BACKEND:-$SERVE_BACKEND}" \\
   --n-gpu-layers "\${NKS_NGL:-$SERVE_NGL}" \\
-  --node-id "\$(hostname -s)-\${2}" --no-file-server --skip-sha256
+  --node-id "\$(hostname -s)-\${2}" --no-file-server "\${TRUST_ARGS[@]}"
 SERVE
 chmod +x "$WORKER_DIR/serve-worker.sh"
 

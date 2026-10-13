@@ -20,12 +20,15 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import ipaddress
 import os
+import re
 import shutil
 import sys
 import tempfile
 from pathlib import Path
 from urllib import request as urlrequest
+from urllib.parse import unquote, urlparse
 
 import numpy as np
 from gguf import GGUFReader, GGUFWriter
@@ -42,19 +45,137 @@ _CHUNK = 8 * 1024 * 1024
 
 
 def _is_url(s: str) -> bool:
-    return s.startswith("http://") or s.startswith("https://")
+    return urlparse(s).scheme.lower() in ("http", "https")
 
 
-def _read_manifest(location: str) -> tuple[NakshatraPackage, str]:
+def _is_loopback_url(location: str) -> bool:
+    """Return true only for an explicit HTTP(S) loopback destination.
+
+    Do not resolve arbitrary hostnames here: DNS can change between this check
+    and the fetch.  ``localhost`` and literal loopback addresses are the only
+    network locations admitted by the local-development exception.
+    """
+    parsed = urlparse(location)
+    if parsed.scheme.lower() not in ("http", "https"):
+        return False
+    host = (parsed.hostname or "").rstrip(".").lower()
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _is_unc_path(location: str) -> bool:
+    """Return true for Windows/portable UNC network paths.
+
+    ``urlparse`` gives both ``\\\\server\\share`` and ``//server/share`` an
+    empty scheme, which otherwise makes them look like ordinary local paths.
+    They are remote SMB locations and must never enter the local-development
+    exception.
+    """
+    return location.startswith(("\\\\", "//"))
+
+
+def _is_windows_drive_path(location: str) -> bool:
+    """Recognize drive-qualified Windows paths even when running on POSIX.
+
+    ``urlparse('C:\\models')`` reports ``c`` as a URI scheme.  Package policy
+    is platform-independent, so a local Windows drive must not be mistaken for
+    a remote/unsupported URI when a config is validated on another host.
+    """
+    return bool(re.match(r"^[A-Za-z]:[\\/]", location))
+
+
+def is_local_package_location(location: str) -> bool:
+    """Whether ``location`` is a filesystem path/file URI or loopback URL."""
+    if _is_unc_path(location):
+        return False
+    if _is_windows_drive_path(location):
+        return True
+    parsed = urlparse(location)
+    scheme = parsed.scheme.lower()
+    if scheme in ("http", "https"):
+        return _is_loopback_url(location)
+    if scheme == "file":
+        return (parsed.netloc in ("", "localhost")
+                and not _is_unc_path(unquote(parsed.path)))
+    return not scheme
+
+
+def package_location_requires_trusted_key(location: str) -> bool:
+    """Whether normal (non-local-dev) use needs an operator-pinned signer.
+
+    Every HTTP(S) source is a network fetch, including loopback unless the
+    caller explicitly opted into local development.  Filesystem-looking remote
+    locations (UNC paths and remote ``file://`` URIs) are remote as well.
+    """
+    return _is_url(location) or not is_local_package_location(location)
+
+
+def _filesystem_location(location: str) -> Path:
+    parsed = urlparse(location)
+    if parsed.scheme.lower() != "file":
+        return Path(location)
+    if parsed.netloc not in ("", "localhost"):
+        raise PackageError(
+            f"file package URI must be local, not host {parsed.netloc!r}")
+    return Path(unquote(parsed.path))
+
+
+class _LocalDevRedirectHandler(urlrequest.HTTPRedirectHandler):
+    """Permit redirects in local-dev mode only when they remain loopback."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not _is_loopback_url(newurl):
+            raise PackageError(
+                f"local-development fetch refused redirect to non-loopback URL {newurl!r}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _open_url(url: str, *, timeout: float, local_dev: bool):
+    if local_dev:
+        return urlrequest.build_opener(_LocalDevRedirectHandler()).open(
+            url, timeout=timeout)
+    return urlrequest.urlopen(url, timeout=timeout)
+
+
+def _enforce_source_policy(location: str, *, local_dev: bool,
+                           require_signature: bool,
+                           trusted_pubkeys: set[str] | None) -> bool:
+    """Return the effective signature requirement for a package source.
+
+    Public network packages get their expected artifact hashes from a manifest,
+    so that manifest is trusted only when an operator-pinned Ed25519 key signs
+    it.  Local development may use an unsigned manifest, but only from the local
+    filesystem or an explicit loopback URL.
+    """
+    is_local = is_local_package_location(location)
+    if local_dev and not is_local:
+        raise PackageError(
+            "local-development package fetch refused: source must be a local "
+            "path, file:// URI, localhost, or a literal loopback address")
+    if package_location_requires_trusted_key(location) and not local_dev:
+        if not trusted_pubkeys:
+            raise PackageError(
+                "remote package fetch requires at least one pinned "
+                "--package-trusted-pubkey; an embedded/self-signed key is not "
+                "a trust anchor")
+        return True
+    return require_signature
+
+
+def _read_manifest(location: str, *, local_dev: bool = False) -> tuple[NakshatraPackage, str]:
     """Load a manifest from a dir, a package.json path, or an http(s) URL.
     Returns (package, root) where root is the base to resolve artifacts against."""
     if _is_url(location):
         url = location if location.endswith(".json") else location.rstrip("/") + "/" + MANIFEST_FILENAME
-        with urlrequest.urlopen(url, timeout=30) as resp:
+        with _open_url(url, timeout=30, local_dev=local_dev) as resp:
             text = resp.read().decode("utf-8")
         root = url.rsplit("/", 1)[0] + "/"
     else:
-        p = Path(location)
+        p = _filesystem_location(location)
         if p.is_dir():
             p = p / MANIFEST_FILENAME
         text = p.read_text()
@@ -64,13 +185,13 @@ def _read_manifest(location: str) -> tuple[NakshatraPackage, str]:
     return pkg, root
 
 
-def _fetch_one(root: str, rel_path: str, dest: Path) -> str:
+def _fetch_one(root: str, rel_path: str, dest: Path, *, local_dev: bool = False) -> str:
     """Fetch a single artifact to dest, returning its streamed SHA-256."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     h = hashlib.sha256()
     if _is_url(root):
         url = root.rstrip("/") + "/" + rel_path
-        with urlrequest.urlopen(url, timeout=120) as resp, open(dest, "wb") as out:
+        with _open_url(url, timeout=120, local_dev=local_dev) as resp, open(dest, "wb") as out:
             for chunk in iter(lambda: resp.read(_CHUNK), b""):
                 out.write(chunk)
                 h.update(chunk)
@@ -100,12 +221,19 @@ def _check_signature(pkg: NakshatraPackage, require_signature: bool,
 def fetch_and_assemble(location: str, start: int, end: int, dest_sub_gguf: str,
                        *, require_signature: bool = False,
                        trusted_pubkeys: set[str] | None = None,
+                       local_dev: bool = False,
                        staging_dir: str | None = None) -> str:
     """Fetch fragments for [start,end), verify each, assemble into dest_sub_gguf.
     Returns dest path on success; raises PackageError/RuntimeError on any failure.
     Fail-closed: a single SHA-256 mismatch aborts the whole assembly."""
-    pkg, root = _read_manifest(location)
-    _check_signature(pkg, require_signature, trusted_pubkeys)
+    effective_require_signature = _enforce_source_policy(
+        location,
+        local_dev=local_dev,
+        require_signature=require_signature,
+        trusted_pubkeys=trusted_pubkeys,
+    )
+    pkg, root = _read_manifest(location, local_dev=local_dev)
+    _check_signature(pkg, effective_require_signature, trusted_pubkeys)
 
     needed = pkg.artifacts_for_range(start, end)
     has_token_embd = (start == 0)
@@ -120,7 +248,7 @@ def fetch_and_assemble(location: str, start: int, end: int, dest_sub_gguf: str,
         # 1. fetch + verify every fragment (fail closed)
         for a in needed:
             lp = staging / a.path
-            actual = _fetch_one(root, a.path, lp)
+            actual = _fetch_one(root, a.path, lp, local_dev=local_dev)
             if actual != a.sha256:
                 raise PackageError(
                     f"SHA-256 mismatch for {a.path}: got {actual[:12]}, "
@@ -216,10 +344,13 @@ def main() -> None:
                     help="refuse unsigned manifests")
     ap.add_argument("--trusted-pubkey", action="append", default=None,
                     help="only accept manifests signed by this Ed25519 hex pubkey (repeatable)")
+    ap.add_argument("--local-dev", action="store_true",
+                    help="allow an unsigned package only from a local path/file URI or loopback URL")
     args = ap.parse_args()
     trusted = set(args.trusted_pubkey) if args.trusted_pubkey else None
     fetch_and_assemble(args.location, args.start, args.end, args.dest,
-                       require_signature=args.require_signature, trusted_pubkeys=trusted)
+                       require_signature=args.require_signature, trusted_pubkeys=trusted,
+                       local_dev=args.local_dev)
 
 
 if __name__ == "__main__":

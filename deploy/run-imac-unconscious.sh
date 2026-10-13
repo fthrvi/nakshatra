@@ -28,7 +28,7 @@ launch(){ # host port mode start end node extra_env
     nohup env NAKSHATRA_ACT_QUANT=int8 $extra ~/nakshatra-venv/bin/python ~/nakshatra-scripts/worker.py --port $port --sub-gguf ~/slice-$mode.gguf \
       --package-url ~/pkg --mode $mode --layer-start $s --layer-end $e --model-id dsr1-8b \
       --daemon-bin ~/llama-nak/build/bin/llama-nakshatra-worker --n-ctx 2048 --n-gpu-layers 0 \
-      --node-id $node --no-file-server --skip-sha256 >~/w-$mode.log 2>&1 & echo started $h $mode:$port'" 2>&1 | tail -1
+      --node-id $node --no-file-server --local-dev --skip-sha256 >~/w-$mode.log 2>&1 & echo started $h $mode:$port'" 2>&1 | tail -1
 }
 stop_all(){ for h in "${ALL_HOSTS[@]}"; do ssh -o BatchMode=yes -o ConnectTimeout=8 "$h" 'pkill -f worker.py 2>/dev/null' 2>/dev/null; done; echo "stopped workers on all iMacs"; }
 [ "${1:-}" = "stop" ] && { stop_all; exit 0; }
