@@ -290,3 +290,30 @@ def test_custom_socket_never_manages_the_bundled_sidecar(tmp_path, monkeypatch):
     monkeypatch.setattr(subprocess, "run", lambda args, **kw: None)
     assert nak.main(["p2p", "on", "--socket", str(tmp_path / "s.sock")]) == 0
     assert nak.main(["p2p", "off", "--socket", str(tmp_path / "s.sock")]) == 0
+
+
+@pytest.mark.parametrize("onoff", ["on", "off"])
+def test_p2p_toggle_restarts_an_enabled_worker(tmp_path, monkeypatch, onoff):
+    from network import nak
+    monkeypatch.setenv("NAK_NET_DIR", str(tmp_path))
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "run"))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "home" / ".nakshatra").mkdir(parents=True)
+    (tmp_path / "home" / ".nakshatra" / "worker.env").write_text("PORT=5530\n")
+    actions = []
+    monkeypatch.setattr(nak, "_p2p_installer", lambda _sp, action: None)
+    monkeypatch.setattr(nak, "_enable_p2p_service", lambda _sp: None)
+    monkeypatch.setattr(nak, "_worker_installer", lambda _sp, action: actions.append(action))
+    monkeypatch.setattr(subprocess, "run", lambda args, **kw: None)
+    assert nak.main(["p2p", onoff]) == 0
+    assert actions == ["restart"]
+
+
+def test_p2p_toggle_without_a_worker_restarts_no_worker(tmp_path, monkeypatch):
+    from network import nak
+    monkeypatch.setenv("NAK_NET_DIR", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(nak, "_p2p_installer", lambda _sp, action: None)
+    monkeypatch.setattr(nak, "_worker_installer", lambda _sp, action: pytest.fail("no worker on this node"))
+    monkeypatch.setattr(subprocess, "run", lambda args, **kw: None)
+    assert nak.main(["p2p", "off"]) == 0

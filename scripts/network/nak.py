@@ -636,6 +636,11 @@ def main(argv=None, *, http_post=None) -> int:
                 _enable_p2p_service(_sp)
             f.write_text(str(dial) + "\n")
             _sp.run(["systemctl", "--user", "restart", "nak-net.service"], check=False)
+        # The worker reads the p2p state (its typed endpoint / PeerId) only at startup: restart it so it advertises
+        # the new state instead of a stale endpoint (U4 C1 final review). Only if this node runs a worker.
+        if (Path.home() / ".nakshatra" / "worker.env").is_file():
+            _worker_installer(_sp, "restart")
+            print("worker restarted so it advertises the new p2p state")
         print(f"p2p {'OFF' if a.onoff == 'off' else 'ON via ' + str(dial)}; nak-net restarted")
     elif a.cmd == "ledger":
         r = call(s, {"op": "ledger"})
