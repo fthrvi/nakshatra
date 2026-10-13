@@ -112,33 +112,35 @@ function Test-ConfiguredProcess {
 }
 
 function Test-OwnerGpuProcess {
-    param([int]$ThresholdMiB)
-    $nvidiaSmi = Get-Command 'nvidia-smi.exe' -ErrorAction SilentlyContinue
-    if ($null -eq $nvidiaSmi) { $nvidiaSmi = Get-Command 'nvidia-smi' -ErrorAction SilentlyContinue }
-    if ($null -eq $nvidiaSmi) { return $false }
-
-    $output = & $nvidiaSmi.Source '--query-compute-apps=pid,process_name,used_memory' '--format=csv,noheader' 2>$null
-    if ($LASTEXITCODE -ne 0) { throw 'nvidia-smi failed' }
-    if (-not $output) { return $false }
-    $rows = $output | ConvertFrom-Csv -Header 'pid', 'process_name', 'used_memory'
-    foreach ($row in $rows) {
-        $name = [System.IO.Path]::GetFileNameWithoutExtension($row.process_name).ToLowerInvariant()
-        if ($name -match '^(vmmem|vmmemwsl|wsl.*)$') { continue }
-        $memoryMatch = [regex]::Match([string]$row.used_memory, '^\s*(\d+)\s*(?:MiB)?\s*$')
-        if (-not $memoryMatch.Success) {
-            throw 'Unexpected nvidia-smi memory value'
-        }
-        if ([int]$memoryMatch.Groups[1].Value -gt $ThresholdMiB) { return $true }
+    param([int]$ThresholdMiB, [string[]]$Ignore)
+    # Windows' own per-process GPU counters. On consumer (WDDM) drivers nvidia-smi reports every
+    # process's memory as [N/A] (measured on blackwell, 2026-10-13), so it cannot be the signal.
+    # The WSL VM's worker shows up as vmwp/vmmem; dwm/csrss are the desktop's own baseline.
+    $samples = (Get-Counter '\GPU Process Memory(*)\Dedicated Usage' -ErrorAction Stop).CounterSamples
+    $perProcess = @{}
+    foreach ($sample in $samples) {
+        if ($sample.InstanceName -notmatch 'pid_(\d+)_') { continue }
+        $procId = [int]$Matches[1]
+        $perProcess[$procId] = [double]$perProcess[$procId] + $sample.CookedValue
+    }
+    foreach ($procId in $perProcess.Keys) {
+        if ($perProcess[$procId] / 1MB -le $ThresholdMiB) { continue }
+        $process = Get-Process -Id $procId -ErrorAction SilentlyContinue
+        if ($null -eq $process) { continue }
+        $name = $process.ProcessName.ToLowerInvariant()
+        $ignored = $false
+        foreach ($pattern in $Ignore) { if ($name -like $pattern) { $ignored = $true; break } }
+        if (-not $ignored) { return $true }
     }
     return $false
 }
 
 function Get-OwnerDecision {
-    param([int]$GpuThresholdMiB)
+    param([int]$GpuThresholdMiB, [string[]]$GpuIgnore)
     if ([System.IO.File]::Exists($PauseFile)) { return @{ clear = $false; reason = 'owner paused' } }
     if (Test-ForegroundFullscreen) { return @{ clear = $false; reason = 'foreground fullscreen' } }
     if (Test-ConfiguredProcess) { return @{ clear = $false; reason = 'configured process running' } }
-    if (Test-OwnerGpuProcess -ThresholdMiB $GpuThresholdMiB) {
+    if (Test-OwnerGpuProcess -ThresholdMiB $GpuThresholdMiB -Ignore $GpuIgnore) {
         return @{ clear = $false; reason = 'owner GPU process' }
     }
     return @{ clear = $true; reason = 'owner clear' }
@@ -168,14 +170,21 @@ try {
         $gpuThresholdMiB = [int]$leaseEnvironment['OWNER_GPU_MEMORY_THRESHOLD_MIB']
     }
     if ($gpuThresholdMiB -lt 0) { throw 'OWNER_GPU_MEMORY_THRESHOLD_MIB must not be negative' }
+    # Processes whose GPU memory is never the owner's demand: the WSL VM (our own worker)
+    # and the desktop's baseline. Comma-separated -like patterns; override in owner-lease.env.
+    $gpuIgnore = @('vmwp', 'vmmem*', 'wsl*', 'dwm', 'csrss')
+    if ($leaseEnvironment.ContainsKey('OWNER_GPU_IGNORE') -and $leaseEnvironment['OWNER_GPU_IGNORE']) {
+        $gpuIgnore = $leaseEnvironment['OWNER_GPU_IGNORE'].Split(',') | ForEach-Object { $_.Trim().ToLowerInvariant() }
+    }
 } catch {
+    if ($DryRun) { Write-Output ("setup error: " + $_.Exception.Message) }
     exit 1
 }
 
 do {
     $succeeded = $false
     try {
-        $decision = Get-OwnerDecision -GpuThresholdMiB $gpuThresholdMiB
+        $decision = Get-OwnerDecision -GpuThresholdMiB $gpuThresholdMiB -GpuIgnore $gpuIgnore
         if ($DryRun) {
             $decision | ConvertTo-Json -Compress
         } else {
@@ -184,6 +193,8 @@ do {
         $succeeded = $true
     } catch {
         # Deliberately silent: a missing heartbeat makes the worker release the GPU.
+        # A dry run is an operator diagnosing the sentinel, so it says why (never the token).
+        if ($DryRun) { Write-Output ("decision error: " + $_.Exception.Message) }
     }
     if ($Once) { if ($succeeded) { exit 0 } else { exit 1 } }
     Start-Sleep -Seconds $HeartbeatSeconds

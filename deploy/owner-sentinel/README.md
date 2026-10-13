@@ -24,9 +24,16 @@ It does not decide how the worker unloads; it reports only whether the owner is 
 Run `./uninstall.ps1` to remove the task. It leaves the token and process list in place.
 
 The Windows sentinel reports busy for the pause switch, a non-Explorer foreground window
-covering its monitor, a configured process, or a non-WSL process holding more than
-`OWNER_GPU_MEMORY_THRESHOLD_MIB` (default 1024 MiB) according to `nvidia-smi`. If
-`nvidia-smi` is absent, that signal is skipped.
+covering its monitor, a configured process, or an owner process holding more than
+`OWNER_GPU_MEMORY_THRESHOLD_MIB` (default 1024 MiB) of dedicated GPU memory.
+
+The GPU signal reads Windows' own `\GPU Process Memory(*)\Dedicated Usage` counters. It works for
+any vendor, and it is the only usable per-process source on consumer drivers: there,
+`nvidia-smi --query-compute-apps` reports `[N/A]` for every process (measured on an RTX 5070
+host, 2026-10-13). By default `OWNER_GPU_IGNORE=vmwp,vmmem*,wsl*,dwm,csrss` excludes the WSL VM,
+which is where our own worker's memory appears, and the desktop compositor's baseline (about 1.6 GB on
+that host). Run `owner-sentinel.ps1 -Once -DryRun` to see the decision; a dry run also prints
+why a decision failed. Normal runs stay silent, which the worker treats as stop.
 
 ## Linux desktop
 
