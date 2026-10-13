@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from types import SimpleNamespace
 
 import pytest
 
@@ -153,6 +154,39 @@ def test_gpu_and_network_are_mocked_in_heartbeat_test(tmp_path, monkeypatch):
     assert registrar.heartbeat_once(config, b"x" * 32, "pub") == (204, 1.0, "fake")
 
 
+def test_invalid_health_fields_are_omitted_without_suppressing_heartbeat(
+    tmp_path, monkeypatch, capsys
+):
+    config = _config(tmp_path)
+    config.mesh_compute_state.mkdir()
+    (config.mesh_compute_state / "health.json").write_text(json.dumps({
+        "state": ["healthy"],
+        "reasons": None,
+        "last_crash": "not-an-object",
+        "checked_ts": ["not-a-timestamp"],
+    }))
+    monkeypatch.setattr(registrar, "_gpu", lambda _config: (1.0, 2.0, "fake", "cpu"))
+    monkeypatch.setattr(registrar, "_ollama_inventory", lambda _config: ([], []))
+    monkeypatch.setattr(registrar.na, "build_signed_envelope", lambda *args: ("signed", 1))
+    captured = {}
+
+    class Response:
+        status = 204
+        def __enter__(self): return self
+        def __exit__(self, *args): return None
+
+    def fake_urlopen(request, **kwargs):
+        captured["body"] = json.loads(request.data)
+        return Response()
+
+    monkeypatch.setattr(registrar.urllib.request, "urlopen", fake_urlopen)
+    assert registrar.heartbeat_once(config, b"x" * 32, "pub") == (204, 1.0, "fake")
+    assert captured["body"]["health"] == {}
+    warnings = [line for line in capsys.readouterr().out.splitlines() if "warning:" in line]
+    assert len(warnings) == 1
+    assert "state, reasons, last_crash, checked_ts" in warnings[0]
+
+
 def test_strict_worker_key_load_refuses_missing_malformed_and_open_mode(tmp_path):
     key = tmp_path / "worker.ed25519"
     with pytest.raises(FileNotFoundError, match="missing"):
@@ -168,10 +202,54 @@ def test_strict_worker_key_load_refuses_missing_malformed_and_open_mode(tmp_path
     assert (key.stat().st_mode & 0o777) == 0o644  # loader refused; it did not repair custody
 
 
-def test_strict_worker_key_load_accepts_only_mode_0600(tmp_path):
+@pytest.mark.parametrize("mode", [0o600, 0o400])
+def test_strict_worker_key_load_accepts_owner_only_modes(tmp_path, mode):
     key = tmp_path / "worker.ed25519"
     key.write_bytes(os.urandom(32))
-    key.chmod(0o600)
+    key.chmod(mode)
     private_key, public_key_hex = auth.load_worker_key(key)
     assert private_key == key.read_bytes()
     assert public_key_hex == auth.public_key_hex_from_private(private_key)
+
+
+def test_strict_worker_key_load_reads_the_same_fd_it_validated(tmp_path, monkeypatch):
+    key = tmp_path / "worker.ed25519"
+    replacement = tmp_path / "replacement.ed25519"
+    original_private, _ = auth.generate_keypair()
+    replacement_private, _ = auth.generate_keypair()
+    key.write_bytes(original_private)
+    replacement.write_bytes(replacement_private)
+    key.chmod(0o600)
+    replacement.chmod(0o600)
+    real_fstat = auth.os.fstat
+
+    def swap_path_after_fstat(fd):
+        key_stat = real_fstat(fd)
+        replacement.replace(key)
+        return key_stat
+
+    monkeypatch.setattr(auth.os, "fstat", swap_path_after_fstat)
+    private_key, public_key_hex = auth.load_worker_key(key)
+    assert private_key == original_private
+    assert public_key_hex == auth.public_key_hex_from_private(original_private)
+    assert key.read_bytes() == replacement_private
+
+
+def test_strict_worker_key_load_refuses_symlink_and_wrong_owner(tmp_path, monkeypatch):
+    key = tmp_path / "worker.ed25519"
+    key.write_bytes(os.urandom(32))
+    key.chmod(0o600)
+    symlink = tmp_path / "linked.ed25519"
+    symlink.symlink_to(key)
+    with pytest.raises(OSError):
+        auth.load_worker_key(symlink)
+
+    real_fstat = auth.os.fstat
+
+    def foreign_fstat(fd):
+        key_stat = real_fstat(fd)
+        return SimpleNamespace(st_mode=key_stat.st_mode, st_uid=auth.os.getuid() + 1)
+
+    monkeypatch.setattr(auth.os, "fstat", foreign_fstat)
+    with pytest.raises(PermissionError, match="owned by uid"):
+        auth.load_worker_key(key)

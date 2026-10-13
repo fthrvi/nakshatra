@@ -67,25 +67,36 @@ def load_worker_key(path: Optional[Path] = None) -> Tuple[bytes, str]:
     """Strictly load an existing node key without changing its custody.
 
     Long-running services must not silently create, rotate, or repair node identity.
-    The private seed is accepted only when it is a regular 32-byte file with mode
-    exactly 0600.  In particular, this function never chmods an operator's key.
+    The private seed is accepted only when it is a regular 32-byte file owned by
+    this user with no group or other permissions.  In particular, this function
+    never chmods an operator's key.
     """
     key_path = Path(path) if path is not None else WORKER_KEY_PATH
     try:
-        key_stat = key_path.stat()
+        fd = os.open(key_path, os.O_RDONLY | os.O_NOFOLLOW)
     except FileNotFoundError as exc:
         raise FileNotFoundError(
             f"worker key is missing at {key_path}; create it through the join/setup flow"
         ) from exc
-    if not stat.S_ISREG(key_stat.st_mode):
-        raise ValueError(f"worker key at {key_path} is not a regular file; refusing")
-    mode = stat.S_IMODE(key_stat.st_mode)
-    if mode != 0o600:
-        raise PermissionError(
-            f"worker key at {key_path} has mode {mode:04o}; refusing. "
-            f"Run: chmod 600 {key_path}"
-        )
-    priv = key_path.read_bytes()
+    try:
+        key_stat = os.fstat(fd)
+        if not stat.S_ISREG(key_stat.st_mode):
+            raise ValueError(f"worker key at {key_path} is not a regular file; refusing")
+        if key_stat.st_uid != os.getuid():
+            raise PermissionError(
+                f"worker key at {key_path} is owned by uid {key_stat.st_uid}, "
+                f"not this service's uid {os.getuid()}; refusing"
+            )
+        mode = stat.S_IMODE(key_stat.st_mode)
+        if mode & 0o077:
+            raise PermissionError(
+                f"worker key at {key_path} has mode {mode:04o}; refusing. "
+                f"Run: chmod 600 {key_path}"
+            )
+        with os.fdopen(fd, "rb", closefd=False) as key_file:
+            priv = key_file.read(33)
+    finally:
+        os.close(fd)
     if len(priv) != 32:
         raise ValueError(
             f"worker key at {key_path} is malformed: expected a 32-byte Ed25519 seed"

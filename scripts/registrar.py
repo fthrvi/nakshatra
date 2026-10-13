@@ -229,13 +229,57 @@ def _read_small_json(path: Path, limit: int = 64 * 1024):
 
 
 def _iso_to_unix(value):
-    if isinstance(value, (int, float)):
-        return float(value)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        value = float(value)
+        return value if math.isfinite(value) else None
+    if not isinstance(value, str):
+        return None
     try:
         from datetime import datetime
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
-    except (TypeError, ValueError):
-        return 0.0
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except (OverflowError, ValueError):
+        return None
+
+
+def _health_block(health: dict) -> dict:
+    """Return only well-typed health fields, warning once about bad input."""
+    result = {}
+    invalid = []
+
+    state = health.get("state", "unknown")
+    if isinstance(state, str):
+        result["state"] = state
+    else:
+        invalid.append("state")
+
+    if "reasons" in health:
+        reasons = health["reasons"]
+        if isinstance(reasons, list) and all(isinstance(reason, str) for reason in reasons):
+            result["reasons"] = [reason[:200] for reason in reasons[:10]]
+        else:
+            invalid.append("reasons")
+
+    if "last_crash" in health:
+        last_crash = health["last_crash"]
+        if not isinstance(last_crash, dict):
+            invalid.append("last_crash")
+        elif "ts" in last_crash:
+            last_crash_ts = _iso_to_unix(last_crash["ts"])
+            if last_crash_ts is None:
+                invalid.append("last_crash.ts")
+            else:
+                result["last_crash_ts"] = last_crash_ts
+
+    if "checked_ts" in health:
+        checked_ts = _iso_to_unix(health["checked_ts"])
+        if checked_ts is None:
+            invalid.append("checked_ts")
+        else:
+            result["checked_ts"] = checked_ts
+
+    if invalid:
+        print(f"  warning: ignored invalid health.json fields: {', '.join(invalid)}", flush=True)
+    return result
 
 
 def _mesh_compute_blocks(config: RegistrarConfig) -> dict:
@@ -243,12 +287,7 @@ def _mesh_compute_blocks(config: RegistrarConfig) -> dict:
     result = {"compute": offer if offer is not None else {"offered": False}}
     health = _read_small_json(config.mesh_compute_state / "health.json")
     if health is not None:
-        result["health"] = {
-            "state": health.get("state", "unknown"),
-            "reasons": [str(reason)[:200] for reason in (health.get("reasons") or [])][:10],
-            "last_crash_ts": _iso_to_unix((health.get("last_crash") or {}).get("ts")),
-            "checked_ts": _iso_to_unix(health.get("checked_ts")),
-        }
+        result["health"] = _health_block(health)
     return result
 
 
