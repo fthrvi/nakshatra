@@ -157,8 +157,81 @@ def test_sidecar_forward_socket_and_spki_preservation():
     assert control.sent == f"FORWARD {PEER_ID}\n".encode("ascii")
     assert control.path == "/run/user/1000/nakshatra/p2p.sock"
     assert (resolved["address"], resolved["port"]) == ("127.0.0.1", 43123)
+    assert resolved[cli._CLIENT_DIAL_ADDRESS] == "127.0.0.1:43123"
+    assert resolved[cli._PUSH_DIAL_ADDRESS] is None
     assert resolved["peer_spki_hash"] == SPKI
     assert spec["address"] == ""  # resolution does not rewrite registry identity
+
+
+def test_legacy_hop_resolver_supplies_client_and_colocated_push_addresses():
+    spec = {
+        "id": "legacy-a", "address": "198.51.100.7", "port": 5562,
+        "internal_address": "127.0.0.1",
+    }
+
+    resolved = cli._resolve_activation_endpoint(spec)
+
+    assert resolved[cli._CLIENT_DIAL_ADDRESS] == "198.51.100.7:5562"
+    assert cli._push_dial_address(resolved) == "127.0.0.1:5562"
+    assert resolved is not spec
+
+
+def test_push_rejects_legacy_hop_that_bypassed_the_resolver():
+    with pytest.raises(RuntimeError, match="not passed through"):
+        cli._push_dial_address({
+            "id": "legacy-a", "address": "198.51.100.7", "port": 5562,
+        })
+
+
+def test_typed_hop_can_never_fall_back_to_legacy_address_for_push():
+    spec = {
+        "id": "typed-a", "endpoint": _endpoint(),
+        "peer_spki_hash": SPKI,
+        # A populated legacy address must not evade direct-only policy.
+        "address": "203.0.113.99", "port": 5562,
+    }
+    with patch.object(cli, "_sidecar_forward",
+                      return_value=("127.0.0.1", 43123)):
+        resolved = cli._resolve_activation_endpoint(spec)
+
+    assert resolved[cli._CLIENT_DIAL_ADDRESS] == "127.0.0.1:43123"
+    with pytest.raises(RuntimeError, match="client-relayed streaming"):
+        cli._push_dial_address(resolved)
+
+
+def test_push_gate_identifies_only_typed_downstream_hops():
+    first = cli._resolve_activation_endpoint({
+        "id": "first", "address": "192.0.2.1", "port": 5561,
+    })
+    last_spec = {
+        "id": "last", "endpoint": _endpoint(), "peer_spki_hash": SPKI,
+        "address": "192.0.2.2", "port": 5562,
+    }
+    with patch.object(cli, "_sidecar_forward",
+                      return_value=("127.0.0.1", 43123)):
+        last = cli._resolve_activation_endpoint(last_spec)
+
+    assert cli._typed_push_downstream_workers([
+        (first, object(), object()), (last, object(), object()),
+    ]) == ["last"]
+
+
+def test_push_gate_allows_typed_first_hop_when_downstream_is_legacy():
+    first_spec = {
+        "id": "first", "endpoint": _endpoint(), "peer_spki_hash": SPKI,
+        "address": "192.0.2.1", "port": 5561,
+    }
+    with patch.object(cli, "_sidecar_forward",
+                      return_value=("127.0.0.1", 43123)):
+        first = cli._resolve_activation_endpoint(first_spec)
+    last = cli._resolve_activation_endpoint({
+        "id": "last", "address": "192.0.2.2", "port": 5562,
+    })
+
+    assert cli._typed_push_downstream_workers([
+        (first, object(), object()), (last, object(), object()),
+    ]) == []
+    assert cli._push_dial_address(last) == "192.0.2.2:5562"
 
 
 def test_sidecar_forward_rejects_non_loopback_reply():

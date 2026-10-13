@@ -496,6 +496,8 @@ def _sanitize_spki(raw) -> str:
 
 
 ACTIVATION_ENDPOINT_KIND = "libp2p-activation-v1"
+_CLIENT_DIAL_ADDRESS = "_client_dial_address"
+_PUSH_DIAL_ADDRESS = "_push_dial_address"
 
 
 def _parse_activation_endpoint(raw) -> dict | None:
@@ -584,15 +586,39 @@ def _sidecar_forward(peer_id: str, socket_path: str | None = None,
 
 def _resolve_activation_endpoint(spec: dict, *, socket_path: str | None = None,
                                  tls_mode: str = "auto") -> dict:
-    """Return a channel spec with a typed endpoint resolved to loopback.
+    """Resolve every supported hop to its authoritative dial addresses.
 
-    Activation forwarding never weakens worker authentication: the loopback
-    listener is useful only when the eventual gRPC channel remains pinned to
-    the SPKI projected by the Pillar for that worker.
+    This is the single address-selection boundary for client.py.  Legacy hops
+    retain their configured literal address (and optional co-located push
+    address).  Typed activation hops *only* expose the loopback listener
+    returned by sidecar FORWARD; their legacy address is never copied into a
+    dial field.
+
+    A FORWARD listener belongs to the hub's network namespace, so it cannot be
+    sent to a remote worker as a server-to-server push target.  Such hops have
+    no ``_push_dial_address`` and the capability gate below downgrades the
+    session to client-relayed streaming.  Unary and ordinary streaming still
+    use the returned listener with end-to-end worker authentication: TLS is
+    pinned to the SPKI projected by the Pillar for that worker.
     """
     endpoint = _parse_activation_endpoint(spec.get("endpoint"))
+    resolved = dict(spec)
     if endpoint is None:
-        return spec
+        host = str(spec.get("address") or "").strip()
+        try:
+            port = int(spec.get("port"))
+        except (TypeError, ValueError) as e:
+            raise RuntimeError("legacy activation hop has an invalid port") from e
+        if not host or not 1 <= port <= 65535:
+            raise RuntimeError("legacy activation hop has an invalid literal address")
+        push_host = str(spec.get("internal_address") or host).strip()
+        if not push_host:
+            raise RuntimeError("legacy activation hop has an invalid push address")
+        resolved["address"] = host
+        resolved["port"] = port
+        resolved[_CLIENT_DIAL_ADDRESS] = f"{host}:{port}"
+        resolved[_PUSH_DIAL_ADDRESS] = f"{push_host}:{port}"
+        return resolved
     if tls_mode == "off":
         raise RuntimeError(
             "libp2p activation endpoints require TLS + worker SPKI pinning")
@@ -603,10 +629,31 @@ def _resolve_activation_endpoint(spec: dict, *, socket_path: str | None = None,
         raise RuntimeError(
             "libp2p activation endpoint has no valid registered worker SPKI")
     host, port = _sidecar_forward(endpoint["peer_id"], socket_path=socket_path)
-    resolved = dict(spec)
     resolved["address"] = host
     resolved["port"] = port
+    resolved[_CLIENT_DIAL_ADDRESS] = f"{host}:{port}"
+    resolved[_PUSH_DIAL_ADDRESS] = None
     return resolved
+
+
+def _push_dial_address(resolved_hop: dict) -> str:
+    """Return a resolver-produced server-to-server target or fail closed."""
+    address = resolved_hop.get(_PUSH_DIAL_ADDRESS)
+    if address:
+        return str(address)
+    endpoint = _parse_activation_endpoint(resolved_hop.get("endpoint"))
+    if endpoint is not None:
+        raise RuntimeError(
+            "typed activation endpoint cannot be used as a downstream push "
+            "target; use client-relayed streaming")
+    raise RuntimeError("push hop was not passed through the activation resolver")
+
+
+def _typed_push_downstream_workers(sorted_stubs: list) -> list[str]:
+    """Return typed hops that a push-mode worker, rather than the hub, would dial."""
+    return [w.get("id") or w.get("node_id") or "<unknown>"
+            for w, _, _ in sorted_stubs[1:]
+            if _parse_activation_endpoint(w.get("endpoint")) is not None]
 
 
 def _fetch_registry_peers(registry_url: str, model_id: str = "") -> list[dict]:
@@ -1150,7 +1197,7 @@ def main():
             spec = _spec(w)
             resolved_spec = _resolve_activation_endpoint(
                 spec, tls_mode=args.tls_mode)
-            addr = f"{resolved_spec['address']}:{resolved_spec['port']}"
+            addr = resolved_spec[_CLIENT_DIAL_ADDRESS]
             # 2026-05-26 SPKI: build a TLS-pinned channel when we have a
             # hash, falling back per --tls-mode policy. Same channel is
             # reused by every later Forward / Inference RPC, so fixing
@@ -1182,7 +1229,13 @@ def main():
                 n_embd_local = info.hidden_size
             elif info.hidden_size != n_embd_local:
                 sys.exit(f"hidden_size mismatch across workers: {n_embd_local} vs {info.hidden_size}")
-            stubs_local.append((w, stub, info))
+            # All later paths receive the active, resolver-produced candidate.
+            # In particular, push construction must not rediscover an address
+            # from the outer worker record (which still contains the primary's
+            # legacy address and may no longer even be the active alternate).
+            active_w = dict(w)
+            active_w.update(resolved_spec)
+            stubs_local.append((active_w, stub, info))
         sorted_local = sorted(stubs_local, key=lambda x: x[2].layer_start)
         prev_end = sorted_local[0][2].layer_start
         for w, _, info in sorted_local:
@@ -1234,6 +1287,18 @@ def main():
                   f"(client relays per-step).", file=sys.stderr)
             args.use_streaming_push = False
             # streaming stays on; only push is disabled
+        else:
+            typed_downstream = _typed_push_downstream_workers(sorted_stubs)
+            if typed_downstream:
+                print(
+                    "[chain] WARNING: push requested with typed activation "
+                    f"downstream hops {typed_downstream}; hub-side FORWARD "
+                    "listeners cannot be dialed from remote workers — "
+                    "downgrading session to streaming-only (client relays "
+                    "per-step).",
+                    file=sys.stderr,
+                )
+                args.use_streaming_push = False
 
     # Tokenize
     print(f"[chain] tokenizing locally")
@@ -1344,11 +1409,7 @@ def main():
         if idx + 1 >= len(sorted_stubs):
             return None
         nxt_w = sorted_stubs[idx + 1][0]
-        # CO-LOCATED PUSH: the previous worker forwards to `internal_address` if set
-        # (e.g. 127.0.0.1 when both stages share a box — localhost hop, no WAN), while
-        # the client still reached the worker on its routable `address` at setup.
-        push_addr = nxt_w.get("internal_address") or nxt_w["address"]
-        return pb.NextServer(address=f"{push_addr}:{nxt_w['port']}",
+        return pb.NextServer(address=_push_dial_address(nxt_w),
                               session_id=session_id)
 
     def _chain_from(idx):
@@ -1356,8 +1417,7 @@ def main():
         idx+1, idx+2, ..., last. Empty if idx is the last worker. v0.5 M0.5.3 v2."""
         out = []
         for w, _, _ in sorted_stubs[idx + 1:]:
-            push_addr = w.get("internal_address") or w["address"]   # co-located → localhost hop
-            out.append(pb.NextServer(address=f"{push_addr}:{w['port']}",
+            out.append(pb.NextServer(address=_push_dial_address(w),
                                       session_id=session_id))
         return out
 
