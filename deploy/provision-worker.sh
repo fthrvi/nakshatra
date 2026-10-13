@@ -214,6 +214,14 @@ elif _have nvidia-smi && nvidia-smi -L >/dev/null 2>&1; then
     # CUDA template instantiation is memory-hungry per job; cap parallelism so a 32-thread box
     # does not try 32 of them at once.
     [ "$NPROC" -gt 16 ] && NPROC=16
+    # The thread cap alone is not enough: the mmq template instances need ~3 GB of RAM per nvcc
+    # job, and a 23 GB WSL box at -j16 segfaulted in cicc (exit 139) on mmq-instance-iq2_s.cu
+    # (bro, RTX 5070, 2026-10-13). Cap by available memory too, never below 1.
+    MEM_KB="$(awk '/^MemAvailable:/{print $2}' /proc/meminfo 2>/dev/null)"
+    if [ -n "$MEM_KB" ]; then
+      MEM_JOBS=$(( MEM_KB / (3 * 1024 * 1024) )); [ "$MEM_JOBS" -lt 1 ] && MEM_JOBS=1
+      [ "$NPROC" -gt "$MEM_JOBS" ] && NPROC="$MEM_JOBS"
+    fi
   else
     say "NVIDIA GPU present but no usable nvcc — building CPU-only (set WORKER_INSTALL_CUDA=1 with sudo to fix)"
   fi
@@ -233,6 +241,11 @@ elif _have glslc && [ -n "$(ls /usr/share/vulkan/icd.d/*.json 2>/dev/null)" ]; t
   ACCEL="vulkan"; ACCEL_FLAGS="-DGGML_VULKAN=ON"
 fi
 
+# Operator override for a box whose memory or thermals the heuristics above misjudge.
+case "${WORKER_BUILD_JOBS:-}" in
+  ''|*[!0-9]*|0) ;;
+  *) NPROC="$WORKER_BUILD_JOBS" ;;
+esac
 say "building $BUILD_TARGET (accel=$ACCEL, GGML_METAL=$METAL, -j$NPROC)"
 # shellcheck disable=SC2086
 "$CM" -S "$LLAMA" -B "$LLAMA/build" -DGGML_METAL=$METAL $ACCEL_FLAGS -DLLAMA_CURL=OFF -DCMAKE_BUILD_TYPE=Release >/dev/null
