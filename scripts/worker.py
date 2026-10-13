@@ -1256,10 +1256,21 @@ class IdleDaemonController:
             return False
         with self._spawn_lock:
             with self._state_lock:
+                now = self._now()
                 if (self._closed or self._daemon is None or self._in_flight
-                        or self._owner_session is not None
-                        or self._now() - self._last_step_at < self.idle_unload_s):
+                        or now - self._last_step_at < self.idle_unload_s):
                     return False
+                if self._owner_session is not None:
+                    # A stream that ended without release_session() (client crashed) would
+                    # otherwise pin VRAM forever. Same staleness rule acquire_session() uses
+                    # to reclaim ownership; we are also past the full idle window here.
+                    if now - self._owner_since <= KV_SESSION_STALE_AFTER_S:
+                        return False
+                    sys.stderr.write(
+                        f"[worker] releasing stale KV-session {self._owner_session!r} "
+                        f"(idle {now - self._owner_since:.0f}s) before idle unload\n")
+                    self._owner_session = None
+                    self._owner_since = 0.0
                 daemon = self._daemon
                 self._daemon = None
             try:

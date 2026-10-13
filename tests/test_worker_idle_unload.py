@@ -115,6 +115,20 @@ def test_does_not_unload_with_open_session_or_in_flight_step(tmp_path):
     assert controller.in_flight == 0
 
 
+def test_abandoned_session_does_not_pin_vram_forever(tmp_path):
+    """A client that crashed mid-stream never calls release_session(); once that ownership is
+    stale (the same rule acquire_session() reclaims by) AND the idle window passed, unload."""
+    clock = FakeClock()
+    daemon = FakeDaemon()
+    controller, _ = _controller(tmp_path, clock, lambda: daemon)
+    assert controller.acquire_session("crashed-client") is True
+    clock.advance(worker.KV_SESSION_STALE_AFTER_S - 1)
+    assert controller.unload_if_idle() is False  # idle, but the session is not stale yet
+    clock.advance(2)
+    assert controller.unload_if_idle() is True
+    assert daemon.closed is True and controller.current_owner is None
+
+
 def test_first_concurrent_requests_perform_exactly_one_reload(tmp_path):
     clock = FakeClock()
     daemons = []
