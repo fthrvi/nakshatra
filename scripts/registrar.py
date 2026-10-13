@@ -101,13 +101,40 @@ def load_config(
     )
 
 
+SYSFS_DRM = Path("/sys/class/drm")
+
+
+def _amdgpu_sysfs_cards(root: Optional[Path] = None) -> list:
+    """``[(total_bytes, used_bytes)]`` from the amdgpu driver's sysfs counters.
+
+    Needs no ROCm userspace: the hub has no rocm-smi on PATH, so both the legacy and the
+    release registrar advertised ``unknown 0.0GB`` (2026-10-13). Read-only, and /sys stays
+    readable under the unit's hardening.
+    """
+    cards = []
+    for dev in sorted((root or SYSFS_DRM).glob("card*/device")):
+        try:
+            total = int((dev / "mem_info_vram_total").read_text().strip())
+            used = int((dev / "mem_info_vram_used").read_text().strip())
+        except (OSError, ValueError):
+            continue
+        cards.append((total, used))
+    return cards
+
+
 def _gpu(config: RegistrarConfig):
     """Return ``(free_gb, total_gb, model, backend)`` best-effort."""
     backend = config.gpu_backend
     if not backend:
         backend = "cuda" if shutil.which("nvidia-smi") else (
-            "rocm" if shutil.which("rocm-smi") else ""
+            "rocm" if shutil.which("rocm-smi") or _amdgpu_sysfs_cards() else ""
         )
+    if backend == "rocm" and not shutil.which("rocm-smi"):
+        cards = _amdgpu_sysfs_cards()
+        if cards:
+            total_bytes, used_bytes = max(cards)
+            return ((total_bytes - used_bytes) / (1024**3), total_bytes / (1024**3),
+                    config.gpu_model, "rocm")
     try:
         if backend == "cuda":
             lines = subprocess.check_output(

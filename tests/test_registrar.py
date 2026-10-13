@@ -267,3 +267,21 @@ def test_an_absurd_ollama_size_never_suppresses_the_heartbeat(tmp_path, monkeypa
     offerings, files = registrar._ollama_inventory(config)
     assert [o["model_id"] for o in offerings] == ["huge:1"]
     assert files[0]["size_bytes"] == 0
+
+
+def test_rocm_vram_falls_back_to_amdgpu_sysfs(tmp_path, monkeypatch):
+    """No rocm-smi on PATH (the hub): VRAM comes from the amdgpu sysfs counters, largest card."""
+    gib = 1024 ** 3
+    for name, total, used in (("card1", 20 * gib, 19 * gib), ("card2", 16 * gib, 4 * gib),
+                              ("card3", 2 * gib, 0)):
+        dev = tmp_path / name / "device"
+        dev.mkdir(parents=True)
+        (dev / "mem_info_vram_total").write_text(f"{total}\n")
+        (dev / "mem_info_vram_used").write_text(f"{used}\n")
+    (tmp_path / "card0" / "device").mkdir(parents=True)  # a card without counters is skipped
+    monkeypatch.setattr(registrar, "SYSFS_DRM", tmp_path)
+    monkeypatch.setattr(registrar.shutil, "which", lambda _name: None)
+    config = _config(tmp_path, NKS_GPU_BACKEND="rocm")
+    free, total, _model, backend = registrar._gpu(config)
+    assert backend == "rocm" and round(total) == 20 and round(free) == 1
+
