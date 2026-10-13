@@ -211,6 +211,43 @@
     "port": 11599,
     "max_wait_s": 900
    }
+  },
+  "nakshatra-worker": {
+   "description": "Nakshatra distributed-inference worker",
+   "requires": "{home}/.nakshatra/worker.env",
+   "env_file": "{home}/.nakshatra/worker.env",
+   "after": [
+    "network-online.target"
+   ],
+   "environment": {
+    "NAKSHATRA_AUDIT_PATH": "{home}/.nakshatra/worker/audit.jsonl",
+    "NAKSHATRA_RELEASE_SERVICE": "true"
+   },
+   "exec": [
+    "{python}",
+    "{prefix}/current/nakshatra/scripts/worker_service.py",
+    "--build-json={home}/.nakshatra/worker/build.json",
+    "--engine-base={prefix}/current/nakshatra/engine/BASE",
+    "--worker-root={home}/.nakshatra/worker",
+    "--worker-script={prefix}/current/nakshatra/scripts/worker.py",
+    "--node-key={home}/.nakshatra/keys/worker.ed25519",
+    "--port=${PORT}",
+    "--sub-gguf=${SUB_GGUF}",
+    "--mode=${MODE}",
+    "--layer-start=${LAYER_START}",
+    "--layer-end=${LAYER_END}",
+    "--model-id=${MODEL_ID}"
+   ],
+   "restart": "on-failure",
+   "hardening": true,
+   "read_write_paths": [
+    "{home}/.nakshatra/worker",
+    "{home}/.nakshatra/tls"
+   ],
+   "components": [
+    "nakshatra"
+   ],
+   "profile": "inference"
   }
  },
  "health": [

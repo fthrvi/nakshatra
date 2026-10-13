@@ -55,7 +55,6 @@ from __future__ import annotations
 
 import json
 import re
-import ssl
 import sys
 import threading
 import time
@@ -274,17 +273,19 @@ class PillarPeerKeyResolver:
                 self._priv_key, self._own_node_id, "GET", "/peers", b"",
             )
             headers["Authorization"] = header_val
-        context: Optional[ssl.SSLContext] = None
-        if url.startswith("https://"):
-            context = auth.build_pillar_ssl_context(self._spki_hash)
         req = urlrequest.Request(url, headers=headers, method="GET")
         try:
-            with urlrequest.urlopen(req, timeout=10, context=context) as resp:
+            with auth.open_pillar_url(
+                req, timeout=10, expected_spki_hash=self._spki_hash,
+            ) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
-        except (urlerror.URLError, OSError, TimeoutError, ValueError) as e:
+        except (urlerror.URLError, OSError, TimeoutError, ValueError,
+                auth.PillarSpkiMismatch) as e:
             with self._lock:
                 self._refresh_failures += 1
-            raise
+            raise RuntimeError(
+                auth.redact_url_in_text(e, self._pillar_url)
+            ) from e
 
         new_cache: dict[str, str] = {}
         new_addrs: set[str] = set()

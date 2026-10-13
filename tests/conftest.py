@@ -104,7 +104,10 @@ def _real_state_digest():
         for name in ("agent", "release-url", "name", "direct-port", "p2p-dial")
     }
     paths.update({home / ".sthambha" / "signer" / "person.pub",
-                  home / ".sthambha" / "signer" / "node.pub"})
+                  home / ".sthambha" / "signer" / "node.pub",
+                  home / ".nakshatra" / "worker.env",
+                  home / ".nakshatra" / "inference.env",
+                  home / ".nakshatra" / "worker" / "build.json"})
     for root in (home / ".nakshatra" / "keys", home / ".config" / "nakshatra-sidecar"):
         if root.exists():
             paths.update(p for p in root.rglob("*") if p.is_file() or p.is_symlink())

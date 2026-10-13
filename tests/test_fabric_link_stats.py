@@ -284,7 +284,7 @@ def test_post_signs_with_worker_priv_key_and_owner_tier():
 
     r = _reporter()
     r.register("worker-b", _FakeLink(sent_packets=42))
-    with patch.object(ls.urlrequest, "urlopen", side_effect=fake_urlopen):
+    with patch.object(ls.auth, "open_pillar_url", side_effect=fake_urlopen):
         r._post(r.snapshot())
 
     assert captured["url"] == f"{PILLAR}/fabric/link_stats"
@@ -343,7 +343,7 @@ def test_loop_failure_soft_on_pillar_outage():
             raise _http_error(500, "internal error")
         return _mock_urlopen()
 
-    with patch.object(ls.urlrequest, "urlopen", side_effect=flaky_urlopen):
+    with patch.object(ls.auth, "open_pillar_url", side_effect=flaky_urlopen):
         r.start()
         # Wait for at least 2 ticks.
         deadline = time.time() + 2.0
@@ -368,7 +368,7 @@ def test_loop_skips_when_no_links_registered():
         called["n"] += 1
         return _mock_urlopen()
 
-    with patch.object(ls.urlrequest, "urlopen", side_effect=counting_urlopen):
+    with patch.object(ls.auth, "open_pillar_url", side_effect=counting_urlopen):
         r.start()
         time.sleep(0.25)
         r.stop()

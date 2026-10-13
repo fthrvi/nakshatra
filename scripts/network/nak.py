@@ -21,6 +21,7 @@ import hashlib
 import json
 import os
 import stat
+import re
 import sys
 import time
 from pathlib import Path
@@ -199,6 +200,190 @@ def _enable_p2p_service(_sp) -> None:
         raise
 
 
+WORKER_SERVICE = "nakshatra-worker"
+WORKER_BACKENDS = {"cpu", "cuda", "rocm", "vulkan", "metal"}
+
+
+def _worker_paths() -> tuple[Path, Path, Path]:
+    home = Path.home()
+    root = home / ".nakshatra" / "worker"
+    return root, root / "build.json", home / ".nakshatra" / "worker.env"
+
+
+def _release_engine_tree(prefix: Path) -> tuple[str, dict]:
+    """Verify the installed release, then return its strict engine TREE and manifest."""
+    _verified_release_installer(prefix)
+    try:
+        man = json.loads((prefix / "current" / "manifest.json").read_text())
+        base = (prefix / "current" / "nakshatra" / "engine" / "BASE").read_text()
+    except (OSError, ValueError) as e:
+        raise SystemExit(f"installed release has no readable engine identity: {e}")
+    trees = re.findall(r"^TREE=([0-9a-f]{40})$", base, re.MULTILINE)
+    if len(trees) != 1:
+        raise SystemExit("installed release engine/BASE has no single valid TREE")
+    return trees[0], man
+
+
+def _write_private(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.write(fd, data)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, path)
+
+
+def _worker_build(_sp) -> dict:
+    prefix = Path(os.environ.get("NAK_NODE_PREFIX", Path.home() / ".nakshatra-node"))
+    tree, man = _release_engine_tree(prefix)
+    script = prefix / "current" / "nakshatra" / "deploy" / "provision-worker.sh"
+    if not script.is_file():
+        raise SystemExit(f"installed release is missing {script}")
+    root, record_path, _env_path = _worker_paths()
+    engine_dir = root / "engine"
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    env = dict(os.environ, WORKER_DIR=str(engine_dir), WORKER_BUILD_ONLY="1")
+    markers: dict[str, str] = {}
+    try:
+        proc = _sp.Popen(["bash", str(script)], env=env, stdout=_sp.PIPE, stderr=_sp.STDOUT,
+                         text=True, bufsize=1)
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            print(line, end="", flush=True)
+            if line.startswith("NAK_BUILD_") and "=" in line:
+                key, value = line.strip().split("=", 1)
+                markers[key] = value
+        rc = proc.wait()
+    except OSError as e:
+        raise SystemExit(f"could not run the installed release's worker build: {e}")
+    if rc != 0:
+        raise SystemExit(f"worker build failed with exit status {rc}; build.json was not changed")
+    try:
+        daemon = Path(markers["NAK_BUILD_DAEMON"]).resolve(strict=True)
+        backend = markers["NAK_BUILD_BACKEND"]
+        n_gpu_layers = int(markers["NAK_BUILD_N_GPU_LAYERS"])
+    except (KeyError, OSError, ValueError) as e:
+        raise SystemExit(f"worker build completed without a valid result: {e}")
+    if not daemon.is_relative_to(engine_dir.resolve()) or not daemon.is_file() or not os.access(daemon, os.X_OK):
+        raise SystemExit(f"worker build returned an unsafe or non-executable daemon path: {daemon}")
+    if backend not in WORKER_BACKENDS or n_gpu_layers < 0:
+        raise SystemExit(f"worker build returned invalid runtime flags: backend={backend!r}, n_gpu_layers={n_gpu_layers}")
+    record = {"daemon_bin": str(daemon), "backend": backend, "n_gpu_layers": n_gpu_layers,
+              "engine_tree": tree, "release_version": man.get("version", ""), "built_at": int(time.time())}
+    _write_private(record_path, (json.dumps(record, indent=1, sort_keys=True) + "\n").encode())
+    print(f"worker build ready: {backend}, engine {tree[:12]}…, daemon {daemon}")
+    return record
+
+
+def _worker_installer(_sp, action: str) -> None:
+    prefix = Path(os.environ.get("NAK_NODE_PREFIX", Path.home() / ".nakshatra-node"))
+    installer = _verified_release_installer(prefix)
+    try:
+        _sp.run([sys.executable, str(installer), "--prefix", str(prefix), action, WORKER_SERVICE], check=True)
+    except (OSError, _sp.CalledProcessError) as e:
+        raise SystemExit(f"could not {action} {WORKER_SERVICE}: {e}")
+
+
+def _env_value(value: str, name: str) -> str:
+    if not value or any(c in value for c in "\r\n\0") or any(c.isspace() for c in value):
+        raise SystemExit(f"--{name} must be one non-empty value without whitespace")
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _worker_enable(_sp, args) -> None:
+    root, _record, env_path = _worker_paths()
+    # systemd's ReadWritePaths requires the path to exist before it can construct the sandbox. Keep
+    # both writable roots present even when build.json is missing so the launcher gets to print the
+    # useful refusal and TLS can create this node's certificate on its first start.
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    (Path.home() / ".nakshatra" / "tls").mkdir(parents=True, exist_ok=True, mode=0o700)
+    inference = Path.home() / ".nakshatra" / "inference.env"
+    old_env = env_path.read_bytes() if env_path.exists() else None
+    old_inference = inference.read_bytes() if inference.exists() else None
+    if old_env is None:
+        missing = [name for name in ("model_id", "package_url", "pillar_url", "layers", "port")
+                   if getattr(args, name) in (None, "")]
+        if missing:
+            raise SystemExit("first `nak worker on` needs --model-id, --package-url, "
+                             "--pillar-url, --layers a-b, and --port")
+        match = re.fullmatch(r"(\d+)-(\d+)", args.layers)
+        if not match or int(match.group(1)) >= int(match.group(2)):
+            raise SystemExit("--layers must be a non-empty half-open range a-b (for example 0-16)")
+        start, end = map(int, match.groups())
+        if not 1 <= args.port <= 65535:
+            raise SystemExit("--port must be between 1 and 65535")
+        model = _env_value(args.model_id, "model-id")
+        package = _env_value(args.package_url, "package-url")
+        pillar = _env_value(args.pillar_url, "pillar-url")
+        from worker_service import WorkerServiceError, validate_pillar_transport
+        trusted_pillar_nets = args.trusted_pillar_nets
+        try:
+            _pillar_url, pillar_spki_value = validate_pillar_transport(
+                args.pillar_url, args.pillar_spki or "", trusted_pillar_nets
+            )
+        except WorkerServiceError as e:
+            raise SystemExit(str(e)) from e
+        pillar_spki = _env_value(pillar_spki_value, "pillar-spki") if pillar_spki_value else '""'
+        trusted_nets = _env_value(trusted_pillar_nets, "trusted-pillar-nets")
+        slice_key = hashlib.sha256(
+            f"{args.model_id}\0{args.package_url}\0{start}\0{end}".encode()).hexdigest()[:16]
+        sub_gguf = root / f"slice-{slice_key}-L{start}-{end}.gguf"
+        listen = _env_value(args.listen_address, "listen-address")
+        body = (f"MODEL_ID={model}\nPACKAGE_URL={package}\nPILLAR_URL={pillar}\n"
+                f"PILLAR_SPKI_SHA256={pillar_spki}\nTRUSTED_PILLAR_NETS={trusted_nets}\n"
+                f"MODE={args.mode}\nPORT={args.port}\n"
+                f"LAYER_START={start}\nLAYER_END={end}\nSUB_GGUF={sub_gguf}\n"
+                f"LISTEN={listen}\n")
+        _write_private(env_path, body.encode())
+    if old_inference is None:
+        _write_private(inference, b"# Enables the signed release's hash-locked inference profile.\n")
+    try:
+        _worker_installer(_sp, "enable")
+    except (Exception, SystemExit):
+        # enable may have started the unit before its stability check failed. Ask the same verified
+        # installer to stop it, then restore exactly the opt-in state the operator had beforehand.
+        try:
+            _worker_installer(_sp, "disable")
+        except (Exception, SystemExit):
+            pass
+        if old_env is None:
+            env_path.unlink(missing_ok=True)
+        else:
+            _write_private(env_path, old_env)
+        if old_inference is None:
+            inference.unlink(missing_ok=True)
+        else:
+            _write_private(inference, old_inference)
+        raise
+    print(f"worker ON ({env_path})")
+
+
+def _worker_status(_sp) -> dict:
+    _root, record_path, env_path = _worker_paths()
+    build = None
+    build_state = "missing"
+    if record_path.exists():
+        try:
+            build = json.loads(record_path.read_text())
+            prefix = Path(os.environ.get("NAK_NODE_PREFIX", Path.home() / ".nakshatra-node"))
+            current_tree, _man = _release_engine_tree(prefix)
+            build_state = "ready" if build.get("engine_tree") == current_tree else "stale"
+        except (OSError, ValueError, SystemExit) as e:
+            build_state = f"invalid: {e}"
+    unit = {}
+    for prop, command in (("active", "is-active"), ("enabled", "is-enabled")):
+        try:
+            result = _sp.run(["systemctl", "--user", command, f"{WORKER_SERVICE}.service"],
+                             capture_output=True, text=True, check=False)
+            unit[prop] = (result.stdout or "").strip() or ("yes" if result.returncode == 0 else "no")
+        except OSError as e:
+            unit[prop] = f"unavailable: {e}"
+    return {"configured": env_path.exists(), "build_state": build_state, "build": build, "unit": unit}
+
+
 def _default_p2p_socket() -> Path:
     runtime = os.environ.get("XDG_RUNTIME_DIR")
     if not runtime:
@@ -242,6 +427,27 @@ def main(argv=None, *, http_post=None) -> int:
     p = sub.add_parser("p2p", help="use the local libp2p sidecar for both-NAT direct paths; restarts nak-net")
     p.add_argument("onoff", choices=["on", "off"])
     p.add_argument("--socket", type=Path, help="sidecar UNIX socket (default: $XDG_RUNTIME_DIR/nakshatra/p2p.sock)")
+    p = sub.add_parser("worker", help="build and operate this node's signed-release inference worker")
+    wsub = p.add_subparsers(dest="worker_cmd", required=True)
+    wsub.add_parser("build", help="compile the current release's verified engine for this GPU")
+    q = wsub.add_parser("on", help="configure (once) and enable the worker service")
+    q.add_argument("--model-id")
+    q.add_argument("--package-url")
+    q.add_argument("--pillar-url")
+    q.add_argument("--pillar-spki",
+                   help="pillar TLS public-key SHA-256 pin (required for https://)")
+    q.add_argument("--trusted-pillar-nets", default="10.42.0.0/24",
+                   help="comma-separated encrypted-overlay CIDRs allowed for http:// pillars")
+    q.add_argument("--listen-address", default="[::]",
+                   help="gRPC bind address (default: [::]; use 127.0.0.1 for sidecar-only access)")
+    q.add_argument("--layers", help="half-open layer range a-b (for example 0-16)")
+    q.add_argument("--port", type=int)
+    # worker.py cannot derive its pipeline role from a layer range alone because the CLI does not
+    # know the model's total layer count. Preserve the proven outsider-worker role as the default,
+    # while exposing the worker.py choice for last/middle/whole-model assignments.
+    q.add_argument("--mode", choices=["first", "middle", "last", "solo"], default="first")
+    wsub.add_parser("off", help="disable the worker service and remove its worker.env opt-in")
+    wsub.add_parser("status", help="show the verified build record and systemd unit state")
     p = sub.add_parser("task", help="post / list / claim / submit tasks")
     tsub = p.add_subparsers(dest="tcmd", required=True)
     q = tsub.add_parser("post"); q.add_argument("to"); q.add_argument("title"); q.add_argument("instructions")
@@ -253,7 +459,18 @@ def main(argv=None, *, http_post=None) -> int:
     a = ap.parse_args(argv)
     s = a.sock
 
-    if a.cmd == "status":
+    if a.cmd == "worker":
+        import subprocess as _sp
+        if a.worker_cmd == "build":
+            _worker_build(_sp)
+        elif a.worker_cmd == "on":
+            _worker_enable(_sp, a)
+        elif a.worker_cmd == "off":
+            _worker_installer(_sp, "disable")
+            print("worker OFF")
+        else:
+            print(json.dumps(_worker_status(_sp), indent=1, sort_keys=True))
+    elif a.cmd == "status":
         r = call(s, {"op": "status"})
         print(f"person {r['person'][:16]}…  node {r['node'][:16]}…  custody {r['custody']}  relay {r['relay']}")
         print(f"{len(r['contacts'])} contacts, {r['pending_requests']} pending requests, {r['open_invites']} open invites")

@@ -20,12 +20,16 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import http.client
 import os
 import ssl
 import stat
 import time
 from pathlib import Path
 from typing import Optional, Tuple
+from urllib import error as urlerror
+from urllib import request as urlrequest
+from urllib.parse import urlsplit, urlunsplit
 
 from cryptography import x509
 from cryptography.exceptions import InvalidSignature
@@ -192,6 +196,10 @@ class PillarSpkiMismatch(Exception):
     doesn't match the expected value. Worker should refuse to proceed."""
 
 
+class PillarRedirectRefused(urlerror.HTTPError):
+    """A pillar response attempted to redirect the authenticated request."""
+
+
 def compute_spki_sha256(cert_pem_or_der: bytes) -> str:
     """SPKI SHA-256 hex of a cert (PEM or DER)."""
     if cert_pem_or_der.startswith(b"-----BEGIN"):
@@ -208,11 +216,145 @@ def compute_spki_sha256(cert_pem_or_der: bytes) -> str:
 def verify_pillar_cert_spki(cert_der: bytes, expected_hash: str) -> None:
     """Raises PillarSpkiMismatch if the cert's SPKI doesn't match. Used
     on the TLS connection's server cert via ssock.getpeercert(binary_form=True)."""
-    actual = compute_spki_sha256(cert_der)
+    try:
+        actual = compute_spki_sha256(cert_der)
+    except (TypeError, ValueError) as e:
+        raise PillarSpkiMismatch(
+            "pillar SPKI verification failed: peer certificate is malformed"
+        ) from e
     if actual != expected_hash.lower():
         raise PillarSpkiMismatch(
             f"pillar SPKI mismatch: expected {expected_hash}, got {actual}"
         )
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPS connection that authenticates the peer before HTTP is written."""
+
+    def __init__(self, *args, expected_spki_hash: str, **kwargs):
+        self._expected_spki_hash = expected_spki_hash
+        kwargs.pop("check_hostname", None)
+        super().__init__(*args, **kwargs)
+
+    def connect(self) -> None:
+        super().connect()
+        try:
+            cert_der = self.sock.getpeercert(binary_form=True) if self.sock else None
+            if not cert_der:
+                raise PillarSpkiMismatch(
+                    "pillar SPKI verification failed: TLS peer certificate is empty"
+                )
+            verify_pillar_cert_spki(cert_der, self._expected_spki_hash)
+        except Exception:
+            # A mismatched connection must never remain available for do_open()
+            # to serialize its request line, headers, or body onto the socket.
+            self.close()
+            raise
+
+
+class _PinnedHTTPSHandler(urlrequest.HTTPSHandler):
+    def __init__(self, context: ssl.SSLContext, expected_spki_hash: str):
+        super().__init__(context=context, check_hostname=False)
+        self._expected_spki_hash = expected_spki_hash
+
+    def https_open(self, req):
+        expected = self._expected_spki_hash
+
+        def connection(host, **kwargs):
+            return _PinnedHTTPSConnection(
+                host, expected_spki_hash=expected, **kwargs
+            )
+
+        return self.do_open(
+            connection, req, context=self._context, check_hostname=False
+        )
+
+
+class _NoPillarRedirectHandler(urlrequest.HTTPRedirectHandler):
+    """Never replay pillar credentials or accept authority via redirects."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise PillarRedirectRefused(
+            req.full_url, code, "pillar redirect refused", headers, fp
+        )
+
+
+def open_pillar_url(
+    req,
+    *,
+    timeout: float,
+    expected_spki_hash: Optional[str] = None,
+):
+    """Open one pillar request without redirects and with pre-write pinning.
+
+    For pinned HTTPS, :class:`_PinnedHTTPSConnection` checks the peer SPKI
+    immediately after the TLS handshake.  ``urllib`` cannot send the HTTP
+    request until ``connect()`` returns, so a mismatch exposes no path, query,
+    headers, or body to the peer.  Plain overlay HTTP still uses the same
+    no-redirect policy.
+    """
+    url = req.full_url if isinstance(req, urlrequest.Request) else str(req)
+    scheme = urlsplit(url).scheme.lower()
+    handlers = [_NoPillarRedirectHandler()]
+    if scheme == "https":
+        if not expected_spki_hash:
+            raise PillarSpkiMismatch(
+                "pillar SPKI verification failed: HTTPS pillar has no pin"
+            )
+        context = build_pillar_ssl_context(expected_spki_hash)
+        handlers.append(_PinnedHTTPSHandler(context, expected_spki_hash))
+    opener = urlrequest.build_opener(*handlers)
+    return opener.open(req, timeout=timeout)
+
+
+def redact_url_for_log(location: str) -> str:
+    """Return a URL/path without userinfo, query parameters, or fragments."""
+    try:
+        parts = urlsplit(location)
+        if parts.netloc:
+            host = parts.hostname or ""
+            if ":" in host:
+                host = f"[{host}]"
+            try:
+                port = f":{parts.port}" if parts.port is not None else ""
+            except ValueError:
+                port = ""
+            return urlunsplit((parts.scheme, host + port, parts.path, "", ""))
+        return urlunsplit((parts.scheme, "", parts.path, "", ""))
+    except (TypeError, ValueError):
+        return "<invalid URL>"
+
+
+def redact_url_in_text(value: object, location: str) -> str:
+    """Redact a configured URL if an HTTP exception embeds it in text."""
+    return str(value).replace(location, redact_url_for_log(location))
+
+
+def verify_pillar_response_spki(response, expected_hash: Optional[str]) -> None:
+    """Verify an opened urllib HTTPS response before its body is consumed.
+
+    Legacy response-level verifier retained for callers outside the release
+    worker. New pillar requests must use :func:`open_pillar_url`, which checks
+    the pin before request bytes are sent.
+    """
+    if not expected_hash:
+        return
+    fp = getattr(response, "fp", None)
+    raw = getattr(fp, "raw", None)
+    sock = getattr(raw, "_sock", None)
+    if sock is None:
+        connection = getattr(raw, "_connection", None)
+        sock = getattr(connection, "sock", None)
+    if sock is None or not hasattr(sock, "getpeercert"):
+        raise PillarSpkiMismatch(
+            "pillar SPKI verification failed: TLS peer certificate is unavailable"
+        )
+    cert_der = sock.getpeercert(binary_form=True)
+    if not cert_der:
+        raise PillarSpkiMismatch(
+            "pillar SPKI verification failed: TLS peer certificate is empty"
+        )
+    verify_pillar_cert_spki(cert_der, expected_hash)
 
 
 def build_pillar_ssl_context(
@@ -225,12 +367,11 @@ def build_pillar_ssl_context(
     STHAMBHA_TLS_ALLOW_1_2=true; the pillar must have the matching opt-
     in for the handshake to succeed.
 
-    When ``expected_spki_hash`` is provided, the caller MUST follow the
-    HTTPS handshake with ``verify_pillar_cert_spki(ssock.getpeercert(
-    binary_form=True), expected_spki_hash)``. This context turns off
-    the default hostname-matching + CA verification because the pillar's
-    cert is self-signed; we authenticate by SPKI hash instead, which
-    survives cert rotations as long as the underlying keypair is stable.
+    When ``expected_spki_hash`` is provided, the caller MUST use
+    ``open_pillar_url`` so the pin is checked before HTTP is sent. This
+    context turns off the default hostname-matching + CA verification because
+    the pillar's cert is self-signed; we authenticate by SPKI hash instead,
+    which survives cert rotations as long as the underlying keypair is stable.
 
     When ``expected_spki_hash`` is None, the context still allows
     self-signed certs through but provides no identity check — useful

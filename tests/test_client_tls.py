@@ -22,6 +22,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 import client as cli  # noqa: E402
+import nakshatra_auth as auth  # noqa: E402
 import nakshatra_tls as nt  # noqa: E402
 
 
@@ -195,7 +196,7 @@ def test_fetch_spki_index_extracts_address_keyed_map():
             {"address": "h2:2", "peer_spki_hash": "b" * 64},
         ],
     }
-    with patch.object(cli.urlrequest, "urlopen",
+    with patch.object(auth, "open_pillar_url",
                        return_value=_mock_urlopen(payload)):
         idx = cli._fetch_spki_index("http://pillar")
     assert idx == {"h1:1": "a" * 64, "h2:2": "b" * 64}
@@ -209,7 +210,7 @@ def test_fetch_spki_index_drops_missing_address_or_hash():
             {"address": "h3:3", "peer_spki_hash": "c" * 64},
         ],
     }
-    with patch.object(cli.urlrequest, "urlopen",
+    with patch.object(auth, "open_pillar_url",
                        return_value=_mock_urlopen(payload)):
         idx = cli._fetch_spki_index("http://pillar")
     assert idx == {"h3:3": "c" * 64}
@@ -226,7 +227,7 @@ def test_fetch_spki_index_drops_malformed_hash():
             {"address": "h3:3", "peer_spki_hash": "c" * 64},
         ],
     }
-    with patch.object(cli.urlrequest, "urlopen",
+    with patch.object(auth, "open_pillar_url",
                        return_value=_mock_urlopen(payload)):
         idx = cli._fetch_spki_index("http://pillar")
     assert idx == {"h3:3": "c" * 64}
@@ -236,7 +237,7 @@ def test_fetch_spki_index_network_failure_returns_empty():
     """A failed /peers fetch must not crash the client — log warning,
     return {}, and let --tls-mode policy take over from there. Without
     this, a pillar outage would break every chain that uses --registry."""
-    with patch.object(cli.urlrequest, "urlopen",
+    with patch.object(auth, "open_pillar_url",
                        side_effect=OSError("connection refused")):
         with patch("sys.stderr", new_callable=io.StringIO) as err:
             idx = cli._fetch_spki_index("http://pillar")
@@ -245,7 +246,7 @@ def test_fetch_spki_index_network_failure_returns_empty():
 
 
 def test_fetch_spki_index_empty_payload_returns_empty():
-    with patch.object(cli.urlrequest, "urlopen",
+    with patch.object(auth, "open_pillar_url",
                        return_value=_mock_urlopen({"peers": []})):
         idx = cli._fetch_spki_index("http://pillar")
     assert idx == {}
@@ -268,7 +269,7 @@ def test_try_pillar_chain_reads_inline_spki_hash():
              "peer_spki_hash": "b" * 64},
         ],
     }
-    with patch.object(cli.urlrequest, "urlopen",
+    with patch.object(auth, "open_pillar_url",
                        return_value=_mock_urlopen(payload)):
         workers = cli._try_pillar_chain("http://pillar", "m")
     assert workers is not None
@@ -287,7 +288,7 @@ def test_try_pillar_chain_handles_legacy_pillar_without_hash():
             # No peer_spki_hash field at all.
         ],
     }
-    with patch.object(cli.urlrequest, "urlopen",
+    with patch.object(auth, "open_pillar_url",
                        return_value=_mock_urlopen(payload)):
         workers = cli._try_pillar_chain("http://pillar", "m")
     assert workers is not None
@@ -305,7 +306,7 @@ def test_try_pillar_chain_drops_malformed_inline_hash():
              "peer_spki_hash": "ZZ" * 32},  # non-hex
         ],
     }
-    with patch.object(cli.urlrequest, "urlopen",
+    with patch.object(auth, "open_pillar_url",
                        return_value=_mock_urlopen(payload)):
         workers = cli._try_pillar_chain("http://pillar", "m")
     assert workers is not None
@@ -320,7 +321,7 @@ def test_fetch_spki_index_non_dict_peer_skipped():
     nulls instead of dicts) shouldn't crash the client — skip them."""
     payload = {"peers": [None, "garbage", {"address": "h1:1",
                                             "peer_spki_hash": "a" * 64}]}
-    with patch.object(cli.urlrequest, "urlopen",
+    with patch.object(auth, "open_pillar_url",
                        return_value=_mock_urlopen(payload)):
         idx = cli._fetch_spki_index("http://pillar")
     assert idx == {"h1:1": "a" * 64}

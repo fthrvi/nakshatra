@@ -847,16 +847,22 @@ def _registry_urlopen(url: str, timeout: float = 10):
     When NKS_REGISTRY_KEYID names a registered peer whose key this box holds (nakshatra_auth's worker key), the request
     is signed - over the FULL path INCLUDING the query string, which is what the pillar verifies. Unset = unsigned,
     exactly the old behaviour, so older open pillars still work."""
+    import nakshatra_auth as _na
+    pin = os.environ.get("STHAMBHA_PILLAR_SPKI_SHA256", "").strip() or None
     keyid = os.environ.get("NKS_REGISTRY_KEYID", "").strip()
     if not keyid:
-        return urlrequest.urlopen(url, timeout=timeout)
-    import nakshatra_auth as _na
+        return _na.open_pillar_url(
+            url, timeout=timeout, expected_spki_hash=pin,
+        )
     from urllib.parse import urlsplit
     parts = urlsplit(url)
     signed_path = parts.path + (f"?{parts.query}" if parts.query else "")
     priv, _pub = _na.load_or_create_worker_key()
     header, _ts = _na.build_signed_envelope(priv, keyid, "GET", signed_path, b"")
-    return urlrequest.urlopen(urlrequest.Request(url, headers={"Authorization": header}), timeout=timeout)
+    return _na.open_pillar_url(
+        urlrequest.Request(url, headers={"Authorization": header}),
+        timeout=timeout, expected_spki_hash=pin,
+    )
 
 
 def _try_pillar_chain(registry_url: str, model_id: str) -> list | None:

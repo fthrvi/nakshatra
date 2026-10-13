@@ -412,6 +412,57 @@ def test_p2p_sidecar_service_is_opt_in_and_uses_the_release_binary(tmp_path):
     assert f"ReadWritePaths={Path.home()}/.config" in text
 
 
+def test_worker_service_is_hardened_profiled_and_release_owned(tmp_path):
+    spec = json.loads((Path(__file__).resolve().parent.parent / "release" / "spec.json").read_text())
+    svc = spec["services"]["nakshatra-worker"]
+    assert svc["requires"].endswith("/.nakshatra/worker.env")
+    assert svc["env_file"] == svc["requires"] and svc["profile"] == "inference"
+    assert svc["hardening"] is True
+    assert svc["read_write_paths"] == ["{home}/.nakshatra/worker", "{home}/.nakshatra/tls"]
+    assert svc["environment"]["NAKSHATRA_AUDIT_PATH"] == \
+        "{home}/.nakshatra/worker/audit.jsonl"
+    command = " ".join(svc["exec"])
+    assert "current/nakshatra/scripts/worker_service.py" in command
+    assert "current/nakshatra/scripts/worker.py" in command
+    assert "--build-json=" in command and "--engine-base=" in command and "--node-key=" in command
+    assert "--package-url" not in command and "--pillar-url" not in command
+    assert "${PACKAGE_URL}" not in command and "${PILLAR_URL}" not in command
+    assert "--skip-sha256" not in command
+
+    inst = I.Installer(Path("/nonexistent-prefix"), systemd=False, make_venv=False,
+                       unit_dir=tmp_path / "units")
+    man = {"version": "0.1.0", "components": [{"name": "nakshatra", "pythonpath": "scripts"}],
+           "services": {"nakshatra-worker": svc}, "profiles": {}}
+    text = inst._unit_text(svc, inst._ctx(man), man)
+    assert "ProtectSystem=strict" in text
+    assert f"ReadWritePaths={Path.home()}/.nakshatra/worker" in text
+    assert f"ReadWritePaths={Path.home()}/.nakshatra/tls" in text
+    assert f"Environment=NAKSHATRA_AUDIT_PATH={Path.home()}/.nakshatra/worker/audit.jsonl" in text
+
+
+def test_enabling_a_profiled_service_installs_its_signed_lock(tmp_path, monkeypatch):
+    prefix = tmp_path / "node"
+    current = prefix / "releases" / "1.2.3"
+    (current / "venv" / "bin").mkdir(parents=True)
+    for path in (current / "uv", current / "venv" / "bin" / "python"):
+        path.write_text("")
+    (current / "requirements-inference.lock").write_text("numpy==1.26.4 --hash=sha256:00\n")
+    (prefix / "current").symlink_to("releases/1.2.3")
+    marker = tmp_path / "inference.env"
+    marker.write_text("")
+    man = {"profiles": {"inference": {"requires": str(marker),
+                                        "lock": {"file": "requirements-inference.lock"}}}}
+    calls = []
+    monkeypatch.setattr(I.subprocess, "run", lambda args, **kw: calls.append((args, kw)) or
+                        type("R", (), {"returncode": 0})())
+    inst = I.Installer(prefix, systemd=False, make_venv=True, unit_dir=tmp_path / "units")
+    inst._ensure_service_profile({"profile": "inference"}, man)
+    args, kwargs = calls[0]
+    assert args[:3] == [str(prefix / "current" / "uv"), "pip", "install"]
+    assert "--require-hashes" in args and str(prefix / "current" / "requirements-inference.lock") in args
+    assert kwargs["check"] is True
+
+
 def test_go_sidecar_is_hash_covered_verified_and_installed(env, monkeypatch):
     source = env["a"] / "sidecar"
     source.mkdir()

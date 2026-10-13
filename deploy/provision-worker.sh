@@ -13,6 +13,8 @@
 #                     for this, like the model download; default = the public onboard host).
 #   WORKER_DIR        install root (default ~/.nakshatra-worker)
 #   BUILD_TARGET      cmake target (default llama-nakshatra-worker)
+#   WORKER_BUILD_ONLY build only the daemon and print machine-readable result lines; do not create
+#                     the legacy worker venv/scripts/serve helper (used by `nak worker build`)
 set -euo pipefail
 
 WORKER_DIR="${WORKER_DIR:-$HOME/.nakshatra-worker}"
@@ -239,6 +241,27 @@ DAEMON="$LLAMA/build/bin/$BUILD_TARGET"
 [ -x "$DAEMON" ] || { say "BUILD FAILED - no $DAEMON"; exit 1; }
 say "daemon built: $DAEMON"
 
+# Runtime flags must come from the backend we actually built. Keep this mapping next to the build so
+# the signed-release service and the legacy serve helper cannot silently disagree and run a GPU build
+# on the CPU (the exact failure this script fixed in 2026-09).
+case "$ACCEL" in
+  cuda*)     SERVE_BACKEND=cuda;   SERVE_NGL=99 ;;
+  hip/rocm)  SERVE_BACKEND=rocm;   SERVE_NGL=99 ;;
+  # Metal stays at 0 deliberately: it is numerically broken on the Intel-iMac Radeons in this fleet.
+  metal*)    SERVE_BACKEND=metal;  SERVE_NGL=0  ;;
+  vulkan*)   SERVE_BACKEND=vulkan; SERVE_NGL=99 ;;
+  *)         SERVE_BACKEND=cpu;    SERVE_NGL=0  ;;
+esac
+say "serve flags: --gpu-backend $SERVE_BACKEND --n-gpu-layers $SERVE_NGL   (from ACCEL=$ACCEL)"
+printf 'NAK_BUILD_DAEMON=%s\n' "$DAEMON"
+printf 'NAK_BUILD_BACKEND=%s\n' "$SERVE_BACKEND"
+printf 'NAK_BUILD_N_GPU_LAYERS=%s\n' "$SERVE_NGL"
+
+if [ "${WORKER_BUILD_ONLY:-0}" = 1 ]; then
+  say "build-only requested; release venv/scripts remain authoritative"
+  exit 0
+fi
+
 # 4. python venv + deps. Relax the pb2 grpc version assertion so any grpcio runs the stubs (the
 #    committed stubs hard-pin >=1.81.1 but 1.80 is wire-compatible for our unary/bidi RPCs). -------
 PYV="$WORKER_DIR/venv"
@@ -272,17 +295,6 @@ say "venv: $PYV ($("$PYV/bin/python" -c 'import grpc;print("grpcio",grpc.__versi
 # are 0 and "cpu", so nothing downstream corrected it either. It is the same silent-CPU
 # fallback the comment at the top of this file says was already found once, in a different
 # place — the build learned the answer and then threw it away.
-case "$ACCEL" in
-  cuda*)     SERVE_BACKEND=cuda;   SERVE_NGL=99 ;;
-  hip/rocm)  SERVE_BACKEND=rocm;   SERVE_NGL=99 ;;
-  # ⚠️ Metal stays at 0 DELIBERATELY — it is compiled on macOS but numerically broken on
-  # the Intel-iMac Radeons in this fleet (see the ACCEL comment above). Changing this to
-  # 99 would trade a slow-but-correct worker for a fast wrong one.
-  metal*)    SERVE_BACKEND=metal;  SERVE_NGL=0  ;;
-  vulkan*)   SERVE_BACKEND=vulkan; SERVE_NGL=99 ;;
-  *)         SERVE_BACKEND=cpu;    SERVE_NGL=0  ;;
-esac
-say "serve flags: --gpu-backend $SERVE_BACKEND --n-gpu-layers $SERVE_NGL   (from ACCEL=$ACCEL)"
 cat > "$WORKER_DIR/serve-worker.sh" <<SERVE
 #!/usr/bin/env bash
 # serve-worker.sh <port> <first|middle|last> <layer-start> <layer-end> <package-url> [model-id]

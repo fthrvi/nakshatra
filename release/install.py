@@ -317,13 +317,18 @@ class Installer:
             os.chmod(dst, int(artifact.get("mode", "0644"), 8))
         shutil.copy2(work / man["lock"]["file"], rel / "requirements.lock")
         lock_to_install = rel / "requirements.lock"
+        # Keep every signed profile lock beside the release even when it was not active during the
+        # first install. An opt-in service can be enabled later (notably `nak worker on`) and must be
+        # able to hydrate its declared profile without trusting or fetching a new, unsigned lock.
+        for profile in (man.get("profiles") or {}).values():
+            pf = profile["lock"]["file"]
+            shutil.copy2(work / pf, rel / pf)
         for pname in self.active_profiles(man):
             # The profile lock is the WHOLE environment (base + profile, resolved together): install it
             # instead of the base lock. More than one active profile would need a combined lock; refuse.
             if lock_to_install != rel / "requirements.lock":
                 raise InstallError("more than one release profile is active on this node; not supported yet")
             pf = man["profiles"][pname]["lock"]["file"]
-            shutil.copy2(work / pf, rel / pf)
             lock_to_install = rel / pf
         shutil.copy2(work / "uv", rel / "uv")
         os.chmod(rel / "uv", 0o755)
@@ -495,6 +500,37 @@ class Installer:
         requires = Path(_render(svc["requires"], self._ctx(man)))
         return man, svc, requires
 
+    def _ensure_service_profile(self, svc: dict, man: dict) -> None:
+        """Hydrate the hash-locked release profile an opt-in service declares.
+
+        Services are commonly enabled after the node was installed. Keeping the profile lock in the
+        signed release and installing it here makes that transition immediate while preserving the
+        same --require-hashes boundary as initial installation.
+        """
+        name = svc.get("profile")
+        if not name:
+            return
+        profile = (man.get("profiles") or {}).get(name)
+        if not isinstance(profile, dict):
+            raise InstallError(f"service requires unknown release profile {name!r}")
+        marker = Path(_render(profile["requires"], self._ctx(man)))
+        if not marker.exists():
+            raise InstallError(f"service profile {name!r} is not opted in: required file does not exist: {marker}")
+        if not self.make_venv:
+            return
+        rel = self.prefix / "current"
+        lock = rel / profile["lock"]["file"]
+        uv = rel / "uv"
+        python = rel / "venv" / "bin" / "python"
+        if not lock.is_file() or not uv.is_file() or not python.is_file():
+            raise InstallError(f"current release cannot hydrate profile {name!r}; its lock, uv, or venv is missing")
+        env = dict(os.environ, UV_CACHE_DIR=str(self.prefix / "uv-cache"))
+        try:
+            subprocess.run([str(uv), "pip", "install", "--quiet", "--require-hashes", "-r", str(lock),
+                            "--python", str(python)], check=True, env=env)
+        except subprocess.CalledProcessError as e:
+            raise InstallError(f"could not install release profile {name!r}: uv exited {e.returncode}") from e
+
     @_locked_operation
     def enable(self, name: str) -> str:
         """Write and start exactly one current-release opt-in service."""
@@ -505,6 +541,7 @@ class Installer:
         unit = self.unit_dir / f"{name}.service"
         if unit.exists() and not self._managed_unit(unit):
             raise InstallError(f"refusing to replace operator-owned unit {unit}")
+        self._ensure_service_profile(svc, man)
         unit.write_text(self._unit_text(svc, self._ctx(man), man))
         if subprocess.run(["systemctl", "--user", "daemon-reload"], check=False).returncode != 0:
             raise InstallError("systemctl --user daemon-reload failed; service was not enabled")

@@ -122,7 +122,7 @@ def test_constructor_defaults_capability_node_id():
 
 def test_join_happy_path_parses_response():
     c = _client()
-    with patch.object(fj.urlrequest, "urlopen",
+    with patch.object(fj.auth, "open_pillar_url",
                        return_value=_mock_urlopen(HAPPY_RESPONSE)):
         resp = c.join()
     assert resp.plan_id == "plan-2026-05-26-001"
@@ -150,7 +150,7 @@ def test_join_signs_and_posts_body():
         captured["content_type"] = req.headers.get("Content-type")
         return _mock_urlopen(HAPPY_RESPONSE)
 
-    with patch.object(fj.urlrequest, "urlopen", side_effect=fake_urlopen):
+    with patch.object(fj.auth, "open_pillar_url", side_effect=fake_urlopen):
         c.join()
 
     assert captured["url"] == "http://pillar:7777/join"
@@ -174,7 +174,7 @@ def test_join_404_raises_no_plan_error():
     Boot-policy decision (open question 2) is the caller's — this
     method just surfaces the typed exception."""
     body = '{"error": "no active chain plan covers peer \'a\'"}'
-    with patch.object(fj.urlrequest, "urlopen",
+    with patch.object(fj.auth, "open_pillar_url",
                        side_effect=_http_error(404, body)):
         with pytest.raises(fj.NoPlanError) as ei:
             _client().join()
@@ -186,7 +186,7 @@ def test_join_404_raises_no_plan_error():
 def test_join_403_raises_auth_denied():
     """Per ADR 0006 §7 — /join is OWNER tier. A 403 means the signer
     doesn't match the joining peer's registered key."""
-    with patch.object(fj.urlrequest, "urlopen",
+    with patch.object(fj.auth, "open_pillar_url",
                        side_effect=_http_error(403, "forbidden")):
         with pytest.raises(fj.AuthDenied):
             _client().join()
@@ -195,7 +195,7 @@ def test_join_403_raises_auth_denied():
 def test_join_5xx_raises_generic_join_error():
     """A 500 / 502 / 503 isn't structurally different from 4xx for
     our purposes — caller can't fix it; just surface."""
-    with patch.object(fj.urlrequest, "urlopen",
+    with patch.object(fj.auth, "open_pillar_url",
                        side_effect=_http_error(500, "internal error")):
         with pytest.raises(fj.JoinError):
             _client().join()
@@ -204,7 +204,7 @@ def test_join_5xx_raises_generic_join_error():
 def test_join_transport_failure_raises_join_error():
     """Network unreachable, pillar down, DNS fail — all map to a
     generic JoinError; the message carries the underlying cause."""
-    with patch.object(fj.urlrequest, "urlopen",
+    with patch.object(fj.auth, "open_pillar_url",
                        side_effect=urlerror.URLError("connection refused")):
         with pytest.raises(fj.JoinError, match="transport"):
             _client().join()
@@ -217,7 +217,7 @@ def test_join_body_not_json_raises_join_error():
     cm = MagicMock()
     cm.__enter__.return_value = io.BytesIO(b"<html>not json</html>")
     cm.__exit__.return_value = False
-    with patch.object(fj.urlrequest, "urlopen", return_value=cm):
+    with patch.object(fj.auth, "open_pillar_url", return_value=cm):
         with pytest.raises(fj.JoinError, match="not JSON"):
             _client().join()
 
@@ -228,7 +228,7 @@ def test_join_body_root_not_dict_raises_join_error():
     cm = MagicMock()
     cm.__enter__.return_value = io.BytesIO(b'["not", "an", "object"]')
     cm.__exit__.return_value = False
-    with patch.object(fj.urlrequest, "urlopen", return_value=cm):
+    with patch.object(fj.auth, "open_pillar_url", return_value=cm):
         with pytest.raises(fj.JoinError, match="object"):
             _client().join()
 
@@ -349,7 +349,7 @@ def test_keyring_returns_empty_before_first_join():
 
 def test_keyring_extracts_forward_neighbor_key():
     c = _client()
-    with patch.object(fj.urlrequest, "urlopen",
+    with patch.object(fj.auth, "open_pillar_url",
                        return_value=_mock_urlopen(HAPPY_RESPONSE)):
         c.join()
     assert c.keyring() == {(NODE_A, NODE_B): b"\xAA" * 16}
@@ -366,7 +366,7 @@ def test_keyring_extracts_both_forward_and_backward():
         "key_hex": KEY_HEX_BA,
     }
     c = _client()
-    with patch.object(fj.urlrequest, "urlopen",
+    with patch.object(fj.auth, "open_pillar_url",
                        return_value=_mock_urlopen(response)):
         c.join()
     kr = c.keyring()
@@ -389,7 +389,7 @@ def test_keyring_drops_malformed_hex_silently():
         "key_hex": "not-hex-at-all",
     }
     c = _client()
-    with patch.object(fj.urlrequest, "urlopen",
+    with patch.object(fj.auth, "open_pillar_url",
                        return_value=_mock_urlopen(response)):
         c.join()
     assert c.keyring() == {}
@@ -403,7 +403,7 @@ def test_keyring_drops_wrong_length_key():
         "key_hex": "aa" * 8,                   # 8 bytes — not 16
     }
     c = _client()
-    with patch.object(fj.urlrequest, "urlopen",
+    with patch.object(fj.auth, "open_pillar_url",
                        return_value=_mock_urlopen(response)):
         c.join()
     assert c.keyring() == {}
@@ -430,7 +430,7 @@ def test_sandbox_block_emits_audit_event():
         fake_audit = MagicMock()
         fake_audit.audit = MagicMock()
         with patch.object(fj, "_audit_mod", fake_audit):
-            with patch.object(fj.urlrequest, "urlopen",
+            with patch.object(fj.auth, "open_pillar_url",
                                return_value=_mock_urlopen(response)):
                 c.join()
     # Audit was called with the sandbox event + key fields.
@@ -457,7 +457,7 @@ def test_wireguard_block_emits_audit_event():
         fake_audit = MagicMock()
         fake_audit.audit = MagicMock()
         with patch.object(fj, "_audit_mod", fake_audit):
-            with patch.object(fj.urlrequest, "urlopen",
+            with patch.object(fj.auth, "open_pillar_url",
                                return_value=_mock_urlopen(response)):
                 c.join()
     wg_calls = [
@@ -476,7 +476,7 @@ def test_join_succeeds_when_audit_module_missing():
                             "ram_limit_gb": 1.0}
     c = _client()
     with patch.object(fj, "_AUDIT_AVAILABLE", False):
-        with patch.object(fj.urlrequest, "urlopen",
+        with patch.object(fj.auth, "open_pillar_url",
                            return_value=_mock_urlopen(response)):
             resp = c.join()
     assert resp.sandbox is not None  # parsed even though audit absent
@@ -525,7 +525,7 @@ def test_rekey_loop_fires_on_rotate_at_with_callback():
     cm_first = _mock_urlopen(first_response)
     cm_second = _mock_urlopen(second_response)
 
-    with patch.object(fj.urlrequest, "urlopen",
+    with patch.object(fj.auth, "open_pillar_url",
                        side_effect=[cm_first, cm_second]):
         c.join()
         c.start_rekey_loop()
@@ -545,7 +545,7 @@ def test_start_rekey_loop_is_idempotent():
     c = _client(rekey_slack_s=10_000.0)              # loop sleeps forever
     first_response = dict(HAPPY_RESPONSE)
     first_response["rotate_at"] = time.time() + 10_000.0
-    with patch.object(fj.urlrequest, "urlopen",
+    with patch.object(fj.auth, "open_pillar_url",
                        return_value=_mock_urlopen(first_response)):
         c.join()
         c.start_rekey_loop()

@@ -29,6 +29,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
@@ -104,11 +105,12 @@ def main() -> int:
     sig = auth.sign_request(priv_bytes, "POST", "/peer", body, ts)
     header = f'Sthambha-Ed25519 keyid="{probe_node_id}",sig="{sig}",ts="{ts}"'
     try:
-        with urlrequest.urlopen(urlrequest.Request(
+        pin = os.environ.get("STHAMBHA_PILLAR_SPKI_SHA256", "").strip() or None
+        with auth.open_pillar_url(urlrequest.Request(
                 f"{args.pillar_url.rstrip('/')}/peer", data=body,
                 headers={"Content-Type": "application/json",
                          "Authorization": header},
-                method="POST"), timeout=10) as resp:
+                method="POST"), timeout=10, expected_spki_hash=pin) as resp:
             print(f"[probe] registered probe client: {resp.read().decode()[:120]}")
     except Exception as e:
         print(f"[probe] WARN: could not register probe client: {e}")
@@ -119,6 +121,7 @@ def main() -> int:
         stale_cache_deadline_s=300.0,
         priv_key=priv_bytes,
         own_node_id=probe_node_id,
+        spki_hash=os.environ.get("STHAMBHA_PILLAR_SPKI_SHA256", "").strip() or None,
     )
     print(f"[probe] pillar URL: {args.pillar_url}")
     print(f"[probe] target: {args.target_addr} (node_id={args.target_node_id})")
@@ -225,6 +228,7 @@ def main() -> int:
         stale_cache_deadline_s=0.5,
         priv_key=priv_bytes,
         own_node_id=probe_node_id,
+        spki_hash=os.environ.get("STHAMBHA_PILLAR_SPKI_SHA256", "").strip() or None,
     )
     try:
         stale_resolver.refresh_once()

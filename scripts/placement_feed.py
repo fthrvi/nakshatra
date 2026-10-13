@@ -234,8 +234,12 @@ def fetch_pillar_peers(pillar_url: Optional[str], model_id: Optional[str] = None
     except Exception:
         pass                               # → unsigned fallback
     try:
-        with _rq.urlopen(_rq.Request(base + path, headers=headers, method="GET"),
-                         timeout=timeout) as r:
+        import nakshatra_auth as _na
+        pin = os.environ.get("STHAMBHA_PILLAR_SPKI_SHA256", "").strip() or None
+        with _na.open_pillar_url(
+            _rq.Request(base + path, headers=headers, method="GET"),
+            timeout=timeout, expected_spki_hash=pin,
+        ) as r:
             data = _json.loads(r.read().decode("utf-8"))
         if isinstance(data, dict):
             return data.get("peers") or data.get("online") or []

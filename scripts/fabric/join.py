@@ -36,7 +36,6 @@ from the same ``scripts/`` sys.path entry every other module uses.
 from __future__ import annotations
 
 import json
-import ssl
 import sys
 import threading
 import time
@@ -441,9 +440,6 @@ class JoinClient:
         header_val, _ts = auth.build_signed_envelope(
             self._priv_key, self._node_id, "POST", "/join", body,
         )
-        context: Optional[ssl.SSLContext] = None
-        if url.startswith("https://"):
-            context = auth.build_pillar_ssl_context(self._pillar_spki_hash)
         req = urlrequest.Request(
             url, data=body,
             headers={
@@ -453,8 +449,9 @@ class JoinClient:
             method="POST",
         )
         try:
-            with urlrequest.urlopen(
-                req, timeout=self._request_timeout_s, context=context,
+            with auth.open_pillar_url(
+                req, timeout=self._request_timeout_s,
+                expected_spki_hash=self._pillar_spki_hash,
             ) as http_resp:
                 raw = http_resp.read().decode("utf-8")
         except urlerror.HTTPError as e:
@@ -463,6 +460,7 @@ class JoinClient:
                 err_body = e.read().decode("utf-8", errors="replace")
             except Exception:
                 pass
+            err_body = auth.redact_url_in_text(err_body, self._pillar_url)
             if e.code == 404:
                 raise NoPlanError(err_body or f"/join 404: {e}") from e
             if e.code == 403:
@@ -470,8 +468,12 @@ class JoinClient:
             raise JoinError(
                 f"/join failed: HTTP {e.code} {err_body[:200]}"
             ) from e
-        except (urlerror.URLError, OSError, TimeoutError) as e:
-            raise JoinError(f"/join transport failure: {e}") from e
+        except (urlerror.URLError, OSError, TimeoutError,
+                auth.PillarSpkiMismatch) as e:
+            raise JoinError(
+                "/join transport failure: "
+                f"{auth.redact_url_in_text(e, self._pillar_url)}"
+            ) from e
         try:
             data = json.loads(raw)
         except ValueError as e:
@@ -484,7 +486,8 @@ class JoinClient:
         with self._lock:
             self._current = resp
         _log_blocks(resp,
-                    node_id=self._node_id, pillar_url=self._pillar_url)
+                    node_id=self._node_id,
+                    pillar_url=auth.redact_url_for_log(self._pillar_url))
         return resp
 
     # ── Snapshot accessors ────────────────────────────────────────
@@ -572,7 +575,7 @@ class JoinClient:
                 _emit_audit(
                     "fabric_rekey_failed",
                     node_id=self._node_id,
-                    pillar_url=self._pillar_url,
+                    pillar_url=auth.redact_url_for_log(self._pillar_url),
                     error=str(e),
                 )
                 if self._stop.wait(timeout=30.0):
@@ -581,7 +584,7 @@ class JoinClient:
             _emit_audit(
                 "fabric_rekey_succeeded",
                 node_id=self._node_id,
-                pillar_url=self._pillar_url,
+                pillar_url=auth.redact_url_for_log(self._pillar_url),
                 plan_id=new.plan_id,
                 rotate_at=new.rotate_at,
             )

@@ -494,7 +494,10 @@ class PillarLeaseClient:
             method=method,
             headers={"Content-Type": "application/json", "Authorization": hdr})
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
+            pin = os.environ.get("STHAMBHA_PILLAR_SPKI_SHA256", "").strip() or None
+            with _na.open_pillar_url(
+                req, timeout=timeout, expected_spki_hash=pin,
+            ) as r:
                 return r.status, json.loads(r.read())
         except urllib.error.HTTPError as e:
             try:

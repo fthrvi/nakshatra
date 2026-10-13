@@ -131,7 +131,7 @@ def test_setup_tls_no_pillar_no_warn(monkeypatch, capsys):
     assert "NAKSHATRA_TLS_REQUIRED" not in capsys.readouterr().out
 
 
-def test_setup_tls_module_missing_warns(monkeypatch, capsys):
+def test_setup_tls_module_missing_warns_for_legacy_mode(monkeypatch, capsys):
     """Legacy worker missing the nakshatra_tls module on PYTHONPATH →
     WARN at boot, return TlsBoot(False, ...). Boot continues in
     plaintext (the legacy pre-Phase-2 bringup path)."""
@@ -147,6 +147,50 @@ def test_setup_tls_module_missing_warns(monkeypatch, capsys):
 
     assert boot == w.TlsBoot(False, None, None, "")
     assert "nakshatra_tls import failed" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(("env", "pillar", "release"), [
+    ("true", "", ""),
+    ("", "https://pillar.test", ""),
+    ("false", "", "true"),
+])
+def test_setup_tls_module_missing_refuses_required_startup(
+        monkeypatch, env, pillar, release):
+    monkeypatch.setattr(w, "_TLS_AVAILABLE", False)
+    monkeypatch.setattr(w, "_TLS_IMPORT_ERR",
+                        ImportError("No module named 'nakshatra_tls'"),
+                        raising=False)
+    monkeypatch.setenv("NAKSHATRA_TLS_REQUIRED", env)
+    monkeypatch.setenv("NAKSHATRA_RELEASE_SERVICE", release)
+
+    with pytest.raises(SystemExit) as ei:
+        w.setup_tls(_args(pillar_url=pillar))
+
+    message = str(ei.value)
+    assert "TLS bringup refused" in message
+    assert "nakshatra_tls could not be imported" in message
+
+
+@pytest.mark.parametrize(("env", "pillar", "release"), [
+    ("true", "", ""),
+    ("", "https://pillar.test", ""),
+    ("false", "", "true"),
+])
+def test_grpc_auth_module_missing_refuses_required_startup(
+        monkeypatch, env, pillar, release):
+    monkeypatch.setattr(w, "_GRPC_AUTH_AVAILABLE", False)
+    monkeypatch.setattr(w, "_GRPC_AUTH_IMPORT_ERR",
+                        ImportError("No module named 'nakshatra_grpc_auth'"),
+                        raising=False)
+    monkeypatch.setenv("NAKSHATRA_AUTH_REQUIRED", env)
+    monkeypatch.setenv("NAKSHATRA_RELEASE_SERVICE", release)
+
+    with pytest.raises(SystemExit) as ei:
+        w.resolve_worker_auth_required(_args(pillar_url=pillar))
+
+    message = str(ei.value)
+    assert "gRPC auth bringup refused" in message
+    assert "nakshatra_grpc_auth could not be imported" in message
 
 
 # ── return-shape guarantees ──────────────────────────────────────────

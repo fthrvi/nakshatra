@@ -144,6 +144,31 @@ class TlsBoot(NamedTuple):
     spki_hash: str
 
 
+_TRUE_VALUES = frozenset(("true", "1", "yes"))
+_FALSE_VALUES = frozenset(("false", "0", "no"))
+
+
+def _release_service_running() -> bool:
+    return os.environ.get("NAKSHATRA_RELEASE_SERVICE", "").strip().lower() in _TRUE_VALUES
+
+
+def _security_required_without_module(env_name: str, pillar_url: str) -> bool:
+    """Mirror the TLS/auth modules' policy when one cannot be imported.
+
+    A configured pillar defaults both protections on, while an explicit false
+    remains the legacy Mode-A escape hatch. Signed-release services are never
+    allowed to take that escape hatch.
+    """
+    if _release_service_running():
+        return True
+    value = os.environ.get(env_name, "").strip().lower()
+    if value in _TRUE_VALUES:
+        return True
+    if value in _FALSE_VALUES:
+        return False
+    return bool((pillar_url or "").strip())
+
+
 def setup_tls(args) -> TlsBoot:
     """2026-05-26 drive-by — factor the worker boot's TLS init block
     into one place. Same behavior as the inline block it replaced
@@ -156,9 +181,22 @@ def setup_tls(args) -> TlsBoot:
     Defined here at module scope (not nested in main) so unit tests can
     construct a fake ``args`` namespace and call it directly without
     invoking the rest of the boot pipeline."""
+    if not _TLS_AVAILABLE:
+        if _security_required_without_module(
+            "NAKSHATRA_TLS_REQUIRED", args.pillar_url
+        ):
+            sys.exit(
+                "[worker] TLS bringup refused: TLS is required but "
+                f"nakshatra_tls could not be imported: {_TLS_IMPORT_ERR}"
+            )
+        print(f"[worker] WARN: nakshatra_tls import failed "
+              f"({_TLS_IMPORT_ERR}); gRPC server will be plaintext",
+              flush=True)
+        return TlsBoot(False, None, None, "")
+
     required = (
-        _TLS_AVAILABLE
-        and _wtls.resolve_tls_required(
+        _release_service_running()
+        or _wtls.resolve_tls_required(
             os.environ.get("NAKSHATRA_TLS_REQUIRED"), args.pillar_url
         )
     )
@@ -186,12 +224,34 @@ def setup_tls(args) -> TlsBoot:
               f"peers that pin this worker's SPKI will refuse outbound "
               f"connections (Phase 3 pin check).",
               flush=True)
-        _audit("tls_disabled_with_pillar", pillar_url=args.pillar_url)
-    elif not _TLS_AVAILABLE:
-        print(f"[worker] WARN: nakshatra_tls import failed "
-              f"({_TLS_IMPORT_ERR}); gRPC server will be plaintext",
-              flush=True)
+        _audit("tls_disabled_with_pillar",
+               pillar_url=pillar_location_for_log(args.pillar_url))
     return TlsBoot(False, None, None, "")
+
+
+def resolve_worker_auth_required(args) -> bool:
+    """Resolve inbound gRPC auth policy, refusing a missing implementation.
+
+    Import failures are tolerated only for a genuinely unauthenticated legacy
+    Mode-A worker. A required or signed-release worker must never silently
+    expose its inference surface without request authentication.
+    """
+    if not _GRPC_AUTH_AVAILABLE:
+        if _security_required_without_module(
+            "NAKSHATRA_AUTH_REQUIRED", args.pillar_url
+        ):
+            sys.exit(
+                "[worker] gRPC auth bringup refused: authentication is required "
+                "but nakshatra_grpc_auth could not be imported: "
+                f"{_GRPC_AUTH_IMPORT_ERR}"
+            )
+        return False
+    return (
+        _release_service_running()
+        or _wgrpcauth.resolve_auth_required(
+            os.environ.get("NAKSHATRA_AUTH_REQUIRED"), args.pillar_url
+        )
+    )
 
 
 # Convention: fabric UDP port = gRPC port + this offset, unless the
@@ -215,7 +275,8 @@ def _neighbor_fabric_addr(neighbor_address: str) -> tuple[str, int]:
     return host, int(port_s) + FABRIC_PORT_OFFSET
 
 
-def setup_fabric(args, forward_fn, n_embd, *, worker_priv, node_id):
+def setup_fabric(args, forward_fn, n_embd, *, worker_priv, node_id,
+                 pillar_spki_hash=None):
     """2026-05-29 fabric Phase D — bring up the network-fabric data
     plane for ``--transport=fabric``. Returns ``(backend, join_client)``
     with the FabricBackend's links wired and ready to ``serve()``, or
@@ -250,6 +311,7 @@ def setup_fabric(args, forward_fn, n_embd, *, worker_priv, node_id):
     }
     jc = JoinClient(
         args.pillar_url, node_id, worker_priv, capability,
+        pillar_spki_hash=pillar_spki_hash,
     )
     try:
         resp = jc.join()
@@ -2118,28 +2180,16 @@ def register_with_pillar(pillar_url: str, payload: dict, log_prefix: str = "[wor
         req = urlrequest.Request(
             full_url, data=body_bytes, headers=headers, method="POST",
         )
-        context = None
         if full_url.startswith("https://"):
             if not _AUTH_AVAILABLE:
                 print(f"{log_prefix} HTTPS pillar URL but auth module missing; "
                       f"refusing connection", flush=True)
                 return False
-            context = _wauth.build_pillar_ssl_context(spki_hash)
-        with urlrequest.urlopen(req, timeout=5, context=context) as resp:
-            # SPKI pinning happens *after* the handshake. If the pillar
-            # served a cert whose SPKI doesn't match expected_hash, the
-            # connection still succeeded at TCP/TLS but we refuse before
-            # consuming the response.
-            if (full_url.startswith("https://") and spki_hash
-                    and _AUTH_AVAILABLE):
-                sock = resp.fp.raw._sock if hasattr(resp.fp, "raw") else None
-                if sock is not None and hasattr(sock, "getpeercert"):
-                    der = sock.getpeercert(binary_form=True)
-                    try:
-                        _wauth.verify_pillar_cert_spki(der, spki_hash)
-                    except _wauth.PillarSpkiMismatch as e:
-                        print(f"{log_prefix} REFUSED: {e}", flush=True)
-                        return False
+        if not _AUTH_AVAILABLE:
+            raise RuntimeError("pillar auth module unavailable")
+        with _wauth.open_pillar_url(
+            req, timeout=5, expected_spki_hash=spki_hash,
+        ) as resp:
             body = resp.read().decode()
             # Phase I8: stash the fresh nonce for the next heartbeat.
             # Phase J1: when we SENT an attestation but the pillar
@@ -2177,15 +2227,20 @@ def register_with_pillar(pillar_url: str, payload: dict, log_prefix: str = "[wor
                               f"attestation_fingerprint_too_long.",
                               flush=True)
                         _audit("attestation_observed_false",
-                               url=pillar_url, log_prefix=log_prefix)
+                               url=pillar_location_for_log(pillar_url),
+                               log_prefix=log_prefix)
             except json.JSONDecodeError:
                 pass
             print(f"{log_prefix} registered with pillar: {body}", flush=True)
-            _audit("register_success", url=pillar_url, log_prefix=log_prefix)
+            _audit("register_success", url=pillar_location_for_log(pillar_url),
+                   log_prefix=log_prefix)
             return True
     except (urlerror.URLError, OSError, TimeoutError) as e:
-        print(f"{log_prefix} pillar registration failed ({pillar_url}): {e}", flush=True)
-        _audit("register_failed", url=pillar_url, error=str(e),
+        safe_pillar = pillar_location_for_log(pillar_url)
+        safe_error = _pillar_error_for_log(e, pillar_url)
+        print(f"{log_prefix} pillar registration failed ({safe_pillar}): {safe_error}",
+              flush=True)
+        _audit("register_failed", url=safe_pillar, error=safe_error,
                log_prefix=log_prefix)
         return False
 
@@ -2899,6 +2954,32 @@ def start_file_server(serving_dir: str, port: int):
     print(f"[fileserver] slicer: {slicer_status}", flush=True)
 
 
+def package_location_for_log(location: str) -> str:
+    """Return a package location safe for journals and audit records.
+
+    URL userinfo, query parameters, and fragments may carry credentials. Keep
+    only scheme, host/port, and path. Local package paths are returned without
+    query/fragment-shaped suffixes for the same conservative logging rule.
+    """
+    if _AUTH_AVAILABLE:
+        return _wauth.redact_url_for_log(location)
+    return "<redacted package location>"
+
+
+def pillar_location_for_log(location: str) -> str:
+    """Return a pillar URL safe for journals and audit records."""
+    if _AUTH_AVAILABLE:
+        return _wauth.redact_url_for_log(location)
+    return "<redacted pillar URL>"
+
+
+def _pillar_error_for_log(error: object, pillar_url: str) -> str:
+    """Remove the configured credential-bearing pillar base from an error."""
+    if _AUTH_AVAILABLE:
+        return _wauth.redact_url_in_text(error, pillar_url)
+    return "<redacted pillar error>"
+
+
 _CONTROL_CAPS_CACHE: Optional[list] = None
 
 
@@ -2932,7 +3013,7 @@ def provision_from_package(package_url: str, layer_start: int, layer_end: int,
     range — a freshly discovered node can self-provision any range from a package
     (docs/v1.0-discovery-and-distribution.md §5.3). `package_url` is a local dir,
     a package.json path, or an http(s) base."""
-    _audit("package_provision_started", package_url=package_url,
+    _audit("package_provision_started", package_url=package_location_for_log(package_url),
            layer_start=layer_start, layer_end=layer_end, dest_path=dest_path)
     from packaging.fetch_package import fetch_and_assemble
     fetch_and_assemble(package_url, layer_start, layer_end, dest_path,
@@ -2945,7 +3026,8 @@ def provision_from_package(package_url: str, layer_start: int, layer_end: int,
 def fetch_sub_gguf_from_peer(pillar_url: str, model_id: str,
                               layer_start: int, layer_end: int,
                               dest_path: str,
-                              own_node_id: str = "") -> str:
+                              own_node_id: str = "",
+                              spki_hash: Optional[str] = None) -> str:
     """Query Sthambha for a peer with the requested file and download it.
 
     Returns the local path on success; raises RuntimeError on failure.
@@ -2961,10 +3043,17 @@ def fetch_sub_gguf_from_peer(pillar_url: str, model_id: str,
     # 1. Ask the pillar for the file index
     files_url = f"{pillar_url.rstrip('/')}/files?model={model_id}"
     try:
-        with urlrequest.urlopen(files_url, timeout=10) as resp:
+        if not _AUTH_AVAILABLE:
+            raise RuntimeError("pillar requests require nakshatra_auth")
+        with _wauth.open_pillar_url(
+            files_url, timeout=10, expected_spki_hash=spki_hash,
+        ) as resp:
             data = json.loads(resp.read())
     except Exception as e:
-        raise RuntimeError(f"could not query pillar at {files_url}: {e}")
+        safe_url = f"{pillar_location_for_log(pillar_url).rstrip('/')}/files"
+        raise RuntimeError(
+            f"could not query pillar at {safe_url}: {_pillar_error_for_log(e, pillar_url)}"
+        )
 
     # 2. Find candidate online peers holding (model_id, layer_start, layer_end)
     candidates = [
@@ -3254,9 +3343,24 @@ def sha256_of_file(path: str) -> str:
     return h.hexdigest()
 
 
+def grpc_listen_endpoint(address: str, port: int) -> str:
+    """Return a gRPC host:port endpoint, bracketing IPv6 literals once."""
+    address = address.strip()
+    if address.startswith("[") and address.endswith("]"):
+        return f"{address}:{port}"
+    if ":" in address:
+        return f"[{address}]:{port}"
+    return f"{address}:{port}"
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=5500)
+    ap.add_argument("--listen-address", type=str,
+                    default=(os.environ.get("NAKSHATRA_LISTEN_ADDRESS", "").strip()
+                             or "[::]"),
+                    help="gRPC bind address (default: [::]; may also be set with "
+                         "NAKSHATRA_LISTEN_ADDRESS).")
     ap.add_argument("--sub-gguf", type=str, required=True)
     ap.add_argument("--mode", type=str, choices=["first", "middle", "last", "solo"], required=True)
     # 2026-05-29 fabric Phase D — transport selector. Default grpc keeps
@@ -3285,7 +3389,8 @@ def main():
                     help="threads for llama_decode; 0 = let llama.cpp pick a default")
     ap.add_argument("--n-gpu-layers", type=int, default=0,
                     help="layers to offload to GPU; 0 = CPU only, 99 = all on GPU")
-    ap.add_argument("--pillar-url", type=str, default="",
+    ap.add_argument("--pillar-url", type=str,
+                    default=os.environ.get("NAKSHATRA_PILLAR_URL", ""),
                     help="Sthambha pillar URL (e.g. http://node-pi:7777). If set, "
                          "worker registers self + sends heartbeat every 30s.")
     ap.add_argument("--public-address", type=str, default="",
@@ -3339,7 +3444,8 @@ def main():
     ap.add_argument("--no-cache-scan", action="store_true",
                     help="Disable cache-dir scan; only advertise --sub-gguf.")
     # v1.0 §5 (P2) — provision from a content-addressed layer package.
-    ap.add_argument("--package-url", type=str, default="",
+    ap.add_argument("--package-url", type=str,
+                    default=os.environ.get("NAKSHATRA_PACKAGE_URL", ""),
                     help="v1.0 §5: if --sub-gguf is missing, provision the assigned "
                          "[layer-start,layer-end) range from a layer package (a dir, "
                          "package.json path, or http(s) base) — fetch only this "
@@ -3364,17 +3470,32 @@ def main():
                     help="Idempotency cache per-session TTL in seconds (default 60).")
     args = ap.parse_args()
 
+    try:
+        spki_hash = validate_spki_hash_env(
+            os.environ.get("STHAMBHA_PILLAR_SPKI_SHA256")
+        )
+    except ValueError as e:
+        sys.exit(f"[worker] startup refused: {e}")
+    if args.pillar_url.startswith("https://") and not spki_hash:
+        if _release_service_running():
+            sys.exit("[worker] startup refused: signed-release HTTPS pillar has no SPKI pin")
+        print(f"[worker] WARN: HTTPS pillar URL but no SPKI hash pinned "
+              f"via STHAMBHA_PILLAR_SPKI_SHA256; cert identity NOT verified",
+              flush=True)
+
     # Phase D5 (2026-05-20): initialise the audit log singleton early so
     # every event in main() (start, fetch, slice, register, auth fail)
     # has a place to land. Failure-soft: missing directory or permission
     # error leaves the worker running without forensic trail.
     if _AUDIT_AVAILABLE:
         try:
-            _waudit.init_audit()
+            audit_path = os.environ.get("NAKSHATRA_AUDIT_PATH", "").strip()
+            _waudit.init_audit(Path(audit_path) if audit_path else None)
             _audit("worker_started",
                    model_id=args.model_id, mode=args.mode,
                    layer_start=args.layer_start, layer_end=args.layer_end,
-                   port=args.port, pillar_url=args.pillar_url)
+                   port=args.port,
+                   pillar_url=pillar_location_for_log(args.pillar_url))
         except Exception as e:
             print(f"[worker] audit init failed (continuing without forensic log): {e}",
                   flush=True)
@@ -3384,8 +3505,10 @@ def main():
     # without manual scp.
     if not os.path.exists(args.sub_gguf):
         if args.package_url:
+            package_log_location = package_location_for_log(args.package_url)
             print(f"[worker] sub-gguf missing at {args.sub_gguf}; provisioning layers "
-                  f"[{args.layer_start},{args.layer_end}) from package {args.package_url}",
+                  f"[{args.layer_start},{args.layer_end}) from package "
+                  f"{package_log_location}",
                   flush=True)
             trusted = (set(args.package_trusted_pubkey)
                        if args.package_trusted_pubkey else None)
@@ -3396,7 +3519,8 @@ def main():
                     trusted_pubkeys=trusted,
                 )
             except Exception as e:
-                sys.exit(f"[worker] package provisioning failed: {e}")
+                detail = str(e).replace(args.package_url, package_log_location)
+                sys.exit(f"[worker] package provisioning failed: {detail}")
         elif args.auto_fetch and args.pillar_url:
             print(f"[worker] sub-gguf missing at {args.sub_gguf}; auto-fetching from peer", flush=True)
             own_node_id = args.node_id or f"{socket.gethostname()}-{args.port}"
@@ -3406,6 +3530,7 @@ def main():
                     args.layer_start, args.layer_end,
                     args.sub_gguf,
                     own_node_id=own_node_id,
+                    spki_hash=spki_hash,
                 )
             except Exception as e:
                 sys.exit(f"[worker] auto-fetch failed: {e}")
@@ -3438,12 +3563,7 @@ def main():
     # Phase B (2026-05-20): resolve NAKSHATRA_AUTH_REQUIRED + decide
     # whether to refuse SSRF pushes to unregistered peers. The peer
     # resolver itself is constructed below once we know the worker key.
-    auth_required = (
-        _GRPC_AUTH_AVAILABLE
-        and _wgrpcauth.resolve_auth_required(
-            os.environ.get("NAKSHATRA_AUTH_REQUIRED"), args.pillar_url
-        )
-    )
+    auth_required = resolve_worker_auth_required(args)
     refuse_unregistered_peers = (
         os.environ.get("NAKSHATRA_REFUSE_UNREGISTERED_PEERS", "true")
         .strip().lower() in ("true", "1", "yes")
@@ -3472,15 +3592,16 @@ def main():
     pb_grpc.add_NakshatraServicer_to_server(servicer, server)
     # 2026-05-21 SPKI Phase 2.4: bind TLS port when cert was prepared
     # above; otherwise legacy insecure path.
+    listen_endpoint = grpc_listen_endpoint(args.listen_address, args.port)
     if tls.required and tls.cert_path and tls.key_path:
         creds = _wtls.build_grpc_server_credentials(
             tls.cert_path, tls.key_path)
-        server.add_secure_port(f"[::]:{args.port}", creds)
+        server.add_secure_port(listen_endpoint, creds)
         listen_proto = "TLS"
     else:
-        server.add_insecure_port(f"[::]:{args.port}")
+        server.add_insecure_port(listen_endpoint)
         listen_proto = "plaintext"
-    print(f"[worker] M5 listening on :{args.port} ({listen_proto})  "
+    print(f"[worker] M5 listening on {listen_endpoint} ({listen_proto})  "
           f"mode={args.mode}  layers=[{args.layer_start},{args.layer_end})  "
           f"model={args.model_id}", flush=True)
     server.start()
@@ -3749,20 +3870,6 @@ def main():
             print(f"[worker] WARN: nakshatra_auth import failed "
                   f"({_AUTH_IMPORT_ERR}); requests will go unsigned",
                   flush=True)
-        # Phase F3: env-pinned pillar SPKI for HTTPS connections.
-        # Phase A4 (2026-05-20): strict length + hex validation. Catches
-        # the silent-disable-by-typo case where an operator sets the env
-        # to "abc" and pinning silently turns off.
-        try:
-            spki_hash = validate_spki_hash_env(
-                os.environ.get("STHAMBHA_PILLAR_SPKI_SHA256")
-            )
-        except ValueError as e:
-            sys.exit(f"[worker] startup refused: {e}")
-        if args.pillar_url.startswith("https://") and not spki_hash:
-            print(f"[worker] WARN: HTTPS pillar URL but no SPKI hash pinned "
-                  f"via STHAMBHA_PILLAR_SPKI_SHA256; cert identity NOT verified",
-                  flush=True)
         # Phase A5 (2026-05-20): refuse-unsigned startup gate. Operators
         # opt in with STHAMBHA_REFUSE_UNSIGNED=true; default keeps the
         # legacy lenient bringup (worker WARNs and proceeds).
@@ -3875,7 +3982,8 @@ def main():
             daemon=True,
         )
         heartbeat_thread.start()
-        print(f"[worker] heartbeat → {args.pillar_url} every 30s as {node_id} @ {public_addr}"
+        print(f"[worker] heartbeat → {pillar_location_for_log(args.pillar_url)} "
+              f"every 30s as {node_id} @ {public_addr}"
               + (f" (signed; pubkey={worker_pub_hex[:16]}…)" if worker_pub_hex else " (UNSIGNED)"),
               flush=True)
 
@@ -3889,6 +3997,7 @@ def main():
         fabric_backend, _fabric_join = setup_fabric(
             args, servicer._run_forward, servicer.n_embd,
             worker_priv=worker_priv, node_id=node_id,
+            pillar_spki_hash=spki_hash,
         )
         if fabric_backend.inbound_link is not None:
             fabric_thread = threading.Thread(

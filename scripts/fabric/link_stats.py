@@ -40,7 +40,6 @@ from __future__ import annotations
 
 import json
 import os
-import ssl
 import sys
 import threading
 import time
@@ -286,20 +285,21 @@ class LinkStatsReporter:
                 self._post(body)
                 self.push_count += 1
             except Exception as e:
+                safe_error = auth.redact_url_in_text(e, self._pillar_url)
                 # Failure-soft — pillar outage shouldn't crash the
                 # worker. Log + count + carry on; next tick may
                 # succeed.
                 self.push_failures += 1
                 sys.stderr.write(
-                    f"[fabric/link_stats] push failed: {e}\n"
+                    f"[fabric/link_stats] push failed: {safe_error}\n"
                 )
                 if _AUDIT_AVAILABLE:
                     try:
                         _audit_mod.audit(
                             "fabric_link_stats_push_failed",
                             peer_id=self._peer_id,
-                            pillar_url=self._pillar_url,
-                            error=str(e),
+                            pillar_url=auth.redact_url_for_log(self._pillar_url),
+                            error=safe_error,
                         )
                     except Exception:
                         pass
@@ -316,9 +316,6 @@ class LinkStatsReporter:
             self._priv_key, self._peer_id,
             "POST", "/fabric/link_stats", body_bytes,
         )
-        context: Optional[ssl.SSLContext] = None
-        if url.startswith("https://"):
-            context = auth.build_pillar_ssl_context(self._pillar_spki_hash)
         req = urlrequest.Request(
             url, data=body_bytes,
             headers={
@@ -327,8 +324,9 @@ class LinkStatsReporter:
             },
             method="POST",
         )
-        with urlrequest.urlopen(
-            req, timeout=self._request_timeout_s, context=context,
+        with auth.open_pillar_url(
+            req, timeout=self._request_timeout_s,
+            expected_spki_hash=self._pillar_spki_hash,
         ) as resp:
             # Drain the body so the connection can be reused; we
             # don't need to inspect it (a non-2xx raises HTTPError

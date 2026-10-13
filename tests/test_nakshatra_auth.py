@@ -7,9 +7,16 @@ cryptography installed.
 """
 from __future__ import annotations
 
+import socket
+import ssl
 import sys
+import threading
 import time
+import types
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib import error as urlerror
+from urllib import request as urlrequest
 
 import pytest
 
@@ -87,7 +94,7 @@ def test_build_signed_envelope_produces_valid_header():
 
 # ── SPKI pinning ─────────────────────────────────────────────────────
 
-def _make_self_signed_cert_der():
+def _make_self_signed_cert_der(return_key=False):
     """Build a tiny self-signed cert in-memory so we don't need the
     Sthambha repo for a fixture."""
     from cryptography import x509
@@ -108,7 +115,15 @@ def _make_self_signed_cert_der():
         .not_valid_before(now).not_valid_after(now + dt.timedelta(days=1))
         .sign(private_key=priv, algorithm=hashes.SHA256())
     )
-    return cert.public_bytes(encoding=serialization.Encoding.DER)
+    der = cert.public_bytes(encoding=serialization.Encoding.DER)
+    if return_key:
+        key_pem = priv.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        return der, key_pem
+    return der
 
 
 def test_spki_sha256_is_stable():
@@ -135,3 +150,119 @@ def test_verify_pillar_cert_spki_case_insensitive():
     der = _make_self_signed_cert_der()
     h = auth.compute_spki_sha256(der).upper()
     auth.verify_pillar_cert_spki(der, h)  # uppercase still works
+
+
+def test_verify_pillar_response_spki_checks_connected_socket_before_body():
+    der = _make_self_signed_cert_der()
+    expected = auth.compute_spki_sha256(der)
+    sock = types.SimpleNamespace(getpeercert=lambda binary_form=False: der if binary_form else {})
+    response = types.SimpleNamespace(
+        fp=types.SimpleNamespace(raw=types.SimpleNamespace(_sock=sock))
+    )
+
+    auth.verify_pillar_response_spki(response, expected)
+    with pytest.raises(auth.PillarSpkiMismatch):
+        auth.verify_pillar_response_spki(response, "0" * 64)
+
+
+def test_verify_pillar_response_spki_refuses_when_socket_is_hidden():
+    response = types.SimpleNamespace(fp=types.SimpleNamespace(raw=object()))
+    with pytest.raises(auth.PillarSpkiMismatch, match="certificate is unavailable"):
+        auth.verify_pillar_response_spki(response, "0" * 64)
+
+
+def test_wrong_pin_sends_zero_http_request_bytes(tmp_path):
+    """The SPKI gate runs after TLS but before request serialization."""
+    cert_der, key_pem = _make_self_signed_cert_der(return_key=True)
+    cert_pem = ssl.DER_cert_to_PEM_cert(cert_der).encode("ascii")
+    cert_path, key_path = tmp_path / "cert.pem", tmp_path / "key.pem"
+    cert_path.write_bytes(cert_pem)
+    key_path.write_bytes(key_pem)
+
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    received = []
+    ready = threading.Event()
+
+    def serve_once():
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(cert_path, key_path)
+        ready.set()
+        conn, _addr = listener.accept()
+        try:
+            with context.wrap_socket(conn, server_side=True) as tls_conn:
+                tls_conn.settimeout(1.0)
+                try:
+                    received.append(tls_conn.recv(4096))
+                except (socket.timeout, ssl.SSLError):
+                    received.append(b"")
+        finally:
+            listener.close()
+
+    thread = threading.Thread(target=serve_once, daemon=True)
+    thread.start()
+    assert ready.wait(2)
+    port = listener.getsockname()[1]
+    req = urlrequest.Request(
+        f"https://127.0.0.1:{port}/secret?token=credential",
+        data=b"sensitive-body",
+        headers={"Authorization": "secret-header"},
+        method="POST",
+    )
+    with pytest.raises(auth.PillarSpkiMismatch):
+        auth.open_pillar_url(req, timeout=2, expected_spki_hash="0" * 64)
+    thread.join(3)
+    assert received == [b""]
+
+
+def test_pillar_redirect_is_refused_without_contacting_location():
+    target_hits = []
+
+    class Target(BaseHTTPRequestHandler):
+        def do_GET(self):
+            target_hits.append(self.path)
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *_args):
+            pass
+
+    target = ThreadingHTTPServer(("127.0.0.1", 0), Target)
+
+    class Redirect(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(302)
+            self.send_header(
+                "Location", f"http://127.0.0.1:{target.server_port}/stolen"
+            )
+            self.end_headers()
+
+        def log_message(self, *_args):
+            pass
+
+    origin = ThreadingHTTPServer(("127.0.0.1", 0), Redirect)
+    threads = [
+        threading.Thread(target=server.serve_forever, daemon=True)
+        for server in (target, origin)
+    ]
+    for thread in threads:
+        thread.start()
+    try:
+        with pytest.raises(urlerror.HTTPError) as exc:
+            auth.open_pillar_url(
+                f"http://127.0.0.1:{origin.server_port}/peers", timeout=2
+            )
+        assert exc.value.code == 302
+        time.sleep(0.05)
+        assert target_hits == []
+    finally:
+        origin.shutdown()
+        target.shutdown()
+
+
+def test_redact_url_for_log_removes_all_credential_bearing_components():
+    url = "https://alice:secret@[2001:db8::1]:9443/base?token=secret#private"
+    assert auth.redact_url_for_log(url) == "https://[2001:db8::1]:9443/base"
+    assert auth.redact_url_in_text(f"failed: {url}", url) == \
+        "failed: https://[2001:db8::1]:9443/base"

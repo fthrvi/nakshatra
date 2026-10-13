@@ -253,9 +253,8 @@ def test_b1_resolver_caches_peers_on_refresh():
          "address": "beta-host:5510"},
     ]
     r = ga.PillarPeerKeyResolver("http://pillar:7777")
-    with patch.object(ga, "urlrequest") as ur:
-        ur.urlopen.return_value = _mock_peers_response(peers)
-        ur.Request = MagicMock()
+    with patch.object(ga.auth, "open_pillar_url",
+                      return_value=_mock_peers_response(peers)):
         r.refresh_once()
     assert r.resolve("alpha") == pub_hex_a.lower()
     assert r.resolve("beta") == pub_hex_b.lower()
@@ -270,9 +269,8 @@ def test_b1_resolver_is_registered_address_post_refresh():
          "address": "beta-host:5510"},
     ]
     r = ga.PillarPeerKeyResolver("http://pillar:7777")
-    with patch.object(ga, "urlrequest") as ur:
-        ur.urlopen.return_value = _mock_peers_response(peers)
-        ur.Request = MagicMock()
+    with patch.object(ga.auth, "open_pillar_url",
+                      return_value=_mock_peers_response(peers)):
         r.refresh_once()
     assert r.is_registered_address("alpha-host:5500") is True
     assert r.is_registered_address("beta-host:5510") is True
@@ -292,9 +290,8 @@ def test_b1_resolver_rejects_malformed_pubkey():
         {"node_id": "non_hex", "public_key_hex": "z" * 64, "address": "zzz:5500"},
     ]
     r = ga.PillarPeerKeyResolver("http://pillar:7777")
-    with patch.object(ga, "urlrequest") as ur:
-        ur.urlopen.return_value = _mock_peers_response(peers)
-        ur.Request = MagicMock()
+    with patch.object(ga.auth, "open_pillar_url",
+                      return_value=_mock_peers_response(peers)):
         r.refresh_once()
     assert r.resolve("good") == "ab" * 32
     assert r.resolve("no_key") is None
@@ -317,9 +314,8 @@ def test_b1_resolver_cache_goes_stale_past_deadline():
     r = ga.PillarPeerKeyResolver(
         "http://pillar:7777", stale_cache_deadline_s=0.1,
     )
-    with patch.object(ga, "urlrequest") as ur:
-        ur.urlopen.return_value = _mock_peers_response(peers)
-        ur.Request = MagicMock()
+    with patch.object(ga.auth, "open_pillar_url",
+                      return_value=_mock_peers_response(peers)):
         r.refresh_once()
     # Immediately after refresh: fresh
     assert r.resolve("alpha") == pub_hex.lower()
@@ -335,9 +331,8 @@ def test_b1_resolver_records_refresh_failures():
     grep stats() for consecutive_failures to detect a pillar outage."""
     import urllib.error as urlerror
     r = ga.PillarPeerKeyResolver("http://pillar:7777")
-    with patch.object(ga, "urlrequest") as ur:
-        ur.urlopen.side_effect = urlerror.URLError("connection refused")
-        ur.Request = MagicMock()
+    with patch.object(ga.auth, "open_pillar_url",
+                      side_effect=urlerror.URLError("connection refused")):
         with pytest.raises(Exception):
             r.refresh_once()
     stats = r.stats()
@@ -350,16 +345,15 @@ def test_b1_resolver_successful_refresh_clears_failure_counter():
               "address": "alpha:5500"}]
     import urllib.error as urlerror
     r = ga.PillarPeerKeyResolver("http://pillar:7777")
-    with patch.object(ga, "urlrequest") as ur:
+    with patch.object(ga.auth, "open_pillar_url") as open_pillar:
         # Fail once
-        ur.urlopen.side_effect = urlerror.URLError("transient")
-        ur.Request = MagicMock()
+        open_pillar.side_effect = urlerror.URLError("transient")
         with pytest.raises(Exception):
             r.refresh_once()
         assert r.stats()["consecutive_failures"] == 1
         # Succeed next
-        ur.urlopen.side_effect = None
-        ur.urlopen.return_value = _mock_peers_response(peers)
+        open_pillar.side_effect = None
+        open_pillar.return_value = _mock_peers_response(peers)
         r.refresh_once()
     assert r.stats()["consecutive_failures"] == 0
 

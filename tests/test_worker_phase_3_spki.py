@@ -45,9 +45,8 @@ def _mock_peers_response(peers):
 
 def _refresh_with(peers):
     r = ga.PillarPeerKeyResolver("http://pillar:7777")
-    with patch.object(ga, "urlrequest") as ur:
-        ur.urlopen.return_value = _mock_peers_response(peers)
-        ur.Request = MagicMock()
+    with patch.object(ga.auth, "open_pillar_url",
+                      return_value=_mock_peers_response(peers)):
         r.refresh_once()
     return r
 
@@ -158,9 +157,8 @@ def test_3_2_expected_spki_address_mapping_survives_replace():
     reverse index must follow — old address shouldn't keep resolving
     to the old SPKI after the peer moved."""
     r = ga.PillarPeerKeyResolver("http://pillar:7777")
-    with patch.object(ga, "urlrequest") as ur:
-        ur.Request = MagicMock()
-        ur.urlopen.return_value = _mock_peers_response([
+    with patch.object(ga.auth, "open_pillar_url") as open_pillar:
+        open_pillar.return_value = _mock_peers_response([
             {"node_id": "alpha", "public_key_hex": "ab" * 32,
              "address": "old-host:5500",
              "peer_spki_hash": VALID_SPKI_A},
@@ -168,7 +166,7 @@ def test_3_2_expected_spki_address_mapping_survives_replace():
         r.refresh_once()
         assert r.expected_spki("old-host:5500") == VALID_SPKI_A
         # Pillar's next /peers shows the peer at a new address.
-        ur.urlopen.return_value = _mock_peers_response([
+        open_pillar.return_value = _mock_peers_response([
             {"node_id": "alpha", "public_key_hex": "ab" * 32,
              "address": "new-host:5500",
              "peer_spki_hash": VALID_SPKI_A},
@@ -190,12 +188,11 @@ def test_3_6_expected_spki_returns_none_when_stale():
         "http://pillar:7777",
         stale_cache_deadline_s=0.01,  # 10ms — easy to step past in a test
     )
-    with patch.object(ga, "urlrequest") as ur:
-        ur.urlopen.return_value = _mock_peers_response([
+    with patch.object(ga.auth, "open_pillar_url",
+                      return_value=_mock_peers_response([
             {"node_id": "alpha", "public_key_hex": "ab" * 32,
              "address": "alpha:5500", "peer_spki_hash": VALID_SPKI_A},
-        ])
-        ur.Request = MagicMock()
+        ])):
         r.refresh_once()
     assert r.expected_spki("alpha:5500") == VALID_SPKI_A  # fresh
     time.sleep(0.02)
@@ -266,14 +263,13 @@ def test_3_7_resolver_parses_real_sthambha_peers_projection_shape():
         "filter": None,
     }
     r = ga.PillarPeerKeyResolver("http://pillar:7777")
-    with patch.object(ga, "urlrequest") as ur:
+    with patch.object(ga.auth, "open_pillar_url") as open_pillar:
         resp = MagicMock()
         resp.read.return_value = json.dumps(
             sthambha_projection_shape).encode("utf-8")
         resp.__enter__ = lambda self: self
         resp.__exit__ = lambda *args: None
-        ur.urlopen.return_value = resp
-        ur.Request = MagicMock()
+        open_pillar.return_value = resp
         r.refresh_once()
     # The pinned worker resolves; the legacy one returns None.
     assert r.expected_spki("worker-1:5530") == VALID_SPKI_A

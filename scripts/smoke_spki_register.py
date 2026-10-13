@@ -91,7 +91,10 @@ def _register_with_pillar(pillar_url: str, node_id: str, address: str,
                  "Authorization": header},
         method="POST",
     )
-    with urlrequest.urlopen(req, timeout=10) as resp:
+    pin = os.environ.get("STHAMBHA_PILLAR_SPKI_SHA256", "").strip() or None
+    with auth.open_pillar_url(
+        req, timeout=10, expected_spki_hash=pin,
+    ) as resp:
         body_resp = resp.read().decode("utf-8")
     print(f"[register] pillar said: {body_resp}", flush=True)
 
