@@ -73,10 +73,10 @@ def test_public_key_fallback_uses_the_same_signing_key(pillar, monkeypatch):
     monkeypatch.delenv("NKS_REGISTRY_KEYID", raising=False)
     priv = ed25519.Ed25519PrivateKey.generate()
     public_key_hex = priv.public_key().public_bytes_raw().hex()
-    monkeypatch.setattr(
-        na, "load_or_create_worker_key",
-        lambda *_a, **_k: (priv.private_bytes_raw(), public_key_hex),
-    )
+    loader = lambda *_a, **_k: (priv.private_bytes_raw(), public_key_hex)  # noqa: E731
+    monkeypatch.setattr(na, "load_or_create_worker_key", loader)
+    # The keyid default is strict load-only; it must never create node identity.
+    monkeypatch.setattr(na, "load_worker_key", loader)
 
     client._registry_urlopen("https://pillar.invalid/chain?model=m").read()
 

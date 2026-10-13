@@ -83,3 +83,11 @@ def test_registry_keyid_falls_back_to_release_worker_public_key(tmp_path):
     assert keyid == public_key_hex
     assert source == f"worker public key at {key_path}"
     assert seen == [key_path]
+
+
+def test_keyid_default_never_creates_a_node_key(tmp_path):
+    import client_defaults as cd
+    keyid, source = cd.resolve_registry_keyid({}, home=tmp_path)
+    assert keyid == ""
+    assert "no usable node key" in source
+    assert not (tmp_path / ".nakshatra" / "keys" / "worker.ed25519").exists()

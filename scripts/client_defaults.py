@@ -103,10 +103,14 @@ def resolve_registry_keyid(
         return registrar_id, f"NKS_NODE_ID in {registrar_env}"
 
     if key_loader is None:
+        # Strict load only: resolving a client default must never create or repair node identity.
         import nakshatra_auth
-        key_loader = nakshatra_auth.load_or_create_worker_key
+        key_loader = nakshatra_auth.load_worker_key
     key_path = base_home / ".nakshatra" / "keys" / "worker.ed25519"
-    _private_key, public_key_hex = key_loader(key_path)
+    try:
+        _private_key, public_key_hex = key_loader(key_path)
+    except Exception as e:  # missing/unsafe key: no default keyid, the 401 message says why
+        return "", f"no usable node key at {key_path} ({e})"
     return public_key_hex, f"worker public key at {key_path}"
 
 
