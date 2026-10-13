@@ -12,7 +12,8 @@
     "release",
     "engine",
     "third_party/shard-libp2p-sidecar",
-    "deploy/provision-worker.sh"
+    "deploy/provision-worker.sh",
+    "deploy/owner-sentinel"
    ],
    "pythonpath": "scripts"
   },
