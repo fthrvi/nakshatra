@@ -5,7 +5,7 @@ On create add a row (status=active, owner). On merge flip to `merged→<sha>`.
 
 | branch | sector | description | base | status | owner |
 |---|---|---|---|---|---|
-| client/admission-defaults | client | Default the release sidecar socket and pillar signing keyid from uid-owned release state; report keyid provenance on 401. | forgejo/main@b10734b | active | codex/root |
+| client/admission-defaults | client | Default the release sidecar socket and pillar signing keyid from uid-owned release state; report keyid provenance on 401. | forgejo/main@b10734b | merged→252b228 | codex/root |
 | u4/c1-sidecar-forward | network | U4 C1: uid-gated dynamic activation FORWARD listeners, direct-only inference streams, optional direct-only worker inbound flags in the release p2p unit. | main@2829468 | active | codex/trisul (U4 C1 lane) |
 | u4/worker-invite | join | U4 phase A signed worker invites, staged onboard codes, and node-key-signed Redeem v2 with retry CLI. | forgejo/main@2829468 | active | codex |
 | u4/b2-registrar | release | Move the signed capacity registrar into Nakshatra releases, strictly reuse the one node key, and ship an opt-in hardened service. | forgejo/main@2829468 | active | codex |
