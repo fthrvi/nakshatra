@@ -25,6 +25,7 @@ import queue
 import socket
 import struct
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -72,6 +73,84 @@ except ImportError:
 #   Llama-3: 128001 <|end_of_text|>, 128008 <|eom_id|>, 128009 <|eot_id|>
 #   Qwen3:   151643 <|endoftext|>,   151645 <|im_end|>   (ChatML end-of-turn — needed for chat)
 LLAMA3_EOS_IDS = {128001, 128008, 128009, 151643, 151645}
+
+# One worker step normally has five minutes to answer. A standby worker gets
+# an additive allowance on its first inference RPC only: loading the slice is
+# expected work, not a stalled inference or a reason to advance recovery.
+STEP_TIMEOUT_S = 300.0
+DEFAULT_WARMUP_TIMEOUT_S = 60.0
+WARMUP_UNAVAILABLE_BACKOFF_S = 0.25
+
+
+def _residency(value) -> str:
+    """Return the pillar residency vocabulary, treating old/missing data as unknown."""
+    value = str(value or "").strip().lower()
+    return value if value in ("loaded", "standby") else "unknown"
+
+
+def _warmup_timeout_s() -> float:
+    raw = os.environ.get("NAKSHATRA_WARMUP_TIMEOUT_S", str(DEFAULT_WARMUP_TIMEOUT_S))
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        raise ValueError(
+            f"NAKSHATRA_WARMUP_TIMEOUT_S must be a number, got {raw!r}"
+        )
+
+
+def _is_unavailable(exc: BaseException) -> bool:
+    code_fn = getattr(exc, "code", None)
+    if not callable(code_fn):
+        return False
+    try:
+        code = code_fn()
+    except Exception:
+        return False
+    return getattr(code, "name", str(code)) == "UNAVAILABLE"
+
+
+class HopRpcPolicy:
+    """Deadlines and the one cold-start retry for a single active chain hop.
+
+    ``invoke`` receives the per-step timeout in seconds. Keeping the policy
+    transport-neutral lets unary Forward and the persistent Inference stream
+    share exactly the same first-RPC semantics.
+    """
+
+    def __init__(self, worker_id: str, residency: str, *, warmup_timeout_s=None,
+                 now=time.monotonic, sleep=time.sleep, log=None):
+        self.worker_id = worker_id
+        self.residency = _residency(residency)
+        self.warmup_timeout_s = (
+            _warmup_timeout_s() if warmup_timeout_s is None
+            else max(0.0, float(warmup_timeout_s))
+        )
+        self._now = now
+        self._sleep = sleep
+        self._log = log or (lambda line: print(line, flush=True))
+        self._first_rpc_consumed = False
+
+    def call(self, invoke, normal_timeout_s: float = STEP_TIMEOUT_S):
+        warming = self.residency == "standby" and not self._first_rpc_consumed
+        # Consume before invoking so an exhausted warm-up falls through to the
+        # existing recovery path; a recovery replay to the same hop is normal.
+        self._first_rpc_consumed = True
+        timeout_s = normal_timeout_s + (self.warmup_timeout_s if warming else 0.0)
+        started = self._now()
+        try:
+            try:
+                return invoke(timeout_s)
+            except Exception as exc:
+                if not (warming and _is_unavailable(exc)):
+                    raise
+                self._sleep(WARMUP_UNAVAILABLE_BACKOFF_S)
+                return invoke(timeout_s)
+        finally:
+            if warming:
+                elapsed = max(0.0, self._now() - started)
+                self._log(
+                    f"[chain] warming {self.worker_id} (standby) … {elapsed:.2f}s"
+                )
 
 
 def _hidden_bytes(n, n_embd):
@@ -230,7 +309,7 @@ def _grpc_auth_metadata(method: str, message_bytes: bytes, streaming: bool = Fal
 
 def call_forward(stub, payload, n_tokens, has_token_ids, worker_id="<unknown>",
                  keep_kv=False, start_pos=0, timing=None, all_logits=False,
-                 eagle_hidden=False):
+                 eagle_hidden=False, rpc_policy=None):
     req = pb.ForwardRequest(
         hidden_in=payload, batch=1, n_tokens=n_tokens, has_token_ids=has_token_ids,
         keep_kv=keep_kv, start_pos=start_pos, all_logits=all_logits,
@@ -238,13 +317,13 @@ def call_forward(stub, payload, n_tokens, has_token_ids, worker_id="<unknown>",
     )
     t0 = time.time()
     try:
-        resp = stub.Forward(req, timeout=300.0,
-                            metadata=_grpc_auth_metadata("Forward", req.SerializeToString()))
+        metadata = _grpc_auth_metadata("Forward", req.SerializeToString())
+        invoke = lambda timeout: stub.Forward(req, timeout=timeout, metadata=metadata)
+        resp = (rpc_policy or HopRpcPolicy(worker_id, "unknown")).call(invoke)
     except grpc.RpcError as e:
-        sys.exit(
-            f"[chain] Forward RPC to worker {worker_id!r} failed: "
-            f"{e.code().name} — {e.details()}"
-        )
+        # RuntimeError subclass: the existing outer recovery loop can swap an
+        # alternate. The warm-up policy has already spent its one local retry.
+        raise EdgeError.from_exc(e, peer_id=worker_id, phase="forward") from e
     if timing is not None:
         timing.setdefault(worker_id, []).append(time.time() - t0)
     return resp.hidden_out
@@ -264,31 +343,82 @@ class InferenceStream:
     stream look like a synchronous send-then-recv to chain-walk code.
     """
 
-    def __init__(self, stub, worker_id):
+    def __init__(self, stub, worker_id, rpc_policy=None):
         self.worker_id = worker_id
-        self._req_q = queue.Queue()
         self._closed = False
         self._stub = stub
-        self._responses = None   # started on the first step(): an authenticated worker verifies the FIRST frame's signature
+        self._rpc_policy = rpc_policy or HopRpcPolicy(worker_id, "unknown")
+        self._req_q = None
+        self._responses = None
+        self._resp_q = None
 
-    def _request_gen(self):
+    @staticmethod
+    def _request_gen(req_q):
         while True:
-            step = self._req_q.get()
+            step = req_q.get()
             if step is None:
                 return
             yield step
 
+    @staticmethod
+    def _pump_responses(responses, resp_q):
+        try:
+            for response in responses:
+                resp_q.put((True, response))
+        except Exception as exc:
+            resp_q.put((False, exc))
+        else:
+            resp_q.put((False, RuntimeError("Inference stream ended without a response")))
+
+    def _discard_stream(self):
+        if self._req_q is not None:
+            self._req_q.put(None)
+        cancel = getattr(self._responses, "cancel", None)
+        if callable(cancel):
+            try:
+                cancel()
+            except Exception:
+                pass
+        self._req_q = self._responses = self._resp_q = None
+
+    def _start_stream(self, request_step):
+        req_q = queue.Queue()
+        resp_q = queue.Queue()
+        req_q.put(request_step)
+        responses = self._stub.Inference(
+            self._request_gen(req_q),
+            metadata=_grpc_auth_metadata(
+                "Inference", request_step.SerializeToString(), streaming=True),
+        )
+        self._req_q, self._responses, self._resp_q = req_q, responses, resp_q
+        threading.Thread(
+            target=self._pump_responses, args=(responses, resp_q), daemon=True,
+        ).start()
+
+    def _wait_response(self, timeout_s):
+        try:
+            ok, value = self._resp_q.get(timeout=timeout_s)
+        except queue.Empty:
+            raise TimeoutError(
+                f"no response from {self.worker_id} in {timeout_s:.1f}s"
+            )
+        if ok:
+            return value
+        raise value
+
     def step(self, request_step):
         if self._closed:
             raise RuntimeError(f"stream to {self.worker_id} already closed")
-        self._req_q.put(request_step)
-        if self._responses is None:
-            self._responses = self._stub.Inference(
-                self._request_gen(),
-                metadata=_grpc_auth_metadata("Inference", request_step.SerializeToString(), streaming=True))
         try:
-            return next(self._responses)
-        except grpc.RpcError as e:
+            if self._responses is None:
+                def first_attempt(timeout_s):
+                    self._discard_stream()
+                    self._start_stream(request_step)
+                    return self._wait_response(timeout_s)
+                return self._rpc_policy.call(first_attempt)
+            self._req_q.put(request_step)
+            return self._wait_response(STEP_TIMEOUT_S)
+        except (grpc.RpcError, TimeoutError) as e:
             # #17 live seam: classify HERE, where the real grpc .code() is live (the
             # plain-RuntimeError rewrap downstream would lose it). EdgeError is a
             # RuntimeError subclass, so the recovery loop catches it and swaps to a
@@ -299,7 +429,7 @@ class InferenceStream:
         if self._closed:
             return
         self._closed = True
-        self._req_q.put(None)
+        self._discard_stream()
 
 
 def call_inference_step(streamer, payload, n_tokens, has_token_ids,
@@ -924,6 +1054,7 @@ def _try_pillar_chain(registry_url: str, model_id: str) -> list | None:
             "layer_end": int(c["layer_end"]),
             "endpoint": endpoint,
             "public_key_hex": str(c.get("public_key_hex") or ""),
+            "residency": _residency(c.get("residency")),
             # 2026-05-26 SPKI Phase 4 — pillar's /chain projection ships
             # peer_spki_hash inline (sthambha commit added the field
             # alongside this one). Older pillars omit it; that's still
@@ -1013,6 +1144,7 @@ def build_chain_from_registry(registry_url: str, model_id: str, *,
                 "layer_end": offering["layer_end"],
                 "endpoint": endpoint,
                 "public_key_hex": str(peer.get("public_key_hex") or ""),
+                "residency": _residency(peer.get("residency")),
                 # 2026-05-26 SPKI: take it straight from the /peers
                 # payload we already loaded. defensive parse mirrors
                 # _fetch_spki_index for the pillar-served chain path.
@@ -1202,12 +1334,14 @@ def main():
         for w in workers:
             w["peer_spki_hash"] = _sanitize_spki(w.get("peer_spki_hash"))
             w["endpoint"] = _parse_activation_endpoint(w.get("endpoint"))
+            w["residency"] = _residency(w.get("residency"))
             config_candidates.append(w)
             for alt in list(w.get("alternates") or []):
                 alt["peer_spki_hash"] = _sanitize_spki(
                     alt.get("peer_spki_hash"))
                 alt["endpoint"] = _parse_activation_endpoint(
                     alt.get("endpoint"))
+                alt["residency"] = _residency(alt.get("residency"))
                 config_candidates.append(alt)
         if any(w.get("endpoint") is not None for w in config_candidates):
             configured_model = str(
@@ -1234,7 +1368,7 @@ def main():
         primary = {k: w[k] for k in ("id", "node_id", "address", "port",
                                        "layer_range", "mode", "peer_spki_hash",
                                        "drift_class", "endpoint", "public_key_hex",
-                                       "internal_address")
+                                       "internal_address", "residency")
                    if k in w}
         primary["sub_gguf_path"] = w.get("sub_gguf_path", "")
         # Normalize per-candidate hashes too: alternates may omit the
@@ -1243,11 +1377,14 @@ def main():
         for alt in list(w.get("alternates") or []):
             alt["peer_spki_hash"] = _sanitize_spki(alt.get("peer_spki_hash"))
             alt["endpoint"] = _parse_activation_endpoint(alt.get("endpoint"))
+            alt["residency"] = _residency(alt.get("residency"))
         w["candidates"] = [primary] + list(w.get("alternates") or [])
         w["cursor"] = 0
 
     def _spec(w):
         return w["candidates"][w["cursor"]]
+
+    rpc_policies = {}
 
     def _setup_chain(context="chain"):
         """Open channels + call Info on each worker's current candidate.
@@ -1297,6 +1434,17 @@ def main():
             # legacy address and may no longer even be the active alternate).
             active_w = dict(w)
             active_w.update(resolved_spec)
+            policy_key = (
+                active_w.get("node_id") or active_w.get("id"),
+                active_w.get(_CLIENT_DIAL_ADDRESS),
+            )
+            active_w["_rpc_policy"] = rpc_policies.setdefault(
+                policy_key,
+                HopRpcPolicy(
+                    active_w.get("node_id") or active_w.get("id") or "<unknown>",
+                    active_w.get("residency"),
+                ),
+            )
             stubs_local.append((active_w, stub, info))
         sorted_local = sorted(stubs_local, key=lambda x: x[2].layer_start)
         prev_end = sorted_local[0][2].layer_start
@@ -1379,7 +1527,8 @@ def main():
                     n = len(prefix_ids)
                     raw = call_forward(_stub, struct.pack(f"<{n}i", *prefix_ids), n,
                                        has_token_ids=True, worker_id=_wid,
-                                       eagle_hidden=True)
+                                       eagle_hidden=True,
+                                       rpc_policy=first_w["_rpc_policy"])
                     return list(struct.unpack(f"<{len(raw) // 4}f", raw))
                 draft = EagleDraft(args.eagle_head, args.eagle_base,
                                    args.eagle_config, _eagle_cmd5_fn)
@@ -1478,7 +1627,7 @@ def main():
         return call_forward(stub_tup[1], payload, n, has_token_ids=has_tok,
                             worker_id=w["id"],
                             keep_kv=keep_kv, start_pos=prefix_length, timing=timing,
-                            all_logits=all_logits)
+                            all_logits=all_logits, rpc_policy=w["_rpc_policy"])
 
     def _run_async_pipeline():
         """Async-pipelined speculative decode over the unary-Forward chain (spec's transport).
@@ -1503,7 +1652,8 @@ def main():
             def stage(payload, n, start_pos, first, last, meta):
                 return call_forward(stubs[i], payload, n, has_token_ids=first,
                                     worker_id=wids[i], keep_kv=True, start_pos=start_pos,
-                                    all_logits=True, timing=timing)
+                                    all_logits=True, timing=timing,
+                                    rpc_policy=sorted_stubs[i][0]["_rpc_policy"])
             return stage
         chain = PipelineChain([make_stage(i) for i in range(len(sorted_stubs))])
         try:
@@ -1513,7 +1663,8 @@ def main():
             buf = struct.pack(f"<{n_pre}i", *pre)
             for i, (w, stub, _) in enumerate(sorted_stubs):
                 buf = call_forward(stub, buf, n_pre, has_token_ids=(i == 0), worker_id=w["id"],
-                                   keep_kv=False, start_pos=0, timing=timing)
+                                   keep_kv=False, start_pos=0, timing=timing,
+                                   rpc_policy=w["_rpc_policy"])
                 if i < len(sorted_stubs) - 1 and len(buf) != _hidden_bytes(n_pre, n_embd):
                     raise RuntimeError(f"async prefill: worker {w['id']!r} returned {len(buf)} bytes")
             first_id = struct.unpack("<i", buf)[0]
@@ -1562,11 +1713,15 @@ def main():
             session_id = uuid.uuid4().hex
             if args.use_streaming_push:
                 first_w, first_stub, _ = sorted_stubs[0]
-                streamers.append(InferenceStream(first_stub, first_w["id"]))
+                streamer = InferenceStream(first_stub, first_w["id"])
+                streamer._rpc_policy = first_w["_rpc_policy"]
+                streamers.append(streamer)
                 tag = f"streaming-push, 1 stream to {first_w['id']}"
             else:
                 for w, stub, _ in sorted_stubs:
-                    streamers.append(InferenceStream(stub, w["id"]))
+                    streamer = InferenceStream(stub, w["id"])
+                    streamer._rpc_policy = w["_rpc_policy"]
+                    streamers.append(streamer)
                 tag = f"streaming, {len(streamers)} streams"
             if recovery_attempts == 0:
                 print(f"[chain] {tag}  session_id={session_id[:8]}…")

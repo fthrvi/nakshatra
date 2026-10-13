@@ -115,6 +115,7 @@ different NATs over IPv4 only (needs a second network).
 
 ## First outsider GPU (bro, RTX 5070, WSL; 2026-10-13)
 Proven:
+- **Standby warm-up is tolerated.** The pillar's per-hop `residency` lets `client.py` add `NAKSHATRA_WARMUP_TIMEOUT_S` (default 60 s) to only a standby hop's first RPC and retry one warm-up `UNAVAILABLE` before normal recovery.
 - **END TO END:** the hub asked "The capital of France is" and bro answered " Paris. The capital of Italy is Rome…" at 63 tok/s, with an 8 ms per-token RPC. The pillar served the chain, the roster firewall admitted bro (`known`) and the worker's TLS SPKI was pinned. Activations went over the sidecar FORWARD, **DIRECT via IPv6 QUIC**; the relay was used for discovery only.
 - **One way in.** The hub ran `nak invite --kind worker --tier known` and bro ran `install.py join`. The node-key-signed `/worker-redeem` on the VPS onboard server then added bro to the roster at `known`.
 - **Signed packages.** `llama32-3b` is signed by a dedicated package-signer key (`2a4d231e…`) and served from the untrusted release host (`:8960/packages/`). A remote fetch verifies the signature and every artifact's SHA-256.
