@@ -92,11 +92,11 @@ def test_nak_worker_on_writes_env_once_and_uses_verified_installer(tmp_path, mon
     env_path = home / ".nakshatra" / "worker.env"
     with pytest.raises(SystemExit, match="--pillar-url"):
         nak.main(["worker", "on", "--model-id", "qwen",
-                  "--package-url", "https://models.test/qwen",
+                  "--package-url", "https://models.test/qwen", "--package-pubkey", "cd" * 32,
                   "--layers", "0-16", "--port", "5530"])
     assert not env_path.exists()
 
-    argv = ["worker", "on", "--model-id", "qwen", "--package-url", "https://models.test/qwen",
+    argv = ["worker", "on", "--model-id", "qwen", "--package-url", "https://models.test/qwen", "--package-pubkey", "cd" * 32,
             "--pillar-url", "https://pillar.test", "--pillar-spki", "ab" * 32,
             "--listen-address", "0.0.0.0",
             "--layers", "0-16", "--port", "5530"]
@@ -145,6 +145,7 @@ def test_worker_launcher_refuses_stale_tree_and_execs_worker_without_skip(tmp_pa
     monkeypatch.setenv("PILLAR_URL", "https://pillar.test:8443")
     monkeypatch.setenv("PILLAR_SPKI_SHA256", "ab" * 32)
     monkeypatch.setenv("PACKAGE_URL", "https://models.test/qwen?token=package-secret")
+    monkeypatch.setenv("PACKAGE_TRUSTED_PUBKEY", "cd" * 32)
     monkeypatch.setenv("NAKSHATRA_TLS_REQUIRED", "false")
     monkeypatch.setenv("NAKSHATRA_AUTH_REQUIRED", "false")
     executed = []
@@ -156,6 +157,7 @@ def test_worker_launcher_refuses_stale_tree_and_execs_worker_without_skip(tmp_pa
     assert command[command.index("--gpu-backend") + 1] == "rocm"
     assert command[command.index("--node-id") + 1] == pub and env["NAKSHATRA_NODE_ID"] == pub
     assert "--skip-sha256" not in command
+    assert command[command.index("--package-trusted-pubkey") + 1] == "cd" * 32
     assert "package-secret" not in " ".join(command)
     assert env["NAKSHATRA_PILLAR_URL"] == "https://pillar.test:8443"
     assert env["STHAMBHA_PILLAR_SPKI_SHA256"] == "ab" * 32
@@ -176,6 +178,9 @@ def test_worker_launcher_refuses_stale_tree_and_execs_worker_without_skip(tmp_pa
     assert worker_service.main(argv, execve=lambda *_: None) == 1
     error = capsys.readouterr().err
     assert "REFUSING TO START" in error and "nak worker build" in error
+    monkeypatch.delenv("PACKAGE_TRUSTED_PUBKEY")
+    refused = []
+    assert worker_service.main(argv, execve=lambda *a: refused.append(a)) != 0 and refused == []
 
 
 def test_worker_launcher_refuses_missing_pillar_and_permissive_node_key(tmp_path, monkeypatch, capsys):
@@ -199,6 +204,7 @@ def test_worker_launcher_refuses_missing_pillar_and_permissive_node_key(tmp_path
             "--sub-gguf", str(root / "slice.gguf"), "--mode", "first",
             "--layer-start", "0", "--layer-end", "16", "--model-id", "qwen"]
     monkeypatch.setenv("PACKAGE_URL", "https://models.test/qwen")
+    monkeypatch.setenv("PACKAGE_TRUSTED_PUBKEY", "cd" * 32)
     monkeypatch.delenv("PILLAR_URL", raising=False)
 
     assert worker_service.main(argv, execve=lambda *_: None) == 1
@@ -328,7 +334,7 @@ def test_nak_worker_on_defaults_to_wildcard_listen(tmp_path, monkeypatch):
                         type("R", (), {"returncode": 0, "stdout": ""})())
 
     argv = ["worker", "on", "--model-id", "qwen",
-            "--package-url", "https://models.test/qwen",
+            "--package-url", "https://models.test/qwen", "--package-pubkey", "cd" * 32,
             "--pillar-url", "https://pillar.test", "--pillar-spki", "ab" * 32,
             "--layers", "0-16", "--port", "5530"]
     assert nak.main(argv) == 0
@@ -366,7 +372,7 @@ def test_nak_worker_on_requires_https_pin_before_writing_env(tmp_path, monkeypat
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("NAK_NODE_PREFIX", str(prefix))
     argv = ["worker", "on", "--model-id", "qwen",
-            "--package-url", "https://models.test/qwen",
+            "--package-url", "https://models.test/qwen", "--package-pubkey", "cd" * 32,
             "--pillar-url", "https://pillar.test", "--layers", "0-16", "--port", "5530"]
 
     with pytest.raises(SystemExit, match="--pillar-spki"):

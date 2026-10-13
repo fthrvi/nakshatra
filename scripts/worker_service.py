@@ -179,6 +179,11 @@ def worker_command(args) -> tuple[list[str], dict[str, str]]:
     if not package_url:
         raise WorkerServiceError("worker.env must set PACKAGE_URL")
     listen_address = os.environ.get("LISTEN", "").strip() or "[::]"
+    # B3: remote packages must be signed by an operator-pinned signer; without the pin every bootstrap fails.
+    package_pubkey = os.environ.get("PACKAGE_TRUSTED_PUBKEY", "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", package_pubkey):
+        raise WorkerServiceError(
+            "worker.env must set PACKAGE_TRUSTED_PUBKEY (64 hex; use `nak worker on --package-pubkey`)")
 
     if not args.worker_script.is_file():
         raise WorkerServiceError(f"release worker script is missing: {args.worker_script}")
@@ -196,6 +201,7 @@ def worker_command(args) -> tuple[list[str], dict[str, str]]:
         "--n-gpu-layers", str(n_gpu_layers),
         "--node-id", node_id,
         "--no-file-server",
+        "--package-trusted-pubkey", package_pubkey,
     ]
     env = dict(
         os.environ,

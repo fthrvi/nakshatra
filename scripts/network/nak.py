@@ -304,11 +304,13 @@ def _worker_enable(_sp, args) -> None:
     old_env = env_path.read_bytes() if env_path.exists() else None
     old_inference = inference.read_bytes() if inference.exists() else None
     if old_env is None:
-        missing = [name for name in ("model_id", "package_url", "pillar_url", "layers", "port")
+        missing = [name for name in ("model_id", "package_url", "package_pubkey", "pillar_url", "layers", "port")
                    if getattr(args, name) in (None, "")]
         if missing:
-            raise SystemExit("first `nak worker on` needs --model-id, --package-url, "
+            raise SystemExit("first `nak worker on` needs --model-id, --package-url, --package-pubkey, "
                              "--pillar-url, --layers a-b, and --port")
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", args.package_pubkey):
+            raise SystemExit("--package-pubkey must be the package signer's Ed25519 public key (64 hex characters)")
         match = re.fullmatch(r"(\d+)-(\d+)", args.layers)
         if not match or int(match.group(1)) >= int(match.group(2)):
             raise SystemExit("--layers must be a non-empty half-open range a-b (for example 0-16)")
@@ -332,7 +334,8 @@ def _worker_enable(_sp, args) -> None:
             f"{args.model_id}\0{args.package_url}\0{start}\0{end}".encode()).hexdigest()[:16]
         sub_gguf = root / f"slice-{slice_key}-L{start}-{end}.gguf"
         listen = _env_value(args.listen_address, "listen-address")
-        body = (f"MODEL_ID={model}\nPACKAGE_URL={package}\nPILLAR_URL={pillar}\n"
+        body = (f"MODEL_ID={model}\nPACKAGE_URL={package}\nPACKAGE_TRUSTED_PUBKEY={args.package_pubkey.lower()}\n"
+                f"PILLAR_URL={pillar}\n"
                 f"PILLAR_SPKI_SHA256={pillar_spki}\nTRUSTED_PILLAR_NETS={trusted_nets}\n"
                 f"MODE={args.mode}\nPORT={args.port}\n"
                 f"LAYER_START={start}\nLAYER_END={end}\nSUB_GGUF={sub_gguf}\n"
@@ -433,6 +436,8 @@ def main(argv=None, *, http_post=None) -> int:
     q = wsub.add_parser("on", help="configure (once) and enable the worker service")
     q.add_argument("--model-id")
     q.add_argument("--package-url")
+    q.add_argument("--package-pubkey",
+                   help="Ed25519 public key (hex) of the model package signer; remote packages must be signed by it")
     q.add_argument("--pillar-url")
     q.add_argument("--pillar-spki",
                    help="pillar TLS public-key SHA-256 pin (required for https://)")
