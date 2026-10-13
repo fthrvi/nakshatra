@@ -5,6 +5,7 @@ On create add a row (status=active, owner). On merge flip to `merged→<sha>`.
 
 | branch | sector | description | base | status | owner |
 |---|---|---|---|---|---|
+| worker/idle-unload | worker | Stop the GPU daemon after an idle window, reload it single-flight after SHA-256 re-verification, and publish loaded/standby residency. | forgejo/main@a4bbf4a | active | codex/root |
 | client/admission-defaults | client | Default the release sidecar socket and pillar signing keyid from uid-owned release state; report keyid provenance on 401. | forgejo/main@b10734b | merged→252b228 | codex/root |
 | u4/c1-sidecar-forward | network | U4 C1: uid-gated dynamic activation FORWARD listeners, direct-only inference streams, optional direct-only worker inbound flags in the release p2p unit. | main@2829468 | active | codex/trisul (U4 C1 lane) |
 | u4/worker-invite | join | U4 phase A signed worker invites, staged onboard codes, and node-key-signed Redeem v2 with retry CLI. | forgejo/main@2829468 | active | codex |

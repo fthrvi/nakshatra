@@ -852,7 +852,11 @@ class DaemonClient:
         self.recent_rpc_ms = collections.deque(maxlen=20)
         threading.Thread(target=self._drain_stderr, daemon=True).start()
         # Wait for the "[daemon] ready" line so info+forward are valid.
-        self._wait_ready()
+        try:
+            self._wait_ready()
+        except Exception:
+            self.close()
+            raise
 
     def _drain_stderr(self):
         for line in iter(self.proc.stderr.readline, b""):
@@ -956,11 +960,19 @@ class DaemonClient:
                     has_token_embd=bool(has_embd), has_lm_head=bool(has_lm), n_vocab=n_vocab)
 
     def close(self):
+        # EOF on stdin is the daemon's normal clean-shutdown path.  Only
+        # escalate to SIGKILL when it ignores that path for five seconds;
+        # an incidental close/wait error is not permission to kill a process
+        # which may already have exited normally.
         try:
             self.proc.stdin.close()
-            self.proc.wait(timeout=5)
         except Exception:
+            pass
+        try:
+            self.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
             self.proc.kill()
+            self.proc.wait(timeout=5)
 
     # -- worker/kv-session-ownership-gate (2026-09-12) -----------------------
 
@@ -1012,6 +1024,275 @@ class DaemonClient:
     def current_owner(self) -> Optional[str]:
         with self._owner_lock:
             return self._owner_session
+
+
+class DaemonUnavailableError(RuntimeError):
+    """The local inference daemon could not be made ready for a request."""
+
+
+class IdleDaemonController:
+    """Keep the heavyweight daemon resident only while it is being used.
+
+    The Python worker, TLS listener, registration loop, and slice file remain
+    alive in standby.  This controller is deliberately the sole owner of
+    daemon creation and teardown so concurrent cold requests cannot race two
+    GPU loads.  Session ownership lives here (rather than in a replaceable
+    DaemonClient instance), which makes the no-unload invariant explicit.
+    """
+
+    def __init__(self, daemon_factory, sub_gguf: str, startup_sha256: str,
+                 idle_unload_s: float = 600.0, *, now=None,
+                 residency_event: threading.Event = None):
+        if not math.isfinite(idle_unload_s) or idle_unload_s < 0:
+            raise ValueError("idle_unload_s must be a finite number >= 0")
+        self._daemon_factory = daemon_factory
+        self._sub_gguf = sub_gguf
+        self._startup_sha256 = startup_sha256.lower()
+        self.idle_unload_s = float(idle_unload_s)
+        self._now = now or time.monotonic
+        self._residency_event = residency_event
+        self._spawn_lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        self._owner_session: Optional[str] = None
+        self._owner_since = 0.0
+        self._in_flight = 0
+        self._last_step_at = self._now()
+        self._closed = False
+        self._residency = "loaded"
+        self.recent_rpc_ms = collections.deque(maxlen=20)
+        self._last_gpu_offload_status = {}
+        self._daemon = self._spawn_initial()
+
+    def _spawn_initial(self):
+        try:
+            daemon = self._daemon_factory()
+        except Exception as e:
+            raise DaemonUnavailableError(f"daemon initial spawn failed: {e}") from e
+        # Preserve one timing window across unload/reload transitions.
+        try:
+            daemon.recent_rpc_ms = self.recent_rpc_ms
+        except AttributeError:
+            # A few argument-parsing tests inject a bare sentinel and stop
+            # before the daemon is used. Real daemon implementations expose
+            # this deque.
+            pass
+        return daemon
+
+    @property
+    def residency(self) -> str:
+        with self._state_lock:
+            return self._residency
+
+    @property
+    def current_owner(self) -> Optional[str]:
+        with self._state_lock:
+            return self._owner_session
+
+    @property
+    def in_flight(self) -> int:
+        with self._state_lock:
+            return self._in_flight
+
+    @property
+    def service_alive(self) -> bool:
+        with self._state_lock:
+            if self._closed:
+                return False
+            daemon = self._daemon
+        if daemon is None:
+            return True  # standby is a healthy worker state
+        proc = getattr(daemon, "proc", None)
+        return proc is None or proc.poll() is None
+
+    def record_startup_sha256(self, digest: str) -> None:
+        """Install the immutable digest used for every later cold reload."""
+        digest = (digest or "").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ValueError("startup sub-GGUF SHA-256 must be 64 lowercase hex characters")
+        with self._state_lock:
+            if self._startup_sha256 and self._startup_sha256 != digest:
+                raise ValueError("startup sub-GGUF SHA-256 is already recorded")
+            self._startup_sha256 = digest
+
+    def _announce_residency(self, residency: str) -> None:
+        changed = False
+        with self._state_lock:
+            if self._residency != residency:
+                self._residency = residency
+                changed = True
+        if changed:
+            print(f"[worker] residency -> {residency}", flush=True)
+            if self._residency_event is not None:
+                self._residency_event.set()
+
+    def _verify_slice_for_reload(self) -> None:
+        if not self._startup_sha256:
+            raise DaemonUnavailableError(
+                "daemon reload refused: no startup SHA-256 was recorded"
+            )
+        try:
+            observed = sha256_of_file(self._sub_gguf)
+        except Exception as e:
+            raise DaemonUnavailableError(
+                f"daemon reload refused: could not verify sub-GGUF: {e}"
+            ) from e
+        if observed.lower() != self._startup_sha256:
+            raise DaemonUnavailableError(
+                "daemon reload refused: sub-GGUF SHA-256 mismatch "
+                f"(expected {self._startup_sha256}, observed {observed.lower()})"
+            )
+
+    def ensure_loaded(self):
+        with self._state_lock:
+            if self._closed:
+                raise DaemonUnavailableError("daemon reload refused: worker is stopping")
+            if self._daemon is not None:
+                return self._daemon
+
+        # Exactly one contender verifies and spawns.  Losers re-check after
+        # acquiring the same lock and reuse the winner's daemon.
+        with self._spawn_lock:
+            with self._state_lock:
+                if self._closed:
+                    raise DaemonUnavailableError("daemon reload refused: worker is stopping")
+                if self._daemon is not None:
+                    return self._daemon
+            try:
+                self._verify_slice_for_reload()
+                daemon = self._daemon_factory()
+                try:
+                    daemon.recent_rpc_ms = self.recent_rpc_ms
+                except AttributeError:
+                    pass
+            except DaemonUnavailableError as e:
+                sys.stderr.write(
+                    f"[worker] daemon reload failed; worker remains in standby: {e}\n"
+                )
+                raise
+            except Exception as e:
+                message = f"daemon reload failed; worker remains in standby: {e}"
+                sys.stderr.write(f"[worker] {message}\n")
+                raise DaemonUnavailableError(message) from e
+            with self._state_lock:
+                if self._closed:
+                    daemon.close()
+                    raise DaemonUnavailableError("daemon reload refused: worker is stopping")
+                self._daemon = daemon
+                self._last_step_at = self._now()
+            self._announce_residency("loaded")
+            return daemon
+
+    def acquire_session(self, session_id: str,
+                        stale_after_s: float = KV_SESSION_STALE_AFTER_S) -> bool:
+        now = self._now()
+        with self._state_lock:
+            if self._owner_session is None or self._owner_session == session_id:
+                self._owner_session = session_id
+                self._owner_since = now
+            elif now - self._owner_since > stale_after_s:
+                sys.stderr.write(
+                    f"[daemon] reclaiming stale KV-session ownership from "
+                    f"{self._owner_session!r} (idle {now - self._owner_since:.0f}s) "
+                    f"for {session_id!r}\n"
+                )
+                self._owner_session = session_id
+                self._owner_since = now
+            else:
+                return False
+        try:
+            self.ensure_loaded()
+        except Exception:
+            self.release_session(session_id)
+            raise
+        return True
+
+    def release_session(self, session_id: str) -> None:
+        with self._state_lock:
+            if self._owner_session == session_id:
+                self._owner_session = None
+                self._owner_since = 0.0
+
+    def mark_step_served(self) -> None:
+        """Refresh idle accounting for a response served from a local cache."""
+        with self._state_lock:
+            self._last_step_at = self._now()
+
+    def call(self, cmd: int, n_tokens: int, payload: bytes,
+             start_pos: int = 0, flags: int = 0):
+        is_inference = cmd in (CMD_TOKEN_DECODE, CMD_EMBD_DECODE, CMD_EAGLE_HIDDEN)
+        if is_inference:
+            with self._state_lock:
+                self._in_flight += 1
+        served = False
+        try:
+            daemon = self.ensure_loaded()
+            result = daemon.call(cmd, n_tokens, payload, start_pos=start_pos, flags=flags)
+            served = is_inference
+            return result
+        finally:
+            if is_inference:
+                with self._state_lock:
+                    self._in_flight -= 1
+                    if served:
+                        self._last_step_at = self._now()
+
+    def info(self):
+        return self.ensure_loaded().info()
+
+    def gpu_offload_status(self) -> dict:
+        with self._state_lock:
+            daemon = self._daemon
+            previous = dict(self._last_gpu_offload_status)
+        if daemon is None:
+            return previous
+        status = daemon.gpu_offload_status()
+        with self._state_lock:
+            self._last_gpu_offload_status = dict(status)
+        return status
+
+    def unload_if_idle(self) -> bool:
+        """Cleanly enter standby when every idle/session guard permits it."""
+        if self.idle_unload_s == 0:
+            return False
+        with self._spawn_lock:
+            with self._state_lock:
+                if (self._closed or self._daemon is None or self._in_flight
+                        or self._owner_session is not None
+                        or self._now() - self._last_step_at < self.idle_unload_s):
+                    return False
+                daemon = self._daemon
+                self._daemon = None
+            try:
+                daemon.close()
+            except Exception as e:
+                # The controller cannot safely reuse a daemon whose shutdown
+                # path failed.  Stay in standby and let a request create a
+                # freshly verified instance.
+                sys.stderr.write(f"[worker] daemon clean stop failed: {e}\n")
+            self._announce_residency("standby")
+            return True
+
+    def idle_monitor_loop(self, stop_event: threading.Event) -> None:
+        if self.idle_unload_s == 0:
+            return
+        while not stop_event.is_set():
+            with self._state_lock:
+                remaining = max(
+                    0.05,
+                    self.idle_unload_s - (self._now() - self._last_step_at),
+                )
+            if stop_event.wait(timeout=min(remaining, 1.0)):
+                return
+            self.unload_if_idle()
+
+    def close(self) -> None:
+        with self._spawn_lock:
+            with self._state_lock:
+                self._closed = True
+                daemon = self._daemon
+                self._daemon = None
+            if daemon is not None:
+                daemon.close()
 
 
 # v0.5 §9.7: idempotency cache is sized in MB, internally converted to an
@@ -1571,7 +1852,13 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
         # refused (fail closed) if a real session currently owns the daemon,
         # released immediately after so it never blocks anyone else.
         forward_session_id = f"forward:{uuid.uuid4()}"
-        if not self.daemon.acquire_session(forward_session_id):
+        try:
+            acquired = self.daemon.acquire_session(forward_session_id)
+        except DaemonUnavailableError as e:
+            context.set_code(grpc.StatusCode.UNAVAILABLE)
+            context.set_details(str(e))
+            return pb.ForwardResponse()
+        if not acquired:
             context.set_code(grpc.StatusCode.RESOURCE_EXHAUSTED)
             context.set_details(
                 f"worker busy serving another session "
@@ -1866,6 +2153,9 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                 # "not first" with respect to keep_kv semantics.
                 cached = self._idem_get(step.session_id, step.step_id)
                 if cached is not None:
+                    mark_served = getattr(self.daemon, "mark_step_served", None)
+                    if mark_served is not None:
+                        mark_served()
                     first_step = False
                     yield cached
                     continue
@@ -2122,6 +2412,11 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                 # whole point of failure, replays should retry).
                 self._idem_put(step.session_id, step.step_id, out)
                 yield out
+        except DaemonUnavailableError as e:
+            sys.stderr.write(f"[inference] daemon unavailable: {e}\n")
+            context.set_code(grpc.StatusCode.UNAVAILABLE)
+            context.set_details(str(e))
+            return
         except TimeoutError as e:
             sys.stderr.write(f"[inference] idle timeout: {e}\n")
             context.set_code(grpc.StatusCode.DEADLINE_EXCEEDED)
@@ -2331,7 +2626,8 @@ def heartbeat_loop(pillar_url: str, payload: dict, interval: float = 30.0,
                    daemon_for_timing=None,
                    priv_key: Optional[bytes] = None,
                    node_id: Optional[str] = None,
-                   spki_hash: Optional[str] = None):
+                   spki_hash: Optional[str] = None,
+                   residency_event: threading.Event = None):
     """Re-register with pillar every `interval` seconds. Run as daemon thread.
 
     Phase H: if `daemon_for_timing` is supplied, refresh the heartbeat
@@ -2357,8 +2653,19 @@ def heartbeat_loop(pillar_url: str, payload: dict, interval: float = 30.0,
         next_interval = _next_heartbeat_interval(
             interval, consecutive_failures
         )
-        if stop_event.wait(timeout=next_interval):
-            break
+        if residency_event is None:
+            if stop_event.wait(timeout=next_interval):
+                break
+        else:
+            # A residency transition is registry-significant: publish it now,
+            # not after the normal 30-second cadence.  The shutdown path sets
+            # both events so this wait also exits promptly.
+            residency_event.wait(timeout=next_interval)
+            residency_event.clear()
+            if stop_event.is_set():
+                break
+        if daemon_for_timing is not None:
+            payload["residency"] = daemon_for_timing.residency
         if daemon_for_timing is not None and daemon_for_timing.recent_rpc_ms:
             avg = sum(daemon_for_timing.recent_rpc_ms) / len(daemon_for_timing.recent_rpc_ms)
             # Phase A6: belt-and-suspenders — avg of all-finite values
@@ -2667,10 +2974,17 @@ class FileServerHandler(BaseHTTPRequestHandler):
         verify liveness + basic identity without leaking GPU/RAM/idem
         cache stats (those go on /healthz/full)."""
         daemon = _HEALTH_STATE.get("daemon")
-        daemon_alive = daemon is not None and daemon.proc.poll() is None
+        daemon_alive = bool(
+            daemon is not None and (
+                daemon.service_alive if hasattr(daemon, "service_alive")
+                else daemon.proc.poll() is None
+            )
+        )
+        residency = getattr(daemon, "residency", "loaded" if daemon_alive else "standby")
         started_at = _HEALTH_STATE.get("started_at", time.time())
         return {
             "status": "ok" if daemon_alive else "down",
+            "residency": residency,
             "mode": _HEALTH_STATE.get("mode", ""),
             "layer_start": _HEALTH_STATE.get("layer_start", -1),
             "layer_end": _HEALTH_STATE.get("layer_end", -1),
@@ -2681,13 +2995,20 @@ class FileServerHandler(BaseHTTPRequestHandler):
 
     def _health_payload(self):
         daemon = _HEALTH_STATE.get("daemon")
-        daemon_alive = daemon is not None and daemon.proc.poll() is None
+        daemon_alive = bool(
+            daemon is not None and (
+                daemon.service_alive if hasattr(daemon, "service_alive")
+                else daemon.proc.poll() is None
+            )
+        )
+        residency = getattr(daemon, "residency", "loaded" if daemon_alive else "standby")
         started_at = _HEALTH_STATE.get("started_at", time.time())
         samples = list(daemon.recent_rpc_ms) if daemon is not None else []
         recent_avg = (sum(samples) / len(samples)) if samples else None
         gpu = daemon.gpu_offload_status() if daemon is not None else None
         return {
             "status": "ok" if daemon_alive else "down",
+            "residency": residency,
             "node_id": _HEALTH_STATE.get("node_id", ""),
             "model_id": _HEALTH_STATE.get("model_id", ""),
             "mode": _HEALTH_STATE.get("mode", ""),
@@ -3540,6 +3861,13 @@ def main():
     args = ap.parse_args()
 
     try:
+        idle_unload_s = float(
+            os.environ.get("NAKSHATRA_WORKER_IDLE_UNLOAD_S", "600")
+        )
+        if not math.isfinite(idle_unload_s) or idle_unload_s < 0:
+            raise ValueError(
+                "NAKSHATRA_WORKER_IDLE_UNLOAD_S must be a finite number >= 0"
+            )
         validate_local_dev_fetch_policy(
             local_dev=args.local_dev,
             skip_sha256=args.skip_sha256,
@@ -3654,8 +3982,19 @@ def main():
                      f"(use --package-url to provision from a layer package, or "
                      f"--auto-fetch with --pillar-url to bootstrap from a peer)")
 
-    print(f"[worker] spawning daemon: {args.daemon_bin} {args.sub_gguf} {args.mode} {args.n_ctx} threads={args.n_threads} gpu_layers={args.n_gpu_layers}", flush=True)
-    daemon = DaemonClient(args.daemon_bin, args.sub_gguf, args.mode, args.n_ctx, args.n_threads, args.n_gpu_layers)
+    residency_event = threading.Event()
+
+    def spawn_daemon():
+        print(f"[worker] spawning daemon: {args.daemon_bin} {args.sub_gguf} {args.mode} {args.n_ctx} threads={args.n_threads} gpu_layers={args.n_gpu_layers}", flush=True)
+        return DaemonClient(
+            args.daemon_bin, args.sub_gguf, args.mode, args.n_ctx,
+            args.n_threads, args.n_gpu_layers,
+        )
+
+    daemon = IdleDaemonController(
+        spawn_daemon, args.sub_gguf, "", idle_unload_s,
+        residency_event=residency_event,
+    )
 
     # 2026-05-26 drive-by — TLS bringup factored into setup_tls(args).
     # Same behavior (resolve policy, ensure_cert, WARN on Mode-A
@@ -3721,6 +4060,47 @@ def main():
           f"model={args.model_id}", flush=True)
     server.start()
 
+    # Idle reload integrity is independent of pillar registration policy.
+    # Record the bytes that the initial daemon loaded, then require an exact
+    # match before every later spawn.  With idle unload disabled, retain the
+    # legacy startup path and hash only if registration needs it below.
+    startup_slice_sha256 = ""
+    sub_gguf_sha256 = ""
+    sub_gguf_size = 0
+    if idle_unload_s > 0:
+        try:
+            sub_gguf_size = os.path.getsize(args.sub_gguf)
+            if provisioned_sha256:
+                startup_slice_sha256 = provisioned_sha256
+                print(
+                    f"[worker] recording verified download sha256="
+                    f"{startup_slice_sha256[:16]}... for idle reload",
+                    flush=True,
+                )
+            else:
+                t0 = time.time()
+                print(
+                    f"[worker] recording startup sha256 of {args.sub_gguf} "
+                    f"({sub_gguf_size/1e9:.1f} GB) for idle reload…",
+                    flush=True,
+                )
+                startup_slice_sha256 = sha256_of_file(args.sub_gguf)
+                print(
+                    f"[worker] startup sha256={startup_slice_sha256[:16]}... "
+                    f"({time.time()-t0:.1f}s)",
+                    flush=True,
+                )
+            daemon.record_startup_sha256(startup_slice_sha256)
+            if not args.skip_sha256:
+                sub_gguf_sha256 = startup_slice_sha256
+        except Exception as e:
+            daemon.close()
+            server.stop(grace=0)
+            sys.exit(
+                f"[worker] startup refused: cannot record sub-GGUF SHA-256 "
+                f"required for idle reload: {e}"
+            )
+
     # Phase 4: file server lets peers fetch this worker's sub-GGUF over HTTP
     # byte-range. New peers joining the cluster don't need their files
     # pre-shipped — they query the pillar's file index, find a peer that has
@@ -3759,12 +4139,17 @@ def main():
         public_addr = args.public_address or f"{socket.gethostname()}:{args.port}"
 
         # Phase 3.5: compute SHA-256 of the sub-GGUF (one-time at startup)
-        sub_gguf_sha256 = ""
-        sub_gguf_size = 0
         try:
-            sub_gguf_size = os.path.getsize(args.sub_gguf)
+            if not sub_gguf_size:
+                sub_gguf_size = os.path.getsize(args.sub_gguf)
             if not args.skip_sha256:
-                if provisioned_sha256:
+                if sub_gguf_sha256:
+                    print(
+                        f"[worker] reusing startup sha256={sub_gguf_sha256[:16]}... "
+                        "for pillar registration",
+                        flush=True,
+                    )
+                elif provisioned_sha256:
                     sub_gguf_sha256 = provisioned_sha256
                     print(
                         f"[worker] reusing download sha256={sub_gguf_sha256[:16]}... "
@@ -3913,6 +4298,7 @@ def main():
             "budget": budget,
             "cached_files": cached_files,
             "recent_rpc_ms": 0.0,  # Phase H — populated by heartbeat as data accrues
+            "residency": daemon.residency,
         }
         try:
             activation_endpoint = activation_endpoint_from_env()
@@ -3998,9 +4384,16 @@ def main():
                 "but no worker Ed25519 key is available (auth module "
                 "missing or key load failed)."
             )
-        registered_ok = bool(register_with_pillar(args.pillar_url, register_payload,
-                                                  priv_key=worker_priv, node_id=node_id,
-                                                  spki_hash=spki_hash))
+        def register_current_residency():
+            # Registration retries may overlap an idle transition. Never
+            # replay the startup value after the daemon has entered standby.
+            register_payload["residency"] = daemon.residency
+            return register_with_pillar(
+                args.pillar_url, register_payload,
+                priv_key=worker_priv, node_id=node_id, spki_hash=spki_hash,
+            )
+
+        registered_ok = bool(register_current_residency())
 
         # Phase B (2026-05-20): start the peer-key resolver in the
         # background. The resolver caches the pillar's /peers projection
@@ -4046,8 +4439,7 @@ def main():
             threading.Thread(
                 target=_await_startup_ready, name="startup-ready", daemon=True,
                 args=(servicer,
-                      lambda: register_with_pillar(args.pillar_url, register_payload, priv_key=worker_priv,
-                                                   node_id=node_id, spki_hash=spki_hash),
+                      register_current_residency,
                       resolver, node_id, _ready_keyids),
                 kwargs={"registered": registered_ok},
             ).start()
@@ -4092,7 +4484,8 @@ def main():
             args=(args.pillar_url, heartbeat_payload, 30.0, stop_event),
             kwargs={"daemon_for_timing": daemon,
                     "priv_key": worker_priv, "node_id": node_id,
-                    "spki_hash": spki_hash},
+                    "spki_hash": spki_hash,
+                    "residency_event": residency_event},
             daemon=True,
         )
         heartbeat_thread.start()
@@ -4100,6 +4493,23 @@ def main():
               f"every 30s as {node_id} @ {public_addr}"
               + (f" (signed; pubkey={worker_pub_hex[:16]}…)" if worker_pub_hex else " (UNSIGNED)"),
               flush=True)
+
+    idle_thread = None
+    if idle_unload_s > 0:
+        idle_thread = threading.Thread(
+            target=daemon.idle_monitor_loop,
+            args=(stop_event,),
+            daemon=True,
+            name="daemon-idle-unload",
+        )
+        idle_thread.start()
+        print(
+            f"[worker] idle unload enabled: {idle_unload_s:g}s "
+            "(gRPC/TLS/heartbeat stay resident)",
+            flush=True,
+        )
+    else:
+        print("[worker] idle unload disabled; daemon remains loaded", flush=True)
 
     # 2026-05-29 fabric Phase D — bring up the fabric data plane when
     # --transport=fabric. gRPC server above stays up for Info + the
@@ -4137,6 +4547,7 @@ def main():
         server.wait_for_termination()
     finally:
         stop_event.set()
+        residency_event.set()
         if fabric_backend is not None:
             fabric_backend.stop()
         daemon.close()

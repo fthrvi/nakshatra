@@ -119,6 +119,7 @@ Proven:
 - **One way in.** The hub ran `nak invite --kind worker --tier known` and bro ran `install.py join`. The node-key-signed `/worker-redeem` on the VPS onboard server then added bro to the roster at `known`.
 - **Signed packages.** `llama32-3b` is signed by a dedicated package-signer key (`2a4d231e…`) and served from the untrusted release host (`:8960/packages/`). A remote fetch verifies the signature and every artifact's SHA-256.
 - **Pinned pillar.** Off-overlay workers reach the pillar through an nginx TLS front on the VPS (`https://45.63.109.137:7778`, forwarding to the Pi `10.42.0.3:7777`, SPKI `17c38321…`).
+- **Idle unload (step 1).** The worker now stops its GPU daemon after 600 idle seconds by default, while gRPC, TLS, heartbeat, and the verified slice stay up in standby. The first inference request re-verifies the startup SHA-256 and performs a single-flight reload; `nak worker on --idle-unload-s 0` retains permanent residency.
 
 Outsider bugs fixed in 0.12.1–0.12.3:
 - The CUDA build is capped by RAM (`WORKER_BUILD_JOBS` overrides).

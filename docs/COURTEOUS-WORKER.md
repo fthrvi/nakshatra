@@ -3,6 +3,8 @@
 **Design. 2026-09-04. Nothing here is built. Prompted by adding an RTX 5070 in WSL2 on a
 family member's gaming PC; written to hold for every consumer machine that follows.**
 
+**Status:** idle unload is built; the owner lease and platform sentinel are not.
+
 ## The problem is general, and the current rule does not solve it
 
 Every consumer machine that joins has an **owner whose use outranks ours**, and on every

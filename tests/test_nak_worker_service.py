@@ -108,6 +108,7 @@ def test_nak_worker_on_writes_env_once_and_uses_verified_installer(tmp_path, mon
     assert 'TRUSTED_PILLAR_NETS="10.42.0.0/24"' in first
     assert 'LISTEN="0.0.0.0"' in first
     assert "MODE=first" in first and "LAYER_START=0" in first and "LAYER_END=16" in first
+    assert "IDLE_UNLOAD_S=600" in first
     assert 'NAKSHATRA_P2P_WORKER_ARGS="-inbound=127.0.0.1:5530 -require-direct-activation"' in first
     assert "SUB_GGUF=" in first and "skip-sha256" not in first
     inference_env = home / ".nakshatra" / "inference.env"
@@ -224,6 +225,7 @@ def test_worker_launcher_refuses_stale_tree_and_execs_worker_without_skip(tmp_pa
     assert env["STHAMBHA_PILLAR_SPKI_SHA256"] == "ab" * 32
     assert env["NAKSHATRA_PACKAGE_URL"].endswith("package-secret")
     assert env["NAKSHATRA_LISTEN_ADDRESS"] == "[::]"
+    assert env["NAKSHATRA_WORKER_IDLE_UNLOAD_S"] == "600"
     assert env["NAKSHATRA_TLS_REQUIRED"] == "true"
     assert env["NAKSHATRA_AUTH_REQUIRED"] == "true"
     assert env["NAKSHATRA_RELEASE_SERVICE"] == "true"
@@ -405,6 +407,56 @@ def test_nak_worker_on_defaults_to_wildcard_listen(tmp_path, monkeypatch):
             "--layers", "0-16", "--port", "5530"]
     assert nak.main(argv) == 0
     assert 'LISTEN="[::]"' in (home / ".nakshatra" / "worker.env").read_text()
+
+
+def test_nak_worker_on_writes_idle_unload_override(tmp_path, monkeypatch):
+    home, prefix = tmp_path / "home", tmp_path / "node"
+    _fake_release(prefix)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("NAK_NODE_PREFIX", str(prefix))
+    monkeypatch.setattr(subprocess, "run", lambda *_args, **_kwargs:
+                        type("R", (), {"returncode": 0, "stdout": ""})())
+
+    argv = ["worker", "on", "--model-id", "qwen",
+            "--package-url", "https://models.test/qwen", "--package-pubkey", "cd" * 32,
+            "--pillar-url", "https://pillar.test", "--pillar-spki", "ab" * 32,
+            "--layers", "0-16", "--port", "5530", "--idle-unload-s", "0"]
+    assert nak.main(argv) == 0
+    assert "IDLE_UNLOAD_S=0" in (home / ".nakshatra" / "worker.env").read_text()
+
+
+def test_worker_launcher_passes_idle_unload_and_defaults_old_env_to_600(
+        tmp_path, monkeypatch):
+    root = tmp_path / "worker"
+    daemon = root / "daemon"
+    daemon.parent.mkdir(parents=True)
+    daemon.write_text("binary")
+    daemon.chmod(0o755)
+    build = root / "build.json"
+    build.write_text(json.dumps({"daemon_bin": str(daemon), "backend": "cpu",
+                                 "n_gpu_layers": 0, "engine_tree": TREE}))
+    base = tmp_path / "BASE"
+    base.write_text(f"TREE={TREE}\n")
+    worker_script = tmp_path / "worker.py"
+    worker_script.write_text("# release worker\n")
+    key = tmp_path / "worker.ed25519"
+    key.write_bytes(ed25519.Ed25519PrivateKey.generate().private_bytes_raw())
+    key.chmod(0o600)
+    args = type("Args", (), {
+        "build_json": build, "engine_base": base, "worker_root": root,
+        "worker_script": worker_script, "node_key": key, "p2p_opt_in": None,
+        "port": 5530, "sub_gguf": root / "slice.gguf", "mode": "first",
+        "layer_start": 0, "layer_end": 1, "model_id": "qwen", "n_ctx": 2048,
+    })()
+    monkeypatch.setenv("PILLAR_URL", "https://pillar.test")
+    monkeypatch.setenv("PILLAR_SPKI_SHA256", "ab" * 32)
+    monkeypatch.setenv("PACKAGE_URL", "https://models.test/qwen")
+    monkeypatch.setenv("PACKAGE_TRUSTED_PUBKEY", "cd" * 32)
+    monkeypatch.delenv("IDLE_UNLOAD_S", raising=False)
+
+    assert worker_service.worker_command(args)[1]["NAKSHATRA_WORKER_IDLE_UNLOAD_S"] == "600"
+    monkeypatch.setenv("IDLE_UNLOAD_S", "12.5")
+    assert worker_service.worker_command(args)[1]["NAKSHATRA_WORKER_IDLE_UNLOAD_S"] == "12.5"
 
 
 @pytest.mark.parametrize(("url", "pin", "trusted"), [

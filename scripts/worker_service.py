@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import ipaddress
 import json
+import math
 import os
 import re
 import stat
@@ -184,6 +185,13 @@ def worker_command(args) -> tuple[list[str], dict[str, str]]:
     if not re.fullmatch(r"[0-9a-f]{64}", package_pubkey):
         raise WorkerServiceError(
             "worker.env must set PACKAGE_TRUSTED_PUBKEY (64 hex; use `nak worker on --package-pubkey`)")
+    idle_unload_raw = os.environ.get("IDLE_UNLOAD_S", "600").strip() or "600"
+    try:
+        idle_unload_s = float(idle_unload_raw)
+    except ValueError as e:
+        raise WorkerServiceError("IDLE_UNLOAD_S must be a finite number >= 0") from e
+    if not math.isfinite(idle_unload_s) or idle_unload_s < 0:
+        raise WorkerServiceError("IDLE_UNLOAD_S must be a finite number >= 0")
 
     if not args.worker_script.is_file():
         raise WorkerServiceError(f"release worker script is missing: {args.worker_script}")
@@ -210,6 +218,7 @@ def worker_command(args) -> tuple[list[str], dict[str, str]]:
         STHAMBHA_PILLAR_SPKI_SHA256=pillar_spki,
         NAKSHATRA_PACKAGE_URL=package_url,
         NAKSHATRA_LISTEN_ADDRESS=listen_address,
+        NAKSHATRA_WORKER_IDLE_UNLOAD_S=f"{idle_unload_s:g}",
         # A signed-release worker never inherits Mode-A downgrade switches.
         NAKSHATRA_RELEASE_SERVICE="true",
         NAKSHATRA_TLS_REQUIRED="true",

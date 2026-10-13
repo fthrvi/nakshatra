@@ -19,6 +19,7 @@ import argparse
 import base64
 import hashlib
 import json
+import math
 import os
 import stat
 import re
@@ -347,6 +348,8 @@ def _worker_enable(_sp, args) -> None:
         start, end = map(int, match.groups())
         if not 1 <= args.port <= 65535:
             raise SystemExit("--port must be between 1 and 65535")
+        if not math.isfinite(args.idle_unload_s) or args.idle_unload_s < 0:
+            raise SystemExit("--idle-unload-s must be a finite number >= 0")
         model = _env_value(args.model_id, "model-id")
         package = _env_value(args.package_url, "package-url")
         pillar = _env_value(args.pillar_url, "pillar-url")
@@ -369,7 +372,7 @@ def _worker_enable(_sp, args) -> None:
                 f"PILLAR_SPKI_SHA256={pillar_spki}\nTRUSTED_PILLAR_NETS={trusted_nets}\n"
                 f"MODE={args.mode}\nPORT={args.port}\n"
                 f"LAYER_START={start}\nLAYER_END={end}\nSUB_GGUF={sub_gguf}\n"
-                f"LISTEN={listen}\n")
+                f"LISTEN={listen}\nIDLE_UNLOAD_S={args.idle_unload_s:g}\n")
         _write_private(env_path, body.encode())
     port = _worker_port(env_path)
     _set_env_assignment(
@@ -500,6 +503,8 @@ def main(argv=None, *, http_post=None) -> int:
                    help="gRPC bind address (default: [::]; use 127.0.0.1 for sidecar-only access)")
     q.add_argument("--layers", help="half-open layer range a-b (for example 0-16)")
     q.add_argument("--port", type=int)
+    q.add_argument("--idle-unload-s", type=float, default=600.0,
+                   help="seconds before an idle worker unloads GPU memory; 0 keeps it resident")
     # worker.py cannot derive its pipeline role from a layer range alone because the CLI does not
     # know the model's total layer count. Preserve the proven outsider-worker role as the default,
     # while exposing the worker.py choice for last/middle/whole-model assignments.
