@@ -116,24 +116,35 @@ def _unb64u(s: str) -> bytes:
     return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
 
 
+def _valid_worker_redeem_url(value: object) -> bool:
+    """Return whether *value* is an HTTP(S) URL with a usable host and optional port."""
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = urlsplit(value)
+        host = parsed.hostname
+        port = parsed.port  # Access validates numeric syntax and the 1-65535 upper bound.
+    except ValueError:
+        return False
+    authority = parsed.netloc.rsplit("@", 1)[-1]
+    return parsed.scheme in {"http", "https"} and bool(host) and \
+        not authority.endswith(":") and (port is None or 1 <= port <= 65535)
+
+
 def _validate_invite_kind(inv: dict) -> None:
     """Validate the U4 discriminator while treating pre-U4 invites as contacts."""
     kind = inv.get("kind", "contact")
     if kind not in {"contact", "worker"}:
         raise ValueError("invite kind is unsupported")
-    worker = inv.get("worker")
     if kind == "contact":
-        if worker is not None:
+        if "worker" in inv:
             raise ValueError("contact invite must not contain worker details")
         return
+    worker = inv.get("worker")
     if not isinstance(worker, dict) or set(worker) != {"redeem", "code", "tier"}:
         raise ValueError("worker invite details are malformed")
     redeem, code, tier = worker.get("redeem"), worker.get("code"), worker.get("tier")
-    try:
-        parsed = urlsplit(redeem)
-    except (TypeError, ValueError):
-        parsed = None
-    if parsed is None or parsed.scheme not in {"http", "https"} or not parsed.netloc:
+    if not _valid_worker_redeem_url(redeem):
         raise ValueError("worker redeem URL must be http(s)")
     if not isinstance(code, str) or not code.strip() or len(code) > 64:
         raise ValueError("worker invite code is malformed")

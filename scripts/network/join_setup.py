@@ -15,6 +15,7 @@ NAK_JOIN_NO_SYSTEMD=1 skips step 5 (tests run nakd in-process).
 from __future__ import annotations
 
 import argparse
+from http.client import HTTPException
 import json
 import os
 import stat
@@ -44,9 +45,9 @@ def _say(msg: str) -> None:  # noqa: D401
 
 
 def _http_post_json(url: str, body: dict) -> dict:
-    req = Request(url, data=json.dumps(body, sort_keys=True, separators=(",", ":")).encode(),
-                  headers={"content-type": "application/json"}, method="POST")
     try:
+        req = Request(url, data=json.dumps(body, sort_keys=True, separators=(",", ":")).encode(),
+                      headers={"content-type": "application/json"}, method="POST")
         with urlopen(req, timeout=30) as response:
             result = json.loads(response.read().decode())
     except HTTPError as e:
@@ -56,7 +57,7 @@ def _http_post_json(url: str, body: dict) -> dict:
             detail = ""
         raise WorkerRedeemError(f"onboard server refused worker admission ({e.code})" +
                                 (f": {detail}" if detail else ""))
-    except (OSError, URLError, ValueError) as e:
+    except (HTTPException, OSError, URLError, ValueError) as e:
         raise WorkerRedeemError(f"could not reach the onboard server: {e}")
     if not isinstance(result, dict):
         raise WorkerRedeemError("onboard server returned an invalid worker response")
@@ -118,7 +119,12 @@ def redeem_worker_invite(home: Path, code: str, name: str, *, http_post=None,
             "ts": int(now if now is not None else time.time())}
     canonical = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
     body["sig"] = priv.sign(canonical).hex()
-    result = (http_post or _http_post_json)(inv["worker"]["redeem"].rstrip("/") + "/worker-redeem", body)
+    try:
+        result = (http_post or _http_post_json)(inv["worker"]["redeem"].rstrip("/") + "/worker-redeem", body)
+    except WorkerRedeemError:
+        raise
+    except (HTTPException, OSError, URLError, ValueError) as e:
+        raise WorkerRedeemError(f"could not reach the onboard server: {e}")
     if not isinstance(result, dict) or not isinstance(result.get("tier"), str) or \
             not isinstance(result.get("junction"), str):
         raise WorkerRedeemError("onboard server returned no worker standing")

@@ -228,7 +228,7 @@ import threading as _th
 
 from cryptography.hazmat.primitives.asymmetric import ed25519 as _ed
 
-from joincode import encode_invite, decode_invite, InviteBook, INVITE_PREFIX  # noqa: E402
+from joincode import _canon, encode_invite, decode_invite, InviteBook, INVITE_PREFIX  # noqa: E402
 
 _NODE = "ab" * 32
 _PEERS = [{"node": "cd" * 32, "addrs": ["203.0.113.5:4433"]}]
@@ -264,6 +264,11 @@ class TestSignedInvite:
         ("contact", {"redeem": "https://x", "code": "c", "tier": "known"}, "must not"),
         ("worker", None, "details"),
         ("worker", {"redeem": "file:///tmp/x", "code": "c", "tier": "known"}, "http"),
+        ("worker", {"redeem": "http:///missing-host", "code": "c", "tier": "known"}, "http"),
+        ("worker", {"redeem": "http://host:bad", "code": "c", "tier": "known"}, "http"),
+        ("worker", {"redeem": "http://host:0", "code": "c", "tier": "known"}, "http"),
+        ("worker", {"redeem": "http://host:65536", "code": "c", "tier": "known"}, "http"),
+        ("worker", {"redeem": "http://host:", "code": "c", "tier": "known"}, "http"),
         ("worker", {"redeem": "https://x", "code": "", "tier": "known"}, "code"),
         ("worker", {"redeem": "https://x", "code": "x" * 65, "tier": "known"}, "code"),
         ("worker", {"redeem": "https://x", "code": "c", "tier": "self"}, "tier"),
@@ -272,6 +277,15 @@ class TestSignedInvite:
         k, _ = _person()
         with pytest.raises(ValueError, match=reason):
             encode_invite(k, _NODE, _PEERS, kind=kind, worker=worker, now=1000)
+
+    def test_signed_contact_cannot_carry_explicit_null_worker_details(self):
+        k, _ = _person()
+        inv = decode_invite(encode_invite(k, _NODE, _PEERS, now=1000), now=1001)
+        inv["worker"] = None
+        inv["sig"] = {"alg": "Ed25519", "keyid": inv["inviter"][:16],
+                      "value": _b64.b64encode(k.sign(_canon(inv))).decode()}
+        with pytest.raises(ValueError, match="must not contain worker details"):
+            decode_invite(_reencode(inv), now=1001)
 
     def test_tampered_peer_address_breaks_signature(self):
         k, _ = _person()

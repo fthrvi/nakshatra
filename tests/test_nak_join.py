@@ -1,6 +1,7 @@
 """The newcomer's road: one pasted line → verified installer → keys + agent → connection request."""
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import subprocess
@@ -27,6 +28,14 @@ def _invite(p, **kw):
     return joincode.encode_invite(p.person_priv, p.node.node, [{"node": p.node.node, "addrs": []}], release=REL, **kw)
 
 
+def _resign_invite(p, code, **changes):
+    body = json.loads(joincode._unb64u(code[5:]))
+    body.update(changes)
+    body["sig"] = {"alg": "Ed25519", "keyid": p.person_pub[:16],
+                   "value": base64.b64encode(p.person_priv.sign(joincode._canon(body))).decode()}
+    return "nki1." + joincode._b64u(json.dumps(body, sort_keys=True, separators=(",", ":")).encode())
+
+
 def test_installer_verifies_invites_without_cryptography(net):
     a = net("inviter")
     code = _invite(a)
@@ -45,6 +54,13 @@ def test_installer_verifies_invites_without_cryptography(net):
     worker = _invite(a, kind="worker", worker={
         "redeem": "https://onboard.example/base", "code": "one-time", "tier": "trusted"})
     assert I.parse_invite(worker)["worker"]["tier"] == "trusted"
+    with pytest.raises(I.InstallError, match="unexpected worker details"):
+        I.parse_invite(_resign_invite(a, code, worker=None))
+    for redeem in ("http:///missing-host", "http://host:bad", "http://host:0", "http://host:65536",
+                   "http://host:"):
+        with pytest.raises(I.InstallError, match="worker invite details are malformed"):
+            I.parse_invite(_resign_invite(a, worker,
+                                          worker={"redeem": redeem, "code": "one-time", "tier": "trusted"}))
     with pytest.raises(I.InstallError, match="not a Nakshatra invite"):
         I.parse_invite("hello")
 
@@ -157,17 +173,30 @@ def test_nak_worker_invite_stages_code_with_injected_http(tmp_path, monkeypatch,
 
     def fake_post(url, body):
         posted.append((url, body))
-        return {"code": "staged-once"}
+        return {"code": "staged-once", "expires_at": 1600}
 
     monkeypatch.setattr(nak, "call", fake_call)
+    monkeypatch.setattr(nak.time, "time", lambda: 1000)
     assert nak.main(["invite", "--person-key", str(person_path), "--kind", "worker", "--tier", "known",
                      "--redeem", "https://onboard.example/base", "--code-only"], http_post=fake_post) == 0
-    code = capsys.readouterr().out.strip()
-    inv = joincode.decode_invite(code)
+    output = capsys.readouterr()
+    code = output.out.strip()
+    inv = joincode.decode_invite(code, now=1001)
     assert posted == [("https://onboard.example/base/worker-stage",
                        {"token": "operator-secret", "tier": "known"})]
     assert inv["worker"] == {"redeem": "https://onboard.example/base", "code": "staged-once", "tier": "known"}
+    assert inv["expires_at"] == 1600 and "Unix 1600" in output.err
     assert registered == [code]
+
+
+def test_worker_stage_expiry_defaults_to_one_hour_and_rejects_bad_urls(monkeypatch):
+    monkeypatch.setenv("NAK_ONBOARD_TOKEN", "operator-secret")
+    worker, expires_at = nak._stage_worker(
+        "https://onboard.example/base", "known", lambda _url, _body: {"code": "staged-once"}, now=1000)
+    assert worker["code"] == "staged-once" and expires_at == 4600
+    for url in ("http:///missing-host", "http://host:bad", "http://host:0", "http://host:65536", "http://host:"):
+        with pytest.raises(SystemExit, match=r"http\(s\)"):
+            nak._stage_worker(url, "known", lambda _url, _body: {"code": "never"}, now=1000)
 
 
 def test_worker_token_file_must_be_0600(tmp_path, monkeypatch):
@@ -186,6 +215,29 @@ def test_worker_token_file_must_be_0600(tmp_path, monkeypatch):
 def test_worker_redeem_without_stored_invite_is_a_clear_cli_error(tmp_path):
     with pytest.raises(SystemExit, match="could not read a stored worker invite"):
         join_setup.retry_worker_redeem(tmp_path)
+
+
+def test_worker_redeem_converts_invalid_url_error_to_retry_guidance(net, tmp_path, monkeypatch):
+    from http.client import InvalidURL
+    from fabric import worker_join
+    a = net("inviter")
+    code = _invite(a, kind="worker", worker={
+        "redeem": "https://onboard.example/base", "code": "one-use", "tier": "known"})
+    join_setup.ensure_identity(tmp_path)
+    saved = join_setup._store_worker_invite(tmp_path, code, "GPU Friend")
+    monkeypatch.setattr(worker_join, "detect_capabilities", lambda: {"gpu": "fake", "vram_mb": 1})
+
+    def fail_url(_url, _body):
+        raise InvalidURL("nonnumeric port: 'bad'")
+
+    with pytest.raises(SystemExit, match="invite is still stored; retry: nak worker-redeem"):
+        join_setup.retry_worker_redeem(tmp_path, http_post=fail_url)
+    assert saved.exists()
+
+
+def test_worker_http_client_wraps_a_malformed_port():
+    with pytest.raises(join_setup.WorkerRedeemError, match="could not reach the onboard server"):
+        join_setup._http_post_json("http://host:bad/worker-redeem", {})
 
 
 class _WorkerOnboardHandler(BaseHTTPRequestHandler):

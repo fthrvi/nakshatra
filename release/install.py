@@ -866,16 +866,19 @@ def parse_invite(code: str, now=None) -> dict:
     worker = inv.get("worker")
     if kind not in {"contact", "worker"}:
         raise InstallError("the invite kind is not supported by this installer")
-    if kind == "contact" and worker is not None:
+    if kind == "contact" and "worker" in inv:
         raise InstallError("the contact invite contains unexpected worker details")
     if kind == "worker":
         if not isinstance(worker, dict) or set(worker) != {"redeem", "code", "tier"}:
             raise InstallError("the worker invite details are malformed")
         try:
             redeem = urlsplit(worker.get("redeem"))
+            host, port = redeem.hostname, redeem.port
+            authority = redeem.netloc.rsplit("@", 1)[-1]
         except (TypeError, ValueError):
-            redeem = None
-        if redeem is None or redeem.scheme not in {"http", "https"} or not redeem.netloc or \
+            redeem = host = port = authority = None
+        if redeem is None or redeem.scheme not in {"http", "https"} or not host or \
+                authority.endswith(":") or (port is not None and not 1 <= port <= 65535) or \
                 not isinstance(worker.get("code"), str) or not worker["code"].strip() or \
                 len(worker["code"]) > 64 or worker.get("tier") not in {"stranger", "known", "trusted"}:
             raise InstallError("the worker invite details are malformed")

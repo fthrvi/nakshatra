@@ -121,18 +121,25 @@ def _onboard_token() -> str:
     return token
 
 
-def _stage_worker(redeem: str, tier: str, http_post) -> dict:
+def _stage_worker(redeem: str, tier: str, http_post, *, now: int | None = None) -> tuple[dict, int]:
+    staged_at = int(time.time() if now is None else now)
     try:
         parsed = urlsplit(redeem)
+        host, port = parsed.hostname, parsed.port
+        authority = parsed.netloc.rsplit("@", 1)[-1]
     except (TypeError, ValueError):
-        parsed = None
-    if parsed is None or parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        parsed = host = port = authority = None
+    if parsed is None or parsed.scheme not in {"http", "https"} or not host or authority.endswith(":") or \
+            (port is not None and not 1 <= port <= 65535):
         raise SystemExit("worker redeem URL must be an http(s) base URL")
     result = http_post(redeem.rstrip("/") + "/worker-stage", {"token": _onboard_token(), "tier": tier})
     code = result.get("code") if isinstance(result, dict) else None
     if not isinstance(code, str) or not code.strip() or len(code) > 64:
         raise SystemExit("onboard server returned an invalid worker code")
-    return {"redeem": redeem.rstrip("/"), "code": code, "tier": tier}
+    expires_at = result.get("expires_at", staged_at + 3600)
+    if isinstance(expires_at, bool) or not isinstance(expires_at, int) or expires_at <= staged_at:
+        raise SystemExit("onboard server returned an invalid worker code expiry")
+    return {"redeem": redeem.rstrip("/"), "code": code, "tier": tier}, expires_at
 
 
 def _p2p_installer(_sp, action: str) -> None:
@@ -266,16 +273,26 @@ def main(argv=None, *, http_post=None) -> int:
         if not from_name:
             print("tip: add --from <your name> so your friend sees who invited them (remembered after once)",
                   file=sys.stderr)
-        worker = _stage_worker(a.redeem, a.tier, http_post) if a.kind == "worker" else None
+        issued_at = int(time.time())
+        worker, staged_expiry = _stage_worker(a.redeem, a.tier, http_post, now=issued_at) \
+            if a.kind == "worker" else (None, issued_at + a.ttl)
+        expires_at = min(issued_at + a.ttl, staged_expiry)
         code = joincode.encode_invite(priv, st["node"], [{"node": st["node"], "addrs": [st["relay"]]}],
-                                      ttl_s=a.ttl, note=a.note, release=release, from_name=from_name,
+                                      ttl_s=expires_at - issued_at, now=issued_at, note=a.note,
+                                      release=release, from_name=from_name,
                                       kind=a.kind, worker=worker)
         call(s, {"op": "register_invite", "code": code})
         if a.code_only or not line:
             print(code)
+            if a.kind == "worker":
+                print("worker invite expires at " +
+                      f"{time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(expires_at))} "
+                      f"(Unix {expires_at})", file=sys.stderr)
         else:
-            print("Send your friend this ONE line (single use, expires in "
-                  f"{a.ttl // 3600}h; it is a secret — only them):\n", file=sys.stderr)
+            expiry = (f"expires at {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(expires_at))} "
+                      f"(Unix {expires_at})" if a.kind == "worker" else f"expires in {a.ttl // 3600}h")
+            print(f"Send your friend this ONE line (single use, {expiry}; it is a secret — only them):\n",
+                  file=sys.stderr)
             print(line.replace("{CODE}", code))
             print("\nThey paste it in a terminal (Linux or WSL with systemd). When their request arrives:"
                   "  nak requests  →  nak accept <id> --as <name>", file=sys.stderr)
