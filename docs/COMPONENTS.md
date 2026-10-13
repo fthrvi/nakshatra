@@ -115,6 +115,7 @@ different NATs over IPv4 only (needs a second network).
 
 ## First outsider GPU (bro, RTX 5070, WSL; 2026-10-13)
 Proven:
+- **END TO END:** the hub asked "The capital of France is" and bro answered " Paris. The capital of Italy is Rome…" at 63 tok/s, with an 8 ms per-token RPC. The pillar served the chain, the roster firewall admitted bro (`known`) and the worker's TLS SPKI was pinned. Activations went over the sidecar FORWARD, **DIRECT via IPv6 QUIC**; the relay was used for discovery only.
 - **One way in.** The hub ran `nak invite --kind worker --tier known` and bro ran `install.py join`. The node-key-signed `/worker-redeem` on the VPS onboard server then added bro to the roster at `known`.
 - **Signed packages.** `llama32-3b` is signed by a dedicated package-signer key (`2a4d231e…`) and served from the untrusted release host (`:8960/packages/`). A remote fetch verifies the signature and every artifact's SHA-256.
 - **Pinned pillar.** Off-overlay workers reach the pillar through an nginx TLS front on the VPS (`https://45.63.109.137:7778`, forwarding to the Pi `10.42.0.3:7777`, SPKI `17c38321…`).
@@ -125,6 +126,8 @@ Outsider bugs fixed in 0.12.1–0.12.3:
 - nvcc is now found in `/usr/local/cuda*/bin`.
 
 Open:
+- **Pillar deploy drift.** The Pi pillar ran Sthambha `3a4f7bf` (09-30), which drops typed endpoints, so the chain showed `endpoint: null`. It was redeployed to `c8d62c1` with `scripts/deploy-pi.sh`. Pillar deploys need to follow Sthambha main the way releases do.
+- **Client ergonomics.** A one-off inference needs `NKS_REGISTRY_KEYID` (the hub's registrar id) and `NAKSHATRA_P2P_SOCKET` set by hand. The gateway or client should default both from the node's own release state.
 - **Roster sync.** Self-joins land in the VPS roster (`/var/lib/nakshatra-roster/peers.tsv`). Nothing brings them back to the hub's admission roster, and `roster-merge.py` only pushes git to the VPS.
 - **Worker profile weight.** The worker pulls in the `inference` profile, whose sdist-only `llama-cpp-python` compiles llama.cpp a second time. `worker.py` never imports it, so a slimmer worker profile is needed.
 - **Pillar front access.** The front is allow-listed to the home IPs for this test. Real strangers need it opened, with rate limits.
