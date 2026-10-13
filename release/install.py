@@ -170,6 +170,23 @@ def _releases_in_use(rel: Path) -> set:
     return used
 
 
+def _uv_env(prefix: Path) -> dict:
+    """Environment for every uv call. A locked sdist (llama-cpp-python) compiles C++ at one job per
+    thread by default, and on a 23 GB, 32-thread WSL box g++ died with an internal compiler error
+    (bro, 2026-10-13). Cap the build at ~3 GB per job unless the operator already chose a level."""
+    env = dict(os.environ, UV_CACHE_DIR=str(prefix / "uv-cache"))
+    if "CMAKE_BUILD_PARALLEL_LEVEL" not in env:
+        jobs = os.cpu_count() or 1
+        try:
+            with open("/proc/meminfo") as f:
+                avail_kb = next(int(line.split()[1]) for line in f if line.startswith("MemAvailable:"))
+            jobs = min(jobs, avail_kb // (3 * 1024 * 1024))
+        except (OSError, StopIteration, ValueError):
+            pass
+        env["CMAKE_BUILD_PARALLEL_LEVEL"] = str(max(1, jobs))
+    return env
+
+
 def _current(prefix: Path):
     c = prefix / "current"
     return os.readlink(c).split("/")[-1] if c.is_symlink() else None
@@ -335,7 +352,7 @@ class Installer:
         (rel / "manifest.json").write_text(json.dumps(man, indent=1, sort_keys=True))
         if self.make_venv:
             uv = str(rel / "uv")
-            env = dict(os.environ, UV_CACHE_DIR=str(self.prefix / "uv-cache"))
+            env = _uv_env(self.prefix)
             subprocess.run([uv, "venv", str(rel / "venv"), "--python", man["python"], "--quiet"], check=True, env=env)
             subprocess.run([uv, "pip", "install", "--quiet", "--require-hashes", "-r", str(lock_to_install),
                             "--python", str(rel / "venv" / "bin" / "python")], check=True, env=env)
@@ -527,7 +544,7 @@ class Installer:
         python = rel / "venv" / "bin" / "python"
         if not lock.is_file() or not uv.is_file() or not python.is_file():
             raise InstallError(f"current release cannot hydrate profile {name!r}; its lock, uv, or venv is missing")
-        env = dict(os.environ, UV_CACHE_DIR=str(self.prefix / "uv-cache"))
+        env = _uv_env(self.prefix)
         try:
             subprocess.run([str(uv), "pip", "install", "--quiet", "--require-hashes", "-r", str(lock),
                             "--python", str(python)], check=True, env=env)
