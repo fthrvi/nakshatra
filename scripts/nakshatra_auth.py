@@ -22,6 +22,7 @@ import base64
 import hashlib
 import os
 import ssl
+import stat
 import time
 from pathlib import Path
 from typing import Optional, Tuple
@@ -60,6 +61,40 @@ def public_key_hex_from_private(priv_bytes: bytes) -> str:
         encoding=serialization.Encoding.Raw,
         format=serialization.PublicFormat.Raw,
     ).hex()
+
+
+def load_worker_key(path: Optional[Path] = None) -> Tuple[bytes, str]:
+    """Strictly load an existing node key without changing its custody.
+
+    Long-running services must not silently create, rotate, or repair node identity.
+    The private seed is accepted only when it is a regular 32-byte file with mode
+    exactly 0600.  In particular, this function never chmods an operator's key.
+    """
+    key_path = Path(path) if path is not None else WORKER_KEY_PATH
+    try:
+        key_stat = key_path.stat()
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            f"worker key is missing at {key_path}; create it through the join/setup flow"
+        ) from exc
+    if not stat.S_ISREG(key_stat.st_mode):
+        raise ValueError(f"worker key at {key_path} is not a regular file; refusing")
+    mode = stat.S_IMODE(key_stat.st_mode)
+    if mode != 0o600:
+        raise PermissionError(
+            f"worker key at {key_path} has mode {mode:04o}; refusing. "
+            f"Run: chmod 600 {key_path}"
+        )
+    priv = key_path.read_bytes()
+    if len(priv) != 32:
+        raise ValueError(
+            f"worker key at {key_path} is malformed: expected a 32-byte Ed25519 seed"
+        )
+    try:
+        pub_hex = public_key_hex_from_private(priv)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"worker key at {key_path} is not a valid Ed25519 seed") from exc
+    return priv, pub_hex
 
 
 def load_or_create_worker_key(path: Path = WORKER_KEY_PATH) -> Tuple[bytes, str]:

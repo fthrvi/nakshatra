@@ -167,6 +167,23 @@
    ],
    "runtime_directory": "nakshatra"
   },
+  "nakshatra-registrar": {
+   "description": "Nakshatra signed capacity registrar",
+   "requires": "{home}/.nakshatra/registrar.env",
+   "env_file": "{home}/.nakshatra/registrar.env",
+   "after": [
+    "network-online.target"
+   ],
+   "exec": [
+    "{python}",
+    "{prefix}/current/nakshatra/scripts/registrar.py"
+   ],
+   "restart": "always",
+   "hardening": true,
+   "components": [
+    "nakshatra"
+   ]
+  },
   "nakshatra-unconscious": {
    "description": "Nakshatra inference gateway (OpenAI /v1/chat/completions over the mesh)",
    "requires": "{home}/.nakshatra/unconscious.release",

@@ -316,6 +316,83 @@ def test_meshd_and_relay_ship_in_the_release_but_only_run_where_opted_in():
         assert svc["requires"].endswith(".env") and svc["hardening"] is True and svc["restart"] == "always"
 
 
+def test_registrar_is_a_hardened_opt_in_release_service(tmp_path):
+    spec = json.loads((Path(__file__).resolve().parent.parent / "release" / "spec.json").read_text())
+    svc = spec["services"]["nakshatra-registrar"]
+    assert svc["requires"].endswith("/.nakshatra/registrar.env")
+    assert svc["env_file"] == svc["requires"]
+    assert svc["after"] == ["network-online.target"]
+    assert svc["restart"] == "always" and svc["hardening"] is True
+    assert svc["components"] == ["nakshatra"]
+    assert "profiles" not in svc and "drain" not in svc
+    assert svc["exec"][-1] == "{prefix}/current/nakshatra/scripts/registrar.py"
+
+    inst = I.Installer(tmp_path / "node", systemd=False, make_venv=False, unit_dir=tmp_path / "units")
+    man = {"components": [{"name": "nakshatra", "pythonpath": "scripts"}]}
+    text = inst._unit_text(svc, inst._ctx(man), man)
+    home = str(Path.home())
+    for line in (f"ConditionPathExists={home}/.nakshatra/registrar.env",
+                 f"EnvironmentFile=-{home}/.nakshatra/registrar.env",
+                 "After=network-online.target", "Restart=always", "ProtectSystem=strict",
+                 f"ReadWritePaths={home}/.nakshatra"):
+        assert line in text
+
+
+def test_registrar_fingerprint_tracks_only_the_nakshatra_component(tmp_path):
+    spec = json.loads((Path(__file__).resolve().parent.parent / "release" / "spec.json").read_text())
+    inst = I.Installer(tmp_path / "node", systemd=False, make_venv=False, unit_dir=tmp_path / "units")
+
+    def manifest(nak, sth):
+        return {"version": "1", "lock": {"file": "requirements.lock"}, "profiles": {},
+                "components": [{"name": "nakshatra", "commit": nak, "pythonpath": "scripts"},
+                               {"name": "sthambha", "commit": sth, "pythonpath": "."}],
+                "services": {"nakshatra-registrar": spec["services"]["nakshatra-registrar"]}}
+
+    baseline = inst._fingerprint("nakshatra-registrar", manifest("n1", "s1"))
+    assert inst._fingerprint("nakshatra-registrar", manifest("n1", "s2")) == baseline
+    assert inst._fingerprint("nakshatra-registrar", manifest("n2", "s1")) != baseline
+
+
+def test_registrar_enable_disable_is_isolated_from_other_services(tmp_path, monkeypatch):
+    spec = json.loads((Path(__file__).resolve().parent.parent / "release" / "spec.json").read_text())
+    prefix, units = tmp_path / "node", tmp_path / "units"
+    release = prefix / "releases" / "1.2.3"
+    release.mkdir(parents=True)
+    units.mkdir()
+    opt_in = tmp_path / "home" / ".nakshatra" / "registrar.env"
+    svc = dict(spec["services"]["nakshatra-registrar"], requires=str(opt_in), env_file=str(opt_in))
+    man = {"version": "1.2.3", "components": [{"name": "nakshatra", "pythonpath": "scripts"}],
+           "services": {"nakshatra-registrar": svc}}
+    (release / "manifest.json").write_text(json.dumps(man))
+    (prefix / "current").symlink_to("releases/1.2.3")
+    opt_in.parent.mkdir(parents=True)
+    opt_in.write_text("NKS_NODE_ID=test\n")
+    (units / "operator.service").write_text("operator owned\n")
+    inst = I.Installer(prefix, systemd=True, make_venv=False, unit_dir=units)
+    calls = []
+
+    def systemctl(args, **kwargs):
+        calls.append(args)
+        stdout = "ActiveState=active\nMainPID=42\nNRestarts=0\n" if "show" in args else ""
+        return type("R", (), {"returncode": 0, "stdout": stdout, "stderr": ""})()
+
+    monkeypatch.setattr(I.subprocess, "run", systemctl)
+    monkeypatch.setattr(I, "SERVICE_STABILITY_S", 0)
+    assert inst.enable("nakshatra-registrar") == "enabled nakshatra-registrar.service"
+    assert I.UNIT_MARKER in (units / "nakshatra-registrar.service").read_text()
+    assert (units / "operator.service").read_text() == "operator owned\n"
+    assert all("operator" not in " ".join(call) for call in calls)
+
+    calls.clear()
+    assert inst.disable("nakshatra-registrar") == "disabled nakshatra-registrar.service"
+    assert not opt_in.exists() and not (units / "nakshatra-registrar.service").exists()
+    assert (units / "operator.service").read_text() == "operator owned\n"
+    assert calls == [
+        ["systemctl", "--user", "disable", "--now", "nakshatra-registrar.service"],
+        ["systemctl", "--user", "daemon-reload"],
+    ]
+
+
 def test_p2p_sidecar_service_is_opt_in_and_uses_the_release_binary(tmp_path):
     spec = json.loads((Path(__file__).resolve().parent.parent / "release" / "spec.json").read_text())
     svc = spec["services"]["nakshatra-p2p"]

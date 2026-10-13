@@ -37,12 +37,14 @@ import sys
 import threading
 import time
 from pathlib import Path
+
 from typing import Callable, Optional
 
 _SCRIPTS = Path(__file__).resolve().parent.parent
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
+from nakshatra_auth import WORKER_KEY_PATH  # noqa: E402
 from cryptography.hazmat.primitives.asymmetric import ed25519  # noqa: E402
 
 import joincode  # noqa: E402
@@ -1081,7 +1083,7 @@ def main(argv=None) -> int:
     home = Path.home()
     ap = argparse.ArgumentParser(prog="nakd", description="Nakshatra messaging node")
     ap.add_argument("--state", type=Path, default=Path(os.environ.get("NAK_NET_DIR", home / ".nakshatra" / "net")))
-    ap.add_argument("--node-key", type=Path, default=home / ".nakshatra" / "keys" / "worker.ed25519")
+    ap.add_argument("--node-key", type=Path, default=WORKER_KEY_PATH)
     ap.add_argument("--signer", type=Path, default=Path(os.environ.get(
         "NAK_SIGNER_SOCK", home / ".sthambha" / "signer" / "signer.sock")))
     ap.add_argument("--agent", default=os.environ.get("NAK_AGENT", ""))

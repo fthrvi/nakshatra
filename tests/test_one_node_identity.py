@@ -43,6 +43,20 @@ def test_sidecar_peer_id_matches_go_libp2p_fixed_vector():
     assert peer_id_from_node_pub(pub) == "12D3KooWQK1wnefoLrcVHbbnf5tLzbopUd3K3bFAoJpA7YJgL5pV"
 
 
+def test_all_node_services_reference_the_one_node_key():
+    import nakshatra_auth
+    import registrar
+    import sidecar_key
+    import worker
+    from network import nakd
+
+    one = nakshatra_auth.WORKER_KEY_PATH
+    assert registrar.na.WORKER_KEY_PATH == one
+    assert worker._wauth.WORKER_KEY_PATH == one
+    assert nakd.WORKER_KEY_PATH == one
+    assert sidecar_key.WORKER_KEY_PATH == one
+
+
 def test_sidecar_if_missing_repairs_mismatched_or_corrupt_key_and_keeps_backup(tmp_path):
     import os
     from sidecar_key import libp2p_ed25519_private, main
