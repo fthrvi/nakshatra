@@ -131,5 +131,5 @@ Fixed by `client/admission-defaults`:
 Open:
 - **Pillar deploy drift.** The Pi pillar ran Sthambha `3a4f7bf` (09-30), which drops typed endpoints, so the chain showed `endpoint: null`. It was redeployed to `c8d62c1` with `scripts/deploy-pi.sh`. Pillar deploys need to follow Sthambha main the way releases do.
 - **Roster sync.** Self-joins land in the VPS roster (`/var/lib/nakshatra-roster/peers.tsv`). Nothing brings them back to the hub's admission roster, and `roster-merge.py` only pushes git to the VPS.
-- **Worker profile weight.** The worker pulls in the `inference` profile, whose sdist-only `llama-cpp-python` compiles llama.cpp a second time. `worker.py` never imports it, so a slimmer worker profile is needed.
+- **Worker profile weight — FIXED on `worker/slim-profile`.** The worker now has its own hash-locked `worker` profile (grpcio/protobuf/numpy/gguf only). `inference` is a build-checked superset when both profiles are active, so worker-only nodes no longer compile sdist-only `llama-cpp-python`.
 - **Pillar front access.** The front is allow-listed to the home IPs for this test. Real strangers need it opened, with rate limits.

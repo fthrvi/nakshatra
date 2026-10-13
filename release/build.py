@@ -21,6 +21,7 @@ import argparse
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -35,6 +36,48 @@ import releasekit as rk  # noqa: E402
 LATEST_TTL_S = 60 * 86400        # the signed "latest" pointer is refused after this (republish to extend)
 PINNED_GO_VERSION = "go1.25.7"
 SPEC = json.loads((Path(__file__).resolve().parent / "spec.json").read_text())
+_PINNED_REQUIREMENT = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([^;\s]+)$")
+
+
+def _requirement_pins(requirements: list[str], profile: str) -> dict[str, str]:
+    """Return normalized package -> exact pin for one profile's direct requirements."""
+    pins = {}
+    for requirement in requirements:
+        match = _PINNED_REQUIREMENT.fullmatch(requirement.strip())
+        if not match:
+            raise RuntimeError(
+                f"profile {profile!r} requirement {requirement!r} is not an exact name==version pin"
+            )
+        name = re.sub(r"[-_.]+", "-", match.group(1)).lower()
+        if name in pins and pins[name] != match.group(2):
+            raise RuntimeError(f"profile {profile!r} pins {name!r} more than once")
+        pins[name] = match.group(2)
+    return pins
+
+
+def _validate_profile_subsumption(profiles: dict) -> None:
+    """Prove every declared superset contains the subset's direct pins."""
+    pins = {
+        name: _requirement_pins(profile.get("requirements", []), name)
+        for name, profile in profiles.items()
+    }
+    for subset_name, subset in profiles.items():
+        satisfied_by = subset.get("satisfied_by", [])
+        if not isinstance(satisfied_by, list) or any(not isinstance(name, str) for name in satisfied_by):
+            raise RuntimeError(f"profile {subset_name!r} satisfied_by must be a list of profile names")
+        for superset_name in satisfied_by:
+            if superset_name == subset_name or superset_name not in profiles:
+                raise RuntimeError(
+                    f"profile {subset_name!r} names invalid satisfying profile {superset_name!r}"
+                )
+            superset_pins = pins[superset_name]
+            for package, pin in pins[subset_name].items():
+                if superset_pins.get(package) != pin:
+                    got = superset_pins.get(package, "missing")
+                    raise RuntimeError(
+                        f"profile {subset_name!r} claims {superset_name!r} satisfies it, but "
+                        f"{package} is pinned {pin!r} in the subset and {got!r} in the superset"
+                    )
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -104,6 +147,8 @@ def _build_go_binary(repo: Path, commit: str, source: str, out: Path, go_bin: Pa
 def build(version: str, channel: str, refs: dict, key_path: Path, out_root: Path,
           uv_bin: Path, now: int | None = None, go_bin: Path | None = None) -> Path:
     now = int(now if now is not None else time.time())
+    profile_specs = SPEC.get("profiles") or {}
+    _validate_profile_subsumption(profile_specs)
     out = out_root / channel / version
     if out.exists():
         raise SystemExit(f"{out} already exists; versions are immutable")
@@ -154,7 +199,7 @@ def build(version: str, channel: str, refs: dict, key_path: Path, out_root: Path
     # into one hash-locked file, so an opted-in node installs a single consistent environment instead of
     # layering a second resolution on top of the first.
     profiles = {}
-    for pname, prof in (SPEC.get("profiles") or {}).items():
+    for pname, prof in profile_specs.items():
         p_in = out / f"requirements-{pname}.in"
         p_in.write_text("\n".join(SPEC["requirements"] + prof["requirements"]) + "\n")
         p_lock = out / f"requirements-{pname}.lock"
@@ -162,7 +207,8 @@ def build(version: str, channel: str, refs: dict, key_path: Path, out_root: Path
                         "--python-version", SPEC["python"], "-o", str(p_lock)], check=True)
         p_in.unlink()
         profiles[pname] = {"lock": {"file": p_lock.name, "sha256": rk.sha256_file(p_lock)},
-                           "requires": prof["requires"], "description": prof.get("description", "")}
+                           "requires": prof["requires"], "description": prof.get("description", ""),
+                           "satisfied_by": list(prof.get("satisfied_by", []))}
     shutil.copy2(uv_bin, out / "uv")
     uv_version = subprocess.check_output([str(uv_bin), "--version"], text=True).split()[1]
     manifest = {"schema": rk.MANIFEST_SCHEMA, "name": SPEC["name"], "version": version, "channel": channel,

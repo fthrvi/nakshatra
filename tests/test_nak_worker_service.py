@@ -110,15 +110,19 @@ def test_nak_worker_on_writes_env_once_and_uses_verified_installer(tmp_path, mon
     assert "MODE=first" in first and "LAYER_START=0" in first and "LAYER_END=16" in first
     assert 'NAKSHATRA_P2P_WORKER_ARGS="-inbound=127.0.0.1:5530 -require-direct-activation"' in first
     assert "SUB_GGUF=" in first and "skip-sha256" not in first
-    assert (home / ".nakshatra" / "inference.env").exists()
+    inference_env = home / ".nakshatra" / "inference.env"
+    assert not inference_env.exists()
     assert (home / ".nakshatra" / "tls").is_dir()
     installer = prefix / "current" / "nakshatra" / "release" / "install.py"
     assert calls[-1] == [sys.executable, str(installer), "--prefix", str(prefix),
                          "enable", "nakshatra-worker"]
 
-    # Existing configuration is authoritative: a bare `on` is enough and does not rewrite it.
+    # Existing worker and inference configuration is authoritative: a bare `on` does not rewrite
+    # either file, and worker activation never creates or removes the gateway's profile marker.
+    inference_env.write_text("EXISTING=leave-me-alone\n")
     assert nak.main(["worker", "on"]) == 0
     assert env_path.read_text() == first
+    assert inference_env.read_text() == "EXISTING=leave-me-alone\n"
 
 
 def test_nak_worker_on_and_off_restart_opted_in_sidecar_through_installer(

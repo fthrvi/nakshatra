@@ -340,12 +340,11 @@ class Installer:
         for profile in (man.get("profiles") or {}).values():
             pf = profile["lock"]["file"]
             shutil.copy2(work / pf, rel / pf)
-        for pname in self.active_profiles(man):
-            # The profile lock is the WHOLE environment (base + profile, resolved together): install it
-            # instead of the base lock. More than one active profile would need a combined lock; refuse.
-            if lock_to_install != rel / "requirements.lock":
-                raise InstallError("more than one release profile is active on this node; not supported yet")
-            pf = man["profiles"][pname]["lock"]["file"]
+        selected_profile = self._selected_profile(man)
+        if selected_profile:
+            # A profile lock is the WHOLE environment (base + profile, resolved together). A declared
+            # superset may stand in for every active subset; unrelated active profiles remain an error.
+            pf = man["profiles"][selected_profile]["lock"]["file"]
             lock_to_install = rel / pf
         shutil.copy2(work / "uv", rel / "uv")
         os.chmod(rel / "uv", 0o755)
@@ -364,6 +363,28 @@ class Installer:
         ctx = {"home": Path.home(), "prefix": self.prefix}
         return [n for n, p in sorted((man.get("profiles") or {}).items())
                 if Path(_render(p["requires"], ctx)).exists()]
+
+    def _selected_profile(self, man: dict) -> str | None:
+        """Choose the one active lock that covers all active release profiles."""
+        active = self.active_profiles(man)
+        if not active:
+            return None
+        if len(active) == 1:
+            return active[0]
+        profiles = man.get("profiles") or {}
+        candidates = [
+            candidate for candidate in active
+            if all(
+                name == candidate
+                or candidate in profiles[name].get("satisfied_by", [])
+                for name in active
+            )
+        ]
+        if len(candidates) == 1:
+            return candidates[0]
+        raise InstallError(
+            "incompatible release profiles are active on this node: " + ", ".join(active)
+        )
 
     def _ctx(self, man: dict) -> dict:
         cur = self.prefix / "current"
@@ -534,22 +555,33 @@ class Installer:
         if not isinstance(profile, dict):
             raise InstallError(f"service requires unknown release profile {name!r}")
         marker = Path(_render(profile["requires"], self._ctx(man)))
-        if not marker.exists():
+        active = self.active_profiles(man)
+        satisfying = [candidate for candidate in profile.get("satisfied_by", []) if candidate in active]
+        if name not in active and not satisfying:
             raise InstallError(f"service profile {name!r} is not opted in: required file does not exist: {marker}")
+        selected_profile = self._selected_profile(man)
+        if selected_profile != name and selected_profile not in profile.get("satisfied_by", []):
+            raise InstallError(
+                f"active release profile {selected_profile!r} does not satisfy service profile {name!r}"
+            )
         if not self.make_venv:
             return
         rel = self.prefix / "current"
-        lock = rel / profile["lock"]["file"]
+        lock = rel / man["profiles"][selected_profile]["lock"]["file"]
         uv = rel / "uv"
         python = rel / "venv" / "bin" / "python"
         if not lock.is_file() or not uv.is_file() or not python.is_file():
-            raise InstallError(f"current release cannot hydrate profile {name!r}; its lock, uv, or venv is missing")
+            raise InstallError(
+                f"current release cannot hydrate profile {selected_profile!r}; its lock, uv, or venv is missing"
+            )
         env = _uv_env(self.prefix)
         try:
             subprocess.run([str(uv), "pip", "install", "--quiet", "--require-hashes", "-r", str(lock),
                             "--python", str(python)], check=True, env=env)
         except subprocess.CalledProcessError as e:
-            raise InstallError(f"could not install release profile {name!r}: uv exited {e.returncode}") from e
+            raise InstallError(
+                f"could not install release profile {selected_profile!r}: uv exited {e.returncode}"
+            ) from e
 
     @_locked_operation
     def enable(self, name: str) -> str:

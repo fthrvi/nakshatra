@@ -420,7 +420,14 @@ def test_worker_service_is_hardened_profiled_and_release_owned(tmp_path):
     spec = json.loads((Path(__file__).resolve().parent.parent / "release" / "spec.json").read_text())
     svc = spec["services"]["nakshatra-worker"]
     assert svc["requires"].endswith("/.nakshatra/worker.env")
-    assert svc["env_file"] == svc["requires"] and svc["profile"] == "inference"
+    assert svc["env_file"] == svc["requires"] and svc["profile"] == "worker"
+    worker_profile = spec["profiles"]["worker"]
+    assert worker_profile["requires"] == svc["requires"]
+    assert worker_profile["satisfied_by"] == ["inference"]
+    assert worker_profile["requirements"] == [
+        "grpcio==1.81.1", "protobuf==6.33.6", "numpy==1.26.4", "gguf==0.19.0"
+    ]
+    assert "llama_cpp_python==0.3.28" not in worker_profile["requirements"]
     assert svc["hardening"] is True
     assert svc["read_write_paths"] == ["{home}/.nakshatra/worker", "{home}/.nakshatra/tls"]
     assert svc["environment"]["NAKSHATRA_AUDIT_PATH"] == \
@@ -466,6 +473,93 @@ def test_enabling_a_profiled_service_installs_its_signed_lock(tmp_path, monkeypa
     assert args[:3] == [str(prefix / "current" / "uv"), "pip", "install"]
     assert "--require-hashes" in args and str(prefix / "current" / "requirements-inference.lock") in args
     assert kwargs["check"] is True
+
+
+def _profile_unpack_fixture(tmp_path, monkeypatch, *, inference: bool):
+    prefix, work = tmp_path / "node", tmp_path / "work"
+    work.mkdir()
+    worker_marker = tmp_path / "worker.env"
+    inference_marker = tmp_path / "inference.env"
+    worker_marker.write_text("")
+    if inference:
+        inference_marker.write_text("")
+    for name in ("requirements.lock", "requirements-worker.lock", "requirements-inference.lock", "uv"):
+        (work / name).write_text(name + "\n")
+    man = {
+        "version": "1.2.3",
+        "python": "3.12",
+        "components": [],
+        "lock": {"file": "requirements.lock"},
+        "profiles": {
+            "worker": {
+                "requires": str(worker_marker),
+                "lock": {"file": "requirements-worker.lock"},
+                "satisfied_by": ["inference"],
+            },
+            "inference": {
+                "requires": str(inference_marker),
+                "lock": {"file": "requirements-inference.lock"},
+                "satisfied_by": [],
+            },
+        },
+    }
+    calls = []
+    monkeypatch.setattr(I.subprocess, "run", lambda args, **kw: calls.append((args, kw)) or
+                        type("R", (), {"returncode": 0})())
+    inst = I.Installer(prefix, systemd=False, make_venv=True, unit_dir=tmp_path / "units")
+    rel = inst.unpack(man, work)
+    return inst, man, rel, calls
+
+
+def test_worker_only_node_installs_worker_lock(tmp_path, monkeypatch):
+    _inst, _man, _rel, calls = _profile_unpack_fixture(tmp_path, monkeypatch, inference=False)
+    pip = next(args for args, _kwargs in calls if "pip" in args)
+    assert str(tmp_path / "node" / "releases" / "1.2.3" / "requirements-worker.lock") in pip
+    assert not any("requirements-inference.lock" in arg for arg in pip)
+
+
+def test_inference_superset_installs_once_and_satisfies_worker_service(tmp_path, monkeypatch):
+    inst, man, rel, calls = _profile_unpack_fixture(tmp_path, monkeypatch, inference=True)
+    pip_calls = [args for args, _kwargs in calls if "pip" in args]
+    assert len(pip_calls) == 1
+    assert str(rel / "requirements-inference.lock") in pip_calls[0]
+
+    (rel / "venv" / "bin").mkdir(parents=True)
+    (rel / "venv" / "bin" / "python").write_text("")
+    (inst.prefix / "current").symlink_to("releases/1.2.3")
+    inst._ensure_service_profile({"profile": "worker"}, man)
+    assert str(inst.prefix / "current" / "requirements-inference.lock") in calls[-1][0]
+
+
+def test_active_superset_satisfies_service_without_subset_marker(tmp_path, monkeypatch):
+    inst, man, rel, calls = _profile_unpack_fixture(tmp_path, monkeypatch, inference=True)
+    Path(man["profiles"]["worker"]["requires"]).unlink()
+    (rel / "venv" / "bin").mkdir(parents=True)
+    (rel / "venv" / "bin" / "python").write_text("")
+    (inst.prefix / "current").symlink_to("releases/1.2.3")
+
+    inst._ensure_service_profile({"profile": "worker"}, man)
+
+    assert str(inst.prefix / "current" / "requirements-inference.lock") in calls[-1][0]
+
+
+def test_incompatible_active_profiles_are_still_refused(tmp_path, monkeypatch):
+    prefix, work = tmp_path / "node", tmp_path / "work"
+    work.mkdir()
+    profiles = {}
+    for name in ("worker", "analytics"):
+        marker = tmp_path / f"{name}.env"
+        marker.write_text("")
+        lock = f"requirements-{name}.lock"
+        (work / lock).write_text(lock + "\n")
+        profiles[name] = {"requires": str(marker), "lock": {"file": lock}}
+    (work / "requirements.lock").write_text("base\n")
+    (work / "uv").write_text("uv\n")
+    man = {"version": "1.2.3", "python": "3.12", "components": [],
+           "lock": {"file": "requirements.lock"}, "profiles": profiles}
+    inst = I.Installer(prefix, systemd=False, make_venv=False, unit_dir=tmp_path / "units")
+    with pytest.raises(I.InstallError, match="incompatible release profiles.*analytics, worker"):
+        inst.unpack(man, work)
 
 
 def test_go_sidecar_is_hash_covered_verified_and_installed(env, monkeypatch):
@@ -590,11 +684,20 @@ def test_units_are_written_by_the_installer_shipped_in_the_new_release(tmp_path)
     assert "write-units" in called and "--no-systemd" in called and str(tmp_path / "units") in called
 
 
-def test_a_profile_lock_is_shipped_verified_and_installed_only_where_opted_in(env, monkeypatch, tmp_path):
-    monkeypatch.setitem(B.SPEC, "profiles", {"inference": {"requirements": ["numpy==1.26.4"],
-                                                           "requires": str(tmp_path / "inference.env")}})
+def test_profile_locks_are_shipped_hashed_and_include_subsumption(env, monkeypatch, tmp_path):
+    monkeypatch.setitem(B.SPEC, "profiles", {
+        "worker": {"requirements": ["numpy==1.26.4"],
+                   "requires": str(tmp_path / "worker.env"), "satisfied_by": ["inference"]},
+        "inference": {"requirements": ["numpy==1.26.4"],
+                      "requires": str(tmp_path / "inference.env")},
+    })
     _build(env, "0.1.0")
-    man = json.loads((env["dist"] / "canary" / "0.1.0" / "manifest.json").read_text())
+    release = env["dist"] / "canary" / "0.1.0"
+    man = json.loads((release / "manifest.json").read_text())
+    assert man["profiles"]["worker"]["lock"]["file"] == "requirements-worker.lock"
+    assert man["profiles"]["worker"]["lock"]["sha256"] == \
+        rk.sha256_file(release / "requirements-worker.lock")
+    assert man["profiles"]["worker"]["satisfied_by"] == ["inference"]
     assert man["profiles"]["inference"]["lock"]["file"] == "requirements-inference.lock"
     inst = env["inst"]
     assert inst.active_profiles(man) == []                       # not opted in → lean base env
@@ -603,6 +706,17 @@ def test_a_profile_lock_is_shipped_verified_and_installed_only_where_opted_in(en
     msg = inst.install(str(env["dist"]), "canary", env["pub"])
     assert "installed 0.1.0" in msg
     assert (env["tmp"] / "node" / "releases" / "0.1.0" / "requirements-inference.lock").exists()
+
+
+def test_build_refuses_false_profile_superset_claim(env, monkeypatch, tmp_path):
+    monkeypatch.setitem(B.SPEC, "profiles", {
+        "worker": {"requirements": ["numpy==1.26.4"], "requires": str(tmp_path / "worker.env"),
+                   "satisfied_by": ["inference"]},
+        "inference": {"requirements": ["numpy==2.0.0"], "requires": str(tmp_path / "inference.env")},
+    })
+    with pytest.raises(RuntimeError, match="numpy.*1.26.4.*2.0.0"):
+        _build(env, "0.1.0")
+    assert not (env["dist"] / "canary" / "0.1.0").exists()
 
 
 def test_units_are_written_only_for_services_the_node_opted_into(tmp_path):

@@ -332,9 +332,7 @@ def _worker_enable(_sp, args) -> None:
     # useful refusal and TLS can create this node's certificate on its first start.
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     (Path.home() / ".nakshatra" / "tls").mkdir(parents=True, exist_ok=True, mode=0o700)
-    inference = Path.home() / ".nakshatra" / "inference.env"
     old_env = env_path.read_bytes() if env_path.exists() else None
-    old_inference = inference.read_bytes() if inference.exists() else None
     if old_env is None:
         missing = [name for name in ("model_id", "package_url", "package_pubkey", "pillar_url", "layers", "port")
                    if getattr(args, name) in (None, "")]
@@ -379,8 +377,6 @@ def _worker_enable(_sp, args) -> None:
         "NAKSHATRA_P2P_WORKER_ARGS",
         f"-inbound=127.0.0.1:{port} -require-direct-activation",
     )
-    if old_inference is None:
-        _write_private(inference, b"# Enables the signed release's hash-locked inference profile.\n")
     try:
         _worker_installer(_sp, "enable")
         if _p2p_enabled():
@@ -396,10 +392,6 @@ def _worker_enable(_sp, args) -> None:
             env_path.unlink(missing_ok=True)
         else:
             _write_private(env_path, old_env)
-        if old_inference is None:
-            inference.unlink(missing_ok=True)
-        else:
-            _write_private(inference, old_inference)
         if _p2p_enabled():
             try:
                 _p2p_installer(_sp, "restart")

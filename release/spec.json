@@ -252,7 +252,7 @@
    "components": [
     "nakshatra"
    ],
-   "profile": "inference"
+   "profile": "worker"
   }
  },
  "health": [
@@ -267,6 +267,19 @@
   "nak-mcp": "network.nak_mcp"
  },
  "profiles": {
+  "worker": {
+   "description": "distributed inference worker (gRPC, protobuf, numpy, GGUF); opt in with ~/.nakshatra/worker.env",
+   "requires": "{home}/.nakshatra/worker.env",
+   "requirements": [
+    "grpcio==1.81.1",
+    "protobuf==6.33.6",
+    "numpy==1.26.4",
+    "gguf==0.19.0"
+   ],
+   "satisfied_by": [
+    "inference"
+   ]
+  },
   "inference": {
    "description": "inference gateway + chain client (gRPC, numpy, tokenizer); opt in with ~/.nakshatra/inference.env",
    "requires": "{home}/.nakshatra/inference.env",
