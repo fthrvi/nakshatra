@@ -2190,6 +2190,24 @@ def register_with_pillar(pillar_url: str, payload: dict, log_prefix: str = "[wor
         return False
 
 
+def activation_endpoint_from_env(environ=None) -> Optional[dict]:
+    """Return the additive Pillar endpoint for the local libp2p sidecar.
+
+    The release derives ``NAKSHATRA_P2P_PEER_ID`` from the node key.  The
+    Pillar independently verifies that derivation against ``public_key_hex``;
+    this function only validates the line-safe representation before placing
+    it in the signed registration body.
+    """
+    environ = os.environ if environ is None else environ
+    peer_id = str(environ.get("NAKSHATRA_P2P_PEER_ID", "") or "").strip()
+    if not peer_id:
+        return None
+    if (not peer_id.isascii() or len(peer_id) > 160
+            or any(ch.isspace() or ord(ch) < 33 for ch in peer_id)):
+        raise ValueError("NAKSHATRA_P2P_PEER_ID is invalid")
+    return {"kind": "libp2p-activation-v1", "peer_id": peer_id}
+
+
 HEARTBEAT_INITIAL_INTERVAL_S = 30.0
 HEARTBEAT_MAX_INTERVAL_S = 600.0   # 10 minutes
 HEARTBEAT_BACKOFF_FACTOR = 2.0
@@ -3647,6 +3665,12 @@ def main():
             "cached_files": cached_files,
             "recent_rpc_ms": 0.0,  # Phase H — populated by heartbeat as data accrues
         }
+        try:
+            activation_endpoint = activation_endpoint_from_env()
+        except ValueError as e:
+            sys.exit(f"[worker] startup refused: {e}")
+        if activation_endpoint is not None:
+            register_payload["endpoint"] = activation_endpoint
         # Compute-lease ownership (scale-to-zero): declare to the pillar how
         # patiently it may keep this node summoned. Sent in the fabric block the
         # pillar already parses; other fabric fields keep their safe defaults.

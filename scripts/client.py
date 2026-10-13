@@ -22,6 +22,7 @@ import argparse
 import json
 import os
 import queue
+import socket
 import struct
 import sys
 import time
@@ -494,16 +495,206 @@ def _sanitize_spki(raw) -> str:
     return spki
 
 
+ACTIVATION_ENDPOINT_KIND = "libp2p-activation-v1"
+
+
+def _parse_activation_endpoint(raw) -> dict | None:
+    """Validate the additive registry endpoint used for activation streams.
+
+    Peers without an endpoint retain the legacy literal-address path.  An
+    endpoint that is present is never silently treated as a literal address:
+    unknown kinds and malformed peer ids fail closed.
+    """
+    if raw in (None, ""):
+        return None
+    if not isinstance(raw, dict):
+        raise RuntimeError("registry endpoint must be an object")
+    kind = str(raw.get("kind") or "").strip()
+    if kind != ACTIVATION_ENDPOINT_KIND:
+        raise RuntimeError(f"unsupported registry endpoint kind {kind!r}")
+    peer_id = str(raw.get("peer_id") or "").strip()
+    if (not peer_id or not peer_id.isascii() or len(peer_id) > 160
+            or any(ch.isspace() or ord(ch) < 33 for ch in peer_id)):
+        raise RuntimeError("libp2p activation endpoint has an invalid peer_id")
+    addrs = raw.get("addrs", [])
+    if addrs is None:
+        addrs = []
+    if (not isinstance(addrs, list) or len(addrs) > 8
+            or any(not isinstance(a, str) or not a or len(a) > 512
+                   for a in addrs)):
+        raise RuntimeError("libp2p activation endpoint has invalid addrs")
+    endpoint = {"kind": kind, "peer_id": peer_id}
+    if addrs:
+        endpoint["addrs"] = list(addrs)
+    return endpoint
+
+
+def _sidecar_forward(peer_id: str, socket_path: str | None = None,
+                     timeout: float = 10.0) -> tuple[str, int]:
+    """Ask the uid-protected sidecar for a cached activation forward.
+
+    The sidecar is a byte pipe only.  TLS and the registered worker SPKI are
+    still checked by :func:`_open_chain_channel` after this returns.
+    """
+    endpoint = _parse_activation_endpoint(
+        {"kind": ACTIVATION_ENDPOINT_KIND, "peer_id": peer_id})
+    socket_path = (socket_path
+                   or os.environ.get("NAKSHATRA_P2P_SOCKET", "")).strip()
+    if not socket_path:
+        raise RuntimeError(
+            "libp2p activation endpoint requires NAKSHATRA_P2P_SOCKET")
+    if not os.path.isabs(socket_path):
+        raise RuntimeError("NAKSHATRA_P2P_SOCKET must be an absolute path")
+
+    control = None
+    try:
+        control = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        control.settimeout(timeout)
+        control.connect(socket_path)
+        control.sendall(f"FORWARD {endpoint['peer_id']}\n".encode("ascii"))
+        response = b""
+        while b"\n" not in response and len(response) <= 4096:
+            chunk = control.recv(4096)
+            if not chunk:
+                break
+            response += chunk
+    except OSError as e:
+        raise RuntimeError(f"sidecar FORWARD failed: {e}") from e
+    finally:
+        if control is not None:
+            control.close()
+    if len(response) > 4096 or b"\n" not in response:
+        raise RuntimeError("sidecar FORWARD returned an unterminated response")
+    try:
+        line = response.split(b"\n", 1)[0].decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise RuntimeError("sidecar FORWARD returned non-UTF-8 data") from e
+    if line.startswith("ERR "):
+        raise RuntimeError(f"sidecar FORWARD refused {peer_id}: {line[4:]}")
+    if not line.startswith("OK "):
+        raise RuntimeError(f"sidecar FORWARD returned malformed response: {line!r}")
+    host, sep, port_text = line[3:].rpartition(":")
+    if sep != ":" or host != "127.0.0.1" or not port_text.isdigit():
+        raise RuntimeError("sidecar FORWARD did not return a loopback TCP address")
+    port = int(port_text)
+    if not 1 <= port <= 65535:
+        raise RuntimeError("sidecar FORWARD returned an invalid TCP port")
+    return host, port
+
+
+def _resolve_activation_endpoint(spec: dict, *, socket_path: str | None = None,
+                                 tls_mode: str = "auto") -> dict:
+    """Return a channel spec with a typed endpoint resolved to loopback.
+
+    Activation forwarding never weakens worker authentication: the loopback
+    listener is useful only when the eventual gRPC channel remains pinned to
+    the SPKI projected by the Pillar for that worker.
+    """
+    endpoint = _parse_activation_endpoint(spec.get("endpoint"))
+    if endpoint is None:
+        return spec
+    if tls_mode == "off":
+        raise RuntimeError(
+            "libp2p activation endpoints require TLS + worker SPKI pinning")
+    if not _TLS_AVAILABLE:
+        raise RuntimeError(
+            "libp2p activation endpoint cannot be used without nakshatra_tls")
+    if not _sanitize_spki(spec.get("peer_spki_hash")):
+        raise RuntimeError(
+            "libp2p activation endpoint has no valid registered worker SPKI")
+    host, port = _sidecar_forward(endpoint["peer_id"], socket_path=socket_path)
+    resolved = dict(spec)
+    resolved["address"] = host
+    resolved["port"] = port
+    return resolved
+
+
+def _fetch_registry_peers(registry_url: str, model_id: str = "") -> list[dict]:
+    suffix = f"?model={model_id}" if model_id else ""
+    url = f"{registry_url.rstrip('/')}/peers{suffix}"
+    with _registry_urlopen(url, timeout=10) as resp:
+        data = json.loads(resp.read())
+    peers = (data or {}).get("peers", [])
+    return [p for p in peers if isinstance(p, dict)]
+
+
+def _admit_activation_workers(model_id: str, workers: list[dict],
+                              peers: list[dict], *, roster_loader=None,
+                              eligible_fn=None) -> None:
+    """Apply the operator roster firewall to every typed activation hop.
+
+    The Pillar supplies identity and reachability facts.  Trust tier comes
+    exclusively from the operator-curated roster; a peer-projected ``tier``
+    field is deliberately ignored.
+    """
+    typed = [w for w in workers if w.get("endpoint") is not None]
+    if not typed:
+        return
+    from fabric import worker_join as wj
+
+    by_node = {str(p.get("node_id") or p.get("id") or ""): p for p in peers}
+
+    if roster_loader is None:
+        admission = wj._load_admission()
+        roster_loader = admission.load_peers
+    roster = roster_loader() or {}
+    standings = []
+    for hop in typed:
+        endpoint = _parse_activation_endpoint(hop.get("endpoint"))
+        node_id = str(hop.get("node_id") or hop.get("id") or "")
+        peer = by_node.get(node_id)
+        if peer is None:
+            raise PermissionError(
+                f"identity firewall: activation peer {node_id!r} is absent from /peers")
+        projected = _parse_activation_endpoint(peer.get("endpoint"))
+        if projected is None or projected["peer_id"] != endpoint["peer_id"]:
+            raise PermissionError(
+                f"identity firewall: endpoint mismatch for activation peer {node_id!r}")
+        pubkey = str(peer.get("public_key_hex") or "").strip().lower()
+        if not pubkey:
+            raise PermissionError(
+                f"identity firewall: activation peer {node_id!r} has no node public key")
+        registered_spki = _sanitize_spki(peer.get("peer_spki_hash"))
+        inline_spki = _sanitize_spki(hop.get("peer_spki_hash"))
+        if not registered_spki:
+            raise PermissionError(
+                f"identity firewall: activation peer {node_id!r} has no registered worker SPKI")
+        if inline_spki and inline_spki != registered_spki:
+            raise PermissionError(
+                f"identity firewall: SPKI mismatch for activation peer {node_id!r}")
+        hop["peer_spki_hash"] = registered_spki
+        roster_peer = roster.get(pubkey)
+        standing = wj.WorkerStanding(
+            node_id=node_id, pubkey=pubkey, admitted=roster_peer is not None,
+            tier=(roster_peer or {}).get("tier", "denied"),
+            tenant=(roster_peer or {}).get("tenant"), capabilities={})
+        standings.append(standing)
+
+    if eligible_fn is None:
+        eligible, rejected = wj.eligible_workers(model_id, standings)
+    else:
+        eligible, rejected = eligible_fn(model_id, standings)
+    eligible_identities = {(w.node_id, w.pubkey) for w in eligible}
+    refused = [w for w in standings
+               if (w.node_id, w.pubkey) not in eligible_identities]
+    if refused:
+        reasons = {r.get("worker"): r.get("reason") for r in rejected}
+        detail = ", ".join(
+            f"{w.node_id}: {reasons.get(w.node_id, 'not eligible')}" for w in refused)
+        raise PermissionError(
+            f"identity firewall: activation chain is not eligible for {model_id!r}: {detail}")
+
+
 def _fetch_spki_index(registry_url: str) -> dict[str, str]:
     """2026-05-26 SPKI — query the pillar's /peers projection once and
-    build an ``address → peer_spki_hash`` index.
+    build an identity-first ``node_id/PeerId → peer_spki_hash`` index.
 
     The pillar's /chain endpoint doesn't include peer_spki_hash in its
     chain entries (that's a sthambha-side extension we haven't shipped
     yet), so we get the hashes the same way :class:`PillarPeerKeyResolver`
-    does on the worker side — a separate /peers fetch. The map is keyed
-    by the same ``"host:port"`` string the chain entries carry, so the
-    caller can do a flat lookup.
+    does on the worker side — a separate /peers fetch. Literal address keys
+    remain as a legacy fallback, but typed activation endpoints use stable
+    node/peer identities because their loopback port is dynamic.
 
     Returns ``{}`` on failure or missing fields rather than raising —
     --tls-mode=auto then transparently degrades to plaintext for any
@@ -523,9 +714,19 @@ def _fetch_spki_index(registry_url: str) -> dict[str, str]:
         if not isinstance(peer, dict):
             continue
         address = str(peer.get("address") or "").strip()
+        node_id = str(peer.get("node_id") or "").strip()
+        try:
+            endpoint = _parse_activation_endpoint(peer.get("endpoint"))
+        except RuntimeError:
+            endpoint = None
         spki = _sanitize_spki(peer.get("peer_spki_hash"))
-        if address and spki:
-            index[address] = spki
+        if spki:
+            if node_id:
+                index[node_id] = spki
+            if endpoint is not None:
+                index[endpoint["peer_id"]] = spki
+            if address:  # legacy pillars/chains remain address-keyed
+                index[address] = spki
     return index
 
 
@@ -600,18 +801,22 @@ def _try_pillar_chain(registry_url: str, model_id: str) -> list | None:
         print(f"[chain] WARNING (from pillar): {warn}", file=sys.stderr)
     workers = []
     for c in chain:
+        endpoint = _parse_activation_endpoint(c.get("endpoint"))
         host, _, port = (c.get("address") or "").rpartition(":")
-        if not port:
+        if endpoint is None and not port:
             raise RuntimeError(
                 f"pillar returned malformed chain entry for "
                 f"{c.get('node_id')!r}: address={c.get('address')!r}"
             )
         workers.append({
             "id": (c.get("node_id") or "")[:14],
+            "node_id": str(c.get("node_id") or ""),
             "address": host,
-            "port": int(port),
+            "port": int(port) if port else 0,
             "layer_start": int(c["layer_start"]),
             "layer_end": int(c["layer_end"]),
+            "endpoint": endpoint,
+            "public_key_hex": str(c.get("public_key_hex") or ""),
             # 2026-05-26 SPKI Phase 4 — pillar's /chain projection ships
             # peer_spki_hash inline (sthambha commit added the field
             # alongside this one). Older pillars omit it; that's still
@@ -623,7 +828,8 @@ def _try_pillar_chain(registry_url: str, model_id: str) -> list | None:
     return workers
 
 
-def build_chain_from_registry(registry_url: str, model_id: str) -> list:
+def build_chain_from_registry(registry_url: str, model_id: str, *,
+                              roster_loader=None, eligible_fn=None) -> list:
     """Query Sthambha registry, return a contiguous chain plan for `model_id`.
 
     Phase I: prefer the pillar's own /chain endpoint; if absent, fall
@@ -638,16 +844,19 @@ def build_chain_from_registry(registry_url: str, model_id: str) -> list:
     """
     pillar_chain = _try_pillar_chain(registry_url, model_id)
     if pillar_chain is not None:
+        if any(w.get("endpoint") is not None for w in pillar_chain):
+            peers = _fetch_registry_peers(registry_url, model_id)
+            _admit_activation_workers(
+                model_id, pillar_chain, peers, roster_loader=roster_loader,
+                eligible_fn=eligible_fn)
         print(f"[chain] using pillar-served chain plan ({len(pillar_chain)} workers)")
         return pillar_chain
 
-    url = f"{registry_url.rstrip('/')}/peers?model={model_id}"
-    with _registry_urlopen(url, timeout=10) as resp:
-        data = json.loads(resp.read())
+    peers = _fetch_registry_peers(registry_url, model_id)
 
     # Collect (peer, offering) pairs from online compute peers
     pairs = []
-    for p in data.get("peers", []):
+    for p in peers:
         if not p.get("is_online"):
             continue
         for o in p.get("layer_offerings", []):
@@ -675,8 +884,9 @@ def build_chain_from_registry(registry_url: str, model_id: str) -> list:
     saw_drifty = False
     for peer, offering in pairs:
         if offering["layer_start"] == cursor and peer["node_id"] not in used_node_ids:
-            host, _, port = peer["address"].rpartition(":")
-            if not port:
+            endpoint = _parse_activation_endpoint(peer.get("endpoint"))
+            host, _, port = str(peer.get("address") or "").rpartition(":")
+            if endpoint is None and not port:
                 raise RuntimeError(f"peer {peer['node_id']!r} has malformed address {peer['address']!r} (expected host:port)")
             score = _peer_chain_score(peer)
             if score == 2:
@@ -689,10 +899,13 @@ def build_chain_from_registry(registry_url: str, model_id: str) -> list:
                       file=sys.stderr)
             chain.append({
                 "id": peer["node_id"][:14],
+                "node_id": str(peer["node_id"]),
                 "address": host,
-                "port": int(port),
+                "port": int(port) if port else 0,
                 "layer_start": offering["layer_start"],
                 "layer_end": offering["layer_end"],
+                "endpoint": endpoint,
+                "public_key_hex": str(peer.get("public_key_hex") or ""),
                 # 2026-05-26 SPKI: take it straight from the /peers
                 # payload we already loaded. defensive parse mirrors
                 # _fetch_spki_index for the pillar-served chain path.
@@ -708,6 +921,10 @@ def build_chain_from_registry(registry_url: str, model_id: str) -> list:
 
     if not chain:
         raise RuntimeError(f"no peer offers layer 0 of model {model_id!r}; cannot start chain")
+
+    _admit_activation_workers(
+        model_id, chain, peers, roster_loader=roster_loader,
+        eligible_fn=eligible_fn)
 
     return chain
 
@@ -850,7 +1067,12 @@ def main():
             spki_index = _fetch_spki_index(args.registry)
             for w in workers:
                 addr = f"{w['address']}:{w['port']}"
-                from_index = spki_index.get(addr, "")
+                endpoint = w.get("endpoint") or {}
+                from_index = (
+                    spki_index.get(w.get("node_id") or w.get("id") or "", "")
+                    or spki_index.get(endpoint.get("peer_id") or "", "")
+                    or spki_index.get(addr, "")
+                )
                 # Don't clobber a hash the chain entry already
                 # populated with one that disagrees — surface it so
                 # the operator sees something is wrong. Equal values
@@ -869,8 +1091,27 @@ def main():
         print(f"[chain] {len(workers)} workers in config")
         # Normalize whatever the YAML carried into the same shape the
         # registry path emits — defensive parse rejects malformed hex.
+        config_candidates = []
         for w in workers:
             w["peer_spki_hash"] = _sanitize_spki(w.get("peer_spki_hash"))
+            w["endpoint"] = _parse_activation_endpoint(w.get("endpoint"))
+            config_candidates.append(w)
+            for alt in list(w.get("alternates") or []):
+                alt["peer_spki_hash"] = _sanitize_spki(
+                    alt.get("peer_spki_hash"))
+                alt["endpoint"] = _parse_activation_endpoint(
+                    alt.get("endpoint"))
+                config_candidates.append(alt)
+        if any(w.get("endpoint") is not None for w in config_candidates):
+            configured_model = str(
+                args.model_id or (cfg.get("model") or {}).get("id") or "")
+            if not configured_model:
+                raise PermissionError(
+                    "identity firewall: typed activation config needs a model id")
+            for candidate in config_candidates:
+                if candidate.get("endpoint") is not None:
+                    _admit_activation_workers(
+                        configured_model, [candidate], [candidate])
 
     # v0.5 M0.5.4 v1: alternate-worker recovery. Each worker has a list of
     # candidates: primary first, then optional alternates from yaml. A
@@ -883,8 +1124,9 @@ def main():
         # the class an alternate must match. Omitting it here silently degraded
         # the constraint to the legacy "any alternate" path (primary class None
         # → allow anything). Alternates already pass through verbatim below.
-        primary = {k: w[k] for k in ("id", "address", "port", "layer_range",
-                                       "mode", "peer_spki_hash", "drift_class")
+        primary = {k: w[k] for k in ("id", "node_id", "address", "port",
+                                       "layer_range", "mode", "peer_spki_hash",
+                                       "drift_class", "endpoint", "public_key_hex")
                    if k in w}
         primary["sub_gguf_path"] = w.get("sub_gguf_path", "")
         # Normalize per-candidate hashes too: alternates may omit the
@@ -892,6 +1134,7 @@ def main():
         # downgrade rather than silently switching to plaintext.
         for alt in list(w.get("alternates") or []):
             alt["peer_spki_hash"] = _sanitize_spki(alt.get("peer_spki_hash"))
+            alt["endpoint"] = _parse_activation_endpoint(alt.get("endpoint"))
         w["candidates"] = [primary] + list(w.get("alternates") or [])
         w["cursor"] = 0
 
@@ -905,13 +1148,16 @@ def main():
         n_embd_local = None
         for w in workers:
             spec = _spec(w)
-            addr = f"{spec['address']}:{spec['port']}"
+            resolved_spec = _resolve_activation_endpoint(
+                spec, tls_mode=args.tls_mode)
+            addr = f"{resolved_spec['address']}:{resolved_spec['port']}"
             # 2026-05-26 SPKI: build a TLS-pinned channel when we have a
             # hash, falling back per --tls-mode policy. Same channel is
             # reused by every later Forward / Inference RPC, so fixing
             # this single call site lights up the whole chain.
             ch = _open_chain_channel(
-                addr, spec.get("peer_spki_hash") or None, args.tls_mode,
+                addr, resolved_spec.get("peer_spki_hash") or None,
+                "required" if spec.get("endpoint") is not None else args.tls_mode,
             )
             stub = pb_grpc.NakshatraStub(ch)
             info = info_with_startup_wait(stub, pb.InfoRequest(), timeout=10.0)

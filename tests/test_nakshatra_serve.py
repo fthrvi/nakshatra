@@ -139,6 +139,17 @@ def test_version_constant_starts_with_nakshatra():
     assert ns.VERSION_STRING.startswith("nakshatra-")
 
 
+def test_chain_backend_passes_p2p_socket_to_client(monkeypatch):
+    monkeypatch.setenv("NAKSHATRA_P2P_SOCKET", "/run/user/1000/nakshatra/p2p.sock")
+    env = ns.ChainChatBackend._client_env()
+    assert env["NAKSHATRA_P2P_SOCKET"] == "/run/user/1000/nakshatra/p2p.sock"
+
+
+def test_chain_backend_drops_blank_p2p_socket(monkeypatch):
+    monkeypatch.setenv("NAKSHATRA_P2P_SOCKET", "   ")
+    assert "NAKSHATRA_P2P_SOCKET" not in ns.ChainChatBackend._client_env()
+
+
 def test_unknown_get_returns_404_with_json_error():
     """4xx responses MUST carry a JSON body the Ollama client can
     surface. Empty 404 bodies are a footgun for callers that try to

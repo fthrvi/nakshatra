@@ -440,6 +440,22 @@ class ChainChatBackend(ChatBackend):
             cmd += ["--registry", entry.registry_url or "", "--model-id", entry.name]
         return cmd
 
+    @staticmethod
+    def _client_env() -> dict:
+        """Environment for client.py, including the activation sidecar socket.
+
+        Keeping this explicit makes the gateway→client handoff testable and
+        prevents future subprocess hardening from accidentally dropping the
+        uid-protected control-socket setting.
+        """
+        env = os.environ.copy()
+        p2p_socket = os.environ.get("NAKSHATRA_P2P_SOCKET", "").strip()
+        if p2p_socket:
+            env["NAKSHATRA_P2P_SOCKET"] = p2p_socket
+        else:
+            env.pop("NAKSHATRA_P2P_SOCKET", None)
+        return env
+
     def _ledger_hook(self):
         """Cached credit-ledger hook. DEFAULT-OFF + FAIL-OPEN — never gates/breaks a run unless
         NAKSHATRA_CREDITS=1 (and only DENIES with NAKSHATRA_CREDITS_ENFORCE=1). A broken/absent
@@ -497,7 +513,7 @@ class ChainChatBackend(ChatBackend):
         try:
             out = subprocess.run(self._cmd(entry, prompt, max_tokens, receipt_path=rcpt),
                                  capture_output=True, text=True,
-                                 timeout=self._timeout)
+                                 timeout=self._timeout, env=self._client_env())
         except subprocess.TimeoutExpired:
             if rcpt:
                 _quiet_unlink(rcpt)
@@ -521,7 +537,7 @@ class ChainChatBackend(ChatBackend):
         import subprocess
         proc = subprocess.Popen(self._cmd(entry, prompt, max_tokens),
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                text=True)
+                                text=True, env=self._client_env())
         try:
             for line in proc.stdout:
                 m = self._STEP_RE.search(line.rstrip("\n"))
