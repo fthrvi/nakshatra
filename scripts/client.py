@@ -656,6 +656,43 @@ def _typed_push_downstream_workers(sorted_stubs: list) -> list[str]:
             if _parse_activation_endpoint(w.get("endpoint")) is not None]
 
 
+def _apply_streaming_push_gate(use_streaming_push: bool, sorted_stubs: list,
+                               *, context: str = "chain") -> bool:
+    """Return whether push remains safe for this fully resolved chain.
+
+    This gate belongs to chain setup rather than one-time session setup: an
+    alternate selected during recovery can have a different endpoint kind or
+    capability set from the primary it replaces.  Calling this after every
+    rebuild makes a legacy-to-typed downstream replacement take the same safe
+    client-relay downgrade as a typed downstream present at startup.
+    """
+    if not use_streaming_push:
+        return False
+
+    non_pushers = [w["id"] for w, _, info in sorted_stubs
+                   if "rpc_push" not in info.protocol_capabilities]
+    if non_pushers:
+        print(
+            f"[{context}] WARNING: push requested but workers lack rpc_push "
+            f"capability: {non_pushers} — downgrading session to streaming-only "
+            "(client relays per-step).",
+            file=sys.stderr,
+        )
+        return False
+
+    typed_downstream = _typed_push_downstream_workers(sorted_stubs)
+    if typed_downstream:
+        print(
+            f"[{context}] WARNING: push requested with typed activation "
+            f"downstream hops {typed_downstream}; hub-side FORWARD listeners "
+            "cannot be dialed from remote workers — downgrading session to "
+            "streaming-only (client relays per-step).",
+            file=sys.stderr,
+        )
+        return False
+    return True
+
+
 def _fetch_registry_peers(registry_url: str, model_id: str = "") -> list[dict]:
     suffix = f"?model={model_id}" if model_id else ""
     url = f"{registry_url.rstrip('/')}/peers{suffix}"
@@ -1188,9 +1225,10 @@ def main():
     def _spec(w):
         return w["candidates"][w["cursor"]]
 
-    def _setup_chain():
+    def _setup_chain(context="chain"):
         """Open channels + call Info on each worker's current candidate.
-        Returns (sorted_stubs, n_embd). Validates chain partition."""
+        Returns (sorted_stubs, n_embd). Validates chain partition and reruns
+        every transport gate for both initial setup and recovery rebuilds."""
         stubs_local = []
         n_embd_local = None
         for w in workers:
@@ -1246,6 +1284,8 @@ def main():
             sys.exit("first worker must have token_embd")
         if not sorted_local[-1][2].has_lm_head:
             sys.exit("last worker must have lm_head")
+        args.use_streaming_push = _apply_streaming_push_gate(
+            args.use_streaming_push, sorted_local, context=context)
         return sorted_local, n_embd_local
 
     def _advance_one_alternate():
@@ -1272,33 +1312,6 @@ def main():
 
     sorted_stubs, n_embd = _setup_chain()
     print(f"[chain] OK: contiguous coverage of [{sorted_stubs[0][2].layer_start}, {sorted_stubs[-1][2].layer_end})")
-
-    # v0.5 §9.1 closure — session-start capability negotiation. If the user
-    # requested push but any worker doesn't advertise rpc_push, downgrade
-    # the whole session to streaming-only mode (no per-token retry — just
-    # don't enable push). Older workers report an empty capability list,
-    # which we treat as "no streaming/push" → downgrade.
-    if args.use_streaming_push:
-        non_pushers = [w["id"] for w, _, info in sorted_stubs
-                       if "rpc_push" not in info.protocol_capabilities]
-        if non_pushers:
-            print(f"[chain] WARNING: push requested but workers lack rpc_push capability: "
-                  f"{non_pushers} — downgrading session to streaming-only "
-                  f"(client relays per-step).", file=sys.stderr)
-            args.use_streaming_push = False
-            # streaming stays on; only push is disabled
-        else:
-            typed_downstream = _typed_push_downstream_workers(sorted_stubs)
-            if typed_downstream:
-                print(
-                    "[chain] WARNING: push requested with typed activation "
-                    f"downstream hops {typed_downstream}; hub-side FORWARD "
-                    "listeners cannot be dialed from remote workers — "
-                    "downgrading session to streaming-only (client relays "
-                    "per-step).",
-                    file=sys.stderr,
-                )
-                args.use_streaming_push = False
 
     # Tokenize
     print(f"[chain] tokenizing locally")
@@ -1790,7 +1803,7 @@ def main():
                       f"(candidate {advanced['cursor']}/{len(advanced['candidates'])-1})",
                       file=sys.stderr)
                 # Re-setup chain with new candidate(s)
-                sorted_stubs[:], n_embd_new = _setup_chain()
+                sorted_stubs[:], n_embd_new = _setup_chain("recovery")
                 # n_embd shouldn't change across same-arch alternates; if it does, error.
                 if n_embd_new != n_embd:
                     sys.exit(f"[recovery] alternate has different hidden_size "

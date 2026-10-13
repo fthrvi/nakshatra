@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import io
 import json
+import struct
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -232,6 +234,127 @@ def test_push_gate_allows_typed_first_hop_when_downstream_is_legacy():
         (first, object(), object()), (last, object(), object()),
     ]) == []
     assert cli._push_dial_address(last) == "192.0.2.2:5562"
+
+
+def test_recovery_rebuild_downgrades_push_when_alternate_is_typed(capsys):
+    """The one replacement site must resolve and gate the replacement again."""
+    class Info:
+        protocol_capabilities = ["rpc_push"]
+
+    first = cli._resolve_activation_endpoint({
+        "id": "first", "address": "192.0.2.1", "port": 5561,
+    })
+    legacy_last = cli._resolve_activation_endpoint({
+        "id": "last", "address": "192.0.2.2", "port": 5562,
+    })
+    initial = [(first, object(), Info()), (legacy_last, object(), Info())]
+    assert cli._apply_streaming_push_gate(True, initial) is True
+
+    typed_alternate = {
+        "id": "last", "endpoint": _endpoint(), "peer_spki_hash": SPKI,
+        # Recovery must not reuse this stale literal address.
+        "address": "203.0.113.99", "port": 5562,
+    }
+    with patch.object(cli, "_sidecar_forward",
+                      return_value=("127.0.0.1", 43123)) as forward:
+        resolved_alternate = cli._resolve_activation_endpoint(typed_alternate)
+    rebuilt = [(first, object(), Info()),
+               (resolved_alternate, object(), Info())]
+
+    assert cli._apply_streaming_push_gate(
+        True, rebuilt, context="recovery") is False
+    assert resolved_alternate[cli._CLIENT_DIAL_ADDRESS] == "127.0.0.1:43123"
+    assert resolved_alternate[cli._PUSH_DIAL_ADDRESS] is None
+    forward.assert_called_once_with(PEER_ID, socket_path=None)
+    assert "[recovery] WARNING" in capsys.readouterr().err
+
+
+def test_client_recovery_applies_typed_gate_to_rebuilt_chain(
+        tmp_path, monkeypatch, capsys):
+    """A real recovery rebuild downgrades before constructing its next push."""
+    config = tmp_path / "chain.yaml"
+    config.write_text(
+        """\
+model:
+  id: public-model
+workers:
+  - id: first
+    address: first.example
+    port: 5561
+    layer_range: [0, 4]
+  - id: last
+    address: last.example
+    port: 5562
+    layer_range: [4, 8]
+    alternates:
+      - id: last-alt
+        address: stale.example
+        port: 5562
+        layer_range: [4, 8]
+        peer_spki_hash: """ + SPKI + """
+        endpoint:
+          kind: libp2p-activation-v1
+          peer_id: 12D3KooWorkerActivationPeer
+""",
+        encoding="utf-8",
+    )
+
+    class Tokenizer:
+        def detokenize(self, _tokens):
+            return b"generated"
+
+    class Stream:
+        def __init__(self, _stub, worker_id):
+            self.worker_id = worker_id
+
+        def close(self):
+            pass
+
+    def info_for(address):
+        first = address == "first.example:5561"
+        return SimpleNamespace(
+            protocol_capabilities=["rpc_push"], protocol_version="0.1.0",
+            layer_start=0 if first else 4, layer_end=4 if first else 8,
+            has_token_embd=first, has_lm_head=not first, hidden_size=2,
+            backend="test",
+        )
+
+    calls = []
+
+    def inference_step(streamer, _payload, n_tokens, has_token_ids, **kwargs):
+        calls.append((streamer.worker_id, bool(kwargs.get("chain"))))
+        if kwargs.get("chain"):
+            return struct.pack("<i", 201)
+        if has_token_ids:
+            return b"\x00" * (n_tokens * 2 * 4)
+        return struct.pack("<i", 202)
+
+    monkeypatch.setattr(sys, "argv", [
+        "client.py", "--config", str(config), "--model-path", "model.gguf",
+        "--use-streaming-push", "--simulate-fail-step", "1",
+        "--max-tokens", "2",
+    ])
+    with (
+        patch.object(cli, "_admit_activation_workers"),
+        patch.object(cli, "_sidecar_forward",
+                     return_value=("127.0.0.1", 43123)) as forward,
+        patch.object(cli, "_open_chain_channel", side_effect=lambda addr, *_: addr),
+        patch.object(cli.pb_grpc, "NakshatraStub", side_effect=lambda channel: channel),
+        patch.object(cli, "info_with_startup_wait",
+                     side_effect=lambda stub, *_args, **_kwargs: info_for(stub)),
+        patch.object(cli, "tokenize_local", return_value=([101], Tokenizer())),
+        patch.object(cli, "InferenceStream", Stream),
+        patch.object(cli, "call_inference_step", side_effect=inference_step),
+    ):
+        cli.main()
+
+    # First attempt used one server-to-server push.  After the typed alternate
+    # replaced the downstream hop, recovery relayed through both client streams.
+    assert calls == [("first", True), ("first", False), ("last-alt", False)]
+    forward.assert_called_once_with(PEER_ID, socket_path=None)
+    err = capsys.readouterr().err
+    assert "[recovery] WARNING: push requested with typed activation" in err
+    assert "attempts exhausted" not in err
 
 
 def test_sidecar_forward_rejects_non_loopback_reply():
