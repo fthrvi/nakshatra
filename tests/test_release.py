@@ -400,6 +400,8 @@ def test_p2p_sidecar_service_is_opt_in_and_uses_the_release_binary(tmp_path):
     assert svc["exec"][0] == "{prefix}/current/nakshatra/bin/nakshatra-sidecar"
     assert "-quic" in svc["exec"] and "-nakd-inbound=127.0.0.1:${NAK_DIRECT_PORT}" in svc["exec"]
     assert "-dial-listen=${XDG_RUNTIME_DIR}/nakshatra/p2p.sock" in svc["exec"] and "-relays=${P2P_RELAYS}" in svc["exec"]
+    assert svc["optional_env_files"] == ["{home}/.nakshatra/worker.env"]
+    assert svc["exec"][-1] == "$NAKSHATRA_P2P_WORKER_ARGS"
     pre = svc["exec_start_pre"][0]
     assert "scripts/sidecar_key.py" in " ".join(pre) and "--if-missing" in pre
     assert spec["binaries"] == [{"name": "nakshatra-sidecar", "file": "nakshatra-sidecar",
@@ -410,6 +412,8 @@ def test_p2p_sidecar_service_is_opt_in_and_uses_the_release_binary(tmp_path):
                            {"components": [{"name": "nakshatra", "pythonpath": "scripts"}]})
     assert "ExecStartPre=" in text and "sidecar_key.py" in text
     assert f"ReadWritePaths={Path.home()}/.config" in text
+    assert f"EnvironmentFile=-{Path.home()}/.nakshatra/worker.env" in text
+    assert " $NAKSHATRA_P2P_WORKER_ARGS" in text
 
 
 def test_worker_service_is_hardened_profiled_and_release_owned(tmp_path):
@@ -425,6 +429,7 @@ def test_worker_service_is_hardened_profiled_and_release_owned(tmp_path):
     assert "current/nakshatra/scripts/worker_service.py" in command
     assert "current/nakshatra/scripts/worker.py" in command
     assert "--build-json=" in command and "--engine-base=" in command and "--node-key=" in command
+    assert "--p2p-opt-in=" in command
     assert "--package-url" not in command and "--pillar-url" not in command
     assert "${PACKAGE_URL}" not in command and "${PILLAR_URL}" not in command
     assert "--skip-sha256" not in command
@@ -944,6 +949,30 @@ def test_enable_refuses_missing_opt_in_and_daemon_reload_failure(tmp_path, monke
         inst.enable("nakshatra-p2p")
     assert calls == [["systemctl", "--user", "daemon-reload"]]
     assert (units / "nakshatra-p2p.service").exists()
+
+
+def test_restart_service_rewrites_and_restarts_only_enabled_managed_unit(tmp_path, monkeypatch):
+    inst, _man, opt_in, units = _one_service_install(tmp_path)
+    opt_in.parent.mkdir(parents=True)
+    opt_in.write_text("P2P_RELAYS=test\n")
+    (units / "unrelated.service").write_text("operator owned\n")
+    calls = []
+
+    def systemctl(args, **kwargs):
+        calls.append(args)
+        stdout = "ActiveState=active\nMainPID=42\nNRestarts=0\n" if "show" in args else ""
+        return type("R", (), {"returncode": 0, "stdout": stdout, "stderr": ""})()
+
+    monkeypatch.setattr(I.subprocess, "run", systemctl)
+    monkeypatch.setattr(I, "SERVICE_STABILITY_S", 0)
+    assert inst.restart_service("nakshatra-p2p") == "restarted nakshatra-p2p.service"
+    assert calls[:3] == [
+        ["systemctl", "--user", "is-enabled", "--quiet", "nakshatra-p2p.service"],
+        ["systemctl", "--user", "daemon-reload"],
+        ["systemctl", "--user", "restart", "nakshatra-p2p.service"],
+    ]
+    assert all("unrelated" not in " ".join(call) for call in calls)
+    assert (units / "unrelated.service").read_text() == "operator owned\n"
 
 
 def test_disable_stops_removes_only_managed_unit_and_opt_in(tmp_path, monkeypatch):

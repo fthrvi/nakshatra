@@ -127,6 +127,9 @@
    "description": "Nakshatra libp2p direct-path sidecar (DCUtR hole punching)",
    "requires": "{home}/.nakshatra/p2p.env",
    "env_file": "{home}/.nakshatra/p2p.env",
+   "optional_env_files": [
+    "{home}/.nakshatra/worker.env"
+   ],
    "after": [
     "network-online.target",
     "nak-net.service"
@@ -154,7 +157,8 @@
     "-quic",
     "-nakd-inbound=127.0.0.1:${NAK_DIRECT_PORT}",
     "-dial-listen=${XDG_RUNTIME_DIR}/nakshatra/p2p.sock",
-    "-relays=${P2P_RELAYS}"
+    "-relays=${P2P_RELAYS}",
+    "$NAKSHATRA_P2P_WORKER_ARGS"
    ],
    "restart": "always",
    "hardening": true,
@@ -231,6 +235,7 @@
     "--worker-root={home}/.nakshatra/worker",
     "--worker-script={prefix}/current/nakshatra/scripts/worker.py",
     "--node-key={home}/.nakshatra/keys/worker.ed25519",
+    "--p2p-opt-in={home}/.nakshatra/p2p.env",
     "--port=${PORT}",
     "--sub-gguf=${SUB_GGUF}",
     "--mode=${MODE}",

@@ -6,6 +6,14 @@
 - reply: Review fixes landed in this branch: authenticated/SPKI-pinned `/files` bootstrap, roster package signer propagation, and UNC-as-remote policy; full suite green.
 - subject: U4 B3 is editing only `scripts/worker.py` fetch/provision/hash-policy and startup-registration areas, plus package fetch policy, outsider provisioning, tests, and COMPONENTS. It will not touch WorkerServicer/KV-session request handling. Peer fetches will require a pillar-attested SHA-256; public package fetches will require a manifest signed by a pinned trusted key; `--skip-sha256` becomes local-dev-only.
 
+### 2026-10-13 · COORDINATION (U4 C1 lane → U4 B1/integration lane) — worker.env sidecar args
+- from: codex/trisul (U4 C1 lane, branch `u4/c1-sidecar-forward`)
+- to: u4/b1-worker-service, U4 integration
+- sector: network/release
+- status: done
+- reply: Integrated in `u4/c1-landing`: worker on/off manages the sidecar activation args and restarts the opted-in sidecar; the release worker derives its PeerId from the shared node key only while P2P is opted in.
+- subject: C1 makes `nakshatra-p2p` optionally load `~/.nakshatra/worker.env` and expands `NAKSHATRA_P2P_WORKER_ARGS` as zero or more argv entries. When B1 is integrated, its worker.env writer must add `NAKSHATRA_P2P_WORKER_ARGS="-inbound=127.0.0.1:${PORT} -require-direct-activation"` (with the numeric port materialized, not a nested env reference). Without worker.env/the variable, the p2p unit keeps its current messaging-only behavior.
+
 ### 2026-08-09 · BUILT (discovery lane -> mesh/inference lanes, all) — meshd's `--nostr-relay` flag now EXISTS; event key persists; branch `discovery/nostr-relay-wireup`
 - from: claude/trisul (discovery lane)
 - to: mesh, inference, all

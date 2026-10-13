@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -123,6 +124,21 @@ func TestNakdInboundRequiresDirectConnection(t *testing.T) {
 		if got := directPathAllowed(tc.limited, tc.addr); got != tc.want {
 			t.Fatalf("directPathAllowed(%v, %q) = %v, want %v", tc.limited, tc.addr, got, tc.want)
 		}
+	}
+}
+
+func TestDirectActivationInboundIsOptIn(t *testing.T) {
+	if !activationPathAllowed(false, true, "/ip4/1.2.3.4/tcp/1/p2p-circuit") {
+		t.Fatal("legacy activation inbound stopped allowing relay circuits")
+	}
+	if activationPathAllowed(true, true, "/ip4/1.2.3.4/tcp/1") {
+		t.Fatal("strict activation inbound accepted a limited connection")
+	}
+	if activationPathAllowed(true, false, "/ip4/1.2.3.4/tcp/1/p2p-circuit") {
+		t.Fatal("strict activation inbound accepted a circuit multiaddr")
+	}
+	if !activationPathAllowed(true, false, "/ip4/1.2.3.4/tcp/1") {
+		t.Fatal("strict activation inbound rejected a direct connection")
 	}
 }
 
@@ -365,8 +381,8 @@ func TestPeerIDFixedVector(t *testing.T) {
 	}
 }
 
-func TestDialProtocolRejectsBadAndOverlongLines(t *testing.T) {
-	for _, line := range []string{"DIAL not-a-peer-id\n", "NOPE x\n", "DIAL " + strings.Repeat("x", maxDialLine) + "\n"} {
+func TestControlProtocolRejectsBadAndOverlongLines(t *testing.T) {
+	for _, line := range []string{"DIAL not-a-peer-id\n", "FORWARD not-a-peer-id\n", "NOPE x\n", "DIAL " + strings.Repeat("x", maxDialLine) + "\n"} {
 		server, client := net.Pipe()
 		go handleDialConn(nil, server, nil, time.Second, nil)
 		go func() { _, _ = io.WriteString(client, line) }()
@@ -375,6 +391,199 @@ func TestDialProtocolRejectsBadAndOverlongLines(t *testing.T) {
 		if err != nil || !strings.HasPrefix(got, "ERR ") {
 			t.Fatalf("line %q: got %q, %v", line[:min(len(line), 40)], got, err)
 		}
+	}
+}
+
+func testPeerID(t *testing.T) peer.ID {
+	t.Helper()
+	priv, _, err := crypto.GenerateEd25519Key(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := peer.IDFromPrivateKey(priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+type gatedAcceptListener struct {
+	*net.TCPListener
+	accepted chan struct{}
+	release  chan struct{}
+	once     sync.Once
+}
+
+func (l *gatedAcceptListener) Accept() (net.Conn, error) {
+	c, err := l.TCPListener.Accept()
+	if err == nil {
+		l.once.Do(func() { close(l.accepted) })
+		<-l.release
+	}
+	return c, err
+}
+
+func TestDynamicForwardsAreCachedAndLRUEvictIdle(t *testing.T) {
+	m := newForwardManager(nil, nil, time.Second, nil)
+	defer m.close()
+	clock := time.Unix(1, 0)
+	m.now = func() time.Time {
+		clock = clock.Add(time.Second)
+		return clock
+	}
+	ids := make([]peer.ID, maxDynamicForwards+1)
+	addrs := make(map[peer.ID]string)
+	for i := 0; i < maxDynamicForwards; i++ {
+		ids[i] = testPeerID(t)
+		addr, err := m.get(ids[i])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.HasPrefix(addr, "127.0.0.1:") {
+			t.Fatalf("forward address = %q, want loopback", addr)
+		}
+		addrs[ids[i]] = addr
+	}
+	if got, err := m.get(ids[0]); err != nil || got != addrs[ids[0]] {
+		t.Fatalf("cached forward = %q, %v; want %q", got, err, addrs[ids[0]])
+	}
+	ids[maxDynamicForwards] = testPeerID(t)
+	if _, err := m.get(ids[maxDynamicForwards]); err != nil {
+		t.Fatal(err)
+	}
+	m.mu.Lock()
+	_, keptRecent := m.entries[ids[0]]
+	_, evictedOldest := m.entries[ids[1]]
+	count := len(m.entries)
+	m.mu.Unlock()
+	if !keptRecent || evictedOldest || count != maxDynamicForwards {
+		t.Fatalf("LRU state: kept recent=%v, oldest present=%v, count=%d", keptRecent, evictedOldest, count)
+	}
+	if c, err := net.DialTimeout("tcp", addrs[ids[1]], 100*time.Millisecond); err == nil {
+		_ = c.Close()
+		t.Fatal("evicted forward listener still accepted connections")
+	}
+}
+
+func TestDynamicForwardAcceptIsCountedBeforeEviction(t *testing.T) {
+	priv, _, err := crypto.GenerateEd25519Key(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := newHost(priv, "/ip4/127.0.0.1/tcp/0", natOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+
+	m := newForwardManager(h, nil, 2*time.Second, nil)
+	defer m.close()
+	clock := time.Unix(1, 0)
+	m.now = func() time.Time {
+		clock = clock.Add(time.Second)
+		return clock
+	}
+	var gated *gatedAcceptListener
+	listenCalls := 0
+	m.listen = func(_, _ string) (net.Listener, error) {
+		ln, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.ParseIP("127.0.0.1")})
+		if err != nil {
+			return nil, err
+		}
+		listenCalls++
+		if listenCalls == 1 {
+			gated = &gatedAcceptListener{
+				TCPListener: ln,
+				accepted:    make(chan struct{}),
+				release:     make(chan struct{}),
+			}
+			return gated, nil
+		}
+		return ln, nil
+	}
+
+	ids := make([]peer.ID, maxDynamicForwards+1)
+	var firstAddr string
+	for i := 0; i < maxDynamicForwards; i++ {
+		ids[i] = testPeerID(t)
+		addr, err := m.get(ids[i])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i == 0 {
+			firstAddr = addr
+		}
+	}
+	client, err := net.Dial("tcp", firstAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	select {
+	case <-gated.accepted:
+	case <-time.After(time.Second):
+		t.Fatal("listener did not accept the test connection")
+	}
+
+	ids[maxDynamicForwards] = testPeerID(t)
+	evicted := make(chan error, 1)
+	go func() {
+		_, err := m.get(ids[maxDynamicForwards])
+		evicted <- err
+	}()
+	select {
+	case err := <-evicted:
+		t.Fatalf("eviction completed before accepted connection was counted: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(gated.release)
+	select {
+	case err := <-evicted:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("eviction did not resume after Accept completed")
+	}
+
+	m.mu.Lock()
+	first := m.entries[ids[0]]
+	active := 0
+	if first != nil {
+		active = first.active
+	}
+	_, evictedIdle := m.entries[ids[1]]
+	m.mu.Unlock()
+	if first == nil || active != 1 {
+		t.Fatalf("accepted forward was evicted or not counted: entry=%v active=%d", first != nil, active)
+	}
+	if evictedIdle {
+		t.Fatal("oldest idle forward was not evicted after accepted forward became busy")
+	}
+	if err := client.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Read(make([]byte, 1)); err == nil {
+		t.Fatal("unexpected data from forward")
+	} else if netErr, ok := err.(net.Error); !ok || !netErr.Timeout() {
+		t.Fatalf("accepted client was reset during eviction: %v", err)
+	}
+}
+
+func TestDynamicForwardLimitDoesNotEvictBusyEntries(t *testing.T) {
+	m := newForwardManager(nil, nil, time.Second, nil)
+	defer m.close()
+	for i := 0; i < maxDynamicForwards; i++ {
+		id := testPeerID(t)
+		if _, err := m.get(id); err != nil {
+			t.Fatal(err)
+		}
+		m.mu.Lock()
+		m.entries[id].active = 1
+		m.mu.Unlock()
+	}
+	if _, err := m.get(testPeerID(t)); err == nil || !strings.Contains(err.Error(), "busy") {
+		t.Fatalf("full busy cache error = %v", err)
 	}
 }
 
@@ -574,6 +783,125 @@ func TestDialListenerDirectRoundTrip(t *testing.T) {
 	}
 	if directConn(a, b.ID()) == nil {
 		t.Fatal("the stream was not carried by a direct connection")
+	}
+}
+
+func controlRequest(t *testing.T, socket, request string) string {
+	t.Helper()
+	c, err := net.Dial("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if _, err := io.WriteString(c, request+"\n"); err != nil {
+		t.Fatal(err)
+	}
+	line, err := bufio.NewReader(c).ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	return line
+}
+
+func TestForwardListenerDirectActivationRoundTripAndCache(t *testing.T) {
+	privA, _, err := crypto.GenerateEd25519Key(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	privB, _, err := crypto.GenerateEd25519Key(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := newHost(privA, "/ip4/127.0.0.1/tcp/0", natOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, err := newHost(privB, "/ip4/0.0.0.0/tcp/0", natOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	bAddrs := preferredDirectDialAddrs(b.Addrs())
+	if len(bAddrs) == 0 {
+		t.Skip("test host has no non-loopback LAN address")
+	}
+	a.Peerstore().AddAddrs(b.ID(), bAddrs, peerstore.PermanentAddrTTL)
+
+	echo, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer echo.Close()
+	go func() {
+		for {
+			c, err := echo.Accept()
+			if err != nil {
+				return
+			}
+			go func() { defer c.Close(); _, _ = io.Copy(c, c) }()
+		}
+	}()
+	runInboundWithPolicy(b, echo.Addr().String(), true)
+
+	sockPath := filepath.Join(t.TempDir(), "nakshatra", "p2p.sock")
+	ln, err := listenDialSocket(sockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go serveDialListener(a, ln, nil, 5*time.Second, nil)
+	request := "FORWARD " + b.ID().String()
+	line := controlRequest(t, sockPath, request)
+	if !strings.HasPrefix(line, "OK 127.0.0.1:") {
+		t.Fatalf("reply = %q", line)
+	}
+	addr := strings.TrimSpace(strings.TrimPrefix(line, "OK "))
+	if again := controlRequest(t, sockPath, request); again != line {
+		t.Fatalf("cached reply = %q, want %q", again, line)
+	}
+
+	c, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	want := []byte("inference activation over a direct libp2p stream")
+	if _, err := c.Write(want); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, len(want))
+	if _, err := io.ReadFull(c, got); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("round trip: got %q, want %q", got, want)
+	}
+	if directConn(a, b.ID()) == nil {
+		t.Fatal("activation stream was not carried by a direct connection")
+	}
+}
+
+func TestForwardRequestFailsWithoutDirectPath(t *testing.T) {
+	priv, _, err := crypto.GenerateEd25519Key(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := newHost(priv, "/ip4/127.0.0.1/tcp/0", natOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	sockPath := filepath.Join(t.TempDir(), "nakshatra", "p2p.sock")
+	ln, err := listenDialSocket(sockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go serveDialListener(h, ln, nil, 50*time.Millisecond, nil)
+	line := controlRequest(t, sockPath, "FORWARD "+testPeerID(t).String())
+	if !strings.HasPrefix(line, "ERR no direct connection") {
+		t.Fatalf("reply = %q", line)
 	}
 }
 

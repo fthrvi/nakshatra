@@ -498,6 +498,10 @@ def _sanitize_spki(raw) -> str:
 ACTIVATION_ENDPOINT_KIND = "libp2p-activation-v1"
 _CLIENT_DIAL_ADDRESS = "_client_dial_address"
 _PUSH_DIAL_ADDRESS = "_push_dial_address"
+# Keep this paired with the sidecar's Go defaultDirectWait (15 seconds).
+# FORWARD does not reply until that direct-path wait completes.
+SIDECAR_DIRECT_WAIT_S = 15.0
+SIDECAR_FORWARD_CONTROL_TIMEOUT_S = SIDECAR_DIRECT_WAIT_S + 5.0
 
 
 def _parse_activation_endpoint(raw) -> dict | None:
@@ -532,11 +536,15 @@ def _parse_activation_endpoint(raw) -> dict | None:
 
 
 def _sidecar_forward(peer_id: str, socket_path: str | None = None,
-                     timeout: float = 10.0) -> tuple[str, int]:
+                     timeout: float = SIDECAR_FORWARD_CONTROL_TIMEOUT_S) -> tuple[str, int]:
     """Ask the uid-protected sidecar for a cached activation forward.
 
     The sidecar is a byte pipe only.  TLS and the registered worker SPKI are
-    still checked by :func:`_open_chain_channel` after this returns.
+    still checked by :func:`_open_chain_channel` after this returns.  The
+    control timeout exceeds the sidecar's 15-second direct wait.  If a caller
+    overrides it with a shorter value and times out after listener creation,
+    the cached forward has no accepted client, remains idle, and is LRU-
+    evictable.
     """
     endpoint = _parse_activation_endpoint(
         {"kind": ACTIVATION_ENDPOINT_KIND, "peer_id": peer_id})

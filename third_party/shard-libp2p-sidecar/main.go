@@ -58,13 +58,17 @@ const (
 	activationProto       = "/shard/activation/1.0.0"
 	nakdProto             = "/nakshatra/nakd/1.0.0"
 	activationRelayReason = "shard activation stream"
-	forceDirectReason     = "nakd direct path"
+	forceDirectReason     = "direct sidecar path"
 	maxDialLine           = 512
 	directDialRetries     = 3
 	maxDirectDialAddrs    = 8
 	maxConcurrentDials    = 16
-	directDialRetryDelay  = 250 * time.Millisecond
-	directDialAttemptMax  = 3 * time.Second
+	maxDynamicForwards    = 32
+	// scripts/client.py's SIDECAR_FORWARD_CONTROL_TIMEOUT_S must remain longer
+	// than this default: FORWARD waits for the direct path before replying.
+	defaultDirectWait    = 15 * time.Second
+	directDialRetryDelay = 250 * time.Millisecond
+	directDialAttemptMax = 3 * time.Second
 )
 
 // openActivationStream opts into circuit-relay connections. go-libp2p marks
@@ -441,9 +445,10 @@ func main() {
 	addrFile := flag.String("addrfile", "", "write this host's dial multiaddr here (for scripting)")
 	listenAddr := flag.String("listen", "/ip4/0.0.0.0/tcp/0", "libp2p listen multiaddr; pin the port for cross-box reach, e.g. /ip4/0.0.0.0/tcp/29600")
 	inbound := flag.String("inbound", "", "tunnel: dial this local engine addr (host:port) for each inbound libp2p stream")
+	requireDirectActivation := flag.Bool("require-direct-activation", false, "refuse inbound activation streams unless their libp2p connection is direct")
 	nakdInbound := flag.String("nakd-inbound", "", "direct-only tunnel: dial this local nakd addr for each nakd libp2p stream")
-	dialListen := flag.String("dial-listen", "", "listen on this user-only UNIX socket for DIAL <peerid> requests that require a direct libp2p path")
-	directWait := flag.Duration("direct-wait", 15*time.Second, "maximum time to wait for a direct (non-relayed) connection")
+	dialListen := flag.String("dial-listen", "", "listen on this user-only UNIX socket for DIAL/FORWARD requests that require a direct libp2p path")
+	directWait := flag.Duration("direct-wait", defaultDirectWait, "maximum time to wait for a direct (non-relayed) connection")
 	var forwards stringList
 	flag.Var(&forwards, "forward", "tunnel: localAddr=peerMultiaddr — listen localAddr, carry each conn to the peer (repeatable)")
 	size := flag.Int("size", 1<<20, "self-test frame size in bytes (default 1 MiB)")
@@ -578,7 +583,7 @@ func main() {
 	// right ring neighbour over libp2p. This is what replaces wire.py's TCP.
 	if *inbound != "" || *nakdInbound != "" || *dialListen != "" || len(forwards) > 0 {
 		if *inbound != "" {
-			runInbound(h, *inbound)
+			runInboundWithPolicy(h, *inbound, *requireDirectActivation)
 		}
 		if *nakdInbound != "" {
 			runNakdInbound(h, *nakdInbound)
@@ -597,7 +602,7 @@ func main() {
 			}
 			go runForward(h, pp[0], pp[1])
 		}
-		log.Printf("tunnel up (inbound=%q nakd-inbound=%q dial-listen=%q forwards=%v)", *inbound, *nakdInbound, *dialListen, []string(forwards))
+		log.Printf("tunnel up (inbound=%q require-direct-activation=%v nakd-inbound=%q dial-listen=%q forwards=%v)", *inbound, *requireDirectActivation, *nakdInbound, *dialListen, []string(forwards))
 		select {}
 	}
 
@@ -729,23 +734,38 @@ func listenDialSocket(path string) (net.Listener, error) {
 }
 
 func parseDialLine(line []byte) (peer.ID, error) {
+	op, p, err := parseControlLine(line)
+	if err != nil {
+		return "", err
+	}
+	if op != "DIAL" {
+		return "", fmt.Errorf("want DIAL <peerid>")
+	}
+	return p, nil
+}
+
+func parseControlLine(line []byte) (string, peer.ID, error) {
 	if len(line) > maxDialLine {
-		return "", fmt.Errorf("DIAL line too long")
+		return "", "", fmt.Errorf("control line too long")
 	}
 	line = bytes.TrimSuffix(line, []byte("\n"))
 	line = bytes.TrimSuffix(line, []byte("\r"))
-	if !bytes.HasPrefix(line, []byte("DIAL ")) || len(line) == len("DIAL ") {
-		return "", fmt.Errorf("want DIAL <peerid>")
+	parts := bytes.SplitN(line, []byte(" "), 2)
+	if len(parts) != 2 || len(parts[1]) == 0 {
+		return "", "", fmt.Errorf("want DIAL or FORWARD followed by a peer id")
 	}
-	value := string(line[len("DIAL "):])
+	op, value := string(parts[0]), string(parts[1])
+	if op != "DIAL" && op != "FORWARD" {
+		return "", "", fmt.Errorf("want DIAL or FORWARD")
+	}
 	if strings.ContainsAny(value, " \t\r\n") {
-		return "", fmt.Errorf("want one peer id")
+		return "", "", fmt.Errorf("want one peer id")
 	}
 	p, err := peer.Decode(value)
 	if err != nil {
-		return "", fmt.Errorf("bad peer id: %w", err)
+		return "", "", fmt.Errorf("bad peer id: %w", err)
 	}
-	return p, nil
+	return op, p, nil
 }
 
 func writeDialError(w io.Writer, err error) {
@@ -762,6 +782,10 @@ func directPathAllowed(limited bool, remoteAddr string) bool {
 
 func isDirectConn(c network.Conn) bool {
 	return directPathAllowed(c.Stat().Limited, c.RemoteMultiaddr().String())
+}
+
+func activationPathAllowed(requireDirect, limited bool, remoteAddr string) bool {
+	return !requireDirect || directPathAllowed(limited, remoteAddr)
 }
 
 func directConn(h host.Host, p peer.ID) network.Conn {
@@ -979,12 +1003,23 @@ func waitDirect(ctx context.Context, h host.Host, p peer.ID, relays []peer.AddrI
 }
 
 func openDirectNakdStream(ctx context.Context, h host.Host, p peer.ID, relays []peer.AddrInfo, policy *outboundDialPolicy) (network.Stream, error) {
+	return openDirectStream(ctx, h, p, relays, policy, nakdProto)
+}
+
+// openDirectActivationStream deliberately differs from openActivationStream: dynamic inference
+// forwards may use a relay circuit to rendezvous for DCUtR, but activation bytes never traverse it.
+func openDirectActivationStream(ctx context.Context, h host.Host, p peer.ID, relays []peer.AddrInfo, policy *outboundDialPolicy) (network.Stream, error) {
+	return openDirectStream(ctx, h, p, relays, policy, activationProto)
+}
+
+func openDirectStream(ctx context.Context, h host.Host, p peer.ID, relays []peer.AddrInfo, policy *outboundDialPolicy, proto protocol.ID) (network.Stream, error) {
 	if err := waitDirect(ctx, h, p, relays, policy); err != nil {
 		return nil, err
 	}
 	// Unlike openActivationStream, this intentionally does NOT call WithAllowLimitedConn. A relay
-	// circuit is a limited/transient connection and may rendezvous DCUtR, but may never carry nakd data.
-	s, err := h.NewStream(ctx, p, nakdProto)
+	// circuit is a limited/transient connection and may rendezvous DCUtR, but may never carry this
+	// direct-only stream's data.
+	s, err := h.NewStream(ctx, p, proto)
 	if err != nil {
 		return nil, err
 	}
@@ -995,21 +1030,243 @@ func openDirectNakdStream(ctx context.Context, h host.Host, p peer.ID, relays []
 	return s, nil
 }
 
+type dynamicForward struct {
+	peer     peer.ID
+	listener interface {
+		net.Listener
+		SetDeadline(time.Time) error
+	}
+	lastUsed time.Time
+	active   int
+
+	// Accept must be atomic with the active-count transition. The evictor
+	// pauses the accept loop and takes this same lock before it decides that
+	// active==0, so a connection returned by Accept can never be evicted in
+	// the gap before it is counted.
+	acceptMu     sync.Mutex
+	pauseMu      sync.Mutex
+	acceptPaused bool
+	pauseCond    *sync.Cond
+}
+
+// forwardManager owns the bounded, per-PeerId loopback listeners returned by FORWARD. Entries with
+// live TCP clients are never evicted; the least-recently-used idle entry makes room at the cap.
+type forwardManager struct {
+	host       host.Host
+	relays     []peer.AddrInfo
+	directWait time.Duration
+	policy     *outboundDialPolicy
+
+	// cacheMu serializes get/evict/close operations. mu protects entry state
+	// and stays available to an Accept that is completing while eviction waits
+	// on that forward's acceptMu.
+	cacheMu sync.Mutex
+	mu      sync.Mutex
+	entries map[peer.ID]*dynamicForward
+	now     func() time.Time
+	listen  func(network, address string) (net.Listener, error)
+}
+
+func newForwardManager(h host.Host, relays []peer.AddrInfo, directWait time.Duration, policy *outboundDialPolicy) *forwardManager {
+	return &forwardManager{
+		host: h, relays: relays, directWait: directWait, policy: policy,
+		entries: make(map[peer.ID]*dynamicForward), now: time.Now, listen: net.Listen,
+	}
+}
+
+func (m *forwardManager) get(p peer.ID) (string, error) {
+	m.cacheMu.Lock()
+	defer m.cacheMu.Unlock()
+
+	m.mu.Lock()
+	if f := m.entries[p]; f != nil {
+		f.lastUsed = m.now()
+		addr := f.listener.Addr().String()
+		m.mu.Unlock()
+		return addr, nil
+	}
+	full := len(m.entries) >= maxDynamicForwards
+	m.mu.Unlock()
+	if full {
+		if err := m.evictIdle(); err != nil {
+			return "", err
+		}
+	}
+	ln, err := m.listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		return "", fmt.Errorf("listen for forward: %w", err)
+	}
+	deadlineLn, ok := ln.(interface {
+		net.Listener
+		SetDeadline(time.Time) error
+	})
+	if !ok {
+		_ = ln.Close()
+		return "", fmt.Errorf("listen for forward: listener cannot interrupt Accept")
+	}
+	f := &dynamicForward{peer: p, listener: deadlineLn}
+	f.pauseCond = sync.NewCond(&f.pauseMu)
+	m.mu.Lock()
+	f.lastUsed = m.now()
+	m.entries[p] = f
+	m.mu.Unlock()
+	go m.accept(f)
+	log.Printf("FORWARD %s: loopback listener %s", p, ln.Addr())
+	return ln.Addr().String(), nil
+}
+
+func (f *dynamicForward) waitUntilAcceptable() {
+	f.pauseMu.Lock()
+	for f.acceptPaused {
+		f.pauseCond.Wait()
+	}
+	f.pauseMu.Unlock()
+}
+
+// pauseAcceptAndLock interrupts a blocked Accept and returns holding acceptMu.
+// An Accept that already returned keeps the lock until its connection is counted.
+func (f *dynamicForward) pauseAcceptAndLock() {
+	f.pauseMu.Lock()
+	f.acceptPaused = true
+	f.pauseMu.Unlock()
+	_ = f.listener.SetDeadline(time.Now())
+	f.acceptMu.Lock()
+	_ = f.listener.SetDeadline(time.Time{})
+}
+
+func (f *dynamicForward) resumeAcceptAndUnlock() {
+	f.pauseMu.Lock()
+	f.acceptPaused = false
+	f.pauseCond.Broadcast()
+	f.pauseMu.Unlock()
+	f.acceptMu.Unlock()
+}
+
+func (m *forwardManager) evictIdle() error {
+	tried := make(map[*dynamicForward]bool)
+	for {
+		m.mu.Lock()
+		var victim *dynamicForward
+		for _, f := range m.entries {
+			if !tried[f] && f.active == 0 && (victim == nil || f.lastUsed.Before(victim.lastUsed)) {
+				victim = f
+			}
+		}
+		m.mu.Unlock()
+		if victim == nil {
+			return fmt.Errorf("all %d forwards are busy", maxDynamicForwards)
+		}
+
+		victim.pauseAcceptAndLock()
+		m.mu.Lock()
+		current := m.entries[victim.peer] == victim
+		idle := victim.active == 0
+		if current && idle {
+			delete(m.entries, victim.peer)
+		}
+		m.mu.Unlock()
+		if current && idle {
+			_ = victim.listener.Close()
+			victim.resumeAcceptAndUnlock()
+			return nil
+		}
+		victim.resumeAcceptAndUnlock()
+		tried[victim] = true
+	}
+}
+
+func (m *forwardManager) accept(f *dynamicForward) {
+	for {
+		f.waitUntilAcceptable()
+		f.acceptMu.Lock()
+		f.pauseMu.Lock()
+		paused := f.acceptPaused
+		f.pauseMu.Unlock()
+		if paused {
+			f.acceptMu.Unlock()
+			continue
+		}
+		c, err := f.listener.Accept()
+		if err != nil {
+			f.acceptMu.Unlock()
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
+			return
+		}
+		m.mu.Lock()
+		if m.entries[f.peer] != f {
+			m.mu.Unlock()
+			f.acceptMu.Unlock()
+			_ = c.Close()
+			continue
+		}
+		f.active++
+		f.lastUsed = m.now()
+		m.mu.Unlock()
+		f.acceptMu.Unlock()
+		go m.handle(f, c)
+	}
+}
+
+func (m *forwardManager) handle(f *dynamicForward, c net.Conn) {
+	defer func() {
+		m.mu.Lock()
+		f.active--
+		f.lastUsed = m.now()
+		m.mu.Unlock()
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), m.directWait)
+	defer cancel()
+	s, err := openDirectActivationStream(ctx, m.host, f.peer, m.relays, m.policy)
+	if err != nil {
+		log.Printf("FORWARD %s: no direct activation path: %v", f.peer, err)
+		_ = c.Close()
+		return
+	}
+	log.Printf("FORWARD %s: DIRECT via %s (%s)", f.peer, s.Conn().RemoteMultiaddr(), directPathKind(s.Conn().RemoteMultiaddr()))
+	pipe(c, s)
+}
+
+func (m *forwardManager) close() {
+	m.cacheMu.Lock()
+	defer m.cacheMu.Unlock()
+
+	m.mu.Lock()
+	forwards := make([]*dynamicForward, 0, len(m.entries))
+	for _, f := range m.entries {
+		forwards = append(forwards, f)
+	}
+	m.mu.Unlock()
+	for _, f := range forwards {
+		f.pauseAcceptAndLock()
+		m.mu.Lock()
+		delete(m.entries, f.peer)
+		m.mu.Unlock()
+		_ = f.listener.Close()
+		f.resumeAcceptAndUnlock()
+	}
+}
+
 func handleDialConn(h host.Host, c net.Conn, relays []peer.AddrInfo, directWait time.Duration, policy *outboundDialPolicy) {
+	handleControlConn(h, c, relays, directWait, policy, nil)
+}
+
+func handleControlConn(h host.Host, c net.Conn, relays []peer.AddrInfo, directWait time.Duration, policy *outboundDialPolicy, forwards *forwardManager) {
 	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
 	reader := bufio.NewReaderSize(c, maxDialLine+1)
 	line, err := reader.ReadSlice('\n')
 	if err == bufio.ErrBufferFull || len(line) > maxDialLine {
-		writeDialError(c, fmt.Errorf("DIAL line too long"))
+		writeDialError(c, fmt.Errorf("control line too long"))
 		c.Close()
 		return
 	}
 	if err != nil {
-		writeDialError(c, fmt.Errorf("read DIAL line: %w", err))
+		writeDialError(c, fmt.Errorf("read control line: %w", err))
 		c.Close()
 		return
 	}
-	p, err := parseDialLine(line)
+	op, p, err := parseControlLine(line)
 	if err != nil {
 		writeDialError(c, err)
 		c.Close()
@@ -1018,6 +1275,27 @@ func handleDialConn(h host.Host, c net.Conn, relays []peer.AddrInfo, directWait 
 	_ = c.SetDeadline(time.Time{})
 	ctx, cancel := context.WithTimeout(context.Background(), directWait)
 	defer cancel()
+	if op == "FORWARD" {
+		if forwards == nil {
+			writeDialError(c, fmt.Errorf("FORWARD unavailable"))
+			_ = c.Close()
+			return
+		}
+		if err := waitDirect(ctx, h, p, relays, policy); err != nil {
+			writeDialError(c, err)
+			_ = c.Close()
+			return
+		}
+		addr, err := forwards.get(p)
+		if err != nil {
+			writeDialError(c, err)
+			_ = c.Close()
+			return
+		}
+		_, _ = fmt.Fprintf(c, "OK %s\n", addr)
+		_ = c.Close()
+		return
+	}
 	s, err := openDirectNakdStream(ctx, h, p, relays, policy)
 	if err != nil {
 		writeDialError(c, err)
@@ -1036,13 +1314,15 @@ func handleDialConn(h host.Host, c net.Conn, relays []peer.AddrInfo, directWait 
 func serveDialListener(h host.Host, ln net.Listener, relays []peer.AddrInfo, directWait time.Duration, policy *outboundDialPolicy) {
 	log.Printf("dial listener on %s (direct wait %s)", ln.Addr(), directWait)
 	slots := make(chan struct{}, maxConcurrentDials)
+	forwards := newForwardManager(h, relays, directWait, policy)
+	defer forwards.close()
 	for {
 		c, err := ln.Accept()
 		if err != nil {
 			return
 		}
 		dispatchDialConn(c, slots, func(c net.Conn) {
-			handleDialConn(h, c, relays, directWait, policy)
+			handleControlConn(h, c, relays, directWait, policy, forwards)
 		})
 	}
 }
@@ -1132,7 +1412,16 @@ func runForward(h host.Host, listenAddr, peerMaddr string) {
 // runInbound pipes each inbound libp2p stream to a fresh connection to the local
 // engine — so the engine accepts on localhost, fed by its ring neighbours.
 func runInbound(h host.Host, engineAddr string) {
+	runInboundWithPolicy(h, engineAddr, false)
+}
+
+func runInboundWithPolicy(h host.Host, engineAddr string, requireDirect bool) {
 	h.SetStreamHandler(activationProto, func(s network.Stream) {
+		if !activationPathAllowed(requireDirect, s.Conn().Stat().Limited, s.Conn().RemoteMultiaddr().String()) {
+			log.Printf("refused inbound activation stream over limited/relayed connection from %s", s.Conn().RemotePeer())
+			_ = s.Reset()
+			return
+		}
 		c, err := net.Dial("tcp", engineAddr)
 		if err != nil {
 			log.Printf("inbound -> engine %s: %v", engineAddr, err)
@@ -1143,9 +1432,9 @@ func runInbound(h host.Host, engineAddr string) {
 	})
 }
 
-// runNakdInbound is deliberately separate from the activation tunnel. Inference activation streams
-// are allowed to fall back to circuit relay; nakd already has its own relay fallback, so carrying its
-// bytes over a limited circuit would waste the rendezvous relay's tight data allowance.
+// runNakdInbound is deliberately separate from the activation tunnel. Legacy activation streams can
+// still opt into relay circuits, while nakd already has its own relay fallback; carrying its bytes over
+// a limited circuit would waste the rendezvous relay's tight data allowance.
 func runNakdInbound(h host.Host, nakdAddr string) {
 	h.SetStreamHandler(nakdProto, func(s network.Stream) {
 		if !isDirectConn(s.Conn()) {

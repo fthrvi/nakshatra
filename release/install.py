@@ -382,7 +382,8 @@ class Installer:
 
     def _unit_text(self, svc: dict, ctx: dict, man: dict) -> str:
         """One systemd unit from a spec entry. Optional keys (all from the SIGNED manifest):
-        requires (opt-in per node: ConditionPathExists), after, env_file, environment {K: V},
+        requires (opt-in per node: ConditionPathExists), after, env_file, optional_env_files,
+        environment {K: V},
         restart (default on-failure), hardening (the meshd/relay sandbox: read-only home except
         ~/.nakshatra). ${VARS} pass through to systemd, which expands them from the env file."""
         unit = [f"Description={svc['description']} (managed by nakshatra-node install.py)"]
@@ -393,6 +394,8 @@ class Installer:
         service = [f"Environment=PYTHONPATH={self._pythonpath(man)}"]
         if svc.get("env_file"):
             service.append(f"EnvironmentFile=-{_render(svc['env_file'], ctx)}")
+        for path in svc.get("optional_env_files", []):
+            service.append(f"EnvironmentFile=-{_render(path, ctx)}")
         for k, v in (svc.get("environment") or {}).items():
             service.append(f"Environment={k}={_render(str(v), ctx)}")
         for command in svc.get("exec_start_pre", []):
@@ -580,6 +583,40 @@ class Installer:
             raise InstallError(f"could not fully disable {name}.service: {failure}")
         self._clear_service_issue(name)
         return f"disabled {name}.service"
+
+    @_locked_operation
+    def restart_service(self, name: str) -> str:
+        """Rewrite and restart exactly one already-enabled current-release service.
+
+        This is the narrow mutation used when an operator command changes an
+        EnvironmentFile consumed by a service.  Keeping it in the verified
+        installer preserves the signed manifest/unit boundary instead of
+        teaching callers to invoke systemctl on release-owned units directly.
+        """
+        man, svc, requires = self._current_service(name)
+        if not requires.exists():
+            raise InstallError(f"{name} is not opted in: required file does not exist: {requires}")
+        unit = self.unit_dir / f"{name}.service"
+        if not unit.exists() or not self._managed_unit(unit):
+            raise InstallError(f"{name}.service is not an enabled release-managed service")
+        enabled = subprocess.run(
+            ["systemctl", "--user", "is-enabled", "--quiet", f"{name}.service"], check=False)
+        if enabled.returncode != 0:
+            raise InstallError(f"{name}.service is not enabled")
+        self._ensure_service_profile(svc, man)
+        unit.write_text(self._unit_text(svc, self._ctx(man), man))
+        if subprocess.run(["systemctl", "--user", "daemon-reload"], check=False).returncode != 0:
+            raise InstallError("systemctl --user daemon-reload failed; service was not restarted")
+        restarted = subprocess.run(
+            ["systemctl", "--user", "restart", f"{name}.service"], check=False)
+        if restarted.returncode != 0:
+            raise InstallError(f"systemctl restart {name}.service failed with exit status {restarted.returncode}")
+        healthy, detail = self._wait_stable(name, SERVICE_ACTIVE_TIMEOUT_S, SERVICE_STABILITY_S)
+        if not healthy:
+            self._record_service_issue(name, "failed", detail)
+            raise InstallError(f"{name}.service {detail}")
+        self._clear_service_issue(name)
+        return f"restarted {name}.service"
 
     def restart(self, names: list, man: dict | None = None, *, force: bool = False) -> list:
         """Restart services only when needed, and never in the middle of a request (2026-10-03):
@@ -974,6 +1011,8 @@ def main(argv=None) -> int:
     p.add_argument("service")
     p = sub.add_parser("disable", help="stop and remove one current-release opt-in service")
     p.add_argument("service")
+    p = sub.add_parser("restart", help="rewrite and restart one enabled current-release opt-in service")
+    p.add_argument("service")
     p = sub.add_parser("join", help="join Nakshatra with an invite a friend sent you")
     p.add_argument("invite")
     p.add_argument("--name", default="", help="what your friend will see you as")
@@ -998,6 +1037,8 @@ def main(argv=None) -> int:
             print(inst.enable(a.service))
         elif a.cmd == "disable":
             print(inst.disable(a.service))
+        elif a.cmd == "restart":
+            print(inst.restart_service(a.service))
         else:
             print(json.dumps(inst.status(), indent=1))
         return 0

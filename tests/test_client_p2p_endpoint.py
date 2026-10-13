@@ -158,6 +158,8 @@ def test_sidecar_forward_socket_and_spki_preservation():
 
     assert control.sent == f"FORWARD {PEER_ID}\n".encode("ascii")
     assert control.path == "/run/user/1000/nakshatra/p2p.sock"
+    assert control.timeout == cli.SIDECAR_FORWARD_CONTROL_TIMEOUT_S == 20.0
+    assert control.timeout > cli.SIDECAR_DIRECT_WAIT_S
     assert (resolved["address"], resolved["port"]) == ("127.0.0.1", 43123)
     assert resolved[cli._CLIENT_DIAL_ADDRESS] == "127.0.0.1:43123"
     assert resolved[cli._PUSH_DIAL_ADDRESS] is None

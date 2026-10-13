@@ -108,6 +108,7 @@ def test_nak_worker_on_writes_env_once_and_uses_verified_installer(tmp_path, mon
     assert 'TRUSTED_PILLAR_NETS="10.42.0.0/24"' in first
     assert 'LISTEN="0.0.0.0"' in first
     assert "MODE=first" in first and "LAYER_START=0" in first and "LAYER_END=16" in first
+    assert 'NAKSHATRA_P2P_WORKER_ARGS="-inbound=127.0.0.1:5530 -require-direct-activation"' in first
     assert "SUB_GGUF=" in first and "skip-sha256" not in first
     assert (home / ".nakshatra" / "inference.env").exists()
     assert (home / ".nakshatra" / "tls").is_dir()
@@ -118,6 +119,59 @@ def test_nak_worker_on_writes_env_once_and_uses_verified_installer(tmp_path, mon
     # Existing configuration is authoritative: a bare `on` is enough and does not rewrite it.
     assert nak.main(["worker", "on"]) == 0
     assert env_path.read_text() == first
+
+
+def test_nak_worker_on_and_off_restart_opted_in_sidecar_through_installer(
+        tmp_path, monkeypatch):
+    home, prefix = tmp_path / "home", tmp_path / "node"
+    _fake_release(prefix)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("NAK_NODE_PREFIX", str(prefix))
+    p2p_env = home / ".nakshatra" / "p2p.env"
+    p2p_env.parent.mkdir(parents=True)
+    p2p_env.write_text("P2P_RELAYS=test\n")
+    calls = []
+
+    def run(args, **kwargs):
+        calls.append(args)
+        return type("R", (), {"returncode": 0, "stdout": ""})()
+
+    monkeypatch.setattr(subprocess, "run", run)
+    argv = ["worker", "on", "--model-id", "qwen",
+            "--package-url", "https://models.test/qwen", "--package-pubkey", "cd" * 32,
+            "--pillar-url", "https://pillar.test", "--pillar-spki", "ab" * 32,
+            "--layers", "0-16", "--port", "5530"]
+    assert nak.main(argv) == 0
+    installer = prefix / "current" / "nakshatra" / "release" / "install.py"
+    assert calls[-2:] == [
+        [sys.executable, str(installer), "--prefix", str(prefix), "enable", "nakshatra-worker"],
+        [sys.executable, str(installer), "--prefix", str(prefix), "restart", "nakshatra-p2p"],
+    ]
+
+    calls.clear()
+    assert nak.main(["worker", "off"]) == 0
+    assert "NAKSHATRA_P2P_WORKER_ARGS" not in (
+        home / ".nakshatra" / "worker.env").read_text()
+    assert calls == [
+        [sys.executable, str(installer), "--prefix", str(prefix), "disable", "nakshatra-worker"],
+        [sys.executable, str(installer), "--prefix", str(prefix), "restart", "nakshatra-p2p"],
+    ]
+
+
+def test_nak_worker_on_without_p2p_reports_literal_only(tmp_path, monkeypatch, capsys):
+    home, prefix = tmp_path / "home", tmp_path / "node"
+    _fake_release(prefix)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("NAK_NODE_PREFIX", str(prefix))
+    monkeypatch.setattr(subprocess, "run", lambda *_args, **_kwargs:
+                        type("R", (), {"returncode": 0, "stdout": ""})())
+    assert nak.main([
+        "worker", "on", "--model-id", "qwen",
+        "--package-url", "https://models.test/qwen", "--package-pubkey", "cd" * 32,
+        "--pillar-url", "https://pillar.test", "--pillar-spki", "ab" * 32,
+        "--layers", "0-16", "--port", "5530",
+    ]) == 0
+    assert "p2p is not enabled; this worker is reachable only by its literal address" in capsys.readouterr().out
 
 
 def test_worker_launcher_refuses_stale_tree_and_execs_worker_without_skip(tmp_path, monkeypatch, capsys):
@@ -138,8 +192,11 @@ def test_worker_launcher_refuses_stale_tree_and_execs_worker_without_skip(tmp_pa
     key.write_bytes(private.private_bytes_raw())
     key.chmod(0o600)
     sub = root / "slice.gguf"
+    p2p_opt_in = tmp_path / "p2p.env"
+    p2p_opt_in.write_text("P2P_RELAYS=test\n")
     argv = ["--build-json", str(build), "--engine-base", str(base), "--worker-root", str(root),
-            "--worker-script", str(worker), "--node-key", str(key), "--port", "5530",
+            "--worker-script", str(worker), "--node-key", str(key),
+            "--p2p-opt-in", str(p2p_opt_in), "--port", "5530",
             "--sub-gguf", str(sub), "--mode", "first",
             "--layer-start", "0", "--layer-end", "16", "--model-id", "qwen"]
     monkeypatch.setenv("PILLAR_URL", "https://pillar.test:8443")
@@ -167,11 +224,16 @@ def test_worker_launcher_refuses_stale_tree_and_execs_worker_without_skip(tmp_pa
     assert env["NAKSHATRA_AUTH_REQUIRED"] == "true"
     assert env["NAKSHATRA_RELEASE_SERVICE"] == "true"
     assert env["NAKSHATRA_AUDIT_PATH"] == str(root / "audit.jsonl")
+    from sidecar_key import peer_id_from_node_pub
+    assert env["NAKSHATRA_P2P_PEER_ID"] == peer_id_from_node_pub(pub)
 
     monkeypatch.setenv("LISTEN", "0.0.0.0")
+    monkeypatch.setenv("NAKSHATRA_P2P_PEER_ID", "attacker-controlled")
+    p2p_opt_in.unlink()
     executed.clear()
     assert worker_service.main(argv, execve=lambda path, command, env: executed.append((path, command, env))) == 0
     assert executed[0][2]["NAKSHATRA_LISTEN_ADDRESS"] == "0.0.0.0"
+    assert "NAKSHATRA_P2P_PEER_ID" not in executed[0][2]
 
     build.write_text(json.dumps({"daemon_bin": str(daemon), "backend": "rocm", "n_gpu_layers": 99,
                                  "engine_tree": "0" * 40}))

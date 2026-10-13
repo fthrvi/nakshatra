@@ -216,6 +216,13 @@ def worker_command(args) -> tuple[list[str], dict[str, str]]:
         NAKSHATRA_AUTH_REQUIRED="true",
         NAKSHATRA_AUDIT_PATH=str(worker_root / "audit.jsonl"),
     )
+    # Never trust an ambient PeerId.  The endpoint is advertised only while
+    # this node has opted into the release-managed sidecar, and is derived
+    # from the same node key that signs the worker's pillar registration.
+    env.pop("NAKSHATRA_P2P_PEER_ID", None)
+    if args.p2p_opt_in is not None and args.p2p_opt_in.is_file():
+        from sidecar_key import peer_id_from_node_pub
+        env["NAKSHATRA_P2P_PEER_ID"] = peer_id_from_node_pub(node_id)
     return command, env
 
 
@@ -226,6 +233,7 @@ def main(argv=None, *, execve=os.execve) -> int:
     ap.add_argument("--worker-root", type=Path, required=True)
     ap.add_argument("--worker-script", type=Path, required=True)
     ap.add_argument("--node-key", type=Path, required=True)
+    ap.add_argument("--p2p-opt-in", type=Path)
     ap.add_argument("--port", type=int, required=True)
     ap.add_argument("--sub-gguf", type=Path, required=True)
     ap.add_argument("--mode", choices=("first", "middle", "last", "solo"), required=True)

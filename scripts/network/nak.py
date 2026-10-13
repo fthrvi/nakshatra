@@ -287,6 +287,38 @@ def _worker_installer(_sp, action: str) -> None:
         raise SystemExit(f"could not {action} {WORKER_SERVICE}: {e}")
 
 
+def _p2p_enabled() -> bool:
+    """The release's opt-in file is the authoritative sidecar-enabled marker."""
+    return (Path.home() / ".nakshatra" / "p2p.env").is_file()
+
+
+def _set_env_assignment(path: Path, name: str, value: str | None) -> None:
+    """Replace one assignment in a release-owned env file, preserving the rest."""
+    try:
+        lines = path.read_text().splitlines()
+    except OSError as e:
+        raise SystemExit(f"cannot update {path}: {e}") from e
+    prefix = f"{name}="
+    lines = [line for line in lines if not line.startswith(prefix)]
+    if value is not None:
+        lines.append(f'{name}="{value}"')
+    _write_private(path, (("\n".join(lines) + "\n") if lines else "").encode())
+
+
+def _worker_port(env_path: Path) -> int:
+    try:
+        body = env_path.read_text()
+    except OSError as e:
+        raise SystemExit(f"cannot read worker port from {env_path}: {e}") from e
+    match = re.search(r"(?m)^PORT=(?:\"(\d+)\"|'(\d+)'|(\d+))\s*$", body)
+    if not match:
+        raise SystemExit(f"{env_path} has no valid PORT assignment")
+    port = int(next(value for value in match.groups() if value is not None))
+    if not 1 <= port <= 65535:
+        raise SystemExit(f"{env_path} has an out-of-range PORT assignment")
+    return port
+
+
 def _env_value(value: str, name: str) -> str:
     if not value or any(c in value for c in "\r\n\0") or any(c.isspace() for c in value):
         raise SystemExit(f"--{name} must be one non-empty value without whitespace")
@@ -341,10 +373,18 @@ def _worker_enable(_sp, args) -> None:
                 f"LAYER_START={start}\nLAYER_END={end}\nSUB_GGUF={sub_gguf}\n"
                 f"LISTEN={listen}\n")
         _write_private(env_path, body.encode())
+    port = _worker_port(env_path)
+    _set_env_assignment(
+        env_path,
+        "NAKSHATRA_P2P_WORKER_ARGS",
+        f"-inbound=127.0.0.1:{port} -require-direct-activation",
+    )
     if old_inference is None:
         _write_private(inference, b"# Enables the signed release's hash-locked inference profile.\n")
     try:
         _worker_installer(_sp, "enable")
+        if _p2p_enabled():
+            _p2p_installer(_sp, "restart")
     except (Exception, SystemExit):
         # enable may have started the unit before its stability check failed. Ask the same verified
         # installer to stop it, then restore exactly the opt-in state the operator had beforehand.
@@ -360,8 +400,31 @@ def _worker_enable(_sp, args) -> None:
             inference.unlink(missing_ok=True)
         else:
             _write_private(inference, old_inference)
+        if _p2p_enabled():
+            try:
+                _p2p_installer(_sp, "restart")
+            except (Exception, SystemExit):
+                pass
         raise
     print(f"worker ON ({env_path})")
+    if not _p2p_enabled():
+        print("p2p is not enabled; this worker is reachable only by its literal address")
+
+
+def _worker_disable(_sp) -> None:
+    _root, _record, env_path = _worker_paths()
+    old_env = env_path.read_bytes() if env_path.exists() else None
+    if old_env is not None:
+        _set_env_assignment(env_path, "NAKSHATRA_P2P_WORKER_ARGS", None)
+    try:
+        _worker_installer(_sp, "disable")
+    except (Exception, SystemExit):
+        if old_env is not None:
+            _write_private(env_path, old_env)
+        raise
+    if _p2p_enabled():
+        _p2p_installer(_sp, "restart")
+    print("worker OFF")
 
 
 def _worker_status(_sp) -> dict:
@@ -471,8 +534,7 @@ def main(argv=None, *, http_post=None) -> int:
         elif a.worker_cmd == "on":
             _worker_enable(_sp, a)
         elif a.worker_cmd == "off":
-            _worker_installer(_sp, "disable")
-            print("worker OFF")
+            _worker_disable(_sp)
         else:
             print(json.dumps(_worker_status(_sp), indent=1, sort_keys=True))
     elif a.cmd == "status":
