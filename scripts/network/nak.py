@@ -21,6 +21,7 @@ import hashlib
 import json
 import math
 import os
+import secrets
 import stat
 import re
 import sys
@@ -350,6 +351,8 @@ def _worker_enable(_sp, args) -> None:
             raise SystemExit("--port must be between 1 and 65535")
         if not math.isfinite(args.idle_unload_s) or args.idle_unload_s < 0:
             raise SystemExit("--idle-unload-s must be a finite number >= 0")
+        if not math.isfinite(args.release_grace_s):
+            raise SystemExit("--release-grace-s must be finite (negative disables it)")
         model = _env_value(args.model_id, "model-id")
         package = _env_value(args.package_url, "package-url")
         pillar = _env_value(args.pillar_url, "pillar-url")
@@ -372,7 +375,8 @@ def _worker_enable(_sp, args) -> None:
                 f"PILLAR_SPKI_SHA256={pillar_spki}\nTRUSTED_PILLAR_NETS={trusted_nets}\n"
                 f"MODE={args.mode}\nPORT={args.port}\n"
                 f"LAYER_START={start}\nLAYER_END={end}\nSUB_GGUF={sub_gguf}\n"
-                f"LISTEN={listen}\nIDLE_UNLOAD_S={args.idle_unload_s:g}\n")
+                f"LISTEN={listen}\nIDLE_UNLOAD_S={args.idle_unload_s:g}\n"
+                f"RELEASE_GRACE_S={args.release_grace_s:g}\n")
         _write_private(env_path, body.encode())
     port = _worker_port(env_path)
     _set_env_assignment(
@@ -445,6 +449,98 @@ def _worker_status(_sp) -> dict:
     return {"configured": env_path.exists(), "build_state": build_state, "build": build, "unit": unit}
 
 
+def _owner_lease_path() -> Path:
+    return Path.home() / ".nakshatra" / "owner-lease.env"
+
+
+def _worker_unit_enabled(_sp) -> bool:
+    try:
+        result = _sp.run(
+            ["systemctl", "--user", "is-enabled", f"{WORKER_SERVICE}.service"],
+            capture_output=True, text=True, check=False,
+        )
+    except OSError:
+        return False
+    return result.returncode == 0 and (result.stdout or "").strip() not in {
+        "disabled", "masked", "not-found",
+    }
+
+
+def _owner_lease_values(path: Path) -> dict[str, str]:
+    try:
+        body = path.read_text()
+    except OSError:
+        return {}
+    values = {}
+    for name in ("OWNER_LEASE_PORT", "OWNER_LEASE_TOKEN", "OWNER_LEASE_TTL_S",
+                 "OWNER_LEASE_RESUME_S"):
+        match = re.search(rf"(?m)^{name}=([^\r\n]+)$", body)
+        if match:
+            values[name] = match.group(1).strip().strip("\"'")
+    return values
+
+
+def _owner_lease_on(_sp, args) -> None:
+    if not 1 <= args.port <= 65535:
+        raise SystemExit("--port must be between 1 and 65535")
+    if not math.isfinite(args.ttl_s) or args.ttl_s <= 0:
+        raise SystemExit("--ttl-s must be finite and > 0")
+    if not math.isfinite(args.resume_s) or args.resume_s < 0:
+        raise SystemExit("--resume-s must be finite and >= 0")
+    path = _owner_lease_path()
+    old = path.read_bytes() if path.exists() else None
+    previous = _owner_lease_values(path)
+    token = previous.get("OWNER_LEASE_TOKEN", "").lower()
+    if len(token) < 64 or len(token) % 2 or not re.fullmatch(r"[0-9a-f]+", token):
+        token = secrets.token_hex(32)
+    body = (
+        f"OWNER_LEASE_PORT={args.port}\n"
+        f"OWNER_LEASE_TOKEN={token}\n"
+        f"OWNER_LEASE_TTL_S={args.ttl_s:g}\n"
+        f"OWNER_LEASE_RESUME_S={args.resume_s:g}\n"
+    ).encode()
+    _write_private(path, body)
+    try:
+        if _worker_unit_enabled(_sp):
+            _worker_installer(_sp, "restart")
+    except (Exception, SystemExit):
+        if old is None:
+            path.unlink(missing_ok=True)
+        else:
+            _write_private(path, old)
+        raise
+    print(f"owner lease ON: 127.0.0.1:{args.port}; token file: {path}")
+
+
+def _owner_lease_off(_sp) -> None:
+    path = _owner_lease_path()
+    old = path.read_bytes() if path.exists() else None
+    path.unlink(missing_ok=True)
+    try:
+        if _worker_unit_enabled(_sp):
+            _worker_installer(_sp, "restart")
+    except (Exception, SystemExit):
+        if old is not None:
+            _write_private(path, old)
+        raise
+    print("owner lease OFF")
+
+
+def _owner_lease_status() -> dict:
+    path = _owner_lease_path()
+    values = _owner_lease_values(path)
+    result = {"enabled": path.is_file(), "token_file": str(path)}
+    if path.is_file():
+        result.update({
+            "port": int(values.get("OWNER_LEASE_PORT", "5571")),
+            "ttl_s": float(values.get("OWNER_LEASE_TTL_S", "6")),
+            "resume_s": float(values.get("OWNER_LEASE_RESUME_S", "30")),
+            "token_configured": bool(values.get("OWNER_LEASE_TOKEN")),
+            "owner_only": not bool(path.stat().st_mode & 0o077),
+        })
+    return result
+
+
 def _default_p2p_socket() -> Path:
     from client_defaults import default_p2p_socket_path
     return default_p2p_socket_path()
@@ -504,13 +600,23 @@ def main(argv=None, *, http_post=None) -> int:
     q.add_argument("--layers", help="half-open layer range a-b (for example 0-16)")
     q.add_argument("--port", type=int)
     q.add_argument("--idle-unload-s", type=float, default=600.0,
-                   help="seconds before an idle worker unloads GPU memory; 0 keeps it resident")
+                   help="seconds before idle-backstop unload; 0 disables this backstop")
+    q.add_argument("--release-grace-s", type=float, default=30.0,
+                   help="seconds after session release before unload; 0 is immediate, negative disables")
     # worker.py cannot derive its pipeline role from a layer range alone because the CLI does not
     # know the model's total layer count. Preserve the proven outsider-worker role as the default,
     # while exposing the worker.py choice for last/middle/whole-model assignments.
     q.add_argument("--mode", choices=["first", "middle", "last", "solo"], default="first")
     wsub.add_parser("off", help="disable the worker service and remove its worker.env opt-in")
     wsub.add_parser("status", help="show the verified build record and systemd unit state")
+    q = wsub.add_parser("owner-lease", help="control the local owner-sentinel lease")
+    lsub = q.add_subparsers(dest="owner_lease_cmd", required=True)
+    q = lsub.add_parser("on", help="create the private lease token and enable default-deny")
+    q.add_argument("--port", type=int, default=5571)
+    q.add_argument("--ttl-s", type=float, default=6.0)
+    q.add_argument("--resume-s", type=float, default=30.0)
+    lsub.add_parser("off", help="remove the lease configuration")
+    lsub.add_parser("status", help="show lease configuration without revealing its token")
     p = sub.add_parser("task", help="post / list / claim / submit tasks")
     tsub = p.add_subparsers(dest="tcmd", required=True)
     q = tsub.add_parser("post"); q.add_argument("to"); q.add_argument("title"); q.add_argument("instructions")
@@ -530,8 +636,14 @@ def main(argv=None, *, http_post=None) -> int:
             _worker_enable(_sp, a)
         elif a.worker_cmd == "off":
             _worker_disable(_sp)
-        else:
+        elif a.worker_cmd == "status":
             print(json.dumps(_worker_status(_sp), indent=1, sort_keys=True))
+        elif a.owner_lease_cmd == "on":
+            _owner_lease_on(_sp, a)
+        elif a.owner_lease_cmd == "off":
+            _owner_lease_off(_sp)
+        else:
+            print(json.dumps(_owner_lease_status(), indent=1, sort_keys=True))
     elif a.cmd == "status":
         r = call(s, {"op": "status"})
         print(f"person {r['person'][:16]}…  node {r['node'][:16]}…  custody {r['custody']}  relay {r['relay']}")

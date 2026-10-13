@@ -220,6 +220,9 @@
    "description": "Nakshatra distributed-inference worker",
    "requires": "{home}/.nakshatra/worker.env",
    "env_file": "{home}/.nakshatra/worker.env",
+   "optional_env_files": [
+    "{home}/.nakshatra/owner-lease.env"
+   ],
    "after": [
     "network-online.target"
    ],

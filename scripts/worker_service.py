@@ -192,6 +192,45 @@ def worker_command(args) -> tuple[list[str], dict[str, str]]:
         raise WorkerServiceError("IDLE_UNLOAD_S must be a finite number >= 0") from e
     if not math.isfinite(idle_unload_s) or idle_unload_s < 0:
         raise WorkerServiceError("IDLE_UNLOAD_S must be a finite number >= 0")
+    release_grace_raw = os.environ.get("RELEASE_GRACE_S", "30").strip() or "30"
+    try:
+        release_grace_s = float(release_grace_raw)
+    except ValueError as e:
+        raise WorkerServiceError("RELEASE_GRACE_S must be finite (negative disables it)") from e
+    if not math.isfinite(release_grace_s):
+        raise WorkerServiceError("RELEASE_GRACE_S must be finite (negative disables it)")
+
+    owner_names = (
+        "OWNER_LEASE_PORT", "OWNER_LEASE_TOKEN", "OWNER_LEASE_TTL_S",
+        "OWNER_LEASE_RESUME_S",
+    )
+    owner_enabled = any(os.environ.get(name, "").strip() for name in owner_names)
+    owner_values = {}
+    if owner_enabled:
+        token = os.environ.get("OWNER_LEASE_TOKEN", "").strip().lower()
+        if len(token) < 64 or len(token) % 2 or not re.fullmatch(r"[0-9a-f]+", token):
+            raise WorkerServiceError(
+                "owner-lease.env OWNER_LEASE_TOKEN must be 32+ random bytes encoded as hex"
+            )
+        try:
+            owner_port = int(os.environ.get("OWNER_LEASE_PORT", "5571"))
+            owner_ttl = float(os.environ.get("OWNER_LEASE_TTL_S", "6"))
+            owner_resume = float(os.environ.get("OWNER_LEASE_RESUME_S", "30"))
+        except ValueError as e:
+            raise WorkerServiceError(f"owner-lease.env has an invalid value: {e}") from e
+        if not 1 <= owner_port <= 65535:
+            raise WorkerServiceError("OWNER_LEASE_PORT must be between 1 and 65535")
+        if not math.isfinite(owner_ttl) or owner_ttl <= 0:
+            raise WorkerServiceError("OWNER_LEASE_TTL_S must be finite and > 0")
+        if not math.isfinite(owner_resume) or owner_resume < 0:
+            raise WorkerServiceError("OWNER_LEASE_RESUME_S must be finite and >= 0")
+        owner_values = {
+            "NAKSHATRA_OWNER_LEASE_ENABLED": "true",
+            "NAKSHATRA_OWNER_LEASE_PORT": str(owner_port),
+            "NAKSHATRA_OWNER_LEASE_TOKEN": token,
+            "NAKSHATRA_OWNER_LEASE_TTL_S": f"{owner_ttl:g}",
+            "NAKSHATRA_OWNER_LEASE_RESUME_S": f"{owner_resume:g}",
+        }
 
     if not args.worker_script.is_file():
         raise WorkerServiceError(f"release worker script is missing: {args.worker_script}")
@@ -219,12 +258,20 @@ def worker_command(args) -> tuple[list[str], dict[str, str]]:
         NAKSHATRA_PACKAGE_URL=package_url,
         NAKSHATRA_LISTEN_ADDRESS=listen_address,
         NAKSHATRA_WORKER_IDLE_UNLOAD_S=f"{idle_unload_s:g}",
+        NAKSHATRA_WORKER_RELEASE_GRACE_S=f"{release_grace_s:g}",
         # A signed-release worker never inherits Mode-A downgrade switches.
         NAKSHATRA_RELEASE_SERVICE="true",
         NAKSHATRA_TLS_REQUIRED="true",
         NAKSHATRA_AUTH_REQUIRED="true",
         NAKSHATRA_AUDIT_PATH=str(worker_root / "audit.jsonl"),
     )
+    for name in (
+        "NAKSHATRA_OWNER_LEASE_ENABLED", "NAKSHATRA_OWNER_LEASE_PORT",
+        "NAKSHATRA_OWNER_LEASE_TOKEN", "NAKSHATRA_OWNER_LEASE_TTL_S",
+        "NAKSHATRA_OWNER_LEASE_RESUME_S",
+    ):
+        env.pop(name, None)
+    env.update(owner_values)
     # Never trust an ambient PeerId.  The endpoint is advertised only while
     # this node has opted into the release-managed sidecar, and is derived
     # from the same node key that signs the worker's pillar registration.

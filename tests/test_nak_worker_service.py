@@ -109,6 +109,7 @@ def test_nak_worker_on_writes_env_once_and_uses_verified_installer(tmp_path, mon
     assert 'LISTEN="0.0.0.0"' in first
     assert "MODE=first" in first and "LAYER_START=0" in first and "LAYER_END=16" in first
     assert "IDLE_UNLOAD_S=600" in first
+    assert "RELEASE_GRACE_S=30" in first
     assert 'NAKSHATRA_P2P_WORKER_ARGS="-inbound=127.0.0.1:5530 -require-direct-activation"' in first
     assert "SUB_GGUF=" in first and "skip-sha256" not in first
     inference_env = home / ".nakshatra" / "inference.env"
@@ -420,9 +421,12 @@ def test_nak_worker_on_writes_idle_unload_override(tmp_path, monkeypatch):
     argv = ["worker", "on", "--model-id", "qwen",
             "--package-url", "https://models.test/qwen", "--package-pubkey", "cd" * 32,
             "--pillar-url", "https://pillar.test", "--pillar-spki", "ab" * 32,
-            "--layers", "0-16", "--port", "5530", "--idle-unload-s", "0"]
+            "--layers", "0-16", "--port", "5530", "--idle-unload-s", "0",
+            "--release-grace-s", "-1"]
     assert nak.main(argv) == 0
-    assert "IDLE_UNLOAD_S=0" in (home / ".nakshatra" / "worker.env").read_text()
+    body = (home / ".nakshatra" / "worker.env").read_text()
+    assert "IDLE_UNLOAD_S=0" in body
+    assert "RELEASE_GRACE_S=-1" in body
 
 
 def test_worker_launcher_passes_idle_unload_and_defaults_old_env_to_600(
@@ -457,6 +461,88 @@ def test_worker_launcher_passes_idle_unload_and_defaults_old_env_to_600(
     assert worker_service.worker_command(args)[1]["NAKSHATRA_WORKER_IDLE_UNLOAD_S"] == "600"
     monkeypatch.setenv("IDLE_UNLOAD_S", "12.5")
     assert worker_service.worker_command(args)[1]["NAKSHATRA_WORKER_IDLE_UNLOAD_S"] == "12.5"
+
+
+def test_worker_launcher_validates_and_passes_owner_lease(tmp_path, monkeypatch):
+    root = tmp_path / "worker"
+    daemon = root / "daemon"
+    daemon.parent.mkdir(parents=True)
+    daemon.write_text("binary")
+    daemon.chmod(0o755)
+    build = root / "build.json"
+    build.write_text(json.dumps({"daemon_bin": str(daemon), "backend": "cpu",
+                                 "n_gpu_layers": 0, "engine_tree": TREE}))
+    base = tmp_path / "BASE"
+    base.write_text(f"TREE={TREE}\n")
+    worker_script = tmp_path / "worker.py"
+    worker_script.write_text("# release worker\n")
+    key = tmp_path / "worker.ed25519"
+    key.write_bytes(ed25519.Ed25519PrivateKey.generate().private_bytes_raw())
+    key.chmod(0o600)
+    args = type("Args", (), {
+        "build_json": build, "engine_base": base, "worker_root": root,
+        "worker_script": worker_script, "node_key": key, "p2p_opt_in": None,
+        "port": 5530, "sub_gguf": root / "slice.gguf", "mode": "first",
+        "layer_start": 0, "layer_end": 1, "model_id": "qwen", "n_ctx": 2048,
+    })()
+    monkeypatch.setenv("PILLAR_URL", "https://pillar.test")
+    monkeypatch.setenv("PILLAR_SPKI_SHA256", "ab" * 32)
+    monkeypatch.setenv("PACKAGE_URL", "https://models.test/qwen")
+    monkeypatch.setenv("PACKAGE_TRUSTED_PUBKEY", "cd" * 32)
+    monkeypatch.setenv("OWNER_LEASE_PORT", "5580")
+    monkeypatch.setenv("OWNER_LEASE_TOKEN", "ef" * 32)
+    monkeypatch.setenv("OWNER_LEASE_TTL_S", "8")
+    monkeypatch.setenv("OWNER_LEASE_RESUME_S", "12")
+
+    env = worker_service.worker_command(args)[1]
+    assert env["NAKSHATRA_OWNER_LEASE_ENABLED"] == "true"
+    assert env["NAKSHATRA_OWNER_LEASE_PORT"] == "5580"
+    assert env["NAKSHATRA_OWNER_LEASE_TOKEN"] == "ef" * 32
+    assert env["NAKSHATRA_OWNER_LEASE_TTL_S"] == "8"
+    assert env["NAKSHATRA_OWNER_LEASE_RESUME_S"] == "12"
+    assert env["NAKSHATRA_WORKER_RELEASE_GRACE_S"] == "30"
+
+    monkeypatch.setenv("OWNER_LEASE_TOKEN", "too-short")
+    with pytest.raises(worker_service.WorkerServiceError, match=r"32\+ random bytes"):
+        worker_service.worker_command(args)
+
+
+def test_owner_lease_cli_never_prints_token_and_restarts_enabled_worker(
+        tmp_path, monkeypatch, capsys):
+    home, prefix = tmp_path / "home", tmp_path / "node"
+    _fake_release(prefix)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("NAK_NODE_PREFIX", str(prefix))
+    token = "12" * 32
+    monkeypatch.setattr(nak.secrets, "token_hex", lambda _n: token)
+    calls = []
+
+    def run(args, **kwargs):
+        calls.append(args)
+        if args[:3] == ["systemctl", "--user", "is-enabled"]:
+            return type("R", (), {"returncode": 0, "stdout": "enabled\n"})()
+        return type("R", (), {"returncode": 0, "stdout": ""})()
+
+    monkeypatch.setattr(subprocess, "run", run)
+    assert nak.main(["worker", "owner-lease", "on", "--port", "5580"]) == 0
+    output = capsys.readouterr().out
+    path = home / ".nakshatra" / "owner-lease.env"
+    assert "127.0.0.1:5580" in output and str(path) in output
+    assert token not in output
+    assert token in path.read_text()
+    assert path.stat().st_mode & 0o777 == 0o600
+    installer = prefix / "current" / "nakshatra" / "release" / "install.py"
+    assert calls[-1] == [sys.executable, str(installer), "--prefix", str(prefix),
+                         "restart", "nakshatra-worker"]
+
+    assert nak.main(["worker", "owner-lease", "status"]) == 0
+    status_output = capsys.readouterr().out
+    assert token not in status_output
+    assert json.loads(status_output)["port"] == 5580
+
+    assert nak.main(["worker", "owner-lease", "off"]) == 0
+    assert not path.exists()
+    assert token not in capsys.readouterr().out
 
 
 @pytest.mark.parametrize(("url", "pin", "trusted"), [

@@ -19,6 +19,7 @@ CLI:
 import argparse
 import collections
 import hashlib
+import hmac
 import json
 import math
 import os
@@ -51,6 +52,7 @@ from worker_service import (
     WorkerServiceError,
     validate_pillar_transport,
 )
+from heartbeat import node_state
 
 # Phase F (worker hardening sprint, 2026-05-19): Ed25519-signed pillar
 # requests + optional TLS SPKI pinning. cryptography is a runtime dep
@@ -1030,6 +1032,58 @@ class DaemonUnavailableError(RuntimeError):
     """The local inference daemon could not be made ready for a request."""
 
 
+class OwnerLeaseConfig(NamedTuple):
+    port: int
+    token: str
+    ttl_s: float
+    resume_s: float
+
+
+def owner_lease_state(last_clear_at: Optional[float], now: float, ttl_s: float,
+                      *, explicitly_clear: bool = True,
+                      reason: str = "") -> tuple[str, str]:
+    """Pure owner-lease policy, using the mesh heartbeat's live/stale/dead bands."""
+    if not explicitly_clear:
+        return "lapsed", reason or "owner sentinel reported busy"
+    if last_clear_at is None:
+        return "lapsed", "owner lease has not received a clear heartbeat"
+    state, _detail = node_state(
+        last_clear_at, now, interval=ttl_s / 2.0,
+        miss_stale=1, miss_dead=2,
+    )
+    if state == "live":
+        return "live", reason or "owner lease heartbeat is live"
+    if state == "stale":
+        return "stale", "owner lease heartbeat is stale; refusing new sessions"
+    return "lapsed", "owner lease heartbeat lapsed; silence means stop"
+
+
+def owner_lease_config_from_env(environ=None) -> Optional[OwnerLeaseConfig]:
+    """Return the launcher's validated lease config, or None when it is disabled."""
+    env = os.environ if environ is None else environ
+    if env.get("NAKSHATRA_OWNER_LEASE_ENABLED", "").strip().lower() not in {
+            "1", "true", "yes"}:
+        return None
+    try:
+        port = int(env.get("NAKSHATRA_OWNER_LEASE_PORT", "5571"))
+        ttl_s = float(env.get("NAKSHATRA_OWNER_LEASE_TTL_S", "6"))
+        resume_s = float(env.get("NAKSHATRA_OWNER_LEASE_RESUME_S", "30"))
+    except ValueError as e:
+        raise ValueError(f"invalid owner lease setting: {e}") from e
+    token = env.get("NAKSHATRA_OWNER_LEASE_TOKEN", "").strip().lower()
+    if not 1 <= port <= 65535:
+        raise ValueError("NAKSHATRA_OWNER_LEASE_PORT must be between 1 and 65535")
+    if not math.isfinite(ttl_s) or ttl_s <= 0:
+        raise ValueError("NAKSHATRA_OWNER_LEASE_TTL_S must be finite and > 0")
+    if not math.isfinite(resume_s) or resume_s < 0:
+        raise ValueError("NAKSHATRA_OWNER_LEASE_RESUME_S must be finite and >= 0")
+    if len(token) < 64 or len(token) % 2 or not re.fullmatch(r"[0-9a-f]+", token):
+        raise ValueError(
+            "NAKSHATRA_OWNER_LEASE_TOKEN must be 32+ random bytes encoded as hex"
+        )
+    return OwnerLeaseConfig(port, token, ttl_s, resume_s)
+
+
 class IdleDaemonController:
     """Keep the heavyweight daemon resident only while it is being used.
 
@@ -1041,7 +1095,8 @@ class IdleDaemonController:
     """
 
     def __init__(self, daemon_factory, sub_gguf: str, startup_sha256: str,
-                 idle_unload_s: float = 600.0, *, now=None,
+                 idle_unload_s: float = 600.0, *, release_grace_s: float = 30.0,
+                 owner_lease_enabled: bool = False, now=None,
                  residency_event: threading.Event = None):
         if not math.isfinite(idle_unload_s) or idle_unload_s < 0:
             raise ValueError("idle_unload_s must be a finite number >= 0")
@@ -1049,6 +1104,9 @@ class IdleDaemonController:
         self._sub_gguf = sub_gguf
         self._startup_sha256 = startup_sha256.lower()
         self.idle_unload_s = float(idle_unload_s)
+        if not math.isfinite(release_grace_s):
+            raise ValueError("release_grace_s must be finite")
+        self.release_grace_s = float(release_grace_s)
         self._now = now or time.monotonic
         self._residency_event = residency_event
         self._spawn_lock = threading.Lock()
@@ -1057,11 +1115,33 @@ class IdleDaemonController:
         self._owner_since = 0.0
         self._in_flight = 0
         self._last_step_at = self._now()
+        self._release_unload_at: Optional[float] = None
         self._closed = False
-        self._residency = "loaded"
+        self._owner_lease_enabled = bool(owner_lease_enabled)
+        self._lease_state = "lapsed" if owner_lease_enabled else "disabled"
+        self._lease_reason = (
+            "owner lease has not received a clear heartbeat"
+            if owner_lease_enabled else ""
+        )
+        self._lease_admit = not owner_lease_enabled
+        self._residency = "away" if owner_lease_enabled else "loaded"
         self.recent_rpc_ms = collections.deque(maxlen=20)
         self._last_gpu_offload_status = {}
         self._daemon = self._spawn_initial()
+        self._daemon_info = None
+        if owner_lease_enabled:
+            # Capture immutable shape metadata before default-deny unloads the
+            # initial process. The gRPC surface can then start in away without
+            # a request lazily loading weights before the first clear lease.
+            self._daemon_info = self._daemon.info()
+            try:
+                self._last_gpu_offload_status = dict(
+                    self._daemon.gpu_offload_status()
+                )
+            except (AttributeError, TypeError):
+                pass
+            self._daemon.close()
+            self._daemon = None
 
     def _spawn_initial(self):
         try:
@@ -1092,6 +1172,16 @@ class IdleDaemonController:
     def in_flight(self) -> int:
         with self._state_lock:
             return self._in_flight
+
+    @property
+    def lease_state(self) -> str:
+        with self._state_lock:
+            return self._lease_state
+
+    @property
+    def lease_reason(self) -> str:
+        with self._state_lock:
+            return self._lease_reason
 
     @property
     def service_alive(self) -> bool:
@@ -1148,6 +1238,8 @@ class IdleDaemonController:
                 raise DaemonUnavailableError("daemon reload refused: worker is stopping")
             if self._daemon is not None:
                 return self._daemon
+            if self._owner_lease_enabled and not self._lease_admit:
+                raise DaemonUnavailableError(self._lease_reason)
 
         # Exactly one contender verifies and spawns.  Losers re-check after
         # acquiring the same lock and reuse the winner's daemon.
@@ -1157,6 +1249,8 @@ class IdleDaemonController:
                     raise DaemonUnavailableError("daemon reload refused: worker is stopping")
                 if self._daemon is not None:
                     return self._daemon
+                if self._owner_lease_enabled and not self._lease_admit:
+                    raise DaemonUnavailableError(self._lease_reason)
             try:
                 self._verify_slice_for_reload()
                 daemon = self._daemon_factory()
@@ -1177,6 +1271,9 @@ class IdleDaemonController:
                 if self._closed:
                     daemon.close()
                     raise DaemonUnavailableError("daemon reload refused: worker is stopping")
+                if self._owner_lease_enabled and not self._lease_admit:
+                    daemon.close()
+                    raise DaemonUnavailableError(self._lease_reason)
                 self._daemon = daemon
                 self._last_step_at = self._now()
             self._announce_residency("loaded")
@@ -1186,6 +1283,10 @@ class IdleDaemonController:
                         stale_after_s: float = KV_SESSION_STALE_AFTER_S) -> bool:
         now = self._now()
         with self._state_lock:
+            if (self._owner_lease_enabled and not self._lease_admit
+                    and self._owner_session != session_id):
+                raise DaemonUnavailableError(self._lease_reason)
+            self._release_unload_at = None
             if self._owner_session is None or self._owner_session == session_id:
                 self._owner_session = session_id
                 self._owner_since = now
@@ -1207,28 +1308,46 @@ class IdleDaemonController:
         return True
 
     def release_session(self, session_id: str) -> None:
+        unload_now = False
         with self._state_lock:
             if self._owner_session == session_id:
                 self._owner_session = None
                 self._owner_since = 0.0
+                if self._in_flight == 0 and self.release_grace_s >= 0:
+                    self._release_unload_at = self._now() + self.release_grace_s
+                    unload_now = self.release_grace_s == 0
+        if unload_now:
+            self.unload_if_idle()
 
     def mark_step_served(self) -> None:
         """Refresh idle accounting for a response served from a local cache."""
         with self._state_lock:
             self._last_step_at = self._now()
+            self._release_unload_at = None
 
     def call(self, cmd: int, n_tokens: int, payload: bytes,
              start_pos: int = 0, flags: int = 0):
         is_inference = cmd in (CMD_TOKEN_DECODE, CMD_EMBD_DECODE, CMD_EAGLE_HIDDEN)
         if is_inference:
             with self._state_lock:
+                self._release_unload_at = None
                 self._in_flight += 1
         served = False
         try:
             daemon = self.ensure_loaded()
             result = daemon.call(cmd, n_tokens, payload, start_pos=start_pos, flags=flags)
+            with self._state_lock:
+                if self._owner_lease_enabled and self._lease_state == "lapsed":
+                    raise DaemonUnavailableError(self._lease_reason)
             served = is_inference
             return result
+        except Exception as e:
+            with self._state_lock:
+                lapsed = self._owner_lease_enabled and self._lease_state == "lapsed"
+                reason = self._lease_reason
+            if lapsed and not isinstance(e, DaemonUnavailableError):
+                raise DaemonUnavailableError(reason) from e
+            raise
         finally:
             if is_inference:
                 with self._state_lock:
@@ -1237,7 +1356,14 @@ class IdleDaemonController:
                         self._last_step_at = self._now()
 
     def info(self):
-        return self.ensure_loaded().info()
+        with self._state_lock:
+            cached = self._daemon_info
+        if cached is not None:
+            return dict(cached)
+        info = self.ensure_loaded().info()
+        with self._state_lock:
+            self._daemon_info = dict(info)
+        return info
 
     def gpu_offload_status(self) -> dict:
         with self._state_lock:
@@ -1252,13 +1378,20 @@ class IdleDaemonController:
 
     def unload_if_idle(self) -> bool:
         """Cleanly enter standby when every idle/session guard permits it."""
-        if self.idle_unload_s == 0:
-            return False
         with self._spawn_lock:
             with self._state_lock:
                 now = self._now()
+                release_due = (
+                    self._release_unload_at is not None
+                    and now >= self._release_unload_at
+                )
+                idle_due = (
+                    self.idle_unload_s > 0
+                    and self._release_unload_at is None
+                    and now - self._last_step_at >= self.idle_unload_s
+                )
                 if (self._closed or self._daemon is None or self._in_flight
-                        or now - self._last_step_at < self.idle_unload_s):
+                        or not (release_due or idle_due)):
                     return False
                 if self._owner_session is not None:
                     # A stream that ended without release_session() (client crashed) would
@@ -1273,6 +1406,7 @@ class IdleDaemonController:
                     self._owner_since = 0.0
                 daemon = self._daemon
                 self._daemon = None
+                self._release_unload_at = None
             try:
                 daemon.close()
             except Exception as e:
@@ -1283,15 +1417,56 @@ class IdleDaemonController:
             self._announce_residency("standby")
             return True
 
+    def update_owner_lease(self, state: str, reason: str, *, resume: bool = False) -> None:
+        """Apply one policy observation; lapse is an immediate destructive release."""
+        if not self._owner_lease_enabled:
+            return
+        if state not in {"live", "stale", "lapsed"}:
+            raise ValueError(f"invalid owner lease state {state!r}")
+        if state == "lapsed":
+            # Publish default-deny immediately. If a digest verification/load
+            # currently owns _spawn_lock, that contender observes this gate
+            # before installing its new daemon and tears it back down.
+            with self._state_lock:
+                self._lease_state = state
+                self._lease_reason = reason
+                self._lease_admit = False
+                self._owner_session = None
+                self._owner_since = 0.0
+                self._release_unload_at = None
+            self._announce_residency("away")
+            with self._spawn_lock:
+                with self._state_lock:
+                    daemon = self._daemon
+                    self._daemon = None
+                if daemon is not None:
+                    try:
+                        daemon.close()
+                    except Exception as e:
+                        sys.stderr.write(f"[worker] owner-lease daemon stop failed: {e}\n")
+            return
+        with self._state_lock:
+            self._lease_state = state
+            self._lease_reason = reason
+            if state == "stale":
+                self._lease_admit = False
+                return
+            if resume:
+                self._lease_admit = True
+        if state == "live" and resume and self.residency == "away":
+            self._announce_residency("standby")
+
     def idle_monitor_loop(self, stop_event: threading.Event) -> None:
-        if self.idle_unload_s == 0:
+        if self.idle_unload_s == 0 and self.release_grace_s < 0:
             return
         while not stop_event.is_set():
             with self._state_lock:
-                remaining = max(
-                    0.05,
-                    self.idle_unload_s - (self._now() - self._last_step_at),
-                )
+                deadlines = []
+                if self._release_unload_at is not None:
+                    deadlines.append(self._release_unload_at)
+                elif self.idle_unload_s > 0:
+                    deadlines.append(self._last_step_at + self.idle_unload_s)
+                remaining = max(0.05, min(deadlines) - self._now()) if deadlines else 1.0
             if stop_event.wait(timeout=min(remaining, 1.0)):
                 return
             self.unload_if_idle()
@@ -1304,6 +1479,128 @@ class IdleDaemonController:
                 self._daemon = None
             if daemon is not None:
                 daemon.close()
+
+
+class OwnerLease:
+    """Stateful receipt history around the pure owner_lease_state policy."""
+
+    def __init__(self, config: OwnerLeaseConfig, daemon: IdleDaemonController, *, now=None):
+        self.config = config
+        self.daemon = daemon
+        self._now = now or time.monotonic
+        self._lock = threading.Lock()
+        self._last_clear_at: Optional[float] = None
+        self._resume_since: Optional[float] = None
+        self._explicitly_clear = True
+        self._reason = ""
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            now = self._now()
+            state, reason = owner_lease_state(
+                self._last_clear_at, now, self.config.ttl_s,
+                explicitly_clear=self._explicitly_clear, reason=self._reason,
+            )
+            resume_ready = bool(
+                state == "live" and self._resume_since is not None
+                and now - self._resume_since >= self.config.resume_s
+            )
+            return {"state": state, "reason": reason,
+                    "resume_ready": resume_ready,
+                    "last_clear_at": self._last_clear_at}
+
+    def heartbeat(self, *, at: float, clear: bool, reason: str) -> dict:
+        del at  # sender wall time is audit context; receipt monotonic time owns expiry
+        with self._lock:
+            now = self._now()
+            prior_state, _ = owner_lease_state(
+                self._last_clear_at, now, self.config.ttl_s,
+                explicitly_clear=self._explicitly_clear, reason=self._reason,
+            )
+            self._reason = reason
+            if not clear:
+                self._explicitly_clear = False
+                self._resume_since = None
+            else:
+                if prior_state != "live" or self._resume_since is None:
+                    self._resume_since = now
+                self._explicitly_clear = True
+                self._last_clear_at = now
+        return self.reconcile()
+
+    def reconcile(self) -> dict:
+        snap = self.snapshot()
+        self.daemon.update_owner_lease(
+            snap["state"], snap["reason"], resume=snap["resume_ready"]
+        )
+        return snap
+
+    def monitor_loop(self, stop_event: threading.Event) -> None:
+        while not stop_event.wait(timeout=min(1.0, self.config.ttl_s / 4.0)):
+            self.reconcile()
+
+
+def owner_lease_http_response(lease: OwnerLease, path: str,
+                              authorization: str, body: bytes) -> tuple[int, dict]:
+    """Pure request validation/action used by the tiny HTTP adapter."""
+    prefix = "Bearer "
+    candidate = authorization[len(prefix):] if authorization.startswith(prefix) else ""
+    if not hmac.compare_digest(candidate, lease.config.token):
+        return 401, {"error": "unauthorized"}
+    if path != "/lease":
+        return 404, {"error": "not found"}
+    try:
+        if not body or len(body) > 4096:
+            raise ValueError("body length must be 1..4096 bytes")
+        payload = json.loads(body)
+        at = payload["at"]
+        clear = payload["clear"]
+        reason = payload.get("reason", "")
+        if isinstance(at, bool) or not isinstance(at, (int, float)):
+            raise ValueError("at must be a unix timestamp")
+        if not isinstance(clear, bool):
+            raise ValueError("clear must be boolean")
+        if not isinstance(reason, str) or len(reason.encode()) > 512:
+            raise ValueError("reason must be a string of at most 512 bytes")
+    except (KeyError, ValueError, TypeError, json.JSONDecodeError) as e:
+        return 400, {"error": str(e)}
+    snap = lease.heartbeat(at=float(at), clear=clear, reason=reason)
+    return 200, {"state": snap["state"], "residency": lease.daemon.residency}
+
+
+def start_owner_lease_server(lease: OwnerLease, *, server_class=HTTPServer):
+    """Start the authenticated endpoint, hard-coded to IPv4 loopback."""
+
+    class Handler(BaseHTTPRequestHandler):
+        def _json(self, status: int, payload: dict):
+            body = json.dumps(payload, separators=(",", ":")).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self):  # noqa: N802 - BaseHTTPRequestHandler API
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError as e:
+                self._json(400, {"error": str(e)})
+                return
+            body = self.rfile.read(length) if 0 < length <= 4096 else b""
+            status, payload = owner_lease_http_response(
+                lease, self.path, self.headers.get("Authorization", ""), body
+            )
+            self._json(status, payload)
+
+        def log_message(self, _format, *_args):
+            return
+
+    httpd = server_class(("127.0.0.1", lease.config.port), Handler)
+    thread = threading.Thread(
+        target=httpd.serve_forever, daemon=True, name="owner-lease-http"
+    )
+    thread.start()
+    return httpd, thread
 
 
 # v0.5 §9.7: idempotency cache is sized in MB, internally converted to an
@@ -1877,11 +2174,16 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
             )
             return pb.ForwardResponse()
         try:
-            result = self._run_forward(
-                request.hidden_in, request.n_tokens, request.has_token_ids,
-                request.keep_kv, int(request.start_pos), request.all_logits,
-                eagle_hidden=request.eagle_hidden,
-            )
+            try:
+                result = self._run_forward(
+                    request.hidden_in, request.n_tokens, request.has_token_ids,
+                    request.keep_kv, int(request.start_pos), request.all_logits,
+                    eagle_hidden=request.eagle_hidden,
+                )
+            except DaemonUnavailableError as e:
+                context.set_code(grpc.StatusCode.UNAVAILABLE)
+                context.set_details(str(e))
+                return pb.ForwardResponse()
         finally:
             self.daemon.release_session(forward_session_id)
         if not result.ok:
@@ -3879,6 +4181,15 @@ def main():
             raise ValueError(
                 "NAKSHATRA_WORKER_IDLE_UNLOAD_S must be a finite number >= 0"
             )
+        release_grace_s = float(
+            os.environ.get("NAKSHATRA_WORKER_RELEASE_GRACE_S", "30")
+        )
+        if not math.isfinite(release_grace_s):
+            raise ValueError(
+                "NAKSHATRA_WORKER_RELEASE_GRACE_S must be finite "
+                "(negative disables it)"
+            )
+        owner_lease_config = owner_lease_config_from_env()
         validate_local_dev_fetch_policy(
             local_dev=args.local_dev,
             skip_sha256=args.skip_sha256,
@@ -4004,6 +4315,8 @@ def main():
 
     daemon = IdleDaemonController(
         spawn_daemon, args.sub_gguf, "", idle_unload_s,
+        release_grace_s=release_grace_s,
+        owner_lease_enabled=owner_lease_config is not None,
         residency_event=residency_event,
     )
 
@@ -4071,6 +4384,29 @@ def main():
           f"model={args.model_id}", flush=True)
     server.start()
 
+    owner_lease = None
+    owner_lease_httpd = None
+    owner_lease_http_thread = None
+    if owner_lease_config is not None:
+        owner_lease = OwnerLease(owner_lease_config, daemon)
+        owner_lease.reconcile()
+        try:
+            owner_lease_httpd, owner_lease_http_thread = start_owner_lease_server(
+                owner_lease
+            )
+        except OSError as e:
+            daemon.close()
+            server.stop(grace=0)
+            sys.exit(
+                f"[worker] startup refused: owner lease endpoint could not bind "
+                f"127.0.0.1:{owner_lease_config.port}: {e}"
+            )
+        print(
+            f"[worker] owner lease enabled on "
+            f"127.0.0.1:{owner_lease_config.port}; default deny (away)",
+            flush=True,
+        )
+
     # Idle reload integrity is independent of pillar registration policy.
     # Record the bytes that the initial daemon loaded, then require an exact
     # match before every later spawn.  With idle unload disabled, retain the
@@ -4078,7 +4414,7 @@ def main():
     startup_slice_sha256 = ""
     sub_gguf_sha256 = ""
     sub_gguf_size = 0
-    if idle_unload_s > 0:
+    if idle_unload_s > 0 or release_grace_s >= 0 or owner_lease_config is not None:
         try:
             sub_gguf_size = os.path.getsize(args.sub_gguf)
             if provisioned_sha256:
@@ -4107,6 +4443,9 @@ def main():
         except Exception as e:
             daemon.close()
             server.stop(grace=0)
+            if owner_lease_httpd is not None:
+                owner_lease_httpd.shutdown()
+                owner_lease_httpd.server_close()
             sys.exit(
                 f"[worker] startup refused: cannot record sub-GGUF SHA-256 "
                 f"required for idle reload: {e}"
@@ -4506,7 +4845,7 @@ def main():
               flush=True)
 
     idle_thread = None
-    if idle_unload_s > 0:
+    if idle_unload_s > 0 or release_grace_s >= 0:
         idle_thread = threading.Thread(
             target=daemon.idle_monitor_loop,
             args=(stop_event,),
@@ -4514,13 +4853,25 @@ def main():
             name="daemon-idle-unload",
         )
         idle_thread.start()
-        print(
-            f"[worker] idle unload enabled: {idle_unload_s:g}s "
-            "(gRPC/TLS/heartbeat stay resident)",
-            flush=True,
-        )
+        features = []
+        if idle_unload_s > 0:
+            features.append(f"idle backstop {idle_unload_s:g}s")
+        if release_grace_s >= 0:
+            features.append(f"release grace {release_grace_s:g}s")
+        print(f"[worker] daemon unload enabled: {', '.join(features)} "
+              "(gRPC/TLS/heartbeat stay resident)", flush=True)
     else:
-        print("[worker] idle unload disabled; daemon remains loaded", flush=True)
+        print("[worker] idle/release unload disabled; daemon remains loaded", flush=True)
+
+    owner_lease_thread = None
+    if owner_lease is not None:
+        owner_lease_thread = threading.Thread(
+            target=owner_lease.monitor_loop,
+            args=(stop_event,),
+            daemon=True,
+            name="owner-lease-monitor",
+        )
+        owner_lease_thread.start()
 
     # 2026-05-29 fabric Phase D — bring up the fabric data plane when
     # --transport=fabric. gRPC server above stays up for Info + the
@@ -4559,6 +4910,9 @@ def main():
     finally:
         stop_event.set()
         residency_event.set()
+        if owner_lease_httpd is not None:
+            owner_lease_httpd.shutdown()
+            owner_lease_httpd.server_close()
         if fabric_backend is not None:
             fabric_backend.stop()
         daemon.close()

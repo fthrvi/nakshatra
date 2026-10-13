@@ -85,7 +85,7 @@ WARMUP_UNAVAILABLE_BACKOFF_S = 0.25
 def _residency(value) -> str:
     """Return the pillar residency vocabulary, treating old/missing data as unknown."""
     value = str(value or "").strip().lower()
-    return value if value in ("loaded", "standby") else "unknown"
+    return value if value in ("loaded", "standby", "away") else "unknown"
 
 
 def _warmup_timeout_s() -> float:

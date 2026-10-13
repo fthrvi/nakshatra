@@ -421,6 +421,7 @@ def test_worker_service_is_hardened_profiled_and_release_owned(tmp_path):
     svc = spec["services"]["nakshatra-worker"]
     assert svc["requires"].endswith("/.nakshatra/worker.env")
     assert svc["env_file"] == svc["requires"] and svc["profile"] == "worker"
+    assert svc["optional_env_files"] == ["{home}/.nakshatra/owner-lease.env"]
     worker_profile = spec["profiles"]["worker"]
     assert worker_profile["requires"] == svc["requires"]
     assert worker_profile["satisfied_by"] == ["inference"]
@@ -449,6 +450,7 @@ def test_worker_service_is_hardened_profiled_and_release_owned(tmp_path):
     assert "ProtectSystem=strict" in text
     assert f"ReadWritePaths={Path.home()}/.nakshatra/worker" in text
     assert f"ReadWritePaths={Path.home()}/.nakshatra/tls" in text
+    assert f"EnvironmentFile=-{Path.home()}/.nakshatra/owner-lease.env" in text
     assert f"Environment=NAKSHATRA_AUDIT_PATH={Path.home()}/.nakshatra/worker/audit.jsonl" in text
 
 

@@ -1,11 +1,37 @@
 # The courteous worker — a lease, not a poll
 
-**Design. 2026-09-04. Prompted by adding an RTX 5070 in WSL2 on a family member's gaming PC;
-written to hold for every consumer machine that follows. Sentinel implementation added
-2026-10-13.**
+**Design 2026-09-04; worker-side lease and sentinels built 2026-10-13. Prompted by adding an RTX 5070
+in WSL2 on a family member's gaming PC; written to hold for every consumer machine that follows.**
 
-**Status:** idle unload and the Windows/Linux sentinels are built; worker lease enforcement is
-documented here and implemented separately.
+**Status:** idle unload, release grace, the worker-side owner lease and the Windows/Linux sentinels
+are built. Enable the lease only together with a sentinel that renews it continuously.
+
+## Enable the worker-side lease
+
+The lease is opt-in. `nak worker owner-lease on` creates
+`~/.nakshatra/owner-lease.env` with mode 0600 and a random 32-byte bearer token, then restarts
+an enabled worker. It prints the loopback port and the token-file path, never the token. The
+sentinel reads that file and sends every 1–2 seconds:
+
+```http
+POST http://127.0.0.1:5571/lease
+Authorization: Bearer <token-from-owner-lease.env>
+Content-Type: application/json
+
+{"at": 1791849600, "clear": true, "reason": "owner idle"}
+```
+
+The endpoint binds only `127.0.0.1`; WSL2's Windows-localhost forwarding is the intended
+Windows-host path. Defaults are `OWNER_LEASE_PORT=5571`, `OWNER_LEASE_TTL_S=6`, and
+`OWNER_LEASE_RESUME_S=30`. Override them when enabling with `--port`, `--ttl-s`, and
+`--resume-s`. Inspect configuration with `nak worker owner-lease status`; disable it with
+`nak worker owner-lease off`.
+
+Once enabled, restart is default-deny: residency is `away` until clear heartbeats have stayed
+live for the resume window. A stale heartbeat stream (older than TTL/2) refuses new sessions.
+Silence beyond TTL or any `clear=false` immediately cancels active daemon work, releases KV
+ownership, unloads the daemon, and publishes `away`. Recovery returns only to `standby`; the
+next admitted request performs the existing digest-verified lazy load.
 
 ## Sentinels
 
@@ -135,9 +161,8 @@ The join sequence should refuse to declare a shared machine `joined` without a s
 
 ## Order of work
 
-1. **The lease policy** — pure, reusing `heartbeat.py`'s shape. Small. Testable with a dict.
-2. **The release action** — in the acting layer: cancel → free KV → unload → announce leaving.
-   Testable against a local daemon.
+1. ~~**The lease policy** — pure, reusing `heartbeat.py`'s shape.~~ **Built.**
+2. ~~**The release action** — cancel → free KV → unload → announce leaving.~~ **Built.**
 3. **The Windows sentinel** for blackwell — the owner switch first (a tray toggle), fullscreen
    detection second. It must be installable without touching the owner's files or accounts:
    a scheduled task in the operator's own user, reading only window state.

@@ -299,3 +299,59 @@ def test_zero_disables_idle_unload(tmp_path):
     assert controller.unload_if_idle() is False
     assert daemon.closed is False
     assert controller.residency == "loaded"
+
+
+def test_release_session_unloads_after_grace_with_fake_clock(tmp_path):
+    clock = FakeClock()
+    daemon = FakeDaemon()
+    model = tmp_path / "slice.gguf"
+    model.write_bytes(b"verified")
+    controller = worker.IdleDaemonController(
+        lambda: daemon, str(model), hashlib.sha256(model.read_bytes()).hexdigest(),
+        1_000, release_grace_s=5, now=clock,
+    )
+
+    assert controller.acquire_session("finished") is True
+    controller.release_session("finished")
+    clock.advance(4.9)
+    assert controller.unload_if_idle() is False
+    clock.advance(0.2)
+    assert controller.unload_if_idle() is True
+    assert daemon.closed is True
+    assert controller.residency == "standby"
+
+
+def test_new_session_cancels_pending_release_grace(tmp_path):
+    clock = FakeClock()
+    daemon = FakeDaemon()
+    model = tmp_path / "slice.gguf"
+    model.write_bytes(b"verified")
+    controller = worker.IdleDaemonController(
+        lambda: daemon, str(model), hashlib.sha256(model.read_bytes()).hexdigest(),
+        1_000, release_grace_s=5, now=clock,
+    )
+
+    assert controller.acquire_session("first") is True
+    controller.release_session("first")
+    clock.advance(4)
+    assert controller.acquire_session("replacement") is True
+    clock.advance(2)
+    assert controller.unload_if_idle() is False
+    assert daemon.closed is False
+    assert controller.residency == "loaded"
+
+
+def test_zero_release_grace_unloads_immediately(tmp_path):
+    clock = FakeClock()
+    daemon = FakeDaemon()
+    model = tmp_path / "slice.gguf"
+    model.write_bytes(b"verified")
+    controller = worker.IdleDaemonController(
+        lambda: daemon, str(model), hashlib.sha256(model.read_bytes()).hexdigest(),
+        0, release_grace_s=0, now=clock,
+    )
+
+    assert controller.acquire_session("finished") is True
+    controller.release_session("finished")
+    assert daemon.closed is True
+    assert controller.residency == "standby"

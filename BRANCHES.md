@@ -6,6 +6,7 @@ On create add a row (status=active, owner). On merge flip to `merged→<sha>`.
 | branch | sector | description | base | status | owner |
 |---|---|---|---|---|---|
 | worker/idle-unload | worker | Stop the GPU daemon after an idle window, reload it single-flight after SHA-256 re-verification, and publish loaded/standby residency. | forgejo/main@a4bbf4a | merged | codex/root |
+| worker/owner-lease | worker | Add session-release grace plus an opt-in loopback owner lease: default-deny, stale admission stop, lapse cancellation/unload, away residency, and safe CLI controls. | forgejo/main@a6eb8fc | active | codex/root |
 | client/warmup-tolerance | client | Treat pillar-projected standby residency as an expected first-RPC cold start: additive warm-up deadline, one UNAVAILABLE retry, and operator timing. | main@a4bbf4a | merged | codex/root |
 | client/admission-defaults | client | Default the release sidecar socket and pillar signing keyid from uid-owned release state; report keyid provenance on 401. | forgejo/main@b10734b | merged→252b228 | codex/root |
 | u4/c1-sidecar-forward | network | U4 C1: uid-gated dynamic activation FORWARD listeners, direct-only inference streams, optional direct-only worker inbound flags in the release p2p unit. | main@2829468 | active | codex/trisul (U4 C1 lane) |

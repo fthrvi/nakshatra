@@ -82,7 +82,7 @@ def test_default_warmup_allowance_comes_from_environment(monkeypatch):
     assert policy.warmup_timeout_s == 60.0
 
 
-@pytest.mark.parametrize("residency", ["loaded", "unknown", None])
+@pytest.mark.parametrize("residency", ["loaded", "away", "unknown", None])
 def test_loaded_or_unknown_keeps_normal_deadline(residency):
     stub = _ForwardStub([b"ok"])
     policy = client.HopRpcPolicy("hop-a", residency, warmup_timeout_s=60,
@@ -178,6 +178,7 @@ def test_streaming_gateway_path_retries_and_restores_normal_step_deadline():
 def test_pillar_chain_residency_is_projected_and_missing_is_unknown(monkeypatch):
     bodies = iter([
         b'{"chain": [{"node_id":"cold","address":"host:1","layer_start":0,"layer_end":1,"residency":"standby"}]}',
+        b'{"chain": [{"node_id":"leased","address":"host:1","layer_start":0,"layer_end":1,"residency":"away"}]}',
         b'{"chain": [{"node_id":"old","address":"host:1","layer_start":0,"layer_end":1}]}',
     ])
 
@@ -198,4 +199,5 @@ def test_pillar_chain_residency_is_projected_and_missing_is_unknown(monkeypatch)
                         lambda *_args, **_kwargs: _Response(next(bodies)))
 
     assert client._try_pillar_chain("https://pillar.invalid", "m")[0]["residency"] == "standby"
+    assert client._try_pillar_chain("https://pillar.invalid", "m")[0]["residency"] == "away"
     assert client._try_pillar_chain("https://pillar.invalid", "m")[0]["residency"] == "unknown"
