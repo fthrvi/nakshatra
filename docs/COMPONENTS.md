@@ -126,7 +126,7 @@ Outsider bugs fixed in 0.12.1–0.12.3:
 - nvcc is now found in `/usr/local/cuda*/bin`.
 
 Fixed by `client/admission-defaults`:
-- **Client ergonomics — FIXED (`1721315`, `252b228`).** The socket and keyid now default from the release state, and the keyid fallback is load-only, so it never creates a node identity. The hub still needs `NKS_REGISTRY_KEYID=hub` until it runs the release registrar (`~/.nakshatra/registrar.env`), which is blocked on retiring its legacy hand-installed `nakshatra-registrar.service`.
+- **Client ergonomics — FIXED (`1721315`, `252b228`).** The socket and keyid default from the release state, and the keyid fallback is load-only. The hub moved to the release registrar on 2026-10-13: the legacy hand-installed unit was kept as `nakshatra-registrar.service.legacy-20261013`, the same node key was reused so the pillar's `hub` lock holds, and the config is `~/.nakshatra/registrar.env`. A hub inference with ZERO manual env ("Water boils at" → "100°C (212°F)…", 63 tok/s) works. Pre-existing, not a regression: the registrar advertises `unknown offering 0.0GB` on the hub (the legacy one did too), so its VRAM probe via `rocm-smi` needs a look.
 
 Status of the follow-ups (second inference with the defaults, 2026-10-13: "Jupiter. It is a gas giant…" at 51 tok/s):
 - **Pillar deploy drift.** The Pi pillar ran Sthambha `3a4f7bf` (09-30), which drops typed endpoints, so the chain showed `endpoint: null`. It was redeployed to `c8d62c1` with `scripts/deploy-pi.sh`. Pillar deploys need to follow Sthambha main the way releases do.
