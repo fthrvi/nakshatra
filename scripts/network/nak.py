@@ -451,10 +451,8 @@ def _worker_status(_sp) -> dict:
 
 
 def _default_p2p_socket() -> Path:
-    runtime = os.environ.get("XDG_RUNTIME_DIR")
-    if not runtime:
-        raise SystemExit("XDG_RUNTIME_DIR is not set; pass `nak p2p on --socket /absolute/path/p2p.sock`")
-    return Path(runtime) / "nakshatra" / "p2p.sock"
+    from client_defaults import default_p2p_socket_path
+    return default_p2p_socket_path()
 
 
 def main(argv=None, *, http_post=None) -> int:

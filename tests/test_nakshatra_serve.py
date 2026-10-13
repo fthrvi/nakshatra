@@ -139,15 +139,42 @@ def test_version_constant_starts_with_nakshatra():
     assert ns.VERSION_STRING.startswith("nakshatra-")
 
 
-def test_chain_backend_passes_p2p_socket_to_client(monkeypatch):
+def test_chain_backend_passes_p2p_socket_to_client(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("NKS_REGISTRY_KEYID", "test-node")
     monkeypatch.setenv("NAKSHATRA_P2P_SOCKET", "/run/user/1000/nakshatra/p2p.sock")
     env = ns.ChainChatBackend._client_env()
     assert env["NAKSHATRA_P2P_SOCKET"] == "/run/user/1000/nakshatra/p2p.sock"
 
 
-def test_chain_backend_drops_blank_p2p_socket(monkeypatch):
+def test_chain_backend_preserves_explicit_blank_p2p_socket(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("NKS_REGISTRY_KEYID", "test-node")
     monkeypatch.setenv("NAKSHATRA_P2P_SOCKET", "   ")
-    assert "NAKSHATRA_P2P_SOCKET" not in ns.ChainChatBackend._client_env()
+    assert ns.ChainChatBackend._client_env()["NAKSHATRA_P2P_SOCKET"] == "   "
+
+
+def test_chain_backend_materializes_release_client_defaults(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("NKS_REGISTRY_KEYID", raising=False)
+    monkeypatch.delenv("NAKSHATRA_P2P_SOCKET", raising=False)
+    runtime = tmp_path / "runtime"
+    socket_dir = runtime / "nakshatra"
+    socket_dir.mkdir(parents=True)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
+    registrar = tmp_path / ".nakshatra" / "registrar.env"
+    registrar.parent.mkdir()
+    registrar.write_text("NKS_NODE_ID=hub\n")
+    socket_path = socket_dir / "p2p.sock"
+    control = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        control.bind(str(socket_path))
+        env = ns.ChainChatBackend._client_env()
+    finally:
+        control.close()
+
+    assert env["NAKSHATRA_P2P_SOCKET"] == str(socket_path)
+    assert env["NKS_REGISTRY_KEYID"] == "hub"
 
 
 def test_unknown_get_returns_404_with_json_error():

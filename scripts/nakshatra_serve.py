@@ -442,19 +442,14 @@ class ChainChatBackend(ChatBackend):
 
     @staticmethod
     def _client_env() -> dict:
-        """Environment for client.py, including the activation sidecar socket.
+        """Environment for client.py, including release identity/socket defaults.
 
         Keeping this explicit makes the gateway→client handoff testable and
         prevents future subprocess hardening from accidentally dropping the
-        uid-protected control-socket setting.
+        uid-protected control-socket and pillar-signing settings.
         """
-        env = os.environ.copy()
-        p2p_socket = os.environ.get("NAKSHATRA_P2P_SOCKET", "").strip()
-        if p2p_socket:
-            env["NAKSHATRA_P2P_SOCKET"] = p2p_socket
-        else:
-            env.pop("NAKSHATRA_P2P_SOCKET", None)
-        return env
+        from client_defaults import apply_client_defaults
+        return apply_client_defaults()
 
     def _ledger_hook(self):
         """Cached credit-ledger hook. DEFAULT-OFF + FAIL-OPEN — never gates/breaks a run unless

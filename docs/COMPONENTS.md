@@ -125,9 +125,11 @@ Outsider bugs fixed in 0.12.1–0.12.3:
 - The installer's sdist build is capped too (`CMAKE_BUILD_PARALLEL_LEVEL`).
 - nvcc is now found in `/usr/local/cuda*/bin`.
 
+Fixed by `client/admission-defaults`:
+- **Client ergonomics.** The gateway and one-off client now default `NKS_REGISTRY_KEYID` from the release registrar id (or the release worker's public-key node id), and use the uid-owned release sidecar socket when it exists. Explicit environment settings still win.
+
 Open:
 - **Pillar deploy drift.** The Pi pillar ran Sthambha `3a4f7bf` (09-30), which drops typed endpoints, so the chain showed `endpoint: null`. It was redeployed to `c8d62c1` with `scripts/deploy-pi.sh`. Pillar deploys need to follow Sthambha main the way releases do.
-- **Client ergonomics.** A one-off inference needs `NKS_REGISTRY_KEYID` (the hub's registrar id) and `NAKSHATRA_P2P_SOCKET` set by hand. The gateway or client should default both from the node's own release state.
 - **Roster sync.** Self-joins land in the VPS roster (`/var/lib/nakshatra-roster/peers.tsv`). Nothing brings them back to the hub's admission roster, and `roster-merge.py` only pushes git to the VPS.
 - **Worker profile weight.** The worker pulls in the `inference` profile, whose sdist-only `llama-cpp-python` compiles llama.cpp a second time. `worker.py` never imports it, so a slimmer worker profile is needed.
 - **Pillar front access.** The front is allow-listed to the home IPs for this test. Real strangers need it opened, with rate limits.

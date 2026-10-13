@@ -34,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import yaml
 
+from client_defaults import resolve_p2p_socket, resolve_registry_keyid
 from step_text import escape_step_text   # one token = one output line (see step_text.py)
 from edge_health import EdgeError, EdgeFailureKind   # #17 live seam: typed edge faults so the
 # recovery loop can swap a dead worker instead of the process dying. Pure stdlib (duck-types grpc).
@@ -215,13 +216,14 @@ def _grpc_auth_metadata(method: str, message_bytes: bytes, streaming: bool = Fal
     signed `Sthambha-Ed25519` header: this driver had no way to send one, so it could only drive unauthenticated
     (static-YAML, Mode A) workers. When NKS_REGISTRY_KEYID names a registered peer whose key this box holds, the call is
     signed over the serialized request (Forward) or the FIRST frame (Inference, streaming), exactly as the worker verifies.
-    Unset = None = no metadata, the old behaviour."""
-    keyid = os.environ.get("NKS_REGISTRY_KEYID", "").strip()
+    When the variable is absent, the release registrar id or this node's public-key id is used."""
+    keyid, _keyid_source = resolve_registry_keyid()
     if not keyid:
         return None
     import nakshatra_auth as _na
     import nakshatra_grpc_auth as _ga
-    priv, _pub = _na.load_or_create_worker_key()
+    key_path = Path.home() / ".nakshatra" / "keys" / "worker.ed25519"
+    priv, _pub = _na.load_or_create_worker_key(key_path)
     header = _ga.build_grpc_auth_header(priv, keyid, _GRPC_AUTH_METHODS[method], message_bytes, is_streaming=streaming)
     return [("authorization", header)]
 
@@ -548,8 +550,7 @@ def _sidecar_forward(peer_id: str, socket_path: str | None = None,
     """
     endpoint = _parse_activation_endpoint(
         {"kind": ACTIVATION_ENDPOINT_KIND, "peer_id": peer_id})
-    socket_path = (socket_path
-                   or os.environ.get("NAKSHATRA_P2P_SOCKET", "")).strip()
+    socket_path = socket_path.strip() if socket_path is not None else resolve_p2p_socket()
     if not socket_path:
         raise RuntimeError(
             "libp2p activation endpoint requires NAKSHATRA_P2P_SOCKET")
@@ -853,24 +854,36 @@ def _registry_urlopen(url: str, timeout: float = 10):
     """urlopen for a Sthambha registry GET. Since the pillar's auth hardening /chain and /peers need a signed
     `Authorization: Sthambha-Ed25519` header (an unsigned GET is a 401), so registry mode was silently broken.
     When NKS_REGISTRY_KEYID names a registered peer whose key this box holds (nakshatra_auth's worker key), the request
-    is signed - over the FULL path INCLUDING the query string, which is what the pillar verifies. Unset = unsigned,
-    exactly the old behaviour, so older open pillars still work."""
+    is signed - over the FULL path INCLUDING the query string, which is what the pillar verifies. When unset, the
+    release registrar id or the release worker's public-key id is selected automatically."""
     import nakshatra_auth as _na
     pin = os.environ.get("STHAMBHA_PILLAR_SPKI_SHA256", "").strip() or None
-    keyid = os.environ.get("NKS_REGISTRY_KEYID", "").strip()
-    if not keyid:
+    keyid, keyid_source = resolve_registry_keyid()
+    try:
+        if not keyid:
+            return _na.open_pillar_url(
+                url, timeout=timeout, expected_spki_hash=pin,
+            )
+        from urllib.parse import urlsplit
+        parts = urlsplit(url)
+        signed_path = parts.path + (f"?{parts.query}" if parts.query else "")
+        key_path = Path.home() / ".nakshatra" / "keys" / "worker.ed25519"
+        priv, _pub = _na.load_or_create_worker_key(key_path)
+        header, _ts = _na.build_signed_envelope(priv, keyid, "GET", signed_path, b"")
         return _na.open_pillar_url(
-            url, timeout=timeout, expected_spki_hash=pin,
+            urlrequest.Request(url, headers={"Authorization": header}),
+            timeout=timeout, expected_spki_hash=pin,
         )
-    from urllib.parse import urlsplit
-    parts = urlsplit(url)
-    signed_path = parts.path + (f"?{parts.query}" if parts.query else "")
-    priv, _pub = _na.load_or_create_worker_key()
-    header, _ts = _na.build_signed_envelope(priv, keyid, "GET", signed_path, b"")
-    return _na.open_pillar_url(
-        urlrequest.Request(url, headers={"Authorization": header}),
-        timeout=timeout, expected_spki_hash=pin,
-    )
+    except urlrequest.HTTPError as e:
+        if e.code == 401:
+            attempted = repr(keyid) if keyid else "<unsigned>"
+            raise RuntimeError(
+                "the Sthambha pillar refused the registry request (401); "
+                f"tried keyid {attempted} from {keyid_source}. "
+                "Set NKS_REGISTRY_KEYID to a node id registered with the "
+                "pillar whose key this box holds, or use --config."
+            ) from e
+        raise
 
 
 def _try_pillar_chain(registry_url: str, model_id: str) -> list | None:
@@ -887,10 +900,6 @@ def _try_pillar_chain(registry_url: str, model_id: str) -> list | None:
     except urlrequest.HTTPError as e:
         if e.code == 404:
             return None
-        if e.code == 401:
-            raise RuntimeError(
-                "the Sthambha pillar refused an unsigned registry request (401). Set NKS_REGISTRY_KEYID to a node id "
-                "registered with the pillar whose key this box holds (e.g. the box's registrar id), or use --config.") from e
         raise
     chain = data.get("chain") or []
     if not chain:
