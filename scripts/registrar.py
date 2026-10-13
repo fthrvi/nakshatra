@@ -210,7 +210,7 @@ def _ollama_inventory(config: RegistrarConfig):
                   "layer_start": 0, "layer_end": block_count}
         try:
             size_bytes = max(0, int(item.get("size", 0) or 0))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):     # e.g. a JSON 1e999 parses as inf
             size_bytes = 0
         offerings.append(dict(common))
         cached_files.append({**common, "size_bytes": size_bytes, "file_path": ""})

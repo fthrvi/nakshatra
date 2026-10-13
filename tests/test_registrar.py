@@ -253,3 +253,17 @@ def test_strict_worker_key_load_refuses_symlink_and_wrong_owner(tmp_path, monkey
     monkeypatch.setattr(auth.os, "fstat", foreign_fstat)
     with pytest.raises(PermissionError, match="owned by uid"):
         auth.load_worker_key(key)
+
+
+def test_an_absurd_ollama_size_never_suppresses_the_heartbeat(tmp_path, monkeypatch):
+    config = _config(tmp_path, NKS_OLLAMA_URL="http://127.0.0.1:11434")
+
+    def fake_json(_config, path, body=None):
+        if path == "/api/tags":
+            return {"models": [{"name": "huge:1", "size": float("inf"), "details": {"family": "llama"}}]}
+        return {"details": {"family": "llama"}, "model_info": {"llama.block_count": 28}}
+
+    monkeypatch.setattr(registrar, "_ollama_json", fake_json)
+    offerings, files = registrar._ollama_inventory(config)
+    assert [o["model_id"] for o in offerings] == ["huge:1"]
+    assert files[0]["size_bytes"] == 0
