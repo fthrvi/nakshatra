@@ -1210,7 +1210,8 @@ def main():
         # → allow anything). Alternates already pass through verbatim below.
         primary = {k: w[k] for k in ("id", "node_id", "address", "port",
                                        "layer_range", "mode", "peer_spki_hash",
-                                       "drift_class", "endpoint", "public_key_hex")
+                                       "drift_class", "endpoint", "public_key_hex",
+                                       "internal_address")
                    if k in w}
         primary["sub_gguf_path"] = w.get("sub_gguf_path", "")
         # Normalize per-candidate hashes too: alternates may omit the
