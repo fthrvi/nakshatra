@@ -1,0 +1,2 @@
+# Optional: one executable name per line, with or without .exe.
+# game.exe

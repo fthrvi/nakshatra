@@ -1,0 +1,15 @@
+[Unit]
+Description=Nakshatra owner GPU lease sentinel
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/.local/lib/nakshatra/owner-sentinel/owner_sentinel.py --env-file %h/.config/nakshatra/owner-lease.env --process-list %h/.config/nakshatra/games.txt
+Restart=always
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

@@ -1,9 +1,19 @@
 # The courteous worker — a lease, not a poll
 
-**Design. 2026-09-04. Nothing here is built. Prompted by adding an RTX 5070 in WSL2 on a
-family member's gaming PC; written to hold for every consumer machine that follows.**
+**Design. 2026-09-04. Prompted by adding an RTX 5070 in WSL2 on a family member's gaming PC;
+written to hold for every consumer machine that follows. Sentinel implementation added
+2026-10-13.**
 
-**Status:** idle unload is built; the owner lease and platform sentinel are not.
+**Status:** idle unload and the Windows/Linux sentinels are built; worker lease enforcement is
+documented here and implemented separately.
+
+## Sentinels
+
+The installable Windows and Linux owner sentinels live in
+[`deploy/owner-sentinel/`](../deploy/owner-sentinel/README.md). They renew the local worker's
+lease every two seconds while the owner is clear, report busy for local owner-use signals, and
+fail safely by sending nothing on errors. The worker therefore releases the GPU when a sentinel
+reports busy or disappears.
 
 ## The problem is general, and the current rule does not solve it
 
