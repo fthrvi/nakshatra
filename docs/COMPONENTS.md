@@ -112,3 +112,19 @@ different NATs over IPv4 only (needs a second network).
 - "Healthy" = stable process for 5 s; there is no readiness probe (e.g. the gateway's /v1/models, the sidecar's relay reservation).
 - A request arriving between the last idle sample and the restart is cut (a narrow race).
 - An interruption between the switch and saving the config leaves an unvalidated release active until the next run.
+
+## First outsider GPU (bro, RTX 5070, WSL; 2026-10-13)
+Proven:
+- **One way in.** The hub ran `nak invite --kind worker --tier known` and bro ran `install.py join`. The node-key-signed `/worker-redeem` on the VPS onboard server then added bro to the roster at `known`.
+- **Signed packages.** `llama32-3b` is signed by a dedicated package-signer key (`2a4d231e…`) and served from the untrusted release host (`:8960/packages/`). A remote fetch verifies the signature and every artifact's SHA-256.
+- **Pinned pillar.** Off-overlay workers reach the pillar through an nginx TLS front on the VPS (`https://45.63.109.137:7778`, forwarding to the Pi `10.42.0.3:7777`, SPKI `17c38321…`).
+
+Outsider bugs fixed in 0.12.1–0.12.3:
+- The CUDA build is capped by RAM (`WORKER_BUILD_JOBS` overrides).
+- The installer's sdist build is capped too (`CMAKE_BUILD_PARALLEL_LEVEL`).
+- nvcc is now found in `/usr/local/cuda*/bin`.
+
+Open:
+- **Roster sync.** Self-joins land in the VPS roster (`/var/lib/nakshatra-roster/peers.tsv`). Nothing brings them back to the hub's admission roster, and `roster-merge.py` only pushes git to the VPS.
+- **Worker profile weight.** The worker pulls in the `inference` profile, whose sdist-only `llama-cpp-python` compiles llama.cpp a second time. `worker.py` never imports it, so a slimmer worker profile is needed.
+- **Pillar front access.** The front is allow-listed to the home IPs for this test. Real strangers need it opened, with rate limits.
