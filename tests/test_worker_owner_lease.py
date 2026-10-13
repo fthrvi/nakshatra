@@ -264,3 +264,15 @@ def test_resume_requires_continuous_live_heartbeats(tmp_path):
     clock.advance(1)
     assert lease.heartbeat(at=7, clear=True, reason="still clear")["resume_ready"] is True
     assert controller.residency == "standby"
+
+
+def test_non_ascii_bearer_is_a_clean_401_not_a_crash():
+    class _Cfg:
+        token = "a" * 64
+
+    class _Lease:
+        config = _Cfg()
+
+    status, payload = worker.owner_lease_http_response(
+        _Lease(), "/lease", "Bearer ééé", b'{"at": 1, "clear": true}')
+    assert status == 401 and payload == {"error": "unauthorized"}

@@ -1545,7 +1545,10 @@ def owner_lease_http_response(lease: OwnerLease, path: str,
     """Pure request validation/action used by the tiny HTTP adapter."""
     prefix = "Bearer "
     candidate = authorization[len(prefix):] if authorization.startswith(prefix) else ""
-    if not hmac.compare_digest(candidate, lease.config.token):
+    # Compare bytes: hmac.compare_digest raises TypeError on non-ASCII str, which a hostile local
+    # caller could otherwise use to crash the handler instead of getting a clean 401.
+    if not hmac.compare_digest(candidate.encode("utf-8", "surrogateescape"),
+                               lease.config.token.encode("utf-8")):
         return 401, {"error": "unauthorized"}
     if path != "/lease":
         return 404, {"error": "not found"}
@@ -1572,6 +1575,10 @@ def start_owner_lease_server(lease: OwnerLease, *, server_class=HTTPServer):
     """Start the authenticated endpoint, hard-coded to IPv4 loopback."""
 
     class Handler(BaseHTTPRequestHandler):
+        # One request at a time; a stalled local sender must not hold the endpoint (a missed
+        # heartbeat only ever releases the GPU, but the owner's real sentinel should get through).
+        timeout = 5
+
         def _json(self, status: int, payload: dict):
             body = json.dumps(payload, separators=(",", ":")).encode()
             self.send_response(status)
