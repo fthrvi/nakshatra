@@ -152,6 +152,13 @@ elif _have nvidia-smi && nvidia-smi -L >/dev/null 2>&1; then
   CC="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d ' .')"
   [ -n "$CC" ] || CC=86
   NVCC_OK=0
+  # NVIDIA's toolkit installs to /usr/local/cuda*/bin, which is not on a login PATH. Without this a
+  # box that already has CUDA silently built CPU-only (bro, 2026-10-13: CUDA 13.4 installed, "cpu").
+  if ! _have nvcc; then
+    for d in /usr/local/cuda/bin $(ls -d /usr/local/cuda-*/bin 2>/dev/null | sort -rV); do
+      [ -x "$d/nvcc" ] && { PATH="$d:$PATH"; break; }
+    done
+  fi
   if _have nvcc; then
     NVV="$(nvcc --version 2>/dev/null | grep -oE 'release [0-9]+\.[0-9]+' | awk '{print $2}')"
     NVMAJ="${NVV%%.*}"; NVMIN="${NVV##*.}"
