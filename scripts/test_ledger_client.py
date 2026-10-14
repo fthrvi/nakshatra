@@ -144,6 +144,73 @@ def test_fail_open_on_network_error_even_when_enforced(monkeypatch, tmp_path):
     assert allow is True and "fail-open" in reason
 
 
+@pytest.mark.parametrize("failure", [ConnectionError("ledger down"), TimeoutError("slow")])
+def test_strict_mode_denies_transport_failures(monkeypatch, tmp_path, failure):
+    h = _hook(
+        monkeypatch, tmp_path,
+        NAKSHATRA_CREDITS="1", NAKSHATRA_LEDGER_MODE="enforce",
+    )
+    monkeypatch.setattr(h, "_get", lambda _path: (_ for _ in ()).throw(failure))
+    allow, reason = h.gate(100)
+    assert allow is False and "ledger unreachable" in reason
+
+
+@pytest.mark.parametrize("status", [401, 500, 503])
+def test_strict_mode_denies_unsigned_and_http_errors(monkeypatch, tmp_path, status):
+    monkeypatch.setattr(
+        ledger_client.urllib.request, "urlopen",
+        lambda request, timeout: (_ for _ in ()).throw(_http_error(request, status)),
+    )
+    h = _hook(
+        monkeypatch, tmp_path,
+        NAKSHATRA_CREDITS="1", NAKSHATRA_LEDGER_MODE="enforce",
+    )
+    allow, reason = h.gate(100)
+    assert allow is False
+    assert "signature" in reason if status == 401 else f"HTTP {status}" in reason
+
+
+def test_strict_mode_missing_key_denies_without_creating_it(monkeypatch, tmp_path):
+    key_path = _missing_key(monkeypatch, tmp_path)
+    h = _hook(
+        monkeypatch, tmp_path, install_key=False,
+        NAKSHATRA_CREDITS="1", NAKSHATRA_LEDGER_MODE="enforce",
+    )
+    assert h.gate(1) == (False, "ledger signing key unavailable")
+    assert not key_path.exists()
+
+
+def test_strict_mode_ok_allows_and_never_asserts_requester(monkeypatch, tmp_path):
+    _key_path, public_key_hex = _install_key(monkeypatch, tmp_path)
+    requests = []
+    monkeypatch.setattr(
+        ledger_client.urllib.request, "urlopen",
+        lambda request, timeout: requests.append(request) or _Response(),
+    )
+    h = _hook(
+        monkeypatch, tmp_path,
+        NAKSHATRA_CREDITS="1", NAKSHATRA_LEDGER_MODE="enforce",
+    )
+    assert h.gate(7) == (True, "")
+    assert requests[0].full_url.endswith("/can_consume?cost=7")
+    assert "account=" not in requests[0].full_url
+    _assert_signed(requests[0], public_key_hex, "/can_consume?cost=7", b"")
+
+
+def test_strict_mode_402_denies(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        ledger_client.urllib.request, "urlopen",
+        lambda request, timeout: (_ for _ in ()).throw(
+            _http_error(request, 402, {"balance": 2})),
+    )
+    h = _hook(
+        monkeypatch, tmp_path,
+        NAKSHATRA_CREDITS="1", NAKSHATRA_LEDGER_MODE="enforce",
+    )
+    allow, reason = h.gate(7)
+    assert allow is False and "insufficient credits" in reason
+
+
 def test_signed_post_verifies_against_exact_wire_body(monkeypatch, tmp_path):
     _key_path, public_key_hex = _install_key(monkeypatch, tmp_path)
     requests = []
@@ -168,6 +235,26 @@ def test_signed_post_verifies_against_exact_wire_body(monkeypatch, tmp_path):
     body = json.loads(request.data)
     assert body["receipt"]["run_id"] == "r1"
     assert body["requester"] == "self"
+
+
+def test_strict_settle_does_not_assert_requester(monkeypatch, tmp_path):
+    _key_path, public_key_hex = _install_key(monkeypatch, tmp_path)
+    requests = []
+    monkeypatch.setattr(
+        ledger_client.urllib.request, "urlopen",
+        lambda request, timeout: requests.append(request) or _Response(b'{"charged":3}'),
+    )
+    h = _hook(
+        monkeypatch, tmp_path,
+        NAKSHATRA_CREDITS="1", NAKSHATRA_LEDGER_MODE="enforce",
+        NAKSHATRA_LEDGER_OWN_ALL="1",
+    )
+    receipt_path = tmp_path / "receipt.json"
+    receipt_path.write_text(json.dumps({"run_id": "r1"}))
+    assert h.settle(str(receipt_path)) == {"charged": 3}
+    _assert_signed(requests[0], public_key_hex, "/settle", requests[0].data)
+    body = json.loads(requests[0].data)
+    assert "requester" not in body and "own_nodes" not in body
 
 
 @pytest.mark.parametrize("path", ["/balance", "/history?limit=2"])
@@ -282,6 +369,29 @@ def test_rejected_receipt_is_logged_and_never_retried(
 
     assert len(calls) == 1
     assert message in caplog.text
+
+
+def test_strict_rejected_receipt_stays_denied_without_retry(monkeypatch, tmp_path):
+    calls = []
+
+    def reject(request, timeout):
+        calls.append(request)
+        raise _http_error(request, 409)
+
+    monkeypatch.setattr(ledger_client.urllib.request, "urlopen", reject)
+    h = _hook(
+        monkeypatch, tmp_path,
+        NAKSHATRA_CREDITS="1", NAKSHATRA_LEDGER_MODE="enforce",
+    )
+    receipt_path = tmp_path / "receipt.json"
+    receipt_path.write_text(json.dumps({"run_id": "strict-rejected"}))
+
+    with pytest.raises(ledger_client.LedgerUnavailable, match="settle HTTP 409"):
+        h.settle(str(receipt_path))
+    with pytest.raises(ledger_client.LedgerUnavailable, match="previously rejected"):
+        h.settle(str(receipt_path))
+
+    assert len(calls) == 1
 
 
 def test_settle_network_error_fails_open(monkeypatch, tmp_path):

@@ -35,13 +35,23 @@ ESCROW_BACKENDS = ("ledger",)
 
 
 def metering():
-    """The metering half, configured from env. Never raises: a broken backend degrades to a no-op
-    that allows every run (the gateway must always be able to serve)."""
+    """The metering half, configured from env.
+
+    The historical hub policy remains fail-open. An outsider gateway explicitly selects
+    ``NAKSHATRA_LEDGER_MODE=enforce``; in that mode even an import/construction failure must deny.
+    """
     try:
         from ledger_client import LedgerHook
         return LedgerHook()
     except Exception:  # noqa: BLE001 — the inference gateway's safety contract
         from types import SimpleNamespace
+        if os.environ.get("NAKSHATRA_LEDGER_MODE", "").strip().lower() == "enforce":
+            return SimpleNamespace(
+                enabled=True, wants_receipt=True, fail_closed=True,
+                gate=lambda est: (False, "ledger client unavailable"),
+                settle=lambda p: (_ for _ in ()).throw(
+                    RuntimeError("ledger client unavailable")),
+            )
         return SimpleNamespace(enabled=False, wants_receipt=False,
                                gate=lambda est: (True, ""), settle=lambda p: None)
 

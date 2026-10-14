@@ -8,16 +8,21 @@ Two calls the inference serve makes around a run:
 SAFETY (this guards Prithvi's live brain):
   • DEFAULT-OFF: with NAKSHATRA_CREDITS unset, every method is a total no-op — the serve is
     byte-for-byte unchanged.
-  • FAIL-OPEN: any ledger error (down, slow, 5xx) → the run PROCEEDS. The credit system can
-    never block or break a served reply. An explicit v2 402 denies; a legacy 200 denial is
-    enforced only when NAKSHATRA_CREDITS_ENFORCE=1.
+  • FAIL-OPEN BY DEFAULT: any ledger error (down, slow, 5xx) → the run PROCEEDS. The hub's
+    existing behaviour is unchanged. An explicit v2 402 denies; a legacy 200 denial is enforced
+    only when NAKSHATRA_CREDITS_ENFORCE=1.
+  • OUTSIDER ENFORCE MODE: NAKSHATRA_LEDGER_MODE=enforce fails closed on a missing key or any
+    transport/protocol error. It also omits the legacy requester assertion: the ledger derives the
+    operator from the signing key's roster row.
 
 Env:
   NAKSHATRA_CREDITS=1            enable the hook (still fail-open; advisory unless enforced)
   NAKSHATRA_CREDITS_ENFORCE=1   enforce legacy 200-body denials (v2 uses HTTP 402)
   NAKSHATRA_LEDGER_URL          default http://127.0.0.1:8097
+  NAKSHATRA_LEDGER_MODE         default fail-open; "enforce" denies on every ledger failure
+  NAKSHATRA_LEDGER_SPKI_SHA256  optional HTTPS SPKI pin (required by `nak gateway on`)
   NAKSHATRA_LEDGER_KEYID        optional roster id for the node key (default: public-key hex)
-  NAKSHATRA_LEDGER_REQUESTER    who is consuming (default "self" = Prithvi; an operator id for outsiders)
+  NAKSHATRA_LEDGER_REQUESTER    legacy fail-open requester (default "self"; ignored in enforce mode)
   NAKSHATRA_LEDGER_TIMEOUT      seconds (default 2)
 """
 from __future__ import annotations
@@ -37,15 +42,27 @@ import nakshatra_auth
 _LOG = logging.getLogger(__name__)
 
 
+class LedgerUnavailable(RuntimeError):
+    """Strict accounting could not prove that the run was chargeable/settled."""
+
+
 def _truthy(v: str) -> bool:
     return (v or "").strip() in ("1", "true", "True", "yes", "on")
 
 
 class LedgerHook:
-    def __init__(self):
-        self.enabled = _truthy(os.environ.get("NAKSHATRA_CREDITS", ""))
+    def __init__(self, *, url: str | None = None, enabled: bool | None = None,
+                 mode: str | None = None, spki_hash: str | None = None):
+        self.enabled = (_truthy(os.environ.get("NAKSHATRA_CREDITS", ""))
+                        if enabled is None else bool(enabled))
         self.enforce = _truthy(os.environ.get("NAKSHATRA_CREDITS_ENFORCE", ""))
-        self.url = os.environ.get("NAKSHATRA_LEDGER_URL", "http://127.0.0.1:8097").rstrip("/")
+        self.mode = (mode if mode is not None else
+                     os.environ.get("NAKSHATRA_LEDGER_MODE", "fail-open")).strip().lower()
+        self.fail_closed = self.mode == "enforce"
+        self.url = (url or os.environ.get(
+            "NAKSHATRA_LEDGER_URL", "http://127.0.0.1:8097")).rstrip("/")
+        self.spki_hash = (spki_hash if spki_hash is not None else os.environ.get(
+            "NAKSHATRA_LEDGER_SPKI_SHA256", "")).strip().lower() or None
         self.requester = os.environ.get("NAKSHATRA_LEDGER_REQUESTER", "self")
         self._private_key = None
         self.keyid = None
@@ -62,8 +79,9 @@ class LedgerHook:
                     os.environ.get("NAKSHATRA_LEDGER_KEYID", "").strip()
                     or public_key_hex
                 )
-            except Exception as exc:  # noqa: BLE001 - accounting must remain fail-open
-                _LOG.warning("ledger signing key unavailable (%s); fail-open", exc)
+            except Exception as exc:  # noqa: BLE001 - gate applies the selected policy
+                policy = "fail-closed" if self.fail_closed else "fail-open"
+                _LOG.warning("ledger signing key unavailable (%s); %s", exc, policy)
 
     @property
     def wants_receipt(self) -> bool:
@@ -74,15 +92,21 @@ class LedgerHook:
         when the ledger says yes / legacy enforcement is off. An explicit v2 402 denies."""
         if not self.enabled:
             return True, ""
+        if self._private_key is None and self.fail_closed:
+            return False, "ledger signing key unavailable"
         if self._private_key is None:
             return True, "ledger signing key unavailable; fail-open"
         try:
-            q = urllib.parse.urlencode({"account": self.requester, "cost": int(est_cost)})
+            params = ({"cost": int(est_cost)} if self.fail_closed else
+                      {"account": self.requester, "cost": int(est_cost)})
+            q = urllib.parse.urlencode(params)
             r = self._get(f"/can_consume?{q}")
             ok = bool(r.get("ok"))
         except urllib.error.HTTPError as e:
             if e.code == 401:
                 self._log_signature_refusal()
+                if self.fail_closed:
+                    return False, "ledger refused this node's signature"
                 return True, "ledger refused signature; fail-open"
             if e.code == 402:
                 detail = self._http_error_json(e)
@@ -90,11 +114,17 @@ class LedgerHook:
                     f"insufficient credits (balance {detail.get('balance')}, "
                     f"cost {int(est_cost)})"
                 )
+            if self.fail_closed:
+                return False, f"ledger HTTP {e.code}"
             return True, f"ledger HTTP {e.code}; fail-open"
         except Exception as e:
+            if self.fail_closed:
+                return False, f"ledger unreachable ({e})"
             return True, f"ledger unreachable ({e}); fail-open"
         if ok:
             return True, ""
+        if self.fail_closed:
+            return False, f"insufficient credits (balance {r.get('balance')}, cost {int(est_cost)})"
         if not self.enforce:
             return True, "insufficient credits (advisory; enforcement off)"
         return False, f"insufficient credits (balance {r.get('balance')}, cost {int(est_cost)})"
@@ -102,16 +132,26 @@ class LedgerHook:
     def settle(self, receipt_path: str):
         """Credit the workers from a #20 run receipt. Fail-open: a settle failure NEVER affects
         the served reply. Returns the delta dict or None."""
-        if not self.enabled or self._private_key is None:
+        if not self.enabled:
+            return None
+        if self._private_key is None:
+            if self.fail_closed:
+                raise LedgerUnavailable("ledger signing key unavailable")
             return None
         try:
             with open(receipt_path) as f:
                 receipt = json.load(f)
             receipt_id = self._receipt_id(receipt)
             if receipt_id in self._rejected_receipts:
+                if self.fail_closed:
+                    raise LedgerUnavailable(
+                        f"ledger previously rejected receipt {receipt_id}"
+                    )
                 return None
-            body = {"receipt": receipt, "requester": self.requester}
-            own = self._own_nodes(receipt)
+            body = {"receipt": receipt}
+            if not self.fail_closed:
+                body["requester"] = self.requester
+            own = [] if self.fail_closed else self._own_nodes(receipt)
             if own:
                 body["own_nodes"] = own        # local infra → free
             # identity-binding: attach the holder-of-key-PROVEN accounts (each worker Ed25519-signed the
@@ -155,9 +195,33 @@ class LedgerHook:
                         "ledger rejected %s receipt (%d); will not retry receipt %s",
                         outcome, e.code, receipt_id,
                     )
+                if self.fail_closed:
+                    raise LedgerUnavailable(f"ledger settle HTTP {e.code}") from e
                 return None
-        except Exception:
+        except LedgerUnavailable:
+            raise
+        except Exception as e:
+            if self.fail_closed:
+                raise LedgerUnavailable(f"ledger settle failed ({e})") from e
             return None
+
+    def balance(self) -> dict:
+        """Return the signing operator's balance/tier. No account selector is ever sent."""
+        if not self.enabled:
+            raise LedgerUnavailable("ledger accounting is disabled")
+        if self._private_key is None:
+            raise LedgerUnavailable("ledger signing key unavailable")
+        try:
+            value = self._get("/balance")
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                self._log_signature_refusal()
+            raise LedgerUnavailable(f"ledger balance HTTP {e.code}") from e
+        except Exception as e:
+            raise LedgerUnavailable(f"ledger balance unavailable ({e})") from e
+        if not isinstance(value, dict):
+            raise LedgerUnavailable("ledger returned an invalid balance response")
+        return value
 
     @staticmethod
     def _receipt_id(receipt: dict) -> str:
@@ -200,7 +264,7 @@ class LedgerHook:
             headers={"Authorization": authorization},
             method="GET",
         )
-        with urllib.request.urlopen(req, timeout=self.timeout) as r:
+        with self._urlopen(req) as r:
             return json.loads(r.read())
 
     def _post(self, path: str, obj: dict):
@@ -217,5 +281,11 @@ class LedgerHook:
             },
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=self.timeout) as r:
+        with self._urlopen(req) as r:
             return json.loads(r.read())
+
+    def _urlopen(self, request):
+        if self.spki_hash:
+            return nakshatra_auth.open_pillar_url(
+                request, timeout=self.timeout, expected_spki_hash=self.spki_hash)
+        return urllib.request.urlopen(request, timeout=self.timeout)

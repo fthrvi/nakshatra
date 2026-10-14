@@ -217,6 +217,38 @@
     "max_wait_s": 900
    }
   },
+  "nakshatra-gateway": {
+   "description": "Nakshatra outsider consumer gateway (local OpenAI endpoint)",
+   "requires": "{home}/.nakshatra/gateway.env",
+   "env_file": "{home}/.nakshatra/gateway.env",
+   "after": [
+    "network-online.target"
+   ],
+   "environment": {
+    "PORT": "11600",
+    "BIND": "127.0.0.1",
+    "MODELS": "auto"
+   },
+   "exec": [
+    "{python}",
+    "{prefix}/current/nakshatra/scripts/nakshatra_serve.py",
+    "--port",
+    "${PORT}",
+    "--bind",
+    "${BIND}",
+    "--models",
+    "${MODELS}"
+   ],
+   "restart": "always",
+   "hardening": true,
+   "read_write_paths": [
+    "{home}/.nakshatra/gateway"
+   ],
+   "components": [
+    "nakshatra"
+   ],
+   "profile": "inference"
+  },
   "nakshatra-worker": {
    "description": "Nakshatra distributed-inference worker",
    "requires": "{home}/.nakshatra/worker.env",

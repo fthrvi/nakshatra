@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import ipaddress
 import json
 import math
 import os
@@ -204,6 +205,147 @@ def _enable_p2p_service(_sp) -> None:
 
 WORKER_SERVICE = "nakshatra-worker"
 WORKER_BACKENDS = {"cpu", "cuda", "rocm", "vulkan", "metal"}
+GATEWAY_SERVICE = "nakshatra-gateway"
+
+
+def _gateway_paths() -> tuple[Path, Path]:
+    root = Path.home() / ".nakshatra" / "gateway"
+    return root, Path.home() / ".nakshatra" / "gateway.env"
+
+
+def _gateway_installer(_sp, action: str) -> None:
+    prefix = Path(os.environ.get("NAK_NODE_PREFIX", Path.home() / ".nakshatra-node"))
+    installer = _verified_release_installer(prefix)
+    try:
+        _sp.run([sys.executable, str(installer), "--prefix", str(prefix),
+                 action, GATEWAY_SERVICE], check=True)
+    except (OSError, _sp.CalledProcessError) as e:
+        raise SystemExit(f"could not {action} {GATEWAY_SERVICE}: {e}")
+
+
+def _bare_http_url(value: str, name: str, *, allow_path: bool = False) -> str:
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except (TypeError, ValueError) as e:
+        raise SystemExit(f"--{name} is not a valid URL: {e}") from e
+    if (parsed.scheme not in {"http", "https"} or not parsed.hostname
+            or parsed.username is not None or parsed.password is not None
+            or parsed.query or parsed.fragment or (port is not None and not 1 <= port <= 65535)
+            or (not allow_path and parsed.path not in {"", "/"})):
+        kind = "base URL without credentials, query, or fragment" if allow_path else "bare origin"
+        raise SystemExit(f"--{name} must be an http(s) {kind}")
+    return value.rstrip("/")
+
+
+def _loopback_bind(value: str) -> bool:
+    if value == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(value).is_loopback
+    except ValueError:
+        return False
+
+
+def _gateway_on(_sp, args) -> None:
+    if not 1 <= args.port <= 65535:
+        raise SystemExit("--port must be between 1 and 65535")
+    if not _loopback_bind(args.bind) and not args.allow_lan:
+        raise SystemExit("refusing a non-loopback gateway bind without --allow-lan")
+    pillar = _bare_http_url(args.pillar_url, "pillar-url")
+    ledger = _bare_http_url(args.ledger_url, "ledger-url", allow_path=True)
+    for value, name in ((pillar, "pillar-url"), (ledger, "ledger-url")):
+        parsed = urlsplit(value)
+        try:
+            local = ipaddress.ip_address(parsed.hostname).is_loopback
+        except ValueError:
+            local = parsed.hostname == "localhost"
+        if parsed.scheme != "https" and not local:
+            raise SystemExit(f"--{name} must use https outside loopback")
+    pin = (args.pillar_spki or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", pin):
+        raise SystemExit("--pillar-spki must be a 64-character SHA-256 hex digest")
+    if args.models != "auto" and not Path(args.models).is_file():
+        raise SystemExit("--models must be 'auto' or an existing serve_models YAML file")
+
+    root, env_path = _gateway_paths()
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    old_env = env_path.read_bytes() if env_path.exists() else None
+    profile = Path.home() / ".nakshatra" / "inference.env"
+    made_profile = not profile.exists()
+    if made_profile:
+        _write_private(profile, b"# Opted into the signed release inference profile.\n")
+    body = (
+        f"PORT={args.port}\n"
+        f"BIND={_env_value(args.bind, 'bind')}\n"
+        f"MODELS={_env_value(args.models, 'models')}\n"
+        f"NAKSHATRA_PILLAR_URL={_env_value(pillar, 'pillar-url')}\n"
+        f"STHAMBHA_PILLAR_SPKI_SHA256={pin}\n"
+        "NKS_TRUST_PINNED_PILLAR=1\n"
+        "NAKSHATRA_CHAIN_TLS_MODE=required\n"
+        "NAKSHATRA_CREDITS=1\n"
+        "NAKSHATRA_LEDGER_MODE=enforce\n"
+        f"NAKSHATRA_LEDGER_URL={_env_value(ledger, 'ledger-url')}\n"
+        f"NAKSHATRA_LEDGER_SPKI_SHA256={pin}\n"
+    ).encode()
+    _write_private(env_path, body)
+    action = "restart" if old_env is not None and _gateway_unit_enabled(_sp) else "enable"
+    try:
+        _gateway_installer(_sp, action)
+    except (Exception, SystemExit):
+        if old_env is None:
+            env_path.unlink(missing_ok=True)
+        else:
+            _write_private(env_path, old_env)
+        if made_profile:
+            profile.unlink(missing_ok=True)
+        raise
+    print(f"gateway ON at http://{args.bind}:{args.port}/v1 (credits enforced)")
+
+
+def _gateway_unit_enabled(_sp) -> bool:
+    try:
+        result = _sp.run(
+            ["systemctl", "--user", "is-enabled", f"{GATEWAY_SERVICE}.service"],
+            capture_output=True, text=True, check=False)
+    except OSError:
+        return False
+    return result.returncode == 0 and (result.stdout or "").strip() not in {
+        "disabled", "masked", "not-found",
+    }
+
+
+def _gateway_off(_sp) -> None:
+    _gateway_installer(_sp, "disable")
+    _gateway_paths()[1].unlink(missing_ok=True)
+    print("gateway OFF")
+
+
+def _gateway_status(_sp) -> dict:
+    _root, env_path = _gateway_paths()
+    values = {}
+    if env_path.is_file():
+        for line in env_path.read_text().splitlines():
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            values[key] = value.strip().strip("\"'")
+    unit = {}
+    for prop, command in (("active", "is-active"), ("enabled", "is-enabled")):
+        try:
+            result = _sp.run(["systemctl", "--user", command,
+                              f"{GATEWAY_SERVICE}.service"],
+                             capture_output=True, text=True, check=False)
+            unit[prop] = (result.stdout or "").strip() or ("yes" if result.returncode == 0 else "no")
+        except OSError as e:
+            unit[prop] = f"unavailable: {e}"
+    return {
+        "configured": env_path.is_file(),
+        "bind": values.get("BIND"), "port": int(values["PORT"]) if values.get("PORT", "").isdigit() else None,
+        "models": values.get("MODELS"), "pillar_url": values.get("NAKSHATRA_PILLAR_URL"),
+        "ledger_url": values.get("NAKSHATRA_LEDGER_URL"),
+        "ledger_mode": values.get("NAKSHATRA_LEDGER_MODE"), "unit": unit,
+    }
 
 
 def _worker_paths() -> tuple[Path, Path, Path]:
@@ -583,6 +725,22 @@ def main(argv=None, *, http_post=None) -> int:
     p = sub.add_parser("p2p", help="use the local libp2p sidecar for both-NAT direct paths; restarts nak-net")
     p.add_argument("onoff", choices=["on", "off"])
     p.add_argument("--socket", type=Path, help="sidecar UNIX socket (default: $XDG_RUNTIME_DIR/nakshatra/p2p.sock)")
+    p = sub.add_parser("gateway", help="operate this node's local OpenAI consumer gateway")
+    gsub = p.add_subparsers(dest="gateway_cmd", required=True)
+    q = gsub.add_parser("on", help="configure and enable the fail-closed consumer gateway")
+    q.add_argument("--port", type=int, default=11600)
+    q.add_argument("--bind", default="127.0.0.1")
+    q.add_argument("--allow-lan", action="store_true",
+                   help="acknowledge that a non-loopback bind exposes inference to the LAN")
+    q.add_argument("--pillar-url", required=True)
+    q.add_argument("--pillar-spki", required=True,
+                   help="TLS SPKI SHA-256 pin for the public VPS front")
+    q.add_argument("--ledger-url", required=True,
+                   help="public ledger base on the same pinned VPS front")
+    q.add_argument("--models", default="auto",
+                   help="auto (signed pillar discovery) or a local serve_models YAML")
+    gsub.add_parser("off", help="disable the gateway and remove its opt-in")
+    gsub.add_parser("status", help="show configuration and unit state without key material")
     p = sub.add_parser("worker", help="build and operate this node's signed-release inference worker")
     wsub = p.add_subparsers(dest="worker_cmd", required=True)
     wsub.add_parser("build", help="compile the current release's verified engine for this GPU")
@@ -631,7 +789,15 @@ def main(argv=None, *, http_post=None) -> int:
     a = ap.parse_args(argv)
     s = a.sock
 
-    if a.cmd == "worker":
+    if a.cmd == "gateway":
+        import subprocess as _sp
+        if a.gateway_cmd == "on":
+            _gateway_on(_sp, a)
+        elif a.gateway_cmd == "off":
+            _gateway_off(_sp)
+        else:
+            print(json.dumps(_gateway_status(_sp), indent=1, sort_keys=True))
+    elif a.cmd == "worker":
         import subprocess as _sp
         if a.worker_cmd == "build":
             _worker_build(_sp)

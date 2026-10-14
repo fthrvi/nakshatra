@@ -22,6 +22,7 @@ import argparse
 import json
 import os
 import queue
+import re
 import socket
 import struct
 import sys
@@ -853,6 +854,16 @@ def _admit_activation_workers(model_id: str, workers: list[dict],
     """
     typed = [w for w in workers if w.get("endpoint") is not None]
     if not typed:
+        return
+    # An outsider consumer does not possess Biswa's private local roster. Its authority is the
+    # signed, roster-gated pillar projection reached through an SPKI-pinned public front. This
+    # narrowly-scoped mode is written only by `nak gateway on`; without BOTH the flag and a valid
+    # TLS pin, the historical local-roster firewall below remains mandatory.
+    trust_pillar = os.environ.get("NKS_TRUST_PINNED_PILLAR", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+    pillar_pin = os.environ.get("STHAMBHA_PILLAR_SPKI_SHA256", "").strip()
+    if trust_pillar and re.fullmatch(r"[0-9a-fA-F]{64}", pillar_pin):
         return
     from fabric import worker_join as wj
 

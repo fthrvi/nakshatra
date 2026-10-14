@@ -40,6 +40,7 @@ import logging
 import os
 import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -77,6 +78,24 @@ class ModelConfigError(Exception):
     """serve_models.yaml is missing, unreadable, or invalid. Raised at
     boot so a misconfigured gateway fails fast instead of serving an
     empty/odd model list."""
+
+
+def _env_assignments(path: str) -> dict[str, str]:
+    """Read the small KEY=value files written by `nak`; no shell evaluation."""
+    values = {}
+    try:
+        lines = open(path, encoding="utf-8").read().splitlines()
+    except OSError:
+        return values
+    for line in lines:
+        if not line or line.lstrip().startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        values[key.strip()] = value
+    return values
 
 
 @dataclass
@@ -215,6 +234,127 @@ def _load_models(path: str) -> dict[str, ModelEntry]:
     return registry
 
 
+def _local_tokenizers(model_ids: set[str]) -> dict[str, str]:
+    """Find tokenizer-capable GGUFs already present on this invited node.
+
+    Outsider worker slices retain GGUF tokenizer metadata, so a worker can consume the network
+    without downloading another model copy. A non-worker may place tokenizer-only/full GGUFs in
+    ``~/.nakshatra/gateway/models/<sanitised-model-id>.gguf``.
+    """
+    found = {}
+    worker = _env_assignments(os.path.expanduser("~/.nakshatra/worker.env"))
+    worker_model, worker_gguf = worker.get("MODEL_ID", ""), worker.get("SUB_GGUF", "")
+    if worker_model in model_ids and worker_gguf and os.path.isfile(worker_gguf):
+        found[worker_model] = worker_gguf
+    explicit = os.environ.get("NAKSHATRA_TOKENIZER_GGUF", "").strip()
+    if explicit and os.path.isfile(explicit) and len(model_ids) == 1:
+        found[next(iter(model_ids))] = explicit
+    root = os.path.expanduser(os.environ.get(
+        "NAKSHATRA_TOKENIZER_DIR", "~/.nakshatra/gateway/models"))
+    for model_id in model_ids - set(found):
+        name = re.sub(r"[^A-Za-z0-9._-]+", "_", model_id).strip("._") + ".gguf"
+        candidate = os.path.join(root, name)
+        if os.path.isfile(candidate):
+            found[model_id] = candidate
+    return found
+
+
+def _discover_auto_models(registry_url: str) -> dict[str, ModelEntry]:
+    """Discover contiguous, online model chains from the signed pillar `/peers` projection."""
+    if not registry_url:
+        raise ModelConfigError("--models auto needs NAKSHATRA_PILLAR_URL")
+    scripts = os.path.dirname(os.path.abspath(__file__))
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
+    import client as chain_client
+    peers = chain_client._fetch_registry_peers(registry_url)
+    by_model: dict[str, list[tuple[int, int]]] = {}
+    for peer in peers:
+        if not peer.get("is_online") or peer.get("residency") == "away":
+            continue
+        for offer in peer.get("layer_offerings") or []:
+            try:
+                model_id = str(offer["model_id"])
+                start, end = int(offer["layer_start"]), int(offer["layer_end"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if model_id and 0 <= start < end:
+                by_model.setdefault(model_id, []).append((start, end))
+    complete = {}
+    for model_id, ranges in by_model.items():
+        cursor, expected_end = 0, max(end for _start, end in ranges)
+        for start, end in sorted(ranges):
+            if start > cursor:
+                break
+            cursor = max(cursor, end)
+        if cursor == expected_end:
+            complete[model_id] = cursor
+    tokenizers = _local_tokenizers(set(complete))
+    missing = sorted(set(complete) - set(tokenizers))
+    if missing:
+        log.warning("auto models omitted without a local tokenizer GGUF: %s",
+                    ", ".join(missing))
+    return {
+        model_id: ModelEntry(
+            name=model_id, tokenizer_gguf=tokenizers[model_id],
+            registry_url=registry_url, num_layers=complete[model_id],
+            details={"source": "pillar", "layers": complete[model_id]},
+        )
+        for model_id in sorted(tokenizers)
+    }
+
+
+class AutoModelRegistry(dict):
+    """Small TTL cache so `/v1/models` tracks the currently complete pillar chains."""
+    def __init__(self, registry_url: str, refresh_s: float = 15.0):
+        super().__init__()
+        self.registry_url = registry_url
+        self.refresh_s = refresh_s
+        self._next_refresh = 0.0
+        self._lock = threading.Lock()
+
+    def _refresh(self):
+        now = time.monotonic()
+        if now < self._next_refresh:
+            return
+        with self._lock:
+            if now < self._next_refresh:
+                return
+            try:
+                discovered = _discover_auto_models(self.registry_url)
+            except Exception as e:  # keep the last known-good projection
+                log.warning("auto model discovery failed: %s", e)
+            else:
+                super().clear()
+                super().update(discovered)
+            self._next_refresh = now + self.refresh_s
+
+    def get(self, key, default=None):
+        self._refresh()
+        with self._lock:
+            return super().get(key, default)
+
+    def __iter__(self):
+        self._refresh()
+        with self._lock:
+            return iter(tuple(super().keys()))
+
+    def __len__(self):
+        self._refresh()
+        with self._lock:
+            return super().__len__()
+
+    def values(self):
+        self._refresh()
+        with self._lock:
+            return tuple(super().values())
+
+    def items(self):
+        self._refresh()
+        with self._lock:
+            return tuple(super().items())
+
+
 def _looks_reasoning_model(*paths: Optional[str]) -> bool:
     """Name heuristic for the registry default of ``ModelEntry.think`` —
     an explicit ``think:`` in serve_models.yaml always wins over this."""
@@ -259,6 +399,13 @@ class ChainBackendError(RuntimeError):
     unparseable output). Mapped to a 502 at the HTTP layer."""
 
 
+class CreditGateError(ChainBackendError):
+    """A fail-closed ledger decision, carrying its intended HTTP status."""
+    def __init__(self, message: str, status: int):
+        super().__init__(message)
+        self.status = status
+
+
 class _LifecycleColdStart(RuntimeError):
     """Scale-to-zero could not bring the chain up in time. Mapped to a 503 at
     the HTTP layer — distinct from a 502, because the right client response is
@@ -277,6 +424,27 @@ class GenerationResult:
     eval_count: int = 0          # tokens generated
     prompt_eval_count: int = 0   # prompt tokens
     done_reason: str = "stop"
+    credits_charged: Optional[int] = None
+
+
+def _credit_error_status(error: Exception) -> int:
+    return int(getattr(error, "status", HTTPStatus.BAD_GATEWAY))
+
+
+def _credits_charged(settlement) -> Optional[int]:
+    """Read the ledger's additive charge result without guessing from token usage."""
+    if not isinstance(settlement, dict):
+        return None
+    for key in ("charged", "credits_charged"):
+        value = settlement.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            return value
+    delta = settlement.get("delta")
+    if isinstance(delta, dict):
+        values = [v for v in delta.values()
+                  if isinstance(v, int) and not isinstance(v, bool) and v > 0]
+        return sum(values) if values else 0
+    return None
 
 
 class ChatBackend:
@@ -427,6 +595,13 @@ class ChainChatBackend(ChatBackend):
                "--model-path", entry.tokenizer_gguf,
                "--prompt", prompt, "--max-tokens", str(max_tokens),
                "--use-streaming"]
+        tls_mode = os.environ.get("NAKSHATRA_CHAIN_TLS_MODE", "").strip().lower()
+        if tls_mode:
+            if tls_mode not in {"off", "auto", "required"}:
+                raise ChainBackendError(
+                    f"invalid NAKSHATRA_CHAIN_TLS_MODE {tls_mode!r}"
+                )
+            cmd += ["--tls-mode", tls_mode]
         tok_sock = self._tokenizer_socket(entry.tokenizer_gguf)
         if tok_sock:
             cmd += ["--tokenizer-socket", tok_sock]
@@ -452,9 +627,7 @@ class ChainChatBackend(ChatBackend):
         return apply_client_defaults()
 
     def _ledger_hook(self):
-        """Cached credit-ledger hook. DEFAULT-OFF + FAIL-OPEN — never gates/breaks a run unless
-        NAKSHATRA_CREDITS=1 (and only DENIES with NAKSHATRA_CREDITS_ENFORCE=1). A broken/absent
-        ledger_client degrades to a no-op so the serve can never fail to load on its account."""
+        """Cached credit hook. Hub defaults stay fail-open; outsider enforce mode fails closed."""
         h = getattr(self, "_ledger_hook_cached", None)
         if h is None:
             try:
@@ -464,10 +637,21 @@ class ChainChatBackend(ChatBackend):
                 h = metering()
             except Exception:
                 from types import SimpleNamespace
-                h = SimpleNamespace(enabled=False, wants_receipt=False,
-                                    gate=lambda est: (True, ""), settle=lambda p: None)
+                strict = os.environ.get("NAKSHATRA_LEDGER_MODE", "").strip().lower() == "enforce"
+                h = SimpleNamespace(
+                    enabled=strict, wants_receipt=strict, fail_closed=strict,
+                    gate=(lambda est: (False, "ledger client unavailable")) if strict
+                    else (lambda est: (True, "")),
+                    settle=(lambda p: (_ for _ in ()).throw(
+                        RuntimeError("ledger client unavailable"))) if strict
+                    else (lambda p: None),
+                )
             self._ledger_hook_cached = h
         return h
+
+    def requires_credit_buffer(self) -> bool:
+        """Strict mode buffers streaming output until the signed settle succeeds."""
+        return bool(getattr(self._ledger_hook(), "fail_closed", False))
 
     def _roster_chain_yaml(self, entry) -> str:
         """from_roster: GENERATE the chain from the live roster at request time (firewall-gated +
@@ -496,11 +680,17 @@ class ChainChatBackend(ChatBackend):
     def generate(self, entry, prompt, max_tokens, options):
         import subprocess, tempfile
         hook = self._ledger_hook()
-        # gate before the run (no-op/advisory unless enforced; fail-open)
+        # gate before the run (no-op/advisory for the hub; mandatory for outsider gateways)
         est = int(max_tokens) * int(getattr(entry, "num_layers", 0) or 0)
-        allow, reason = hook.gate(est)
+        try:
+            allow, reason = hook.gate(est)
+        except Exception as e:
+            if getattr(hook, "fail_closed", False):
+                raise CreditGateError(f"ledger unavailable: {e}", 503) from e
+            allow, reason = True, ""
         if not allow:
-            raise ChainBackendError(f"credit gate: {reason}")
+            status = 402 if reason.startswith("insufficient credits") else 503
+            raise CreditGateError(reason, status)
         rcpt = None
         if getattr(hook, "wants_receipt", False):
             fd, rcpt = tempfile.mkstemp(suffix=".receipt.json")
@@ -519,16 +709,29 @@ class ChainChatBackend(ChatBackend):
                 _quiet_unlink(rcpt)
             raise ChainBackendError(
                 f"client.py exited {out.returncode}: {out.stderr.strip()[-400:]}")
+        settlement = None
         if rcpt:
-            hook.settle(rcpt)                  # credit the workers (fail-open)
-            _quiet_unlink(rcpt)
-        return GenerationResult(text=_parse_client_output(out.stdout))
+            try:
+                settlement = hook.settle(rcpt)
+            except Exception as e:
+                if getattr(hook, "fail_closed", False):
+                    raise CreditGateError(f"ledger settlement failed: {e}", 503) from e
+            finally:
+                _quiet_unlink(rcpt)
+        return GenerationResult(
+            text=_parse_client_output(out.stdout),
+            credits_charged=_credits_charged(settlement),
+        )
 
     def generate_stream(self, entry, prompt, max_tokens, options):
         """Stream tokens as client.py emits them: spawn it with Popen, parse
         each flushed `[chain] step ...` line, yield the detokenized text.
         Best-effort single-quote parse (a token with a literal quote is rare);
         box-smoked in Phase F."""
+        if self.requires_credit_buffer():
+            # Do not leak generated tokens and only discover afterward that settlement failed.
+            yield self.generate(entry, prompt, max_tokens, options).text
+            return
         import subprocess
         proc = subprocess.Popen(self._cmd(entry, prompt, max_tokens),
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -692,6 +895,9 @@ class RoutingChatBackend(ChatBackend):
 
     def generate_stream(self, entry, prompt, max_tokens, options):
         return self._pick(entry).generate_stream(entry, prompt, max_tokens, options)
+
+    def requires_credit_buffer(self) -> bool:
+        return bool(getattr(self._chain, "requires_credit_buffer", lambda: False)())
 
 
 def _render_llama3(messages: list) -> str:
@@ -1093,10 +1299,12 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
                 result = backend.generate(entry, prompt, max_tokens, options)
             except ChainBackendError as e:
                 log.error("chain backend error: %s", e)
-                self._json_error(HTTPStatus.BAD_GATEWAY, "chain generation failed")
-                return 502
+                status = _credit_error_status(e)
+                message = str(e) if isinstance(e, CreditGateError) else "chain generation failed"
+                self._json_error(status, message)
+                return status
             total_ns = int((time.monotonic() - t0) * 1e9)
-            self._json(HTTPStatus.OK, {
+            response = {
                 "model": entry.name,
                 "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "message": {"role": "assistant", "content": result.text},
@@ -1105,7 +1313,10 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
                 "total_duration": total_ns,
                 "prompt_eval_count": result.prompt_eval_count,
                 "eval_count": result.eval_count,
-            })
+            }
+            if result.credits_charged is not None:
+                response["nakshatra"] = {"credits_charged": result.credits_charged}
+            self._json(HTTPStatus.OK, response)
             return 200
         finally:
             if lc is not None:
@@ -1146,6 +1357,15 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
         ``_call_ollama``) consume it incrementally. Headers are already sent
         once the first chunk goes out, so a mid-stream failure can only emit a
         terminal error chunk — not change the status code."""
+        buffered = None
+        if getattr(backend, "requires_credit_buffer", lambda: False)():
+            try:
+                buffered = backend.generate(entry, prompt, max_tokens, options)
+            except ChainBackendError as e:
+                status = _credit_error_status(e)
+                message = str(e) if isinstance(e, CreditGateError) else "chain generation failed"
+                self._json_error(status, message)
+                return status
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "application/x-ndjson")
         self._cors()
@@ -1159,7 +1379,9 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
             self.wfile.flush()
 
         try:
-            for delta in backend.generate_stream(entry, prompt, max_tokens, options):
+            deltas = [buffered.text] if buffered is not None else \
+                backend.generate_stream(entry, prompt, max_tokens, options)
+            for delta in deltas:
                 _write({"model": entry.name, "created_at": created,
                         "message": {"role": "assistant", "content": delta},
                         "done": False})
@@ -1172,11 +1394,14 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
             except Exception:
                 pass  # client already gone
             return 502
-        _write({"model": entry.name, "created_at": created,
+        final = {"model": entry.name, "created_at": created,
                 "message": {"role": "assistant", "content": ""},
                 "done": True, "done_reason": "stop",
                 "total_duration": int((time.monotonic() - t0) * 1e9),
-                "eval_count": eval_count})
+                "eval_count": eval_count}
+        if buffered is not None and buffered.credits_charged is not None:
+            final["nakshatra"] = {"credits_charged": buffered.credits_charged}
+        _write(final)
         return 200
 
     # ── OpenAI-compat surface (/v1) ───────────────────────────────
@@ -1266,9 +1491,10 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
                 result = backend.generate(entry, prompt, max_tokens, options)
             except ChainBackendError as e:
                 log.error("chain backend error: %s", e)
-                self._openai_error(HTTPStatus.BAD_GATEWAY, "chain generation failed",
-                                   "server_error")
-                return 502
+                status = _credit_error_status(e)
+                message = str(e) if isinstance(e, CreditGateError) else "chain generation failed"
+                self._openai_error(status, message, "server_error")
+                return status
             p, c = result.prompt_eval_count, result.eval_count
             message = {"role": "assistant", "content": result.text}
             if _think_split_enabled(entry):
@@ -1276,7 +1502,7 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
                 message["content"] = content
                 if reasoning:
                     message["reasoning_content"] = reasoning
-            self._json(HTTPStatus.OK, {
+            response = {
                 "id": cid, "object": "chat.completion", "created": created,
                 "model": entry.name,
                 "choices": [{"index": 0,
@@ -1284,7 +1510,10 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
                              "finish_reason": result.done_reason}],
                 "usage": {"prompt_tokens": p, "completion_tokens": c,
                           "total_tokens": p + c},
-            })
+            }
+            if result.credits_charged is not None:
+                response["nakshatra"] = {"credits_charged": result.credits_charged}
+            self._json(HTTPStatus.OK, response)
             return 200
         finally:
             if lc is not None:
@@ -1418,6 +1647,15 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
         """OpenAI streaming: Server-Sent Events — ``data: {chunk}`` lines, a
         role-first delta, content deltas, a terminal ``finish_reason:stop``
         chunk, then ``data: [DONE]``."""
+        buffered = None
+        if getattr(backend, "requires_credit_buffer", lambda: False)():
+            try:
+                buffered = backend.generate(entry, prompt, max_tokens, options)
+            except ChainBackendError as e:
+                status = _credit_error_status(e)
+                message = str(e) if isinstance(e, CreditGateError) else "chain generation failed"
+                self._openai_error(status, message, "server_error")
+                return status
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -1437,7 +1675,9 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
         _sse(_chunk({"role": "assistant"}))   # OpenAI's first delta carries the role
         think_filter = _ThinkStreamFilter() if _think_split_enabled(entry) else None
         try:
-            for delta in backend.generate_stream(entry, prompt, max_tokens, options):
+            deltas = [buffered.text] if buffered is not None else \
+                backend.generate_stream(entry, prompt, max_tokens, options)
+            for delta in deltas:
                 if think_filter is None:
                     _sse(_chunk({"content": delta}))
                     continue
@@ -1592,7 +1832,7 @@ def build_server(bind: str, port: int,
     server object instead of starting it lets tests spin one up on
     an ephemeral port without process-level setup."""
     server = ThreadingHTTPServer((bind, port), NakshatraServeHandler)
-    server.models = models or {}
+    server.models = models if models is not None else {}
     server.chat_backend = chat_backend
     server.chat_lifecycle = chat_lifecycle
     return server
@@ -1625,7 +1865,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                          "= localhost + WG mesh, the :8078 confinement pattern; "
                          "default 0.0.0.0)")
     ap.add_argument("--models", default=None,
-                    help="path to serve_models.yaml (model registry). "
+                    help="path to serve_models.yaml, or 'auto' to discover complete models "
+                         "from signed pillar /peers using local tokenizer GGUFs. "
                          "Omit to run with an empty registry "
                          "(/api/tags returns []).")
     ap.add_argument("--stub-backend", nargs="?", const="Hello from a stubbed "
@@ -1640,11 +1881,14 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     models: dict[str, ModelEntry] = {}
     if args.models:
-        try:
-            models = _load_models(args.models)
-        except ModelConfigError as e:
-            log.error("model config error: %s", e)
-            return 2
+        if args.models == "auto":
+            models = AutoModelRegistry(os.environ.get("NAKSHATRA_PILLAR_URL", ""))
+        else:
+            try:
+                models = _load_models(args.models)
+            except ModelConfigError as e:
+                log.error("model config error: %s", e)
+                return 2
 
     # Backend: an explicit stub (wire-smoke) wins; otherwise RoutingChatBackend
     # whenever we have models — it dispatches per-entry to ChainChatBackend
@@ -1657,7 +1901,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         chat_backend = StubChatBackend(args.stub_backend)
         log.info("serving STUB backend (no chain): %r", args.stub_backend[:60])
     else:
-        chat_backend = RoutingChatBackend(ChainChatBackend()) if models else None
+        chat_backend = RoutingChatBackend(ChainChatBackend()) if args.models else None
     # Scale-to-zero lifecycle (compute is summoned, not squatted). Active only
     # when NAKSHATRA_LIFECYCLE_UNITS is set; otherwise None → always-on legacy.
     chat_lifecycle = None

@@ -46,7 +46,10 @@ Nothing is shared and no message can flow until they accept. Then:
     # Hermes: an mcp_servers entry whose command is ~/.local/bin/nak-mcp
 
 Your AI can then read messages (always marked as untrusted outside content), message your
-contacts, and take on tasks your contacts post. It can't accept connections; that stays with you.
+contacts, take on tasks your contacts post, see inference credits, and ask models through this
+node's local, credit-enforced gateway. It can't accept connections; that stays with you. See
+[HARNESSES.md](HARNESSES.md) for OpenClaw, Hermes, Claude Code, Codex, every MCP tool, and the
+OpenAI-compatible `http://127.0.0.1:11600/v1` provider setup.
 
 ## Sharing compute
 

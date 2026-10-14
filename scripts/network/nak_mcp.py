@@ -19,8 +19,11 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
+from urllib import error as urlerror
+from urllib import request as urlrequest
 
 _SCRIPTS = Path(__file__).resolve().parent.parent
 if str(_SCRIPTS) not in sys.path:
@@ -53,6 +56,12 @@ READ_TOOLS = {
                       "max_chars, contains_all, contains_none, sha256, json_keys.",
                       {"to": _STR, "title": _STR, "instructions": _STR, "acceptance": {"type": "array"},
                        "reward": {"type": "integer"}, "deadline_s": {"type": "integer"}}),
+    "nak_models": ("Models this node's local Nakshatra gateway can serve now.", {}),
+    "nak_ask": ("Ask one question through the local, credit-enforced Nakshatra gateway.",
+                {"prompt": _STR, "model": _STR,
+                 "max_tokens": {"type": "integer", "description": "maximum reply tokens (default 256)"}}),
+    "nak_balance": ("This node operator's inference-credit balance and tier (the signer is the account).", {}),
+    "nak_worker_status": ("This node's worker configuration, verified build state, and unit state; no secrets.", {}),
 }
 CONNECT_TOOLS = {
     "nak_accept": ("Accept a pending connection request (id from nak_requests); optional name to call them.",
@@ -63,6 +72,7 @@ CONNECT_TOOLS = {
 }
 REQUIRED = {"nak_task_claim": ["task"], "nak_task_submit": ["task", "output"],
             "nak_task_post": ["to", "title", "instructions", "acceptance"], "nak_send": ["to", "text"], "nak_accept": ["id"], "nak_decline": ["id"], "nak_redeem": ["code"]}
+REQUIRED["nak_ask"] = ["prompt"]
 
 
 # Small local models guess parameter names ("message" for text, "task_id" for task). Accept the
@@ -73,8 +83,84 @@ ALIASES = {
     "task": ("task_id", "id", "task_hash", "hash"),
     "output": ("answer", "result", "text", "content", "response"),
     "instructions": ("description", "body", "prompt", "details"),
+    "prompt": ("question", "message", "text", "content"),
+    "model": ("model_id", "name"),
+    "max_tokens": ("tokens", "max_output_tokens", "limit"),
 }
 CLAIM_WAIT_S = 20.0
+
+
+def _gateway_config() -> dict[str, str]:
+    path = Path.home() / ".nakshatra" / "gateway.env"
+    if not path.is_file():
+        raise NakError("the local gateway is off; run: nak gateway on …")
+    values = {}
+    try:
+        lines = path.read_text().splitlines()
+    except OSError as e:
+        raise NakError(f"the local gateway configuration is unreadable ({e})") from e
+    for line in lines:
+        if not line or line.lstrip().startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        values[key.strip()] = value
+    return values
+
+
+def _gateway_base(config: dict[str, str]) -> str:
+    try:
+        port = int(config.get("PORT", "11600"))
+    except ValueError as e:
+        raise NakError("the local gateway has an invalid port") from e
+    bind = config.get("BIND", "127.0.0.1")
+    host = f"[{bind}]" if ":" in bind and not bind.startswith("[") else bind
+    return f"http://{host}:{port}/v1"
+
+
+def _gateway_json(path: str, body: dict | None = None) -> dict:
+    config = _gateway_config()
+    raw = json.dumps(body).encode() if body is not None else None
+    req = urlrequest.Request(
+        _gateway_base(config) + path, data=raw,
+        headers={"Content-Type": "application/json"} if raw is not None else {},
+        method="POST" if raw is not None else "GET")
+    try:
+        with urlrequest.urlopen(req, timeout=1800 if raw is not None else 10) as response:
+            value = json.loads(response.read())
+    except urlerror.HTTPError as e:
+        try:
+            message = json.loads(e.read()).get("error", {}).get("message", "")
+        except Exception:
+            message = ""
+        raise NakError(f"gateway refused the request ({e.code})" +
+                       (f": {message}" if message else "")) from e
+    except (OSError, urlerror.URLError, ValueError) as e:
+        raise NakError(f"the local gateway is off or unavailable; run: nak gateway on … ({e})") from e
+    if not isinstance(value, dict):
+        raise NakError("the local gateway returned an invalid response")
+    return value
+
+
+def _models() -> list[str]:
+    value = _gateway_json("/models")
+    return [str(row["id"]) for row in value.get("data", [])
+            if isinstance(row, dict) and row.get("id")]
+
+
+def _safe_worker_status(value):
+    """Defense in depth: status output can never grow a secret-bearing field."""
+    if isinstance(value, dict):
+        return {k: _safe_worker_status(v) for k, v in value.items()
+                if not any(word in k.lower() for word in
+                           ("key", "token", "secret", "authorization"))}
+    if isinstance(value, list):
+        return [_safe_worker_status(v) for v in value]
+    if isinstance(value, str) and "/.nakshatra/keys/" in value:
+        return "[redacted]"
+    return value
 
 
 def normalize_args(name: str, args: dict) -> dict:
@@ -123,6 +209,55 @@ class Server:
         if name == "nak_send":
             r = c.send(str(args["to"]), str(args["text"]), self.aspect)
             return f"Queued for {r['to']} (id {r['queued']}); it is delivered when they are online."
+        if name == "nak_models":
+            models = _models()
+            return "\n".join(models) if models else "No models are currently servable."
+        if name == "nak_ask":
+            models = _models()
+            model = str(args.get("model") or (models[0] if models else ""))
+            if not model:
+                raise NakError("no model is currently servable")
+            try:
+                max_tokens = int(args.get("max_tokens") or 256)
+            except (TypeError, ValueError) as e:
+                raise NakError("max_tokens must be an integer") from e
+            if not 1 <= max_tokens <= 32768:
+                raise NakError("max_tokens must be between 1 and 32768")
+            result = _gateway_json("/chat/completions", {
+                "model": model, "messages": [{"role": "user", "content": str(args["prompt"])}],
+                "max_tokens": max_tokens, "stream": False,
+            })
+            try:
+                answer = result["choices"][0]["message"]["content"]
+            except (KeyError, IndexError, TypeError) as e:
+                raise NakError("the local gateway returned no answer") from e
+            charged = (result.get("nakshatra") or {}).get("credits_charged")
+            charge = f"\nCredits charged: {charged}" if isinstance(charged, int) else \
+                "\nCredits charged: unknown"
+            return str(answer) + charge
+        if name == "nak_balance":
+            config = _gateway_config()
+            try:
+                from ledger_client import LedgerHook, LedgerUnavailable
+            except Exception as e:
+                raise NakError(f"ledger client unavailable ({e})") from e
+            try:
+                hook = LedgerHook(
+                    url=config.get("NAKSHATRA_LEDGER_URL"), enabled=True, mode="enforce",
+                    spki_hash=config.get("NAKSHATRA_LEDGER_SPKI_SHA256"))
+                row = hook.balance()
+            except (LedgerUnavailable, OSError, ValueError) as e:
+                raise NakError(str(e)) from e
+            public = {k: row[k] for k in
+                      ("balance", "tier", "available", "credit_limit", "limit", "unit")
+                      if k in row and isinstance(row[k], (str, int, float, bool, type(None)))}
+            if not public:
+                raise NakError("the ledger returned no balance or tier")
+            return json.dumps(public, sort_keys=True)
+        if name == "nak_worker_status":
+            from network.nak import _worker_status
+            return json.dumps(_safe_worker_status(_worker_status(subprocess)),
+                              indent=1, sort_keys=True)
         if name == "nak_tasks":
             return render_tasks(c.tasks(str(args.get("role") or "")))
         if name == "nak_task_claim":
@@ -170,7 +305,7 @@ class Server:
             if method == "initialize":
                 result = {"protocolVersion": msg.get("params", {}).get("protocolVersion", PROTOCOL),
                           "capabilities": {"tools": {}},
-                          "serverInfo": {"name": "nakshatra", "version": "0.2"}}
+                          "serverInfo": {"name": "nakshatra", "version": "0.3"}}
             elif method == "ping":
                 result = {}
             elif method == "tools/list":
