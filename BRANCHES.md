@@ -5,8 +5,8 @@ On create add a row (status=active, owner). On merge flip to `merged→<sha>`.
 
 | branch | sector | description | base | status | owner |
 |---|---|---|---|---|---|
-| network/gateway-discovery-retry | network | Give signed pillar GETs a per-request nonce; retry empty auto-discovery with backoff and refresh it every five minutes. | main | active | codex/root |
-| network/consumer-tokenizer | network | Let consumer-only gateways fetch only the signed package metadata GGUF, verify its signer and SHA-256, and use it as the discovered model tokenizer. | forgejo/main@eea6fe8 | active | codex/root |
+| network/gateway-discovery-retry | network | Give signed pillar GETs a per-request nonce; retry empty auto-discovery with backoff and refresh it every five minutes. | main | merged→bd57243 | codex/root |
+| network/consumer-tokenizer | network | Let consumer-only gateways fetch only the signed package metadata GGUF, verify its signer and SHA-256, and use it as the discovered model tokenizer. | forgejo/main@eea6fe8 | merged→bd57243 | codex/root |
 | credits/s5-wallet-ux | credits | Solana credits S5 client side: signed wallet/status/bind/withdraw in ledger_client, `nak wallet`, read-only MCP `nak_wallet`, HARNESSES row (Neuron routes default off). | forgejo/main | merged→8226eb3 | codex for claude/trisul-aa network lane (hub) |
 | deploy/node-container | deploy | Official rootless-first Docker/Podman node container, signed installer bootstrap, generated-unit supervisor, hardened host wrapper, and isolation tests/docs. | main@a1de039 | merged→088070f | codex for claude/trisul-aa network lane (hub) |
 | owner-sentinel/launcher-self-update | worker | The Windows sentinel launcher updates itself from the signed release (wsl.exe only while the distro runs, File.Replace, monotonic Launcher-Version, successor handoff under a Global per-user SID mutex); install.ps1 reuses the saved distro/user. | forgejo/main@cd3ae8b | merged→3792bf2 | claude/trisul-aa network lane (hub) |
