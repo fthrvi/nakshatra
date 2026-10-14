@@ -1,0 +1,47 @@
+# syntax=docker/dockerfile:1
+# CPU default. GPU builds select a version-pinned development base so `nak worker build`
+# has the compiler as well as the runtime libraries:
+#   NVIDIA: --build-arg NAK_VARIANT=nvidia --build-arg BASE_IMAGE=nvidia/cuda:13.0.1-devel-ubuntu24.04
+#   ROCm:   --build-arg NAK_VARIANT=rocm   --build-arg BASE_IMAGE=rocm/dev-ubuntu-24.04:7.0.2-complete
+ARG BASE_IMAGE=debian:12.12-slim
+FROM ${BASE_IMAGE}
+
+ARG NAK_VARIANT=cpu
+ARG NAK_UID=11600
+ARG NAK_GID=11600
+
+RUN case "$NAK_VARIANT" in cpu|nvidia|rocm) ;; *) exit 64 ;; esac \
+    && apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+       bash build-essential ca-certificates cmake curl git iproute2 libssl-dev pkg-config \
+       python3 python3-venv tini \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid "$NAK_GID" nak \
+    && useradd --uid "$NAK_UID" --gid "$NAK_GID" --home-dir /state \
+       --shell /usr/sbin/nologin --no-create-home nak \
+    && install -d -o "$NAK_UID" -g "$NAK_GID" -m 0700 /state \
+    && install -d -o "$NAK_UID" -g "$NAK_GID" -m 0755 /share
+
+COPY --chmod=0755 supervisor.py /usr/local/lib/nakshatra-container/supervisor.py
+COPY --chmod=0755 systemctl.py /usr/local/bin/systemctl
+COPY --chmod=0755 bootstrap.py /usr/local/bin/nak-container-bootstrap
+COPY --chmod=0755 control.py /usr/local/bin/nak-container-control
+COPY --chmod=0755 dispatch.sh /usr/local/bin/nak
+RUN ln -s /usr/local/bin/nak /usr/local/bin/nak-mcp
+
+ENV HOME=/state \
+    NAK_NODE_PREFIX=/state/.nakshatra-node \
+    NAK_SUPERVISOR_SOCKET=/tmp/nakshatra-supervisor.sock \
+    NAK_UPDATE_INTERVAL_S=3600 \
+    PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    PYTHONUNBUFFERED=1 \
+    XDG_RUNTIME_DIR=/tmp/run
+
+USER 11600:11600
+WORKDIR /state
+VOLUME ["/state"]
+EXPOSE 11599
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD ["nak-container-control", "status", "--quiet"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/lib/nakshatra-container/supervisor.py"]

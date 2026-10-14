@@ -1,0 +1,254 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+CONTAINER_NAME="${NAKC_NAME:-nakshatra-node}"
+VOLUME_NAME="${NAKC_VOLUME:-nakshatra-node-state}"
+CONFIG_DIR="${NAKC_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/nakshatra-container}"
+VARIANT="${NAKC_VARIANT:-cpu}"
+IMAGE="${NAKC_IMAGE:-nakshatra-node:$VARIANT}"
+DRY_RUN="${NAKC_DRY_RUN:-0}"
+
+die() { printf 'nakc: %s\n' "$*" >&2; exit 2; }
+
+engine() {
+    if [ -n "${NAKC_ENGINE:-}" ]; then
+        command -v "$NAKC_ENGINE" >/dev/null 2>&1 || die "container engine not found: $NAKC_ENGINE"
+        printf '%s\n' "$NAKC_ENGINE"
+    elif command -v podman >/dev/null 2>&1; then
+        printf '%s\n' podman
+    elif command -v docker >/dev/null 2>&1; then
+        printf '%s\n' docker
+    else
+        die "install Docker or Podman first"
+    fi
+}
+
+print_command() {
+    local item
+    printf '+ '
+    for item in "$@"; do printf '%q ' "$item"; done
+    printf '\n'
+}
+
+run() {
+    if [ "$DRY_RUN" = 1 ]; then print_command "$@"; else "$@"; fi
+}
+
+config_read() {
+    local name="$1"
+    [ -f "$CONFIG_DIR/$name" ] && sed -n '1p' "$CONFIG_DIR/$name" || true
+}
+
+config_write() {
+    mkdir -p "$CONFIG_DIR"
+    printf '%s\n' "$2" >"$CONFIG_DIR/$1"
+}
+
+container_exists() {
+    [ "$DRY_RUN" != 1 ] && "$(engine)" container inspect "$CONTAINER_NAME" >/dev/null 2>&1
+}
+
+container_running() {
+    [ "$DRY_RUN" != 1 ] && [ "$("$(engine)" inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null || true)" = true ]
+}
+
+base_image() {
+    case "$VARIANT" in
+        cpu) printf '%s\n' 'debian:12.12-slim' ;;
+        nvidia) printf '%s\n' 'nvidia/cuda:13.0.1-devel-ubuntu24.04' ;;
+        rocm) printf '%s\n' 'rocm/dev-ubuntu-24.04:7.0.2-complete' ;;
+        *) die "NAKC_VARIANT must be cpu, nvidia, or rocm" ;;
+    esac
+}
+
+ensure_image() {
+    local runtime="$1"
+    if [ "$DRY_RUN" = 1 ]; then return; fi
+    if ! "$runtime" image inspect "$IMAGE" >/dev/null 2>&1; then
+        "$runtime" build --pull -t "$IMAGE" -f "$SCRIPT_DIR/Containerfile" \
+            --build-arg "NAK_VARIANT=$VARIANT" --build-arg "BASE_IMAGE=$(base_image)" "$SCRIPT_DIR"
+    fi
+}
+
+run_args() {
+    local runtime="$1" share_path share_mode worker_port
+    share_path="$(config_read share-path)"
+    share_mode="$(config_read share-mode)"
+    worker_port="$(config_read worker-port)"
+    RUN_ARGS=(run -d --name "$CONTAINER_NAME" --hostname "$CONTAINER_NAME"
+        --label io.nakshatra.role=node --restart unless-stopped
+        --user 11600:11600 --cap-drop ALL --security-opt no-new-privileges
+        --read-only --tmpfs "/tmp:rw,nosuid,nodev,size=${NAKC_TMPFS_SIZE:-2g},mode=1777"
+        --pids-limit "${NAKC_PIDS_LIMIT:-512}" --memory "${NAKC_MEMORY:-16g}"
+        --network bridge --stop-timeout "${NAKC_STOP_TIMEOUT:-20}"
+        --publish "127.0.0.1:${NAKC_GATEWAY_PORT:-11600}:11599/tcp"
+        --env "NAK_UPDATE_INTERVAL_S=${NAKC_UPDATE_INTERVAL_S:-3600}")
+    if [ "${runtime##*/}" = podman ]; then
+        RUN_ARGS+=(--volume "$VOLUME_NAME:/state:U")
+    else
+        RUN_ARGS+=(--volume "$VOLUME_NAME:/state")
+    fi
+    if [ -n "$share_path" ]; then
+        if [ "${share_mode:-ro}" = rw ]; then
+            RUN_ARGS+=(--mount "type=bind,src=$share_path,dst=/share")
+        else
+            RUN_ARGS+=(--mount "type=bind,src=$share_path,dst=/share,readonly")
+        fi
+    fi
+    if [ -n "$worker_port" ]; then
+        [[ "$worker_port" =~ ^[0-9]+$ ]] && [ "$worker_port" -ge 1 ] && [ "$worker_port" -le 65535 ] \
+            || die "stored worker port is invalid"
+        RUN_ARGS+=(--publish "$worker_port:$worker_port/tcp")
+    fi
+    case "$VARIANT" in
+        nvidia)
+            if [ "${runtime##*/}" = podman ]; then
+                RUN_ARGS+=(--device nvidia.com/gpu=all)
+            else
+                RUN_ARGS+=(--gpus all)
+            fi
+            ;;
+        rocm) RUN_ARGS+=(--device /dev/kfd --device /dev/dri) ;;
+    esac
+    RUN_ARGS+=("$IMAGE")
+}
+
+start_container() {
+    local runtime="$1"
+    ensure_image "$runtime"
+    if container_exists; then run "$runtime" rm -f "$CONTAINER_NAME" >/dev/null; fi
+    run_args "$runtime"
+    run "$runtime" "${RUN_ARGS[@]}"
+}
+
+ensure_running() {
+    local runtime="$1"
+    if ! container_running; then start_container "$runtime"; fi
+}
+
+worker_port_from_args() {
+    local previous='' item
+    for item in "$@"; do
+        if [ "$previous" = port ]; then printf '%s\n' "$item"; return; fi
+        case "$item" in
+            --port) previous=port ;;
+            --port=*) printf '%s\n' "${item#--port=}"; return ;;
+            *) previous='' ;;
+        esac
+    done
+}
+
+usage() {
+    cat <<'EOF'
+usage: nakc join '<invite line>'
+       nakc start [--share-rw] | stop | status | logs | update
+       nakc worker build|on|off|status ...
+       nakc share [--share-rw] <directory>
+       nakc mcp
+
+Environment: NAKC_ENGINE=docker|podman, NAKC_VARIANT=cpu|nvidia|rocm,
+NAKC_MEMORY=16g, NAKC_PIDS_LIMIT=512, NAKC_DRY_RUN=1.
+EOF
+}
+
+main() {
+    [ "$#" -gt 0 ] || { usage; exit 2; }
+    local command="$1" runtime port path mode old_port
+    shift
+    runtime="$(engine)"
+    case "$command" in
+        start)
+            if [ "${1:-}" = --share-rw ]; then
+                [ -n "$(config_read share-path)" ] || die "configure a share first with: nakc share <directory>"
+                config_write share-mode rw
+                shift
+            fi
+            [ "$#" -eq 0 ] || die "start takes only the optional --share-rw flag"
+            start_container "$runtime"
+            ;;
+        stop)
+            [ "$#" -eq 0 ] || die "stop takes no arguments"
+            if container_exists; then run "$runtime" stop "$CONTAINER_NAME"; fi
+            ;;
+        status)
+            [ "$#" -eq 0 ] || die "status takes no arguments"
+            run "$runtime" ps -a --filter "name=^${CONTAINER_NAME}$"
+            if container_running; then run "$runtime" exec "$CONTAINER_NAME" nak-container-control status; fi
+            ;;
+        logs)
+            run "$runtime" logs "$@" "$CONTAINER_NAME"
+            ;;
+        update)
+            [ "$#" -eq 0 ] || die "update takes no arguments"
+            ensure_running "$runtime"
+            run "$runtime" exec "$CONTAINER_NAME" nak-container-control update
+            ;;
+        join)
+            [ "$#" -eq 1 ] || die "join needs the single complete invite line"
+            ensure_running "$runtime"
+            if [ "$DRY_RUN" = 1 ]; then
+                printf '+ printf %s\\n %s | ' "%s" "'<invite redacted>'"
+                print_command "$runtime" exec -i "$CONTAINER_NAME" nak-container-bootstrap
+            else
+                printf '%s\n' "$1" | "$runtime" exec -i "$CONTAINER_NAME" nak-container-bootstrap
+            fi
+            ;;
+        share)
+            mode=ro
+            if [ "${1:-}" = --share-rw ]; then mode=rw; shift; fi
+            [ "$#" -eq 1 ] || die "share needs [--share-rw] <directory>"
+            [ -d "$1" ] || die "share path is not a directory: $1"
+            path="$(cd "$1" && pwd -P)"
+            config_write share-path "$path"
+            config_write share-mode "$mode"
+            printf 'share configured %s at /share (%s)\n' "$path" "$mode"
+            if container_running; then start_container "$runtime"; fi
+            ;;
+        worker)
+            [ "$#" -gt 0 ] || die "worker needs build, on, off, or status"
+            if [ "$1" = on ]; then
+                old_port="$(config_read worker-port)"
+                port="$(worker_port_from_args "$@")"
+                if [ -n "$port" ]; then
+                    [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] \
+                        || die "worker --port must be between 1 and 65535"
+                    config_write worker-port "$port"
+                fi
+                [ -n "$(config_read worker-port)" ] || die "worker on needs --port on its first configuration"
+                start_container "$runtime"
+                if [ "$DRY_RUN" = 1 ]; then
+                    run "$runtime" exec -i "$CONTAINER_NAME" nak worker "$@"
+                elif ! "$runtime" exec -i "$CONTAINER_NAME" nak worker "$@"; then
+                    if [ -n "$old_port" ]; then
+                        config_write worker-port "$old_port"
+                    else
+                        rm -f "$CONFIG_DIR/worker-port"
+                    fi
+                    start_container "$runtime"
+                    return 1
+                fi
+            else
+                ensure_running "$runtime"
+                run "$runtime" exec -i "$CONTAINER_NAME" nak worker "$@"
+            fi
+            if [ "$1" = off ] && [ "$DRY_RUN" != 1 ]; then
+                rm -f "$CONFIG_DIR/worker-port"
+                start_container "$runtime"
+            fi
+            ;;
+        mcp)
+            [ "$#" -eq 0 ] || die "mcp takes no arguments"
+            if [ "$DRY_RUN" = 1 ]; then
+                print_command "$runtime" exec -i "$CONTAINER_NAME" nak-mcp
+            else
+                exec "$runtime" exec -i "$CONTAINER_NAME" nak-mcp
+            fi
+            ;;
+        -h|--help|help) usage ;;
+        *) die "unknown command: $command" ;;
+    esac
+}
+
+main "$@"
