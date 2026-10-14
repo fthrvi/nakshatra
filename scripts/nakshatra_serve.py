@@ -80,6 +80,11 @@ class ModelConfigError(Exception):
     empty/odd model list."""
 
 
+def _ledger_enforced() -> bool:
+    """Whether this process is the fail-closed outsider gateway."""
+    return os.environ.get("NAKSHATRA_LEDGER_MODE", "").strip().lower() == "enforce"
+
+
 def _env_assignments(path: str) -> dict[str, str]:
     """Read the small KEY=value files written by `nak`; no shell evaluation."""
     values = {}
@@ -156,7 +161,7 @@ class ModelEntry:
     default_max_tokens: Optional[int] = None
 
 
-def _load_models(path: str) -> dict[str, ModelEntry]:
+def _load_models(path: str, *, enforce_ledger: Optional[bool] = None) -> dict[str, ModelEntry]:
     """Parse + validate serve_models.yaml → ``{name: ModelEntry}``.
 
     Format::
@@ -191,6 +196,9 @@ def _load_models(path: str) -> dict[str, ModelEntry]:
     if not isinstance(entries, list) or not entries:
         raise ModelConfigError(f"{path}: 'models' must be a non-empty list")
 
+    if enforce_ledger is None:
+        enforce_ledger = _ledger_enforced()
+
     registry: dict[str, ModelEntry] = {}
     for i, raw in enumerate(entries):
         if not isinstance(raw, dict):
@@ -199,6 +207,10 @@ def _load_models(path: str) -> dict[str, ModelEntry]:
         chain_yaml, registry_url = raw.get("chain_yaml"), raw.get("registry_url")
         from_roster = bool(raw.get("from_roster"))
         engine_url = raw.get("engine_url")
+        if enforce_ledger and engine_url:
+            raise ModelConfigError(
+                f"{path}: model {name or f'#{i}'} uses engine_url; "
+                "NAKSHATRA_LEDGER_MODE=enforce refuses unmetered proxy models")
         missing = [k for k, v in (("name", name),) if not v]
         # tokenizer_gguf is only required when nakshatra itself renders a
         # prompt / drives a chain — an engine_url entry proxies to a local
@@ -447,6 +459,15 @@ def _credits_charged(settlement) -> Optional[int]:
     return None
 
 
+_PROXY_ENFORCE_REFUSAL = (
+    "NAKSHATRA_LEDGER_MODE=enforce refuses unmetered engine_url proxy models"
+)
+
+
+def _refuse_unmetered_proxy(entry: ModelEntry) -> bool:
+    return _ledger_enforced() and bool(entry.engine_url)
+
+
 class ChatBackend:
     """Turns (model, rendered prompt) into an assistant reply. Injected into
     the server so the HTTP/format layer is testable without a live chain
@@ -682,15 +703,23 @@ class ChainChatBackend(ChatBackend):
         hook = self._ledger_hook()
         # gate before the run (no-op/advisory for the hub; mandatory for outsider gateways)
         est = int(max_tokens) * int(getattr(entry, "num_layers", 0) or 0)
-        try:
-            allow, reason = hook.gate(est)
-        except Exception as e:
-            if getattr(hook, "fail_closed", False):
+        fail_closed = bool(getattr(hook, "fail_closed", False))
+        if fail_closed:
+            try:
+                allow, reason = hook.gate(est)
+            except Exception as e:
                 raise CreditGateError(f"ledger unavailable: {e}", 503) from e
-            allow, reason = True, ""
+        else:
+            # Parent (cd3ae8b) behaviour: an unexpected hook exception is not
+            # swallowed. The live hub has always surfaced it out of the request.
+            allow, reason = hook.gate(est)
         if not allow:
-            status = 402 if reason.startswith("insufficient credits") else 503
-            raise CreditGateError(reason, status)
+            if fail_closed:
+                status = 402 if reason.startswith("insufficient credits") else 503
+                raise CreditGateError(reason, status)
+            # Parent behaviour: every ledger refusal is a generic backend
+            # failure, rendered as the established 502 envelope by the handler.
+            raise ChainBackendError(f"credit gate: {reason}")
         rcpt = None
         if getattr(hook, "wants_receipt", False):
             fd, rcpt = tempfile.mkstemp(suffix=".receipt.json")
@@ -711,16 +740,21 @@ class ChainChatBackend(ChatBackend):
                 f"client.py exited {out.returncode}: {out.stderr.strip()[-400:]}")
         settlement = None
         if rcpt:
-            try:
-                settlement = hook.settle(rcpt)
-            except Exception as e:
-                if getattr(hook, "fail_closed", False):
+            if fail_closed:
+                try:
+                    settlement = hook.settle(rcpt)
+                except Exception as e:
                     raise CreditGateError(f"ledger settlement failed: {e}", 503) from e
-            finally:
+                finally:
+                    _quiet_unlink(rcpt)
+            else:
+                # Parent ordering is intentional: LedgerHook itself owns the
+                # fail-open policy, while an unexpected exception surfaces.
+                hook.settle(rcpt)
                 _quiet_unlink(rcpt)
         return GenerationResult(
             text=_parse_client_output(out.stdout),
-            credits_charged=_credits_charged(settlement),
+            credits_charged=_credits_charged(settlement) if fail_closed else None,
         )
 
     def generate_stream(self, entry, prompt, max_tokens, options):
@@ -888,6 +922,8 @@ class RoutingChatBackend(ChatBackend):
         self._proxy = proxy or ProxyChatBackend()
 
     def _pick(self, entry: ModelEntry) -> ChatBackend:
+        if _refuse_unmetered_proxy(entry):
+            raise CreditGateError(_PROXY_ENFORCE_REFUSAL, HTTPStatus.FORBIDDEN)
         return self._proxy if entry.engine_url else self._chain
 
     def generate(self, entry, prompt, max_tokens, options):
@@ -1247,6 +1283,9 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
         if entry is None:
             self._json_error(HTTPStatus.NOT_FOUND, f"model {name!r} not found")
             return 404
+        if _refuse_unmetered_proxy(entry):
+            self._json_error(HTTPStatus.FORBIDDEN, _PROXY_ENFORCE_REFUSAL)
+            return 403
         messages = req.get("messages")
         if not isinstance(messages, list) or not messages:
             # Ollama "load" convention: an empty /api/chat preloads the model.
@@ -1441,6 +1480,10 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
             self._openai_error(HTTPStatus.NOT_FOUND, f"model '{name}' not found",
                                "model_not_found")
             return 404
+        if _refuse_unmetered_proxy(entry):
+            self._openai_error(HTTPStatus.FORBIDDEN, _PROXY_ENFORCE_REFUSAL,
+                               "permission_error")
+            return 403
         messages = req.get("messages")
         if not isinstance(messages, list) or not messages:
             self._openai_error(HTTPStatus.BAD_REQUEST,

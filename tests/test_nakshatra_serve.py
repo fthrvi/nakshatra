@@ -1269,6 +1269,21 @@ def test_load_models_engine_url_accepted_without_tokenizer(tmp_path):
     assert e.engine_model == "qwen3:14b"
 
 
+def test_service_config_load_rejects_engine_url_in_enforce_mode(tmp_path, monkeypatch):
+    models = _write_models_yaml(tmp_path, _ENGINE_MODEL)
+    monkeypatch.setenv("NAKSHATRA_LEDGER_MODE", "enforce")
+
+    with pytest.raises(ns.ModelConfigError, match="refuses unmetered proxy models"):
+        ns._load_models(models)
+
+
+def test_service_main_rejects_engine_url_in_enforce_mode(tmp_path, monkeypatch):
+    models = _write_models_yaml(tmp_path, _ENGINE_MODEL)
+    monkeypatch.setenv("NAKSHATRA_LEDGER_MODE", "enforce")
+
+    assert ns.main(["--models", models]) == 2
+
+
 def test_invalid_config_rejected_missing_everything(tmp_path):
     """Name alone (no tokenizer_gguf, no chain_yaml/registry_url/from_roster/
     engine_url) must still be rejected — engine_url only relaxes the
@@ -1411,6 +1426,61 @@ def test_routing_backend_prefers_engine_over_chain_when_both_set():
         result = router.generate(
             entry, "p", 8, {"messages": [{"role": "user", "content": "hi"}]})
     assert result.text == "proxy-reply"
+
+
+def test_routing_backend_refuses_engine_url_in_enforce_mode(monkeypatch):
+    class _NeverProxy(ns.ChatBackend):
+        def generate(self, *args, **kwargs):
+            pytest.fail("proxy backend must not receive enforce-mode output")
+
+    monkeypatch.setenv("NAKSHATRA_LEDGER_MODE", "enforce")
+    router = ns.RoutingChatBackend(_ChainSpy(), proxy=_NeverProxy())
+    entry = ns.ModelEntry(name="proxied", engine_url="http://127.0.0.1:11434")
+
+    with pytest.raises(ns.CreditGateError, match="refuses unmetered") as caught:
+        router.generate(entry, "p", 8, {})
+
+    assert caught.value.status == 403
+
+
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        ("/v1/chat/completions", {
+            "model": "proxied", "messages": [{"role": "user", "content": "hi"}]}),
+        ("/v1/chat/completions", {
+            "model": "proxied", "stream": True,
+            "messages": [{"role": "user", "content": "hi"}]}),
+        ("/api/chat", {
+            "model": "proxied", "messages": [{"role": "user", "content": "hi"}]}),
+        ("/api/chat", {
+            "model": "proxied", "stream": True,
+            "messages": [{"role": "user", "content": "hi"}]}),
+    ],
+)
+def test_enforce_mode_request_backstop_refuses_proxy_without_forwarding(
+        path, payload, monkeypatch):
+    class _NeverProxy(ns.ChatBackend):
+        def generate(self, *args, **kwargs):
+            pytest.fail("proxy backend must not receive enforce-mode output")
+
+        def generate_stream(self, *args, **kwargs):
+            pytest.fail("proxy backend must not receive enforce-mode output")
+
+    monkeypatch.setenv("NAKSHATRA_LEDGER_MODE", "enforce")
+    monkeypatch.setattr(
+        ns.NakshatraServeHandler, "_passthrough_openai_chat",
+        lambda *_args, **_kwargs: pytest.fail("passthrough must not be reached"))
+    entry = ns.ModelEntry(name="proxied", engine_url="http://127.0.0.1:11434")
+    router = ns.RoutingChatBackend(_ChainSpy(), proxy=_NeverProxy())
+
+    with _running_chat({"proxied": entry}, router) as port:
+        status, body = _post(port, path, payload)
+
+    assert status == 403
+    error = body["error"]
+    message = error["message"] if isinstance(error, dict) else error
+    assert "refuses unmetered engine_url proxy models" in message
 
 
 # ── end-to-end: registry → RoutingChatBackend → ProxyChatBackend → engine ──

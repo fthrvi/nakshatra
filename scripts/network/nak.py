@@ -267,6 +267,15 @@ def _gateway_on(_sp, args) -> None:
         raise SystemExit("--pillar-spki must be a 64-character SHA-256 hex digest")
     if args.models != "auto" and not Path(args.models).is_file():
         raise SystemExit("--models must be 'auto' or an existing serve_models YAML file")
+    if args.models != "auto":
+        # The service repeats this check at config load. Refuse here too so
+        # `nak gateway on` never enables an enforce-mode registry that can
+        # bypass settlement through a local engine proxy.
+        from nakshatra_serve import ModelConfigError, _load_models
+        try:
+            _load_models(args.models, enforce_ledger=True)
+        except ModelConfigError as e:
+            raise SystemExit(f"refusing gateway models config: {e}") from e
 
     root, env_path = _gateway_paths()
     root.mkdir(parents=True, exist_ok=True, mode=0o700)

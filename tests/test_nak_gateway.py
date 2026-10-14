@@ -77,6 +77,19 @@ def test_gateway_allows_lan_only_with_explicit_flag(tmp_path, monkeypatch):
     assert calls == ["enable"]
 
 
+def test_gateway_on_rejects_engine_url_registry_before_enable(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    models = tmp_path / "models.yaml"
+    models.write_text("models:\n  - name: local\n    engine_url: http://127.0.0.1:11434\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(nak, "_gateway_installer", lambda *_args: pytest.fail("must not enable"))
+
+    with pytest.raises(SystemExit, match="refuses unmetered proxy models"):
+        nak._gateway_on(object(), _args(models=str(models)))
+
+    assert not (home / ".nakshatra" / "gateway.env").exists()
+
+
 def test_gateway_off_removes_opt_in_without_starting_units(tmp_path, monkeypatch):
     home = tmp_path / "home"
     env = home / ".nakshatra" / "gateway.env"
@@ -147,6 +160,23 @@ def test_gateway_maps_credit_refusals_to_clear_http_status(reason, status):
 
     assert caught.value.status == status
     assert reason in str(caught.value)
+
+
+def test_gateway_gate_exception_denies_in_enforce_mode():
+    backend = serve.ChainChatBackend()
+    backend._ledger_hook_cached = SimpleNamespace(
+        enabled=True, wants_receipt=True, fail_closed=True,
+        gate=lambda _cost: (_ for _ in ()).throw(RuntimeError("ledger exploded")),
+        settle=lambda _path: None)
+    entry = serve.ModelEntry(
+        name="model-a", tokenizer_gguf="/unused.gguf",
+        registry_url="https://pillar.example", num_layers=2)
+
+    with pytest.raises(serve.CreditGateError) as caught:
+        backend.generate(entry, "hello", 1, {})
+
+    assert caught.value.status == 503
+    assert "ledger unavailable: ledger exploded" in str(caught.value)
 
 
 def test_gateway_chain_client_requires_worker_tls(monkeypatch):
