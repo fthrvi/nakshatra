@@ -1579,6 +1579,27 @@ def test_enforce_mode_global_handler_refuses_unknown_model_forward(monkeypatch):
     assert "external forwards" in body["error"]["message"]
 
 
+@pytest.mark.parametrize("path", ["/v1/chat/completions", "/api/chat"])
+def test_auto_registry_empty_returns_clear_503_before_enforce_refusal(
+        path, tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("NAKSHATRA_LEDGER_MODE", "enforce")
+    models = ns.AutoModelRegistry(
+        "https://pillar.invalid", discover_fn=lambda _url: {})
+    backend = ns.ChainChatBackend()
+    backend._ledger_hook_cached = SimpleNamespace(fail_closed=True)
+
+    with _running_chat(models, backend) as port:
+        status, body = _post(port, path, {
+            "model": "not-discovered-yet",
+            "messages": [{"role": "user", "content": "hi"}]})
+
+    assert status == 503
+    error = body["error"]
+    message = error["message"] if isinstance(error, dict) else error
+    assert message == "no models discovered yet"
+
+
 def test_default_proxy_stream_does_not_construct_ledger_hook(
         monkeypatch, caplog):
     class _LegacyProxy(ns.ChatBackend):

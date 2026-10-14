@@ -1091,8 +1091,17 @@ def _registry_urlopen(url: str, timeout: float = 10):
     `Authorization: Sthambha-Ed25519` header (an unsigned GET is a 401), so registry mode was silently broken.
     When NKS_REGISTRY_KEYID names a registered peer whose key this box holds (nakshatra_auth's worker key), the request
     is signed - over the FULL path INCLUDING the query string, which is what the pillar verifies. When unset, the
-    release registrar id or the release worker's public-key id is selected automatically."""
+    release registrar id or the release worker's public-key id is selected automatically.
+
+    Sthambha's envelope has only an integer-second timestamp, not a nonce. Two
+    same-key GETs for the same path in one second would therefore be identical
+    and the pillar correctly rejects the second as a replay. A random query
+    nonce makes every signed canonical path unique; the pillar's /peers and
+    /chain handlers ignore unknown query keys while authenticating the complete
+    path, so this needs no protocol or server change.
+    """
     import nakshatra_auth as _na
+    import secrets
     pin = os.environ.get("STHAMBHA_PILLAR_SPKI_SHA256", "").strip() or None
     keyid, keyid_source = resolve_registry_keyid()
     try:
@@ -1100,8 +1109,12 @@ def _registry_urlopen(url: str, timeout: float = 10):
             return _na.open_pillar_url(
                 url, timeout=timeout, expected_spki_hash=pin,
             )
-        from urllib.parse import urlsplit
+        from urllib.parse import urlsplit, urlunsplit
         parts = urlsplit(url)
+        nonce_query = f"nks_nonce={secrets.token_hex(16)}"
+        parts = parts._replace(
+            query=f"{parts.query}&{nonce_query}" if parts.query else nonce_query)
+        url = urlunsplit(parts)
         signed_path = parts.path + (f"?{parts.query}" if parts.query else "")
         key_path = Path.home() / ".nakshatra" / "keys" / "worker.ed25519"
         priv, _pub = _na.load_or_create_worker_key(key_path)

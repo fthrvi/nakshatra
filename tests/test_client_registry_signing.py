@@ -8,6 +8,7 @@ import hashlib
 import io
 import sys
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 from urllib.error import HTTPError
 from urllib.request import Request
 
@@ -58,15 +59,38 @@ def test_with_a_keyid_the_get_is_signed_over_the_full_path_including_the_query(p
     assert isinstance(request, Request)
     path = request.selector
     header = request.get_header("Authorization")
-    assert path == "/chain?model=qwen3-30b-q3"
+    query = parse_qs(urlsplit(path).query)
+    assert urlsplit(path).path == "/chain"
+    assert query["model"] == ["qwen3-30b-q3"]
+    assert len(query["nks_nonce"][0]) == 32
     assert header.startswith("Sthambha-Ed25519 ") and 'keyid="hub"' in header
     sig = base64.b64decode(header.split('sig="')[1].split('"')[0])
     ts = header.split('ts="')[1].split('"')[0]
     pub = priv.public_key()
-    good = f"GET\n/chain?model=qwen3-30b-q3\n{hashlib.sha256(b'').hexdigest()}\n{ts}".encode()
+    good = f"GET\n{path}\n{hashlib.sha256(b'').hexdigest()}\n{ts}".encode()
     pub.verify(sig, good)  # verifies over the FULL path, query included
     with pytest.raises(Exception):
         pub.verify(sig, f"GET\n/chain\n{hashlib.sha256(b'').hexdigest()}\n{ts}".encode())  # NOT over the bare path
+
+
+def test_back_to_back_signed_gets_have_unique_query_nonces(pillar, monkeypatch):
+    priv = ed25519.Ed25519PrivateKey.generate()
+    monkeypatch.setenv("NKS_REGISTRY_KEYID", "hub")
+    monkeypatch.setattr(na, "load_or_create_worker_key",
+                        lambda *a, **k: (priv.private_bytes_raw(), "unused"))
+    monkeypatch.setattr(na.time, "time", lambda: 1_800_000_000.0)
+
+    client._registry_urlopen("https://pillar.invalid/peers").read()
+    client._registry_urlopen("https://pillar.invalid/peers").read()
+
+    paths = [request.selector for request in pillar]
+    assert len(set(paths)) == 2
+    nonces = [parse_qs(urlsplit(path).query)["nks_nonce"][0]
+              for path in paths]
+    assert len(set(nonces)) == 2
+    assert all(urlsplit(path).path == "/peers" for path in paths)
+    assert all('ts="1800000000"' in request.get_header("Authorization")
+               for request in pillar)
 
 
 def test_public_key_fallback_uses_the_same_signing_key(pillar, monkeypatch):

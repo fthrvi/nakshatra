@@ -317,52 +317,110 @@ def _discover_auto_models(registry_url: str) -> dict[str, ModelEntry]:
 
 
 class AutoModelRegistry(dict):
-    """Small TTL cache so `/v1/models` tracks the currently complete pillar chains."""
-    def __init__(self, registry_url: str, refresh_s: float = 15.0):
+    """Background-refreshed projection of complete pillar model chains.
+
+    Discovery starts synchronously so the startup model count is meaningful.
+    An error or empty projection retries with capped exponential backoff; once
+    models exist, the projection is refreshed every five minutes. Refresh
+    failures preserve the last known-good list, while a successful empty
+    projection removes models that are no longer complete.
+    """
+    DEFAULT_RETRY_DELAYS = (2.0, 4.0, 8.0, 16.0, 32.0, 60.0)
+
+    def __init__(self, registry_url: str, refresh_s: float = 300.0, *,
+                 retry_delays=None, discover_fn=None):
         super().__init__()
         self.registry_url = registry_url
         self.refresh_s = refresh_s
-        self._next_refresh = 0.0
-        self._lock = threading.Lock()
+        self.retry_delays = tuple(retry_delays or self.DEFAULT_RETRY_DELAYS)
+        if not self.retry_delays or any(delay <= 0 for delay in self.retry_delays):
+            raise ValueError("retry_delays must contain positive delays")
+        self._discover_fn = discover_fn or _discover_auto_models
+        self._lock = threading.RLock()
+        self._stop = threading.Event()
+        self._thread = None
 
-    def _refresh(self):
-        now = time.monotonic()
-        if now < self._next_refresh:
-            return
+    def _refresh_once(self) -> bool:
+        try:
+            discovered = self._discover_fn(self.registry_url)
+        except Exception as e:  # keep the last known-good projection
+            log.warning("auto model discovery failed: %s", e)
+            return False
         with self._lock:
-            if now < self._next_refresh:
+            super().clear()
+            super().update(discovered)
+        if not discovered:
+            log.warning("auto model discovery found no complete local models")
+            return False
+        log.info("auto model discovery found %d model(s): %s",
+                 len(discovered), ", ".join(discovered))
+        return True
+
+    def start(self):
+        """Discover now, then maintain the projection in a daemon thread."""
+        with self._lock:
+            if self._thread is not None:
                 return
-            try:
-                discovered = _discover_auto_models(self.registry_url)
-            except Exception as e:  # keep the last known-good projection
-                log.warning("auto model discovery failed: %s", e)
+        found = self._refresh_once()
+        thread = threading.Thread(
+            target=self._refresh_loop, args=(found,), daemon=True,
+            name="auto-model-discovery")
+        with self._lock:
+            if self._thread is not None:
+                return
+            self._thread = thread
+        thread.start()
+
+    def _refresh_loop(self, found: bool):
+        retry_index = 0
+        while True:
+            if found:
+                delay = self.refresh_s
+                retry_index = 0
             else:
-                super().clear()
-                super().update(discovered)
-            self._next_refresh = now + self.refresh_s
+                delay = self.retry_delays[min(retry_index,
+                                              len(self.retry_delays) - 1)]
+                retry_index += 1
+            if self._stop.wait(delay):
+                return
+            found = self._refresh_once()
+
+    def close(self):
+        self._stop.set()
+        with self._lock:
+            thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=1.0)
 
     def get(self, key, default=None):
-        self._refresh()
         with self._lock:
             return super().get(key, default)
 
+    def __getitem__(self, key):
+        with self._lock:
+            return super().__getitem__(key)
+
+    def __contains__(self, key):
+        with self._lock:
+            return super().__contains__(key)
+
     def __iter__(self):
-        self._refresh()
         with self._lock:
             return iter(tuple(super().keys()))
 
     def __len__(self):
-        self._refresh()
         with self._lock:
             return super().__len__()
 
+    def keys(self):
+        with self._lock:
+            return tuple(super().keys())
+
     def values(self):
-        self._refresh()
         with self._lock:
             return tuple(super().values())
 
     def items(self):
-        self._refresh()
         with self._lock:
             return tuple(super().items())
 
@@ -1365,6 +1423,11 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
             return 400
         name = req.get("model")
         entry = self._models.get(name) if name else None
+        if entry is None and isinstance(self._models, AutoModelRegistry) \
+                and len(self._models) == 0:
+            self._json_error(HTTPStatus.SERVICE_UNAVAILABLE,
+                             "no models discovered yet")
+            return 503
         if self._refuse_unmetered_inference(entry, openai=False):
             return 403
         if entry is None:
@@ -1562,6 +1625,11 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
             return 400
         name = req.get("model")
         entry = self._models.get(name) if name else None
+        if entry is None and isinstance(self._models, AutoModelRegistry) \
+                and len(self._models) == 0:
+            self._openai_error(HTTPStatus.SERVICE_UNAVAILABLE,
+                               "no models discovered yet", "server_error")
+            return 503
         if self._refuse_unmetered_inference(entry, openai=True):
             return 403
         if entry is None:
@@ -2077,6 +2145,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         threading.Thread(target=extra.serve_forever, daemon=True,
                          name=f"serve-{addr}").start()
         extra_servers.append(extra)
+    if isinstance(models, AutoModelRegistry):
+        models.start()
     log.info("nakshatra_serve listening on %s port %d (version=%s, %d model(s): %s)",
              " + ".join([binds[0]] + [s.server_address[0] for s in extra_servers]),
              args.port, VERSION_STRING, len(models),
@@ -2091,6 +2161,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         for extra in extra_servers:
             extra.shutdown()
             extra.server_close()
+        if isinstance(models, AutoModelRegistry):
+            models.close()
     return 0
 
 

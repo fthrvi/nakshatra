@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
+import time
+from urllib.error import HTTPError
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,6 +19,15 @@ import nakshatra_serve as serve  # noqa: E402
 
 
 PIN = "17" * 32
+
+
+def _wait_for_model_names(models, expected, timeout=1.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if list(models) == expected:
+            return True
+        time.sleep(0.005)
+    return list(models) == expected
 
 
 def _completed_chain_with_receipt(cmd, *, prompt=7, generated=2, text="settled"):
@@ -150,6 +162,60 @@ def test_auto_models_uses_signed_peers_and_only_complete_local_models(tmp_path, 
     assert list(models) == ["model-a"]
     assert models["model-a"].tokenizer_gguf == str(model)
     assert models["model-a"].num_layers == 16
+
+
+def test_auto_models_retry_409_then_appear_without_restart(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    appeared = threading.Event()
+    calls = []
+    entry = serve.ModelEntry(name="llama32-3b", tokenizer_gguf="/fake.gguf",
+                             registry_url="https://pillar.example", num_layers=28)
+
+    def discover(_url):
+        calls.append(len(calls) + 1)
+        if len(calls) == 1:
+            raise HTTPError("https://pillar.example/peers", 409,
+                            "Conflict", {}, None)
+        appeared.set()
+        return {entry.name: entry}
+
+    models = serve.AutoModelRegistry(
+        "https://pillar.example", refresh_s=60,
+        retry_delays=(0.01,), discover_fn=discover)
+    try:
+        models.start()
+        assert appeared.wait(1.0), "409 retry did not run"
+        assert _wait_for_model_names(models, ["llama32-3b"])
+        assert calls[:2] == [1, 2]
+    finally:
+        models.close()
+
+
+def test_auto_models_periodically_refresh_added_and_removed_models(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    refreshed = threading.Event()
+    first = serve.ModelEntry(name="model-a", tokenizer_gguf="/a.gguf")
+    second = serve.ModelEntry(name="model-b", tokenizer_gguf="/b.gguf")
+    calls = 0
+
+    def discover(_url):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return {first.name: first}
+        refreshed.set()
+        return {second.name: second}
+
+    models = serve.AutoModelRegistry(
+        "https://pillar.example", refresh_s=0.01,
+        retry_delays=(0.01,), discover_fn=discover)
+    try:
+        models.start()
+        assert refreshed.wait(1.0), "periodic refresh did not run"
+        assert _wait_for_model_names(models, ["model-b"])
+    finally:
+        models.close()
 
 
 @pytest.mark.parametrize(
