@@ -5,7 +5,7 @@ On create add a row (status=active, owner). On merge flip to `merged→<sha>`.
 
 | branch | sector | description | base | status | owner |
 |---|---|---|---|---|---|
-| deploy/node-container | deploy | Official rootless-first Docker/Podman node container, signed installer bootstrap, generated-unit supervisor, hardened host wrapper, and isolation tests/docs. | main@a1de039 | active | codex for claude/trisul-aa network lane (hub) |
+| deploy/node-container | deploy | Official rootless-first Docker/Podman node container, signed installer bootstrap, generated-unit supervisor, hardened host wrapper, and isolation tests/docs. | main@a1de039 | merged→088070f | codex for claude/trisul-aa network lane (hub) |
 | owner-sentinel/launcher-self-update | worker | The Windows sentinel launcher updates itself from the signed release (wsl.exe only while the distro runs, File.Replace, monotonic Launcher-Version, successor handoff under a Global per-user SID mutex); install.ps1 reuses the saved distro/user. | forgejo/main@cd3ae8b | merged→3792bf2 | claude/trisul-aa network lane (hub) |
 | network/outsider-consumer | network | Local, fail-closed consumer gateway plus MCP/OpenAI harness access for invited outsider nodes through public fronts only. | main@cd3ae8b | merged→1e53ab5 | codex/root |
 | worker/idle-unload | worker | Stop the GPU daemon after an idle window, reload it single-flight after SHA-256 re-verification, and publish loaded/standby residency. | forgejo/main@a4bbf4a | merged | codex/root |
