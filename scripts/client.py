@@ -285,7 +285,8 @@ def detok_one(llama, tid):
 
 
 # The exact method strings worker.py signs/verifies (NOT the protobuf service name nakshatra.v0_1.Nakshatra).
-_GRPC_AUTH_METHODS = {"Forward": "/nakshatra.Nakshatra/Forward", "Inference": "/nakshatra.Nakshatra/Inference"}
+_GRPC_AUTH_METHODS = {"Forward": "/nakshatra.Nakshatra/Forward", "Inference": "/nakshatra.Nakshatra/Inference",
+                      "SignParticipation": "/nakshatra.Nakshatra/SignParticipation"}
 
 
 def _grpc_auth_metadata(method: str, message_bytes: bytes, streaming: bool = False):
@@ -2052,9 +2053,15 @@ def main():
             collected_sigs = []
             for w, _stub_sp, info in sorted_stubs:
                 try:
-                    r = _stub_sp.SignParticipation(pb.SignParticipationRequest(
+                    sp_req = pb.SignParticipationRequest(
                         run_id=run_id, output_sha256=rcpt["output_sha256"],
-                        layer_start=info.layer_start, layer_end=info.layer_end), timeout=20)
+                        layer_start=info.layer_start, layer_end=info.layer_end)
+                    # An authenticated worker (every pillar-registered one) refuses an unsigned
+                    # call with UNAUTHENTICATED, so the stage went unsigned and earned nothing
+                    # (found live on bro, 2026-10-13). Sign it exactly like Forward.
+                    r = _stub_sp.SignParticipation(
+                        sp_req, timeout=20,
+                        metadata=_grpc_auth_metadata("SignParticipation", sp_req.SerializeToString()))
                 except Exception as e:                       # noqa: BLE001
                     code = getattr(e, "code", lambda: None)()
                     note = getattr(code, "name", None) or type(e).__name__

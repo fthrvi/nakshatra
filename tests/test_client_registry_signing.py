@@ -170,3 +170,17 @@ def test_an_unsigned_stream_still_starts_with_no_metadata(monkeypatch):
 
     client.InferenceStream(_FakeStub(), "w0").step(pb.InferenceStep(session_id="s", step_id="1", prefix_length=3))
     assert seen["metadata"] is None
+
+
+def test_sign_participation_metadata_verifies_for_that_method(monkeypatch):
+    """An authenticated worker refused the unsigned SignParticipation with UNAUTHENTICATED, so every
+    stage went unsigned and earned nothing (bro, 2026-10-13). The client now signs it like Forward."""
+    pub_hex = _signer(monkeypatch)
+    req = pb.SignParticipationRequest(run_id="r", output_sha256="h", layer_start=0, layer_end=28)
+    (key, header), = client._grpc_auth_metadata("SignParticipation", req.SerializeToString())
+    assert key == "authorization"
+    resolver = lambda keyid: pub_hex if keyid == "hub" else None  # noqa: E731
+    assert ga.verify_grpc_call("/nakshatra.Nakshatra/SignParticipation", header,
+                               req.SerializeToString(), resolver) == "hub"
+    with pytest.raises(ga.AuthError):  # not valid for another method
+        ga.verify_grpc_call("/nakshatra.Nakshatra/Forward", header, req.SerializeToString(), resolver)
