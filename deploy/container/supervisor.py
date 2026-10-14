@@ -21,6 +21,8 @@ from pathlib import Path
 
 
 VARIABLE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+UNIT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@-]*")
+UNIT_MARKER = "# Managed by nakshatra-node install.py"
 
 
 def _assignments(value: str) -> dict[str, str]:
@@ -97,11 +99,15 @@ def parse_unit(path: Path, base_env: dict[str, str] | None = None) -> Unit:
         values.setdefault(key, []).append(value)
         directives.append((key, value))
     env = dict(os.environ if base_env is None else base_env)
+    # systemd gives EnvironmentFile values precedence over Environment values, independent of
+    # where the directives appear in the unit. This is what makes release opt-in env files useful
+    # for overriding signed defaults such as the gateway's container-internal BIND address.
+    for key, item in directives:
+        if key == "Environment":
+            env.update(_assignments(item))
     for key, item in directives:
         if key == "EnvironmentFile":
             env.update(_env_file(Path(item.removeprefix("-"))))
-        elif key == "Environment":
-            env.update(_assignments(item))
     starts = values.get("ExecStart", [])
     if len(starts) != 1:
         raise ValueError(f"{path} must contain exactly one ExecStart")
@@ -138,6 +144,7 @@ class Supervisor:
     backoff_cap: float = 30.0
     control: bool = True
     services: dict[str, Service] = field(default_factory=dict)
+    managed_names: set[str] = field(default_factory=set)
     stopping: bool = False
     updating: bool = False
     update_ok: bool | None = None
@@ -147,6 +154,7 @@ class Supervisor:
     _update_thread: threading.Thread | None = None
     _update_process: subprocess.Popen | None = None
     _next_update: float = float("inf")
+    _ignored_units: set[str] = field(default_factory=set)
 
     def log(self, message: str) -> None:
         print(f"[supervisor] {message}", flush=True)
@@ -163,28 +171,120 @@ class Supervisor:
         installer = self.prefix / "current" / relative
         return installer if installer.is_file() else None
 
+    @staticmethod
+    def _managed_unit(path: Path) -> bool:
+        try:
+            return UNIT_MARKER in path.read_text()[:1000]
+        except OSError:
+            return False
+
+    @staticmethod
+    def _set_env(path: Path, name: str, value: str) -> None:
+        try:
+            lines = path.read_text().splitlines()
+        except FileNotFoundError:
+            lines = []
+        prefix = f"{name}="
+        lines = [line for line in lines if not line.startswith(prefix)]
+        lines.append(f'{name}="{value}"')
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary.write_text("\n".join(lines) + "\n")
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+
+    def reconcile_container_env(self) -> None:
+        """Apply container-only network overrides through release-owned EnvironmentFiles."""
+        home = Path(os.environ.get("HOME", str(self.prefix.parent)))
+        bind = os.environ.get("NAK_CONTAINER_GATEWAY_BIND", "")
+        if bind:
+            if bind != "0.0.0.0":
+                raise ValueError("container gateway bind must be 0.0.0.0")
+            self._set_env(home / ".nakshatra" / "unconscious.env", "BIND", bind)
+        if os.environ.get("NAK_CONTAINER_WORKER") != "1":
+            return
+        port_text = os.environ.get("NAK_CONTAINER_P2P_PORT", "4001")
+        try:
+            port = int(port_text)
+        except ValueError as exc:
+            raise ValueError("container p2p port must be an integer") from exc
+        if not 1 <= port <= 65535 or str(port) != port_text:
+            raise ValueError("container p2p port must be between 1 and 65535")
+        worker_env = home / ".nakshatra" / "worker.env"
+        if worker_env.exists():
+            values = _env_file(worker_env)
+            worker_port = values.get("PORT", "")
+            if not worker_port.isdigit() or not 1 <= int(worker_port) <= 65535:
+                raise ValueError("worker env has an invalid PORT")
+            self._set_env(worker_env, "LISTEN", "127.0.0.1")
+            self._set_env(
+                worker_env,
+                "NAKSHATRA_P2P_WORKER_ARGS",
+                f"-listen /ip4/0.0.0.0/tcp/{port} -inbound=127.0.0.1:{worker_port} "
+                "-require-direct-activation",
+            )
+        p2p_env = home / ".nakshatra" / "p2p.env"
+        if p2p_env.exists() and not worker_env.exists():
+            self._set_env(
+                p2p_env, "NAKSHATRA_P2P_WORKER_ARGS", f"-listen /ip4/0.0.0.0/tcp/{port}"
+            )
+
+    @staticmethod
+    def _validated_names(value: object) -> list[str]:
+        if not isinstance(value, list) or not all(isinstance(name, str) for name in value):
+            raise RuntimeError("signed installer returned an invalid unit list")
+        names = []
+        for name in value:
+            normalized = name.removesuffix(".service")
+            if not UNIT_NAME.fullmatch(normalized):
+                raise RuntimeError(f"signed installer returned an invalid unit name: {name!r}")
+            if normalized not in names:
+                names.append(normalized)
+        return names
+
     def generate_units(self) -> list[str]:
         installer = self._installer()
         if installer is None:
             return []
-        result = subprocess.run(
-            [sys.executable, str(installer), "--prefix", str(self.prefix), "write-units",
-             "--no-systemd", "--unit-dir", str(self.unit_dir)],
-            capture_output=True, text=True, timeout=120, check=False,
-        )
+        command = [sys.executable, str(installer), "--prefix", str(self.prefix), "write-units",
+                   "--no-systemd", "--include-updater", "--unit-dir", str(self.unit_dir)]
+        result = subprocess.run(command, capture_output=True, text=True, timeout=120, check=False)
+        if result.returncode and "--include-updater" in result.stderr and "unrecognized arguments" in result.stderr:
+            # An already-installed release may predate the container updater-reporting contract. Its
+            # ordinary services remain safe to run from its returned allowlist, but its updater is not
+            # authorized until a newer signed installer explicitly returns that name.
+            self.log("signed installer predates updater allowlisting; automatic updates remain disabled")
+            result = subprocess.run(
+                [item for item in command if item != "--include-updater"],
+                capture_output=True, text=True, timeout=120, check=False,
+            )
         if result.returncode:
             raise RuntimeError(f"signed installer could not generate units: {result.stderr.strip()[-300:]}")
-        return json.loads(result.stdout.strip().splitlines()[-1])
+        return self._validated_names(json.loads(result.stdout.strip().splitlines()[-1]))
 
     def load_units(self, names: list[str] | None = None, *, activate_new: bool = False) -> None:
-        if names is None:
-            names = sorted(path.stem.removesuffix(".service") for path in self.unit_dir.glob("*.service")
-                           if path.name != "nak-update.service")
+        if names is not None:
+            names = self._validated_names(names)
+            self.managed_names = set(names)
+        else:
+            names = sorted(self.managed_names)
+        service_names = [name for name in names if name != "nak-update"]
+        allowed_files = {f"{name}.service" for name in names}
+        ignored = sorted(path.name for path in self.unit_dir.glob("*.service") if path.name not in allowed_files)
+        for filename in ignored:
+            if filename not in self._ignored_units:
+                self.log(f"ignoring unit not returned by signed installer: {filename}")
+        self._ignored_units.update(ignored)
         incoming = {}
-        for name in names:
+        if "nak-update" in names and (self.unit_dir / "nak-update.service").is_file() \
+                and not self._managed_unit(self.unit_dir / "nak-update.service"):
+            self.log("ignoring installer-listed unit without managed marker: nak-update.service")
+        for name in service_names:
             path = self.unit_dir / f"{name}.service"
-            if path.is_file():
+            if path.is_file() and self._managed_unit(path):
                 incoming[name] = parse_unit(path)
+            elif path.is_file():
+                self.log(f"ignoring installer-listed unit without managed marker: {path.name}")
         for name in set(self.services) - set(incoming):
             self.stop_service(name)
             del self.services[name]
@@ -201,6 +301,7 @@ class Supervisor:
             self.start_ready()
 
     def reload(self, *, generate: bool = False) -> None:
+        self.reconcile_container_env()
         names = self.generate_units() if generate and self.refresh else None
         self.load_units(names)
 
@@ -288,7 +389,10 @@ class Supervisor:
 
     def _run_update(self) -> None:
         try:
-            unit = parse_unit(self.unit_dir / "nak-update.service")
+            update_path = self.unit_dir / "nak-update.service"
+            if "nak-update" not in self.managed_names or not self._managed_unit(update_path):
+                raise RuntimeError("ignoring updater without installer managed-unit marker")
+            unit = parse_unit(update_path)
             self._update_process = subprocess.Popen(
                 unit.argv, env=unit.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                 start_new_session=True,
@@ -317,7 +421,8 @@ class Supervisor:
             self.updating = False
 
     def begin_update(self) -> None:
-        if self.updating or not (self.unit_dir / "nak-update.service").is_file():
+        if self.updating or "nak-update" not in self.managed_names \
+                or not self._managed_unit(self.unit_dir / "nak-update.service"):
             return
         self.updating = True
         self.update_ok = None
@@ -349,7 +454,7 @@ class Supervisor:
                 self.begin_update()
                 return {"ok": self.updating, "error": "no installed updater" if not self.updating else ""}
             if action == "reload":
-                self.reload(generate=False)
+                self.reload(generate=True)
                 return {"ok": True}
             if action in {"enable", "disable", "restart"}:
                 names = request.get("services") or []
@@ -446,6 +551,7 @@ class Supervisor:
         os.chmod(runtime_dir, 0o700)
         try:
             self.unit_dir.mkdir(parents=True, exist_ok=True)
+            self.reconcile_container_env()
             names = self.generate_units() if self.refresh else None
             self.load_units(names, activate_new=True)
         except Exception as exc:

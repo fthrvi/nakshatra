@@ -509,10 +509,10 @@ class Installer:
         cur_rel = self.prefix / "releases" / man["version"]
         updater = (self.prefix / "current" / shipped) if shipped and (cur_rel / shipped).exists() else bin_dir / "install.py"
         (self.unit_dir / "nak-update.service").write_text(
-            "[Unit]\nDescription=Nakshatra node self-update (signed releases only)\n\n"
+            UNIT_MARKER + "\n[Unit]\nDescription=Nakshatra node self-update (signed releases only)\n\n"
             f"[Service]\nType=oneshot\nExecStart={sys.executable} {updater} --prefix {self.prefix} update\n")
         (self.unit_dir / "nak-update.timer").write_text(
-            "[Unit]\nDescription=Hourly Nakshatra node update check\n\n"
+            UNIT_MARKER + "\n[Unit]\nDescription=Hourly Nakshatra node update check\n\n"
             "[Timer]\nOnCalendar=hourly\nRandomizedDelaySec=600\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n")
         if self.systemd:
             if subprocess.run(["systemctl", "--user", "daemon-reload"], check=False).returncode != 0:
@@ -1063,6 +1063,8 @@ def main(argv=None) -> int:
     sub.add_parser("update"); sub.add_parser("rollback"); sub.add_parser("status")
     p = sub.add_parser("write-units", help="(internal) write this release's systemd units; prints their names")
     p.add_argument("--no-systemd", action="store_true")
+    p.add_argument("--include-updater", action="store_true",
+                   help=argparse.SUPPRESS)
     p.add_argument("--unit-dir", default=None)
     p = sub.add_parser("enable", help="write and start one current-release opt-in service")
     p.add_argument("service")
@@ -1079,7 +1081,10 @@ def main(argv=None) -> int:
         if a.cmd == "write-units":
             w = Installer(a.prefix, systemd=not a.no_systemd, unit_dir=a.unit_dir)
             man = json.loads((a.prefix / "current" / "manifest.json").read_text())
-            print(json.dumps(w.write_units(man)))
+            names = w.write_units(man)
+            if a.include_updater:
+                names.append("nak-update")
+            print(json.dumps(names))
             return 0
         if a.cmd == "join":
             name = a.name or (input("Your name (what your friend will see): ").strip() if sys.stdin.isatty() else "")

@@ -72,11 +72,18 @@ ensure_image() {
     fi
 }
 
+valid_port() {
+    [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
+
 run_args() {
-    local runtime="$1" share_path share_mode worker_port
+    local runtime="$1" share_path share_mode worker_port p2p_port
     share_path="$(config_read share-path)"
     share_mode="$(config_read share-mode)"
     worker_port="$(config_read worker-port)"
+    p2p_port="${NAKC_P2P_PORT:-$(config_read p2p-port)}"
+    p2p_port="${p2p_port:-4001}"
+    valid_port "$p2p_port" || die "p2p port must be between 1 and 65535"
     RUN_ARGS=(run -d --name "$CONTAINER_NAME" --hostname "$CONTAINER_NAME"
         --label io.nakshatra.role=node --restart unless-stopped
         --user 11600:11600 --cap-drop ALL --security-opt no-new-privileges
@@ -84,7 +91,8 @@ run_args() {
         --pids-limit "${NAKC_PIDS_LIMIT:-512}" --memory "${NAKC_MEMORY:-16g}"
         --network bridge --stop-timeout "${NAKC_STOP_TIMEOUT:-20}"
         --publish "127.0.0.1:${NAKC_GATEWAY_PORT:-11600}:11599/tcp"
-        --env "NAK_UPDATE_INTERVAL_S=${NAKC_UPDATE_INTERVAL_S:-3600}")
+        --env "NAK_UPDATE_INTERVAL_S=${NAKC_UPDATE_INTERVAL_S:-3600}"
+        --env "NAK_CONTAINER_GATEWAY_BIND=0.0.0.0")
     if [ "${runtime##*/}" = podman ]; then
         RUN_ARGS+=(--volume "$VOLUME_NAME:/state:U")
     else
@@ -98,9 +106,10 @@ run_args() {
         fi
     fi
     if [ -n "$worker_port" ]; then
-        [[ "$worker_port" =~ ^[0-9]+$ ]] && [ "$worker_port" -ge 1 ] && [ "$worker_port" -le 65535 ] \
-            || die "stored worker port is invalid"
-        RUN_ARGS+=(--publish "$worker_port:$worker_port/tcp")
+        valid_port "$worker_port" || die "stored worker port is invalid"
+        RUN_ARGS+=(--env "NAK_CONTAINER_WORKER=1" --env "NAK_CONTAINER_P2P_PORT=$p2p_port"
+            --publish "0.0.0.0:$p2p_port:$p2p_port/tcp"
+            --publish "0.0.0.0:$p2p_port:$p2p_port/udp")
     fi
     case "$VARIANT" in
         nvidia)
@@ -120,6 +129,10 @@ start_container() {
     ensure_image "$runtime"
     if container_exists; then run "$runtime" rm -f "$CONTAINER_NAME" >/dev/null; fi
     run_args "$runtime"
+    if [ -n "$(config_read worker-port)" ]; then
+        printf 'nakc: deliberate public port: libp2p sidecar 0.0.0.0:%s (tcp+udp); worker gRPC stays on container loopback\n' \
+            "${NAKC_P2P_PORT:-$(config_read p2p-port)}" >&2
+    fi
     run "$runtime" "${RUN_ARGS[@]}"
 }
 
@@ -149,13 +162,13 @@ usage: nakc join '<invite line>'
        nakc mcp
 
 Environment: NAKC_ENGINE=docker|podman, NAKC_VARIANT=cpu|nvidia|rocm,
-NAKC_MEMORY=16g, NAKC_PIDS_LIMIT=512, NAKC_DRY_RUN=1.
+NAKC_MEMORY=16g, NAKC_PIDS_LIMIT=512, NAKC_P2P_PORT=4001, NAKC_DRY_RUN=1.
 EOF
 }
 
 main() {
     [ "$#" -gt 0 ] || { usage; exit 2; }
-    local command="$1" runtime port path mode old_port
+    local command="$1" runtime port path mode old_port old_p2p_port p2p_port
     shift
     runtime="$(engine)"
     case "$command" in
@@ -210,21 +223,31 @@ main() {
             [ "$#" -gt 0 ] || die "worker needs build, on, off, or status"
             if [ "$1" = on ]; then
                 old_port="$(config_read worker-port)"
+                old_p2p_port="$(config_read p2p-port)"
                 port="$(worker_port_from_args "$@")"
                 if [ -n "$port" ]; then
-                    [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] \
-                        || die "worker --port must be between 1 and 65535"
+                    valid_port "$port" || die "worker --port must be between 1 and 65535"
                     config_write worker-port "$port"
                 fi
                 [ -n "$(config_read worker-port)" ] || die "worker on needs --port on its first configuration"
+                p2p_port="${NAKC_P2P_PORT:-${old_p2p_port:-4001}}"
+                valid_port "$p2p_port" || die "NAKC_P2P_PORT must be between 1 and 65535"
+                config_write p2p-port "$p2p_port"
                 start_container "$runtime"
                 if [ "$DRY_RUN" = 1 ]; then
+                    run "$runtime" exec -i "$CONTAINER_NAME" nak p2p on
                     run "$runtime" exec -i "$CONTAINER_NAME" nak worker "$@"
-                elif ! "$runtime" exec -i "$CONTAINER_NAME" nak worker "$@"; then
+                elif ! "$runtime" exec -i "$CONTAINER_NAME" nak p2p on || \
+                     ! "$runtime" exec -i "$CONTAINER_NAME" nak worker "$@"; then
                     if [ -n "$old_port" ]; then
                         config_write worker-port "$old_port"
                     else
                         rm -f "$CONFIG_DIR/worker-port"
+                    fi
+                    if [ -n "$old_p2p_port" ]; then
+                        config_write p2p-port "$old_p2p_port"
+                    else
+                        rm -f "$CONFIG_DIR/p2p-port"
                     fi
                     start_container "$runtime"
                     return 1

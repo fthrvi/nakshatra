@@ -16,7 +16,11 @@ This is not a boundary against a compromised host. Host root, Docker's root daem
 owner of a rootless Podman account can inspect the volume and the container. A worker also
 necessarily sees prompts and activations it serves. Containers reduce host-file exposure;
 they do not make inference private from the worker doing it, and they do not defend against
-container-runtime or kernel escapes.
+container-runtime or kernel escapes. Bridge networking still permits outbound LAN and Internet
+access, including any host service reachable over the bridge; it is not isolation from personal
+data exposed over the network. The state volume is writable by the same UID as the node, so a
+compromised process can alter its own installed releases and keys. That does not grant access to
+unmounted host files, but the volume must not be treated as tamper-proof.
 
 ## A friend's setup
 
@@ -85,9 +89,12 @@ delete that volume only as a separate, deliberate operation.
 `NAKC_ENGINE=docker` or `NAKC_ENGINE=podman`. Every start uses a non-root UID, drops all
 capabilities, enables `no-new-privileges`, uses a read-only root filesystem, supplies only a
 bounded `/tmp` tmpfs, uses the normal container network namespace, and applies memory and
-PID limits. The gateway maps only to host loopback at `127.0.0.1:11600`. No worker port is
-published until `nakc worker on ... --port PORT`; turning the worker off removes that
-publication. Host networking is never used.
+PID limits. The gateway binds `0.0.0.0:11599` only inside the container and maps only to host
+loopback at `127.0.0.1:11600`. The worker's gRPC port always binds container loopback and is
+never published. While the worker is on, its libp2p sidecar is the one deliberate public ingress:
+`0.0.0.0:4001` over both TCP and UDP/QUIC by default. Set `NAKC_P2P_PORT` on the first
+`nakc worker on` to choose another fixed port. Turning the worker off removes both publications.
+Host networking is never used.
 
 Tune resource ceilings without weakening the file boundary:
 
@@ -103,7 +110,8 @@ NAKC_VARIANT=nvidia nakc start   # CUDA image; Docker --gpus or Podman CDI
 NAKC_VARIANT=rocm nakc start     # ROCm image; only /dev/kfd and /dev/dri
 ```
 
-The default build bases are version-pinned in `nakc` and `Containerfile`. Set `NAKC_IMAGE`
+The default build bases are pinned by version tag, not immutable digest, in `nakc` and
+`Containerfile`; image construction is outside Nakshatra release signing. Set `NAKC_IMAGE`
 to use a prebuilt official image instead of the locally built `nakshatra-node:<variant>`.
 NVIDIA requires the NVIDIA container runtime/CDI setup on the host; ROCm requires host
 device permissions. Neither mode mounts the host filesystem beyond the optional share.

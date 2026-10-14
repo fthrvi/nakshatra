@@ -62,6 +62,7 @@ def test_nakc_default_run_is_hardened_and_mounts_only_the_state_volume(tmp_path)
     assert "--read-only" in argv and "--network" in argv and argv[argv.index("--network") + 1] == "bridge"
     assert "--network=host" not in argv and "--privileged" not in argv
     assert "127.0.0.1:11600:11599/tcp" in argv
+    assert "NAK_CONTAINER_GATEWAY_BIND=0.0.0.0" in argv
     assert not any(item.endswith(":/share") or "dst=/share" in item for item in argv)
     mounts = [argv[index + 1] for index, item in enumerate(argv) if item == "--volume"]
     assert mounts == ["nakshatra-node-state:/state"]
@@ -83,13 +84,29 @@ def test_share_is_read_only_by_default_and_rw_only_when_explicit(tmp_path):
     assert share == f"type=bind,src={shared},dst=/share"
 
 
-def test_worker_port_and_gpu_devices_are_added_only_when_requested(tmp_path):
+def test_only_fixed_p2p_port_and_gpu_devices_are_added_while_worker_is_on(tmp_path):
     worker = _nakc(tmp_path, "worker", "on", "--port", "50051", NAKC_VARIANT="nvidia")
     assert worker.returncode == 0, worker.stderr
     argv = _dry_run_argv(worker.stdout)
-    assert "50051:50051/tcp" in argv and "--gpus" in argv and argv[argv.index("--gpus") + 1] == "all"
+    assert "50051:50051/tcp" not in argv
+    assert "0.0.0.0:4001:4001/tcp" in argv and "0.0.0.0:4001:4001/udp" in argv
+    assert "NAK_CONTAINER_WORKER=1" in argv and "NAK_CONTAINER_P2P_PORT=4001" in argv
+    assert "--gpus" in argv and argv[argv.index("--gpus") + 1] == "all"
+    assert "deliberate public port" in worker.stderr
+    assert "+ docker exec -i nakshatra-node nak p2p on" in worker.stdout
     clean = _nakc(tmp_path / "clean", "start", NAKC_VARIANT="cpu")
-    assert "50051:50051/tcp" not in _dry_run_argv(clean.stdout)
+    clean_argv = _dry_run_argv(clean.stdout)
+    assert not any(item.endswith(":4001/tcp") or item.endswith(":4001/udp") for item in clean_argv)
+
+
+def test_worker_p2p_port_is_configurable_and_persisted(tmp_path):
+    worker = _nakc(tmp_path, "worker", "on", "--port", "50051", NAKC_P2P_PORT="24001")
+    assert worker.returncode == 0, worker.stderr
+    argv = _dry_run_argv(worker.stdout)
+    assert "0.0.0.0:24001:24001/tcp" in argv and "0.0.0.0:24001:24001/udp" in argv
+    restarted = _nakc(tmp_path, "start")
+    argv = _dry_run_argv(restarted.stdout)
+    assert "0.0.0.0:24001:24001/tcp" in argv and "NAK_CONTAINER_P2P_PORT=24001" in argv
 
 
 def test_join_dry_run_never_prints_the_invite(tmp_path):
@@ -139,6 +156,7 @@ def test_generated_unit_parser_expands_env_files_without_copying_commands(tmp_pa
     env_file.write_text('PORT=50051\nEXTRA="--one two"\n')
     unit_file = tmp_path / "fake.service"
     unit_file.write_text(
+        supervisor.UNIT_MARKER + "\n"
         "[Service]\n"
         f"EnvironmentFile=-{env_file}\n"
         "Environment=BASE=ready\n"
@@ -151,6 +169,39 @@ def test_generated_unit_parser_expands_env_files_without_copying_commands(tmp_pa
     assert unit.pre[0][0] == sys.executable and unit.restart == "always"
 
 
+def test_container_env_makes_gateway_reachable_and_worker_private(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    env_dir = home / ".nakshatra"
+    env_dir.mkdir(parents=True)
+    (env_dir / "p2p.env").write_text("P2P_RELAYS=test\n")
+    (env_dir / "worker.env").write_text("PORT=50051\nLISTEN=0.0.0.0\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("NAK_CONTAINER_GATEWAY_BIND", "0.0.0.0")
+    monkeypatch.setenv("NAK_CONTAINER_WORKER", "1")
+    monkeypatch.setenv("NAK_CONTAINER_P2P_PORT", "4001")
+    instance = supervisor.Supervisor(tmp_path / "prefix", tmp_path / "units", tmp_path / "sock",
+                                     refresh=False, control=False)
+    instance.reconcile_container_env()
+    gateway_env = env_dir / "unconscious.env"
+    assert supervisor._env_file(gateway_env)["BIND"] == "0.0.0.0"
+    worker_env = supervisor._env_file(env_dir / "worker.env")
+    assert worker_env["LISTEN"] == "127.0.0.1"
+    assert worker_env["NAKSHATRA_P2P_WORKER_ARGS"] == (
+        "-listen /ip4/0.0.0.0/tcp/4001 -inbound=127.0.0.1:50051 -require-direct-activation"
+    )
+
+    unit_file = tmp_path / "gateway.service"
+    unit_file.write_text(
+        supervisor.UNIT_MARKER + "\n[Service]\n"
+        f"EnvironmentFile=-{gateway_env}\n"
+        "Environment=BIND=127.0.0.1 PORT=11599\n"
+        "ExecStart=gateway --bind ${BIND} --port ${PORT}\n"
+    )
+    unit = supervisor.parse_unit(unit_file, {})
+    assert unit.env["BIND"] == "0.0.0.0"
+    assert unit.argv == ["gateway", "--bind", "0.0.0.0", "--port", "11599"]
+
+
 def test_supervisor_reload_refreshes_environment_file_without_starting_service(tmp_path):
     units = tmp_path / "units"
     units.mkdir()
@@ -158,6 +209,7 @@ def test_supervisor_reload_refreshes_environment_file_without_starting_service(t
     env_file.write_text("PORT=50051\n")
     unit_file = units / "worker.service"
     unit_file.write_text(
+        supervisor.UNIT_MARKER + "\n"
         "[Service]\n"
         f"EnvironmentFile=-{env_file}\n"
         f"ExecStart={sys.executable} -c 'raise SystemExit(0)' --port=${{PORT}}\n"
@@ -194,6 +246,7 @@ def test_supervisor_restarts_with_backoff_and_stops_child_on_sigterm(tmp_path):
     units.mkdir()
     command = shlex.join([sys.executable, str(fake)])
     (units / "fake.service").write_text(
+        supervisor.UNIT_MARKER + "\n"
         "[Service]\n"
         f"Environment=COUNTER={counter}\n"
         f"Environment=TIMELINE={timeline}\n"
@@ -202,12 +255,18 @@ def test_supervisor_restarts_with_backoff_and_stops_child_on_sigterm(tmp_path):
         "Restart=on-failure\n"
     )
     sock = tmp_path / "supervisor.sock"
+    prefix = tmp_path / "prefix"
+    current = prefix / "current"
+    current.mkdir(parents=True)
+    installer = current / "install.py"
+    installer.write_text("import json\nprint(json.dumps(['fake']))\n")
+    (current / "manifest.json").write_text('{"installer":"install.py"}')
     env = dict(os.environ, NAK_SUPERVISOR_BACKOFF_BASE_S="0.05", NAK_SUPERVISOR_BACKOFF_CAP_S="0.1",
                XDG_RUNTIME_DIR=str(tmp_path / "runtime"))
     process = subprocess.Popen(
-        [sys.executable, str(CONTAINER / "supervisor.py"), "--no-refresh",
+        [sys.executable, str(CONTAINER / "supervisor.py"),
          "--no-control", "--update-interval", "0", "--unit-dir", str(units), "--socket", str(sock),
-         "--prefix", str(tmp_path / "prefix")],
+         "--prefix", str(prefix)],
         env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
     )
     try:
@@ -227,6 +286,47 @@ def test_supervisor_restarts_with_backoff_and_stops_child_on_sigterm(tmp_path):
         if process.poll() is None:
             process.kill()
             process.wait(timeout=5)
+
+
+def test_supervisor_uses_only_installer_names_with_managed_marker(tmp_path, capsys):
+    units = tmp_path / "units"
+    units.mkdir()
+    command = shlex.join([sys.executable, "-c", "raise SystemExit(0)"])
+    managed = supervisor.UNIT_MARKER + f"\n[Service]\nExecStart={command}\n"
+    (units / "good.service").write_text(managed)
+    (units / "listed-but-unmarked.service").write_text(f"[Service]\nExecStart={command}\n")
+    (units / "injected.service").write_text(managed)
+    (units / "nak-update.service").write_text(managed)
+    instance = supervisor.Supervisor(tmp_path / "prefix", units, tmp_path / "sock",
+                                     refresh=False, control=False)
+    instance.load_units(["good", "listed-but-unmarked"])
+    assert set(instance.services) == {"good"}
+    output = capsys.readouterr().out
+    assert "ignoring unit not returned by signed installer: injected.service" in output
+    assert "ignoring unit not returned by signed installer: nak-update.service" in output
+    assert "ignoring installer-listed unit without managed marker: listed-but-unmarked.service" in output
+    instance.begin_update()
+    assert instance.updating is False
+
+    (units / "good.service").unlink()
+    instance.reload(generate=False)
+    assert instance.services == {}
+
+
+def test_daemon_reload_regenerates_the_installer_allowlist(tmp_path, monkeypatch):
+    units = tmp_path / "units"
+    units.mkdir()
+    command = shlex.join([sys.executable, "-c", "raise SystemExit(0)"])
+    for name in ("old", "new"):
+        (units / f"{name}.service").write_text(
+            supervisor.UNIT_MARKER + f"\n[Service]\nExecStart={command}\n"
+        )
+    instance = supervisor.Supervisor(tmp_path / "prefix", units, tmp_path / "sock",
+                                     refresh=True, control=False)
+    instance.load_units(["old"])
+    monkeypatch.setattr(instance, "generate_units", lambda: ["new"])
+    assert instance.handle({"action": "reload"}) == {"ok": True}
+    assert set(instance.services) == {"new"}
 
 
 def test_cpu_image_smoke_when_docker_is_usable_without_sudo(tmp_path):
