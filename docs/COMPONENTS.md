@@ -86,11 +86,11 @@ different NATs over IPv4 only (needs a second network).
 ## Accounting
 | Job | Component | Status |
 |---|---|---|
-| Meter inference: `gate` / `settle(receipt)` | `ledger_client.py` → Neuron ledger | LIVE (`NAKSHATRA_CREDITS=1` → :8097) |
+| Meter inference: `gate` / `settle(receipt)` | `ledger_client.py` → Neuron ledger; signs every call with the node key (strict load, never creates it; `NAKSHATRA_LEDGER_KEYID` optional) | LIVE (`NAKSHATRA_CREDITS=1` in `~/.nakshatra/unconscious.env` → :8097). Fail-open. NOTE: it is ON for Prithvi's unconscious gateway; every settle so far charged 0 (own nodes). Until the hub runs a release with the signed client, its calls get 401 and fail open (same zero charge). The hub's receipts carry no worker signatures yet (the gateway sets no `NAKSHATRA_ROSTER`), so only free own-node settles can be recorded. |
 | Settle once per run; tier credit limits | `settlekey.py`, `creditlimit.py` | BUILT / WIRED |
 | Task escrow: open / release / refund | `network/settle.py` (local ledger adapter) | LIVE (TEST units) |
 | **The front door for both halves** | **`scripts/accounting.py`**: `metering()` (the gateway's credit hook) and `escrow(state_dir)` (task escrow). New backends (Solana devnet escrow, the repaired Neuron ledger) are added HERE. | LIVE (U5, 2026-10-03) |
-| Ledger service | Neuron `python/ledger_server.py` :8097 | LIVE, **unauthenticated, racy, takes forged receipts** (fix before money) |
+| Ledger service | Neuron `python/ledger_server.py` :8097, **v2 since 2026-10-13**. It runs on an authenticated SQLite store (`~/.neuron/credits/ledger.sqlite`) through the user-unit drop-in `~/.config/systemd/user/neuron-ledger.service.d/10-v2.conf`; the legacy `ledger.json` and its `.bak.*` are untouched. Every POST/GET must be signed by a key in the admission roster, and the requester is derived from the roster row, never the body. Credit goes only to stages with valid rostered worker signatures; `receipt_id` comes from the work's content, so replays are idempotent; disputes are final; free own-node settles are recorded; amounts are bounded integers; the credit limit is checked inside the transaction; the journal is append-only. Live smoke: an unsigned settle/transfer gets 401 and `/balances` gets 403. Rollback: remove the drop-in, `daemon-reload`, restart. Backed up nightly (trisul `backup-sources.tsv`). | **HARDENED (TEST units only)** |
 | Chain | Neuron Substrate | LIVE, being stopped (Biswa 10-03) |
 
 ## Shipping code to machines
