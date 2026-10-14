@@ -1245,7 +1245,10 @@ class IdleDaemonController:
         if not self._warm_directives_enabled:
             return
         with self._state_lock:
-            changed = directive != self._warm_directive
+            # Renewals carry a fresh "until" every heartbeat; log only a change of model/action.
+            def _kind(d):
+                return None if d is None else (d.model, d.action)
+            changed = _kind(directive) != _kind(self._warm_directive)
             self._warm_directive = directive
             action = self._warm_action_locked()
             can_prewarm = (
