@@ -201,3 +201,16 @@ def test_pillar_chain_residency_is_projected_and_missing_is_unknown(monkeypatch)
     assert client._try_pillar_chain("https://pillar.invalid", "m")[0]["residency"] == "standby"
     assert client._try_pillar_chain("https://pillar.invalid", "m")[0]["residency"] == "away"
     assert client._try_pillar_chain("https://pillar.invalid", "m")[0]["residency"] == "unknown"
+
+
+def test_peers_fallback_skips_away_workers_with_a_clear_reason(monkeypatch):
+    """The /peers fallback used to dial an owner-reclaimed worker and fail with
+    'UNAVAILABLE: owner paused'; it must skip it like the pillar's /chain does."""
+    monkeypatch.setattr(client, "_try_pillar_chain", lambda *_a, **_k: None)
+    monkeypatch.setattr(client, "_fetch_registry_peers", lambda *_a, **_k: [{
+        "node_id": "leased", "address": "host", "port": 1, "is_online": True,
+        "residency": "away",
+        "layer_offerings": [{"model_id": "m", "layer_start": 0, "layer_end": 4}],
+    }])
+    with pytest.raises(RuntimeError, match=r"1 away: their owners are using them"):
+        client.build_chain_from_registry("https://pillar.invalid", "m")

@@ -1094,15 +1094,22 @@ def build_chain_from_registry(registry_url: str, model_id: str, *,
 
     # Collect (peer, offering) pairs from online compute peers
     pairs = []
+    away = 0
     for p in peers:
         if not p.get("is_online"):
+            continue
+        # An owner-reclaimed worker refuses all inference; the pillar's /chain already skips it,
+        # and this fallback must too (it used to dial it and fail with "UNAVAILABLE: owner paused").
+        if p.get("residency") == "away":
+            away += any(o.get("model_id") == model_id for o in p.get("layer_offerings", []))
             continue
         for o in p.get("layer_offerings", []):
             if o.get("model_id") == model_id:
                 pairs.append((p, o))
 
     if not pairs:
-        raise RuntimeError(f"no online peers advertise model_id={model_id!r} on {registry_url}")
+        why = f" ({away} away: their owners are using them)" if away else ""
+        raise RuntimeError(f"no online peers advertise model_id={model_id!r} on {registry_url}{why}")
 
     # Sort: layer_start ascending, then chain-quality score ascending,
     # then recent_rpc_ms ascending (lower latency wins WITHIN a quality
