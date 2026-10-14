@@ -242,7 +242,7 @@ def test_strict_settle_does_not_assert_requester(monkeypatch, tmp_path):
     requests = []
     monkeypatch.setattr(
         ledger_client.urllib.request, "urlopen",
-        lambda request, timeout: requests.append(request) or _Response(b'{"charged":3}'),
+        lambda request, timeout: requests.append(request) or _Response(b'{"receipt_id":"r-1","charged":3}'),
     )
     h = _hook(
         monkeypatch, tmp_path,
@@ -251,7 +251,7 @@ def test_strict_settle_does_not_assert_requester(monkeypatch, tmp_path):
     )
     receipt_path = tmp_path / "receipt.json"
     receipt_path.write_text(json.dumps({"run_id": "r1"}))
-    assert h.settle(str(receipt_path)) == {"charged": 3}
+    assert h.settle(str(receipt_path)) == {"receipt_id": "r-1", "charged": 3}
     _assert_signed(requests[0], public_key_hex, "/settle", requests[0].data)
     body = json.loads(requests[0].data)
     assert "requester" not in body and "own_nodes" not in body
