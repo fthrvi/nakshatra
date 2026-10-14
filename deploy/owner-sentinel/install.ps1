@@ -1,9 +1,7 @@
 param(
-    [Parameter(Mandatory = $true)]
     [ValidatePattern('^[A-Za-z0-9._-]+$')]
     [string]$Distro,
 
-    [Parameter(Mandatory = $true)]
     [ValidatePattern('^[A-Za-z0-9._-]+$')]
     [string]$LinuxUser
 )
@@ -17,6 +15,23 @@ $scriptPath = Join-Path $installDirectory 'sentinel-launcher.ps1'
 $powerShellPath = Join-Path $PSHOME 'powershell.exe'
 
 New-Item -ItemType Directory -Path $installDirectory -Force | Out-Null
+$hadExistingEnvironment = [System.IO.File]::Exists($environmentPath)
+if ($hadExistingEnvironment -and (-not $Distro -or -not $LinuxUser)) {
+    foreach ($line in [System.IO.File]::ReadAllLines($environmentPath)) {
+        if (-not $Distro -and $line -match '^\s*(?:export\s+)?OWNER_WSL_DISTRO\s*=(.*)$') {
+            $Distro = $Matches[1].Trim().Trim('"').Trim("'")
+        } elseif (-not $LinuxUser -and $line -match '^\s*(?:export\s+)?OWNER_WSL_USER\s*=(.*)$') {
+            $LinuxUser = $Matches[1].Trim().Trim('"').Trim("'")
+        }
+    }
+}
+if (-not $Distro -or -not $LinuxUser) {
+    throw '-Distro and -LinuxUser are required for a fresh install; an existing installed owner-lease.env may supply them'
+}
+if ($Distro -notmatch '^[A-Za-z0-9._-]+$' -or $LinuxUser -notmatch '^[A-Za-z0-9._-]+$') {
+    throw '-Distro and -LinuxUser contain unsupported characters'
+}
+
 foreach ($name in @('owner-sentinel.ps1', 'sentinel-launcher.ps1')) {
     $source = Join-Path $PSScriptRoot $name
     $destination = Join-Path $installDirectory $name
@@ -70,8 +85,8 @@ $action = New-ScheduledTaskAction -Execute $powerShellPath -Argument $arguments 
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $identity
 $principal = New-ScheduledTaskPrincipal -UserId $identity -LogonType Interactive -RunLevel Limited
 # No execution time limit: the default (72 h) would kill the sentinel after three days, and its
-# silence would keep the worker 'away' until the next logon. Run on battery too, and restart after
-# launcher self-update exit code 75 or an unexpected launcher failure.
+# silence would keep the worker 'away' until the next logon. Run on battery too. RestartCount and
+# RestartInterval are crash insurance only; launcher updates hand off directly to their successor.
 $settings = New-ScheduledTaskSettingsSet -Hidden -StartWhenAvailable -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) `
     -ExecutionTimeLimit (New-TimeSpan -Seconds 0) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 $task = New-ScheduledTask -Action $action -Trigger $trigger -Principal $principal -Settings $settings

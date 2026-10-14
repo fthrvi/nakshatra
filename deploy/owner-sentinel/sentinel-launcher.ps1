@@ -1,19 +1,17 @@
-# Launcher-Version: 2026-10-13.1
+# Launcher-Version: 2026101302
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
 
 $InstallDirectory = $PSScriptRoot
 $EnvironmentFile = Join-Path $InstallDirectory 'owner-lease.env'
 $LauncherPath = $PSCommandPath
-$PendingLauncherPath = "${LauncherPath}.next"
 $LocalSentinelPath = Join-Path $InstallDirectory 'owner-sentinel.ps1'
 $LogPath = Join-Path $InstallDirectory 'launcher.log'
 $PowerShellPath = Join-Path $PSHOME 'powershell.exe'
 $UpdateInterval = [TimeSpan]::FromHours(6)
 $RestartDelaySeconds = 5
 $MaximumLogLines = 200
-$LauncherUpdateExitCode = 75
-$LauncherMutexName = 'Local\NakshatraOwnerSentinelLauncher'
+$LauncherMutexWait = [TimeSpan]::FromSeconds(30)
 
 function ConvertFrom-EnvironmentValue {
     param([string]$Value)
@@ -47,27 +45,6 @@ function Get-OwnerWslIdentity {
         throw 'OWNER_WSL_DISTRO and OWNER_WSL_USER contain unsupported characters'
     }
     return @{ Distro = $distro; LinuxUser = $linuxUser }
-}
-
-function Get-ReleaseFilePath {
-    param([hashtable]$Identity, [string]$FileName)
-    if ([System.IO.Path]::GetFileName($FileName) -ne $FileName) {
-        throw 'release file name must not contain a path'
-    }
-    $relativePath = 'home\{0}\.nakshatra-node\current\nakshatra\deploy\owner-sentinel\{1}' -f `
-        $Identity.LinuxUser, $FileName
-    $candidates = @(
-        ('\\wsl.localhost\{0}\{1}' -f $Identity.Distro, $relativePath),
-        ('\\wsl$\{0}\{1}' -f $Identity.Distro, $relativePath)
-    )
-    foreach ($candidate in $candidates) {
-        try {
-            if ([System.IO.File]::Exists($candidate)) { return $candidate }
-        } catch {
-            # A stopped or unavailable WSL distro is an ordinary fail-open-for-the-sentinel case.
-        }
-    }
-    return $null
 }
 
 function Get-ScriptVersion {
@@ -135,6 +112,16 @@ function Test-PowerShellFile {
     }
 }
 
+function Install-VerifiedFile {
+    param([string]$TemporaryPath, [string]$TargetPath)
+    if ([System.IO.File]::Exists($TargetPath)) {
+        $backupPath = "${TargetPath}.bak"
+        [System.IO.File]::Replace($TemporaryPath, $TargetPath, $backupPath)
+    } else {
+        [System.IO.File]::Move($TemporaryPath, $TargetPath)
+    }
+}
+
 function Stop-LocalSentinels {
     # A running sentinel holds owner-sentinel.ps1 open, so the replace below fails with
     # "being used by another process" (measured on blackwell). Stop every sentinel started from
@@ -145,7 +132,7 @@ function Stop-LocalSentinels {
             ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
         Start-Sleep -Milliseconds 500
     } catch {
-        # Best effort; the move below reports a failure and the current sentinel is restarted.
+        # Best effort; the replacement below reports a failure and the current sentinel is restarted.
     }
 }
 
@@ -163,12 +150,12 @@ function Stop-SentinelChild {
 }
 
 function Save-ReleaseFileViaWsl {
-    # Fallback when \\wsl.localhost is not visible to this Windows session (measured on blackwell,
-    # 2026-10-13: the share was absent even in the interactive session). Reads the signed release copy
-    # through wsl.exe, but ONLY when the distro is already running: wsl.exe would otherwise boot it,
-    # and booting the distro starts the worker, which the owner's sentinel must never do.
+    # Read the signed release copy only through wsl.exe, and only when the distro is already running.
+    # A distro-targeted wsl.exe call would otherwise boot it and start the worker that this sentinel
+    # must never summon.
     param([hashtable]$Identity, [string]$FileName, [string]$Destination)
     try {
+        if ([System.IO.Path]::GetFileName($FileName) -ne $FileName) { return $false }
         $running = ((& wsl.exe -l --running -q) -join "`n") -replace "`0", ''
         $names = $running -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ }
         if ($names -notcontains $Identity.Distro) { return $false }
@@ -184,69 +171,23 @@ function Save-ReleaseFileViaWsl {
 }
 
 function Get-ReleaseFileCopy {
-    # Both scripts use this exact share-first, already-running-WSL-second fetch and hash path.
+    # Both scripts use this exact already-running-WSL fetch path.
     param([hashtable]$Identity, [string]$FileName)
-    $downloadPath = $null
     $temporaryPath = Join-Path $InstallDirectory ('{0}.{1}.tmp' -f $FileName, [Guid]::NewGuid().ToString('N'))
     try {
-        $releasePath = Get-ReleaseFilePath -Identity $Identity -FileName $FileName
-        if (-not $releasePath) {
-            $downloadPath = Join-Path $InstallDirectory ('{0}.{1}.wsl' -f $FileName, [Guid]::NewGuid().ToString('N'))
-            if (-not (Save-ReleaseFileViaWsl -Identity $Identity -FileName $FileName -Destination $downloadPath)) {
-                throw 'release copy unavailable'
-            }
-            $releasePath = $downloadPath
+        if (-not (Save-ReleaseFileViaWsl -Identity $Identity -FileName $FileName -Destination $temporaryPath)) {
+            throw 'release copy unavailable'
         }
-
-        $releaseHash = Get-ScriptHash -Path $releasePath
+        $releaseHash = Get-ScriptHash -Path $temporaryPath
         if ($releaseHash -eq 'unavailable' -or $releaseHash -eq 'missing') {
             throw 'could not hash the release copy'
         }
-        Copy-Item -LiteralPath $releasePath -Destination $temporaryPath -Force
-        $temporaryHash = Get-ScriptHash -Path $temporaryPath
-        if ($temporaryHash -ne $releaseHash) { throw 'release copy changed while it was being copied' }
         return @{ Path = $temporaryPath; Hash = $releaseHash }
     } catch {
         if ([System.IO.File]::Exists($temporaryPath)) {
             Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
         }
         throw
-    } finally {
-        if ($downloadPath -and [System.IO.File]::Exists($downloadPath)) {
-            Remove-Item -LiteralPath $downloadPath -Force -ErrorAction SilentlyContinue
-        }
-    }
-}
-
-function Invoke-PendingLauncherUpdate {
-    if (-not [System.IO.File]::Exists($PendingLauncherPath)) { return $false }
-    $localVersion = Get-ScriptVersion -Path $LauncherPath -Header 'Launcher-Version'
-    $localHash = Get-ScriptHash -Path $LauncherPath
-    $releaseVersion = Get-ScriptVersion -Path $PendingLauncherPath -Header 'Launcher-Version'
-    $releaseHash = Get-ScriptHash -Path $PendingLauncherPath
-    try {
-        if ($releaseVersion -eq 'missing' -or $releaseVersion -eq 'unknown') {
-            throw 'pending launcher lacks a Launcher-Version header'
-        }
-        if (-not (Test-PowerShellFile -Path $PendingLauncherPath)) {
-            throw 'pending launcher has PowerShell parse errors'
-        }
-        if ($releaseHash -eq 'unavailable' -or $releaseHash -eq 'missing') {
-            throw 'could not hash the pending launcher'
-        }
-
-        Move-Item -LiteralPath $PendingLauncherPath -Destination $LauncherPath -Force
-        $installedHash = Get-ScriptHash -Path $LauncherPath
-        if ($installedHash -ne $releaseHash) { throw 'pending launcher hash changed during replacement' }
-        Write-LauncherLog -Component 'launcher' -Action 'updated' -LocalVersion $releaseVersion `
-            -LocalHash $installedHash -ReleaseVersion $releaseVersion -ReleaseHash $releaseHash `
-            -Detail 'applied sentinel-launcher.ps1.next'
-        return $true
-    } catch {
-        Write-LauncherLog -Component 'launcher' -Action 'kept' -LocalVersion $localVersion `
-            -LocalHash $localHash -ReleaseVersion $releaseVersion -ReleaseHash $releaseHash `
-            -Detail ('pending update: ' + $_.Exception.Message)
-        return $false
     }
 }
 
@@ -273,29 +214,25 @@ function Invoke-LauncherSync {
         if (-not (Test-PowerShellFile -Path $temporaryPath)) {
             throw 'release launcher has PowerShell parse errors'
         }
-
-        try {
-            # PowerShell has already read this script. Verify that Windows permits the same-directory
-            # atomic move over the running launcher's path before choosing the .next fallback.
-            Move-Item -LiteralPath $temporaryPath -Destination $LauncherPath -Force
-            $temporaryPath = $null
-            $installedHash = Get-ScriptHash -Path $LauncherPath
-            if ($installedHash -ne $releaseHash) { throw 'launcher hash changed during replacement' }
-            Write-LauncherLog -Component 'launcher' -Action 'updated' -LocalVersion $releaseVersion `
-                -LocalHash $installedHash -ReleaseVersion $releaseVersion -ReleaseHash $releaseHash
-            return $true
-        } catch {
-            $moveDetail = $_.Exception.Message
-            if (-not $temporaryPath -or -not [System.IO.File]::Exists($temporaryPath)) { throw }
-            Move-Item -LiteralPath $temporaryPath -Destination $PendingLauncherPath -Force
-            $temporaryPath = $null
-            $pendingHash = Get-ScriptHash -Path $PendingLauncherPath
-            if ($pendingHash -ne $releaseHash) { throw 'staged launcher hash changed during replacement' }
-            Write-LauncherLog -Component 'launcher' -Action 'staged' -LocalVersion $localVersion `
-                -LocalHash $localHash -ReleaseVersion $releaseVersion -ReleaseHash $releaseHash `
-                -Detail ("direct replacement failed; staged .next: $moveDetail")
-            return $true
+        $localVersionNumber = 0L
+        $releaseVersionNumber = 0L
+        if (-not [Int64]::TryParse($localVersion, [ref]$localVersionNumber)) {
+            throw 'installed launcher has a non-integer Launcher-Version header'
         }
+        if (-not [Int64]::TryParse($releaseVersion, [ref]$releaseVersionNumber)) {
+            throw 'release launcher has a non-integer Launcher-Version header'
+        }
+        if ($releaseVersionNumber -lt $localVersionNumber) {
+            throw 'release launcher version is lower than the running launcher version'
+        }
+
+        # The temporary file is the release copy just fetched. Equal-version replacements are
+        # permitted because its hash was computed from these exact bytes above.
+        Install-VerifiedFile -TemporaryPath $temporaryPath -TargetPath $LauncherPath
+        $temporaryPath = $null
+        Write-LauncherLog -Component 'launcher' -Action 'updated' -LocalVersion $releaseVersion `
+            -LocalHash $releaseHash -ReleaseVersion $releaseVersion -ReleaseHash $releaseHash
+        return $true
     } catch {
         Write-LauncherLog -Component 'launcher' -Action 'kept' -LocalVersion $localVersion `
             -LocalHash $localHash -ReleaseVersion $releaseVersion -ReleaseHash $releaseHash `
@@ -326,13 +263,18 @@ function Invoke-SentinelSync {
             return $false
         }
 
+        if ($releaseVersion -eq 'missing' -or $releaseVersion -eq 'unknown') {
+            throw 'release sentinel lacks a Sentinel-Version header'
+        }
+        if (-not (Test-PowerShellFile -Path $temporaryPath)) {
+            throw 'release sentinel has PowerShell parse errors'
+        }
+
         Stop-LocalSentinels
-        Move-Item -LiteralPath $temporaryPath -Destination $LocalSentinelPath -Force
+        Install-VerifiedFile -TemporaryPath $temporaryPath -TargetPath $LocalSentinelPath
         $temporaryPath = $null
-        $localVersion = Get-ScriptVersion -Path $LocalSentinelPath -Header 'Sentinel-Version'
-        $localHash = Get-ScriptHash -Path $LocalSentinelPath
-        Write-LauncherLog -Component 'sentinel' -Action 'updated' -LocalVersion $localVersion `
-            -LocalHash $localHash -ReleaseVersion $releaseVersion -ReleaseHash $releaseHash
+        Write-LauncherLog -Component 'sentinel' -Action 'updated' -LocalVersion $releaseVersion `
+            -LocalHash $releaseHash -ReleaseVersion $releaseVersion -ReleaseHash $releaseHash
         return $true
     } catch {
         Write-LauncherLog -Component 'sentinel' -Action 'kept' -LocalVersion $localVersion `
@@ -352,11 +294,35 @@ function Start-SentinelChild {
         -WindowStyle Hidden -PassThru
 }
 
+function Start-LauncherSuccessor {
+    $arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$LauncherPath`""
+    Start-Process -FilePath $PowerShellPath -ArgumentList $arguments -WorkingDirectory $InstallDirectory `
+        -WindowStyle Hidden | Out-Null
+}
+
 $launcherMutex = $null
 $ownsLauncherMutex = $false
 try {
-    $launcherMutex = [System.Threading.Mutex]::new($false, $LauncherMutexName)
-    try { $ownsLauncherMutex = $launcherMutex.WaitOne(0, $false) }
+    $currentUserSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $launcherMutexName = "Global\NakshatraOwnerSentinelLauncher-$currentUserSid"
+    try {
+        $launcherMutex = [System.Threading.Mutex]::new($false, $launcherMutexName)
+    } catch [System.UnauthorizedAccessException] {
+        $launcherMutexName = "Local\NakshatraOwnerSentinelLauncher-$currentUserSid"
+        Write-LauncherLog -Component 'launcher' -Action 'mutex-fallback' `
+            -LocalVersion (Get-ScriptVersion -Path $LauncherPath -Header 'Launcher-Version') `
+            -LocalHash (Get-ScriptHash -Path $LauncherPath) -ReleaseVersion 'not-checked' `
+            -ReleaseHash 'not-checked' -Detail 'Global mutex denied; using the per-session fallback'
+        $launcherMutex = [System.Threading.Mutex]::new($false, $launcherMutexName)
+    } catch [System.Security.SecurityException] {
+        $launcherMutexName = "Local\NakshatraOwnerSentinelLauncher-$currentUserSid"
+        Write-LauncherLog -Component 'launcher' -Action 'mutex-fallback' `
+            -LocalVersion (Get-ScriptVersion -Path $LauncherPath -Header 'Launcher-Version') `
+            -LocalHash (Get-ScriptHash -Path $LauncherPath) -ReleaseVersion 'not-checked' `
+            -ReleaseHash 'not-checked' -Detail 'Global mutex denied; using the per-session fallback'
+        $launcherMutex = [System.Threading.Mutex]::new($false, $launcherMutexName)
+    }
+    try { $ownsLauncherMutex = $launcherMutex.WaitOne($LauncherMutexWait, $false) }
     catch [System.Threading.AbandonedMutexException] { $ownsLauncherMutex = $true }
 } catch {
     Write-LauncherLog -Component 'launcher' -Action 'mutex-error' `
@@ -370,19 +336,12 @@ if (-not $ownsLauncherMutex) {
     Write-LauncherLog -Component 'launcher' -Action 'second-instance' `
         -LocalVersion (Get-ScriptVersion -Path $LauncherPath -Header 'Launcher-Version') `
         -LocalHash (Get-ScriptHash -Path $LauncherPath) -ReleaseVersion 'not-checked' `
-        -ReleaseHash 'not-checked' -Detail 'another launcher owns the mutex; exiting'
+        -ReleaseHash 'not-checked' -Detail 'could not acquire the launcher mutex within 30 seconds; exiting'
     $launcherMutex.Dispose()
     exit 0
 }
 
 try {
-    # A previous run uses .next only when Windows refused a move over the running script.
-    # Apply it before starting a sentinel or checking the release again, then restart into it.
-    if (Invoke-PendingLauncherUpdate) {
-        Stop-LocalSentinels
-        exit $LauncherUpdateExitCode
-    }
-
     Write-LauncherLog -Component 'launcher' -Action 'started' `
         -LocalVersion (Get-ScriptVersion -Path $LauncherPath -Header 'Launcher-Version') `
         -LocalHash (Get-ScriptHash -Path $LauncherPath) -ReleaseVersion 'not-checked' `
@@ -395,7 +354,14 @@ try {
             if (Invoke-LauncherSync) {
                 Stop-SentinelChild -Child $child
                 $child = $null
-                exit $LauncherUpdateExitCode
+                if ($ownsLauncherMutex) {
+                    try { $launcherMutex.ReleaseMutex() } catch { }
+                    $ownsLauncherMutex = $false
+                }
+                $launcherMutex.Dispose()
+                $launcherMutex = $null
+                Start-LauncherSuccessor
+                exit 0
             }
 
             $updated = Invoke-SentinelSync
