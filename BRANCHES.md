@@ -5,6 +5,7 @@ On create add a row (status=active, owner). On merge flip to `merged→<sha>`.
 
 | branch | sector | description | base | status | owner |
 |---|---|---|---|---|---|
+| owner-sentinel/launcher-self-update | worker | The Windows sentinel launcher updates itself from the signed release (wsl.exe only while the distro runs, File.Replace, monotonic Launcher-Version, successor handoff under a Global per-user SID mutex); install.ps1 reuses the saved distro/user. | forgejo/main@cd3ae8b | merged→3792bf2 | claude/trisul-aa network lane (hub) |
 | worker/idle-unload | worker | Stop the GPU daemon after an idle window, reload it single-flight after SHA-256 re-verification, and publish loaded/standby residency. | forgejo/main@a4bbf4a | merged | codex/root |
 | worker/owner-lease | worker | Add session-release grace plus an opt-in loopback owner lease: default-deny, stale admission stop, lapse cancellation/unload, away residency, and safe CLI controls. | forgejo/main@a6eb8fc | active | codex/root |
 | client/warmup-tolerance | client | Treat pillar-projected standby residency as an expected first-RPC cold start: additive warm-up deadline, one UNAVAILABLE retry, and operator timing. | main@a4bbf4a | merged | codex/root |
