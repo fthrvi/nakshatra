@@ -127,6 +127,15 @@ Measured on bro (RTX 5070, WSL) with the Linux sentinel standing in for the owne
 ### Warm pools — step 3 LIVE (Sthambha `2a80590`, worker 0.15.x, 2026-10-13)
 The pillar tracks per-model `/chain` demand over a 10-minute window (authenticated callers only; the public front does not expose `/chain`). It computes a Little's-law warm target, `ceil(rpm × 20 s / 60 × 1.5)` clamped to floor/cap (`~/.neuron/pillar/warm-pool.json`, default floor 0 and cap 4), and returns a short-lived `warm` directive (`keep`/`prewarm`/`release`, ≤120 s) in each worker's heartbeat response. It chooses already-loaded workers first, warms whole chains, and never directs an `away` worker. Operators can read `GET /warm`. Workers honour directives only under the owner lease (prewarm needs a live lease; a lapse always wins). Opt-out: `WARM_DIRECTIVES=0`. Measured on bro: one prompt gave llama32-3b `target 1, loaded 1`, and bro stayed loaded 70 s after the request (past the 30 s release grace) on renewed `keep`. A `release` now frees the daemon immediately when no step is in flight and no fresh session owns it.
 
+### Outsider workers EARN (2026-10-13, client 0.15.5 + Neuron `ea81881`)
+First real outsider payment: hub → bro (llama32-3b, streaming, `--receipt-out`). bro signed its stage, and the v2 ledger credited `op-686a9540` **+280** test units (10 tokens × 28 layers) and debited `self` −280. Both moves are in the append-only journal (earn/spend).
+Three fixes made it work, all found live:
+1. **client.** `SignParticipation` was sent unsigned, so authenticated workers answered UNAUTHENTICATED. It is now signed like Forward.
+2. **ledger.** It matched signatures to chain stages by exact id. Real chains use a 14-hex short id, and a release worker's node id IS its pubkey (the roster name is a label). Matching is now same range plus an exact or ≥12-hex prefix id, with identity bound by node_id == the rostered pubkey.
+3. **receipt id.** It now includes `run_id`: deterministic output made two genuine runs collide, so the second went unpaid. A replay under an invented run_id still credits nothing, because the signature binds the real run.
+Signatures only exist for the streaming `Inference` path (by design; unary `Forward` carries no run id). The gateway already uses `--use-streaming --receipt-out`.
+Known nit: a credited account is created with tier `stranger` regardless of its roster tier. Credits are unaffected, but the tier should come from the roster when the account is first created.
+
 ## Known installer follow-ups (Codex review, 2026-10-03; NOT regressions of p2p, all pre-existing)
 - `current` switches before services drain, so an in-flight gateway request can spawn helpers from the new release.
 - Rollback (automatic or explicit) restarts the previous release's services without draining.
