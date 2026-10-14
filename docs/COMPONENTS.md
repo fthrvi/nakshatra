@@ -111,6 +111,16 @@ Measured on bro (RTX 5070) with a 60 s test timeout. After 60 s idle the worker 
 
 The opt-in `~/.nakshatra/owner-lease.env` adds the loopback-only sentinel endpoint described in `COURTEOUS-WORKER.md`. Its default-deny state is `away`; live permission moves it to `standby`, demand loads it to `loaded`, and a lapse cancels work, frees session ownership, unloads, and immediately heartbeats `away`. The residency vocabulary is therefore exactly `loaded | standby | away`; the worker never admits work while away, and coordinators must exclude away workers. The pillar ranks `loaded > unknown > standby` only as a tie-breaker after health, admission, coverage and tier. Remaining work: the Windows sentinel and demand-based warm pools in the planner.
 
+### Owner lease + release-on-done — step 2 LIVE (0.14.x, 2026-10-13)
+Measured on bro (RTX 5070, WSL) with the Linux sentinel standing in for the owner:
+- **Release on done.** 30 s after a request finished, the worker went to `standby` (VRAM 4892 → 2329 MiB). `NAKSHATRA_WORKER_RELEASE_GRACE_S`, default 30; the 600 s idle unload stays as the backstop.
+- **Default deny.** With the lease on, the worker starts `away`. After 30 s of clear heartbeats it moves to `standby` and serves ("The Nile river flows through 11 countries…", 2.3 s warm).
+- **Owner busy.** When the pause file appeared, the worker went `away` in about 0.5 s, mid-load, and freed VRAM (4912 → 2508 MiB). The pillar dropped it from `/chain`, and the client's `/peers` fallback now skips it with "(N away: their owners are using them)" (`50ff853`).
+- **Owner done.** Back to `standby` after exactly the 30 s resume window.
+- **Sentinel silent.** The worker went `away` after 6.7 s (TTL 6 s): silence means stop.
+- **Windows sentinel.** Parsed and dry-run on blackwell's real Windows: `{clear:true}`. The GPU signal uses Windows' per-process GPU counters, because `nvidia-smi` reports `[N/A]` per process on consumer drivers. The WSL VM (`vmwp`) and the desktop (`dwm`) are ignored. It is NOT installed on blackwell yet (that needs Biswa's ok), so bro's lease is OFF for now and bro relies on idle unload plus release grace.
+- **Hardening applied in review:** the lease token is compared as bytes, the handler times out after 5 s, and an abandoned KV session can no longer pin VRAM forever.
+
 ## Known installer follow-ups (Codex review, 2026-10-03; NOT regressions of p2p, all pre-existing)
 - `current` switches before services drain, so an in-flight gateway request can spawn helpers from the new release.
 - Rollback (automatic or explicit) restarts the previous release's services without draining.
