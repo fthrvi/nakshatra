@@ -19,6 +19,7 @@ and start_pos=prefix_length.
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
 import queue
@@ -36,7 +37,11 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import yaml
 
-from client_defaults import resolve_p2p_socket, resolve_registry_keyid
+from client_defaults import (
+    _environment_file_value,
+    resolve_p2p_socket,
+    resolve_registry_keyid,
+)
 from step_text import escape_step_text   # one token = one output line (see step_text.py)
 from edge_health import EdgeError, EdgeFailureKind   # #17 live seam: typed edge faults so the
 # recovery loop can swap a dead worker instead of the process dying. Pure stdlib (duck-types grpc).
@@ -638,6 +643,86 @@ SIDECAR_DIRECT_WAIT_S = 15.0
 SIDECAR_FORWARD_CONTROL_TIMEOUT_S = SIDECAR_DIRECT_WAIT_S + 5.0
 
 
+def _own_node_and_sidecar_ids(*, home: Path | None = None) -> tuple[str, str]:
+    """Return this uid's node public key and deterministically-derived PeerId.
+
+    Identity discovery is read-only and deliberately strict: a gateway must
+    never create or repair a node key merely because it is resolving a chain.
+    An absent or unusable key means that no hop is classified as local.
+    """
+    base = Path.home() if home is None else Path(home)
+    try:
+        import nakshatra_auth
+        from sidecar_key import peer_id_from_node_pub
+        _private, node_public_key = nakshatra_auth.load_worker_key(
+            base / ".nakshatra" / "keys" / "worker.ed25519"
+        )
+        return node_public_key, peer_id_from_node_pub(node_public_key)
+    except (OSError, TypeError, ValueError):
+        return "", ""
+
+
+def _self_hop_loopback(spec: dict, endpoint: dict, *, home: Path | None = None
+                       ) -> tuple[str, int] | None:
+    """Resolve this node's typed activation hop without asking its sidecar.
+
+    ``nak worker on`` is the authority for both the bind family and port. We
+    therefore require valid ``LISTEN`` and ``PORT`` assignments in the worker
+    opt-in instead of falling back to worker.py defaults. Wildcard binds map
+    to loopback in the same address family; non-loopback-specific binds are
+    refused because silently dialing them would violate the local-only path.
+    """
+    base = Path.home() if home is None else Path(home)
+    node_public_key, sidecar_peer_id = _own_node_and_sidecar_ids(home=base)
+    if not node_public_key:
+        return None
+    hop_node_id = str(spec.get("node_id") or spec.get("id") or "").strip()
+    is_self = (
+        hop_node_id.lower() == node_public_key.lower()
+        or endpoint["peer_id"] == sidecar_peer_id
+    )
+    if not is_self:
+        return None
+
+    env_path = base / ".nakshatra" / "worker.env"
+    port_text = _environment_file_value(env_path, "PORT")
+    listen = _environment_file_value(env_path, "LISTEN")
+    if not port_text.isascii() or not port_text.isdigit():
+        raise RuntimeError(
+            f"self activation hop requires a valid PORT in {env_path}"
+        )
+    port = int(port_text)
+    if not 1 <= port <= 65535:
+        raise RuntimeError(
+            f"self activation hop has an out-of-range PORT in {env_path}"
+        )
+    if not listen:
+        raise RuntimeError(
+            f"self activation hop requires an explicit LISTEN in {env_path}"
+        )
+
+    candidate = (listen[1:-1]
+                 if listen.startswith("[") and listen.endswith("]") else listen)
+    if candidate.lower() == "localhost":
+        host = "127.0.0.1"
+    else:
+        try:
+            configured = ipaddress.ip_address(candidate)
+        except ValueError as e:
+            raise RuntimeError(
+                f"self activation hop has an invalid LISTEN in {env_path}"
+            ) from e
+        if configured.is_unspecified:
+            host = "::1" if configured.version == 6 else "127.0.0.1"
+        elif configured.is_loopback:
+            host = configured.compressed
+        else:
+            raise RuntimeError(
+                f"self activation hop LISTEN in {env_path} does not include loopback"
+            )
+    return host, port
+
+
 def _parse_activation_endpoint(raw) -> dict | None:
     """Validate the additive registry endpoint used for activation streams.
 
@@ -726,14 +811,17 @@ def _sidecar_forward(peer_id: str, socket_path: str | None = None,
 
 
 def _resolve_activation_endpoint(spec: dict, *, socket_path: str | None = None,
-                                 tls_mode: str = "auto") -> dict:
+                                 tls_mode: str = "auto",
+                                 home: Path | None = None) -> dict:
     """Resolve every supported hop to its authoritative dial addresses.
 
     This is the single address-selection boundary for client.py.  Legacy hops
     retain their configured literal address (and optional co-located push
     address).  Typed activation hops *only* expose the loopback listener
     returned by sidecar FORWARD; their legacy address is never copied into a
-    dial field.
+    dial field. The one exception is this node's own typed hop: it uses the
+    worker opt-in's explicit port over loopback, avoiding a nonsensical
+    sidecar self-dial while retaining the projected worker SPKI below.
 
     A FORWARD listener belongs to the hub's network namespace, so it cannot be
     sent to a remote worker as a server-to-server push target.  Such hops have
@@ -769,10 +857,14 @@ def _resolve_activation_endpoint(spec: dict, *, socket_path: str | None = None,
     if not _sanitize_spki(spec.get("peer_spki_hash")):
         raise RuntimeError(
             "libp2p activation endpoint has no valid registered worker SPKI")
-    host, port = _sidecar_forward(endpoint["peer_id"], socket_path=socket_path)
+    local = _self_hop_loopback(spec, endpoint, home=home)
+    host, port = local or _sidecar_forward(
+        endpoint["peer_id"], socket_path=socket_path
+    )
     resolved["address"] = host
     resolved["port"] = port
-    resolved[_CLIENT_DIAL_ADDRESS] = f"{host}:{port}"
+    dial_host = f"[{host}]" if ":" in host else host
+    resolved[_CLIENT_DIAL_ADDRESS] = f"{dial_host}:{port}"
     resolved[_PUSH_DIAL_ADDRESS] = None
     return resolved
 

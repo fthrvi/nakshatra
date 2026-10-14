@@ -21,6 +21,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -385,6 +386,14 @@ def test_probe_peer_spki_rejects_malformed_address():
         nt.probe_peer_spki("just-host-no-port", timeout=0.1)
     with pytest.raises(OSError):
         nt.probe_peer_spki("host:not-a-number", timeout=0.1)
+
+
+def test_probe_peer_spki_unbrackets_ipv6_for_socket_connect():
+    with patch("socket.create_connection", side_effect=OSError("stop")) as connect:
+        with pytest.raises(OSError, match="stop"):
+            nt.probe_peer_spki("[::1]:5530", timeout=0.1)
+
+    connect.assert_called_once_with(("::1", 5530), timeout=0.1)
 
 
 def test_open_pinned_channel_sets_ssl_target_name_override(tmp_path):

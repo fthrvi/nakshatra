@@ -327,6 +327,8 @@ def probe_peer_spki(
     if ":" not in address:
         raise OSError(f"address {address!r} missing :port suffix")
     host, port_s = address.rsplit(":", 1)
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
     try:
         port = int(port_s)
     except ValueError as e:

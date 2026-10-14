@@ -471,6 +471,21 @@ def _affirmative_settlement_charge(settlement) -> Optional[int]:
     return charged
 
 
+def _receipt_usage(receipt_path: str) -> tuple[int, int]:
+    """Return ``(prompt, generated)`` counts from client.py's settled receipt."""
+    with open(receipt_path, encoding="utf-8") as receipt_file:
+        receipt = json.load(receipt_file)
+    if not isinstance(receipt, dict):
+        raise ValueError("run receipt is not an object")
+    counts = []
+    for field in ("n_prompt", "n_generated"):
+        value = receipt.get(field)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError(f"run receipt has no valid {field}")
+        counts.append(value)
+    return counts[0], counts[1]
+
+
 _UNMETERED_ENFORCE_REFUSAL = (
     "NAKSHATRA_LEDGER_MODE=enforce refuses unmetered engine_url proxy models, "
     "stub backends, and external forwards; use the metered chain backend"
@@ -757,9 +772,17 @@ class ChainChatBackend(ChatBackend):
                 f"client.py exited {out.returncode}: {out.stderr.strip()[-400:]}")
         settlement = None
         charged = None
+        prompt_eval_count = 0
+        eval_count = 0
         if rcpt:
             if fail_closed:
                 try:
+                    # Strict mode already mandates this receipt for settlement,
+                    # so it is also the authoritative tokenizer/generation count.
+                    # Keep fail-open/default results at their parent-compatible
+                    # zero values: changing those responses is a live hub API
+                    # behaviour change guarded by the parent goldens.
+                    prompt_eval_count, eval_count = _receipt_usage(rcpt)
                     settlement = hook.settle(rcpt)
                     charged = _affirmative_settlement_charge(settlement)
                     if charged is None:
@@ -777,6 +800,8 @@ class ChainChatBackend(ChatBackend):
                 _quiet_unlink(rcpt)
         return GenerationResult(
             text=_parse_client_output(out.stdout),
+            eval_count=eval_count if fail_closed else 0,
+            prompt_eval_count=prompt_eval_count if fail_closed else 0,
             credits_charged=charged if fail_closed else None,
         )
 
@@ -1499,7 +1524,10 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
                 "message": {"role": "assistant", "content": ""},
                 "done": True, "done_reason": "stop",
                 "total_duration": int((time.monotonic() - t0) * 1e9),
-                "eval_count": eval_count}
+                "eval_count": (buffered.eval_count if buffered is not None
+                               else eval_count)}
+        if buffered is not None:
+            final["prompt_eval_count"] = buffered.prompt_eval_count
         if buffered is not None and buffered.credits_charged is not None:
             final["nakshatra"] = {"credits_charged": buffered.credits_charged}
         _write(final)

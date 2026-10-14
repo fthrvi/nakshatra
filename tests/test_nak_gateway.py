@@ -18,6 +18,17 @@ import nakshatra_serve as serve  # noqa: E402
 PIN = "17" * 32
 
 
+def _completed_chain_with_receipt(cmd, *, prompt=7, generated=2, text="settled"):
+    receipt_path = Path(cmd[cmd.index("--receipt-out") + 1])
+    receipt_path.write_text(json.dumps({
+        "n_prompt": prompt,
+        "n_generated": generated,
+        "chain": [{"node_id": "own-node"}],
+    }))
+    return SimpleNamespace(
+        returncode=0, stderr="", stdout=f"[chain] gen:  '{text}'\n")
+
+
 def _args(**overrides):
     values = {
         "port": 11600,
@@ -196,8 +207,8 @@ def test_gateway_enforce_requires_affirmative_settlement(
     monkeypatch.setattr(backend, "_client_env", lambda: {})
     monkeypatch.setattr(
         "subprocess.run",
-        lambda *_args, **_kwargs: SimpleNamespace(
-            returncode=0, stderr="", stdout="[chain] gen:  'must not escape'\n"))
+        lambda cmd, **_kwargs: _completed_chain_with_receipt(
+            cmd, text="must not escape"))
     entry = serve.ModelEntry(
         name="model-a", tokenizer_gguf="/unused.gguf",
         registry_url="https://pillar.example", num_layers=2)
@@ -217,8 +228,7 @@ def test_gateway_enforce_accepts_affirmative_settlement(monkeypatch):
     monkeypatch.setattr(backend, "_client_env", lambda: {})
     monkeypatch.setattr(
         "subprocess.run",
-        lambda *_args, **_kwargs: SimpleNamespace(
-            returncode=0, stderr="", stdout="[chain] gen:  'settled'\n"))
+        lambda cmd, **_kwargs: _completed_chain_with_receipt(cmd))
     entry = serve.ModelEntry(
         name="model-a", tokenizer_gguf="/unused.gguf",
         registry_url="https://pillar.example", num_layers=2)
@@ -226,6 +236,7 @@ def test_gateway_enforce_accepts_affirmative_settlement(monkeypatch):
     result = backend.generate(entry, "hello", 1, {})
 
     assert result.text == "settled" and result.credits_charged == 0
+    assert result.prompt_eval_count == 7 and result.eval_count == 2
 
 
 def test_default_mode_does_not_require_affirmative_settlement(monkeypatch):

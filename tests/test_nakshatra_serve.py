@@ -792,6 +792,44 @@ def test_v1_chat_completions_nonstream(tmp_path):
         body["usage"]["prompt_tokens"] + body["usage"]["completion_tokens"])
 
 
+def test_enforce_mode_receipt_counts_reach_openai_and_ollama_responses(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("NAKSHATRA_LEDGER_MODE", "enforce")
+    backend = ns.ChainChatBackend()
+    backend._ledger_hook_cached = SimpleNamespace(
+        enabled=True, wants_receipt=True, fail_closed=True,
+        gate=lambda _cost: (True, ""),
+        settle=lambda _path: {"receipt_id": "own-run", "charged": 0},
+    )
+    monkeypatch.setattr(backend, "_client_env", lambda: {})
+
+    def fake_run(cmd, **_kwargs):
+        receipt = Path(cmd[cmd.index("--receipt-out") + 1])
+        receipt.write_text(json.dumps({"n_prompt": 11, "n_generated": 3}))
+        return SimpleNamespace(
+            returncode=0, stderr="", stdout="[chain] gen:  'Kathmandu.'\n")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    with _running_chat(_chat_models(tmp_path), backend) as port:
+        status, openai = _post(port, "/v1/chat/completions", {
+            "model": "llama-3.3-70b",
+            "messages": [{"role": "user", "content": "capital?"}],
+        })
+        ollama_lines = _post_lines(port, "/api/chat", {
+            "model": "llama-3.3-70b", "stream": True,
+            "messages": [{"role": "user", "content": "capital?"}],
+        })
+
+    assert status == 200
+    assert openai["usage"] == {
+        "prompt_tokens": 11, "completion_tokens": 3, "total_tokens": 14,
+    }
+    assert openai["nakshatra"] == {"credits_charged": 0}
+    assert ollama_lines[-1]["prompt_eval_count"] == 11
+    assert ollama_lines[-1]["eval_count"] == 3
+    assert ollama_lines[-1]["nakshatra"] == {"credits_charged": 0}
+
+
 def test_v1_chat_completions_nonstream_surfaces_real_finish_reason(tmp_path):
     """A truncated/length-limited completion must NOT be reported as
     finish_reason "stop" — that's indistinguishable from a genuinely

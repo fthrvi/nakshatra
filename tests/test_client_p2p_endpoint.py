@@ -10,11 +10,13 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+from cryptography.hazmat.primitives.asymmetric import ed25519
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 import client as cli  # noqa: E402
 from fabric import worker_join as wj  # noqa: E402
+from sidecar_key import peer_id_from_node_pub  # noqa: E402
 
 
 PEER_ID = "12D3KooWorkerActivationPeer"
@@ -40,6 +42,20 @@ def _pillar_open(peers: list[dict], chain: list[dict]):
 
 def _endpoint():
     return {"kind": cli.ACTIVATION_ENDPOINT_KIND, "peer_id": PEER_ID}
+
+
+def _install_local_worker(tmp_path, monkeypatch, *, listen="[::]", port=5530):
+    home = tmp_path / "home"
+    key_path = home / ".nakshatra" / "keys" / "worker.ed25519"
+    key_path.parent.mkdir(parents=True)
+    private = ed25519.Ed25519PrivateKey.generate()
+    key_path.write_bytes(private.private_bytes_raw())
+    key_path.chmod(0o600)
+    worker_env = home / ".nakshatra" / "worker.env"
+    worker_env.write_text(f'PORT={port}\nLISTEN="{listen}"\n')
+    monkeypatch.setenv("HOME", str(home))
+    public = private.public_key().public_bytes_raw().hex()
+    return home, public, peer_id_from_node_pub(public)
 
 
 def _peer(**updates):
@@ -175,6 +191,68 @@ def test_sidecar_forward_socket_and_spki_preservation():
     assert resolved[cli._PUSH_DIAL_ADDRESS] is None
     assert resolved["peer_spki_hash"] == SPKI
     assert spec["address"] == ""  # resolution does not rewrite registry identity
+
+
+def test_self_hop_by_node_public_key_uses_configured_ipv6_loopback(
+        tmp_path, monkeypatch):
+    home, public, _peer_id = _install_local_worker(tmp_path, monkeypatch)
+    spec = {
+        "id": "friendly-name", "node_id": public,
+        "endpoint": _endpoint(), "peer_spki_hash": SPKI,
+        "address": "", "port": 0,
+    }
+
+    with patch.object(cli, "_sidecar_forward") as forward:
+        resolved = cli._resolve_activation_endpoint(spec, home=home)
+
+    forward.assert_not_called()
+    assert resolved[cli._CLIENT_DIAL_ADDRESS] == "[::1]:5530"
+    assert (resolved["address"], resolved["port"]) == ("::1", 5530)
+    assert resolved["peer_spki_hash"] == SPKI
+
+
+def test_self_hop_by_sidecar_peer_id_and_remote_hop_form_mixed_chain(
+        tmp_path, monkeypatch):
+    home, _public, local_peer_id = _install_local_worker(
+        tmp_path, monkeypatch, listen="0.0.0.0", port=5544)
+    local = {
+        "id": "bro", "node_id": "bro",
+        "endpoint": {"kind": cli.ACTIVATION_ENDPOINT_KIND,
+                     "peer_id": local_peer_id},
+        "peer_spki_hash": "11" * 32, "address": "", "port": 0,
+    }
+    remote = {
+        "id": "remote", "node_id": "remote",
+        "endpoint": _endpoint(), "peer_spki_hash": SPKI,
+        "address": "", "port": 0,
+    }
+
+    with patch.object(cli, "_sidecar_forward",
+                      return_value=("127.0.0.1", 43123)) as forward:
+        resolved = [cli._resolve_activation_endpoint(hop, home=home)
+                    for hop in (local, remote)]
+
+    assert [hop[cli._CLIENT_DIAL_ADDRESS] for hop in resolved] == [
+        "127.0.0.1:5544", "127.0.0.1:43123",
+    ]
+    forward.assert_called_once_with(PEER_ID, socket_path=None)
+    assert [hop["peer_spki_hash"] for hop in resolved] == ["11" * 32, SPKI]
+
+
+def test_self_hop_never_guesses_a_missing_worker_port(tmp_path, monkeypatch):
+    home, public, local_peer_id = _install_local_worker(tmp_path, monkeypatch)
+    (home / ".nakshatra" / "worker.env").write_text('LISTEN="[::]"\n')
+    spec = {
+        "id": public, "node_id": public,
+        "endpoint": {"kind": cli.ACTIVATION_ENDPOINT_KIND,
+                     "peer_id": local_peer_id},
+        "peer_spki_hash": SPKI,
+    }
+
+    with patch.object(cli, "_sidecar_forward") as forward:
+        with pytest.raises(RuntimeError, match="valid PORT"):
+            cli._resolve_activation_endpoint(spec, home=home)
+    forward.assert_not_called()
 
 
 def test_legacy_hop_resolver_supplies_client_and_colocated_push_addresses():

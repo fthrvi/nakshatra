@@ -257,6 +257,30 @@ def test_strict_settle_does_not_assert_requester(monkeypatch, tmp_path):
     assert "requester" not in body and "own_nodes" not in body
 
 
+def test_strict_own_node_free_settle_accepts_zero_charge(monkeypatch, tmp_path):
+    _install_key(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        ledger_client.urllib.request, "urlopen",
+        lambda request, timeout: _Response(
+            b'{"receipt_id":"own-run","charged":0}'),
+    )
+    h = _hook(
+        monkeypatch, tmp_path,
+        NAKSHATRA_LEDGER_MODE="enforce",
+    )
+    receipt_path = tmp_path / "receipt.json"
+    receipt_path.write_text(json.dumps({
+        "run_id": "own-run",
+        "chain": [{"node_id": h.keyid}],
+        "n_prompt": 7,
+        "n_generated": 2,
+    }))
+
+    assert h.settle(str(receipt_path)) == {
+        "receipt_id": "own-run", "charged": 0,
+    }
+
+
 @pytest.mark.parametrize("path", ["/balance", "/history?limit=2"])
 def test_get_calls_are_signed_with_empty_body(monkeypatch, tmp_path, path):
     _key_path, public_key_hex = _install_key(monkeypatch, tmp_path)
