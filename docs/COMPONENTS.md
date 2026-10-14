@@ -78,9 +78,10 @@ different NATs over IPv4 only (needs a second network).
 
 **U4 (agreed direction): one invite, one installer, one key, several kinds.**
 - One installer: the signed release, everywhere. It retires the unsigned worker tarballs. The worker stack moves into the release first (U6).
-- One invite: the signed `nki1.` invite carries a `kind` (contact | worker | device). A worker invite also carries the one-time code from `onboard_server` (which stays the roster authority).
+- One invite: the signed `nki1.` invite carries a `kind` (contact | worker). A worker invite also carries the one-time code from `onboard_server` (which stays the roster authority).
+- **No `device` kind (Biswa, 2026-10-13).** Nakshatra grants inference/compute admission ONLY. Mesh membership is personal to each person and stays in that person's own mesh tooling (for Biswa: trisul `infra/onboarding` + `infra/wireguard`), never in a Nakshatra invite, release or key.
 - One node key: `~/.nakshatra/keys/worker.ed25519`, replacing `~/.nakshatra-worker/`.
-- Order: U6 (worker stack in the release) → the U4 worker kind → the device kind.
+- Order: U6 (worker stack in the release) → the U4 worker kind. **U4 is complete.**
 
 ## Accounting
 | Job | Component | Status |
