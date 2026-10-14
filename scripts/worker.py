@@ -1530,6 +1530,13 @@ class OwnerLease:
 
     def reconcile(self) -> dict:
         snap = self.snapshot()
+        # Operators need to see WHY a worker is away (busy owner vs. a silent sentinel); log
+        # each change of state/reason, never every heartbeat and never the token.
+        seen = (snap["state"], snap["reason"], snap["resume_ready"])
+        if seen != getattr(self, "_last_logged", None):
+            self._last_logged = seen
+            print(f"[worker] owner lease: {snap['state']} ({snap['reason']})"
+                  + ("; resume window satisfied" if snap["resume_ready"] else ""), flush=True)
         self.daemon.update_owner_lease(
             snap["state"], snap["reason"], resume=snap["resume_ready"]
         )
