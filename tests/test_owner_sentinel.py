@@ -212,8 +212,9 @@ def test_launcher_self_update_has_required_safety_structure():
     assert "$LauncherPath = $PSCommandPath" in launcher
     assert "[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value" in launcher
     assert '"Global\\NakshatraOwnerSentinelLauncher-$currentUserSid"' in launcher
-    assert '"Local\\NakshatraOwnerSentinelLauncher-$currentUserSid"' in launcher
-    assert "Action 'mutex-fallback'" in launcher
+    # Local\ is per-session: a fallback there would let two sessions run two launchers.
+    assert '"Local\\NakshatraOwnerSentinelLauncher' not in launcher
+    assert "Action 'mutex-unavailable'" in launcher
     assert "[System.Threading.Mutex]::new" in launcher
     assert "[TimeSpan]::FromSeconds(30)" in launcher
     assert "[System.Management.Automation.Language.Parser]::ParseFile" in launcher
@@ -246,10 +247,11 @@ def test_launcher_self_update_has_required_safety_structure():
     assert "release sentinel lacks a Sentinel-Version header" in sentinel_sync
 
     handoff = launcher[launcher.index("if (Invoke-LauncherSync)") : launcher.index("$updated = Invoke-SentinelSync")]
+    # successor first, then let go: a failed Start-Process must leave this launcher running
+    assert handoff.index("Start-LauncherSuccessor") < handoff.index("Stop-SentinelChild")
     assert handoff.index("Stop-SentinelChild") < handoff.index("ReleaseMutex")
     assert handoff.index("ReleaseMutex") < handoff.index("$launcherMutex.Dispose()")
-    assert handoff.index("$launcherMutex.Dispose()") < handoff.index("Start-LauncherSuccessor")
-    assert handoff.index("Start-LauncherSuccessor") < handoff.index("exit 0")
+    assert handoff.index("$launcherMutex.Dispose()") < handoff.index("exit 0")
     successor = launcher[
         launcher.index("function Start-LauncherSuccessor") : launcher.index("$launcherMutex = $null")
     ]
@@ -292,3 +294,16 @@ def test_installer_registers_launcher_without_an_execution_time_limit():
     assert re.search(r"-ExecutionTimeLimit\s*\(New-TimeSpan\s+-Seconds\s+0\)", installer)
     assert re.search(r"-RestartCount\s+999\b", installer)
     assert re.search(r"-RestartInterval\s*\(New-TimeSpan\s+-Minutes\s+1\)", installer)
+
+
+def test_launcher_handoff_starts_successor_before_letting_go():
+    launcher = (SENTINEL_DIR / "sentinel-launcher.ps1").read_text(encoding="utf-8")
+    loop = launcher[launcher.index("if (Invoke-LauncherSync) {") :]
+    start = loop.index("Start-LauncherSuccessor")
+    # the successor is started while this launcher still holds the mutex and its sentinel runs
+    assert start < loop.index("Stop-SentinelChild -Child $child")
+    assert start < loop.index("ReleaseMutex()")
+    # a failed Start-Process is caught and this launcher keeps running
+    assert "Action 'handoff-failed'" in loop
+    assert loop.index("if ($handedOff) {") < loop.index("exit 0")
+

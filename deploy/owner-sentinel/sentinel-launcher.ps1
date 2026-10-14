@@ -303,33 +303,23 @@ function Start-LauncherSuccessor {
 $launcherMutex = $null
 $ownsLauncherMutex = $false
 try {
+    # One launcher per USER, across every logon session: a Global\ name carrying the user's SID.
+    # Creating a named mutex in Global\ needs no privilege. There is deliberately no Local\ fallback:
+    # Local\ is per-SESSION, so two sessions could each "win" and run two sentinels.
     $currentUserSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-    $launcherMutexName = "Global\NakshatraOwnerSentinelLauncher-$currentUserSid"
-    try {
-        $launcherMutex = [System.Threading.Mutex]::new($false, $launcherMutexName)
-    } catch [System.UnauthorizedAccessException] {
-        $launcherMutexName = "Local\NakshatraOwnerSentinelLauncher-$currentUserSid"
-        Write-LauncherLog -Component 'launcher' -Action 'mutex-fallback' `
-            -LocalVersion (Get-ScriptVersion -Path $LauncherPath -Header 'Launcher-Version') `
-            -LocalHash (Get-ScriptHash -Path $LauncherPath) -ReleaseVersion 'not-checked' `
-            -ReleaseHash 'not-checked' -Detail 'Global mutex denied; using the per-session fallback'
-        $launcherMutex = [System.Threading.Mutex]::new($false, $launcherMutexName)
-    } catch [System.Security.SecurityException] {
-        $launcherMutexName = "Local\NakshatraOwnerSentinelLauncher-$currentUserSid"
-        Write-LauncherLog -Component 'launcher' -Action 'mutex-fallback' `
-            -LocalVersion (Get-ScriptVersion -Path $LauncherPath -Header 'Launcher-Version') `
-            -LocalHash (Get-ScriptHash -Path $LauncherPath) -ReleaseVersion 'not-checked' `
-            -ReleaseHash 'not-checked' -Detail 'Global mutex denied; using the per-session fallback'
-        $launcherMutex = [System.Threading.Mutex]::new($false, $launcherMutexName)
-    }
+    $launcherMutex = [System.Threading.Mutex]::new($false, "Global\NakshatraOwnerSentinelLauncher-$currentUserSid")
     try { $ownsLauncherMutex = $launcherMutex.WaitOne($LauncherMutexWait, $false) }
     catch [System.Threading.AbandonedMutexException] { $ownsLauncherMutex = $true }
 } catch {
-    Write-LauncherLog -Component 'launcher' -Action 'mutex-error' `
+    # The sentinel is what tells the network the owner is busy, so liveness wins over exclusivity:
+    # without a lock we still run (a duplicate sentinel only sends a second identical heartbeat).
+    Write-LauncherLog -Component 'launcher' -Action 'mutex-unavailable' `
         -LocalVersion (Get-ScriptVersion -Path $LauncherPath -Header 'Launcher-Version') `
-        -LocalHash (Get-ScriptHash -Path $LauncherPath) -ReleaseVersion 'unavailable' `
-        -ReleaseHash 'unavailable' -Detail $_.Exception.Message
-    exit 1
+        -LocalHash (Get-ScriptHash -Path $LauncherPath) -ReleaseVersion 'not-checked' `
+        -ReleaseHash 'not-checked' -Detail ('running unlocked: ' + $_.Exception.Message)
+    if ($null -ne $launcherMutex) { $launcherMutex.Dispose() }
+    $launcherMutex = $null
+    $ownsLauncherMutex = $true
 }
 
 if (-not $ownsLauncherMutex) {
@@ -337,7 +327,7 @@ if (-not $ownsLauncherMutex) {
         -LocalVersion (Get-ScriptVersion -Path $LauncherPath -Header 'Launcher-Version') `
         -LocalHash (Get-ScriptHash -Path $LauncherPath) -ReleaseVersion 'not-checked' `
         -ReleaseHash 'not-checked' -Detail 'could not acquire the launcher mutex within 30 seconds; exiting'
-    $launcherMutex.Dispose()
+    if ($null -ne $launcherMutex) { $launcherMutex.Dispose() }
     exit 0
 }
 
@@ -352,16 +342,28 @@ try {
     while ($true) {
         if ([DateTime]::UtcNow -ge $nextUpdate) {
             if (Invoke-LauncherSync) {
-                Stop-SentinelChild -Child $child
-                $child = $null
-                if ($ownsLauncherMutex) {
-                    try { $launcherMutex.ReleaseMutex() } catch { }
-                    $ownsLauncherMutex = $false
+                # Start the successor FIRST, while this launcher still holds the mutex and its sentinel
+                # still runs: the successor waits up to 30 s for the mutex. If it cannot be started, this
+                # launcher simply carries on (the new file is already in place for the next start).
+                $handedOff = $false
+                try { Start-LauncherSuccessor; $handedOff = $true }
+                catch {
+                    Write-LauncherLog -Component 'launcher' -Action 'handoff-failed' `
+                        -LocalVersion (Get-ScriptVersion -Path $LauncherPath -Header 'Launcher-Version') `
+                        -LocalHash (Get-ScriptHash -Path $LauncherPath) -ReleaseVersion 'not-checked' `
+                        -ReleaseHash 'not-checked' -Detail ('keeping this launcher: ' + $_.Exception.Message)
                 }
-                $launcherMutex.Dispose()
-                $launcherMutex = $null
-                Start-LauncherSuccessor
-                exit 0
+                if ($handedOff) {
+                    Stop-SentinelChild -Child $child
+                    $child = $null
+                    if ($null -ne $launcherMutex) {
+                        if ($ownsLauncherMutex) { try { $launcherMutex.ReleaseMutex() } catch { } }
+                        $launcherMutex.Dispose()
+                        $launcherMutex = $null
+                    }
+                    $ownsLauncherMutex = $false
+                    exit 0
+                }
             }
 
             $updated = Invoke-SentinelSync
