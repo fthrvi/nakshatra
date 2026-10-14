@@ -28,7 +28,7 @@ Windows-host path. Defaults are `OWNER_LEASE_PORT=5571`, `OWNER_LEASE_TTL_S=6`, 
 `nak worker owner-lease off`.
 
 Once enabled, restart is default-deny: residency is `away` until clear heartbeats have stayed
-live for the resume window. A stale heartbeat stream (older than TTL/2) refuses new sessions.
+live for the resume window. A stale heartbeat stream (older than 3/4 of the TTL, 4.5 s by default) refuses new sessions.
 Silence beyond TTL or any `clear=false` immediately cancels active daemon work, releases KV
 ownership, unloads the daemon, and publishes `away`. Recovery returns only to `standby`; the
 next admitted request performs the existing digest-verified lazy load.

@@ -1084,9 +1084,12 @@ def owner_lease_state(last_clear_at: Optional[float], now: float, ttl_s: float,
         return "lapsed", reason or "owner sentinel reported busy"
     if last_clear_at is None:
         return "lapsed", "owner lease has not received a clear heartbeat"
+    # live <= 3/4 TTL < stale <= TTL < lapsed. The stale band used to start at TTL/2 (3 s), but a
+    # Windows sentinel's ~2-3 s cadence (1 s GPU-counter sample) kept crossing it, and stale refuses
+    # new sessions, so requests bounced at random (blackwell, 2026-10-13). The lapse point (TTL) is unchanged.
     state, _detail = node_state(
-        last_clear_at, now, interval=ttl_s / 2.0,
-        miss_stale=1, miss_dead=2,
+        last_clear_at, now, interval=ttl_s / 4.0,
+        miss_stale=3, miss_dead=4,
     )
     if state == "live":
         return "live", reason or "owner lease heartbeat is live"

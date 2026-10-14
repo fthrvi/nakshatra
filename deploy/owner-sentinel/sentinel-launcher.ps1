@@ -110,6 +110,40 @@ function Write-LauncherLog {
     }
 }
 
+function Stop-LocalSentinels {
+    # A running sentinel holds owner-sentinel.ps1 open, so the replace below fails with
+    # "being used by another process" (measured on blackwell). Stop every sentinel started from
+    # THIS install directory: our own child, and orphans a previous launcher left behind.
+    try {
+        Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
+            Where-Object { $_.CommandLine -and $_.CommandLine.Contains($LocalSentinelPath) } |
+            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+        Start-Sleep -Milliseconds 500
+    } catch {
+        # Best effort; the move below reports a failure and the current sentinel keeps running.
+    }
+}
+
+function Save-ReleaseSentinelViaWsl {
+    # Fallback when \\wsl.localhost is not visible to this Windows session (measured on blackwell,
+    # 2026-10-13: the share was absent even in the interactive session). Reads the signed release copy
+    # through wsl.exe, but ONLY when the distro is already running: wsl.exe would otherwise boot it,
+    # and booting the distro starts the worker, which the owner's sentinel must never do.
+    param([hashtable]$Identity, [string]$Destination)
+    try {
+        $running = ((& wsl.exe -l --running -q) -join "`n") -replace "`0", ''
+        $names = $running -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+        if ($names -notcontains $Identity.Distro) { return $false }
+        $linuxPath = '/home/{0}/.nakshatra-node/current/nakshatra/deploy/owner-sentinel/owner-sentinel.ps1' -f $Identity.LinuxUser
+        $encoded = (& wsl.exe -d $Identity.Distro -u $Identity.LinuxUser -- base64 -w0 $linuxPath) -join ''
+        if ($LASTEXITCODE -ne 0 -or -not $encoded) { return $false }
+        [System.IO.File]::WriteAllBytes($Destination, [Convert]::FromBase64String($encoded.Trim()))
+        return $true
+    } catch {
+        return $false
+    }
+}
+
 function Invoke-SentinelSync {
     $localVersion = Get-SentinelVersion -Path $LocalSentinelPath
     $localHash = Get-SentinelHash -Path $LocalSentinelPath
@@ -120,9 +154,15 @@ function Invoke-SentinelSync {
         $identity = Get-OwnerWslIdentity
         $releasePath = Get-ReleaseSentinelPath -Identity $identity
         if (-not $releasePath) {
-            Write-LauncherLog -Action 'kept' -LocalVersion $localVersion -LocalHash $localHash `
-                -ReleaseVersion $releaseVersion -ReleaseHash $releaseHash -Detail 'release copy unavailable'
-            return $false
+            $fetched = Join-Path $InstallDirectory ('owner-sentinel.{0}.wsl' -f [Guid]::NewGuid().ToString('N'))
+            if (-not (Save-ReleaseSentinelViaWsl -Identity $identity -Destination $fetched)) {
+                Write-LauncherLog -Action 'kept' -LocalVersion $localVersion -LocalHash $localHash `
+                    -ReleaseVersion $releaseVersion -ReleaseHash $releaseHash -Detail 'release copy unavailable'
+                return $false
+            }
+            # The fetched copy is the release copy from here on; the copy step below re-hashes it.
+            $releasePath = $fetched
+            $temporaryPath = $fetched
         }
 
         $releaseVersion = Get-SentinelVersion -Path $releasePath
@@ -136,10 +176,13 @@ function Invoke-SentinelSync {
             return $false
         }
 
-        $temporaryPath = Join-Path $InstallDirectory ('owner-sentinel.{0}.tmp' -f [Guid]::NewGuid().ToString('N'))
-        Copy-Item -LiteralPath $releasePath -Destination $temporaryPath -Force
+        if ($temporaryPath -ne $releasePath) {
+            $temporaryPath = Join-Path $InstallDirectory ('owner-sentinel.{0}.tmp' -f [Guid]::NewGuid().ToString('N'))
+            Copy-Item -LiteralPath $releasePath -Destination $temporaryPath -Force
+        }
         $temporaryHash = Get-SentinelHash -Path $temporaryPath
         if ($temporaryHash -ne $releaseHash) { throw 'release copy changed while it was being copied' }
+        Stop-LocalSentinels
         Move-Item -LiteralPath $temporaryPath -Destination $LocalSentinelPath -Force
         $temporaryPath = $null
         $localVersion = Get-SentinelVersion -Path $LocalSentinelPath

@@ -162,7 +162,7 @@ def test_stale_lease_keeps_loaded_work_but_refuses_new_sessions(tmp_path):
     _response, context = forward(servicer)
     assert context.code is None and controller.residency == "loaded"
 
-    clock.advance(3.1)
+    clock.advance(4.6)  # past 3/4 TTL (4.5 s), before the 6 s lapse
     assert lease.reconcile()["state"] == "stale"
     assert controller.residency == "loaded" and daemons[-1].closed is False
     _response, context = forward(servicer)
