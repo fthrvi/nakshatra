@@ -87,6 +87,16 @@ def test_escrow_backend_is_chosen_once_and_unknown_is_refused(tmp_path, monkeypa
         accounting.escrow(tmp_path)
 
 
+def test_wallet_backend_is_named_and_fail_closed(monkeypatch):
+    monkeypatch.setattr(
+        nakshatra_auth, "load_worker_key", lambda: (b"private", "ab" * 32)
+    )
+    hook = accounting.wallet(url="http://ledger.test")
+    assert accounting.METERING_BACKEND == accounting.WALLET_BACKEND == "neuron-ledger"
+    assert type(hook).__name__ == "LedgerHook"
+    assert hook.enabled is True and hook.fail_closed is True
+
+
 def test_callers_go_through_the_front_door():
     root = Path(__file__).resolve().parent.parent / "scripts"
     assert "from accounting import metering" in (root / "nakshatra_serve.py").read_text()

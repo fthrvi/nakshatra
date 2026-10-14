@@ -27,6 +27,7 @@ import stat
 import re
 import sys
 import time
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
@@ -242,6 +243,66 @@ def _gateway_paths() -> tuple[Path, Path]:
     return root, Path.home() / ".nakshatra" / "gateway.env"
 
 
+def _gateway_values() -> dict[str, str]:
+    _root, env_path = _gateway_paths()
+    values = {}
+    if env_path.is_file():
+        for line in env_path.read_text().splitlines():
+            if not line or line.lstrip().startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            values[key.strip()] = value.strip().strip("\"'")
+    return values
+
+
+def _wallet_hook():
+    values = _gateway_values()
+    url = (
+        os.environ.get("NAKSHATRA_LEDGER_URL", "").strip()
+        or values.get("NAKSHATRA_LEDGER_URL", "").strip()
+    )
+    if not url:
+        raise SystemExit("wallet needs a ledger URL; run: nak gateway on …")
+    pin = (
+        os.environ.get("NAKSHATRA_LEDGER_SPKI_SHA256", "").strip()
+        or values.get("NAKSHATRA_LEDGER_SPKI_SHA256", "").strip()
+        or None
+    )
+    from accounting import wallet
+    return wallet(url=url, spki_hash=pin)
+
+
+def _usdc_credits(text: str) -> int:
+    try:
+        value = Decimal(text)
+    except (InvalidOperation, ValueError) as exc:
+        raise SystemExit("withdraw amount must be a positive USDC decimal") from exc
+    micros = value * 1_000_000
+    if not value.is_finite() or value <= 0 or micros != micros.to_integral_value():
+        raise SystemExit("withdraw amount must be positive with at most 6 USDC decimals")
+    return int(micros) * 100
+
+
+def _wallet_command(args) -> None:
+    from ledger_client import LedgerUnavailable
+    try:
+        hook = _wallet_hook()
+        if args.wallet_cmd == "address":
+            row = hook.wallet()
+            address = row.get("deposit_address")
+            print(address if isinstance(address, str) and address
+                  else "pending: deposit address creation queued")
+        elif args.wallet_cmd == "status":
+            print(json.dumps(hook.wallet_status(), indent=1, sort_keys=True))
+        elif args.wallet_cmd == "bind":
+            print(json.dumps(hook.bind(args.address), indent=1, sort_keys=True))
+        else:
+            credits = _usdc_credits(args.usdc)
+            print(json.dumps(hook.withdraw(credits), indent=1, sort_keys=True))
+    except LedgerUnavailable as exc:
+        raise SystemExit(f"wallet refused: {exc}") from exc
+
+
 def _gateway_installer(_sp, action: str) -> None:
     prefix = Path(os.environ.get("NAK_NODE_PREFIX", Path.home() / ".nakshatra-node"))
     installer = _verified_release_installer(prefix)
@@ -361,13 +422,7 @@ def _gateway_off(_sp) -> None:
 
 def _gateway_status(_sp) -> dict:
     _root, env_path = _gateway_paths()
-    values = {}
-    if env_path.is_file():
-        for line in env_path.read_text().splitlines():
-            if "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            values[key] = value.strip().strip("\"'")
+    values = _gateway_values()
     unit = {}
     for prop, command in (("active", "is-active"), ("enabled", "is-enabled")):
         try:
@@ -759,6 +814,14 @@ def main(argv=None, *, http_post=None) -> int:
     p.add_argument("--aspect", default="")
     p = sub.add_parser("inbox"); p.add_argument("--limit", type=int, default=20)
     sub.add_parser("ledger", help="escrow journal: open / released / refunded")
+    p = sub.add_parser("wallet", help="deposit and withdraw USDC-backed inference credits")
+    walsub = p.add_subparsers(dest="wallet_cmd", required=True)
+    walsub.add_parser("address", help="show or queue this operator's deposit token account")
+    walsub.add_parser("status", help="show balance, cashable credits, and pending withdrawals")
+    q = walsub.add_parser("bind", help="bind the Solana address that receives withdrawals")
+    q.add_argument("address")
+    q = walsub.add_parser("withdraw", help="request USDC to the bound payout address")
+    q.add_argument("usdc", help="USDC amount (at least 1, up to 6 decimal places)")
     p = sub.add_parser("direct", help="allow/stop direct connections with a contact (reveals your LAN/IPv6)")
     p.add_argument("who"); p.add_argument("onoff", choices=["on", "off"])
     p = sub.add_parser("direct-listen", help="accept direct connections on this port (or 'off'); restarts nak-net")
@@ -830,7 +893,9 @@ def main(argv=None, *, http_post=None) -> int:
     a = ap.parse_args(argv)
     s = a.sock
 
-    if a.cmd == "gateway":
+    if a.cmd == "wallet":
+        _wallet_command(a)
+    elif a.cmd == "gateway":
         import subprocess as _sp
         if a.gateway_cmd == "on":
             _gateway_on(_sp, a)

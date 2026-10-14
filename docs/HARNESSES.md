@@ -121,6 +121,7 @@ Codex can use this endpoint as a model provider independently of their MCP conne
 | `nak_models` | Lists models currently exposed by the local gateway. | Cannot query the private mesh or advertise an incomplete/un-tokenizable chain. |
 | `nak_ask` | Makes one non-streaming chat completion through the local gateway and reports charged credits when the ledger returns them. | Cannot bypass the local gateway, its credit gate, or its loopback boundary. |
 | `nak_balance` | Makes a signed ledger `GET /balance` for this node's roster-derived operator and shows balance/tier fields. | Cannot select or inspect another account and never sends an `account` argument. |
+| `nak_wallet` | Makes signer-scoped ledger reads and returns exactly the deposit address plus wallet status (balance, withdrawable amount, payout state, and pending withdrawals). | Read-only: cannot bind a payout address, request a withdrawal, expose a local key/path, or select another account. Use `nak wallet bind …` and `nak wallet withdraw …` at the operator's CLI. |
 | `nak_worker_status` | Shows the same configured/build/unit facts as `nak worker status`, with secret-shaped fields removed. | Cannot start, stop, build, or reconfigure the worker. |
 | `nak_accept` | Accepts a pending contact request when `nak-mcp --allow-connect` was chosen by the person. | Disabled by default; cannot grant mesh or inference authority. |
 | `nak_decline` | Declines a pending contact request when `--allow-connect` is enabled. | Disabled by default. |

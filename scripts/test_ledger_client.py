@@ -428,5 +428,53 @@ def test_settle_network_error_fails_open(monkeypatch, tmp_path):
     assert h.settle(str(receipt_path)) is None
 
 
+def test_wallet_methods_use_exact_signed_routes_and_bodies(monkeypatch, tmp_path):
+    _key_path, public_key_hex = _install_key(monkeypatch, tmp_path)
+    requests = []
+
+    def fake_urlopen(request, timeout):
+        requests.append(request)
+        if request.full_url.endswith("/wallet/status"):
+            return _Response(b'{"balance":200000000,"withdrawable":100000000}')
+        if request.full_url.endswith("/wallet/bind"):
+            return _Response(b'{"address":"11111111111111111111111111111111"}')
+        if request.full_url.endswith("/withdraw"):
+            return _Response(b'{"id":"withdrawal-1","state":"pending"}')
+        return _Response(b'{"status":"pending","deposit_address":null}')
+
+    monkeypatch.setattr(ledger_client.urllib.request, "urlopen", fake_urlopen)
+    hook = _hook(monkeypatch, tmp_path, NAKSHATRA_LEDGER_MODE="enforce")
+    address = "1" * 32
+
+    assert hook.wallet()["status"] == "pending"
+    assert hook.wallet_status()["withdrawable"] == 100_000_000
+    assert hook.bind(address)["address"] == address
+    assert hook.withdraw(100_000_000)["state"] == "pending"
+
+    expected = [
+        ("/wallet", b""),
+        ("/wallet/status", b""),
+        ("/wallet/bind", json.dumps({"address": address}).encode()),
+        ("/withdraw", json.dumps({"amount": 100_000_000}).encode()),
+    ]
+    for request, (path, body) in zip(requests, expected):
+        assert request.full_url.endswith(path)
+        _assert_signed(request, public_key_hex, path, body)
+    assert json.loads(requests[2].data) == {"address": address}
+    assert json.loads(requests[3].data) == {"amount": 100_000_000}
+
+
+def test_wallet_methods_fail_closed_when_disabled_or_unsigned(monkeypatch, tmp_path):
+    hook = _hook(monkeypatch, tmp_path)
+    with pytest.raises(ledger_client.LedgerUnavailable, match="disabled"):
+        hook.wallet()
+    hook = _hook(
+        monkeypatch, tmp_path / "missing", install_key=False,
+        NAKSHATRA_LEDGER_MODE="enforce"
+    )
+    with pytest.raises(ledger_client.LedgerUnavailable, match="signing key"):
+        hook.wallet_status()
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

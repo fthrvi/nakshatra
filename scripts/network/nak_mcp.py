@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -61,6 +62,7 @@ READ_TOOLS = {
                 {"prompt": _STR, "model": _STR,
                  "max_tokens": {"type": "integer", "description": "maximum reply tokens (default 256)"}}),
     "nak_balance": ("This node operator's inference-credit balance and tier (the signer is the account).", {}),
+    "nak_wallet": ("This node operator's read-only wallet status and deposit address; cannot bind or withdraw.", {}),
     "nak_worker_status": ("This node's worker configuration, verified build state, and unit state; no secrets.", {}),
 }
 CONNECT_TOOLS = {
@@ -254,6 +256,42 @@ class Server:
             if not public:
                 raise NakError("the ledger returned no balance or tier")
             return json.dumps(public, sort_keys=True)
+        if name == "nak_wallet":
+            config = _gateway_config()
+            try:
+                from accounting import wallet
+                from ledger_client import LedgerUnavailable
+            except Exception as e:
+                raise NakError(f"ledger client unavailable ({e})") from e
+            try:
+                hook = wallet(
+                    url=config.get("NAKSHATRA_LEDGER_URL"),
+                    spki_hash=config.get("NAKSHATRA_LEDGER_SPKI_SHA256"),
+                )
+                status = hook.wallet_status()
+                deposit = hook.wallet()
+            except (LedgerUnavailable, OSError, ValueError) as e:
+                raise NakError(str(e)) from e
+            public_status = {
+                key: status[key]
+                for key in (
+                    "account", "tier", "balance", "withdrawable", "balance_usdc",
+                    "withdrawable_usdc", "rate", "payout", "pending_withdrawals",
+                )
+                if key in status
+            }
+            address = deposit.get("deposit_address")
+            if address is not None and (
+                not isinstance(address, str)
+                or re.fullmatch(
+                    r"[1-9A-HJ-NP-Za-km-z]{32,44}", address
+                ) is None
+            ):
+                raise NakError("the ledger returned an invalid deposit address")
+            return json.dumps({
+                "deposit_address": address,
+                "status": _safe_worker_status(public_status),
+            }, sort_keys=True)
         if name == "nak_worker_status":
             from network.nak import _worker_status
             return json.dumps(_safe_worker_status(_worker_status(subprocess)),

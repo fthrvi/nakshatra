@@ -247,6 +247,64 @@ class LedgerHook:
             raise LedgerUnavailable("ledger returned an invalid balance response")
         return value
 
+    def wallet(self) -> dict:
+        """Return (or queue creation of) the signing operator's deposit account."""
+        return self._required_get("/wallet", "wallet")
+
+    def wallet_status(self) -> dict:
+        """Return only the signing operator's balance and withdrawal state."""
+        return self._required_get("/wallet/status", "wallet status")
+
+    def bind(self, address: str) -> dict:
+        """Bind this signing operator's payout address."""
+        if not isinstance(address, str) or not address:
+            raise LedgerUnavailable("payout address is required")
+        return self._required_post("/wallet/bind", {"address": address}, "wallet bind")
+
+    def withdraw(self, amount: int) -> dict:
+        """Request a withdrawal in integer ledger credits to the bound address."""
+        if isinstance(amount, bool) or not isinstance(amount, int) or amount <= 0:
+            raise LedgerUnavailable("withdrawal amount must be a positive integer number of credits")
+        return self._required_post("/withdraw", {"amount": amount}, "withdraw")
+
+    def _required_get(self, path: str, label: str) -> dict:
+        if not self.enabled:
+            raise LedgerUnavailable("ledger accounting is disabled")
+        if self._private_key is None:
+            raise LedgerUnavailable("ledger signing key unavailable")
+        try:
+            value = self._get(path)
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                self._log_signature_refusal()
+            detail = self._http_error_json(e).get("error")
+            suffix = f": {detail}" if isinstance(detail, str) and detail else ""
+            raise LedgerUnavailable(f"ledger {label} HTTP {e.code}{suffix}") from e
+        except Exception as e:
+            raise LedgerUnavailable(f"ledger {label} unavailable ({e})") from e
+        if not isinstance(value, dict):
+            raise LedgerUnavailable(f"ledger returned an invalid {label} response")
+        return value
+
+    def _required_post(self, path: str, body: dict, label: str) -> dict:
+        if not self.enabled:
+            raise LedgerUnavailable("ledger accounting is disabled")
+        if self._private_key is None:
+            raise LedgerUnavailable("ledger signing key unavailable")
+        try:
+            value = self._post(path, body)
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                self._log_signature_refusal()
+            detail = self._http_error_json(e).get("error")
+            suffix = f": {detail}" if isinstance(detail, str) and detail else ""
+            raise LedgerUnavailable(f"ledger {label} HTTP {e.code}{suffix}") from e
+        except Exception as e:
+            raise LedgerUnavailable(f"ledger {label} unavailable ({e})") from e
+        if not isinstance(value, dict):
+            raise LedgerUnavailable(f"ledger returned an invalid {label} response")
+        return value
+
     @staticmethod
     def _receipt_id(receipt: dict) -> str:
         canonical = json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode()

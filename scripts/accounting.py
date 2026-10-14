@@ -10,13 +10,16 @@ ledger) is added HERE, once, and every caller gets it.
     METERING — pay for inference as it is served (reciprocal compute credits)
         gate(est_cost) -> (allow, reason)        before a run
         settle(receipt_path) -> delta | None     after a run, from the signed run receipt
-        backend today: Sthambha-Ed25519-authenticated Neuron ledger via `ledger_client.LedgerHook`
+        backend: `neuron-ledger`, via Sthambha-Ed25519-authenticated `ledger_client.LedgerHook`
         (DEFAULT-OFF, FAIL-OPEN: it can never block or break a served reply)
 
     ESCROW — pay for a task posted to another person
         open(...) / release(...) / refund(...) / status(...)   exactly once per task
         backend today: `network.settle.LedgerAdapter` (local ledger, TEST units)
         next: Solana devnet escrow (an adapter with the same four calls)
+
+    WALLET — deposit address, balance, payout binding, and withdrawal requests
+        backend: `neuron-ledger`; Solana keys remain outside Nakshatra and the ledger server
 
 Choose backends with env, not code: NAKSHATRA_CREDITS (metering on/off, see ledger_client) and
 NAKSHATRA_ESCROW=ledger (the only escrow backend today; anything else is refused, not guessed).
@@ -32,6 +35,8 @@ if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
 ESCROW_BACKENDS = ("ledger",)
+METERING_BACKEND = "neuron-ledger"
+WALLET_BACKEND = "neuron-ledger"
 
 
 def metering():
@@ -63,3 +68,9 @@ def escrow(state_dir: Path):
         raise ValueError(f"NAKSHATRA_ESCROW={name!r} is not a known escrow backend {ESCROW_BACKENDS}")
     from network.settle import LedgerAdapter
     return LedgerAdapter(Path(state_dir) / "settle.sqlite")
+
+
+def wallet(**kwargs):
+    """The fail-closed Neuron wallet client used by explicit CLI/MCP reads and actions."""
+    from ledger_client import LedgerHook
+    return LedgerHook(enabled=True, mode="enforce", **kwargs)
