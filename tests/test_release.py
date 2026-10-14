@@ -90,6 +90,34 @@ def test_build_install_happy_path(env):
     assert json.loads((node / "config.json").read_text())["pubkey"] == env["pub"]
 
 
+def test_build_pins_package_signers_from_exact_component_commit(env, monkeypatch):
+    policy_path = env["a"] / "pkg" / "package-signers.json"
+    trusted = "12" * 32
+    policy_path.write_text(json.dumps({
+        "schema": "nak-package-signers/1", "keys": [trusted],
+    }))
+    subprocess.run(["git", "-C", str(env["a"]), "add", "."], check=True)
+    subprocess.run([
+        "git", "-C", str(env["a"]), "-c", "user.email=t@t", "-c", "user.name=t",
+        "commit", "-qm", "package trust",
+    ], check=True)
+    monkeypatch.setitem(B.SPEC, "package_signers", {
+        "component": "alpha", "path": "pkg/package-signers.json",
+    })
+    # Dirty working-tree policy changes must not enter a release of the recorded commit.
+    policy_path.write_text(json.dumps({
+        "schema": "nak-package-signers/1", "keys": ["34" * 32],
+    }))
+
+    out = _build(env, "0.1.0")
+    manifest = json.loads((out / "manifest.json").read_text())
+
+    assert rk.verify(manifest, env["pub"])
+    assert manifest["package_signers"] == {
+        "schema": "nak-package-signers/1", "keys": [trusted],
+    }
+
+
 def test_tampered_artifact_refused_and_nothing_switched(env):
     out = _build(env, "0.1.0")
     tgz = next(out.glob("alpha-*.tar.gz"))

@@ -2,6 +2,10 @@
  "name": "nakshatra-node",
  "python": "3.12",
  "installer": "nakshatra/release/install.py",
+ "package_signers": {
+  "component": "nakshatra",
+  "path": "release/package-signers.json"
+ },
  "components": [
   {
    "name": "nakshatra",

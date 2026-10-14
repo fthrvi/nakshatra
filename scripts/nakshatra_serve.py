@@ -263,17 +263,22 @@ def _local_tokenizers(model_ids: set[str]) -> dict[str, str]:
         found[next(iter(model_ids))] = explicit
     root = os.path.expanduser(os.environ.get(
         "NAKSHATRA_TOKENIZER_DIR", "~/.nakshatra/gateway/models"))
+    from gateway_tokenizer import (
+        tokenizer_manifest_path, tokenizer_path, verify_model_tokenizer,
+    )
+    from packaging.nakshatra_package import PackageError
     for model_id in model_ids - set(found):
-        stem = re.sub(r"[^A-Za-z0-9._-]+", "_", model_id).strip("._")
-        for name in (stem + ".metadata.gguf", stem + ".gguf"):
-            candidate = os.path.join(root, name)
-            if os.path.isfile(candidate):
-                found[model_id] = candidate
-                break
+        metadata = tokenizer_path(model_id, root)
+        provenance = tokenizer_manifest_path(model_id, root)
+        if not metadata.exists() and not provenance.exists():
+            continue
+        try:
+            found[model_id] = verify_model_tokenizer(model_id, root=root)
+        except (PackageError, OSError) as e:
+            log.warning("cached tokenizer verification refused for %s: %s", model_id, e)
     missing = model_ids - set(found)
     if missing:
         from gateway_tokenizer import fetch_model_tokenizer
-        from packaging.nakshatra_package import PackageError
         for model_id in sorted(missing):
             try:
                 found[model_id] = fetch_model_tokenizer(model_id, root=root)

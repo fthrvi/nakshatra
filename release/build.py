@@ -37,6 +37,8 @@ LATEST_TTL_S = 60 * 86400        # the signed "latest" pointer is refused after 
 PINNED_GO_VERSION = "go1.25.7"
 SPEC = json.loads((Path(__file__).resolve().parent / "spec.json").read_text())
 _PINNED_REQUIREMENT = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([^;\s]+)$")
+_PACKAGE_SIGNER_SCHEMA = "nak-package-signers/1"
+_ED25519_PUBLIC_KEY = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _requirement_pins(requirements: list[str], profile: str) -> dict[str, str]:
@@ -82,6 +84,38 @@ def _validate_profile_subsumption(profiles: dict) -> None:
 
 def _git(repo: Path, *args: str) -> str:
     return subprocess.check_output(["git", "-C", str(repo), *args], text=True).strip()
+
+
+def _package_signers(resolved: list[tuple]) -> dict | None:
+    """Load package trust policy from the exact component commit being released."""
+    source = SPEC.get("package_signers")
+    if source is None:
+        return None
+    if not isinstance(source, dict) or set(source) != {"component", "path"}:
+        raise RuntimeError("package_signers must name exactly one component and path")
+    try:
+        _comp, repo, commit, _out = next(
+            item for item in resolved if item[0]["name"] == source["component"])
+    except (KeyError, StopIteration) as e:
+        raise RuntimeError("package_signers names an unknown component") from e
+    path = source.get("path")
+    if not isinstance(path, str) or not path or path.startswith("/") or ".." in Path(path).parts:
+        raise RuntimeError("package_signers path must be a safe repository-relative path")
+    try:
+        raw = subprocess.check_output(
+            ["git", "-C", str(repo), "show", f"{commit}:{path}"], text=True)
+        policy = json.loads(raw)
+    except (subprocess.CalledProcessError, json.JSONDecodeError) as e:
+        raise RuntimeError("could not load package_signers from the release commit") from e
+    if not isinstance(policy, dict) or policy.get("schema") != _PACKAGE_SIGNER_SCHEMA:
+        raise RuntimeError(f"package_signers schema must be {_PACKAGE_SIGNER_SCHEMA!r}")
+    keys = policy.get("keys")
+    if not isinstance(keys, list) or not keys or any(
+            not isinstance(key, str) or not _ED25519_PUBLIC_KEY.fullmatch(key) for key in keys):
+        raise RuntimeError("package_signers keys must be a non-empty list of lowercase Ed25519 hex keys")
+    if len(keys) != len(set(keys)):
+        raise RuntimeError("package_signers keys must not contain duplicates")
+    return {"schema": _PACKAGE_SIGNER_SCHEMA, "keys": list(keys)}
 
 
 def _archive(repo: Path, commit: str, paths: list, out: Path, overlays=()) -> None:
@@ -221,6 +255,9 @@ def build(version: str, channel: str, refs: dict, key_path: Path, out_root: Path
                 "toolchains": toolchains,
                 "installer": SPEC.get("installer", ""), "commands": SPEC.get("commands", {}),
                 "bootstrap": bootstrap, "profiles": profiles}
+    package_signers = _package_signers(resolved)
+    if package_signers is not None:
+        manifest["package_signers"] = package_signers
     priv_hex = key_path.read_text().strip()
     signed = rk.sign(manifest, priv_hex)
     (out / "manifest.json").write_text(json.dumps(signed, indent=1, sort_keys=True))

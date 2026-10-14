@@ -24,6 +24,7 @@ import ipaddress
 import os
 import re
 import shutil
+import stat
 import sys
 import tempfile
 from pathlib import Path
@@ -46,6 +47,9 @@ else:  # pragma: no cover
     )
 
 _CHUNK = 8 * 1024 * 1024
+_MANIFEST_MAX_BYTES = 2 * 1024 * 1024
+_MANIFEST_TIMEOUT_S = 15
+_ARTIFACT_TIMEOUT_S = 60
 
 
 def _is_url(s: str) -> bool:
@@ -138,11 +142,18 @@ class _LocalDevRedirectHandler(urlrequest.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
+class _NoRedirectHandler(urlrequest.HTTPRedirectHandler):
+    """Package fetches are object reads; a redirect is never required."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise PackageError(f"package fetch refused redirect to {newurl!r}")
+
+
 def _open_url(url: str, *, timeout: float, local_dev: bool):
     if local_dev:
         return urlrequest.build_opener(_LocalDevRedirectHandler()).open(
             url, timeout=timeout)
-    return urlrequest.urlopen(url, timeout=timeout)
+    return urlrequest.build_opener(_NoRedirectHandler()).open(url, timeout=timeout)
 
 
 def _enforce_source_policy(location: str, *, local_dev: bool,
@@ -175,13 +186,20 @@ def _read_manifest(location: str, *, local_dev: bool = False) -> tuple[Nakshatra
     Returns (package, root) where root is the base to resolve artifacts against."""
     if _is_url(location):
         url = location if location.endswith(".json") else location.rstrip("/") + "/" + MANIFEST_FILENAME
-        with _open_url(url, timeout=30, local_dev=local_dev) as resp:
-            text = resp.read().decode("utf-8")
+        with _open_url(url, timeout=_MANIFEST_TIMEOUT_S, local_dev=local_dev) as resp:
+            raw = resp.read(_MANIFEST_MAX_BYTES + 1)
+        if len(raw) > _MANIFEST_MAX_BYTES:
+            raise PackageError(
+                f"package manifest exceeds {_MANIFEST_MAX_BYTES} byte limit")
+        text = raw.decode("utf-8")
         root = url.rsplit("/", 1)[0] + "/"
     else:
         p = _filesystem_location(location)
         if p.is_dir():
             p = p / MANIFEST_FILENAME
+        if p.stat().st_size > _MANIFEST_MAX_BYTES:
+            raise PackageError(
+                f"package manifest exceeds {_MANIFEST_MAX_BYTES} byte limit")
         text = p.read_text()
         root = str(p.parent)
     pkg = NakshatraPackage.from_json(text)
@@ -189,27 +207,58 @@ def _read_manifest(location: str, *, local_dev: bool = False) -> tuple[Nakshatra
     return pkg, root
 
 
-def _fetch_one(root: str, rel_path: str, dest: Path, *, local_dev: bool = False) -> str:
-    """Fetch a single artifact to dest, returning its streamed SHA-256."""
-    dest.parent.mkdir(parents=True, exist_ok=True)
+def _copy_and_hash(source, out, *, expected_size: int | None, rel_path: str) -> str:
+    """Copy a stream while refusing the first byte beyond the signed size."""
     h = hashlib.sha256()
-    if _is_url(root):
-        url = root.rstrip("/") + "/" + rel_path
-        with _open_url(url, timeout=120, local_dev=local_dev) as resp, open(dest, "wb") as out:
-            for chunk in iter(lambda: resp.read(_CHUNK), b""):
-                out.write(chunk)
-                h.update(chunk)
-    else:
-        src = Path(root) / rel_path
-        with open(src, "rb") as f, open(dest, "wb") as out:
-            for chunk in iter(lambda: f.read(_CHUNK), b""):
-                out.write(chunk)
-                h.update(chunk)
+    total = 0
+    while True:
+        read_size = _CHUNK if expected_size is None else min(
+            _CHUNK, max(1, expected_size + 1 - total))
+        chunk = source.read(read_size)
+        if not chunk:
+            break
+        total += len(chunk)
+        if expected_size is not None and total > expected_size:
+            raise PackageError(
+                f"artifact {rel_path!r} exceeds signed size {expected_size}; aborting download")
+        out.write(chunk)
+        h.update(chunk)
     return h.hexdigest()
 
 
+def _fetch_one(root: str, rel_path: str, dest: Path, *, local_dev: bool = False,
+               expected_size: int | None = None) -> str:
+    """Fetch a single artifact to dest, returning its streamed SHA-256."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if _is_url(root):
+        url = root.rstrip("/") + "/" + rel_path
+        with _open_url(url, timeout=_ARTIFACT_TIMEOUT_S, local_dev=local_dev) as resp, \
+                open(dest, "wb") as out:
+            content_length = getattr(resp, "headers", {}).get("Content-Length")
+            if expected_size is not None and content_length is not None:
+                try:
+                    announced = int(content_length)
+                except (TypeError, ValueError):
+                    announced = -1
+                if announced > expected_size:
+                    raise PackageError(
+                        f"artifact {rel_path!r} announces {announced} bytes, exceeding signed "
+                        f"size {expected_size}; aborting download")
+            return _copy_and_hash(
+                resp, out, expected_size=expected_size, rel_path=rel_path)
+    else:
+        src = Path(root) / rel_path
+        if expected_size is not None and src.stat().st_size > expected_size:
+            raise PackageError(
+                f"artifact {rel_path!r} exceeds signed size {expected_size}; aborting download")
+        with open(src, "rb") as f, open(dest, "wb") as out:
+            return _copy_and_hash(
+                f, out, expected_size=expected_size, rel_path=rel_path)
+
+
 def fetch_verified_metadata(location: str, model_id: str, dest_metadata_gguf: str,
-                            *, trusted_pubkeys: set[str]) -> str:
+                            *, trusted_pubkeys: set[str],
+                            cache_manifest_path: str | None = None) -> str:
     """Fetch only a package's signed tokenizer/metadata GGUF.
 
     This is the consumer-gateway counterpart to :func:`fetch_and_assemble`.
@@ -241,13 +290,18 @@ def fetch_verified_metadata(location: str, model_id: str, dest_metadata_gguf: st
             f"{artifact.path!r}")
 
     dest = Path(dest_metadata_gguf)
+    cache_manifest = Path(cache_manifest_path) if cache_manifest_path else None
+    if cache_manifest is not None and cache_manifest.parent != dest.parent:
+        raise PackageError("cached manifest must be stored next to cached metadata")
     dest.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd, tmp_name = tempfile.mkstemp(
         prefix=f".{dest.name}.", suffix=".tmp", dir=dest.parent)
     os.close(fd)
     tmp = Path(tmp_name)
+    manifest_tmp: Path | None = None
     try:
-        actual = _fetch_one(root, artifact.path, tmp, local_dev=False)
+        actual = _fetch_one(
+            root, artifact.path, tmp, local_dev=False, expected_size=artifact.size)
         if actual != artifact.sha256:
             raise PackageError(
                 f"SHA-256 mismatch for {artifact.path}: got {actual[:12]}, "
@@ -257,11 +311,63 @@ def fetch_verified_metadata(location: str, model_id: str, dest_metadata_gguf: st
             raise PackageError(
                 f"size mismatch for {artifact.path}: got {actual_size}, "
                 f"manifest says {artifact.size}")
+        if cache_manifest is not None:
+            manifest_fd, manifest_tmp_name = tempfile.mkstemp(
+                prefix=f".{cache_manifest.name}.", suffix=".tmp", dir=dest.parent)
+            manifest_tmp = Path(manifest_tmp_name)
+            with os.fdopen(manifest_fd, "w") as out:
+                out.write(pkg.to_json())
+                out.write("\n")
+            os.chmod(manifest_tmp, 0o644)
         os.chmod(tmp, 0o644)
         os.replace(tmp, dest)
+        if cache_manifest is not None and manifest_tmp is not None:
+            os.replace(manifest_tmp, cache_manifest)
         return str(dest)
     finally:
         tmp.unlink(missing_ok=True)
+        if manifest_tmp is not None:
+            manifest_tmp.unlink(missing_ok=True)
+
+
+def verify_cached_metadata(manifest_path: str | os.PathLike[str], model_id: str,
+                           metadata_path: str | os.PathLike[str], *,
+                           trusted_pubkeys: set[str]) -> str:
+    """Re-verify a cached metadata file and its signed manifest on every load."""
+    manifest = Path(manifest_path)
+    metadata = Path(metadata_path)
+    try:
+        manifest_info = manifest.lstat()
+        metadata_info = metadata.lstat()
+    except OSError as e:
+        raise PackageError(f"cached tokenizer provenance is incomplete: {e}") from e
+    if manifest.is_symlink() or not stat.S_ISREG(manifest_info.st_mode):
+        raise PackageError("cached package manifest must be a regular file")
+    if metadata.is_symlink() or not stat.S_ISREG(metadata_info.st_mode):
+        raise PackageError("cached tokenizer metadata must be a regular file")
+    if manifest_info.st_size > _MANIFEST_MAX_BYTES:
+        raise PackageError("cached package manifest exceeds the size limit")
+    pkg = NakshatraPackage.from_json(manifest.read_text())
+    pkg.validate()
+    trusted = {key.strip().lower() for key in trusted_pubkeys if key.strip()}
+    _check_signature(pkg, True, trusted)
+    if pkg.model_id != model_id:
+        raise PackageError(
+            f"cached package model_id {pkg.model_id!r} does not match {model_id!r}")
+    artifact = pkg.shared_by_role(ROLE_METADATA)
+    if artifact is None or artifact.path != "shared/metadata.gguf":
+        raise PackageError("cached manifest does not identify shared/metadata.gguf")
+    if metadata_info.st_size != artifact.size:
+        raise PackageError(
+            f"cached tokenizer size mismatch: got {metadata_info.st_size}, "
+            f"manifest says {artifact.size}")
+    actual = hashlib.sha256()
+    with metadata.open("rb") as source:
+        for chunk in iter(lambda: source.read(_CHUNK), b""):
+            actual.update(chunk)
+    if actual.hexdigest() != artifact.sha256:
+        raise PackageError("cached tokenizer SHA-256 mismatch — refusing tampered cache")
+    return str(metadata)
 
 
 def _check_signature(pkg: NakshatraPackage, require_signature: bool,
@@ -308,7 +414,8 @@ def fetch_and_assemble(location: str, start: int, end: int, dest_sub_gguf: str,
         # 1. fetch + verify every fragment (fail closed)
         for a in needed:
             lp = staging / a.path
-            actual = _fetch_one(root, a.path, lp, local_dev=local_dev)
+            actual = _fetch_one(
+                root, a.path, lp, local_dev=local_dev, expected_size=a.size)
             if actual != a.sha256:
                 raise PackageError(
                     f"SHA-256 mismatch for {a.path}: got {actual[:12]}, "

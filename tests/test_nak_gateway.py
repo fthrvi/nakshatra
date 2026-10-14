@@ -19,6 +19,13 @@ import nakshatra_serve as serve  # noqa: E402
 
 
 PIN = "17" * 32
+PACKAGE_SIGNER = "23" * 32
+
+
+@pytest.fixture(autouse=True)
+def _signed_release_package_signer(monkeypatch):
+    monkeypatch.setattr(
+        nak, "load_release_package_signers", lambda: frozenset({PACKAGE_SIGNER}))
 
 
 def _wait_for_model_names(models, expected, timeout=1.0):
@@ -51,7 +58,7 @@ def _args(**overrides):
         "ledger_url": "https://pillar.example/ledger",
         "models": "auto",
         "package_url": "https://models.example/llama32-3b",
-        "package_pubkey": "23" * 32,
+        "package_pubkey": PACKAGE_SIGNER,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -71,7 +78,7 @@ def test_gateway_on_writes_loopback_enforced_opt_in(tmp_path, monkeypatch):
     assert "PORT=11600" in body
     assert "MODELS=\"auto\"" in body
     assert 'PACKAGE_URL="https://models.example/llama32-3b"' in body
-    assert f"PACKAGE_TRUSTED_PUBKEY={'23' * 32}" in body
+    assert f"PACKAGE_TRUSTED_PUBKEY={PACKAGE_SIGNER}" in body
     assert "NAKSHATRA_LEDGER_MODE=enforce" in body
     assert "NAKSHATRA_CREDITS=1" in body
     assert f"STHAMBHA_PILLAR_SPKI_SHA256={PIN}" in body
@@ -85,18 +92,18 @@ def test_gateway_auto_requires_package_provenance(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setattr(nak, "_gateway_installer", lambda *_args: pytest.fail("must not enable"))
 
-    with pytest.raises(SystemExit, match="package-url.*package-pubkey"):
+    with pytest.raises(SystemExit, match="package-url"):
         nak._gateway_on(object(), _args(package_url=None, package_pubkey=None))
 
 
-def test_gateway_auto_defaults_package_from_consumer_join_state(tmp_path, monkeypatch):
+def test_gateway_auto_uses_join_url_but_ignores_join_key(tmp_path, monkeypatch):
     home = tmp_path / "home"
     state = home / ".nakshatra" / "consumer-standing.json"
     state.parent.mkdir(parents=True)
     state.write_text(json.dumps({
         "role": "consumer", "tier": "known", "operator": "op-1",
         "package_url": "https://models.example/from-join",
-        "package_pubkey": "45" * 32,
+        "package_pubkey": "45" * 32,  # unsigned onboarding data: never a trust root
     }))
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setattr(nak, "_gateway_unit_enabled", lambda _sp: False)
@@ -106,7 +113,15 @@ def test_gateway_auto_defaults_package_from_consumer_join_state(tmp_path, monkey
 
     body = (home / ".nakshatra" / "gateway.env").read_text()
     assert 'PACKAGE_URL="https://models.example/from-join"' in body
-    assert f"PACKAGE_TRUSTED_PUBKEY={'45' * 32}" in body
+    assert "PACKAGE_TRUSTED_PUBKEY" not in body
+
+
+def test_gateway_package_pubkey_may_only_narrow_release_allowlist(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(nak, "_gateway_installer", lambda *_args: pytest.fail("must not enable"))
+
+    with pytest.raises(SystemExit, match="may only narrow"):
+        nak._gateway_on(object(), _args(package_pubkey="45" * 32))
 
 
 def test_gateway_refuses_non_loopback_without_allow_lan(tmp_path, monkeypatch):
@@ -162,6 +177,11 @@ def test_gateway_off_removes_opt_in_without_starting_units(tmp_path, monkeypatch
 
 def test_release_has_separate_gateway_service():
     spec = json.loads((ROOT / "release" / "spec.json").read_text())
+    signer_policy = json.loads((ROOT / spec["package_signers"]["path"]).read_text())
+    assert signer_policy == {
+        "schema": "nak-package-signers/1",
+        "keys": ["2a4d231e7a8a5a97fa89c429e7e3e8900a57f1d5cf780ca67ed053376c68dc77"],
+    }
     service = spec["services"]["nakshatra-gateway"]
     assert service["requires"].endswith("/.nakshatra/gateway.env")
     assert service["profile"] == "inference"

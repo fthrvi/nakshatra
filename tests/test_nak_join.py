@@ -261,7 +261,7 @@ def test_consumer_redeem_uses_node_key_proof_without_worker_capabilities(net, tm
     assert seen["body"]["capabilities"] == {}
 
 
-def test_consumer_redeem_persists_optional_package_provenance(net, tmp_path):
+def test_consumer_redeem_persists_url_but_ignores_onboarding_package_key(net, tmp_path):
     a = net("inviter-package")
     code = _invite(a, kind="consumer", consumer={
         "redeem": "https://onboard.example/base", "code": "consumer-package",
@@ -273,7 +273,7 @@ def test_consumer_redeem_persists_optional_package_provenance(net, tmp_path):
         http_post=lambda _url, _body: {
             "tier": "known", "operator": "op-consumer", "role": "consumer",
             "package_url": "https://models.example/llama32-3b",
-            "package_pubkey": "67" * 32,
+            "package_pubkey": "attacker-controlled-not-a-key",
         })
 
     assert result["package_url"].endswith("llama32-3b")
@@ -281,7 +281,6 @@ def test_consumer_redeem_persists_optional_package_provenance(net, tmp_path):
     assert path.stat().st_mode & 0o777 == 0o600
     assert json.loads(path.read_text()) == {
         "operator": "op-consumer",
-        "package_pubkey": "67" * 32,
         "package_url": "https://models.example/llama32-3b",
         "role": "consumer",
         "tier": "known",

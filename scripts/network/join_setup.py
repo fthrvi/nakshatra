@@ -18,7 +18,6 @@ import argparse
 from http.client import HTTPException
 import json
 import os
-import re
 import stat
 import subprocess
 import sys
@@ -82,26 +81,22 @@ def _store_worker_invite(home: Path, code: str, name: str) -> Path:
 
 
 def _store_consumer_standing(home: Path, standing: dict) -> Path:
-    """Persist only the consumer facts later CLI setup is allowed to reuse."""
+    """Persist only non-authoritative consumer facts later CLI setup may reuse.
+
+    The onboarding response is unsigned. Its package URL is only a location;
+    package signer trust comes exclusively from the signed node release.
+    """
     package_url = standing.get("package_url")
-    package_pubkey = standing.get("package_pubkey", standing.get("package_trusted_pubkey"))
-    if (package_url is None) != (package_pubkey is None):
-        raise WorkerRedeemError(
-            "onboard server returned incomplete package provenance")
     if package_url is not None:
         if not isinstance(package_url, str) or not package_url.strip():
             raise WorkerRedeemError("onboard server returned an invalid package_url")
-        if not isinstance(package_pubkey, str) or not re.fullmatch(
-                r"[0-9a-fA-F]{64}", package_pubkey):
-            raise WorkerRedeemError("onboard server returned an invalid package_pubkey")
     saved = {
         "role": "consumer",
         "tier": standing["tier"],
         "operator": standing["operator"],
     }
     if package_url is not None:
-        saved.update(package_url=package_url.strip(),
-                     package_pubkey=package_pubkey.lower())
+        saved["package_url"] = package_url.strip()
     path = home / CONSUMER_STANDING_FILE
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
