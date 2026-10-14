@@ -253,8 +253,8 @@ def test_resume_requires_continuous_live_heartbeats(tmp_path):
         tmp_path, clock, ttl=6, resume=3,
     )
     lease.heartbeat(at=0, clear=True, reason="clear")
-    clock.advance(4)  # stale breaks continuity before RESUME_S completes
-    assert lease.reconcile()["state"] == "stale"
+    clock.advance(7)  # a LAPSE (silence beyond TTL) breaks continuity before RESUME_S completes
+    assert lease.reconcile()["state"] == "lapsed"
     assert controller.residency == "away"
 
     lease.heartbeat(at=4, clear=True, reason="clear again")
@@ -276,3 +276,26 @@ def test_non_ascii_bearer_is_a_clean_401_not_a_crash():
     status, payload = worker.owner_lease_http_response(
         _Lease(), "/lease", "Bearer ééé", b'{"at": 1, "clear": true}')
     assert status == 401 and payload == {"error": "unauthorized"}
+
+
+def test_a_late_heartbeat_does_not_restart_the_resume_window():
+    """Stale is jitter (a heartbeat a little late), not a lapse: on blackwell a Windows sentinel
+    with a 1 s counter sample landed in the stale band every beat and never accrued resume time."""
+    clock = {"t": 0.0}
+    cfg = worker.OwnerLeaseConfig(port=5571, token="t" * 64, ttl_s=6.0, resume_s=30.0) \
+        if "resume_s" in worker.OwnerLeaseConfig._fields else None
+    if cfg is None:
+        import pytest
+        pytest.skip("OwnerLeaseConfig shape changed")
+
+    class _Daemon:
+        residency = "away"
+        def update_owner_lease(self, *a, **k):
+            pass
+
+    lease = worker.OwnerLease(cfg, _Daemon(), now=lambda: clock["t"])
+    lease.heartbeat(at=0, clear=True, reason="owner clear")
+    for _ in range(9):              # every 3.5 s: always past TTL/2 (stale band), never past TTL
+        clock["t"] += 3.5
+        snap = lease.heartbeat(at=0, clear=True, reason="owner clear")
+    assert clock["t"] >= 30 and snap["resume_ready"] is True

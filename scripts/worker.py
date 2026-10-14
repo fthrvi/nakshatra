@@ -1522,7 +1522,11 @@ class OwnerLease:
                 self._explicitly_clear = False
                 self._resume_since = None
             else:
-                if prior_state != "live" or self._resume_since is None:
+                # Only a real lapse restarts the resume window. "stale" is the jitter band
+                # (a heartbeat a little late): it already refuses new sessions, but counting
+                # it as a restart kept a Windows sentinel (1 s GPU-counter sample + 2 s
+                # sleep) from ever accruing 30 s of resume time on blackwell.
+                if prior_state == "lapsed" or self._resume_since is None:
                     self._resume_since = now
                 self._explicitly_clear = True
                 self._last_clear_at = now

@@ -336,10 +336,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     while True:
+        started = time.monotonic()
         result = heartbeat_iteration(settings)
         if args.once:
             return 0 if result is not None else 1
-        time.sleep(args.interval)
+        # Keep the cadence at --interval regardless of how long the probes took.
+        time.sleep(max(0.2, args.interval - (time.monotonic() - started)))
 
 
 if __name__ == "__main__":

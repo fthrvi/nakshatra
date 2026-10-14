@@ -182,6 +182,7 @@ try {
 }
 
 do {
+    $iterationStart = [DateTime]::UtcNow
     $succeeded = $false
     try {
         $decision = Get-OwnerDecision -GpuThresholdMiB $gpuThresholdMiB -GpuIgnore $gpuIgnore
@@ -197,5 +198,8 @@ do {
         if ($DryRun) { Write-Output ("decision error: " + $_.Exception.Message) }
     }
     if ($Once) { if ($succeeded) { exit 0 } else { exit 1 } }
-    Start-Sleep -Seconds $HeartbeatSeconds
+    # Sleep only what is left of the interval: reading the GPU counters takes ~1 s, and a full
+    # sleep on top pushed heartbeats past the worker's stale band (measured on blackwell).
+    $elapsed = ([DateTime]::UtcNow - $iterationStart).TotalMilliseconds
+    Start-Sleep -Milliseconds ([Math]::Max(200, [int]($HeartbeatSeconds * 1000 - $elapsed)))
 } while ($true)
