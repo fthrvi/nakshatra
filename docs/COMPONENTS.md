@@ -71,7 +71,7 @@ different NATs over IPv4 only (needs a second network).
 | Who joins | Live path | Installer | Key | Status |
 |---|---|---|---|---|
 | Your own **device** onto your private mesh | trisul `infra/onboarding` `mesh-invite.sh` / knock (Biswa approves) → `onboard_server` `/redeem` | WireGuard `join.sh` | WireGuard | LIVE (VPS `onboard.service`) |
-| An **outsider's GPU** into your compute pool, at a trust tier | signed `nak invite --kind worker` → `release/install.py join` → node-key-signed onboard `/worker-redeem`; runtime remains trisul `worker.sh` until phase B | **signed release** for identity/invite; legacy worker tarballs for runtime | `~/.nakshatra/keys/worker.ed25519` | U4 phase A (signed identity + admission); runtime LIVE via `worker.sh` |
+| An **outsider's GPU** into your compute pool, at a trust tier | signed `nak invite --kind worker` → `release/install.py join` → node-key-signed onboard `/worker-redeem` → `nak worker build` + `nak worker on` (public pinned pillar front `:7778`) | **signed release** (the unsigned `/worker.sh` is retired) | `~/.nakshatra/keys/worker.ed25519` | **LIVE end to end 2026-10-13** (bro: invite → serve → idle unload → owner lease → warm pools) |
 | Your own **machine** into your fleet | `fabric/join.py` → Sthambha `/join` | by hand | node key | WIRED |
 | A **person**, as a contact | `release/install.py join` (one pasted line) | **signed release** | node key | LIVE |
 | (engine for the outsider-GPU path) | `scripts/join/` six-phase decision engine | — | — | BUILT: decisions tested, observation layer stubbed. **Not dead**: it is the planned engine for the worker kind. |
