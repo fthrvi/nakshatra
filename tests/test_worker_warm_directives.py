@@ -89,7 +89,7 @@ def test_keep_suppresses_release_grace_and_idle_until_expiry(tmp_path):
     controller.release_session("done")
     controller.apply_warm_directive(directive(clock, "keep", 20))
     clock.advance(11)
-    assert controller.unload_if_idle() is False
+    assert controller.unload_if_idle(force_window=True) is False
     assert daemon.closed is False
 
     clock.advance(10)
@@ -135,6 +135,19 @@ def test_prewarm_is_ignored_while_owner_lease_is_stale(tmp_path):
     assert len(daemons) == 1
 
 
+def test_release_unloads_immediately_when_idle_safe(tmp_path):
+    clock = FakeClock()
+    daemon = FakeDaemon()
+    controller = make_controller(
+        tmp_path, clock, lambda: daemon, idle=1_000, grace=-1,
+    )
+
+    controller.apply_warm_directive(directive(clock, "release"))
+
+    assert daemon.closed is True
+    assert controller.residency == "standby"
+
+
 def test_release_waits_for_session_and_in_flight_guards(tmp_path):
     clock = FakeClock()
     entered = threading.Event()
@@ -145,13 +158,14 @@ def test_release_waits_for_session_and_in_flight_guards(tmp_path):
     )
 
     assert controller.acquire_session("active") is True
+    controller.apply_warm_directive(directive(clock, "release"))
+    assert daemon.closed is False
+
     call = threading.Thread(
         target=lambda: controller.call(worker.CMD_TOKEN_DECODE, 1, b"data")
     )
     call.start()
     assert entered.wait(timeout=2)
-    controller.apply_warm_directive(directive(clock, "release"))
-    assert daemon.closed is False
 
     controller.release_session("active")
     assert daemon.closed is False
@@ -159,6 +173,22 @@ def test_release_waits_for_session_and_in_flight_guards(tmp_path):
     call.join(timeout=2)
     assert not call.is_alive()
     assert daemon.closed is True
+    assert controller.residency == "standby"
+
+
+def test_release_reclaims_stale_abandoned_session(tmp_path):
+    clock = FakeClock()
+    daemon = FakeDaemon()
+    controller = make_controller(
+        tmp_path, clock, lambda: daemon, idle=1_000, grace=-1,
+    )
+
+    assert controller.acquire_session("abandoned") is True
+    clock.advance(worker.KV_SESSION_STALE_AFTER_S + 1)
+    controller.apply_warm_directive(directive(clock, "release"))
+
+    assert daemon.closed is True
+    assert controller.current_owner is None
     assert controller.residency == "standby"
 
 

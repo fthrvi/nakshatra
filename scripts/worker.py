@@ -1273,7 +1273,7 @@ class IdleDaemonController:
             except DaemonUnavailableError as e:
                 sys.stderr.write(f"[worker] warm prewarm failed: {e}\n")
         elif action == "release":
-            self.unload_if_idle()
+            self.unload_if_idle(force_window=True)
 
     @property
     def service_alive(self) -> bool:
@@ -1478,8 +1478,13 @@ class IdleDaemonController:
             self._last_gpu_offload_status = dict(status)
         return status
 
-    def unload_if_idle(self) -> bool:
-        """Cleanly enter standby when every idle/session guard permits it."""
+    def unload_if_idle(self, *, force_window: bool = False) -> bool:
+        """Cleanly enter standby when every safety guard permits it.
+
+        ``force_window`` skips only the idle/release-grace timing requirement;
+        in-flight work, live session ownership, keep directives, and shutdown
+        state remain authoritative.
+        """
         with self._spawn_lock:
             with self._state_lock:
                 now = self._now()
@@ -1497,19 +1502,18 @@ class IdleDaemonController:
                     return False
                 directive_release = warm_action == "release"
                 if (self._closed or self._daemon is None or self._in_flight
-                        or not (directive_release or release_due or idle_due)):
+                        or not (force_window or directive_release
+                                or release_due or idle_due)):
                     return False
                 if self._owner_session is not None:
-                    if directive_release:
-                        return False
                     # A stream that ended without release_session() (client crashed) would
                     # otherwise pin VRAM forever. Same staleness rule acquire_session() uses
-                    # to reclaim ownership; we are also past the full idle window here.
+                    # to reclaim ownership.
                     if now - self._owner_since <= KV_SESSION_STALE_AFTER_S:
                         return False
                     sys.stderr.write(
                         f"[worker] releasing stale KV-session {self._owner_session!r} "
-                        f"(idle {now - self._owner_since:.0f}s) before idle unload\n")
+                        f"(idle {now - self._owner_since:.0f}s) before daemon unload\n")
                     self._owner_session = None
                     self._owner_since = 0.0
                 daemon = self._daemon
