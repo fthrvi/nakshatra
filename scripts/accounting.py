@@ -10,7 +10,7 @@ ledger) is added HERE, once, and every caller gets it.
     METERING — pay for inference as it is served (reciprocal compute credits)
         gate(est_cost) -> (allow, reason)        before a run
         settle(receipt_path) -> delta | None     after a run, from the signed run receipt
-        backend today: Neuron ledger service via `ledger_client.LedgerHook`
+        backend today: Sthambha-Ed25519-authenticated Neuron ledger via `ledger_client.LedgerHook`
         (DEFAULT-OFF, FAIL-OPEN: it can never block or break a served reply)
 
     ESCROW — pay for a task posted to another person

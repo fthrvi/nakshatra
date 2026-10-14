@@ -9,22 +9,32 @@ SAFETY (this guards Prithvi's live brain):
   • DEFAULT-OFF: with NAKSHATRA_CREDITS unset, every method is a total no-op — the serve is
     byte-for-byte unchanged.
   • FAIL-OPEN: any ledger error (down, slow, 5xx) → the run PROCEEDS. The credit system can
-    never block or break a served reply. Denial happens ONLY when NAKSHATRA_CREDITS_ENFORCE=1
-    AND the ledger explicitly says the requester is out of credits.
+    never block or break a served reply. An explicit v2 402 denies; a legacy 200 denial is
+    enforced only when NAKSHATRA_CREDITS_ENFORCE=1.
 
 Env:
   NAKSHATRA_CREDITS=1            enable the hook (still fail-open; advisory unless enforced)
-  NAKSHATRA_CREDITS_ENFORCE=1   actually reject when the ledger denies (for when outsiders pay)
-  NAKSHATRA_LEDGER_URL          default http://127.0.0.1:8093
+  NAKSHATRA_CREDITS_ENFORCE=1   enforce legacy 200-body denials (v2 uses HTTP 402)
+  NAKSHATRA_LEDGER_URL          default http://127.0.0.1:8097
+  NAKSHATRA_LEDGER_KEYID        optional roster id for the node key (default: public-key hex)
   NAKSHATRA_LEDGER_REQUESTER    who is consuming (default "self" = Prithvi; an operator id for outsiders)
   NAKSHATRA_LEDGER_TIMEOUT      seconds (default 2)
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import os
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
+
+import nakshatra_auth
+
+
+_LOG = logging.getLogger(__name__)
 
 
 def _truthy(v: str) -> bool:
@@ -35,12 +45,25 @@ class LedgerHook:
     def __init__(self):
         self.enabled = _truthy(os.environ.get("NAKSHATRA_CREDITS", ""))
         self.enforce = _truthy(os.environ.get("NAKSHATRA_CREDITS_ENFORCE", ""))
-        self.url = os.environ.get("NAKSHATRA_LEDGER_URL", "http://127.0.0.1:8093").rstrip("/")
+        self.url = os.environ.get("NAKSHATRA_LEDGER_URL", "http://127.0.0.1:8097").rstrip("/")
         self.requester = os.environ.get("NAKSHATRA_LEDGER_REQUESTER", "self")
+        self._private_key = None
+        self.keyid = None
+        self._last_signature_refusal_log = None
+        self._rejected_receipts = set()
         try:
             self.timeout = float(os.environ.get("NAKSHATRA_LEDGER_TIMEOUT", "2") or 2)
         except ValueError:
             self.timeout = 2.0
+        if self.enabled:
+            try:
+                self._private_key, public_key_hex = nakshatra_auth.load_worker_key()
+                self.keyid = (
+                    os.environ.get("NAKSHATRA_LEDGER_KEYID", "").strip()
+                    or public_key_hex
+                )
+            except Exception as exc:  # noqa: BLE001 - accounting must remain fail-open
+                _LOG.warning("ledger signing key unavailable (%s); fail-open", exc)
 
     @property
     def wants_receipt(self) -> bool:
@@ -48,13 +71,26 @@ class LedgerHook:
 
     def gate(self, est_cost: int):
         """Return (allow: bool, reason: str). Allows when disabled, on any error (fail-open), or
-        when the ledger says yes / enforcement is off. Denies ONLY when enabled+enforce+denied."""
+        when the ledger says yes / legacy enforcement is off. An explicit v2 402 denies."""
         if not self.enabled:
             return True, ""
+        if self._private_key is None:
+            return True, "ledger signing key unavailable; fail-open"
         try:
             q = urllib.parse.urlencode({"account": self.requester, "cost": int(est_cost)})
             r = self._get(f"/can_consume?{q}")
             ok = bool(r.get("ok"))
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                self._log_signature_refusal()
+                return True, "ledger refused signature; fail-open"
+            if e.code == 402:
+                detail = self._http_error_json(e)
+                return False, (
+                    f"insufficient credits (balance {detail.get('balance')}, "
+                    f"cost {int(est_cost)})"
+                )
+            return True, f"ledger HTTP {e.code}; fail-open"
         except Exception as e:
             return True, f"ledger unreachable ({e}); fail-open"
         if ok:
@@ -66,11 +102,14 @@ class LedgerHook:
     def settle(self, receipt_path: str):
         """Credit the workers from a #20 run receipt. Fail-open: a settle failure NEVER affects
         the served reply. Returns the delta dict or None."""
-        if not self.enabled:
+        if not self.enabled or self._private_key is None:
             return None
         try:
             with open(receipt_path) as f:
                 receipt = json.load(f)
+            receipt_id = self._receipt_id(receipt)
+            if receipt_id in self._rejected_receipts:
+                return None
             body = {"receipt": receipt, "requester": self.requester}
             own = self._own_nodes(receipt)
             if own:
@@ -104,9 +143,43 @@ class LedgerHook:
                 body["participation_problems"] = [f"roster unusable: {e}"]
             except ImportError:
                 pass                      # identity_binding/roster absent — legacy deployment
-            return self._post("/settle", body)
+            try:
+                return self._post("/settle", body)
+            except urllib.error.HTTPError as e:
+                if e.code == 401:
+                    self._log_signature_refusal()
+                elif e.code in (409, 422):
+                    self._rejected_receipts.add(receipt_id)
+                    outcome = "disputed" if e.code == 409 else "forged"
+                    _LOG.warning(
+                        "ledger rejected %s receipt (%d); will not retry receipt %s",
+                        outcome, e.code, receipt_id,
+                    )
+                return None
         except Exception:
             return None
+
+    @staticmethod
+    def _receipt_id(receipt: dict) -> str:
+        canonical = json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode()
+        return hashlib.sha256(canonical).hexdigest()
+
+    @staticmethod
+    def _http_error_json(error: urllib.error.HTTPError) -> dict:
+        try:
+            value = json.loads(error.read())
+            return value if isinstance(value, dict) else {}
+        except Exception:
+            return {}
+
+    def _log_signature_refusal(self) -> None:
+        now = time.monotonic()
+        if (
+            self._last_signature_refusal_log is None
+            or now - self._last_signature_refusal_log >= 60.0
+        ):
+            _LOG.warning("ledger refused signature (keyid %s)", self.keyid)
+            self._last_signature_refusal_log = now
 
     def _own_nodes(self, receipt):
         """Which serving nodes belong to the requester (→ free). NAKSHATRA_LEDGER_OWN_ALL=1 treats
@@ -119,11 +192,30 @@ class LedgerHook:
 
     # ---- transport ----
     def _get(self, path: str):
-        with urllib.request.urlopen(self.url + path, timeout=self.timeout) as r:
+        authorization, _ = nakshatra_auth.build_signed_envelope(
+            self._private_key, self.keyid, "GET", path, b""
+        )
+        req = urllib.request.Request(
+            self.url + path,
+            headers={"Authorization": authorization},
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=self.timeout) as r:
             return json.loads(r.read())
 
     def _post(self, path: str, obj: dict):
-        req = urllib.request.Request(self.url + path, data=json.dumps(obj).encode(),
-                                     headers={"Content-Type": "application/json"}, method="POST")
+        raw = json.dumps(obj).encode()
+        authorization, _ = nakshatra_auth.build_signed_envelope(
+            self._private_key, self.keyid, "POST", path, raw
+        )
+        req = urllib.request.Request(
+            self.url + path,
+            data=raw,
+            headers={
+                "Authorization": authorization,
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
         with urllib.request.urlopen(req, timeout=self.timeout) as r:
             return json.loads(r.read())
