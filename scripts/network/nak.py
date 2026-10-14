@@ -146,6 +146,35 @@ def _stage_worker(redeem: str, tier: str, http_post, *, now: int | None = None) 
     return {"redeem": redeem.rstrip("/"), "code": code, "tier": tier}, expires_at
 
 
+def _stage_consumer(redeem: str, tier: str, starter: int, inviter_pubkey: str,
+                    http_post, *, now: int | None = None) -> tuple[dict, int]:
+    """Stage consumer admission; the server records (but does not execute) any starter transfer."""
+    staged_at = int(time.time() if now is None else now)
+    try:
+        parsed = urlsplit(redeem)
+        host, port = parsed.hostname, parsed.port
+        authority = parsed.netloc.rsplit("@", 1)[-1]
+    except (TypeError, ValueError):
+        parsed = host = port = authority = None
+    if parsed is None or parsed.scheme not in {"http", "https"} or not host or authority.endswith(":") or \
+            (port is not None and not 1 <= port <= 65535):
+        raise SystemExit("consumer redeem URL must be an http(s) base URL")
+    if type(starter) is not int or not 0 <= starter <= 10**12:
+        raise SystemExit("--starter must be an integer between 0 and 1000000000000")
+    result = http_post(redeem.rstrip("/") + "/consumer-stage", {
+        "token": _onboard_token(), "tier": tier, "starter": starter,
+        "inviter_pubkey": inviter_pubkey,
+    })
+    code = result.get("code") if isinstance(result, dict) else None
+    if not isinstance(code, str) or not code.strip() or len(code) > 64:
+        raise SystemExit("onboard server returned an invalid consumer code")
+    expires_at = result.get("expires_at", staged_at + 3600)
+    if isinstance(expires_at, bool) or not isinstance(expires_at, int) or expires_at <= staged_at:
+        raise SystemExit("onboard server returned an invalid consumer code expiry")
+    return {"redeem": redeem.rstrip("/"), "code": code, "tier": tier,
+            "starter": starter}, expires_at
+
+
 def _p2p_installer(_sp, action: str) -> None:
     """Ask the signed release's installer to operate on exactly the P2P sidecar service."""
     prefix = Path(os.environ.get("NAK_NODE_PREFIX", Path.home() / ".nakshatra-node"))
@@ -710,10 +739,13 @@ def main(argv=None, *, http_post=None) -> int:
     p.add_argument("--release-url", default="", help="where newcomers download Nakshatra (default: this node's source)")
     p.add_argument("--code-only", action="store_true", help="print just the invite code")
     p.add_argument("--from", dest="from_name", default="", help="your name as your friend will see it (remembered)")
-    p.add_argument("--kind", choices=["contact", "worker"], default="contact")
+    p.add_argument("--kind", choices=["contact", "worker", "consumer"], default="contact")
     p.add_argument("--tier", choices=["stranger", "known", "trusted"], default="known",
-                   help="worker trust tier (self is never granted by an invite)")
-    p.add_argument("--redeem", default=DEFAULT_ONBOARD_BASE, help="onboard server base URL for a worker invite")
+                   help="worker/consumer trust tier (self is never granted by an invite)")
+    p.add_argument("--starter", type=int, default=0,
+                   help="consumer starter credits requested from the inviter (default: 0)")
+    p.add_argument("--redeem", default=DEFAULT_ONBOARD_BASE,
+                   help="onboard server base URL for a worker or consumer invite")
     p = sub.add_parser("redeem"); p.add_argument("code"); p.add_argument("--nickname", default="")
     p.add_argument("--as", dest="petname", default="")
     p = sub.add_parser("worker-redeem", help="retry the stored worker admission while its code is valid")
@@ -831,6 +863,8 @@ def main(argv=None, *, http_post=None) -> int:
     elif a.cmd == "invite":
         import joincode
         from cryptography.hazmat.primitives.asymmetric import ed25519
+        if a.kind != "consumer" and a.starter:
+            raise SystemExit("--starter is only valid with --kind consumer")
         http_post = http_post or _http_post_json
         st = call(s, {"op": "status"})
         priv = ed25519.Ed25519PrivateKey.from_private_bytes(bytes.fromhex(a.person_key.read_text().strip()))
@@ -843,23 +877,30 @@ def main(argv=None, *, http_post=None) -> int:
             print("tip: add --from <your name> so your friend sees who invited them (remembered after once)",
                   file=sys.stderr)
         issued_at = int(time.time())
-        worker, staged_expiry = _stage_worker(a.redeem, a.tier, http_post, now=issued_at) \
-            if a.kind == "worker" else (None, issued_at + a.ttl)
+        worker = consumer = None
+        if a.kind == "worker":
+            worker, staged_expiry = _stage_worker(a.redeem, a.tier, http_post, now=issued_at)
+        elif a.kind == "consumer":
+            consumer, staged_expiry = _stage_consumer(
+                a.redeem, a.tier, a.starter, st["node"], http_post, now=issued_at)
+        else:
+            staged_expiry = issued_at + a.ttl
         expires_at = min(issued_at + a.ttl, staged_expiry)
         code = joincode.encode_invite(priv, st["node"], [{"node": st["node"], "addrs": [st["relay"]]}],
                                       ttl_s=expires_at - issued_at, now=issued_at, note=a.note,
                                       release=release, from_name=from_name,
-                                      kind=a.kind, worker=worker)
+                                      kind=a.kind, worker=worker, consumer=consumer)
         call(s, {"op": "register_invite", "code": code})
         if a.code_only or not line:
             print(code)
-            if a.kind == "worker":
-                print("worker invite expires at " +
+            if a.kind in {"worker", "consumer"}:
+                print(f"{a.kind} invite expires at " +
                       f"{time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(expires_at))} "
                       f"(Unix {expires_at})", file=sys.stderr)
         else:
             expiry = (f"expires at {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(expires_at))} "
-                      f"(Unix {expires_at})" if a.kind == "worker" else f"expires in {a.ttl // 3600}h")
+                      f"(Unix {expires_at})" if a.kind in {"worker", "consumer"}
+                      else f"expires in {a.ttl // 3600}h")
             print(f"Send your friend this ONE line (single use, {expiry}; it is a secret — only them):\n",
                   file=sys.stderr)
             print(line.replace("{CODE}", code))

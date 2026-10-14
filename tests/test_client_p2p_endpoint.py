@@ -103,6 +103,16 @@ def test_unrostered_activation_worker_is_rejected_before_forward():
                 eligible_fn=_eligible_at("stranger"))
 
 
+def test_consumer_roster_identity_is_never_admitted_as_activation_worker():
+    roster = {PUBKEY: {"tier": "trusted", "tenant": "outside", "role": "consumer"}}
+    with patch.object(cli, "_registry_urlopen",
+                      side_effect=_pillar_open([_peer()], [_chain_entry()])):
+        with pytest.raises(PermissionError, match="not admitted"):
+            cli.build_chain_from_registry(
+                "http://pillar", "public-model", roster_loader=lambda: roster,
+                eligible_fn=_eligible_at("stranger"))
+
+
 def test_worker_claimed_tier_cannot_override_operator_roster():
     # Pillar says tier=self, but the operator roster says stranger.  A trusted
     # model must reject it.

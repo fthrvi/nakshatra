@@ -69,6 +69,23 @@ setup remains complete and the box can retry while the code is valid:
 Worker execution itself still uses the existing `worker.sh` runtime until phase B; phase A unifies
 the signed invite, installer, admission proof, and node key.
 
+## Using the network without serving
+
+An operator can invite a laptop or harness as a consumer. It receives a ledger identity but is
+never advertised, planned, or summoned as an inference worker:
+
+    nak invite --kind consumer --tier known --starter 0 --note "laptop"
+
+`known` is the default tier; `self` cannot be granted by an invite. `--starter N` is optional and
+defaults to zero. A nonzero starter is not minted during onboarding: redeem records a pending
+request for the hub to transfer `N` credits from the inviter's ledger operator to the new consumer.
+The ledger applies its normal balance and overdraft checks when that signed transfer is wired.
+
+The consumer proves possession of its node key during redeem, but reports no GPU capabilities and
+opens no worker port. Its roster row is marked `consumer`, so registrar, planner, and activation
+admission paths exclude it. It may run the loopback gateway and harnesses without serving model
+layers; gateway commands are documented with the gateway feature itself.
+
 ## What each side can see
 
 | Who | Sees |

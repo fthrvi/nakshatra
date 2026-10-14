@@ -138,6 +138,18 @@ def test_heartbeat_posts_inventory_and_a_signature_over_the_exact_body(tmp_path,
                                          int(match.group(2)), match.group(1))
 
 
+def test_consumer_roster_role_skips_capacity_registration(tmp_path, monkeypatch):
+    config = _config(tmp_path)
+    called = []
+    monkeypatch.setattr(registrar.urllib.request, "urlopen", lambda *a, **k: called.append(a))
+    result = registrar.heartbeat_once(
+        config, b"x" * 32, "ab" * 32,
+        roster_loader=lambda: {"ab" * 32: {"tier": "known", "role": "consumer"}},
+    )
+    assert result == ("skipped", 0.0, "consumer")
+    assert called == []
+
+
 def test_gpu_and_network_are_mocked_in_heartbeat_test(tmp_path, monkeypatch):
     """A regression guard: the complete heartbeat path does not need this machine's GPU/network."""
     config = _config(tmp_path)
@@ -284,4 +296,3 @@ def test_rocm_vram_falls_back_to_amdgpu_sysfs(tmp_path, monkeypatch):
     config = _config(tmp_path, NKS_GPU_BACKEND="rocm")
     free, total, _model, backend = registrar._gpu(config)
     assert backend == "rocm" and round(total) == 20 and round(free) == 1
-

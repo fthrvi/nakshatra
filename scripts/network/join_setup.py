@@ -133,6 +133,43 @@ def redeem_worker_invite(home: Path, code: str, name: str, *, http_post=None,
     return result
 
 
+def redeem_consumer_invite(home: Path, code: str, name: str, *, http_post=None,
+                           now: int | None = None) -> dict:
+    """Redeem consumer admission with the worker-v2 node-key proof, but no worker probes."""
+    import joincode
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+    try:
+        inv = joincode.decode_invite(code, now=now)
+    except ValueError as e:
+        raise WorkerRedeemError(str(e))
+    if inv.get("kind", "contact") != "consumer":
+        raise WorkerRedeemError("invite is not a consumer invite")
+    node_key = home / ".nakshatra" / "keys" / "worker.ed25519"
+    try:
+        priv = ed25519.Ed25519PrivateKey.from_private_bytes(node_key.read_bytes())
+    except (OSError, ValueError) as e:
+        raise WorkerRedeemError(f"could not read the node key at {node_key}: {e}")
+    body = {"v": 2, "code": inv["consumer"]["code"],
+            "pubkey": priv.public_key().public_bytes_raw().hex(), "name": name[:40],
+            # Redeem v2 deliberately keeps one proof schema. Empty means this identity offers no compute.
+            "capabilities": {}, "ts": int(now if now is not None else time.time())}
+    canonical = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    body["sig"] = priv.sign(canonical).hex()
+    try:
+        result = (http_post or _http_post_json)(
+            inv["consumer"]["redeem"].rstrip("/") + "/consumer-redeem", body)
+    except WorkerRedeemError:
+        raise
+    except (HTTPException, OSError, URLError, ValueError) as e:
+        raise WorkerRedeemError(f"could not reach the onboard server: {e}")
+    if not isinstance(result, dict) or result.get("role") != "consumer" or \
+            not isinstance(result.get("tier"), str) or not isinstance(result.get("operator"), str):
+        raise WorkerRedeemError("onboard server returned no consumer standing")
+    if result["tier"] != inv["consumer"]["tier"]:
+        raise WorkerRedeemError("onboard server returned a different tier than the signed invite")
+    return result
+
+
 def retry_worker_redeem(home: Path, *, name: str = "", http_post=None) -> dict:
     """CLI entry point: retry the persisted invite and delete it only after admission succeeds."""
     try:
@@ -256,6 +293,17 @@ def main(argv=None) -> int:
         else:
             retry_path.unlink()
             print(f"worker standing: tier {standing['tier']}, junction {standing['junction']}")
+    elif inv.get("kind", "contact") == "consumer":
+        try:
+            standing = redeem_consumer_invite(a.home, a.invite, a.name)
+        except WorkerRedeemError as e:
+            print(f"\nconsumer redeem failed: {e}", file=sys.stderr)
+            print("contact setup is complete; paste the signed join line again while its code is valid.",
+                  file=sys.stderr)
+        else:
+            starter = int(inv["consumer"].get("starter", 0))
+            suffix = f"; starter request {starter} pending hub transfer" if starter else ""
+            print(f"consumer standing: tier {standing['tier']}, operator {standing['operator']}{suffix}")
     print("\nnext:")
     print("  1. ask your friend to accept you (they run: nak requests, then nak accept <id>)")
     print("  2. check:  nak contacts      (shows them as active once they accept)")

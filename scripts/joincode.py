@@ -98,9 +98,10 @@ from urllib.parse import urlsplit
 
 INVITE_PREFIX = "nki1."
 _INVITE_KEYS = {"v", "inviter", "inviter_node", "peers", "nonce", "expires_at", "scope", "note", "ik", "release",
-                "from_name", "kind", "worker", "sig"}
+                "from_name", "kind", "worker", "consumer", "sig"}
 _MAX_INVITE_LEN = 8192
 _WORKER_TIERS = {"stranger", "known", "trusted"}
+_MAX_STARTER = 10**12
 
 
 def _canon(obj: dict) -> bytes:
@@ -134,28 +135,38 @@ def _valid_worker_redeem_url(value: object) -> bool:
 def _validate_invite_kind(inv: dict) -> None:
     """Validate the U4 discriminator while treating pre-U4 invites as contacts."""
     kind = inv.get("kind", "contact")
-    if kind not in {"contact", "worker"}:
+    if kind not in {"contact", "worker", "consumer"}:
         raise ValueError("invite kind is unsupported")
     if kind == "contact":
         if "worker" in inv:
             raise ValueError("contact invite must not contain worker details")
+        if "consumer" in inv:
+            raise ValueError("contact invite must not contain consumer details")
         return
-    worker = inv.get("worker")
-    if not isinstance(worker, dict) or set(worker) != {"redeem", "code", "tier"}:
-        raise ValueError("worker invite details are malformed")
-    redeem, code, tier = worker.get("redeem"), worker.get("code"), worker.get("tier")
+    detail_key = kind
+    other_key = "consumer" if kind == "worker" else "worker"
+    if other_key in inv:
+        raise ValueError(f"{kind} invite must not contain {other_key} details")
+    details = inv.get(detail_key)
+    expected = {"redeem", "code", "tier"} | ({"starter"} if kind == "consumer" else set())
+    if not isinstance(details, dict) or set(details) != expected:
+        raise ValueError(f"{kind} invite details are malformed")
+    redeem, code, tier = details.get("redeem"), details.get("code"), details.get("tier")
     if not _valid_worker_redeem_url(redeem):
-        raise ValueError("worker redeem URL must be http(s)")
+        raise ValueError(f"{kind} redeem URL must be http(s)")
     if not isinstance(code, str) or not code.strip() or len(code) > 64:
-        raise ValueError("worker invite code is malformed")
+        raise ValueError(f"{kind} invite code is malformed")
     if tier not in _WORKER_TIERS:
-        raise ValueError("worker invite tier is malformed")
+        raise ValueError(f"{kind} invite tier is malformed")
+    if kind == "consumer" and (type(details.get("starter")) is not int or
+                               not 0 <= details["starter"] <= _MAX_STARTER):
+        raise ValueError("consumer starter is malformed")
 
 
 def encode_invite(person_priv, inviter_node: str, peers: list, *, ttl_s: int = 86400,
                   scope: str = "member", note: str = "", now: int | None = None,
                   release: dict | None = None, from_name: str = "", kind: str = "contact",
-                  worker: dict | None = None) -> str:
+                  worker: dict | None = None, consumer: dict | None = None) -> str:
     """person_priv: a cryptography Ed25519PrivateKey (the inviter's person key).
     peers: [{"node": <node pub hex>, "addrs": ["host:port", ...]}, ...] to dial first."""
     now = int(now if now is not None else _time.time())
@@ -180,6 +191,8 @@ def encode_invite(person_priv, inviter_node: str, peers: list, *, ttl_s: int = 8
         inv["kind"] = kind
     if worker is not None:
         inv["worker"] = dict(worker)
+    if consumer is not None:
+        inv["consumer"] = dict(consumer)
     _validate_invite_kind(inv)
     inv["sig"] = {"alg": "Ed25519", "keyid": inviter[:16],
                   "value": base64.b64encode(person_priv.sign(_canon(inv))).decode("ascii")}

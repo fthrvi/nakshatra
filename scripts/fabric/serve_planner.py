@@ -196,6 +196,8 @@ def standings_from_roster(*, roster_loader: Optional[Callable[[], dict]] = None)
     peers = roster_loader() or {}
     standings = []
     for pub, p in peers.items():
+        if p.get("role", "worker") == "consumer":
+            continue
         coord = p.get("coord") or ""
         addr, _, port = coord.partition(":")
         standings.append(wj.WorkerStanding(

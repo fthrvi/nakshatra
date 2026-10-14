@@ -54,6 +54,10 @@ def test_installer_verifies_invites_without_cryptography(net):
     worker = _invite(a, kind="worker", worker={
         "redeem": "https://onboard.example/base", "code": "one-time", "tier": "trusted"})
     assert I.parse_invite(worker)["worker"]["tier"] == "trusted"
+    consumer = _invite(a, kind="consumer", consumer={
+        "redeem": "https://onboard.example/base", "code": "one-time",
+        "tier": "known", "starter": 50})
+    assert I.parse_invite(consumer)["consumer"]["starter"] == 50
     with pytest.raises(I.InstallError, match="unexpected worker details"):
         I.parse_invite(_resign_invite(a, code, worker=None))
     for redeem in ("http:///missing-host", "http://host:bad", "http://host:0", "http://host:65536",
@@ -189,6 +193,74 @@ def test_nak_worker_invite_stages_code_with_injected_http(tmp_path, monkeypatch,
     assert registered == [code]
 
 
+def test_nak_consumer_invite_stages_signed_starter_request(tmp_path, monkeypatch, capsys):
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+    person = ed25519.Ed25519PrivateKey.generate()
+    person_path = tmp_path / "person.key"
+    person_path.write_text(person.private_bytes_raw().hex())
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("NAK_NET_DIR", str(tmp_path / "net"))
+    monkeypatch.setenv("NAK_ONBOARD_TOKEN", "operator-secret")
+    monkeypatch.setattr(nak, "_release_for_invite", lambda _url="": (REL, ""))
+    registered = []
+
+    def fake_call(_sock, req):
+        if req["op"] == "status":
+            return {"node": "a" * 64, "relay": "relay.example:51820"}
+        registered.append(req["code"])
+        return {}
+
+    posted = []
+
+    def fake_post(url, body):
+        posted.append((url, body))
+        return {"code": "consumer-once", "expires_at": 1600}
+
+    monkeypatch.setattr(nak, "call", fake_call)
+    monkeypatch.setattr(nak.time, "time", lambda: 1000)
+    assert nak.main(["invite", "--person-key", str(person_path), "--kind", "consumer",
+                     "--tier", "known", "--starter", "1234",
+                     "--redeem", "https://onboard.example/base", "--code-only"],
+                    http_post=fake_post) == 0
+    output = capsys.readouterr()
+    code = output.out.strip()
+    inv = joincode.decode_invite(code, now=1001)
+    assert posted == [("https://onboard.example/base/consumer-stage", {
+        "token": "operator-secret", "tier": "known", "starter": 1234,
+        "inviter_pubkey": "a" * 64,
+    })]
+    assert inv["consumer"] == {"redeem": "https://onboard.example/base",
+                               "code": "consumer-once", "tier": "known", "starter": 1234}
+    assert inv["expires_at"] == 1600 and "consumer invite expires" in output.err
+    assert registered == [code]
+
+
+def test_consumer_redeem_uses_node_key_proof_without_worker_capabilities(net, tmp_path):
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+    a = net("inviter")
+    code = _invite(a, kind="consumer", consumer={
+        "redeem": "https://onboard.example/base", "code": "consumer-once",
+        "tier": "known", "starter": 0})
+    identity = join_setup.ensure_identity(tmp_path)
+    seen = {}
+
+    def fake_post(url, body):
+        seen.update(url=url, body=body)
+        unsigned = {k: v for k, v in body.items() if k != "sig"}
+        canonical = json.dumps(unsigned, sort_keys=True, separators=(",", ":"),
+                               ensure_ascii=False).encode()
+        ed25519.Ed25519PublicKey.from_public_bytes(bytes.fromhex(body["pubkey"])).verify(
+            bytes.fromhex(body["sig"]), canonical)
+        return {"tier": "known", "operator": "op-consumer", "role": "consumer"}
+
+    result = join_setup.redeem_consumer_invite(
+        tmp_path, code, "Laptop", http_post=fake_post, now=int(time.time()))
+    assert result["operator"] == "op-consumer"
+    assert seen["url"] == "https://onboard.example/base/consumer-redeem"
+    assert seen["body"]["pubkey"] == identity["node"]
+    assert seen["body"]["capabilities"] == {}
+
+
 def test_worker_stage_expiry_defaults_to_one_hour_and_rejects_bad_urls(monkeypatch):
     monkeypatch.setenv("NAK_ONBOARD_TOKEN", "operator-secret")
     worker, expires_at = nak._stage_worker(
@@ -197,6 +269,11 @@ def test_worker_stage_expiry_defaults_to_one_hour_and_rejects_bad_urls(monkeypat
     for url in ("http:///missing-host", "http://host:bad", "http://host:0", "http://host:65536", "http://host:"):
         with pytest.raises(SystemExit, match=r"http\(s\)"):
             nak._stage_worker(url, "known", lambda _url, _body: {"code": "never"}, now=1000)
+
+
+def test_starter_is_rejected_for_non_consumer_invites():
+    with pytest.raises(SystemExit, match="only valid"):
+        nak.main(["invite", "--kind", "worker", "--starter", "1"])
 
 
 def test_worker_token_file_must_be_0600(tmp_path, monkeypatch):

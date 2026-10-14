@@ -130,12 +130,15 @@ def test_standings_from_roster():
                     "tier": "self", "tenant": "home", "coord": "127.0.0.1:5540"},
         "pk-strange": {"pubkey": "pk-strange", "name": "opB-gpu", "operator": "opB",
                        "tier": "stranger", "tenant": "opB", "coord": "10.50.0.9:5540"},
+        "pk-consumer": {"pubkey": "pk-consumer", "name": "laptop", "operator": "opB",
+                        "tier": "trusted", "tenant": "opB", "coord": "-", "role": "consumer"},
     }
     standings = sp.standings_from_roster(roster_loader=lambda: roster)
     by = {s.node_id: s for s in standings}
     assert by["prithvi-self"].tier == "self"
     assert by["prithvi-self"].capabilities == {"address": "127.0.0.1", "port": 5540}
     assert by["opB-gpu"].capabilities["address"] == "10.50.0.9"
+    assert "laptop" not in by
     # firewall still applies end-to-end through the roster bridge
     plan = sp.plan_chain("prithvi-private", standings, num_layers=16, hidden_size=4096,
                          min_tier_fn=MT, rank=RANK)

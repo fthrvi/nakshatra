@@ -899,8 +899,10 @@ def _admit_activation_workers(model_id: str, workers: list[dict],
                 f"identity firewall: SPKI mismatch for activation peer {node_id!r}")
         hop["peer_spki_hash"] = registered_spki
         roster_peer = roster.get(pubkey)
+        worker_role = (roster_peer or {}).get("role", "worker")
         standing = wj.WorkerStanding(
-            node_id=node_id, pubkey=pubkey, admitted=roster_peer is not None,
+            node_id=node_id, pubkey=pubkey,
+            admitted=roster_peer is not None and worker_role != "consumer",
             tier=(roster_peer or {}).get("tier", "denied"),
             tenant=(roster_peer or {}).get("tenant"), capabilities={})
         standings.append(standing)

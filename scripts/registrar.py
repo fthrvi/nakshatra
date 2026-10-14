@@ -342,8 +342,26 @@ def build_payload(config: RegistrarConfig, public_key_hex: str) -> dict:
     }
 
 
-def heartbeat_once(config: RegistrarConfig, private_key: bytes, public_key_hex: str):
+def _roster_role(public_key_hex: str, roster_loader=None) -> str:
+    """Return this key's admission role; old five/six-column rosters default to worker."""
+    try:
+        if roster_loader is None:
+            from fabric import worker_join
+            roster_loader = worker_join._load_admission().load_peers  # noqa: SLF001
+        roster = roster_loader() or {}
+        peer = roster.get(public_key_hex) or roster.get(public_key_hex.lower()) or {}
+        return peer.get("role", "worker")
+    except Exception:
+        # The registrar predates role-bearing rosters. An unavailable roster keeps legacy workers alive;
+        # consumer setup never enables the registrar, and an explicit consumer row always wins above.
+        return "worker"
+
+
+def heartbeat_once(config: RegistrarConfig, private_key: bytes, public_key_hex: str,
+                   *, roster_loader=None):
     """Build, sign, and POST one heartbeat.  Returns status/offered/model."""
+    if _roster_role(public_key_hex, roster_loader=roster_loader) == "consumer":
+        return ("skipped", 0.0, "consumer")
     payload = build_payload(config, public_key_hex)
     raw = json.dumps(payload).encode()
     auth_header, _ = na.build_signed_envelope(

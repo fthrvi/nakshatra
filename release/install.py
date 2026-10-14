@@ -987,24 +987,32 @@ def parse_invite(code: str, now=None) -> dict:
         raise InstallError("the invite has expired: ask your friend for a new one")
     kind = inv.get("kind", "contact")
     worker = inv.get("worker")
-    if kind not in {"contact", "worker"}:
+    consumer = inv.get("consumer")
+    if kind not in {"contact", "worker", "consumer"}:
         raise InstallError("the invite kind is not supported by this installer")
     if kind == "contact" and "worker" in inv:
         raise InstallError("the contact invite contains unexpected worker details")
-    if kind == "worker":
-        if not isinstance(worker, dict) or set(worker) != {"redeem", "code", "tier"}:
-            raise InstallError("the worker invite details are malformed")
+    if kind == "contact" and "consumer" in inv:
+        raise InstallError("the contact invite contains unexpected consumer details")
+    if kind in {"worker", "consumer"}:
+        details = worker if kind == "worker" else consumer
+        expected = {"redeem", "code", "tier"} | ({"starter"} if kind == "consumer" else set())
+        if not isinstance(details, dict) or set(details) != expected or \
+                (kind == "worker" and "consumer" in inv) or (kind == "consumer" and "worker" in inv):
+            raise InstallError(f"the {kind} invite details are malformed")
         try:
-            redeem = urlsplit(worker.get("redeem"))
+            redeem = urlsplit(details.get("redeem"))
             host, port = redeem.hostname, redeem.port
             authority = redeem.netloc.rsplit("@", 1)[-1]
         except (TypeError, ValueError):
             redeem = host = port = authority = None
         if redeem is None or redeem.scheme not in {"http", "https"} or not host or \
                 authority.endswith(":") or (port is not None and not 1 <= port <= 65535) or \
-                not isinstance(worker.get("code"), str) or not worker["code"].strip() or \
-                len(worker["code"]) > 64 or worker.get("tier") not in {"stranger", "known", "trusted"}:
-            raise InstallError("the worker invite details are malformed")
+                not isinstance(details.get("code"), str) or not details["code"].strip() or \
+                len(details["code"]) > 64 or details.get("tier") not in {"stranger", "known", "trusted"} or \
+                (kind == "consumer" and (type(details.get("starter")) is not int or
+                                         not 0 <= details["starter"] <= 10**12)):
+            raise InstallError(f"the {kind} invite details are malformed")
     rel = inv.get("release")
     if not isinstance(rel, dict) or not all(isinstance(rel.get(k), str) for k in ("url", "channel", "pubkey")):
         raise InstallError("the invite does not say where to get Nakshatra (your friend's node is too old)")

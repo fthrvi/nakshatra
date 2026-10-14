@@ -259,6 +259,29 @@ class TestSignedInvite:
         with pytest.raises(ValueError, match="signature does not verify"):
             decode_invite(_reencode(inv), now=1001)
 
+    def test_consumer_round_trip_and_starter_is_signed(self):
+        k, _ = _person()
+        consumer = {"redeem": "https://onboard.example/base", "code": "one-time",
+                    "tier": "known", "starter": 1234}
+        inv = decode_invite(encode_invite(
+            k, _NODE, _PEERS, kind="consumer", consumer=consumer, now=1000), now=1001)
+        assert inv["kind"] == "consumer" and inv["consumer"] == consumer
+        inv["consumer"]["starter"] += 1
+        with pytest.raises(ValueError, match="signature does not verify"):
+            decode_invite(_reencode(inv), now=1001)
+
+    @pytest.mark.parametrize("consumer,reason", [
+        (None, "details"),
+        ({"redeem": "file:///tmp/x", "code": "c", "tier": "known", "starter": 0}, "http"),
+        ({"redeem": "https://x", "code": "c", "tier": "self", "starter": 0}, "tier"),
+        ({"redeem": "https://x", "code": "c", "tier": "known", "starter": -1}, "starter"),
+        ({"redeem": "https://x", "code": "c", "tier": "known", "starter": True}, "starter"),
+    ])
+    def test_consumer_shape_is_strict(self, consumer, reason):
+        k, _ = _person()
+        with pytest.raises(ValueError, match=reason):
+            encode_invite(k, _NODE, _PEERS, kind="consumer", consumer=consumer, now=1000)
+
     @pytest.mark.parametrize("kind,worker,reason", [
         ("device", None, "kind"),
         ("contact", {"redeem": "https://x", "code": "c", "tier": "known"}, "must not"),
