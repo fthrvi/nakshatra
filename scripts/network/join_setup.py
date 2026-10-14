@@ -293,6 +293,11 @@ def start_services(sock: Path, timeout_s: float = 90) -> None:
     raise SystemExit("the messaging service did not come up; see: journalctl --user -u nak-net -n 30")
 
 
+def _mcp_command() -> str:
+    """Return the command the user's host-side AI client can actually execute."""
+    return "nakc mcp" if os.environ.get("NAK_CONTAINER") == "1" else "~/.local/bin/nak-mcp"
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Nakshatra join setup (run by install.py join)")
     ap.add_argument("--invite", required=True)
@@ -344,9 +349,10 @@ def main(argv=None) -> int:
     print("  1. ask your friend to accept you (they run: nak requests, then nak accept <id>)")
     print("  2. check:  nak contacts      (shows them as active once they accept)")
     print(f"  3. talk:   nak send '{r.get('name') or '<their name>'}' \"hello\"     ·   nak inbox")
+    mcp_command = _mcp_command()
     print("  4. plug in your AI (optional):")
-    print("       OpenClaw: openclaw mcp add nakshatra --command ~/.local/bin/nak-mcp && openclaw config set tools.toolSearch false")
-    print("       Hermes:   add an mcp_servers entry with command ~/.local/bin/nak-mcp")
+    print(f"       OpenClaw: openclaw mcp add nakshatra --command '{mcp_command}' && openclaw config set tools.toolSearch false")
+    print(f"       Hermes:   add an mcp_servers entry with command {mcp_command}")
     print(f"\nyou are {done['person'][:16]}… on node {done['node'][:16]}… — your person key is a TEST file at "
           f"~/.sthambha/person-TEST.key: back it up, and never share it.")
     return 0

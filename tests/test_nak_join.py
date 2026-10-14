@@ -109,6 +109,7 @@ def test_join_end_to_end_request_reaches_the_inviter(net, tmp_path, monkeypatch,
     assert join_setup.main(["--invite", code, "--name", "Rajesh", "--home", str(home)]) == 0
     out = capsys.readouterr().out
     assert "request sent" in out and "nak accept" in out and "appears here as 'Biswa'" in out
+    assert "~/.local/bin/nak-mcp" in out and "nakc mcp" not in out
     c = node.store.contact(a.person_pub)
     assert c["petname"] == "Biswa" and c["name_src"] == "self-chosen"          # NOT the note "for rajesh"
     reqs = a.node.store.requests()
@@ -116,6 +117,14 @@ def test_join_end_to_end_request_reaches_the_inviter(net, tmp_path, monkeypatch,
     a.node.accept(reqs[0]["id"], petname="rajesh")
     assert wait(lambda: (node.store.contact(a.person_pub) or {}).get("state") == "active")
     stop.set(); node.stop()
+
+
+def test_join_next_steps_use_the_host_nakc_wrapper_inside_container(monkeypatch):
+    monkeypatch.setenv("NAK_CONTAINER", "1")
+    assert join_setup._mcp_command() == "nakc mcp"
+
+    monkeypatch.delenv("NAK_CONTAINER")
+    assert join_setup._mcp_command() == "~/.local/bin/nak-mcp"
 
 
 def test_invite_line_checks_the_installer_fingerprint_before_running_it(tmp_path, monkeypatch):

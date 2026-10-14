@@ -85,6 +85,7 @@ def test_gateway_on_writes_loopback_enforced_opt_in(tmp_path, monkeypatch):
     assert "NAKSHATRA_CHAIN_TLS_MODE=required" in body
     assert "NAKSHATRA_LEDGER_REQUESTER" not in body
     assert (home / ".nakshatra" / "inference.env").is_file()
+    assert (home / ".nakshatra" / "gateway" / "inference-profile-created").is_file()
     assert calls == ["enable"]
 
 
@@ -94,6 +95,23 @@ def test_gateway_auto_requires_package_provenance(tmp_path, monkeypatch):
 
     with pytest.raises(SystemExit, match="package-url"):
         nak._gateway_on(object(), _args(package_url=None, package_pubkey=None))
+
+
+def test_gateway_enable_failure_rolls_back_created_profile_ownership(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(nak, "_gateway_unit_enabled", lambda _sp: False)
+
+    def fail_enable(_sp, _action):
+        raise SystemExit("enable failed")
+
+    monkeypatch.setattr(nak, "_gateway_installer", fail_enable)
+    with pytest.raises(SystemExit, match="enable failed"):
+        nak._gateway_on(object(), _args())
+
+    assert not (home / ".nakshatra" / "gateway.env").exists()
+    assert not (home / ".nakshatra" / "inference.env").exists()
+    assert not (home / ".nakshatra" / "gateway" / "inference-profile-created").exists()
 
 
 def test_gateway_auto_uses_join_url_but_ignores_join_key(tmp_path, monkeypatch):
@@ -134,6 +152,51 @@ def test_gateway_refuses_non_loopback_without_allow_lan(tmp_path, monkeypatch):
     assert not (home / ".nakshatra" / "gateway.env").exists()
 
 
+def test_gateway_uses_exact_nakc_defaults_without_allow_lan(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("NAK_CONTAINER", "1")
+    monkeypatch.setenv("NAK_GATEWAY_BIND", "0.0.0.0")
+    monkeypatch.setenv("NAK_GATEWAY_PORT", "11599")
+    calls = []
+    monkeypatch.setattr(nak, "_gateway_unit_enabled", lambda _sp: False)
+    monkeypatch.setattr(nak, "_gateway_installer", lambda _sp, action: calls.append(action))
+
+    nak._gateway_on(object(), _args(bind="0.0.0.0", port=11599))
+
+    body = (home / ".nakshatra" / "gateway.env").read_text()
+    assert 'BIND="0.0.0.0"' in body and "PORT=11599" in body
+    assert calls == ["enable"]
+
+
+def test_gateway_container_marker_does_not_allow_a_different_lan_bind(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("NAK_CONTAINER", "1")
+    monkeypatch.setenv("NAK_GATEWAY_BIND", "0.0.0.0")
+    monkeypatch.setenv("NAK_GATEWAY_PORT", "11599")
+
+    with pytest.raises(SystemExit, match="non-loopback"):
+        nak._gateway_on(object(), _args(bind="192.0.2.4", port=11599))
+
+
+def test_gateway_cli_defaults_differ_on_host_and_in_nakc(monkeypatch):
+    seen = []
+    monkeypatch.delenv("NAK_CONTAINER", raising=False)
+    monkeypatch.delenv("NAK_GATEWAY_BIND", raising=False)
+    monkeypatch.delenv("NAK_GATEWAY_PORT", raising=False)
+    monkeypatch.setattr(nak, "_gateway_on", lambda _sp, args: seen.append((args.bind, args.port)))
+    required = ["--pillar-url", "https://pillar.example", "--pillar-spki", PIN,
+                "--ledger-url", "https://pillar.example/ledger"]
+    assert nak.main(["gateway", "on", *required]) == 0
+    assert seen.pop() == ("127.0.0.1", 11600)
+
+    monkeypatch.setenv("NAK_CONTAINER", "1")
+    monkeypatch.setenv("NAK_GATEWAY_BIND", "0.0.0.0")
+    monkeypatch.setenv("NAK_GATEWAY_PORT", "11599")
+    assert nak.main(["gateway", "on", *required]) == 0
+    assert seen.pop() == ("0.0.0.0", 11599)
+
+
 def test_gateway_allows_lan_only_with_explicit_flag(tmp_path, monkeypatch):
     home = tmp_path / "home"
     monkeypatch.setenv("HOME", str(home))
@@ -165,6 +228,11 @@ def test_gateway_off_removes_opt_in_without_starting_units(tmp_path, monkeypatch
     env = home / ".nakshatra" / "gateway.env"
     env.parent.mkdir(parents=True)
     env.write_text("NAKSHATRA_LEDGER_MODE=enforce\n")
+    profile = home / ".nakshatra" / "inference.env"
+    profile.write_text("# gateway created\n")
+    owner = home / ".nakshatra" / "gateway" / "inference-profile-created"
+    owner.parent.mkdir()
+    owner.write_text("owned\n")
     calls = []
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setattr(nak, "_gateway_installer", lambda _sp, action: calls.append(action))
@@ -173,6 +241,47 @@ def test_gateway_off_removes_opt_in_without_starting_units(tmp_path, monkeypatch
 
     assert calls == ["disable"]
     assert not env.exists()
+    assert not profile.exists()
+    assert not owner.exists()
+
+
+def test_gateway_off_preserves_preexisting_or_still_needed_inference_profile(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    state = home / ".nakshatra"
+    state.mkdir(parents=True)
+    profile = state / "inference.env"
+    profile.write_text("EXISTING=operator-owned\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(nak, "_gateway_installer", lambda *_args: None)
+
+    nak._gateway_off(object())
+    assert profile.read_text() == "EXISTING=operator-owned\n"
+
+    owner = state / "gateway" / "inference-profile-created"
+    owner.parent.mkdir(exist_ok=True)
+    owner.write_text("owned\n")
+    (state / "unconscious.release").write_text("enabled\n")
+    nak._gateway_off(object())
+    assert profile.exists() and owner.exists()
+
+
+def test_gateway_off_worker_only_falls_back_to_worker_profile(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    state = home / ".nakshatra"
+    gateway = state / "gateway"
+    gateway.mkdir(parents=True)
+    (state / "inference.env").write_text("created by gateway\n")
+    (state / "worker.env").write_text("PORT=50051\n")
+    (gateway / "inference-profile-created").write_text("owned\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(nak, "_gateway_installer", lambda *_args: None)
+
+    nak._gateway_off(object())
+
+    assert not (state / "inference.env").exists()
+    assert (state / "worker.env").exists()
+    spec = json.loads((ROOT / "release" / "spec.json").read_text())
+    assert spec["profiles"]["worker"]["satisfied_by"] == ["inference"]
 
 
 def test_release_has_separate_gateway_service():

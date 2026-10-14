@@ -92,7 +92,11 @@ run_args() {
         --network bridge --stop-timeout "${NAKC_STOP_TIMEOUT:-20}"
         --publish "127.0.0.1:${NAKC_GATEWAY_PORT:-11600}:11599/tcp"
         --env "NAK_UPDATE_INTERVAL_S=${NAKC_UPDATE_INTERVAL_S:-3600}"
-        --env "NAK_CONTAINER_GATEWAY_BIND=0.0.0.0")
+        # These defaults are consumed by `nak gateway on`. NAK_CONTAINER also attests that this
+        # wrapper publishes the otherwise non-loopback container bind on host loopback only.
+        --env "NAK_CONTAINER=1"
+        --env "NAK_GATEWAY_BIND=0.0.0.0"
+        --env "NAK_GATEWAY_PORT=11599")
     if [ "${runtime##*/}" = podman ]; then
         RUN_ARGS+=(--volume "$VOLUME_NAME:/state:U")
     else

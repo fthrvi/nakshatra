@@ -89,9 +89,12 @@ delete that volume only as a separate, deliberate operation.
 `NAKC_ENGINE=docker` or `NAKC_ENGINE=podman`. Every start uses a non-root UID, drops all
 capabilities, enables `no-new-privileges`, uses a read-only root filesystem, supplies only a
 bounded `/tmp` tmpfs, uses the normal container network namespace, and applies memory and
-PID limits. The gateway binds `0.0.0.0:11599` only inside the container and maps only to host
-loopback at `127.0.0.1:11600`. The worker's gRPC port always binds container loopback and is
-never published. While the worker is on, its libp2p sidecar is the one deliberate public ingress:
+PID limits. `nakc` exports `NAK_GATEWAY_BIND=0.0.0.0` and `NAK_GATEWAY_PORT=11599`, so an
+unflagged `nak gateway on` writes the container-internal endpoint instead of the host defaults.
+That otherwise non-loopback bind is safe because `nakc` maps it only to host loopback at
+`127.0.0.1:11600`; it is not exposed to the LAN. The worker's gRPC port always binds container
+loopback and is never published. While the worker is on, its libp2p sidecar is the one deliberate
+public ingress:
 `0.0.0.0:4001` over both TCP and UDP/QUIC by default. Set `NAKC_P2P_PORT` on the first
 `nakc worker on` to choose another fixed port. Turning the worker off removes both publications.
 Host networking is never used.

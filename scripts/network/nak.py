@@ -238,11 +238,43 @@ def _enable_p2p_service(_sp) -> None:
 WORKER_SERVICE = "nakshatra-worker"
 WORKER_BACKENDS = {"cpu", "cuda", "rocm", "vulkan", "metal"}
 GATEWAY_SERVICE = "nakshatra-gateway"
+GATEWAY_PROFILE = "inference.env"
+GATEWAY_PROFILE_OWNER = "inference-profile-created"
 
 
 def _gateway_paths() -> tuple[Path, Path]:
     root = Path.home() / ".nakshatra" / "gateway"
     return root, Path.home() / ".nakshatra" / "gateway.env"
+
+
+def _gateway_profile_paths() -> tuple[Path, Path]:
+    root, _env_path = _gateway_paths()
+    return Path.home() / ".nakshatra" / GATEWAY_PROFILE, root / GATEWAY_PROFILE_OWNER
+
+
+def _gateway_container_defaults_match(args) -> bool:
+    """Allow nakc's internal bind without weakening the normal host-side LAN guard.
+
+    ``nakc`` is the only supported producer of ``NAK_CONTAINER=1`` and publishes container port
+    11599 on host loopback only. Requiring an exact match keeps any different non-loopback bind
+    behind ``--allow-lan``.
+    """
+    if os.environ.get("NAK_CONTAINER") != "1":
+        return False
+    bind = os.environ.get("NAK_GATEWAY_BIND", "")
+    port = os.environ.get("NAK_GATEWAY_PORT", "")
+    return bind == "0.0.0.0" and port == "11599" and args.bind == bind and str(args.port) == port
+
+
+def _inference_profile_needed_without_gateway() -> bool:
+    """Whether another current opt-in still requires the inference release profile.
+
+    The unconscious service has no smaller profile and therefore needs ``inference.env``. A
+    worker does not: ``worker.env`` opts it into the smaller worker profile, while the release
+    spec's ``worker.satisfied_by=["inference"]`` only permits inference to act as a superset when
+    both are active. Removing a gateway-owned inference marker leaves a worker on its own lock.
+    """
+    return (Path.home() / ".nakshatra" / "unconscious.release").is_file()
 
 
 def _gateway_values() -> dict[str, str]:
@@ -371,7 +403,8 @@ def _loopback_bind(value: str) -> bool:
 def _gateway_on(_sp, args) -> None:
     if not 1 <= args.port <= 65535:
         raise SystemExit("--port must be between 1 and 65535")
-    if not _loopback_bind(args.bind) and not args.allow_lan:
+    if (not _loopback_bind(args.bind) and not args.allow_lan
+            and not _gateway_container_defaults_match(args)):
         raise SystemExit("refusing a non-loopback gateway bind without --allow-lan")
     pillar = _bare_http_url(args.pillar_url, "pillar-url")
     ledger = _bare_http_url(args.ledger_url, "ledger-url", allow_path=True)
@@ -427,10 +460,14 @@ def _gateway_on(_sp, args) -> None:
     root, env_path = _gateway_paths()
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     old_env = env_path.read_bytes() if env_path.exists() else None
-    profile = Path.home() / ".nakshatra" / "inference.env"
+    profile, profile_owner = _gateway_profile_paths()
     made_profile = not profile.exists()
     if made_profile:
         _write_private(profile, b"# Opted into the signed release inference profile.\n")
+        _write_private(
+            profile_owner,
+            b"Created by `nak gateway on`; remove with `nak gateway off` when unused.\n",
+        )
     package_body = ""
     if args.models == "auto":
         package_body = f"PACKAGE_URL={_env_value(package_url, 'package-url')}\n"
@@ -461,6 +498,7 @@ def _gateway_on(_sp, args) -> None:
             _write_private(env_path, old_env)
         if made_profile:
             profile.unlink(missing_ok=True)
+            profile_owner.unlink(missing_ok=True)
         raise
     print(f"gateway ON at http://{args.bind}:{args.port}/v1 (credits enforced)")
 
@@ -480,6 +518,10 @@ def _gateway_unit_enabled(_sp) -> bool:
 def _gateway_off(_sp) -> None:
     _gateway_installer(_sp, "disable")
     _gateway_paths()[1].unlink(missing_ok=True)
+    profile, profile_owner = _gateway_profile_paths()
+    if profile_owner.is_file() and not _inference_profile_needed_without_gateway():
+        profile.unlink(missing_ok=True)
+        profile_owner.unlink(missing_ok=True)
     print("gateway OFF")
 
 
@@ -895,8 +937,8 @@ def main(argv=None, *, http_post=None) -> int:
     p = sub.add_parser("gateway", help="operate this node's local OpenAI consumer gateway")
     gsub = p.add_subparsers(dest="gateway_cmd", required=True)
     q = gsub.add_parser("on", help="configure and enable the fail-closed consumer gateway")
-    q.add_argument("--port", type=int, default=11600)
-    q.add_argument("--bind", default="127.0.0.1")
+    q.add_argument("--port", type=int, default=os.environ.get("NAK_GATEWAY_PORT", "11600"))
+    q.add_argument("--bind", default=os.environ.get("NAK_GATEWAY_BIND", "127.0.0.1"))
     q.add_argument("--allow-lan", action="store_true",
                    help="acknowledge that a non-loopback bind exposes inference to the LAN")
     q.add_argument("--pillar-url", required=True)

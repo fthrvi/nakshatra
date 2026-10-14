@@ -62,7 +62,9 @@ def test_nakc_default_run_is_hardened_and_mounts_only_the_state_volume(tmp_path)
     assert "--read-only" in argv and "--network" in argv and argv[argv.index("--network") + 1] == "bridge"
     assert "--network=host" not in argv and "--privileged" not in argv
     assert "127.0.0.1:11600:11599/tcp" in argv
-    assert "NAK_CONTAINER_GATEWAY_BIND=0.0.0.0" in argv
+    assert "NAK_CONTAINER=1" in argv
+    assert "NAK_GATEWAY_BIND=0.0.0.0" in argv
+    assert "NAK_GATEWAY_PORT=11599" in argv
     assert not any(item.endswith(":/share") or "dst=/share" in item for item in argv)
     mounts = [argv[index + 1] for index, item in enumerate(argv) if item == "--volume"]
     assert mounts == ["nakshatra-node-state:/state"]
@@ -169,38 +171,24 @@ def test_generated_unit_parser_expands_env_files_without_copying_commands(tmp_pa
     assert unit.pre[0][0] == sys.executable and unit.restart == "always"
 
 
-def test_container_env_makes_gateway_reachable_and_worker_private(tmp_path, monkeypatch):
+def test_container_env_keeps_worker_private_without_rewriting_gateway_files(tmp_path, monkeypatch):
     home = tmp_path / "home"
     env_dir = home / ".nakshatra"
     env_dir.mkdir(parents=True)
     (env_dir / "p2p.env").write_text("P2P_RELAYS=test\n")
     (env_dir / "worker.env").write_text("PORT=50051\nLISTEN=0.0.0.0\n")
     monkeypatch.setenv("HOME", str(home))
-    monkeypatch.setenv("NAK_CONTAINER_GATEWAY_BIND", "0.0.0.0")
     monkeypatch.setenv("NAK_CONTAINER_WORKER", "1")
     monkeypatch.setenv("NAK_CONTAINER_P2P_PORT", "4001")
     instance = supervisor.Supervisor(tmp_path / "prefix", tmp_path / "units", tmp_path / "sock",
                                      refresh=False, control=False)
     instance.reconcile_container_env()
-    gateway_env = env_dir / "unconscious.env"
-    assert supervisor._env_file(gateway_env)["BIND"] == "0.0.0.0"
+    assert not (env_dir / "unconscious.env").exists()
     worker_env = supervisor._env_file(env_dir / "worker.env")
     assert worker_env["LISTEN"] == "127.0.0.1"
     assert worker_env["NAKSHATRA_P2P_WORKER_ARGS"] == (
         "-listen /ip4/0.0.0.0/tcp/4001 -inbound=127.0.0.1:50051 -require-direct-activation"
     )
-
-    unit_file = tmp_path / "gateway.service"
-    unit_file.write_text(
-        supervisor.UNIT_MARKER + "\n[Service]\n"
-        f"EnvironmentFile=-{gateway_env}\n"
-        "Environment=BIND=127.0.0.1 PORT=11599\n"
-        "ExecStart=gateway --bind ${BIND} --port ${PORT}\n"
-    )
-    unit = supervisor.parse_unit(unit_file, {})
-    assert unit.env["BIND"] == "0.0.0.0"
-    assert unit.argv == ["gateway", "--bind", "0.0.0.0", "--port", "11599"]
-
 
 def test_supervisor_reload_refreshes_environment_file_without_starting_service(tmp_path):
     units = tmp_path / "units"

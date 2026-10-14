@@ -194,13 +194,8 @@ class Supervisor:
         os.replace(temporary, path)
 
     def reconcile_container_env(self) -> None:
-        """Apply container-only network overrides through release-owned EnvironmentFiles."""
+        """Keep worker gRPC private while exposing only its deliberate P2P listener."""
         home = Path(os.environ.get("HOME", str(self.prefix.parent)))
-        bind = os.environ.get("NAK_CONTAINER_GATEWAY_BIND", "")
-        if bind:
-            if bind != "0.0.0.0":
-                raise ValueError("container gateway bind must be 0.0.0.0")
-            self._set_env(home / ".nakshatra" / "unconscious.env", "BIND", bind)
         if os.environ.get("NAK_CONTAINER_WORKER") != "1":
             return
         port_text = os.environ.get("NAK_CONTAINER_P2P_PORT", "4001")
