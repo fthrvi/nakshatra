@@ -29,26 +29,39 @@ Run `./uninstall.ps1` to remove the task. It leaves the token and process list i
 ### Windows self-update
 
 The Scheduled Task runs `sentinel-launcher.ps1`, which always starts the local installed
-`owner-sentinel.ps1`. At startup and every six hours, the launcher looks for the copy from
-the current signed worker release at
-`\\wsl.localhost\<Distro>\home\<LinuxUser>\.nakshatra-node\current\nakshatra\deploy\owner-sentinel\owner-sentinel.ps1`,
-with `\\wsl$\...` as a compatibility fallback. If its SHA-256 differs, the launcher copies
-it to a temporary file, atomically replaces the local sentinel with `Move-Item -Force`, and
-restarts the sentinel child. It also restarts an unexpectedly exited child after five
-seconds. The launcher sends no heartbeat itself, so a failed or stopped sentinel still
-means silence and the worker still stops.
+`owner-sentinel.ps1`. At startup and every six hours, the launcher looks for both scripts
+in the current signed worker release under
+`\\wsl.localhost\<Distro>\home\<LinuxUser>\.nakshatra-node\current\nakshatra\deploy\owner-sentinel`,
+with `\\wsl$\...` as a compatibility fallback. If a SHA-256 differs, it copies the release
+file to a temporary file, re-hashes it, and atomically replaces the installed file with
+`Move-Item -Force`. A sentinel update restarts the sentinel child. A launcher update first
+requires a `Launcher-Version` header and a clean PowerShell parse, then stops the child and
+exits with code 75 so Task Scheduler restarts the updated launcher. Code 75 is an intentional
+self-update restart, not a sentinel failure. If Windows refuses to replace the running script,
+the validated copy is staged as `sentinel-launcher.ps1.next` and applied before the next
+launcher starts its child. An unexpectedly exited child is restarted after five seconds.
+The launcher sends no heartbeat itself, so a failed or stopped sentinel still means silence
+and the worker still stops.
+
+The task allows 999 one-minute restart attempts, has no execution time limit, and runs on
+battery. Existing installations need one manual re-run of `install.ps1` to install this
+self-updating launcher and register those restart-on-failure settings; future launcher and
+sentinel updates are automatic.
 
 The WSL release tree is trusted because it is written only by the signed-release installer
 inside the same Windows user's distro; it has the same trust boundary as the worker it
 updates. The launcher never fetches from a network location. If WSL is stopped, the release
 path is missing, hashing/copying fails, or the release tree is temporarily unavailable, the
-launcher keeps and runs the existing local sentinel. It never deletes that copy.
+launcher keeps and runs the existing local sentinel. It never boots a stopped distro and
+never deletes that copy. A per-user named mutex prevents a task restart and a stray launcher
+copy from running concurrently.
 
 To verify updates, inspect
 `%LOCALAPPDATA%\nakshatra\owner-sentinel\launcher.log`. Each update check is one timestamped
-line with the local and release version/SHA-256 and `action=updated` or `action=kept`; the
-file retains about 200 lines. It never contains the lease token. You can also inspect the
-Scheduled Task action and confirm it names `sentinel-launcher.ps1` in that directory.
+line naming the launcher or sentinel component, its local and release version/SHA-256, and
+an action such as `updated`, `staged`, or `kept`; the file retains about 200 lines. It never
+contains the lease token. You can also inspect the Scheduled Task action and confirm it names
+`sentinel-launcher.ps1` in that directory.
 
 The Windows sentinel reports busy for the pause switch, a non-Explorer foreground window
 covering its monitor, a configured process, or an owner process holding more than

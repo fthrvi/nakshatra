@@ -70,8 +70,9 @@ $action = New-ScheduledTaskAction -Execute $powerShellPath -Argument $arguments 
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $identity
 $principal = New-ScheduledTaskPrincipal -UserId $identity -LogonType Interactive -RunLevel Limited
 # No execution time limit: the default (72 h) would kill the sentinel after three days, and its
-# silence would keep the worker 'away' until the next logon. Run on battery too.
-$settings = New-ScheduledTaskSettingsSet -Hidden -StartWhenAvailable -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) `
+# silence would keep the worker 'away' until the next logon. Run on battery too, and restart after
+# launcher self-update exit code 75 or an unexpected launcher failure.
+$settings = New-ScheduledTaskSettingsSet -Hidden -StartWhenAvailable -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) `
     -ExecutionTimeLimit (New-TimeSpan -Seconds 0) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 $task = New-ScheduledTask -Action $action -Trigger $trigger -Principal $principal -Settings $settings
 if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {

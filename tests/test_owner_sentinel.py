@@ -205,6 +205,48 @@ def test_launcher_has_no_network_download_surface():
     assert all(host.split(":", 1)[0].lower() in {"127.0.0.1", "localhost", "[::1]"} for host in urls)
 
 
+def test_launcher_self_update_has_required_safety_structure():
+    launcher = (SENTINEL_DIR / "sentinel-launcher.ps1").read_text(encoding="utf-8")
+
+    assert re.search(r"(?m)^# Launcher-Version: \S+$", launcher)
+    assert "$LauncherPath = $PSCommandPath" in launcher
+    assert "Local\\NakshatraOwnerSentinelLauncher" in launcher
+    assert "[System.Threading.Mutex]::new" in launcher
+    assert re.search(r"\$LauncherUpdateExitCode\s*=\s*75", launcher)
+    assert launcher.count("exit $LauncherUpdateExitCode") >= 2
+    assert "sentinel-launcher.ps1.next" in launcher
+    assert "[System.Management.Automation.Language.Parser]::ParseFile" in launcher
+
+    pending = launcher[
+        launcher.index("function Invoke-PendingLauncherUpdate") : launcher.index("function Invoke-LauncherSync")
+    ]
+    assert pending.index("Test-PowerShellFile -Path $PendingLauncherPath") < pending.index(
+        "Move-Item -LiteralPath $PendingLauncherPath -Destination $LauncherPath"
+    )
+
+    sync = launcher[launcher.index("function Invoke-LauncherSync") : launcher.index("function Invoke-SentinelSync")]
+    parse_check = sync.index("Test-PowerShellFile -Path $temporaryPath")
+    launcher_swap = sync.index("Move-Item -LiteralPath $temporaryPath -Destination $LauncherPath")
+    assert parse_check < launcher_swap
+    assert "release launcher lacks a Launcher-Version header" in sync
+
+
+def test_launcher_fetch_is_shared_and_wsl_never_boots_a_stopped_distro():
+    launcher = (SENTINEL_DIR / "sentinel-launcher.ps1").read_text(encoding="utf-8")
+
+    assert "function Get-ReleaseFileCopy" in launcher
+    assert "-FileName 'sentinel-launcher.ps1'" in launcher
+    assert "-FileName 'owner-sentinel.ps1'" in launcher
+    wsl_fetch = launcher[
+        launcher.index("function Save-ReleaseFileViaWsl") : launcher.index("function Get-ReleaseFileCopy")
+    ]
+    running_check = wsl_fetch.index("& wsl.exe -l --running -q")
+    distro_read = wsl_fetch.index("& wsl.exe -d $Identity.Distro")
+    assert running_check < distro_read
+    assert "if ($names -notcontains $Identity.Distro) { return $false }" in wsl_fetch
+    assert launcher.count("& wsl.exe") == 2
+
+
 def test_installer_registers_launcher_without_an_execution_time_limit():
     installer = (SENTINEL_DIR / "install.ps1").read_text(encoding="utf-8")
 
@@ -214,3 +256,5 @@ def test_installer_registers_launcher_without_an_execution_time_limit():
     assert "OWNER_WSL_DISTRO" in installer
     assert "OWNER_WSL_USER" in installer
     assert re.search(r"-ExecutionTimeLimit\s*\(New-TimeSpan\s+-Seconds\s+0\)", installer)
+    assert re.search(r"-RestartCount\s+999\b", installer)
+    assert re.search(r"-RestartInterval\s*\(New-TimeSpan\s+-Minutes\s+1\)", installer)
