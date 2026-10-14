@@ -376,7 +376,8 @@ def _worker_enable(_sp, args) -> None:
                 f"MODE={args.mode}\nPORT={args.port}\n"
                 f"LAYER_START={start}\nLAYER_END={end}\nSUB_GGUF={sub_gguf}\n"
                 f"LISTEN={listen}\nIDLE_UNLOAD_S={args.idle_unload_s:g}\n"
-                f"RELEASE_GRACE_S={args.release_grace_s:g}\n")
+                f"RELEASE_GRACE_S={args.release_grace_s:g}\n"
+                f"WARM_DIRECTIVES={'1' if args.warm_directives == 'on' else '0'}\n")
         _write_private(env_path, body.encode())
     port = _worker_port(env_path)
     _set_env_assignment(
@@ -603,6 +604,8 @@ def main(argv=None, *, http_post=None) -> int:
                    help="seconds before idle-backstop unload; 0 disables this backstop")
     q.add_argument("--release-grace-s", type=float, default=30.0,
                    help="seconds after session release before unload; 0 is immediate, negative disables")
+    q.add_argument("--warm-directives", choices=["on", "off"], default="on",
+                   help="honor pillar warm-pool directives (default: on)")
     # worker.py cannot derive its pipeline role from a layer range alone because the CLI does not
     # know the model's total layer count. Preserve the proven outsider-worker role as the default,
     # while exposing the worker.py choice for last/middle/whole-model assignments.

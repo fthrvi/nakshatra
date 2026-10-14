@@ -111,6 +111,8 @@ Measured on bro (RTX 5070) with a 60 s test timeout. After 60 s idle the worker 
 
 The opt-in `~/.nakshatra/owner-lease.env` adds the loopback-only sentinel endpoint described in `COURTEOUS-WORKER.md`. Its default-deny state is `away`; live permission moves it to `standby`, demand loads it to `loaded`, and a lapse cancels work, frees session ownership, unloads, and immediately heartbeats `away`. The residency vocabulary is therefore exactly `loaded | standby | away`; the worker never admits work while away, and coordinators must exclude away workers. The pillar ranks `loaded > unknown > standby` only as a tie-breaker after health, admission, coverage and tier. Remaining work: the Windows sentinel and demand-based warm pools in the planner.
 
+Pillar `/peer` responses may also carry a short-lived warm-pool advisory: `keep` suppresses idle/release unload, `prewarm` digest-verifies and loads a standby worker through the normal single-flight path, and `release` unloads immediately when no session or RPC is active. Advisories never override an owner lease: stale/away workers do not prewarm, and a lease lapse unloads even under `keep`. They expire back to normal policy and may be disabled per worker with `nak worker on --warm-directives off` (`WARM_DIRECTIVES=0` in `worker.env`).
+
 ### Owner lease + release-on-done — step 2 LIVE (0.14.x, 2026-10-13)
 Measured on bro (RTX 5070, WSL) with the Linux sentinel standing in for the owner:
 - **Release on done.** 30 s after a request finished, the worker went to `standby` (VRAM 4892 → 2329 MiB). `NAKSHATRA_WORKER_RELEASE_GRACE_S`, default 30; the 600 s idle unload stays as the backstop.

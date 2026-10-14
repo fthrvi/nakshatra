@@ -1039,6 +1039,43 @@ class OwnerLeaseConfig(NamedTuple):
     resume_s: float
 
 
+class WarmDirective(NamedTuple):
+    model: str
+    action: str
+    until: float
+
+
+_INVALID_WARM_DIRECTIVE = object()
+WARM_DIRECTIVE_MAX_S = 300.0
+
+
+def parse_warm_directive(response: dict, model_id: str, *, now=None):
+    """Validate one pillar advisory, distinguishing absent from malformed."""
+    if "warm" not in response:
+        return None
+    raw = response.get("warm")
+    if not isinstance(raw, dict):
+        return _INVALID_WARM_DIRECTIVE
+    if raw.get("model") != model_id or raw.get("action") not in {
+            "keep", "prewarm", "release"}:
+        return _INVALID_WARM_DIRECTIVE
+    until = raw.get("until")
+    if isinstance(until, bool) or not isinstance(until, (int, float)):
+        return _INVALID_WARM_DIRECTIVE
+    try:
+        until = float(until)
+    except (OverflowError, ValueError):
+        return _INVALID_WARM_DIRECTIVE
+    current = (now or time.time)()
+    if not math.isfinite(until) or until <= current:
+        return _INVALID_WARM_DIRECTIVE
+    return WarmDirective(
+        model=model_id,
+        action=raw["action"],
+        until=min(until, current + WARM_DIRECTIVE_MAX_S),
+    )
+
+
 def owner_lease_state(last_clear_at: Optional[float], now: float, ttl_s: float,
                       *, explicitly_clear: bool = True,
                       reason: str = "") -> tuple[str, str]:
@@ -1097,7 +1134,9 @@ class IdleDaemonController:
     def __init__(self, daemon_factory, sub_gguf: str, startup_sha256: str,
                  idle_unload_s: float = 600.0, *, release_grace_s: float = 30.0,
                  owner_lease_enabled: bool = False, now=None,
-                 residency_event: threading.Event = None):
+                 residency_event: threading.Event = None,
+                 model_id: str = "", warm_directives_enabled: bool = True,
+                 wall_now=None):
         if not math.isfinite(idle_unload_s) or idle_unload_s < 0:
             raise ValueError("idle_unload_s must be a finite number >= 0")
         self._daemon_factory = daemon_factory
@@ -1108,6 +1147,7 @@ class IdleDaemonController:
             raise ValueError("release_grace_s must be finite")
         self.release_grace_s = float(release_grace_s)
         self._now = now or time.monotonic
+        self._wall_now = wall_now or time.time
         self._residency_event = residency_event
         self._spawn_lock = threading.Lock()
         self._state_lock = threading.Lock()
@@ -1117,6 +1157,9 @@ class IdleDaemonController:
         self._last_step_at = self._now()
         self._release_unload_at: Optional[float] = None
         self._closed = False
+        self._model_id = model_id
+        self._warm_directives_enabled = bool(warm_directives_enabled)
+        self._warm_directive: Optional[WarmDirective] = None
         self._owner_lease_enabled = bool(owner_lease_enabled)
         self._lease_state = "lapsed" if owner_lease_enabled else "disabled"
         self._lease_reason = (
@@ -1182,6 +1225,52 @@ class IdleDaemonController:
     def lease_reason(self) -> str:
         with self._state_lock:
             return self._lease_reason
+
+    def _warm_action_locked(self) -> Optional[str]:
+        directive = self._warm_directive
+        if (not self._warm_directives_enabled or directive is None
+                or directive.until <= self._wall_now()):
+            return None
+        return directive.action
+
+    @property
+    def warm_directive(self) -> Optional[WarmDirective]:
+        with self._state_lock:
+            if self._warm_action_locked() is None:
+                return None
+            return self._warm_directive
+
+    def apply_warm_directive(self, directive: Optional[WarmDirective]) -> None:
+        """Apply one validated advisory without weakening owner-lease policy."""
+        if not self._warm_directives_enabled:
+            return
+        with self._state_lock:
+            changed = directive != self._warm_directive
+            self._warm_directive = directive
+            action = self._warm_action_locked()
+            can_prewarm = (
+                action == "prewarm"
+                and self._daemon is None
+                and self._residency == "standby"
+                and (not self._owner_lease_enabled
+                     or (self._lease_state == "live" and self._lease_admit))
+            )
+        if changed:
+            model = directive.model if directive is not None else self._model_id
+            action_for_log = directive.action if directive is not None else "none"
+            until = directive.until if directive is not None else 0
+            print(
+                f"[worker] warm directive: model={model} "
+                f"action={action_for_log} until={until:g}",
+                flush=True,
+            )
+        if can_prewarm:
+            try:
+                self.ensure_loaded()
+            except DaemonUnavailableError as e:
+                sys.stderr.write(f"[worker] warm prewarm failed: {e}\n")
+        elif action == "release":
+            self.unload_if_idle()
 
     @property
     def service_alive(self) -> bool:
@@ -1316,6 +1405,8 @@ class IdleDaemonController:
                 if self._in_flight == 0 and self.release_grace_s >= 0:
                     self._release_unload_at = self._now() + self.release_grace_s
                     unload_now = self.release_grace_s == 0
+                if self._in_flight == 0 and self._warm_action_locked() == "release":
+                    unload_now = True
         if unload_now:
             self.unload_if_idle()
 
@@ -1350,10 +1441,18 @@ class IdleDaemonController:
             raise
         finally:
             if is_inference:
+                release_now = False
                 with self._state_lock:
                     self._in_flight -= 1
                     if served:
                         self._last_step_at = self._now()
+                    release_now = (
+                        self._in_flight == 0
+                        and self._owner_session is None
+                        and self._warm_action_locked() == "release"
+                    )
+                if release_now:
+                    self.unload_if_idle()
 
     def info(self):
         with self._state_lock:
@@ -1390,10 +1489,16 @@ class IdleDaemonController:
                     and self._release_unload_at is None
                     and now - self._last_step_at >= self.idle_unload_s
                 )
+                warm_action = self._warm_action_locked()
+                if warm_action == "keep":
+                    return False
+                directive_release = warm_action == "release"
                 if (self._closed or self._daemon is None or self._in_flight
-                        or not (release_due or idle_due)):
+                        or not (directive_release or release_due or idle_due)):
                     return False
                 if self._owner_session is not None:
+                    if directive_release:
+                        return False
                     # A stream that ended without release_session() (client crashed) would
                     # otherwise pin VRAM forever. Same staleness rule acquire_session() uses
                     # to reclaim ownership; we are also past the full idle window here.
@@ -1462,11 +1567,20 @@ class IdleDaemonController:
         while not stop_event.is_set():
             with self._state_lock:
                 deadlines = []
-                if self._release_unload_at is not None:
+                warm_action = self._warm_action_locked()
+                if warm_action == "keep":
+                    remaining = max(
+                        0.05,
+                        self._warm_directive.until - self._wall_now(),
+                    )
+                elif warm_action == "release":
+                    remaining = 1.0
+                elif self._release_unload_at is not None:
                     deadlines.append(self._release_unload_at)
                 elif self.idle_unload_s > 0:
                     deadlines.append(self._last_step_at + self.idle_unload_s)
-                remaining = max(0.05, min(deadlines) - self._now()) if deadlines else 1.0
+                if warm_action not in {"keep", "release"}:
+                    remaining = max(0.05, min(deadlines) - self._now()) if deadlines else 1.0
             if stop_event.wait(timeout=min(remaining, 1.0)):
                 return
             self.unload_if_idle()
@@ -2804,7 +2918,10 @@ def decide_registered_backend(gpu_vram_gb, declared_backend, offload_status):
 def register_with_pillar(pillar_url: str, payload: dict, log_prefix: str = "[worker]",
                           priv_key: Optional[bytes] = None,
                           node_id: Optional[str] = None,
-                          spki_hash: Optional[str] = None):
+                          spki_hash: Optional[str] = None,
+                          warm_directive_handler=None,
+                          model_id: Optional[str] = None,
+                          now=None):
     """POST to <pillar_url>/peer. Best-effort: log on failure, never raise.
 
     Phase F2: when ``priv_key`` + ``node_id`` are provided, the request
@@ -2852,6 +2969,7 @@ def register_with_pillar(pillar_url: str, payload: dict, log_prefix: str = "[wor
             req, timeout=5, expected_spki_hash=spki_hash,
         ) as resp:
             body = resp.read().decode()
+            parsed = None
             # Phase I8: stash the fresh nonce for the next heartbeat.
             # Phase J1: when we SENT an attestation but the pillar
             # didn't observe it (nonce stale, fingerprint malformed),
@@ -2892,6 +3010,16 @@ def register_with_pillar(pillar_url: str, payload: dict, log_prefix: str = "[wor
                                log_prefix=log_prefix)
             except json.JSONDecodeError:
                 pass
+            if (warm_directive_handler is not None and model_id
+                    and isinstance(parsed, dict)):
+                directive = parse_warm_directive(parsed, model_id, now=now)
+                if directive is _INVALID_WARM_DIRECTIVE:
+                    print(
+                        f"{log_prefix} ignoring invalid warm directive",
+                        flush=True,
+                    )
+                else:
+                    warm_directive_handler(directive)
             print(f"{log_prefix} registered with pillar: {body}", flush=True)
             _audit("register_success", url=pillar_location_for_log(pillar_url),
                    log_prefix=log_prefix)
@@ -2958,7 +3086,10 @@ def heartbeat_loop(pillar_url: str, payload: dict, interval: float = 30.0,
                    priv_key: Optional[bytes] = None,
                    node_id: Optional[str] = None,
                    spki_hash: Optional[str] = None,
-                   residency_event: threading.Event = None):
+                   residency_event: threading.Event = None,
+                   warm_directive_handler=None,
+                   model_id: Optional[str] = None,
+                   now=None):
     """Re-register with pillar every `interval` seconds. Run as daemon thread.
 
     Phase H: if `daemon_for_timing` is supplied, refresh the heartbeat
@@ -3007,6 +3138,8 @@ def heartbeat_loop(pillar_url: str, payload: dict, interval: float = 30.0,
         ok = register_with_pillar(
             pillar_url, payload, log_prefix="[heartbeat]",
             priv_key=priv_key, node_id=node_id, spki_hash=spki_hash,
+            warm_directive_handler=warm_directive_handler,
+            model_id=model_id, now=now,
         )
         if ok:
             consecutive_failures = 0
@@ -4207,6 +4340,17 @@ def main():
                 "NAKSHATRA_WORKER_RELEASE_GRACE_S must be finite "
                 "(negative disables it)"
             )
+        warm_directives_raw = os.environ.get(
+            "NAKSHATRA_WORKER_WARM_DIRECTIVES", "1"
+        ).strip().lower()
+        if warm_directives_raw in {"1", "true", "yes", "on"}:
+            warm_directives_enabled = True
+        elif warm_directives_raw in {"0", "false", "no", "off"}:
+            warm_directives_enabled = False
+        else:
+            raise ValueError(
+                "NAKSHATRA_WORKER_WARM_DIRECTIVES must be 1 or 0"
+            )
         owner_lease_config = owner_lease_config_from_env()
         validate_local_dev_fetch_policy(
             local_dev=args.local_dev,
@@ -4336,6 +4480,8 @@ def main():
         release_grace_s=release_grace_s,
         owner_lease_enabled=owner_lease_config is not None,
         residency_event=residency_event,
+        model_id=args.model_id,
+        warm_directives_enabled=warm_directives_enabled,
     )
 
     # 2026-05-26 drive-by — TLS bringup factored into setup_tls(args).
@@ -4759,6 +4905,11 @@ def main():
             return register_with_pillar(
                 args.pillar_url, register_payload,
                 priv_key=worker_priv, node_id=node_id, spki_hash=spki_hash,
+                warm_directive_handler=(
+                    daemon.apply_warm_directive
+                    if warm_directives_enabled else None
+                ),
+                model_id=args.model_id,
             )
 
         registered_ok = bool(register_current_residency())
@@ -4853,7 +5004,12 @@ def main():
             kwargs={"daemon_for_timing": daemon,
                     "priv_key": worker_priv, "node_id": node_id,
                     "spki_hash": spki_hash,
-                    "residency_event": residency_event},
+                    "residency_event": residency_event,
+                    "warm_directive_handler": (
+                        daemon.apply_warm_directive
+                        if warm_directives_enabled else None
+                    ),
+                    "model_id": args.model_id},
             daemon=True,
         )
         heartbeat_thread.start()

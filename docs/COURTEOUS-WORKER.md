@@ -33,6 +33,18 @@ Silence beyond TTL or any `clear=false` immediately cancels active daemon work, 
 ownership, unloads the daemon, and publishes `away`. Recovery returns only to `standby`; the
 next admitted request performs the existing digest-verified lazy load.
 
+## Warm-pool advisories
+
+The pillar can return an expiring `warm` advisory with each registration or heartbeat. `keep`
+temporarily suppresses release-grace and idle unload, `prewarm` loads a standby worker through the
+same digest-verified single-flight path as a request, and `release` unloads as soon as no RPC or
+session is active. Missing or expired advisories restore the ordinary grace/idle rules.
+
+These are scheduling hints, not ownership authority. A stale or away worker never prewarms, and a
+lease lapse always unloads and publishes `away`, including while `keep` is active. Operators can
+opt a worker out at first setup with `nak worker on --warm-directives off`; the corresponding
+`worker.env` setting is `WARM_DIRECTIVES=0` (default `1`).
+
 ## Sentinels
 
 The installable Windows and Linux owner sentinels live in

@@ -199,6 +199,9 @@ def worker_command(args) -> tuple[list[str], dict[str, str]]:
         raise WorkerServiceError("RELEASE_GRACE_S must be finite (negative disables it)") from e
     if not math.isfinite(release_grace_s):
         raise WorkerServiceError("RELEASE_GRACE_S must be finite (negative disables it)")
+    warm_directives = os.environ.get("WARM_DIRECTIVES", "1").strip() or "1"
+    if warm_directives not in {"0", "1"}:
+        raise WorkerServiceError("WARM_DIRECTIVES must be 1 or 0")
 
     owner_names = (
         "OWNER_LEASE_PORT", "OWNER_LEASE_TOKEN", "OWNER_LEASE_TTL_S",
@@ -259,6 +262,7 @@ def worker_command(args) -> tuple[list[str], dict[str, str]]:
         NAKSHATRA_LISTEN_ADDRESS=listen_address,
         NAKSHATRA_WORKER_IDLE_UNLOAD_S=f"{idle_unload_s:g}",
         NAKSHATRA_WORKER_RELEASE_GRACE_S=f"{release_grace_s:g}",
+        NAKSHATRA_WORKER_WARM_DIRECTIVES=warm_directives,
         # A signed-release worker never inherits Mode-A downgrade switches.
         NAKSHATRA_RELEASE_SERVICE="true",
         NAKSHATRA_TLS_REQUIRED="true",

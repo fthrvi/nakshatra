@@ -110,6 +110,7 @@ def test_nak_worker_on_writes_env_once_and_uses_verified_installer(tmp_path, mon
     assert "MODE=first" in first and "LAYER_START=0" in first and "LAYER_END=16" in first
     assert "IDLE_UNLOAD_S=600" in first
     assert "RELEASE_GRACE_S=30" in first
+    assert "WARM_DIRECTIVES=1" in first
     assert 'NAKSHATRA_P2P_WORKER_ARGS="-inbound=127.0.0.1:5530 -require-direct-activation"' in first
     assert "SUB_GGUF=" in first and "skip-sha256" not in first
     inference_env = home / ".nakshatra" / "inference.env"
@@ -422,11 +423,12 @@ def test_nak_worker_on_writes_idle_unload_override(tmp_path, monkeypatch):
             "--package-url", "https://models.test/qwen", "--package-pubkey", "cd" * 32,
             "--pillar-url", "https://pillar.test", "--pillar-spki", "ab" * 32,
             "--layers", "0-16", "--port", "5530", "--idle-unload-s", "0",
-            "--release-grace-s", "-1"]
+            "--release-grace-s", "-1", "--warm-directives", "off"]
     assert nak.main(argv) == 0
     body = (home / ".nakshatra" / "worker.env").read_text()
     assert "IDLE_UNLOAD_S=0" in body
     assert "RELEASE_GRACE_S=-1" in body
+    assert "WARM_DIRECTIVES=0" in body
 
 
 def test_worker_launcher_passes_idle_unload_and_defaults_old_env_to_600(
@@ -459,8 +461,11 @@ def test_worker_launcher_passes_idle_unload_and_defaults_old_env_to_600(
     monkeypatch.delenv("IDLE_UNLOAD_S", raising=False)
 
     assert worker_service.worker_command(args)[1]["NAKSHATRA_WORKER_IDLE_UNLOAD_S"] == "600"
+    assert worker_service.worker_command(args)[1]["NAKSHATRA_WORKER_WARM_DIRECTIVES"] == "1"
     monkeypatch.setenv("IDLE_UNLOAD_S", "12.5")
     assert worker_service.worker_command(args)[1]["NAKSHATRA_WORKER_IDLE_UNLOAD_S"] == "12.5"
+    monkeypatch.setenv("WARM_DIRECTIVES", "0")
+    assert worker_service.worker_command(args)[1]["NAKSHATRA_WORKER_WARM_DIRECTIVES"] == "0"
 
 
 def test_worker_launcher_validates_and_passes_owner_lease(tmp_path, monkeypatch):
