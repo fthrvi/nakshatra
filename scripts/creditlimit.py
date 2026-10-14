@@ -59,14 +59,15 @@ def tier_source() -> str:
 
 TIERS: dict[str, int] = {
     # stranger: first-time visitor, minimal trust
-    # 100 units: enough for ~10-20 small operations, but not worth attacking at scale
-    "stranger": 100,
+    # $0.01 overdraft (1 USDC = 10^8 credits, Solana design 2026-10-14 §4): lets a first run
+    # work before a deposit is indexed; deposits are the consumer path
+    "stranger": 1_000_000,
     # known: verified identity or minimal history
-    # 500 units: allows more substantial use, but still finite
-    "known": 500,
+    # $0.25 overdraft
+    "known": 25_000_000,
     # trusted: long-standing, well-behaved account
-    # 5000 units: allows heavy legitimate use, but still monitored
-    "trusted": 5000,
+    # $2.50 overdraft
+    "trusted": 250_000_000,
     # self: internal or operator-controlled — unlimited
     # Represented as None (no limit)
     "self": None,

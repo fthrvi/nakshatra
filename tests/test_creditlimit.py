@@ -28,16 +28,17 @@ def test_spend_within_limit_allowed():
 
 def test_spend_exceeding_limit_denied():
     """A spend that would exceed the limit should be denied."""
-    # stranger limit is 100, so balance=50, cost=200 → new_balance=-150 < -100
-    allowed, why = may_consume(50, 200, "stranger")
+    # balance=50, cost=limit+100 → new_balance = -limit-50, past the stranger overdraft
+    limit = TIERS["stranger"]
+    allowed, why = may_consume(50, limit + 100, "stranger")
     assert allowed is False
     assert "would exceed limit" in why
 
 
 def test_boundary_at_limit_allowed():
     """Exactly AT the limit (balance - cost == -limit) should be allowed."""
-    # stranger limit is 100, so balance=0, cost=100 → new_balance=-100 ≥ -100
-    allowed, why = may_consume(0, 100, "stranger")
+    # balance=0, cost=limit → new_balance == -limit, exactly at the overdraft
+    allowed, why = may_consume(0, TIERS["stranger"], "stranger")
     assert allowed is True
     assert "balance=0 → -100" in why
 
