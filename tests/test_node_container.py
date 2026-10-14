@@ -270,6 +270,76 @@ def test_gateway_created_consumer_effective_p2p_argv_has_no_inbound(tmp_path, mo
     assert not any(arg.startswith(("-nakd-inbound", "-inbound")) for arg in effective)
 
 
+def test_explicit_p2p_on_promotes_gateway_consumer_to_legacy_nakd_inbound(
+        tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    token = "ab" * 32
+    monkeypatch.setenv("HOME", str(home))
+    calls = []
+    monkeypatch.setattr(
+        nak, "_p2p_installer", lambda _sp, action: calls.append(action))
+
+    nak._enable_p2p_service(object(), owner_token=token)
+    p2p_env = home / ".nakshatra" / "p2p.env"
+    before = p2p_env.read_bytes()
+    expected = before.replace(b'NAKSHATRA_P2P_NAKD_INBOUND=""\n', b"")
+    owner = home / ".nakshatra" / "gateway" / "p2p-profile-created"
+    owner.parent.mkdir(parents=True)
+    owner.write_text(f"{token}\n")
+    net_dir = home / ".nakshatra" / "net"
+    net_dir.mkdir()
+    monkeypatch.setenv("NAK_NET_DIR", str(net_dir))
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "run"))
+    monkeypatch.setattr(
+        subprocess, "run", lambda *_args, **_kwargs:
+        type("Result", (), {"returncode": 0})())
+
+    calls.clear()
+    assert nak.main(["p2p", "on"]) == 0
+
+    assert p2p_env.read_bytes() == expected
+    assert not owner.exists()
+    assert calls == ["enable", "restart"]
+    effective = _effective_p2p_argv(tmp_path, home)
+    assert "-nakd-inbound=127.0.0.1:51830" in effective
+
+
+def test_host_worker_on_promotes_gateway_consumer_and_gateway_off_preserves_p2p(
+        tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    token = "cd" * 32
+    monkeypatch.setenv("HOME", str(home))
+    p2p_calls = []
+    monkeypatch.setattr(
+        nak, "_p2p_installer", lambda _sp, action: p2p_calls.append(action))
+    monkeypatch.setattr(nak, "_worker_installer", lambda *_args: None)
+    monkeypatch.setattr(nak, "_gateway_installer", lambda *_args: None)
+
+    nak._enable_p2p_service(object(), owner_token=token)
+    owner = home / ".nakshatra" / "gateway" / "p2p-profile-created"
+    owner.parent.mkdir(parents=True)
+    owner.write_text(f"{token}\n")
+    assert nak.main([
+        "worker", "on", "--model-id", "qwen",
+        "--package-url", "https://models.test/qwen", "--package-pubkey", "cd" * 32,
+        "--pillar-url", "http://localhost", "--listen-address", "0.0.0.0",
+        "--layers", "0-16", "--port", "5530",
+    ]) == 0
+
+    p2p_env = home / ".nakshatra" / "p2p.env"
+    assert "NAKSHATRA_P2P_NAKD_INBOUND=" not in p2p_env.read_text()
+    assert not owner.exists()
+    effective = _effective_p2p_argv(tmp_path, home)
+    assert "-nakd-inbound=127.0.0.1:51830" in effective
+    assert "-inbound=127.0.0.1:5530" in effective
+    assert p2p_calls == ["enable", "restart"]
+
+    nak._gateway_off(object())
+
+    assert p2p_env.exists()
+    assert p2p_calls == ["enable", "restart"]
+
+
 def test_fresh_worker_effective_p2p_argv_matches_legacy_worker(tmp_path, monkeypatch):
     home = tmp_path / "home"
     env_dir = home / ".nakshatra"

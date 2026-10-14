@@ -236,6 +236,8 @@ def _enable_p2p_service_locked(_sp, *, owner_token: str = "") -> None:
     """Create and enable P2P while the caller holds ``_p2p_ownership_lock``."""
     env = Path.home() / ".nakshatra" / "p2p.env"
     created = False
+    took_over_consumer = False
+    old_env = env.read_bytes() if env.exists() else None
     if not env.exists():
         env.parent.mkdir(parents=True, exist_ok=True)
         ownership = f"{GATEWAY_PROFILE_OWNER_PREFIX}{owner_token}\n" if owner_token else ""
@@ -244,8 +246,15 @@ def _enable_p2p_service_locked(_sp, *, owner_token: str = "") -> None:
             env, f"P2P_RELAYS={DEFAULT_P2P_RELAYS}\n{consumer}{ownership}".encode()
         )
         created = True
+    elif not owner_token:
+        # An explicit `nak p2p on` takes the gateway-created consumer sidecar over for the
+        # operator. Restore the signed unit's default nakd inbound before enabling/restarting it.
+        took_over_consumer = _remove_env_assignment(
+            env, "NAKSHATRA_P2P_NAKD_INBOUND")
     try:
         _p2p_installer(_sp, "enable")
+        if took_over_consumer:
+            _p2p_installer(_sp, "restart")
     except (Exception, SystemExit) as enable_error:
         # A failed enable may have started the unit before its stability check failed: stop it again.
         disabled = False
@@ -260,6 +269,8 @@ def _enable_p2p_service_locked(_sp, *, owner_token: str = "") -> None:
         # gateway-created generation, the ownership token so `nak gateway off` can retry safely.
         if created and disabled:
             env.unlink(missing_ok=True)
+        elif old_env is not None:
+            _write_private(env, old_env)
         if disable_error is not None:
             raise SystemExit(
                 f"{enable_error}; rollback could not disable nakshatra-p2p: {disable_error}"
@@ -756,6 +767,21 @@ def _set_env_assignment(path: Path, name: str, value: str | None) -> None:
     _write_private(path, (("\n".join(lines) + "\n") if lines else "").encode())
 
 
+def _remove_env_assignment(path: Path, name: str) -> bool:
+    """Atomically remove one assignment without changing any other bytes in the env file."""
+    try:
+        body = path.read_bytes()
+    except OSError as e:
+        raise SystemExit(f"cannot update {path}: {e}") from e
+    prefix = f"{name}=".encode()
+    lines = body.splitlines(keepends=True)
+    kept = [line for line in lines if not line.startswith(prefix)]
+    if len(kept) == len(lines):
+        return False
+    _write_private(path, b"".join(kept))
+    return True
+
+
 def _worker_port(env_path: Path) -> int:
     try:
         body = env_path.read_text()
@@ -789,6 +815,10 @@ def _worker_enable_locked(_sp, args) -> None:
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     (Path.home() / ".nakshatra" / "tls").mkdir(parents=True, exist_ok=True, mode=0o700)
     old_env = env_path.read_bytes() if env_path.exists() else None
+    p2p_env, p2p_owner = _gateway_p2p_paths()
+    old_p2p_env = p2p_env.read_bytes() if p2p_env.exists() else None
+    old_p2p_owner = p2p_owner.read_bytes() if p2p_owner.exists() else None
+    took_over_p2p = False
     if old_env is None:
         missing = [name for name in ("model_id", "package_url", "package_pubkey", "pillar_url", "layers", "port")
                    if getattr(args, name) in (None, "")]
@@ -842,7 +872,13 @@ def _worker_enable_locked(_sp, args) -> None:
     try:
         _worker_installer(_sp, "enable")
         if _p2p_enabled():
+            took_over_p2p = True
+            _remove_env_assignment(p2p_env, "NAKSHATRA_P2P_NAKD_INBOUND")
+            p2p_owner.unlink(missing_ok=True)
             _p2p_installer(_sp, "restart")
+        else:
+            took_over_p2p = True
+            p2p_owner.unlink(missing_ok=True)
     except (Exception, SystemExit):
         # enable may have started the unit before its stability check failed. Ask the same verified
         # installer to stop it, then restore exactly the opt-in state the operator had beforehand.
@@ -854,6 +890,15 @@ def _worker_enable_locked(_sp, args) -> None:
             env_path.unlink(missing_ok=True)
         else:
             _write_private(env_path, old_env)
+        if took_over_p2p:
+            if old_p2p_env is None:
+                p2p_env.unlink(missing_ok=True)
+            else:
+                _write_private(p2p_env, old_p2p_env)
+            if old_p2p_owner is None:
+                p2p_owner.unlink(missing_ok=True)
+            else:
+                _write_private(p2p_owner, old_p2p_owner)
         if _p2p_enabled():
             try:
                 _p2p_installer(_sp, "restart")
