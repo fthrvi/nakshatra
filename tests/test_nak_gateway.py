@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 import threading
 import time
@@ -84,8 +85,11 @@ def test_gateway_on_writes_loopback_enforced_opt_in(tmp_path, monkeypatch):
     assert f"STHAMBHA_PILLAR_SPKI_SHA256={PIN}" in body
     assert "NAKSHATRA_CHAIN_TLS_MODE=required" in body
     assert "NAKSHATRA_LEDGER_REQUESTER" not in body
-    assert (home / ".nakshatra" / "inference.env").is_file()
-    assert (home / ".nakshatra" / "gateway" / "inference-profile-created").is_file()
+    profile = home / ".nakshatra" / "inference.env"
+    owner = home / ".nakshatra" / "gateway" / "inference-profile-created"
+    token = owner.read_text().strip()
+    assert re.fullmatch(r"[0-9a-f]{64}", token)
+    assert f"# nak-gateway-owned: {token}\n" in profile.read_text()
     assert calls == ["enable"]
 
 
@@ -152,49 +156,26 @@ def test_gateway_refuses_non_loopback_without_allow_lan(tmp_path, monkeypatch):
     assert not (home / ".nakshatra" / "gateway.env").exists()
 
 
-def test_gateway_uses_exact_nakc_defaults_without_allow_lan(tmp_path, monkeypatch):
-    home = tmp_path / "home"
-    monkeypatch.setenv("HOME", str(home))
-    monkeypatch.setenv("NAK_CONTAINER", "1")
-    monkeypatch.setenv("NAK_GATEWAY_BIND", "0.0.0.0")
-    monkeypatch.setenv("NAK_GATEWAY_PORT", "11599")
-    calls = []
-    monkeypatch.setattr(nak, "_gateway_unit_enabled", lambda _sp: False)
-    monkeypatch.setattr(nak, "_gateway_installer", lambda _sp, action: calls.append(action))
-
-    nak._gateway_on(object(), _args(bind="0.0.0.0", port=11599))
-
-    body = (home / ".nakshatra" / "gateway.env").read_text()
-    assert 'BIND="0.0.0.0"' in body and "PORT=11599" in body
-    assert calls == ["enable"]
-
-
-def test_gateway_container_marker_does_not_allow_a_different_lan_bind(tmp_path, monkeypatch):
+def test_gateway_container_environment_cannot_bypass_allow_lan(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setenv("NAK_CONTAINER", "1")
     monkeypatch.setenv("NAK_GATEWAY_BIND", "0.0.0.0")
     monkeypatch.setenv("NAK_GATEWAY_PORT", "11599")
 
     with pytest.raises(SystemExit, match="non-loopback"):
-        nak._gateway_on(object(), _args(bind="192.0.2.4", port=11599))
+        nak._gateway_on(object(), _args(bind="0.0.0.0", port=11599))
 
 
-def test_gateway_cli_defaults_differ_on_host_and_in_nakc(monkeypatch):
+def test_gateway_cli_defaults_ignore_container_environment(monkeypatch):
     seen = []
-    monkeypatch.delenv("NAK_CONTAINER", raising=False)
-    monkeypatch.delenv("NAK_GATEWAY_BIND", raising=False)
-    monkeypatch.delenv("NAK_GATEWAY_PORT", raising=False)
+    monkeypatch.setenv("NAK_CONTAINER", "1")
+    monkeypatch.setenv("NAK_GATEWAY_BIND", "0.0.0.0")
+    monkeypatch.setenv("NAK_GATEWAY_PORT", "11599")
     monkeypatch.setattr(nak, "_gateway_on", lambda _sp, args: seen.append((args.bind, args.port)))
     required = ["--pillar-url", "https://pillar.example", "--pillar-spki", PIN,
                 "--ledger-url", "https://pillar.example/ledger"]
     assert nak.main(["gateway", "on", *required]) == 0
     assert seen.pop() == ("127.0.0.1", 11600)
-
-    monkeypatch.setenv("NAK_CONTAINER", "1")
-    monkeypatch.setenv("NAK_GATEWAY_BIND", "0.0.0.0")
-    monkeypatch.setenv("NAK_GATEWAY_PORT", "11599")
-    assert nak.main(["gateway", "on", *required]) == 0
-    assert seen.pop() == ("0.0.0.0", 11599)
 
 
 def test_gateway_allows_lan_only_with_explicit_flag(tmp_path, monkeypatch):
@@ -229,10 +210,11 @@ def test_gateway_off_removes_opt_in_without_starting_units(tmp_path, monkeypatch
     env.parent.mkdir(parents=True)
     env.write_text("NAKSHATRA_LEDGER_MODE=enforce\n")
     profile = home / ".nakshatra" / "inference.env"
-    profile.write_text("# gateway created\n")
+    token = "ab" * 32
+    profile.write_text(f"# gateway created\n# nak-gateway-owned: {token}\n")
     owner = home / ".nakshatra" / "gateway" / "inference-profile-created"
     owner.parent.mkdir()
-    owner.write_text("owned\n")
+    owner.write_text(f"{token}\n")
     calls = []
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setattr(nak, "_gateway_installer", lambda _sp, action: calls.append(action))
@@ -259,10 +241,52 @@ def test_gateway_off_preserves_preexisting_or_still_needed_inference_profile(tmp
 
     owner = state / "gateway" / "inference-profile-created"
     owner.parent.mkdir(exist_ok=True)
-    owner.write_text("owned\n")
+    token = "ab" * 32
+    profile.write_text(f"# nak-gateway-owned: {token}\n")
+    owner.write_text(f"{token}\n")
     (state / "unconscious.release").write_text("enabled\n")
     nak._gateway_off(object())
-    assert profile.exists() and owner.exists()
+    assert profile.exists() and not owner.exists()
+
+
+@pytest.mark.parametrize("replacement", [
+    "EXISTING=operator-owned\n",
+    "# nak-gateway-owned: " + "cd" * 32 + "\n",
+])
+def test_gateway_off_preserves_operator_replaced_profile(tmp_path, monkeypatch, replacement):
+    home = tmp_path / "home"
+    state = home / ".nakshatra"
+    gateway = state / "gateway"
+    gateway.mkdir(parents=True)
+    profile = state / "inference.env"
+    profile.write_text(replacement)
+    owner = gateway / "inference-profile-created"
+    owner.write_text("ab" * 32 + "\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(nak, "_gateway_installer", lambda *_args: None)
+
+    nak._gateway_off(object())
+
+    assert profile.read_text() == replacement
+    assert not owner.exists()
+
+
+def test_gateway_off_preserves_profile_with_stale_marker(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    state = home / ".nakshatra"
+    gateway = state / "gateway"
+    gateway.mkdir(parents=True)
+    profile = state / "inference.env"
+    profile.write_text("EXISTING=operator-owned\n")
+    owner = gateway / "inference-profile-created"
+    owner.write_text("legacy unbound marker\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(nak, "_gateway_installer", lambda *_args: None)
+
+    nak._gateway_off(object())
+
+    assert profile.read_text() == "EXISTING=operator-owned\n"
+    assert not owner.exists()
 
 
 def test_gateway_off_worker_only_falls_back_to_worker_profile(tmp_path, monkeypatch):
@@ -270,9 +294,10 @@ def test_gateway_off_worker_only_falls_back_to_worker_profile(tmp_path, monkeypa
     state = home / ".nakshatra"
     gateway = state / "gateway"
     gateway.mkdir(parents=True)
-    (state / "inference.env").write_text("created by gateway\n")
+    token = "ab" * 32
+    (state / "inference.env").write_text(f"# nak-gateway-owned: {token}\n")
     (state / "worker.env").write_text("PORT=50051\n")
-    (gateway / "inference-profile-created").write_text("owned\n")
+    (gateway / "inference-profile-created").write_text(f"{token}\n")
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setattr(nak, "_gateway_installer", lambda *_args: None)
 

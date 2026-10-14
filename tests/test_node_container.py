@@ -62,9 +62,8 @@ def test_nakc_default_run_is_hardened_and_mounts_only_the_state_volume(tmp_path)
     assert "--read-only" in argv and "--network" in argv and argv[argv.index("--network") + 1] == "bridge"
     assert "--network=host" not in argv and "--privileged" not in argv
     assert "127.0.0.1:11600:11599/tcp" in argv
-    assert "NAK_CONTAINER=1" in argv
-    assert "NAK_GATEWAY_BIND=0.0.0.0" in argv
-    assert "NAK_GATEWAY_PORT=11599" in argv
+    assert not any(item.startswith(("NAK_CONTAINER=", "NAK_GATEWAY_BIND=", "NAK_GATEWAY_PORT="))
+                   for item in argv)
     assert not any(item.endswith(":/share") or "dst=/share" in item for item in argv)
     mounts = [argv[index + 1] for index, item in enumerate(argv) if item == "--volume"]
     assert mounts == ["nakshatra-node-state:/state"]
@@ -125,6 +124,28 @@ def test_mcp_is_a_direct_interactive_exec(tmp_path):
     assert shlex.split(result.stdout.removeprefix("+ ")) == [
         "docker", "exec", "-i", "nakshatra-node", "nak-mcp"
     ]
+
+
+def test_gateway_on_uses_fixed_internal_endpoint_and_explicit_lan_ack(tmp_path):
+    result = _nakc(
+        tmp_path, "gateway", "on", "--pillar-url", "https://pillar.example",
+        "--pillar-spki", "17" * 32, "--ledger-url", "https://pillar.example/ledger",
+    )
+    assert result.returncode == 0, result.stderr
+    command = next(line for line in result.stdout.splitlines()
+                   if line.startswith("+ docker exec "))
+    assert shlex.split(command.removeprefix("+ ")) == [
+        "docker", "exec", "-i", "nakshatra-node", "nak", "gateway", "on",
+        "--bind", "0.0.0.0", "--port", "11599", "--allow-lan",
+        "--pillar-url", "https://pillar.example", "--pillar-spki", "17" * 32,
+        "--ledger-url", "https://pillar.example/ledger",
+    ]
+
+
+def test_gateway_on_rejects_endpoint_overrides(tmp_path):
+    result = _nakc(tmp_path, "gateway", "on", "--port", "12345")
+    assert result.returncode == 2
+    assert "fixes the gateway bind and port" in result.stderr
 
 
 def test_bootstrap_parser_accepts_only_the_fingerprinted_join_form():

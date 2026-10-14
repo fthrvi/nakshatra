@@ -91,12 +91,7 @@ run_args() {
         --pids-limit "${NAKC_PIDS_LIMIT:-512}" --memory "${NAKC_MEMORY:-16g}"
         --network bridge --stop-timeout "${NAKC_STOP_TIMEOUT:-20}"
         --publish "127.0.0.1:${NAKC_GATEWAY_PORT:-11600}:11599/tcp"
-        --env "NAK_UPDATE_INTERVAL_S=${NAKC_UPDATE_INTERVAL_S:-3600}"
-        # These defaults are consumed by `nak gateway on`. NAK_CONTAINER also attests that this
-        # wrapper publishes the otherwise non-loopback container bind on host loopback only.
-        --env "NAK_CONTAINER=1"
-        --env "NAK_GATEWAY_BIND=0.0.0.0"
-        --env "NAK_GATEWAY_PORT=11599")
+        --env "NAK_UPDATE_INTERVAL_S=${NAKC_UPDATE_INTERVAL_S:-3600}")
     if [ "${runtime##*/}" = podman ]; then
         RUN_ARGS+=(--volume "$VOLUME_NAME:/state:U")
     else
@@ -161,6 +156,7 @@ usage() {
     cat <<'EOF'
 usage: nakc join '<invite line>'
        nakc start [--share-rw] | stop | status | logs | update
+       nakc gateway on|off|status ...
        nakc worker build|on|off|status ...
        nakc share [--share-rw] <directory>
        nakc mcp
@@ -172,7 +168,7 @@ EOF
 
 main() {
     [ "$#" -gt 0 ] || { usage; exit 2; }
-    local command="$1" runtime port path mode old_port old_p2p_port p2p_port
+    local command="$1" runtime port path mode old_port old_p2p_port p2p_port item
     shift
     runtime="$(engine)"
     case "$command" in
@@ -222,6 +218,25 @@ main() {
             config_write share-mode "$mode"
             printf 'share configured %s at /share (%s)\n' "$path" "$mode"
             if container_running; then start_container "$runtime"; fi
+            ;;
+        gateway)
+            [ "$#" -gt 0 ] || die "gateway needs on, off, or status"
+            if [ "$1" = on ]; then
+                shift
+                for item in "$@"; do
+                    case "$item" in
+                        --bind|--bind=*|--port|--port=*|--allow-lan)
+                            die "nakc fixes the gateway bind and port; omit $item"
+                            ;;
+                    esac
+                done
+                ensure_running "$runtime"
+                run "$runtime" exec -i "$CONTAINER_NAME" nak gateway on \
+                    --bind 0.0.0.0 --port 11599 --allow-lan "$@"
+            else
+                ensure_running "$runtime"
+                run "$runtime" exec -i "$CONTAINER_NAME" nak gateway "$@"
+            fi
             ;;
         worker)
             [ "$#" -gt 0 ] || die "worker needs build, on, off, or status"

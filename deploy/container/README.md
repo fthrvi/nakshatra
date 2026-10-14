@@ -49,6 +49,17 @@ nakc worker on --model-id MODEL --package-url URL --package-pubkey PUBKEY \
   --pillar-url URL --pillar-spki SHA256 --layers 0-16 --port 50051
 ```
 
+To use the consumer gateway, configure it through the host wrapper:
+
+```sh
+nakc gateway on --pillar-url URL --pillar-spki SHA256 --ledger-url URL
+nakc gateway status
+nakc gateway off
+```
+
+The wrapper supplies the fixed container-internal bind and the explicit LAN acknowledgment;
+do not run `nak gateway on` directly inside the container.
+
 Finally register the stdio MCP bridge with the host harness. For OpenClaw:
 
 ```sh
@@ -89,10 +100,9 @@ delete that volume only as a separate, deliberate operation.
 `NAKC_ENGINE=docker` or `NAKC_ENGINE=podman`. Every start uses a non-root UID, drops all
 capabilities, enables `no-new-privileges`, uses a read-only root filesystem, supplies only a
 bounded `/tmp` tmpfs, uses the normal container network namespace, and applies memory and
-PID limits. `nakc` exports `NAK_GATEWAY_BIND=0.0.0.0` and `NAK_GATEWAY_PORT=11599`, so an
-unflagged `nak gateway on` writes the container-internal endpoint instead of the host defaults.
-That otherwise non-loopback bind is safe because `nakc` maps it only to host loopback at
-`127.0.0.1:11600`; it is not exposed to the LAN. The worker's gRPC port always binds container
+PID limits. `nakc gateway on` explicitly configures the gateway at `0.0.0.0:11599` inside the
+container, while `nakc` maps that port only to host loopback at `127.0.0.1:11600`; it is not
+exposed to the LAN. The worker's gRPC port always binds container
 loopback and is never published. While the worker is on, its libp2p sidecar is the one deliberate
 public ingress:
 `0.0.0.0:4001` over both TCP and UDP/QUIC by default. Set `NAKC_P2P_PORT` on the first
