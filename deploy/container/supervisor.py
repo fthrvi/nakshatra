@@ -201,10 +201,13 @@ class Supervisor:
         worker_env = home / ".nakshatra" / "worker.env"
         if os.environ.get("NAK_CONTAINER_WORKER") != "1":
             # The state volume survives role changes. Strip any fixed inbound listener left by a
-            # former worker container so consumer gateways remain dial-only.
+            # former worker container and explicitly opt the consumer out of the signed unit's
+            # backward-compatible nakd inbound default. The libp2p listener remains for DCUtR.
             for path in (p2p_env, worker_env):
                 if path.exists():
                     self._set_env(path, "NAKSHATRA_P2P_WORKER_ARGS", None)
+            if p2p_env.exists():
+                self._set_env(p2p_env, "NAKSHATRA_P2P_NAKD_INBOUND", "")
             return
         port_text = os.environ.get("NAK_CONTAINER_P2P_PORT", "4001")
         try:
@@ -214,6 +217,8 @@ class Supervisor:
         if not 1 <= port <= 65535 or str(port) != port_text:
             raise ValueError("container p2p port must be between 1 and 65535")
         if worker_env.exists():
+            if p2p_env.exists():
+                self._set_env(p2p_env, "NAKSHATRA_P2P_NAKD_INBOUND", None)
             values = _env_file(worker_env)
             worker_port = values.get("PORT", "")
             if not worker_port.isdigit() or not 1 <= int(worker_port) <= 65535:
@@ -222,8 +227,7 @@ class Supervisor:
             self._set_env(
                 worker_env,
                 "NAKSHATRA_P2P_WORKER_ARGS",
-                f"-listen /ip4/0.0.0.0/tcp/{port} -nakd-inbound=127.0.0.1:51830 "
-                f"-inbound=127.0.0.1:{worker_port} "
+                f"-listen /ip4/0.0.0.0/tcp/{port} -inbound=127.0.0.1:{worker_port} "
                 "-require-direct-activation",
             )
         if p2p_env.exists() and not worker_env.exists():

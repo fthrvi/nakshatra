@@ -139,6 +139,9 @@
     "network-online.target",
     "nak-net.service"
    ],
+   "environment": {
+    "NAKSHATRA_P2P_NAKD_INBOUND": "-nakd-inbound=127.0.0.1:51830"
+   },
    "exec_start_pre": [
     [
      "{python}",
@@ -157,6 +160,7 @@
     "-listen",
     "/ip4/0.0.0.0/tcp/0",
     "-quic",
+    "$NAKSHATRA_P2P_NAKD_INBOUND",
     "-dial-listen=${XDG_RUNTIME_DIR}/nakshatra/p2p.sock",
     "-relays=${P2P_RELAYS}",
     "$NAKSHATRA_P2P_WORKER_ARGS"

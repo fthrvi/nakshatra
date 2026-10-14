@@ -427,7 +427,10 @@ def test_p2p_sidecar_service_is_opt_in_and_uses_the_release_binary(tmp_path):
     assert svc["requires"].endswith("/.nakshatra/p2p.env")
     assert svc["exec"][0] == "{prefix}/current/nakshatra/bin/nakshatra-sidecar"
     assert "-quic" in svc["exec"]
-    assert not any(arg.startswith(("-nakd-inbound", "-inbound")) for arg in svc["exec"])
+    assert svc["environment"]["NAKSHATRA_P2P_NAKD_INBOUND"] == \
+        "-nakd-inbound=127.0.0.1:51830"
+    assert "$NAKSHATRA_P2P_NAKD_INBOUND" in svc["exec"]
+    assert not any(arg.startswith("-inbound") for arg in svc["exec"])
     assert "-dial-listen=${XDG_RUNTIME_DIR}/nakshatra/p2p.sock" in svc["exec"] and "-relays=${P2P_RELAYS}" in svc["exec"]
     assert svc["optional_env_files"] == ["{home}/.nakshatra/worker.env"]
     assert svc["exec"][-1] == "$NAKSHATRA_P2P_WORKER_ARGS"
@@ -442,6 +445,8 @@ def test_p2p_sidecar_service_is_opt_in_and_uses_the_release_binary(tmp_path):
     assert "ExecStartPre=" in text and "sidecar_key.py" in text
     assert f"ReadWritePaths={Path.home()}/.config" in text
     assert f"EnvironmentFile=-{Path.home()}/.nakshatra/worker.env" in text
+    assert "Environment=NAKSHATRA_P2P_NAKD_INBOUND=-nakd-inbound=127.0.0.1:51830" in text
+    assert " $NAKSHATRA_P2P_NAKD_INBOUND " in text
     assert " $NAKSHATRA_P2P_WORKER_ARGS" in text
 
 

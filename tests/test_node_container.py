@@ -10,6 +10,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -32,6 +33,35 @@ supervisor = _load("nak_container_supervisor", CONTAINER / "supervisor.py")
 bootstrap = _load("nak_container_bootstrap", CONTAINER / "bootstrap.py")
 sys.path.insert(0, str(ROOT / "release"))
 release_installer = _load("nak_container_release_installer", ROOT / "release" / "install.py")
+sys.path.insert(0, str(ROOT / "scripts"))
+from network import nak  # noqa: E402
+
+
+def _effective_p2p_argv(tmp_path: Path, home: Path) -> list[str]:
+    spec = json.loads((ROOT / "release" / "spec.json").read_text())
+    service = spec["services"]["nakshatra-p2p"]
+    manifest = {"version": "test", "components": [{"name": "nakshatra", "pythonpath": "scripts"}]}
+    prefix = tmp_path / "prefix"
+    installer = release_installer.Installer(
+        prefix, systemd=False, make_venv=False, unit_dir=tmp_path / "units")
+    unit_path = tmp_path / "p2p.service"
+    unit_path.write_text(installer._unit_text(service, installer._ctx(manifest), manifest))
+    return supervisor.parse_unit(
+        unit_path, {"HOME": str(home), "XDG_RUNTIME_DIR": str(tmp_path / "run")}
+    ).argv
+
+
+def _legacy_p2p_argv(
+        tmp_path: Path, home: Path, relays: str, worker_args: list[str] | None = None) -> list[str]:
+    return [
+        str(tmp_path / "prefix" / "current" / "nakshatra" / "bin" / "nakshatra-sidecar"),
+        "-key", str(home / ".config" / "nakshatra-sidecar" / "node.key"),
+        "-listen", "/ip4/0.0.0.0/tcp/0", "-quic",
+        "-nakd-inbound=127.0.0.1:51830",
+        f"-dial-listen={tmp_path / 'run' / 'nakshatra' / 'p2p.sock'}",
+        f"-relays={relays}",
+        *(worker_args or []),
+    ]
 
 
 def _nakc(tmp_path: Path, *args: str, **extra_env: str) -> subprocess.CompletedProcess:
@@ -199,6 +229,70 @@ def test_generated_unit_parser_expands_env_files_without_copying_commands(tmp_pa
     assert unit.pre[0][0] == sys.executable and unit.restart == "always"
 
 
+def test_signed_p2p_unit_keeps_legacy_worker_and_hub_argv(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    env_dir = home / ".nakshatra"
+    env_dir.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+
+    # Exact release-6ea54bf assignment shapes: the p2p opt-in supplied the relay and the
+    # worker env supplied only its worker inbound arguments. The signed unit supplied nakd.
+    (env_dir / "p2p.env").write_text("P2P_RELAYS=legacy-relay\n")
+    worker_args = ["-inbound=127.0.0.1:5530", "-require-direct-activation"]
+    (env_dir / "worker.env").write_text(
+        'NAKSHATRA_P2P_WORKER_ARGS="-inbound=127.0.0.1:5530 '
+        '-require-direct-activation"\n'
+    )
+    assert _effective_p2p_argv(tmp_path, home) == _legacy_p2p_argv(
+        tmp_path, home, "legacy-relay", worker_args
+    )
+
+    # A hub that never had worker.env still gets precisely the old signed unit's nakd target.
+    (env_dir / "worker.env").unlink()
+    (env_dir / "p2p.env").write_text("P2P_RELAYS=hub-relay\n")
+    assert _effective_p2p_argv(tmp_path, home) == _legacy_p2p_argv(
+        tmp_path, home, "hub-relay"
+    )
+
+
+def test_gateway_created_consumer_effective_p2p_argv_has_no_inbound(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(nak, "_p2p_installer", lambda *_args: None)
+
+    nak._enable_p2p_service(object(), owner_token="ab" * 32)
+
+    values = supervisor._env_file(home / ".nakshatra" / "p2p.env")
+    assert values["NAKSHATRA_P2P_NAKD_INBOUND"] == ""
+    effective = _effective_p2p_argv(tmp_path, home)
+    assert "-listen" in effective and "/ip4/0.0.0.0/tcp/0" in effective
+    assert "-quic" in effective
+    assert not any(arg.startswith(("-nakd-inbound", "-inbound")) for arg in effective)
+
+
+def test_fresh_worker_effective_p2p_argv_matches_legacy_worker(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    env_dir = home / ".nakshatra"
+    env_dir.mkdir(parents=True)
+    (env_dir / "p2p.env").write_text("P2P_RELAYS=legacy-relay\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(nak, "_worker_installer", lambda *_args: None)
+    monkeypatch.setattr(nak, "_p2p_installer", lambda *_args: None)
+    args = SimpleNamespace(
+        model_id="qwen", package_url="https://models.test/qwen", package_pubkey="cd" * 32,
+        pillar_url="http://localhost", pillar_spki=None, trusted_pillar_nets="10.42.0.0/24",
+        listen_address="0.0.0.0", layers="0-16", port=5530, idle_unload_s=600.0,
+        release_grace_s=30.0, warm_directives="on", mode="first",
+    )
+
+    nak._worker_enable(object(), args)
+
+    worker_args = ["-inbound=127.0.0.1:5530", "-require-direct-activation"]
+    assert _effective_p2p_argv(tmp_path, home) == _legacy_p2p_argv(
+        tmp_path, home, "legacy-relay", worker_args
+    )
+
+
 def test_container_env_keeps_worker_private_without_rewriting_gateway_files(tmp_path, monkeypatch):
     home = tmp_path / "home"
     env_dir = home / ".nakshatra"
@@ -215,8 +309,8 @@ def test_container_env_keeps_worker_private_without_rewriting_gateway_files(tmp_
     worker_env = supervisor._env_file(env_dir / "worker.env")
     assert worker_env["LISTEN"] == "127.0.0.1"
     assert worker_env["NAKSHATRA_P2P_WORKER_ARGS"] == (
-        "-listen /ip4/0.0.0.0/tcp/4001 -nakd-inbound=127.0.0.1:51830 "
-        "-inbound=127.0.0.1:50051 -require-direct-activation"
+        "-listen /ip4/0.0.0.0/tcp/4001 -inbound=127.0.0.1:50051 "
+        "-require-direct-activation"
     )
 
 
@@ -235,17 +329,11 @@ def test_container_consumer_effective_p2p_command_listens_but_forwards_nothing(t
 
     instance.reconcile_container_env()
 
-    assert supervisor._env_file(p2p_env) == {"P2P_RELAYS": "test"}
+    assert supervisor._env_file(p2p_env) == {
+        "P2P_RELAYS": "test", "NAKSHATRA_P2P_NAKD_INBOUND": ""
+    }
     assert "0.0.0.0" not in p2p_env.read_text()
-    spec = json.loads((ROOT / "release" / "spec.json").read_text())
-    service = spec["services"]["nakshatra-p2p"]
-    manifest = {"version": "test", "components": [{"name": "nakshatra", "pythonpath": "scripts"}]}
-    installer = release_installer.Installer(
-        tmp_path / "prefix", systemd=False, make_venv=False, unit_dir=tmp_path / "units")
-    unit_path = tmp_path / "p2p.service"
-    unit_path.write_text(installer._unit_text(service, installer._ctx(manifest), manifest))
-    effective = supervisor.parse_unit(
-        unit_path, {"HOME": str(home), "XDG_RUNTIME_DIR": str(tmp_path / "run")}).argv
+    effective = _effective_p2p_argv(tmp_path, home)
     assert "-listen" in effective and "/ip4/0.0.0.0/tcp/0" in effective
     assert "-quic" in effective
     assert not any(arg.startswith(("-nakd-inbound", "-inbound")) for arg in effective)

@@ -95,6 +95,7 @@ def test_gateway_on_writes_loopback_enforced_opt_in(tmp_path, monkeypatch):
     p2p_owner = home / ".nakshatra" / "gateway" / "p2p-profile-created"
     p2p_token = p2p_owner.read_text().strip()
     assert re.fullmatch(r"[0-9a-f]{64}", p2p_token)
+    assert 'NAKSHATRA_P2P_NAKD_INBOUND=""\n' in p2p_env.read_text()
     assert f"# nak-gateway-owned: {p2p_token}\n" in p2p_env.read_text()
     assert (home / ".nakshatra" / "p2p.lock").stat().st_mode & 0o777 == 0o600
     assert calls == ["enable"]

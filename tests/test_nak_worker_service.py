@@ -111,8 +111,8 @@ def test_nak_worker_on_writes_env_once_and_uses_verified_installer(tmp_path, mon
     assert "IDLE_UNLOAD_S=600" in first
     assert "RELEASE_GRACE_S=30" in first
     assert "WARM_DIRECTIVES=1" in first
-    assert ('NAKSHATRA_P2P_WORKER_ARGS="-nakd-inbound=127.0.0.1:51830 '
-            '-inbound=127.0.0.1:5530 -require-direct-activation"') in first
+    assert ('NAKSHATRA_P2P_WORKER_ARGS="-inbound=127.0.0.1:5530 '
+            '-require-direct-activation"') in first
     assert "SUB_GGUF=" in first and "skip-sha256" not in first
     inference_env = home / ".nakshatra" / "inference.env"
     assert not inference_env.exists()

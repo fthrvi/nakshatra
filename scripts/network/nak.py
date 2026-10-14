@@ -239,7 +239,10 @@ def _enable_p2p_service_locked(_sp, *, owner_token: str = "") -> None:
     if not env.exists():
         env.parent.mkdir(parents=True, exist_ok=True)
         ownership = f"{GATEWAY_PROFILE_OWNER_PREFIX}{owner_token}\n" if owner_token else ""
-        _write_private(env, f"P2P_RELAYS={DEFAULT_P2P_RELAYS}\n{ownership}".encode())
+        consumer = 'NAKSHATRA_P2P_NAKD_INBOUND=""\n' if owner_token else ""
+        _write_private(
+            env, f"P2P_RELAYS={DEFAULT_P2P_RELAYS}\n{consumer}{ownership}".encode()
+        )
         created = True
     try:
         _p2p_installer(_sp, "enable")
@@ -834,8 +837,7 @@ def _worker_enable_locked(_sp, args) -> None:
     _set_env_assignment(
         env_path,
         "NAKSHATRA_P2P_WORKER_ARGS",
-        f"-nakd-inbound=127.0.0.1:51830 -inbound=127.0.0.1:{port} "
-        "-require-direct-activation",
+        f"-inbound=127.0.0.1:{port} -require-direct-activation",
     )
     try:
         _worker_installer(_sp, "enable")
