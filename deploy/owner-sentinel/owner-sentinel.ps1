@@ -1,3 +1,4 @@
+# Sentinel-Version: 2026-10-13.1
 param(
     [switch]$Once,
     [switch]$DryRun

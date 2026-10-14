@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -172,8 +173,8 @@ def test_once_dry_run_prints_decision_and_sends_nothing(tmp_path, monkeypatch, c
 
 
 @pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh is not installed")
-def test_powershell_sentinel_parses():
-    script = SENTINEL_DIR / "owner-sentinel.ps1"
+@pytest.mark.parametrize("script", sorted(SENTINEL_DIR.glob("*.ps1")), ids=lambda path: path.name)
+def test_powershell_scripts_parse(script):
     command = (
         "$tokens=$null; $errors=$null; "
         "[System.Management.Automation.Language.Parser]::ParseFile($args[0],[ref]$tokens,[ref]$errors) | Out-Null; "
@@ -185,3 +186,31 @@ def test_powershell_sentinel_parses():
         text=True,
     )
     assert completed.returncode == 0, completed.stderr
+
+
+def test_launcher_runs_only_the_local_sentinel_and_does_not_read_token():
+    launcher = (SENTINEL_DIR / "sentinel-launcher.ps1").read_text(encoding="utf-8")
+
+    assert "Join-Path $InstallDirectory 'owner-sentinel.ps1'" in launcher
+    assert "Start-Process" in launcher
+    assert "OWNER_LEASE_TOKEN" not in launcher
+
+
+def test_launcher_has_no_network_download_surface():
+    launcher = (SENTINEL_DIR / "sentinel-launcher.ps1").read_text(encoding="utf-8")
+    lowered = launcher.lower()
+
+    assert "invoke-webrequest" not in lowered
+    urls = re.findall(r"https?://([^/\s'\"]+)", launcher, flags=re.IGNORECASE)
+    assert all(host.split(":", 1)[0].lower() in {"127.0.0.1", "localhost", "[::1]"} for host in urls)
+
+
+def test_installer_registers_launcher_without_an_execution_time_limit():
+    installer = (SENTINEL_DIR / "install.ps1").read_text(encoding="utf-8")
+
+    assert "[string]$Distro" in installer
+    assert "[string]$LinuxUser" in installer
+    assert "sentinel-launcher.ps1" in installer
+    assert "OWNER_WSL_DISTRO" in installer
+    assert "OWNER_WSL_USER" in installer
+    assert re.search(r"-ExecutionTimeLimit\s*\(New-TimeSpan\s+-Seconds\s+0\)", installer)

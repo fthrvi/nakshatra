@@ -11,17 +11,44 @@ It does not decide how the worker unloads; it reports only whether the owner is 
 
 ## Windows (PowerShell 5.1 or newer)
 
-1. Copy this directory to a stable location in the Windows user's account.
-2. Copy the worker's `~/.nakshatra/owner-lease.env` from WSL next to
-   `owner-sentinel.ps1`. Windows-to-WSL localhost forwarding makes the local endpoint
-   available as `127.0.0.1`; do not expose the lease port to the LAN.
-3. Optionally put one game executable per line in `games.txt`. Names may include `.exe`.
-4. In Windows PowerShell, run `./owner-sentinel.ps1 -Once -DryRun`. It should print one
+1. Copy the worker's `~/.nakshatra/owner-lease.env` from WSL into this directory.
+   Windows-to-WSL localhost forwarding makes the local endpoint available as
+   `127.0.0.1`; do not expose the lease port to the LAN.
+2. Optionally put one game executable per line in `games.txt`. Names may include `.exe`.
+3. In Windows PowerShell, run `./owner-sentinel.ps1 -Once -DryRun`. It should print one
    decision and send nothing.
-5. Run `./install.ps1`. This registers and starts a hidden, per-user Scheduled Task at
-   logon. Administrator access and extra PowerShell modules are not required.
+4. Run `./install.ps1 -Distro <WSL-distro> -LinuxUser <Linux-user>`, for example
+   `./install.ps1 -Distro Ubuntu-24.04 -LinuxUser biswa`. The installer copies the Windows
+   files to `%LOCALAPPDATA%\nakshatra\owner-sentinel`, records `OWNER_WSL_DISTRO` and
+   `OWNER_WSL_USER` in the installed `owner-lease.env`, and registers a hidden per-user
+   Scheduled Task at logon. Administrator access and extra PowerShell modules are not
+   required.
 
 Run `./uninstall.ps1` to remove the task. It leaves the token and process list in place.
+
+### Windows self-update
+
+The Scheduled Task runs `sentinel-launcher.ps1`, which always starts the local installed
+`owner-sentinel.ps1`. At startup and every six hours, the launcher looks for the copy from
+the current signed worker release at
+`\\wsl.localhost\<Distro>\home\<LinuxUser>\.nakshatra-node\current\nakshatra\deploy\owner-sentinel\owner-sentinel.ps1`,
+with `\\wsl$\...` as a compatibility fallback. If its SHA-256 differs, the launcher copies
+it to a temporary file, atomically replaces the local sentinel with `Move-Item -Force`, and
+restarts the sentinel child. It also restarts an unexpectedly exited child after five
+seconds. The launcher sends no heartbeat itself, so a failed or stopped sentinel still
+means silence and the worker still stops.
+
+The WSL release tree is trusted because it is written only by the signed-release installer
+inside the same Windows user's distro; it has the same trust boundary as the worker it
+updates. The launcher never fetches from a network location. If WSL is stopped, the release
+path is missing, hashing/copying fails, or the release tree is temporarily unavailable, the
+launcher keeps and runs the existing local sentinel. It never deletes that copy.
+
+To verify updates, inspect
+`%LOCALAPPDATA%\nakshatra\owner-sentinel\launcher.log`. Each update check is one timestamped
+line with the local and release version/SHA-256 and `action=updated` or `action=kept`; the
+file retains about 200 lines. It never contains the lease token. You can also inspect the
+Scheduled Task action and confirm it names `sentinel-launcher.ps1` in that directory.
 
 The Windows sentinel reports busy for the pause switch, a non-Explorer foreground window
 covering its monitor, a configured process, or an owner process holding more than
