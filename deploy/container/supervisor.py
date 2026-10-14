@@ -222,7 +222,8 @@ class Supervisor:
             self._set_env(
                 worker_env,
                 "NAKSHATRA_P2P_WORKER_ARGS",
-                f"-listen /ip4/0.0.0.0/tcp/{port} -inbound=127.0.0.1:{worker_port} "
+                f"-listen /ip4/0.0.0.0/tcp/{port} -nakd-inbound=127.0.0.1:51830 "
+                f"-inbound=127.0.0.1:{worker_port} "
                 "-require-direct-activation",
             )
         if p2p_env.exists() and not worker_env.exists():

@@ -96,6 +96,7 @@ def test_gateway_on_writes_loopback_enforced_opt_in(tmp_path, monkeypatch):
     p2p_token = p2p_owner.read_text().strip()
     assert re.fullmatch(r"[0-9a-f]{64}", p2p_token)
     assert f"# nak-gateway-owned: {p2p_token}\n" in p2p_env.read_text()
+    assert (home / ".nakshatra" / "p2p.lock").stat().st_mode & 0o777 == 0o600
     assert calls == ["enable"]
 
 
@@ -179,6 +180,33 @@ def test_gateway_enable_failure_rolls_back_created_profile_ownership(tmp_path, m
     assert not (home / ".nakshatra" / "gateway" / "inference-profile-created").exists()
     assert not (home / ".nakshatra" / "p2p.env").exists()
     assert not (home / ".nakshatra" / "gateway" / "p2p-profile-created").exists()
+
+
+def test_gateway_enable_failed_stop_keeps_p2p_ownership_for_off_retry(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(nak, "_gateway_unit_enabled", lambda _sp: False)
+    monkeypatch.setattr(nak, "_gateway_installer", lambda *_args: None)
+    actions = []
+
+    def fail_enable_and_stop(_sp, action):
+        actions.append(action)
+        raise SystemExit(f"{action} failed")
+
+    monkeypatch.setattr(nak, "_p2p_installer", fail_enable_and_stop)
+    with pytest.raises(SystemExit):
+        nak._gateway_on(object(), _args())
+
+    p2p_env = home / ".nakshatra" / "p2p.env"
+    owner = home / ".nakshatra" / "gateway" / "p2p-profile-created"
+    assert p2p_env.exists() and owner.exists()
+    assert nak._gateway_profile_token(p2p_env) == nak._gateway_marker_token(owner)
+    assert actions == ["enable", "disable", "disable"]
+
+    monkeypatch.setattr(nak, "_p2p_installer", lambda _sp, action: actions.append(action))
+    nak._gateway_off(object())
+    assert actions[-1] == "disable"
+    assert not p2p_env.exists() and not owner.exists()
 
 
 def test_gateway_auto_uses_join_url_but_ignores_join_key(tmp_path, monkeypatch):
@@ -332,6 +360,36 @@ def test_gateway_off_preserves_gateway_owned_p2p_when_worker_is_configured(tmp_p
     nak._gateway_off(object())
 
     assert p2p_env.read_text() == body
+    assert not owner.exists()
+
+
+def test_gateway_off_rechecks_worker_ownership_between_check_and_disable(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    state = home / ".nakshatra"
+    gateway = state / "gateway"
+    gateway.mkdir(parents=True)
+    token = "cd" * 32
+    p2p_env = state / "p2p.env"
+    body = f"P2P_RELAYS=test\n# nak-gateway-owned: {token}\n"
+    p2p_env.write_text(body)
+    owner = gateway / "p2p-profile-created"
+    owner.write_text(f"{token}\n")
+    calls = []
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(
+        nak, "_gateway_installer", lambda _sp, action: calls.append(("gateway", action)))
+    monkeypatch.setattr(
+        nak, "_p2p_installer", lambda _sp, action: calls.append(("p2p", action)))
+
+    def worker_takes_ownership():
+        (state / "worker.env").write_text("PORT=50051\n")
+
+    monkeypatch.setattr(nak, "_gateway_p2p_before_disable", worker_takes_ownership)
+    nak._gateway_off(object())
+
+    assert calls == [("gateway", "disable")]
+    assert p2p_env.read_text() == body
+    assert (state / "worker.env").is_file()
     assert not owner.exists()
 
 

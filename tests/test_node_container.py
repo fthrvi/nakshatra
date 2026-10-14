@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import re
 import shlex
@@ -29,6 +30,8 @@ def _load(name: str, path: Path):
 
 supervisor = _load("nak_container_supervisor", CONTAINER / "supervisor.py")
 bootstrap = _load("nak_container_bootstrap", CONTAINER / "bootstrap.py")
+sys.path.insert(0, str(ROOT / "release"))
+release_installer = _load("nak_container_release_installer", ROOT / "release" / "install.py")
 
 
 def _nakc(tmp_path: Path, *args: str, **extra_env: str) -> subprocess.CompletedProcess:
@@ -212,11 +215,12 @@ def test_container_env_keeps_worker_private_without_rewriting_gateway_files(tmp_
     worker_env = supervisor._env_file(env_dir / "worker.env")
     assert worker_env["LISTEN"] == "127.0.0.1"
     assert worker_env["NAKSHATRA_P2P_WORKER_ARGS"] == (
-        "-listen /ip4/0.0.0.0/tcp/4001 -inbound=127.0.0.1:50051 -require-direct-activation"
+        "-listen /ip4/0.0.0.0/tcp/4001 -nakd-inbound=127.0.0.1:51830 "
+        "-inbound=127.0.0.1:50051 -require-direct-activation"
     )
 
 
-def test_container_consumer_p2p_env_has_no_listen_args(tmp_path, monkeypatch):
+def test_container_consumer_effective_p2p_command_listens_but_forwards_nothing(tmp_path, monkeypatch):
     home = tmp_path / "home"
     env_dir = home / ".nakshatra"
     env_dir.mkdir(parents=True)
@@ -233,6 +237,18 @@ def test_container_consumer_p2p_env_has_no_listen_args(tmp_path, monkeypatch):
 
     assert supervisor._env_file(p2p_env) == {"P2P_RELAYS": "test"}
     assert "0.0.0.0" not in p2p_env.read_text()
+    spec = json.loads((ROOT / "release" / "spec.json").read_text())
+    service = spec["services"]["nakshatra-p2p"]
+    manifest = {"version": "test", "components": [{"name": "nakshatra", "pythonpath": "scripts"}]}
+    installer = release_installer.Installer(
+        tmp_path / "prefix", systemd=False, make_venv=False, unit_dir=tmp_path / "units")
+    unit_path = tmp_path / "p2p.service"
+    unit_path.write_text(installer._unit_text(service, installer._ctx(manifest), manifest))
+    effective = supervisor.parse_unit(
+        unit_path, {"HOME": str(home), "XDG_RUNTIME_DIR": str(tmp_path / "run")}).argv
+    assert "-listen" in effective and "/ip4/0.0.0.0/tcp/0" in effective
+    assert "-quic" in effective
+    assert not any(arg.startswith(("-nakd-inbound", "-inbound")) for arg in effective)
 
 def test_supervisor_reload_refreshes_environment_file_without_starting_service(tmp_path):
     units = tmp_path / "units"

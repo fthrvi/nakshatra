@@ -624,6 +624,10 @@ class Installer:
             else:
                 failure = f"systemctl disable --now failed with exit status {stopped.returncode}"
                 self._record_service_issue(name, "removal-failed", failure + "; managed unit retained")
+        # If systemd could not stop the service, its opt-in is still authoritative state: retain it
+        # so a later disable retries instead of leaving a live unit with its recovery handle erased.
+        if failure:
+            raise InstallError(f"could not fully disable {name}.service: {failure}")
         requires.unlink(missing_ok=True)
         if removed and subprocess.run(["systemctl", "--user", "daemon-reload"], check=False).returncode != 0:
             failure = "systemctl --user daemon-reload failed after removing the unit"

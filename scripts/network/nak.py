@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import fcntl
 import hashlib
 import ipaddress
 import json
@@ -27,6 +28,7 @@ import stat
 import re
 import sys
 import time
+from contextlib import contextmanager
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -214,8 +216,24 @@ def _verified_release_installer(prefix: Path) -> Path:
     return installer
 
 
-def _enable_p2p_service(_sp, *, owner_token: str = "") -> None:
-    """Create the opt-in if needed, then atomically hand the one-service enable to the installer."""
+@contextmanager
+def _p2p_ownership_lock():
+    """Serialize every decision that can create, take over, restart, or release P2P."""
+    path = Path.home() / ".nakshatra" / "p2p.lock"
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def _enable_p2p_service_locked(_sp, *, owner_token: str = "") -> None:
+    """Create and enable P2P while the caller holds ``_p2p_ownership_lock``."""
     env = Path.home() / ".nakshatra" / "p2p.env"
     created = False
     if not env.exists():
@@ -225,19 +243,35 @@ def _enable_p2p_service(_sp, *, owner_token: str = "") -> None:
         created = True
     try:
         _p2p_installer(_sp, "enable")
-    except (Exception, SystemExit):
+    except (Exception, SystemExit) as enable_error:
         # A failed enable may have started the unit before its stability check failed: stop it again.
+        disabled = False
+        disable_error = None
         try:
             _p2p_installer(_sp, "disable")
-        except (Exception, SystemExit):
-            pass
-        if created:
+        except (Exception, SystemExit) as error:
+            disable_error = error
+        else:
+            disabled = True
+        # A failed stop means the sidecar may still be live. Preserve both its opt-in and, for a
+        # gateway-created generation, the ownership token so `nak gateway off` can retry safely.
+        if created and disabled:
             env.unlink(missing_ok=True)
+        if disable_error is not None:
+            raise SystemExit(
+                f"{enable_error}; rollback could not disable nakshatra-p2p: {disable_error}"
+            ) from enable_error
         raise
     if not owner_token:
         # A successful explicit `nak p2p on` is an operator/worker takeover. Retire any
         # gateway marker so a later `nak gateway off` cannot disable that sidecar.
         _gateway_p2p_paths()[1].unlink(missing_ok=True)
+
+
+def _enable_p2p_service(_sp, *, owner_token: str = "") -> None:
+    """Create the opt-in and enable the service as one ownership transaction."""
+    with _p2p_ownership_lock():
+        _enable_p2p_service_locked(_sp, owner_token=owner_token)
 
 
 WORKER_SERVICE = "nakshatra-worker"
@@ -309,15 +343,29 @@ def _release_gateway_profile_ownership() -> None:
 
 def _release_gateway_p2p_ownership(_sp) -> None:
     """Disable only the exact P2P opt-in generation created by this gateway."""
-    p2p_env, marker = _gateway_p2p_paths()
-    env_token = _gateway_profile_token(p2p_env)
-    marker_token = _gateway_marker_token(marker)
-    owned = bool(env_token and marker_token and secrets.compare_digest(env_token, marker_token))
-    worker_configured = (Path.home() / ".nakshatra" / "worker.env").is_file()
-    if owned and not worker_configured:
-        _p2p_installer(_sp, "disable")
-        p2p_env.unlink(missing_ok=True)
-    marker.unlink(missing_ok=True)
+    with _p2p_ownership_lock():
+        p2p_env, marker = _gateway_p2p_paths()
+        env_token = _gateway_profile_token(p2p_env)
+        marker_token = _gateway_marker_token(marker)
+        owned = bool(env_token and marker_token and secrets.compare_digest(env_token, marker_token))
+        worker_configured = (Path.home() / ".nakshatra" / "worker.env").is_file()
+        if owned and not worker_configured:
+            _gateway_p2p_before_disable()
+            # The hook is a regression-test seam for the old check/act race. Re-read all authority
+            # state under the same lock immediately before the irreversible service stop.
+            env_token = _gateway_profile_token(p2p_env)
+            marker_token = _gateway_marker_token(marker)
+            owned = bool(env_token and marker_token
+                         and secrets.compare_digest(env_token, marker_token))
+            worker_configured = (Path.home() / ".nakshatra" / "worker.env").is_file()
+            if owned and not worker_configured:
+                _p2p_installer(_sp, "disable")
+                p2p_env.unlink(missing_ok=True)
+        marker.unlink(missing_ok=True)
+
+
+def _gateway_p2p_before_disable() -> None:
+    """Test seam invoked between gateway P2P eligibility checks; production is a no-op."""
 
 
 def _gateway_values() -> dict[str, str]:
@@ -517,18 +565,7 @@ def _gateway_on(_sp, args) -> None:
             profile.unlink(missing_ok=True)
             profile_owner.unlink(missing_ok=True)
             raise
-    p2p_env, p2p_owner = _gateway_p2p_paths()
-    made_p2p = not p2p_env.exists()
-    p2p_owner_token = ""
-    if made_p2p:
-        p2p_owner_token = secrets.token_hex(32)
-        try:
-            _write_private(p2p_owner, f"{p2p_owner_token}\n".encode())
-        except (Exception, SystemExit):
-            if made_profile:
-                _release_gateway_profile_ownership()
-            p2p_owner.unlink(missing_ok=True)
-            raise
+    made_p2p = False
     package_body = ""
     if args.models == "auto":
         package_body = f"PACKAGE_URL={_env_value(package_url, 'package-url')}\n"
@@ -551,8 +588,15 @@ def _gateway_on(_sp, args) -> None:
     action = "restart" if old_env is not None and _gateway_unit_enabled(_sp) else "enable"
     try:
         _write_private(env_path, body)
-        if made_p2p:
-            _enable_p2p_service(_sp, owner_token=p2p_owner_token)
+        # The existence decision, gateway ownership marker, opt-in creation, and service enable
+        # are one transaction relative to explicit P2P and worker commands.
+        with _p2p_ownership_lock():
+            p2p_env, p2p_owner = _gateway_p2p_paths()
+            made_p2p = not p2p_env.exists()
+            if made_p2p:
+                p2p_owner_token = secrets.token_hex(32)
+                _write_private(p2p_owner, f"{p2p_owner_token}\n".encode())
+                _enable_p2p_service_locked(_sp, owner_token=p2p_owner_token)
         _gateway_installer(_sp, action)
     except (Exception, SystemExit):
         if old_env is None:
@@ -730,6 +774,11 @@ def _env_value(value: str, name: str) -> str:
 
 
 def _worker_enable(_sp, args) -> None:
+    with _p2p_ownership_lock():
+        _worker_enable_locked(_sp, args)
+
+
+def _worker_enable_locked(_sp, args) -> None:
     root, _record, env_path = _worker_paths()
     # systemd's ReadWritePaths requires the path to exist before it can construct the sandbox. Keep
     # both writable roots present even when build.json is missing so the launcher gets to print the
@@ -785,7 +834,8 @@ def _worker_enable(_sp, args) -> None:
     _set_env_assignment(
         env_path,
         "NAKSHATRA_P2P_WORKER_ARGS",
-        f"-inbound=127.0.0.1:{port} -require-direct-activation",
+        f"-nakd-inbound=127.0.0.1:51830 -inbound=127.0.0.1:{port} "
+        "-require-direct-activation",
     )
     try:
         _worker_installer(_sp, "enable")
@@ -814,6 +864,11 @@ def _worker_enable(_sp, args) -> None:
 
 
 def _worker_disable(_sp) -> None:
+    with _p2p_ownership_lock():
+        _worker_disable_locked(_sp)
+
+
+def _worker_disable_locked(_sp) -> None:
     _root, _record, env_path = _worker_paths()
     old_env = env_path.read_bytes() if env_path.exists() else None
     if old_env is not None:
@@ -1185,24 +1240,25 @@ def main(argv=None, *, http_post=None) -> int:
     elif a.cmd == "p2p":
         import subprocess as _sp
         f = Path(os.environ.get("NAK_NET_DIR", Path.home() / ".nakshatra" / "net")) / "p2p-dial"
-        if a.onoff == "off":
-            f.unlink(missing_ok=True)
-            _sp.run(["systemctl", "--user", "restart", "nak-net.service"], check=False)
-            if a.socket is None:              # a custom --socket means a sidecar we don't manage
-                _p2p_installer(_sp, "disable")
-        else:
-            dial = a.socket or _default_p2p_socket()
-            if not dial.is_absolute():
-                raise SystemExit("--socket must be an absolute path")
-            if a.socket is None:              # the bundled sidecar listens on the default socket only
-                _enable_p2p_service(_sp)
-            f.write_text(str(dial) + "\n")
-            _sp.run(["systemctl", "--user", "restart", "nak-net.service"], check=False)
-        # The worker reads the p2p state (its typed endpoint / PeerId) only at startup: restart it so it advertises
-        # the new state instead of a stale endpoint (U4 C1 final review). Only if this node runs a worker.
-        if (Path.home() / ".nakshatra" / "worker.env").is_file():
-            _worker_installer(_sp, "restart")
-            print("worker restarted so it advertises the new p2p state")
+        with _p2p_ownership_lock():
+            if a.onoff == "off":
+                f.unlink(missing_ok=True)
+                _sp.run(["systemctl", "--user", "restart", "nak-net.service"], check=False)
+                if a.socket is None:          # a custom --socket means a sidecar we don't manage
+                    _p2p_installer(_sp, "disable")
+            else:
+                dial = a.socket or _default_p2p_socket()
+                if not dial.is_absolute():
+                    raise SystemExit("--socket must be an absolute path")
+                if a.socket is None:          # the bundled sidecar listens on the default socket only
+                    _enable_p2p_service_locked(_sp)
+                f.write_text(str(dial) + "\n")
+                _sp.run(["systemctl", "--user", "restart", "nak-net.service"], check=False)
+            # The worker reads the P2P state only at startup. Keep the ownership check and restart in
+            # this same transaction so gateway release cannot race it.
+            if (Path.home() / ".nakshatra" / "worker.env").is_file():
+                _worker_installer(_sp, "restart")
+                print("worker restarted so it advertises the new p2p state")
         print(f"p2p {'OFF' if a.onoff == 'off' else 'ON via ' + str(dial)}; nak-net restarted")
     elif a.cmd == "ledger":
         r = call(s, {"op": "ledger"})

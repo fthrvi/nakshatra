@@ -426,7 +426,8 @@ def test_p2p_sidecar_service_is_opt_in_and_uses_the_release_binary(tmp_path):
     svc = spec["services"]["nakshatra-p2p"]
     assert svc["requires"].endswith("/.nakshatra/p2p.env")
     assert svc["exec"][0] == "{prefix}/current/nakshatra/bin/nakshatra-sidecar"
-    assert "-quic" in svc["exec"] and "-nakd-inbound=127.0.0.1:${NAK_DIRECT_PORT}" in svc["exec"]
+    assert "-quic" in svc["exec"]
+    assert not any(arg.startswith(("-nakd-inbound", "-inbound")) for arg in svc["exec"])
     assert "-dial-listen=${XDG_RUNTIME_DIR}/nakshatra/p2p.sock" in svc["exec"] and "-relays=${P2P_RELAYS}" in svc["exec"]
     assert svc["optional_env_files"] == ["{home}/.nakshatra/worker.env"]
     assert svc["exec"][-1] == "$NAKSHATRA_P2P_WORKER_ARGS"
@@ -1137,7 +1138,8 @@ def test_disable_stops_removes_only_managed_unit_and_opt_in(tmp_path, monkeypatc
     ]
 
 
-def test_disable_failure_retains_managed_unit_but_removes_opt_in(tmp_path, monkeypatch):
+def test_disable_failure_retains_managed_unit_and_opt_in_and_cli_exits_nonzero(
+        tmp_path, monkeypatch, capsys):
     inst, _man, opt_in, units = _one_service_install(tmp_path)
     opt_in.parent.mkdir(parents=True)
     opt_in.write_text("")
@@ -1145,8 +1147,13 @@ def test_disable_failure_retains_managed_unit_but_removes_opt_in(tmp_path, monke
                         type("R", (), {"returncode": 1, "stdout": "", "stderr": ""})())
     with pytest.raises(I.InstallError, match="could not fully disable"):
         inst.disable("nakshatra-p2p")
-    assert not opt_in.exists()
+    assert opt_in.exists()
     assert (units / "nakshatra-p2p.service").exists()
+
+    monkeypatch.setattr(I, "UNIT_DIR", units)
+    assert I.main(["--prefix", str(inst.prefix), "disable", "nakshatra-p2p"]) == 1
+    assert "systemctl disable --now failed" in capsys.readouterr().err
+    assert opt_in.exists()
 
 
 def test_p2p_unit_gets_a_writable_private_runtime_dir():

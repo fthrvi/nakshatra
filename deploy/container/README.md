@@ -109,6 +109,10 @@ public ingress:
 `nakc worker on` to choose another fixed port. Turning the worker off removes both publications.
 Host networking is never used.
 
+A consumer-only sidecar still opens its authenticated libp2p listening socket because DCUtR hole
+punching requires both peers to listen. Without `worker.env`, however, its effective command has no
+`-nakd-inbound` or `-inbound` target, so it forwards no inbound streams to a local service.
+
 Tune resource ceilings without weakening the file boundary:
 
 ```sh
