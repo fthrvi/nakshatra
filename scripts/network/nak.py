@@ -214,13 +214,14 @@ def _verified_release_installer(prefix: Path) -> Path:
     return installer
 
 
-def _enable_p2p_service(_sp) -> None:
+def _enable_p2p_service(_sp, *, owner_token: str = "") -> None:
     """Create the opt-in if needed, then atomically hand the one-service enable to the installer."""
     env = Path.home() / ".nakshatra" / "p2p.env"
     created = False
     if not env.exists():
         env.parent.mkdir(parents=True, exist_ok=True)
-        env.write_text(f"P2P_RELAYS={DEFAULT_P2P_RELAYS}\n")
+        ownership = f"{GATEWAY_PROFILE_OWNER_PREFIX}{owner_token}\n" if owner_token else ""
+        _write_private(env, f"P2P_RELAYS={DEFAULT_P2P_RELAYS}\n{ownership}".encode())
         created = True
     try:
         _p2p_installer(_sp, "enable")
@@ -233,6 +234,10 @@ def _enable_p2p_service(_sp) -> None:
         if created:
             env.unlink(missing_ok=True)
         raise
+    if not owner_token:
+        # A successful explicit `nak p2p on` is an operator/worker takeover. Retire any
+        # gateway marker so a later `nak gateway off` cannot disable that sidecar.
+        _gateway_p2p_paths()[1].unlink(missing_ok=True)
 
 
 WORKER_SERVICE = "nakshatra-worker"
@@ -240,6 +245,7 @@ WORKER_BACKENDS = {"cpu", "cuda", "rocm", "vulkan", "metal"}
 GATEWAY_SERVICE = "nakshatra-gateway"
 GATEWAY_PROFILE = "inference.env"
 GATEWAY_PROFILE_OWNER = "inference-profile-created"
+GATEWAY_P2P_OWNER = "p2p-profile-created"
 GATEWAY_PROFILE_OWNER_PREFIX = "# nak-gateway-owned: "
 
 
@@ -251,6 +257,11 @@ def _gateway_paths() -> tuple[Path, Path]:
 def _gateway_profile_paths() -> tuple[Path, Path]:
     root, _env_path = _gateway_paths()
     return Path.home() / ".nakshatra" / GATEWAY_PROFILE, root / GATEWAY_PROFILE_OWNER
+
+
+def _gateway_p2p_paths() -> tuple[Path, Path]:
+    root, _env_path = _gateway_paths()
+    return Path.home() / ".nakshatra" / "p2p.env", root / GATEWAY_P2P_OWNER
 
 
 def _inference_profile_needed_without_gateway() -> bool:
@@ -293,6 +304,19 @@ def _release_gateway_profile_ownership() -> None:
                  and secrets.compare_digest(profile_token, marker_token))
     if owned and not _inference_profile_needed_without_gateway():
         profile.unlink(missing_ok=True)
+    marker.unlink(missing_ok=True)
+
+
+def _release_gateway_p2p_ownership(_sp) -> None:
+    """Disable only the exact P2P opt-in generation created by this gateway."""
+    p2p_env, marker = _gateway_p2p_paths()
+    env_token = _gateway_profile_token(p2p_env)
+    marker_token = _gateway_marker_token(marker)
+    owned = bool(env_token and marker_token and secrets.compare_digest(env_token, marker_token))
+    worker_configured = (Path.home() / ".nakshatra" / "worker.env").is_file()
+    if owned and not worker_configured:
+        _p2p_installer(_sp, "disable")
+        p2p_env.unlink(missing_ok=True)
     marker.unlink(missing_ok=True)
 
 
@@ -493,6 +517,18 @@ def _gateway_on(_sp, args) -> None:
             profile.unlink(missing_ok=True)
             profile_owner.unlink(missing_ok=True)
             raise
+    p2p_env, p2p_owner = _gateway_p2p_paths()
+    made_p2p = not p2p_env.exists()
+    p2p_owner_token = ""
+    if made_p2p:
+        p2p_owner_token = secrets.token_hex(32)
+        try:
+            _write_private(p2p_owner, f"{p2p_owner_token}\n".encode())
+        except (Exception, SystemExit):
+            if made_profile:
+                _release_gateway_profile_ownership()
+            p2p_owner.unlink(missing_ok=True)
+            raise
     package_body = ""
     if args.models == "auto":
         package_body = f"PACKAGE_URL={_env_value(package_url, 'package-url')}\n"
@@ -512,9 +548,11 @@ def _gateway_on(_sp, args) -> None:
         f"NAKSHATRA_LEDGER_URL={_env_value(ledger, 'ledger-url')}\n"
         f"NAKSHATRA_LEDGER_SPKI_SHA256={pin}\n"
     ).encode()
-    _write_private(env_path, body)
     action = "restart" if old_env is not None and _gateway_unit_enabled(_sp) else "enable"
     try:
+        _write_private(env_path, body)
+        if made_p2p:
+            _enable_p2p_service(_sp, owner_token=p2p_owner_token)
         _gateway_installer(_sp, action)
     except (Exception, SystemExit):
         if old_env is None:
@@ -523,6 +561,8 @@ def _gateway_on(_sp, args) -> None:
             _write_private(env_path, old_env)
         if made_profile:
             _release_gateway_profile_ownership()
+        if made_p2p:
+            _release_gateway_p2p_ownership(_sp)
         raise
     print(f"gateway ON at http://{args.bind}:{args.port}/v1 (credits enforced)")
 
@@ -543,6 +583,7 @@ def _gateway_off(_sp) -> None:
     _gateway_installer(_sp, "disable")
     _gateway_paths()[1].unlink(missing_ok=True)
     _release_gateway_profile_ownership()
+    _release_gateway_p2p_ownership(_sp)
     print("gateway OFF")
 
 

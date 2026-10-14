@@ -132,8 +132,12 @@ def test_gateway_on_uses_fixed_internal_endpoint_and_explicit_lan_ack(tmp_path):
         "--pillar-spki", "17" * 32, "--ledger-url", "https://pillar.example/ledger",
     )
     assert result.returncode == 0, result.stderr
-    command = next(line for line in result.stdout.splitlines()
-                   if line.startswith("+ docker exec "))
+    lines = result.stdout.splitlines()
+    run_index = next(index for index, line in enumerate(lines) if line.startswith("+ docker run "))
+    exec_index = next(index for index, line in enumerate(lines) if line.startswith("+ docker exec "))
+    assert run_index < exec_index
+    assert not any(" nak p2p on " in f" {line} " for line in lines)
+    command = lines[exec_index]
     assert shlex.split(command.removeprefix("+ ")) == [
         "docker", "exec", "-i", "nakshatra-node", "nak", "gateway", "on",
         "--bind", "0.0.0.0", "--port", "11599", "--allow-lan",
@@ -210,6 +214,25 @@ def test_container_env_keeps_worker_private_without_rewriting_gateway_files(tmp_
     assert worker_env["NAKSHATRA_P2P_WORKER_ARGS"] == (
         "-listen /ip4/0.0.0.0/tcp/4001 -inbound=127.0.0.1:50051 -require-direct-activation"
     )
+
+
+def test_container_consumer_p2p_env_has_no_listen_args(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    env_dir = home / ".nakshatra"
+    env_dir.mkdir(parents=True)
+    p2p_env = env_dir / "p2p.env"
+    p2p_env.write_text(
+        'P2P_RELAYS=test\nNAKSHATRA_P2P_WORKER_ARGS="-listen /ip4/0.0.0.0/tcp/4001"\n'
+    )
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("NAK_CONTAINER_WORKER", raising=False)
+    instance = supervisor.Supervisor(tmp_path / "prefix", tmp_path / "units", tmp_path / "sock",
+                                     refresh=False, control=False)
+
+    instance.reconcile_container_env()
+
+    assert supervisor._env_file(p2p_env) == {"P2P_RELAYS": "test"}
+    assert "0.0.0.0" not in p2p_env.read_text()
 
 def test_supervisor_reload_refreshes_environment_file_without_starting_service(tmp_path):
     units = tmp_path / "units"

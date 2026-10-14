@@ -27,6 +27,7 @@ PACKAGE_SIGNER = "23" * 32
 def _signed_release_package_signer(monkeypatch):
     monkeypatch.setattr(
         nak, "load_release_package_signers", lambda: frozenset({PACKAGE_SIGNER}))
+    monkeypatch.setattr(nak, "_p2p_installer", lambda *_args: None)
 
 
 def _wait_for_model_names(models, expected, timeout=1.0):
@@ -90,7 +91,67 @@ def test_gateway_on_writes_loopback_enforced_opt_in(tmp_path, monkeypatch):
     token = owner.read_text().strip()
     assert re.fullmatch(r"[0-9a-f]{64}", token)
     assert f"# nak-gateway-owned: {token}\n" in profile.read_text()
+    p2p_env = home / ".nakshatra" / "p2p.env"
+    p2p_owner = home / ".nakshatra" / "gateway" / "p2p-profile-created"
+    p2p_token = p2p_owner.read_text().strip()
+    assert re.fullmatch(r"[0-9a-f]{64}", p2p_token)
+    assert f"# nak-gateway-owned: {p2p_token}\n" in p2p_env.read_text()
     assert calls == ["enable"]
+
+
+def test_gateway_on_enables_p2p_before_gateway_when_absent(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    calls = []
+    monkeypatch.setattr(nak, "_gateway_unit_enabled", lambda _sp: False)
+    monkeypatch.setattr(nak, "_p2p_installer", lambda _sp, action: calls.append(("p2p", action)))
+    monkeypatch.setattr(
+        nak, "_gateway_installer", lambda _sp, action: calls.append(("gateway", action)))
+
+    nak._gateway_on(object(), _args())
+
+    assert calls == [("p2p", "enable"), ("gateway", "enable")]
+
+
+def test_gateway_on_leaves_operator_p2p_untouched(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    p2p_env = home / ".nakshatra" / "p2p.env"
+    p2p_env.parent.mkdir(parents=True)
+    original = "P2P_RELAYS=/dns4/operator.example/tcp/443/p2p/operator\n"
+    p2p_env.write_text(original)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(nak, "_gateway_unit_enabled", lambda _sp: False)
+    monkeypatch.setattr(
+        nak, "_p2p_installer", lambda *_args: pytest.fail("operator p2p must be left alone"))
+    monkeypatch.setattr(nak, "_gateway_installer", lambda *_args: None)
+
+    nak._gateway_on(object(), _args())
+
+    assert p2p_env.read_text() == original
+    assert not (home / ".nakshatra" / "gateway" / "p2p-profile-created").exists()
+
+
+def test_explicit_p2p_on_retires_gateway_ownership(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    state = home / ".nakshatra"
+    gateway = state / "gateway"
+    gateway.mkdir(parents=True)
+    token = "ab" * 32
+    p2p_env = state / "p2p.env"
+    body = f"P2P_RELAYS=test\n# nak-gateway-owned: {token}\n"
+    p2p_env.write_text(body)
+    owner = gateway / "p2p-profile-created"
+    owner.write_text(f"{token}\n")
+    calls = []
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(nak, "_p2p_installer", lambda _sp, action: calls.append(action))
+    monkeypatch.setattr(nak, "_gateway_installer", lambda *_args: None)
+
+    nak._enable_p2p_service(object())
+    nak._gateway_off(object())
+
+    assert calls == ["enable"]
+    assert p2p_env.read_text() == body
+    assert not owner.exists()
 
 
 def test_gateway_auto_requires_package_provenance(tmp_path, monkeypatch):
@@ -116,6 +177,8 @@ def test_gateway_enable_failure_rolls_back_created_profile_ownership(tmp_path, m
     assert not (home / ".nakshatra" / "gateway.env").exists()
     assert not (home / ".nakshatra" / "inference.env").exists()
     assert not (home / ".nakshatra" / "gateway" / "inference-profile-created").exists()
+    assert not (home / ".nakshatra" / "p2p.env").exists()
+    assert not (home / ".nakshatra" / "gateway" / "p2p-profile-created").exists()
 
 
 def test_gateway_auto_uses_join_url_but_ignores_join_key(tmp_path, monkeypatch):
@@ -224,6 +287,72 @@ def test_gateway_off_removes_opt_in_without_starting_units(tmp_path, monkeypatch
     assert calls == ["disable"]
     assert not env.exists()
     assert not profile.exists()
+    assert not owner.exists()
+
+
+def test_gateway_off_disables_only_gateway_owned_p2p(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    state = home / ".nakshatra"
+    gateway = state / "gateway"
+    gateway.mkdir(parents=True)
+    token = "cd" * 32
+    p2p_env = state / "p2p.env"
+    p2p_env.write_text(f"P2P_RELAYS=test\n# nak-gateway-owned: {token}\n")
+    owner = gateway / "p2p-profile-created"
+    owner.write_text(f"{token}\n")
+    calls = []
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(nak, "_gateway_installer", lambda _sp, action: calls.append(("gateway", action)))
+    monkeypatch.setattr(nak, "_p2p_installer", lambda _sp, action: calls.append(("p2p", action)))
+
+    nak._gateway_off(object())
+
+    assert calls == [("gateway", "disable"), ("p2p", "disable")]
+    assert not p2p_env.exists()
+    assert not owner.exists()
+
+
+def test_gateway_off_preserves_gateway_owned_p2p_when_worker_is_configured(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    state = home / ".nakshatra"
+    gateway = state / "gateway"
+    gateway.mkdir(parents=True)
+    token = "cd" * 32
+    p2p_env = state / "p2p.env"
+    body = f"P2P_RELAYS=test\n# nak-gateway-owned: {token}\n"
+    p2p_env.write_text(body)
+    (state / "worker.env").write_text("PORT=50051\n")
+    owner = gateway / "p2p-profile-created"
+    owner.write_text(f"{token}\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(nak, "_gateway_installer", lambda *_args: None)
+    monkeypatch.setattr(
+        nak, "_p2p_installer", lambda *_args: pytest.fail("worker still owns p2p"))
+
+    nak._gateway_off(object())
+
+    assert p2p_env.read_text() == body
+    assert not owner.exists()
+
+
+def test_gateway_off_preserves_operator_p2p_when_marker_does_not_match(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    state = home / ".nakshatra"
+    gateway = state / "gateway"
+    gateway.mkdir(parents=True)
+    p2p_env = state / "p2p.env"
+    body = f"P2P_RELAYS=test\n# nak-gateway-owned: {'ab' * 32}\n"
+    p2p_env.write_text(body)
+    owner = gateway / "p2p-profile-created"
+    owner.write_text("cd" * 32 + "\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(nak, "_gateway_installer", lambda *_args: None)
+    monkeypatch.setattr(
+        nak, "_p2p_installer", lambda *_args: pytest.fail("mismatched p2p must be preserved"))
+
+    nak._gateway_off(object())
+
+    assert p2p_env.read_text() == body
     assert not owner.exists()
 
 

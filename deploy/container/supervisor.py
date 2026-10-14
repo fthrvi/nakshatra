@@ -179,14 +179,15 @@ class Supervisor:
             return False
 
     @staticmethod
-    def _set_env(path: Path, name: str, value: str) -> None:
+    def _set_env(path: Path, name: str, value: str | None) -> None:
         try:
             lines = path.read_text().splitlines()
         except FileNotFoundError:
             lines = []
         prefix = f"{name}="
         lines = [line for line in lines if not line.startswith(prefix)]
-        lines.append(f'{name}="{value}"')
+        if value is not None:
+            lines.append(f'{name}="{value}"')
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         temporary = path.with_suffix(path.suffix + ".tmp")
         temporary.write_text("\n".join(lines) + "\n")
@@ -196,7 +197,14 @@ class Supervisor:
     def reconcile_container_env(self) -> None:
         """Keep worker gRPC private while exposing only its deliberate P2P listener."""
         home = Path(os.environ.get("HOME", str(self.prefix.parent)))
+        p2p_env = home / ".nakshatra" / "p2p.env"
+        worker_env = home / ".nakshatra" / "worker.env"
         if os.environ.get("NAK_CONTAINER_WORKER") != "1":
+            # The state volume survives role changes. Strip any fixed inbound listener left by a
+            # former worker container so consumer gateways remain dial-only.
+            for path in (p2p_env, worker_env):
+                if path.exists():
+                    self._set_env(path, "NAKSHATRA_P2P_WORKER_ARGS", None)
             return
         port_text = os.environ.get("NAK_CONTAINER_P2P_PORT", "4001")
         try:
@@ -205,7 +213,6 @@ class Supervisor:
             raise ValueError("container p2p port must be an integer") from exc
         if not 1 <= port <= 65535 or str(port) != port_text:
             raise ValueError("container p2p port must be between 1 and 65535")
-        worker_env = home / ".nakshatra" / "worker.env"
         if worker_env.exists():
             values = _env_file(worker_env)
             worker_port = values.get("PORT", "")
@@ -218,7 +225,6 @@ class Supervisor:
                 f"-listen /ip4/0.0.0.0/tcp/{port} -inbound=127.0.0.1:{worker_port} "
                 "-require-direct-activation",
             )
-        p2p_env = home / ".nakshatra" / "p2p.env"
         if p2p_env.exists() and not worker_env.exists():
             self._set_env(
                 p2p_env, "NAKSHATRA_P2P_WORKER_ARGS", f"-listen /ip4/0.0.0.0/tcp/{port}"

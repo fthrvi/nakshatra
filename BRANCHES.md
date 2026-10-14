@@ -5,6 +5,7 @@ On create add a row (status=active, owner). On merge flip to `merged→<sha>`.
 
 | branch | sector | description | base | status | owner |
 |---|---|---|---|---|---|
+| network/gateway-p2p | network | Make consumer gateways own a dial-only libp2p sidecar without taking over operator/worker p2p configuration. | main@762b0da | active | codex/root |
 | network/gateway-discovery-retry | network | Give signed pillar GETs a per-request nonce; retry empty auto-discovery with backoff and refresh it every five minutes. | main | merged→bd57243 | codex/root |
 | network/consumer-tokenizer | network | Let consumer-only gateways fetch only the signed package metadata GGUF, verify its signer and SHA-256, and use it as the discovered model tokenizer. | forgejo/main@eea6fe8 | merged→bd57243 | codex/root |
 | network/gateway-profile-and-container | network | Own the gateway's inference profile opt-in, use safe container-specific bind/port defaults, and print host-side container MCP guidance. | main@a1110aa | merged→0999b14 | codex/root |
