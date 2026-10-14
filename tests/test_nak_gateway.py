@@ -50,6 +50,8 @@ def _args(**overrides):
         "pillar_spki": PIN,
         "ledger_url": "https://pillar.example/ledger",
         "models": "auto",
+        "package_url": "https://models.example/llama32-3b",
+        "package_pubkey": "23" * 32,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -68,6 +70,8 @@ def test_gateway_on_writes_loopback_enforced_opt_in(tmp_path, monkeypatch):
     assert "BIND=\"127.0.0.1\"" in body
     assert "PORT=11600" in body
     assert "MODELS=\"auto\"" in body
+    assert 'PACKAGE_URL="https://models.example/llama32-3b"' in body
+    assert f"PACKAGE_TRUSTED_PUBKEY={'23' * 32}" in body
     assert "NAKSHATRA_LEDGER_MODE=enforce" in body
     assert "NAKSHATRA_CREDITS=1" in body
     assert f"STHAMBHA_PILLAR_SPKI_SHA256={PIN}" in body
@@ -75,6 +79,34 @@ def test_gateway_on_writes_loopback_enforced_opt_in(tmp_path, monkeypatch):
     assert "NAKSHATRA_LEDGER_REQUESTER" not in body
     assert (home / ".nakshatra" / "inference.env").is_file()
     assert calls == ["enable"]
+
+
+def test_gateway_auto_requires_package_provenance(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(nak, "_gateway_installer", lambda *_args: pytest.fail("must not enable"))
+
+    with pytest.raises(SystemExit, match="package-url.*package-pubkey"):
+        nak._gateway_on(object(), _args(package_url=None, package_pubkey=None))
+
+
+def test_gateway_auto_defaults_package_from_consumer_join_state(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    state = home / ".nakshatra" / "consumer-standing.json"
+    state.parent.mkdir(parents=True)
+    state.write_text(json.dumps({
+        "role": "consumer", "tier": "known", "operator": "op-1",
+        "package_url": "https://models.example/from-join",
+        "package_pubkey": "45" * 32,
+    }))
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(nak, "_gateway_unit_enabled", lambda _sp: False)
+    monkeypatch.setattr(nak, "_gateway_installer", lambda *_args: None)
+
+    nak._gateway_on(object(), _args(package_url=None, package_pubkey=None))
+
+    body = (home / ".nakshatra" / "gateway.env").read_text()
+    assert 'PACKAGE_URL="https://models.example/from-join"' in body
+    assert f"PACKAGE_TRUSTED_PUBKEY={'45' * 32}" in body
 
 
 def test_gateway_refuses_non_loopback_without_allow_lan(tmp_path, monkeypatch):

@@ -264,10 +264,25 @@ def _local_tokenizers(model_ids: set[str]) -> dict[str, str]:
     root = os.path.expanduser(os.environ.get(
         "NAKSHATRA_TOKENIZER_DIR", "~/.nakshatra/gateway/models"))
     for model_id in model_ids - set(found):
-        name = re.sub(r"[^A-Za-z0-9._-]+", "_", model_id).strip("._") + ".gguf"
-        candidate = os.path.join(root, name)
-        if os.path.isfile(candidate):
-            found[model_id] = candidate
+        stem = re.sub(r"[^A-Za-z0-9._-]+", "_", model_id).strip("._")
+        for name in (stem + ".metadata.gguf", stem + ".gguf"):
+            candidate = os.path.join(root, name)
+            if os.path.isfile(candidate):
+                found[model_id] = candidate
+                break
+    missing = model_ids - set(found)
+    if missing:
+        from gateway_tokenizer import fetch_model_tokenizer
+        from packaging.nakshatra_package import PackageError
+        for model_id in sorted(missing):
+            try:
+                found[model_id] = fetch_model_tokenizer(model_id, root=root)
+            except (PackageError, OSError, urllib.error.URLError) as e:
+                detail = str(e)
+                package_url = os.environ.get("PACKAGE_URL", "")
+                if package_url:
+                    detail = detail.replace(package_url, "<package URL>")
+                log.warning("verified tokenizer fetch refused for %s: %s", model_id, detail)
     return found
 
 

@@ -18,6 +18,7 @@ import argparse
 from http.client import HTTPException
 import json
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -34,6 +35,7 @@ AGENT = "agent"
 AGENT_CAPS = ("nak.msg", "nak.task.claim")
 AGENT_TTL_S = 90 * 86400
 WORKER_RETRY_FILE = Path(".nakshatra") / "worker-invite.json"
+CONSUMER_STANDING_FILE = Path(".nakshatra") / "consumer-standing.json"
 
 
 class WorkerRedeemError(RuntimeError):
@@ -72,6 +74,41 @@ def _store_worker_invite(home: Path, code: str, name: str) -> Path:
         fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w") as f:
             json.dump({"invite": code, "name": name[:40]}, f, separators=(",", ":"))
+            f.write("\n")
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+    return path
+
+
+def _store_consumer_standing(home: Path, standing: dict) -> Path:
+    """Persist only the consumer facts later CLI setup is allowed to reuse."""
+    package_url = standing.get("package_url")
+    package_pubkey = standing.get("package_pubkey", standing.get("package_trusted_pubkey"))
+    if (package_url is None) != (package_pubkey is None):
+        raise WorkerRedeemError(
+            "onboard server returned incomplete package provenance")
+    if package_url is not None:
+        if not isinstance(package_url, str) or not package_url.strip():
+            raise WorkerRedeemError("onboard server returned an invalid package_url")
+        if not isinstance(package_pubkey, str) or not re.fullmatch(
+                r"[0-9a-fA-F]{64}", package_pubkey):
+            raise WorkerRedeemError("onboard server returned an invalid package_pubkey")
+    saved = {
+        "role": "consumer",
+        "tier": standing["tier"],
+        "operator": standing["operator"],
+    }
+    if package_url is not None:
+        saved.update(package_url=package_url.strip(),
+                     package_pubkey=package_pubkey.lower())
+    path = home / CONSUMER_STANDING_FILE
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(saved, f, sort_keys=True, separators=(",", ":"))
             f.write("\n")
         os.replace(tmp, path)
     finally:
@@ -167,6 +204,10 @@ def redeem_consumer_invite(home: Path, code: str, name: str, *, http_post=None,
         raise WorkerRedeemError("onboard server returned no consumer standing")
     if result["tier"] != inv["consumer"]["tier"]:
         raise WorkerRedeemError("onboard server returned a different tier than the signed invite")
+    try:
+        _store_consumer_standing(home, result)
+    except OSError as e:
+        raise WorkerRedeemError(f"could not persist consumer standing: {e}") from e
     return result
 
 

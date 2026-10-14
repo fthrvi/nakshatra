@@ -261,6 +261,33 @@ def test_consumer_redeem_uses_node_key_proof_without_worker_capabilities(net, tm
     assert seen["body"]["capabilities"] == {}
 
 
+def test_consumer_redeem_persists_optional_package_provenance(net, tmp_path):
+    a = net("inviter-package")
+    code = _invite(a, kind="consumer", consumer={
+        "redeem": "https://onboard.example/base", "code": "consumer-package",
+        "tier": "known", "starter": 0})
+    join_setup.ensure_identity(tmp_path)
+
+    result = join_setup.redeem_consumer_invite(
+        tmp_path, code, "Laptop", now=int(time.time()),
+        http_post=lambda _url, _body: {
+            "tier": "known", "operator": "op-consumer", "role": "consumer",
+            "package_url": "https://models.example/llama32-3b",
+            "package_pubkey": "67" * 32,
+        })
+
+    assert result["package_url"].endswith("llama32-3b")
+    path = tmp_path / join_setup.CONSUMER_STANDING_FILE
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert json.loads(path.read_text()) == {
+        "operator": "op-consumer",
+        "package_pubkey": "67" * 32,
+        "package_url": "https://models.example/llama32-3b",
+        "role": "consumer",
+        "tier": "known",
+    }
+
+
 def test_worker_stage_expiry_defaults_to_one_hour_and_rejects_bad_urls(monkeypatch):
     monkeypatch.setenv("NAK_ONBOARD_TOKEN", "operator-secret")
     worker, expires_at = nak._stage_worker(

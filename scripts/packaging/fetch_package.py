@@ -35,11 +35,15 @@ from gguf import GGUFReader, GGUFWriter
 
 if __package__:
     from ._gguf_kv import copy_kvs, read_arch_and_block_count
-    from .nakshatra_package import NakshatraPackage, PackageError, MANIFEST_FILENAME
+    from .nakshatra_package import (
+        NakshatraPackage, PackageError, MANIFEST_FILENAME, ROLE_METADATA,
+    )
 else:  # pragma: no cover
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from packaging._gguf_kv import copy_kvs, read_arch_and_block_count
-    from packaging.nakshatra_package import NakshatraPackage, PackageError, MANIFEST_FILENAME
+    from packaging.nakshatra_package import (
+        NakshatraPackage, PackageError, MANIFEST_FILENAME, ROLE_METADATA,
+    )
 
 _CHUNK = 8 * 1024 * 1024
 
@@ -202,6 +206,62 @@ def _fetch_one(root: str, rel_path: str, dest: Path, *, local_dev: bool = False)
                 out.write(chunk)
                 h.update(chunk)
     return h.hexdigest()
+
+
+def fetch_verified_metadata(location: str, model_id: str, dest_metadata_gguf: str,
+                            *, trusted_pubkeys: set[str]) -> str:
+    """Fetch only a package's signed tokenizer/metadata GGUF.
+
+    This is the consumer-gateway counterpart to :func:`fetch_and_assemble`.
+    It deliberately reuses the same source policy, manifest signature check,
+    streamed artifact hash, and size check; unlike slice provisioning, it does
+    not download or assemble any tensor artifact.
+
+    The completed file is atomically installed with mode 0644. Any signature,
+    identity, size, or digest failure leaves ``dest_metadata_gguf`` untouched.
+    """
+    trusted = {key.strip().lower() for key in trusted_pubkeys if key.strip()}
+    effective_require_signature = _enforce_source_policy(
+        location,
+        local_dev=False,
+        require_signature=True,
+        trusted_pubkeys=trusted,
+    )
+    pkg, root = _read_manifest(location, local_dev=False)
+    _check_signature(pkg, effective_require_signature, trusted)
+    if pkg.model_id != model_id:
+        raise PackageError(
+            f"package model_id {pkg.model_id!r} does not match discovered model {model_id!r}")
+    artifact = pkg.shared_by_role(ROLE_METADATA)
+    if artifact is None:
+        raise PackageError("manifest is missing the metadata fragment")
+    if artifact.path != "shared/metadata.gguf":
+        raise PackageError(
+            "metadata artifact must be shared/metadata.gguf; refusing unexpected path "
+            f"{artifact.path!r}")
+
+    dest = Path(dest_metadata_gguf)
+    dest.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{dest.name}.", suffix=".tmp", dir=dest.parent)
+    os.close(fd)
+    tmp = Path(tmp_name)
+    try:
+        actual = _fetch_one(root, artifact.path, tmp, local_dev=False)
+        if actual != artifact.sha256:
+            raise PackageError(
+                f"SHA-256 mismatch for {artifact.path}: got {actual[:12]}, "
+                f"manifest says {artifact.sha256[:12]} — refusing (fail closed)")
+        actual_size = tmp.stat().st_size
+        if actual_size != artifact.size:
+            raise PackageError(
+                f"size mismatch for {artifact.path}: got {actual_size}, "
+                f"manifest says {artifact.size}")
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, dest)
+        return str(dest)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def _check_signature(pkg: NakshatraPackage, require_signature: bool,

@@ -255,6 +255,39 @@ def _gateway_values() -> dict[str, str]:
     return values
 
 
+def _gateway_package_defaults() -> tuple[str, str]:
+    """Load a package URL + signer pin as one provenance pair.
+
+    Prefer the signed-invite/onboarding result, then an existing worker's
+    package state, then this gateway's prior configuration. Never combine two
+    partial sources into a trust pair.
+    """
+    standing = Path.home() / ".nakshatra" / "consumer-standing.json"
+    try:
+        value = json.loads(standing.read_text())
+    except (OSError, ValueError):
+        value = {}
+    if not isinstance(value, dict):
+        value = {}
+    pairs = [(value.get("package_url", ""), value.get("package_pubkey", ""))]
+    for path in (Path.home() / ".nakshatra" / "worker.env",
+                 _gateway_paths()[1]):
+        values = {}
+        try:
+            lines = path.read_text().splitlines()
+        except OSError:
+            lines = ()
+        for line in lines:
+            if line and not line.lstrip().startswith("#") and "=" in line:
+                key, item = line.split("=", 1)
+                values[key.strip()] = item.strip().strip("\"'")
+        pairs.append((values.get("PACKAGE_URL", ""),
+                      values.get("PACKAGE_TRUSTED_PUBKEY", "")))
+    return next(((url.strip(), key.strip()) for url, key in pairs
+                 if isinstance(url, str) and isinstance(key, str)
+                 and url.strip() and key.strip()), ("", ""))
+
+
 def _wallet_hook():
     values = _gateway_values()
     url = (
@@ -357,6 +390,26 @@ def _gateway_on(_sp, args) -> None:
         raise SystemExit("--pillar-spki must be a 64-character SHA-256 hex digest")
     if args.models != "auto" and not Path(args.models).is_file():
         raise SystemExit("--models must be 'auto' or an existing serve_models YAML file")
+    package_url = package_pubkey = ""
+    if args.models == "auto":
+        default_url, default_pubkey = _gateway_package_defaults()
+        package_url = (getattr(args, "package_url", None) or default_url).strip()
+        package_pubkey = (getattr(args, "package_pubkey", None) or default_pubkey).strip().lower()
+        if not package_url or not package_pubkey:
+            raise SystemExit(
+                "--models auto needs --package-url and --package-pubkey "
+                "(or package provenance saved by invite/join)")
+        try:
+            parsed_package = urlsplit(package_url)
+            package_host = parsed_package.hostname
+        except ValueError as e:
+            raise SystemExit(f"--package-url is not a valid URL: {e}") from e
+        if parsed_package.scheme not in {"http", "https"} or not package_host:
+            raise SystemExit("--package-url must be an http(s) package base or package.json URL")
+        if not re.fullmatch(r"[0-9a-f]{64}", package_pubkey):
+            raise SystemExit(
+                "--package-pubkey must be the package signer's Ed25519 public key "
+                "(64 hex characters)")
     if args.models != "auto":
         # The service repeats this check at config load. Refuse here too so
         # `nak gateway on` never enables an enforce-mode registry that can
@@ -374,10 +427,14 @@ def _gateway_on(_sp, args) -> None:
     made_profile = not profile.exists()
     if made_profile:
         _write_private(profile, b"# Opted into the signed release inference profile.\n")
+    package_body = (f"PACKAGE_URL={_env_value(package_url, 'package-url')}\n"
+                    f"PACKAGE_TRUSTED_PUBKEY={package_pubkey}\n"
+                    if args.models == "auto" else "")
     body = (
         f"PORT={args.port}\n"
         f"BIND={_env_value(args.bind, 'bind')}\n"
         f"MODELS={_env_value(args.models, 'models')}\n"
+        f"{package_body}"
         f"NAKSHATRA_PILLAR_URL={_env_value(pillar, 'pillar-url')}\n"
         f"STHAMBHA_PILLAR_SPKI_SHA256={pin}\n"
         "NKS_TRUST_PINNED_PILLAR=1\n"
@@ -843,6 +900,10 @@ def main(argv=None, *, http_post=None) -> int:
                    help="public ledger base on the same pinned VPS front")
     q.add_argument("--models", default="auto",
                    help="auto (signed pillar discovery) or a local serve_models YAML")
+    q.add_argument("--package-url",
+                   help="signed model-package base URL (required for auto unless join state has it)")
+    q.add_argument("--package-pubkey",
+                   help="trusted Ed25519 package signer (64 hex; required for auto unless join state has it)")
     gsub.add_parser("off", help="disable the gateway and remove its opt-in")
     gsub.add_parser("status", help="show configuration and unit state without key material")
     p = sub.add_parser("worker", help="build and operate this node's signed-release inference worker")
