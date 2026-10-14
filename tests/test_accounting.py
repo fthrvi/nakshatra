@@ -13,9 +13,52 @@ import nakshatra_auth  # noqa: E402
 
 def test_metering_is_the_ledger_hook_and_off_by_default(monkeypatch):
     monkeypatch.delenv("NAKSHATRA_CREDITS", raising=False)
+    monkeypatch.delenv("NAKSHATRA_LEDGER_MODE", raising=False)
     m = accounting.metering()
     assert type(m).__name__ == "LedgerHook" and m.enabled is False
     assert m.gate(10**9) == (True, "") and m.settle("/nonexistent") is None
+
+
+@pytest.mark.parametrize("credits", [None, "0", "false"])
+def test_enforce_mode_enables_gate_receipt_and_settle_without_credits_flag(
+        monkeypatch, tmp_path, credits):
+    monkeypatch.setenv("NAKSHATRA_LEDGER_MODE", "enforce")
+    if credits is None:
+        monkeypatch.delenv("NAKSHATRA_CREDITS", raising=False)
+    else:
+        monkeypatch.setenv("NAKSHATRA_CREDITS", credits)
+    monkeypatch.setattr(
+        nakshatra_auth, "load_worker_key", lambda: (b"private", "ab" * 32))
+    hook = accounting.metering()
+    calls = []
+    monkeypatch.setattr(hook, "_get", lambda path: calls.append(("gate", path)) or {"ok": True})
+    monkeypatch.setattr(
+        hook, "_post",
+        lambda path, body: calls.append(("settle", path))
+        or {"receipt_id": "receipt-1", "charged": 0})
+    receipt = tmp_path / "receipt.json"
+    receipt.write_text("{}")
+
+    assert hook.enabled is True and hook.wants_receipt is True
+    assert hook.gate(3) == (True, "")
+    assert hook.settle(str(receipt)) == {"receipt_id": "receipt-1", "charged": 0}
+    assert [kind for kind, _path in calls] == ["gate", "settle"]
+
+
+def test_enforce_mode_without_credits_flag_denies_when_ledger_is_unavailable(
+        monkeypatch):
+    monkeypatch.setenv("NAKSHATRA_LEDGER_MODE", "enforce")
+    monkeypatch.delenv("NAKSHATRA_CREDITS", raising=False)
+    monkeypatch.setattr(
+        nakshatra_auth, "load_worker_key", lambda: (b"private", "ab" * 32))
+    hook = accounting.metering()
+    monkeypatch.setattr(
+        hook, "_get",
+        lambda *_args: (_ for _ in ()).throw(URLError("ledger down")))
+
+    allow, why = hook.gate(3)
+
+    assert allow is False and "ledger unreachable" in why
 
 
 def test_metering_fails_open_when_the_backend_is_down(monkeypatch, tmp_path):

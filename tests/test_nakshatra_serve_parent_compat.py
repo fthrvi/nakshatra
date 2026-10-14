@@ -2,7 +2,7 @@
 
 The parent serve/accounting/ledger sources are extracted with ``git show``
 into an isolated temporary scripts directory and imported from there. Bodies
-are compared after removing only protocol-generated volatile fields:
+are compared after removing only top-level protocol-generated volatile fields:
 ``id``, ``created``, ``created_at``, and ``total_duration``.
 """
 from __future__ import annotations
@@ -101,12 +101,18 @@ class Snapshot:
 
 
 def _without_volatile(value):
-    if isinstance(value, dict):
-        return {key: _without_volatile(item) for key, item in value.items()
-                if key not in VOLATILE_FIELDS}
-    if isinstance(value, list):
-        return [_without_volatile(item) for item in value]
-    return value
+    """Strip generated envelope fields, preserving every nested semantic key."""
+    if not isinstance(value, dict):
+        return value
+    return {key: item for key, item in value.items()
+            if key not in VOLATILE_FIELDS}
+
+
+def test_normalisation_preserves_nested_ids():
+    value = {"id": "volatile", "created": 123,
+             "choice": {"id": "semantic", "created": "also-semantic"}}
+    assert _without_volatile(value) == {
+        "choice": {"id": "semantic", "created": "also-semantic"}}
 
 
 def _normalise_body(content_type: str, body: bytes):

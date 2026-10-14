@@ -179,6 +179,74 @@ def test_gateway_gate_exception_denies_in_enforce_mode():
     assert "ledger unavailable: ledger exploded" in str(caught.value)
 
 
+@pytest.mark.parametrize(
+    "settlement",
+    [None, {}, [], {"charged": 1}, {"receipt_id": "r"},
+     {"receipt_id": "r", "charged": -1},
+     {"receipt_id": "r", "charged": True}],
+    ids=["null", "empty-dict", "list", "missing-receipt-id",
+         "missing-charged", "negative-charged", "bool-charged"],
+)
+def test_gateway_enforce_requires_affirmative_settlement(
+        monkeypatch, settlement):
+    backend = serve.ChainChatBackend()
+    backend._ledger_hook_cached = SimpleNamespace(
+        enabled=True, wants_receipt=True, fail_closed=True,
+        gate=lambda _cost: (True, ""), settle=lambda _path: settlement)
+    monkeypatch.setattr(backend, "_client_env", lambda: {})
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0, stderr="", stdout="[chain] gen:  'must not escape'\n"))
+    entry = serve.ModelEntry(
+        name="model-a", tokenizer_gguf="/unused.gguf",
+        registry_url="https://pillar.example", num_layers=2)
+
+    with pytest.raises(serve.CreditGateError, match="ledger settlement failed") as caught:
+        backend.generate(entry, "hello", 1, {})
+
+    assert caught.value.status == 503
+
+
+def test_gateway_enforce_accepts_affirmative_settlement(monkeypatch):
+    backend = serve.ChainChatBackend()
+    backend._ledger_hook_cached = SimpleNamespace(
+        enabled=True, wants_receipt=True, fail_closed=True,
+        gate=lambda _cost: (True, ""),
+        settle=lambda _path: {"receipt_id": "r", "charged": 0})
+    monkeypatch.setattr(backend, "_client_env", lambda: {})
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0, stderr="", stdout="[chain] gen:  'settled'\n"))
+    entry = serve.ModelEntry(
+        name="model-a", tokenizer_gguf="/unused.gguf",
+        registry_url="https://pillar.example", num_layers=2)
+
+    result = backend.generate(entry, "hello", 1, {})
+
+    assert result.text == "settled" and result.credits_charged == 0
+
+
+def test_default_mode_does_not_require_affirmative_settlement(monkeypatch):
+    backend = serve.ChainChatBackend()
+    backend._ledger_hook_cached = SimpleNamespace(
+        enabled=True, wants_receipt=True, fail_closed=False,
+        gate=lambda _cost: (True, ""), settle=lambda _path: None)
+    monkeypatch.setattr(backend, "_client_env", lambda: {})
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0, stderr="", stdout="[chain] gen:  'legacy reply'\n"))
+    entry = serve.ModelEntry(
+        name="model-a", tokenizer_gguf="/unused.gguf",
+        registry_url="https://pillar.example", num_layers=2)
+
+    result = backend.generate(entry, "hello", 1, {})
+
+    assert result.text == "legacy reply" and result.credits_charged is None
+
+
 def test_gateway_chain_client_requires_worker_tls(monkeypatch):
     monkeypatch.setenv("NAKSHATRA_CHAIN_TLS_MODE", "required")
     entry = serve.ModelEntry(

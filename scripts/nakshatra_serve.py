@@ -459,9 +459,23 @@ def _credits_charged(settlement) -> Optional[int]:
     return None
 
 
-_PROXY_ENFORCE_REFUSAL = (
-    "NAKSHATRA_LEDGER_MODE=enforce refuses unmetered engine_url proxy models"
+def _affirmative_settlement_charge(settlement) -> Optional[int]:
+    """Return the strict v2 charge, or None when settlement was not proven."""
+    if not isinstance(settlement, dict):
+        return None
+    charged = settlement.get("charged")
+    if (not isinstance(settlement.get("receipt_id"), str)
+            or not isinstance(charged, int) or isinstance(charged, bool)
+            or charged < 0):
+        return None
+    return charged
+
+
+_UNMETERED_ENFORCE_REFUSAL = (
+    "NAKSHATRA_LEDGER_MODE=enforce refuses unmetered engine_url proxy models, "
+    "stub backends, and external forwards; use the metered chain backend"
 )
+_PROXY_ENFORCE_REFUSAL = _UNMETERED_ENFORCE_REFUSAL
 
 
 def _refuse_unmetered_proxy(entry: ModelEntry) -> bool:
@@ -671,8 +685,11 @@ class ChainChatBackend(ChatBackend):
         return h
 
     def requires_credit_buffer(self) -> bool:
-        """Strict mode buffers streaming output until the signed settle succeeds."""
-        return bool(getattr(self._ledger_hook(), "fail_closed", False))
+        """Strict mode buffers output, without constructing the default-off hook."""
+        cached = getattr(self, "_ledger_hook_cached", None)
+        return _ledger_enforced() or bool(
+            cached is not None and getattr(cached, "fail_closed", False)
+        )
 
     def _roster_chain_yaml(self, entry) -> str:
         """from_roster: GENERATE the chain from the live roster at request time (firewall-gated +
@@ -739,10 +756,16 @@ class ChainChatBackend(ChatBackend):
             raise ChainBackendError(
                 f"client.py exited {out.returncode}: {out.stderr.strip()[-400:]}")
         settlement = None
+        charged = None
         if rcpt:
             if fail_closed:
                 try:
                     settlement = hook.settle(rcpt)
+                    charged = _affirmative_settlement_charge(settlement)
+                    if charged is None:
+                        raise ValueError(
+                            "expected receipt_id string and nonnegative integer charged"
+                        )
                 except Exception as e:
                     raise CreditGateError(f"ledger settlement failed: {e}", 503) from e
                 finally:
@@ -754,7 +777,7 @@ class ChainChatBackend(ChatBackend):
                 _quiet_unlink(rcpt)
         return GenerationResult(
             text=_parse_client_output(out.stdout),
-            credits_charged=_credits_charged(settlement) if fail_closed else None,
+            credits_charged=charged if fail_closed else None,
         )
 
     def generate_stream(self, entry, prompt, max_tokens, options):
@@ -934,6 +957,29 @@ class RoutingChatBackend(ChatBackend):
 
     def requires_credit_buffer(self) -> bool:
         return bool(getattr(self._chain, "requires_credit_buffer", lambda: False)())
+
+
+def _chain_backend(backend):
+    """Return the only backend allowed to release strict-mode inference."""
+    return backend._chain if isinstance(backend, RoutingChatBackend) else backend
+
+
+def _fail_closed_hook_configured(backend) -> bool:
+    """Read strict state from env/an existing hook; never construct a hook here."""
+    chain = _chain_backend(backend)
+    cached = getattr(chain, "_ledger_hook_cached", None)
+    return _ledger_enforced() or bool(
+        cached is not None and getattr(cached, "fail_closed", False)
+    )
+
+
+def _uses_metered_chain(backend, entry: Optional[ModelEntry]) -> bool:
+    """True only when this request will enter ChainChatBackend accounting."""
+    return (
+        entry is not None
+        and not entry.engine_url
+        and isinstance(_chain_backend(backend), ChainChatBackend)
+    )
 
 
 def _render_llama3(messages: list) -> str:
@@ -1166,6 +1212,20 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
     def _models(self) -> dict:
         return getattr(self.server, "models", {})
 
+    def _refuse_unmetered_inference(self, entry, *, openai: bool) -> bool:
+        """Global fail-closed invariant, before any proxy/backend can emit output."""
+        backend = getattr(self.server, "chat_backend", None)
+        if (not _fail_closed_hook_configured(backend)
+                or _uses_metered_chain(backend, entry)):
+            return False
+        if openai:
+            self._openai_error(
+                HTTPStatus.FORBIDDEN, _UNMETERED_ENFORCE_REFUSAL,
+                "permission_error")
+        else:
+            self._json_error(HTTPStatus.FORBIDDEN, _UNMETERED_ENFORCE_REFUSAL)
+        return True
+
     # ── Per-request timing wrapper ────────────────────────────────
 
     def _dispatch(self, method: str, handler) -> None:
@@ -1280,6 +1340,8 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
             return 400
         name = req.get("model")
         entry = self._models.get(name) if name else None
+        if self._refuse_unmetered_inference(entry, openai=False):
+            return 403
         if entry is None:
             self._json_error(HTTPStatus.NOT_FOUND, f"model {name!r} not found")
             return 404
@@ -1472,6 +1534,8 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
             return 400
         name = req.get("model")
         entry = self._models.get(name) if name else None
+        if self._refuse_unmetered_inference(entry, openai=True):
+            return 403
         if entry is None:
             # v1.0 §6 entry-proxy: if a peer serves this model, route instead of
             # 404. Opt-in (server.entry_proxy must be configured) and fail-safe.
@@ -1921,6 +1985,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
     _setup_logging(args.verbose)
+
+    if _ledger_enforced() and args.stub_backend is not None:
+        log.error("%s", _UNMETERED_ENFORCE_REFUSAL)
+        return 2
 
     models: dict[str, ModelEntry] = {}
     if args.models:

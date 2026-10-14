@@ -30,6 +30,7 @@ import urllib.request
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Iterator
 
 import pytest
@@ -506,6 +507,15 @@ def test_tokenizer_socket_gives_up_cleanly_if_daemon_never_comes_up(monkeypatch)
 def test_main_exits_nonzero_on_bad_config(tmp_path):
     rc = ns.main(["--models", str(tmp_path / "missing.yaml"), "--port", "0"])
     assert rc == 2
+
+
+def test_main_refuses_stub_backend_in_enforce_mode(monkeypatch):
+    monkeypatch.setenv("NAKSHATRA_LEDGER_MODE", "enforce")
+    monkeypatch.setattr(
+        ns, "build_server", lambda *_args, **_kwargs:
+        pytest.fail("enforce-mode stub must fail before server construction"))
+
+    assert ns.main(["--stub-backend", "canned", "--port", "0"]) == 2
 
 
 # ── Phase C: /api/chat non-streaming ────────────────────────────────
@@ -1481,6 +1491,80 @@ def test_enforce_mode_request_backstop_refuses_proxy_without_forwarding(
     error = body["error"]
     message = error["message"] if isinstance(error, dict) else error
     assert "refuses unmetered engine_url proxy models" in message
+
+
+@pytest.mark.parametrize(
+    ("path", "stream"),
+    [("/v1/chat/completions", False), ("/v1/chat/completions", True),
+     ("/api/chat", False), ("/api/chat", True)],
+)
+def test_enforce_mode_global_handler_refuses_stub_backend(
+        path, stream, monkeypatch):
+    monkeypatch.setenv("NAKSHATRA_LEDGER_MODE", "enforce")
+    entry = ns.ModelEntry(
+        name="chained", tokenizer_gguf="/unused.gguf", chain_yaml="chain.yaml")
+    payload = {"model": "chained", "stream": stream,
+               "messages": [{"role": "user", "content": "hi"}]}
+
+    with _running_chat({"chained": entry}, ns.StubChatBackend("must not escape")) as port:
+        status, body = _post(port, path, payload)
+
+    assert status == 403
+    error = body["error"]
+    message = error["message"] if isinstance(error, dict) else error
+    assert "use the metered chain backend" in message
+
+
+def test_enforce_mode_global_handler_refuses_unknown_model_forward(monkeypatch):
+    # The invariant follows the process's already-built hook too; it is not
+    # merely a fresh environment lookup at the proxy branch.
+    monkeypatch.delenv("NAKSHATRA_LEDGER_MODE", raising=False)
+    monkeypatch.setattr(
+        ns.NakshatraServeHandler, "_try_route_openai",
+        lambda *_args, **_kwargs: pytest.fail("entry_proxy must not be reached"))
+    backend = ns.ChainChatBackend()
+    backend._ledger_hook_cached = SimpleNamespace(fail_closed=True)
+    server = ns.build_server("127.0.0.1", 0, {}, backend)
+    server.entry_proxy = object()
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, body = _post(server.server_address[1], "/v1/chat/completions", {
+            "model": "remote-only",
+            "messages": [{"role": "user", "content": "hi"}]})
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert status == 403
+    assert "external forwards" in body["error"]["message"]
+
+
+def test_default_proxy_stream_does_not_construct_ledger_hook(
+        monkeypatch, caplog):
+    class _LegacyProxy(ns.ChatBackend):
+        def generate_stream(self, *_args, **_kwargs):
+            yield "legacy proxy reply"
+
+    monkeypatch.delenv("NAKSHATRA_LEDGER_MODE", raising=False)
+    monkeypatch.setenv("NAKSHATRA_CREDITS", "1")
+    chain = ns.ChainChatBackend()
+    monkeypatch.setattr(
+        chain, "_ledger_hook",
+        lambda: pytest.fail("default streaming must not construct the ledger hook"))
+    router = ns.RoutingChatBackend(chain, proxy=_LegacyProxy())
+    entry = ns.ModelEntry(name="proxied", engine_url="http://unused.invalid")
+
+    with _running_chat({"proxied": entry}, router) as port:
+        chunks = _post_lines(port, "/api/chat", {
+            "model": "proxied", "stream": True,
+            "messages": [{"role": "user", "content": "hi"}]})
+
+    assert "".join(chunk["message"]["content"] for chunk in chunks) \
+        == "legacy proxy reply"
+    assert not any("ledger signing key unavailable" in record.getMessage()
+                   for record in caplog.records)
 
 
 # ── end-to-end: registry → RoutingChatBackend → ProxyChatBackend → engine ──

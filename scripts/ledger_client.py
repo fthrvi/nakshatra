@@ -6,8 +6,9 @@ Two calls the inference serve makes around a run:
   • settle(receipt_path)— after:  POST /settle        (credits the workers from the #20 receipt)
 
 SAFETY (this guards Prithvi's live brain):
-  • DEFAULT-OFF: with NAKSHATRA_CREDITS unset, every method is a total no-op — the serve is
-    byte-for-byte unchanged.
+  • DEFAULT-OFF: with both NAKSHATRA_CREDITS and NAKSHATRA_LEDGER_MODE unset, every method
+    is a total no-op — the serve is byte-for-byte unchanged. ``MODE=enforce`` always enables
+    accounting; it cannot be weakened by omitting the legacy credits switch.
   • FAIL-OPEN BY DEFAULT: any ledger error (down, slow, 5xx) → the run PROCEEDS. The hub's
     existing behaviour is unchanged. An explicit v2 402 denies; a legacy 200 denial is enforced
     only when NAKSHATRA_CREDITS_ENFORCE=1.
@@ -16,7 +17,7 @@ SAFETY (this guards Prithvi's live brain):
     operator from the signing key's roster row.
 
 Env:
-  NAKSHATRA_CREDITS=1            enable the hook (still fail-open; advisory unless enforced)
+  NAKSHATRA_CREDITS=1            enable the fail-open hook (MODE=enforce implies enabled)
   NAKSHATRA_CREDITS_ENFORCE=1   enforce legacy 200-body denials (v2 uses HTTP 402)
   NAKSHATRA_LEDGER_URL          default http://127.0.0.1:8097
   NAKSHATRA_LEDGER_MODE         default fail-open; "enforce" denies on every ledger failure
@@ -53,12 +54,17 @@ def _truthy(v: str) -> bool:
 class LedgerHook:
     def __init__(self, *, url: str | None = None, enabled: bool | None = None,
                  mode: str | None = None, spki_hash: str | None = None):
-        self.enabled = (_truthy(os.environ.get("NAKSHATRA_CREDITS", ""))
-                        if enabled is None else bool(enabled))
-        self.enforce = _truthy(os.environ.get("NAKSHATRA_CREDITS_ENFORCE", ""))
         self.mode = (mode if mode is not None else
                      os.environ.get("NAKSHATRA_LEDGER_MODE", "fail-open")).strip().lower()
         self.fail_closed = self.mode == "enforce"
+        # Strict mode is itself the accounting opt-in.  Requiring a second,
+        # independent NAKSHATRA_CREDITS switch makes a typo fail open: gate(),
+        # receipt generation, and settle() would all silently become no-ops.
+        self.enabled = self.fail_closed or (
+            _truthy(os.environ.get("NAKSHATRA_CREDITS", ""))
+            if enabled is None else bool(enabled)
+        )
+        self.enforce = _truthy(os.environ.get("NAKSHATRA_CREDITS_ENFORCE", ""))
         self.url = (url or os.environ.get(
             "NAKSHATRA_LEDGER_URL", "http://127.0.0.1:8097")).rstrip("/")
         self.spki_hash = (spki_hash if spki_hash is not None else os.environ.get(
@@ -184,7 +190,12 @@ class LedgerHook:
             except ImportError:
                 pass                      # identity_binding/roster absent — legacy deployment
             try:
-                return self._post("/settle", body)
+                result = self._post("/settle", body)
+                if self.fail_closed and not self._affirmative_settlement(result):
+                    raise LedgerUnavailable(
+                        "ledger returned an invalid settlement response"
+                    )
+                return result
             except urllib.error.HTTPError as e:
                 if e.code == 401:
                     self._log_signature_refusal()
@@ -204,6 +215,19 @@ class LedgerHook:
             if self.fail_closed:
                 raise LedgerUnavailable(f"ledger settle failed ({e})") from e
             return None
+
+    @staticmethod
+    def _affirmative_settlement(value) -> bool:
+        """A strict 2xx response proves settlement only with the v2 result shape."""
+        if not isinstance(value, dict):
+            return False
+        charged = value.get("charged")
+        return (
+            isinstance(value.get("receipt_id"), str)
+            and isinstance(charged, int)
+            and not isinstance(charged, bool)
+            and charged >= 0
+        )
 
     def balance(self) -> dict:
         """Return the signing operator's balance/tier. No account selector is ever sent."""
