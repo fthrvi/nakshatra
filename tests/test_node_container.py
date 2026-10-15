@@ -51,6 +51,93 @@ def _effective_p2p_argv(tmp_path: Path, home: Path) -> list[str]:
     ).argv
 
 
+def _systemd_env_file(path: Path) -> dict[str, str]:
+    """Small test oracle for the EnvironmentFile forms in the review matrix."""
+    try:
+        physical = path.read_text().splitlines(keepends=True)
+    except OSError:
+        return {}
+    logical = []
+    index = 0
+    while index < len(physical):
+        line = physical[index].rstrip("\n")
+        while line.endswith("\\") and index + 1 < len(physical):
+            index += 1
+            line = line[:-1] + physical[index].rstrip("\n")
+        stripped = line.lstrip()
+        if "=" in stripped:
+            _name, value = stripped.split("=", 1)
+            quote = value[:1] if value[:1] in {"'", '"'} else ""
+            while quote and not value.endswith(quote) and index + 1 < len(physical):
+                index += 1
+                value += "\n" + physical[index].rstrip("\n")
+            line = stripped.split("=", 1)[0] + "=" + value
+        logical.append(line)
+        index += 1
+    result = {}
+    for raw in logical:
+        line = raw.strip()
+        if not line or line.startswith("#") or line.startswith("export ") or "=" not in line:
+            continue
+        name, value = line.split("=", 1)
+        name = name.rstrip(" \t\r")
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            continue
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        result[name] = value
+    return result
+
+
+def _systemd_effective_p2p_argv(tmp_path: Path, home: Path) -> list[str]:
+    spec = json.loads((ROOT / "release" / "spec.json").read_text())
+    service = spec["services"]["nakshatra-p2p"]
+    manifest = {"version": "test", "components": [{"name": "nakshatra", "pythonpath": "scripts"}]}
+    installer = release_installer.Installer(
+        tmp_path / "prefix", systemd=False, make_venv=False, unit_dir=tmp_path / "units")
+    unit_path = tmp_path / "p2p-systemd.service"
+    unit_path.write_text(installer._unit_text(service, installer._ctx(manifest), manifest))
+    environment = {"HOME": str(home), "XDG_RUNTIME_DIR": str(tmp_path / "run")}
+    exec_start = ""
+    lines = unit_path.read_text().splitlines()
+    # Like systemd, EnvironmentFile values override Environment= regardless of directive position;
+    # EnvironmentFile entries themselves apply strictly in their listed order.
+    for line in lines:
+        if line.startswith("Environment="):
+            environment.update(supervisor._assignments(line.removeprefix("Environment=")))
+    for line in lines:
+        if line.startswith("EnvironmentFile="):
+            environment.update(_systemd_env_file(Path(line.split("=", 1)[1].removeprefix("-"))))
+        elif line.startswith("ExecStart="):
+            exec_start = line.removeprefix("ExecStart=")
+    return supervisor._command(exec_start, environment)
+
+
+def _review_assignment(form: str, name: str, value: str) -> str:
+    if form == "plain":
+        return f"{name}={value}\n"
+    if form == "leading-whitespace":
+        return f" \t{name}={value}\n"
+    if form == "export":
+        return f" export {name}={value}\n"
+    if form == "single-quoted":
+        return f"{name}='{value}'\n"
+    if form == "double-quoted":
+        return f'{name}="{value}"\n'
+    split = max(1, len(value) // 2)
+    if form == "unquoted-continuation":
+        return f"{name}={value[:split]}\\\n{value[split:]}\n"
+    if form == "double-quoted-continuation":
+        return f'{name}="{value[:split]}\\\n{value[split:]}"\n'
+    if form == "multiline-single-quoted":
+        return f"{name}='{value[:split]}\n{value[split:]}'\n"
+    if form == "space-before-equals":
+        return f"{name} ={value}\n"
+    if form == "tab-before-equals":
+        return f"{name}\t={value}\n"
+    raise AssertionError(form)
+
+
 def _legacy_p2p_argv(
         tmp_path: Path, home: Path, relays: str, worker_args: list[str] | None = None) -> list[str]:
     return [
@@ -529,6 +616,8 @@ def test_explicit_p2p_on_promotes_gateway_consumer_to_legacy_nakd_inbound(
 
     nak._enable_p2p_service(object(), owner_token=token)
     p2p_env = home / ".nakshatra" / "p2p.env"
+    (home / ".nakshatra" / "p2p-consumer.env").write_text(
+        'NAKSHATRA_P2P_NAKD_INBOUND=""\nNAKSHATRA_P2P_WORKER_ARGS=""\n')
     p2p_env.write_text(p2p_env.read_text().replace(
         'NAKSHATRA_P2P_NAKD_INBOUND=""',
         f'{assignment_prefix}NAKSHATRA_P2P_NAKD_INBOUND=""',
@@ -553,6 +642,7 @@ def test_explicit_p2p_on_promotes_gateway_consumer_to_legacy_nakd_inbound(
 
     assert p2p_env.read_bytes() == expected
     assert not owner.exists()
+    assert not (home / ".nakshatra" / "p2p-consumer.env").exists()
     assert calls == ["enable", "restart"]
     effective = _effective_p2p_argv(tmp_path, home)
     assert "-nakd-inbound=127.0.0.1:51830" in effective
@@ -575,6 +665,8 @@ def test_host_worker_on_promotes_gateway_consumer_and_gateway_off_preserves_p2p(
 
     nak._enable_p2p_service(object(), owner_token=token)
     p2p_env = home / ".nakshatra" / "p2p.env"
+    (home / ".nakshatra" / "p2p-consumer.env").write_text(
+        'NAKSHATRA_P2P_NAKD_INBOUND=""\nNAKSHATRA_P2P_WORKER_ARGS=""\n')
     p2p_env.write_text(p2p_env.read_text().replace(
         'NAKSHATRA_P2P_NAKD_INBOUND=""',
         f'{nakd_prefix}NAKSHATRA_P2P_NAKD_INBOUND=""',
@@ -594,6 +686,7 @@ def test_host_worker_on_promotes_gateway_consumer_and_gateway_off_preserves_p2p(
     ]) == 0
 
     assert "NAKSHATRA_P2P_NAKD_INBOUND=" not in p2p_env.read_text()
+    assert not (home / ".nakshatra" / "p2p-consumer.env").exists()
     assert not owner.exists()
     effective = _effective_p2p_argv(tmp_path, home)
     assert "-nakd-inbound=127.0.0.1:51830" in effective
@@ -639,6 +732,8 @@ def test_container_env_keeps_worker_private_without_rewriting_gateway_files(tmp_
     env_dir.mkdir(parents=True)
     (env_dir / "p2p.env").write_text("P2P_RELAYS=test\n")
     (env_dir / "worker.env").write_text("PORT=50051\nLISTEN=0.0.0.0\n")
+    (env_dir / "p2p-consumer.env").write_text(
+        'NAKSHATRA_P2P_NAKD_INBOUND=""\nNAKSHATRA_P2P_WORKER_ARGS=""\n')
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("NAK_CONTAINER_WORKER", "1")
     monkeypatch.setenv("NAK_CONTAINER_P2P_PORT", "4001")
@@ -646,6 +741,7 @@ def test_container_env_keeps_worker_private_without_rewriting_gateway_files(tmp_
                                      refresh=False, control=False)
     instance.reconcile_container_env()
     assert not (env_dir / "unconscious.env").exists()
+    assert not (env_dir / "p2p-consumer.env").exists()
     worker_env = supervisor._env_file(env_dir / "worker.env")
     assert worker_env["LISTEN"] == "127.0.0.1"
     assert worker_env["NAKSHATRA_P2P_WORKER_ARGS"] == (
@@ -661,9 +757,12 @@ def test_container_env_rejects_equal_worker_and_p2p_ports_without_rewriting(
     env_dir.mkdir(parents=True)
     p2p_env = env_dir / "p2p.env"
     worker_env = env_dir / "worker.env"
+    consumer_env = env_dir / "p2p-consumer.env"
     p2p_env.write_text("P2P_RELAYS=test\nNAKSHATRA_P2P_NAKD_INBOUND=127.0.0.1:51830\n")
     worker_env.write_text("PORT=50051\nLISTEN=0.0.0.0\n")
-    before = {path: path.read_bytes() for path in (p2p_env, worker_env)}
+    consumer_env.write_text(
+        'NAKSHATRA_P2P_NAKD_INBOUND=""\nNAKSHATRA_P2P_WORKER_ARGS=""\n')
+    before = {path: path.read_bytes() for path in (p2p_env, worker_env, consumer_env)}
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("NAK_CONTAINER_WORKER", "1")
     monkeypatch.setenv("NAK_CONTAINER_P2P_PORT", "50051")
@@ -673,7 +772,7 @@ def test_container_env_rejects_equal_worker_and_p2p_ports_without_rewriting(
     with pytest.raises(ValueError, match="container p2p port must not equal worker PORT 50051"):
         instance.reconcile_container_env()
 
-    assert {path: path.read_bytes() for path in (p2p_env, worker_env)} == before
+    assert {path: path.read_bytes() for path in (p2p_env, worker_env, consumer_env)} == before
 
 
 def test_container_consumer_rejects_noncanonical_port_without_rewriting_any_env(
@@ -742,9 +841,10 @@ def test_published_container_consumer_uses_fixed_tcp_and_quic_port_without_inbou
 
     instance.reconcile_container_env()
 
-    values = supervisor._env_file(p2p_env)
-    assert values == {
-        "P2P_RELAYS": "test",
+    assert supervisor._env_file(p2p_env) == {
+        "P2P_RELAYS": "test", "NAKSHATRA_P2P_NAKD_INBOUND": "",
+    }
+    assert supervisor._env_file(env_dir / "p2p-consumer.env") == {
         "NAKSHATRA_P2P_NAKD_INBOUND": "",
         "NAKSHATRA_P2P_WORKER_ARGS": "-listen /ip4/0.0.0.0/tcp/24001",
     }
@@ -781,9 +881,74 @@ def test_container_consumer_clears_stale_inbound_from_every_loaded_env_file(
     assert "51831" not in (env_dir / "p2p.env").read_text()
     assert "59999" not in (env_dir / "worker.env").read_text()
     assert "59998" not in (env_dir / "worker.env").read_text()
+    assert supervisor._env_file(env_dir / "p2p-consumer.env") == {
+        "NAKSHATRA_P2P_NAKD_INBOUND": "",
+        "NAKSHATRA_P2P_WORKER_ARGS": "-listen /ip4/0.0.0.0/tcp/24001",
+    }
     effective = _effective_p2p_argv(tmp_path, home)
     assert effective[-2:] == ["-listen", "/ip4/0.0.0.0/tcp/24001"]
     assert not any(arg.startswith(("-nakd-inbound", "-inbound")) for arg in effective)
+
+
+@pytest.mark.parametrize("env_name", ["p2p.env", "worker.env"])
+@pytest.mark.parametrize("form", [
+    "plain",
+    "leading-whitespace",
+    "export",
+    "single-quoted",
+    "double-quoted",
+    "unquoted-continuation",
+    "double-quoted-continuation",
+    "multiline-single-quoted",
+    "space-before-equals",
+    "tab-before-equals",
+])
+def test_consumer_override_wins_over_review_parser_matrix(
+        tmp_path, monkeypatch, env_name, form):
+    home = tmp_path / "home"
+    env_dir = home / ".nakshatra"
+    env_dir.mkdir(parents=True)
+    (env_dir / "p2p.env").write_text("P2P_RELAYS=test\n")
+    (env_dir / "worker.env").write_text("PORT=50051\n")
+    target = env_dir / env_name
+    target.write_text(
+        target.read_text()
+        + _review_assignment(
+            form, "NAKSHATRA_P2P_NAKD_INBOUND", "-nakd-inbound=127.0.0.1:59999")
+        + _review_assignment(
+            form, "NAKSHATRA_P2P_WORKER_ARGS",
+            "-listen /ip4/0.0.0.0/tcp/59997 -inbound=127.0.0.1:59998",
+        )
+    )
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("NAK_CONTAINER_WORKER", raising=False)
+    monkeypatch.setenv("NAK_CONTAINER_CONSUMER_P2P_PORT", "24001")
+    instance = supervisor.Supervisor(
+        tmp_path / "prefix", tmp_path / "units", tmp_path / "sock",
+        refresh=False, control=False,
+    )
+
+    instance.reconcile_container_env()
+
+    for effective in (
+            _systemd_effective_p2p_argv(tmp_path, home),
+            _effective_p2p_argv(tmp_path, home)):
+        assert effective[-2:] == ["-listen", "/ip4/0.0.0.0/tcp/24001"]
+        assert not any(arg.startswith(("-nakd-inbound", "-inbound")) for arg in effective)
+        assert not any("5999" in arg for arg in effective)
+
+
+@pytest.mark.parametrize("raw", [
+    "NAME=value",
+    " NAME=value",
+    " export NAME=value",
+    "NAME =value",
+    "NAME\t=value",
+    "NAME\r=value",
+])
+def test_env_assignment_normalizers_have_parser_parity(raw):
+    assert supervisor._env_assignment(raw) == nak._env_assignment(raw)
+    assert supervisor._env_assignment(raw) == ("NAME", "value")
 
 
 def test_supervisor_reload_refreshes_environment_file_without_starting_service(tmp_path):

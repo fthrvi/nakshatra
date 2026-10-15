@@ -44,6 +44,7 @@ def _env_assignment(raw: str) -> tuple[str, str] | None:
     if "=" not in line:
         return None
     name, value = line.split("=", 1)
+    name = name.rstrip(" \t\r")
     return name, value
 
 
@@ -228,6 +229,7 @@ class Supervisor:
         home = Path(os.environ.get("HOME", str(self.prefix.parent)))
         p2p_env = home / ".nakshatra" / "p2p.env"
         worker_env = home / ".nakshatra" / "worker.env"
+        consumer_env = home / ".nakshatra" / "p2p-consumer.env"
         if os.environ.get("NAK_CONTAINER_WORKER") != "1":
             consumer_port = os.environ.get("NAK_CONTAINER_CONSUMER_P2P_PORT")
             port = None
@@ -240,7 +242,8 @@ class Supervisor:
                     raise ValueError("container consumer p2p port must be between 1 and 65535")
 
             # The state volume survives role changes. Strip any worker listener/forward left by a
-            # former worker container and explicitly opt the consumer out of both inbound targets.
+            # former worker container as defence in depth. Consumer safety itself comes from the
+            # canonical override file, loaded after every other P2P EnvironmentFile.
             staged: dict[Path, str] = {}
             for path in (p2p_env, worker_env):
                 if path.exists():
@@ -248,13 +251,13 @@ class Supervisor:
                     self._stage_env(staged, path, "NAKSHATRA_P2P_NAKD_INBOUND", None)
             if p2p_env.exists():
                 self._stage_env(staged, p2p_env, "NAKSHATRA_P2P_NAKD_INBOUND", "")
-                if port is not None:
-                    # The signed unit already supplies -quic. The sidecar derives UDP/P/quic-v1
-                    # (and best-effort IPv6 wildcard TCP+QUIC) from this fixed TCP listen address.
-                    self._stage_env(
-                        staged, p2p_env, "NAKSHATRA_P2P_WORKER_ARGS",
-                        f"-listen /ip4/0.0.0.0/tcp/{port}"
-                    )
+            # The signed unit already supplies -quic. The sidecar derives UDP/P/quic-v1
+            # (and best-effort IPv6 wildcard TCP+QUIC) from this fixed TCP listen address.
+            worker_args = f"-listen /ip4/0.0.0.0/tcp/{port}" if port is not None else ""
+            staged[consumer_env] = (
+                'NAKSHATRA_P2P_NAKD_INBOUND=""\n'
+                f'NAKSHATRA_P2P_WORKER_ARGS="{worker_args}"\n'
+            )
             self._replace_staged_env(staged)
             return
         port_text = os.environ.get("NAK_CONTAINER_P2P_PORT", "4001")
@@ -285,6 +288,9 @@ class Supervisor:
                 staged, p2p_env, "NAKSHATRA_P2P_WORKER_ARGS",
                 f"-listen /ip4/0.0.0.0/tcp/{port}"
             )
+        # Do this only after all validation above succeeds. Worker mode owns P2P again, so the
+        # last-loaded consumer override must disappear before worker.env can take effect.
+        consumer_env.unlink(missing_ok=True)
         self._replace_staged_env(staged)
 
     @staticmethod

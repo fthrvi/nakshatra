@@ -96,6 +96,10 @@ def test_gateway_on_writes_loopback_enforced_opt_in(tmp_path, monkeypatch):
     p2p_token = p2p_owner.read_text().strip()
     assert re.fullmatch(r"[0-9a-f]{64}", p2p_token)
     assert 'NAKSHATRA_P2P_NAKD_INBOUND=""\n' in p2p_env.read_text()
+    assert (home / ".nakshatra" / "p2p-consumer.env").read_text() == (
+        'NAKSHATRA_P2P_NAKD_INBOUND=""\n'
+        'NAKSHATRA_P2P_WORKER_ARGS=""\n'
+    )
     assert f"# nak-gateway-owned: {p2p_token}\n" in p2p_env.read_text()
     assert (home / ".nakshatra" / "p2p.lock").stat().st_mode & 0o777 == 0o600
     assert calls == ["enable"]
@@ -114,7 +118,8 @@ def test_gateway_on_enables_p2p_before_gateway_when_absent(tmp_path, monkeypatch
     assert calls == [("p2p", "enable"), ("gateway", "enable")]
 
 
-def test_gateway_on_leaves_operator_p2p_untouched(tmp_path, monkeypatch):
+def test_gateway_on_adds_final_consumer_override_without_rewriting_operator_p2p(
+        tmp_path, monkeypatch):
     home = tmp_path / "home"
     p2p_env = home / ".nakshatra" / "p2p.env"
     p2p_env.parent.mkdir(parents=True)
@@ -122,14 +127,38 @@ def test_gateway_on_leaves_operator_p2p_untouched(tmp_path, monkeypatch):
     p2p_env.write_text(original)
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setattr(nak, "_gateway_unit_enabled", lambda _sp: False)
-    monkeypatch.setattr(
-        nak, "_p2p_installer", lambda *_args: pytest.fail("operator p2p must be left alone"))
+    p2p_calls = []
+    monkeypatch.setattr(nak, "_p2p_installer", lambda _sp, action: p2p_calls.append(action))
     monkeypatch.setattr(nak, "_gateway_installer", lambda *_args: None)
 
     nak._gateway_on(object(), _args())
 
     assert p2p_env.read_text() == original
+    assert (home / ".nakshatra" / "p2p-consumer.env").read_text() == (
+        'NAKSHATRA_P2P_NAKD_INBOUND=""\n'
+        'NAKSHATRA_P2P_WORKER_ARGS=""\n'
+    )
+    assert p2p_calls == ["restart"]
     assert not (home / ".nakshatra" / "gateway" / "p2p-profile-created").exists()
+
+
+def test_gateway_off_removes_final_consumer_override_under_p2p_ownership(
+        tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    state = home / ".nakshatra"
+    state.mkdir(parents=True)
+    (state / "p2p.env").write_text("P2P_RELAYS=operator\n")
+    (state / "p2p-consumer.env").write_text(
+        'NAKSHATRA_P2P_NAKD_INBOUND=""\nNAKSHATRA_P2P_WORKER_ARGS=""\n')
+    calls = []
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(nak, "_gateway_installer", lambda *_args: None)
+    monkeypatch.setattr(nak, "_p2p_installer", lambda _sp, action: calls.append(action))
+
+    nak._gateway_off(object())
+
+    assert not (state / "p2p-consumer.env").exists()
+    assert calls == ["restart"]
 
 
 def test_explicit_p2p_on_retires_gateway_ownership(tmp_path, monkeypatch):

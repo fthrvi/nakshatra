@@ -235,9 +235,11 @@ def _p2p_ownership_lock():
 def _enable_p2p_service_locked(_sp, *, owner_token: str = "") -> None:
     """Create and enable P2P while the caller holds ``_p2p_ownership_lock``."""
     env = Path.home() / ".nakshatra" / "p2p.env"
+    consumer_env = Path.home() / ".nakshatra" / "p2p-consumer.env"
     created = False
     took_over_consumer = False
     old_env = env.read_bytes() if env.exists() else None
+    old_consumer_env = consumer_env.read_bytes() if consumer_env.exists() else None
     if not env.exists():
         env.parent.mkdir(parents=True, exist_ok=True)
         ownership = f"{GATEWAY_PROFILE_OWNER_PREFIX}{owner_token}\n" if owner_token else ""
@@ -251,6 +253,9 @@ def _enable_p2p_service_locked(_sp, *, owner_token: str = "") -> None:
         # operator. Restore the signed unit's default nakd inbound before enabling/restarting it.
         took_over_consumer = _remove_env_assignment(
             env, "NAKSHATRA_P2P_NAKD_INBOUND")
+    if not owner_token and consumer_env.exists():
+        consumer_env.unlink()
+        took_over_consumer = True
     try:
         _p2p_installer(_sp, "enable")
         if took_over_consumer:
@@ -271,6 +276,8 @@ def _enable_p2p_service_locked(_sp, *, owner_token: str = "") -> None:
             env.unlink(missing_ok=True)
         elif old_env is not None:
             _write_private(env, old_env)
+        if old_consumer_env is not None:
+            _write_private(consumer_env, old_consumer_env)
         if disable_error is not None:
             raise SystemExit(
                 f"{enable_error}; rollback could not disable nakshatra-p2p: {disable_error}"
@@ -310,6 +317,19 @@ def _gateway_profile_paths() -> tuple[Path, Path]:
 def _gateway_p2p_paths() -> tuple[Path, Path]:
     root, _env_path = _gateway_paths()
     return Path.home() / ".nakshatra" / "p2p.env", root / GATEWAY_P2P_OWNER
+
+
+def _p2p_consumer_env_path() -> Path:
+    return Path.home() / ".nakshatra" / "p2p-consumer.env"
+
+
+def _write_p2p_consumer_env(worker_args: str = "") -> None:
+    """Write the last-loaded, canonical consumer P2P override."""
+    _write_private(
+        _p2p_consumer_env_path(),
+        ('NAKSHATRA_P2P_NAKD_INBOUND=""\n'
+         f'NAKSHATRA_P2P_WORKER_ARGS="{worker_args}"\n').encode(),
+    )
 
 
 def _inference_profile_needed_without_gateway() -> bool:
@@ -359,6 +379,9 @@ def _release_gateway_p2p_ownership(_sp) -> None:
     """Disable only the exact P2P opt-in generation created by this gateway."""
     with _p2p_ownership_lock():
         p2p_env, marker = _gateway_p2p_paths()
+        consumer_env = _p2p_consumer_env_path()
+        removed_consumer_override = consumer_env.exists()
+        consumer_env.unlink(missing_ok=True)
         env_token = _gateway_profile_token(p2p_env)
         marker_token = _gateway_marker_token(marker)
         owned = bool(env_token and marker_token and secrets.compare_digest(env_token, marker_token))
@@ -375,6 +398,9 @@ def _release_gateway_p2p_ownership(_sp) -> None:
             if owned and not worker_configured:
                 _p2p_installer(_sp, "disable")
                 p2p_env.unlink(missing_ok=True)
+                removed_consumer_override = False
+        if removed_consumer_override and p2p_env.exists():
+            _p2p_installer(_sp, "restart")
         marker.unlink(missing_ok=True)
 
 
@@ -580,6 +606,13 @@ def _gateway_on(_sp, args) -> None:
             profile_owner.unlink(missing_ok=True)
             raise
     made_p2p = False
+    host_consumer_override = (
+        "NAK_CONTAINER_CONSUMER_P2P_PORT" not in os.environ
+        and not (Path.home() / ".nakshatra" / "worker.env").is_file()
+    )
+    consumer_env = _p2p_consumer_env_path()
+    old_consumer_env = consumer_env.read_bytes() if consumer_env.exists() else None
+    consumer_override_changed = False
     package_body = ""
     if args.models == "auto":
         package_body = f"PACKAGE_URL={_env_value(package_url, 'package-url')}\n"
@@ -607,10 +640,15 @@ def _gateway_on(_sp, args) -> None:
         with _p2p_ownership_lock():
             p2p_env, p2p_owner = _gateway_p2p_paths()
             made_p2p = not p2p_env.exists()
+            if host_consumer_override:
+                _write_p2p_consumer_env()
+                consumer_override_changed = consumer_env.read_bytes() != old_consumer_env
             if made_p2p:
                 p2p_owner_token = secrets.token_hex(32)
                 _write_private(p2p_owner, f"{p2p_owner_token}\n".encode())
                 _enable_p2p_service_locked(_sp, owner_token=p2p_owner_token)
+            elif consumer_override_changed:
+                _p2p_installer(_sp, "restart")
         _gateway_installer(_sp, action)
     except (Exception, SystemExit):
         if old_env is None:
@@ -621,6 +659,17 @@ def _gateway_on(_sp, args) -> None:
             _release_gateway_profile_ownership()
         if made_p2p:
             _release_gateway_p2p_ownership(_sp)
+        if consumer_override_changed:
+            with _p2p_ownership_lock():
+                if old_consumer_env is None:
+                    consumer_env.unlink(missing_ok=True)
+                else:
+                    _write_private(consumer_env, old_consumer_env)
+                if _p2p_enabled():
+                    try:
+                        _p2p_installer(_sp, "restart")
+                    except (Exception, SystemExit):
+                        pass
         raise
     print(f"gateway ON at http://{args.bind}:{args.port}/v1 (credits enforced)")
 
@@ -764,6 +813,7 @@ def _env_assignment(raw: str) -> tuple[str, str] | None:
     if "=" not in line:
         return None
     name, value = line.split("=", 1)
+    name = name.rstrip(" \t\r")
     return name, value
 
 
@@ -839,6 +889,8 @@ def _worker_enable_locked(_sp, args) -> None:
     p2p_env, p2p_owner = _gateway_p2p_paths()
     old_p2p_env = p2p_env.read_bytes() if p2p_env.exists() else None
     old_p2p_owner = p2p_owner.read_bytes() if p2p_owner.exists() else None
+    consumer_env = _p2p_consumer_env_path()
+    old_consumer_env = consumer_env.read_bytes() if consumer_env.exists() else None
     took_over_p2p = False
     if old_env is None:
         missing = [name for name in ("model_id", "package_url", "package_pubkey", "pillar_url", "layers", "port")
@@ -890,6 +942,7 @@ def _worker_enable_locked(_sp, args) -> None:
         "NAKSHATRA_P2P_WORKER_ARGS",
         f"-inbound=127.0.0.1:{port} -require-direct-activation",
     )
+    consumer_env.unlink(missing_ok=True)
     try:
         _worker_installer(_sp, "enable")
         if _p2p_enabled():
@@ -920,6 +973,8 @@ def _worker_enable_locked(_sp, args) -> None:
                 p2p_owner.unlink(missing_ok=True)
             else:
                 _write_private(p2p_owner, old_p2p_owner)
+        if old_consumer_env is not None:
+            _write_private(consumer_env, old_consumer_env)
         if _p2p_enabled():
             try:
                 _p2p_installer(_sp, "restart")

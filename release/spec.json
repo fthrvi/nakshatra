@@ -133,7 +133,8 @@
    "requires": "{home}/.nakshatra/p2p.env",
    "env_file": "{home}/.nakshatra/p2p.env",
    "optional_env_files": [
-    "{home}/.nakshatra/worker.env"
+    "{home}/.nakshatra/worker.env",
+    "{home}/.nakshatra/p2p-consumer.env"
    ],
    "after": [
     "network-online.target",
