@@ -417,7 +417,6 @@ def _release_gateway_p2p_ownership(_sp) -> None:
         p2p_env, marker = _gateway_p2p_paths()
         consumer_env = _p2p_consumer_env_path()
         removed_consumer_override = consumer_env.exists()
-        consumer_env.unlink(missing_ok=True)
         env_token = _gateway_profile_token(p2p_env)
         marker_token = _gateway_marker_token(marker)
         owned = bool(env_token and marker_token and secrets.compare_digest(env_token, marker_token))
@@ -432,9 +431,32 @@ def _release_gateway_p2p_ownership(_sp) -> None:
                          and secrets.compare_digest(env_token, marker_token))
             worker_enabled = _worker_unit_enabled(_sp)
             if owned and not worker_enabled:
-                _p2p_installer(_sp, "disable")
+                # Prepare the only safe retained generation before asking the installer to stop
+                # it. If the stop fails, removing the gateway's empty nakd override makes this
+                # profile byte-equivalent to the pre-gateway operator P2P argv (762b0da).
+                consumer_env.unlink(missing_ok=True)
+                _remove_env_assignment(p2p_env, "NAKSHATRA_P2P_NAKD_INBOUND")
+                try:
+                    _p2p_installer(_sp, "disable")
+                except (Exception, SystemExit) as disable_error:
+                    # The installer retains p2p.env when it cannot prove the sidecar stopped.
+                    # Retire gateway ownership and restart so the retained unit is verified under
+                    # legacy operator config before control returns to the caller.
+                    marker.unlink(missing_ok=True)
+                    try:
+                        _p2p_installer(_sp, "restart")
+                    except (Exception, SystemExit) as restart_error:
+                        raise SystemExit(
+                            f"{disable_error}; retained p2p promotion could not restart: "
+                            f"{restart_error}"
+                        ) from disable_error
+                    raise SystemExit(
+                        f"{disable_error}; retained p2p was promoted to operator-owned legacy "
+                        "configuration and restarted"
+                    ) from disable_error
                 p2p_env.unlink(missing_ok=True)
                 removed_consumer_override = False
+        consumer_env.unlink(missing_ok=True)
         if removed_consumer_override and p2p_env.exists():
             _p2p_installer(_sp, "restart")
         marker.unlink(missing_ok=True)

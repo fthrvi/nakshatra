@@ -162,6 +162,25 @@ def _dry_run_argv(output: str, occurrence: int = 0) -> list[str]:
     return shlex.split(lines[occurrence][2:])
 
 
+def _logged_run_argv(path: Path) -> list[str]:
+    runs = [shlex.split(line) for line in path.read_text().splitlines()
+            if line.startswith("run ")]
+    assert runs
+    return runs[-1]
+
+
+def _reconcile_logged_container(monkeypatch, instance, argv: list[str]) -> None:
+    for name in ("NAK_CONTAINER_WORKER", "NAK_CONTAINER_P2P_PORT",
+                 "NAK_CONTAINER_CONSUMER_P2P_PORT"):
+        monkeypatch.delenv(name, raising=False)
+    for index, item in enumerate(argv):
+        if item == "--env":
+            name, value = argv[index + 1].split("=", 1)
+            if name.startswith("NAK_CONTAINER_"):
+                monkeypatch.setenv(name, value)
+    instance.reconcile_container_env()
+
+
 def test_containerfile_is_nonroot_pinned_and_does_not_copy_secrets():
     body = (CONTAINER / "Containerfile").read_text()
     assert re.search(r"^ARG BASE_IMAGE=(?![^\n]*(?:latest|edge)\b)[^\n]+:[^\n]+$", body, re.MULTILINE)
@@ -250,6 +269,124 @@ def test_worker_dry_run_golden_is_byte_identical(tmp_path):
         "+ docker exec -i nakshatra-node nak p2p on \n"
         "+ docker exec -i nakshatra-node nak worker on --port 50051 \n"
     )
+
+
+def test_nakc_supervisor_promotes_worker_then_demotes_to_gateway_consumer(
+        tmp_path, monkeypatch):
+    """Container role changes regenerate and check effective argv at both boundaries."""
+    home = tmp_path / "home"
+    state = home / ".nakshatra"
+    state.mkdir(parents=True)
+    (state / "p2p.env").write_text("P2P_RELAYS=test\n")
+    engine_log = tmp_path / "engine.log"
+    engine = tmp_path / "role-engine"
+    engine.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"$*\" >>\"$NAKC_TEST_LOG\"\n"
+        "if [ \"$1 $2\" = 'image inspect' ]; then exit 0; fi\n"
+        "if [ \"$1 $2\" = 'container inspect' ]; then exit 1; fi\n"
+        "if [ \"$1\" = inspect ]; then printf 'false\\n'; exit 0; fi\n"
+        "case \" $* \" in\n"
+        "  *' nak worker on '*)\n"
+        "    mkdir -p \"$NAKC_TEST_HOME/.nakshatra\"\n"
+        "    printf '%s\\n' 'PORT=5530' "
+        "\"NAKSHATRA_P2P_WORKER_ARGS=\\\"-inbound=127.0.0.1:5530 "
+        "-require-direct-activation\\\"\" >\"$NAKC_TEST_HOME/.nakshatra/worker.env\";;\n"
+        "  *' nak worker off '*)\n"
+        "    rm -f \"$NAKC_TEST_HOME/.nakshatra/worker.env\";;\n"
+        "esac\n"
+        "exit 0\n"
+    )
+    engine.chmod(0o755)
+    env = dict(
+        os.environ, HOME=str(home), NAKC_ENGINE=str(engine),
+        NAKC_CONFIG_DIR=str(tmp_path / "config"), NAKC_TEST_LOG=str(engine_log),
+        NAKC_TEST_HOME=str(home),
+    )
+    instance = supervisor.Supervisor(
+        tmp_path / "prefix", tmp_path / "units", tmp_path / "sock",
+        refresh=False, control=False,
+    )
+    monkeypatch.setenv("HOME", str(home))
+
+    gateway = subprocess.run(
+        [str(NAKC), "gateway", "on"], env=env, text=True, capture_output=True, check=False)
+    assert gateway.returncode == 0, gateway.stderr
+    _reconcile_logged_container(monkeypatch, instance, _logged_run_argv(engine_log))
+    effective = _effective_p2p_argv(tmp_path, home)
+    assert not any(arg.startswith(("-nakd-inbound", "-inbound=")) for arg in effective)
+
+    worker = subprocess.run(
+        [str(NAKC), "worker", "on", "--port", "5530"],
+        env=env, text=True, capture_output=True, check=False)
+    assert worker.returncode == 0, worker.stderr
+    _reconcile_logged_container(monkeypatch, instance, _logged_run_argv(engine_log))
+    effective = _effective_p2p_argv(tmp_path, home)
+    assert [arg for arg in effective if arg.startswith("-inbound=")] == [
+        "-inbound=127.0.0.1:5530"]
+
+    disabled = subprocess.run(
+        [str(NAKC), "worker", "off"], env=env, text=True, capture_output=True, check=False)
+    assert disabled.returncode == 0, disabled.stderr
+    _reconcile_logged_container(monkeypatch, instance, _logged_run_argv(engine_log))
+    effective = _effective_p2p_argv(tmp_path, home)
+    assert not any(arg.startswith(("-nakd-inbound", "-inbound=")) for arg in effective)
+
+
+def test_nakc_failed_worker_stop_retains_worker_container_and_supervisor_inbound(
+        tmp_path, monkeypatch):
+    """The inner durable recovery opt-in prevents outer consumer demotion."""
+    home = tmp_path / "home"
+    state = home / ".nakshatra"
+    state.mkdir(parents=True)
+    (state / "p2p.env").write_text("P2P_RELAYS=test\n")
+    engine_log = tmp_path / "engine.log"
+    engine = tmp_path / "retained-worker-engine"
+    engine.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"$*\" >>\"$NAKC_TEST_LOG\"\n"
+        "if [ \"$1 $2\" = 'image inspect' ]; then exit 0; fi\n"
+        "if [ \"$1 $2\" = 'container inspect' ]; then exit 1; fi\n"
+        "if [ \"$1\" = inspect ]; then printf 'false\\n'; exit 0; fi\n"
+        "case \" $* \" in\n"
+        "  *' nak worker on '*)\n"
+        "    mkdir -p \"$NAKC_TEST_HOME/.nakshatra\"\n"
+        "    printf '%s\\n' 'PORT=5530' "
+        "\"NAKSHATRA_P2P_WORKER_ARGS=\\\"-inbound=127.0.0.1:5530 "
+        "-require-direct-activation\\\"\" >\"$NAKC_TEST_HOME/.nakshatra/worker.env\"\n"
+        "    exit 23;;\n"
+        "  *' nak worker status '*)\n"
+        "    printf '%s\\n' '{\"configured\":true,\"unit\":{\"active\":\"failed\",\"enabled\":\"disabled\"}}'\n"
+        "    exit 0;;\n"
+        "esac\n"
+        "exit 0\n"
+    )
+    engine.chmod(0o755)
+    env = dict(
+        os.environ, HOME=str(home), NAKC_ENGINE=str(engine),
+        NAKC_CONFIG_DIR=str(tmp_path / "config"), NAKC_TEST_LOG=str(engine_log),
+        NAKC_TEST_HOME=str(home),
+    )
+
+    result = subprocess.run(
+        [str(NAKC), "worker", "on", "--port", "5530"],
+        env=env, text=True, capture_output=True, check=False)
+
+    assert result.returncode != 0
+    assert "retained worker container for inner recovery state" in result.stderr
+    assert (tmp_path / "config" / "worker-port").read_text() == "5530\n"
+    assert len([line for line in engine_log.read_text().splitlines()
+                if line.startswith("run ")]) == 1
+
+    monkeypatch.setenv("HOME", str(home))
+    instance = supervisor.Supervisor(
+        tmp_path / "prefix", tmp_path / "units", tmp_path / "sock",
+        refresh=False, control=False,
+    )
+    _reconcile_logged_container(monkeypatch, instance, _logged_run_argv(engine_log))
+    effective = _effective_p2p_argv(tmp_path, home)
+    assert [arg for arg in effective if arg.startswith("-inbound=")] == [
+        "-inbound=127.0.0.1:5530"]
 
 
 def test_join_dry_run_never_prints_the_invite(tmp_path):
@@ -744,7 +881,9 @@ def test_fresh_worker_effective_p2p_argv_matches_legacy_worker(tmp_path, monkeyp
     ("gateway-restart", ("gateway:restart:1", "gateway:restart:2")),
     ("gateway-off", ()),
     ("gateway-off", ("gateway:disable:1",)),
-    ("gateway-off", ("p2p:restart:1",)),
+    ("gateway-off", ("p2p:disable:1",)),
+    ("gateway-off", ("p2p:disable:1", "p2p:restart:1")),
+    ("gateway-off-operator", ("p2p:restart:1",)),
     ("worker-on", ()),
     ("worker-on", ("worker:enable:1",)),
     ("worker-on", ("worker:enable:1", "worker:disable:1")),
@@ -779,7 +918,7 @@ def test_host_transition_matrix_preserves_effective_p2p_invariant(
         nak, "load_release_package_signers", lambda: frozenset({"23" * 32}))
 
     live = {"gateway": False, "worker": False, "p2p": True}
-    if transition in {"gateway-restart", "gateway-off", "worker-on",
+    if transition in {"gateway-restart", "gateway-off", "gateway-off-operator", "worker-on",
                       "worker-off", "p2p-on-takeover"}:
         live["gateway"] = True
         (state / "gateway.env").write_text("PORT=11600\nOLD=1\n")
@@ -794,7 +933,7 @@ def test_host_transition_matrix_preserves_effective_p2p_invariant(
         # The reproduction: configured worker, disabled unit. Configuration must not suppress
         # consumer protection.
         (state / "worker.env").write_text("PORT=5530\n")
-    if transition == "p2p-on-takeover":
+    if transition in {"gateway-off", "p2p-on-takeover"}:
         token = "ab" * 32
         (state / "p2p.env").write_text(
             f'P2P_RELAYS=test\nNAKSHATRA_P2P_NAKD_INBOUND=""\n'
@@ -807,6 +946,22 @@ def test_host_transition_matrix_preserves_effective_p2p_invariant(
     counts = {}
     fault_set = set(faults)
 
+    def assert_invariant(boundary):
+        if not live["p2p"] or not (state / "p2p.env").exists():
+            return
+        effective = _effective_p2p_argv(tmp_path, home)
+        inbound = [arg for arg in effective if arg.startswith("-inbound=")]
+        nakd_inbound = [arg for arg in effective if arg.startswith("-nakd-inbound=")]
+        if live["worker"]:
+            assert inbound == ["-inbound=127.0.0.1:5530"], (
+                transition, faults, boundary, calls, effective)
+        elif live["gateway"] or (state / "gateway.env").exists():
+            assert inbound == [] and nakd_inbound == [], (
+                transition, faults, boundary, calls, effective)
+        else:
+            assert effective == _legacy_p2p_argv(tmp_path, home, "test"), (
+                transition, faults, boundary, calls, effective)
+
     def operate(service, action):
         key = (service, action)
         counts[key] = counts.get(key, 0) + 1
@@ -815,6 +970,7 @@ def test_host_transition_matrix_preserves_effective_p2p_invariant(
             # enable may start before its stability check fails; restart may leave either
             # generation live. Model the conservative live outcome.
             live[service] = True
+        assert_invariant(calls[-1])
         if calls[-1] in fault_set:
             raise SystemExit(f"injected {calls[-1]} failure")
         if action == "disable":
@@ -846,7 +1002,7 @@ def test_host_transition_matrix_preserves_effective_p2p_invariant(
     def drive():
         if transition in {"gateway-on", "gateway-restart"}:
             nak._gateway_on(object(), gateway_args)
-        elif transition == "gateway-off":
+        elif transition in {"gateway-off", "gateway-off-operator"}:
             nak._gateway_off(object())
         elif transition == "worker-on":
             nak._worker_enable(object(), worker_args)
@@ -863,14 +1019,7 @@ def test_host_transition_matrix_preserves_effective_p2p_invariant(
     else:
         drive()
 
-    if live["p2p"] and (state / "p2p.env").exists():
-        effective = _effective_p2p_argv(tmp_path, home)
-        inbound = [arg for arg in effective if arg.startswith("-inbound=")]
-        nakd_inbound = [arg for arg in effective if arg.startswith("-nakd-inbound=")]
-        if live["worker"]:
-            assert inbound == ["-inbound=127.0.0.1:5530"], (transition, faults, calls, effective)
-        elif live["gateway"]:
-            assert inbound == [] and nakd_inbound == [], (transition, faults, calls, effective)
+    assert_invariant("exit")
 
 
 def test_container_env_keeps_worker_private_without_rewriting_gateway_files(tmp_path, monkeypatch):

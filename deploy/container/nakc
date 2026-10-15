@@ -175,6 +175,28 @@ restart_with_stored_p2p_port() {
     (unset NAKC_P2P_PORT; start_container "$runtime") || true
 }
 
+worker_recovery_retained() {
+    local runtime="$1" status
+    # `nak worker on` owns the durable rollback decision inside the state volume. Do not infer
+    # that decision from the outer command's exit status: an enable failure followed by a failed
+    # compensating stop deliberately retains worker.env so the managed unit can recover later.
+    status="$("$runtime" exec -i "$CONTAINER_NAME" nak worker status 2>/dev/null)" || return 2
+    printf '%s\n' "$status" | python3 -c '
+import json, sys
+try:
+    status = json.load(sys.stdin)
+    unit = status.get("unit", {})
+    retained = status.get("configured") is True
+    retained = retained or unit.get("active") in {"active", "activating", "reloading"}
+    retained = retained or unit.get("enabled") in {
+        "enabled", "enabled-runtime", "linked", "linked-runtime", "alias"
+    }
+except (AttributeError, TypeError, ValueError):
+    raise SystemExit(2)
+raise SystemExit(0 if retained else 1)
+'
+}
+
 ensure_running() {
     local runtime="$1"
     if ! container_running; then start_container "$runtime"; fi
@@ -221,7 +243,7 @@ EOF
 
 main() {
     [ "$#" -gt 0 ] || { usage; exit 2; }
-    local command="$1" runtime port path mode old_port old_gateway old_p2p_port p2p_port worker_port item
+    local command="$1" runtime port path mode old_port old_gateway old_p2p_port p2p_port worker_port item status_rc
     shift
     runtime="$(engine)"
     case "$command" in
@@ -369,6 +391,19 @@ main() {
                     run "$runtime" exec -i "$CONTAINER_NAME" nak worker "$@"
                 elif ! "$runtime" exec -i "$CONTAINER_NAME" nak p2p on || \
                      ! "$runtime" exec -i "$CONTAINER_NAME" nak worker "$@"; then
+                    if worker_recovery_retained "$runtime"; then
+                        printf '%s\n' \
+                            'nakc: worker transition failed; retained worker container for inner recovery state' >&2
+                        return 1
+                    else
+                        status_rc=$?
+                        if [ "$status_rc" -ne 1 ]; then
+                            printf '%s %s\n' \
+                                'nakc: worker transition failed and status is unknown;' \
+                                'conservatively retained worker container' >&2
+                            return 1
+                        fi
+                    fi
                     if [ -n "$old_port" ]; then
                         config_write worker-port "$old_port"
                     else

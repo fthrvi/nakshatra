@@ -289,7 +289,8 @@ def test_gateway_restart_rollback_keeps_consumer_override_throughout(
     assert (state / "p2p-consumer.env").exists()
 
 
-def test_gateway_enable_failed_stop_keeps_p2p_ownership_for_off_retry(tmp_path, monkeypatch):
+def test_gateway_enable_failed_stop_promotes_retained_p2p_to_legacy_operator(
+        tmp_path, monkeypatch):
     home = tmp_path / "home"
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setattr(nak, "_gateway_unit_enabled", lambda _sp: False)
@@ -306,14 +307,47 @@ def test_gateway_enable_failed_stop_keeps_p2p_ownership_for_off_retry(tmp_path, 
 
     p2p_env = home / ".nakshatra" / "p2p.env"
     owner = home / ".nakshatra" / "gateway" / "p2p-profile-created"
-    assert p2p_env.exists() and owner.exists()
-    assert nak._gateway_profile_token(p2p_env) == nak._gateway_marker_token(owner)
-    assert actions == ["enable", "disable", "disable"]
+    assert p2p_env.exists() and not owner.exists()
+    assert "NAKSHATRA_P2P_NAKD_INBOUND" not in p2p_env.read_text()
+    assert actions == ["enable", "disable", "disable", "restart"]
 
-    monkeypatch.setattr(nak, "_p2p_installer", lambda _sp, action: actions.append(action))
-    nak._gateway_off(object())
-    assert actions[-1] == "disable"
-    assert not p2p_env.exists() and not owner.exists()
+
+def test_gateway_off_failed_owned_p2p_stop_promotes_and_verifies_legacy_operator(
+        tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    state = home / ".nakshatra"
+    gateway = state / "gateway"
+    gateway.mkdir(parents=True)
+    token = "cd" * 32
+    (state / "gateway.env").write_text("PORT=11600\n")
+    p2p_env = state / "p2p.env"
+    p2p_env.write_text(
+        f'P2P_RELAYS=test\nNAKSHATRA_P2P_NAKD_INBOUND=""\n'
+        f'# nak-gateway-owned: {token}\n')
+    (state / "p2p-consumer.env").write_text(
+        'NAKSHATRA_P2P_NAKD_INBOUND=""\nNAKSHATRA_P2P_WORKER_ARGS=""\n')
+    owner = gateway / "p2p-profile-created"
+    owner.write_text(token + "\n")
+    monkeypatch.setenv("HOME", str(home))
+    actions = []
+
+    monkeypatch.setattr(nak, "_gateway_installer", lambda *_args: None)
+    monkeypatch.setattr(nak, "_worker_unit_enabled", lambda _sp: False)
+
+    def p2p_installer(_sp, action):
+        actions.append(action)
+        if action == "disable":
+            raise SystemExit("injected p2p disable failure")
+
+    monkeypatch.setattr(nak, "_p2p_installer", p2p_installer)
+
+    with pytest.raises(SystemExit, match="promoted to operator-owned legacy"):
+        nak._gateway_off(object())
+
+    assert actions == ["disable", "restart"]
+    assert p2p_env.exists() and not owner.exists()
+    assert not (state / "p2p-consumer.env").exists()
+    assert "NAKSHATRA_P2P_NAKD_INBOUND" not in p2p_env.read_text()
 
 
 def test_gateway_auto_uses_join_url_but_ignores_join_key(tmp_path, monkeypatch):
