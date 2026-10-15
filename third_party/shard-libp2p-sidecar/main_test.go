@@ -1260,6 +1260,51 @@ func TestDynamicForwardLimitDoesNotEvictBusyEntries(t *testing.T) {
 	}
 }
 
+func TestDynamicForwardColdSelectionIsSingleFlightPerPeer(t *testing.T) {
+	m := newForwardManager(nil, nil, time.Second, nil, false)
+	defer m.close()
+	p := testPeerID(t)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var calls atomic.Int32
+	m.selectPath = func(context.Context, peer.ID) (bool, error) {
+		if calls.Add(1) == 1 {
+			close(started)
+		}
+		<-release
+		return false, nil
+	}
+
+	const callers = 12
+	results := make(chan string, callers)
+	errs := make(chan error, callers)
+	for i := 0; i < callers; i++ {
+		go func() {
+			addr, err := m.prepare(p)
+			results <- addr
+			errs <- err
+		}()
+	}
+	<-started
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+
+	var want string
+	for i := 0; i < callers; i++ {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+		if got := <-results; want == "" {
+			want = got
+		} else if got != want {
+			t.Fatalf("FORWARD address = %q, want shared %q", got, want)
+		}
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("cold path selections = %d, want 1", got)
+	}
+}
+
 func TestRelayCircuitAddressesAreAddedForPeerOnlyDial(t *testing.T) {
 	privA, _, _ := crypto.GenerateEd25519Key(rand.Reader)
 	privRelay, _, _ := crypto.GenerateEd25519Key(rand.Reader)
@@ -1792,7 +1837,9 @@ func TestDynamicForwardRelayOnlyTLSRoundTripDoesNotRepeatDirectWait(t *testing.T
 		t.Fatal("test peers did not connect exclusively through the allowlisted relay")
 	}
 
+	var workerCalls atomic.Int32
 	engine := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		workerCalls.Add(1)
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
 			t.Errorf("read request body: %v", err)
@@ -1862,9 +1909,25 @@ func TestDynamicForwardRelayOnlyTLSRoundTripDoesNotRepeatDirectWait(t *testing.T
 		t.Fatalf("cached relay-only FORWARD repeated path selection: %v", elapsed)
 	}
 	roundTrip("activation-bytes-2")
+	if got := workerCalls.Load(); got != 2 {
+		t.Fatalf("worker handler invocations = %d, want 2", got)
+	}
+}
+
+func TestDynamicForwardRelayBackgroundUpgrade(t *testing.T) {
+	consumer, worker, relayInfo := relayOnlyTestHosts(t, 1<<20)
+	m := newForwardManager(consumer, []peer.AddrInfo{relayInfo}, 5*time.Second, nil, true)
+	defer m.close()
+	relay := relayedConn(consumer, worker.ID())
+	if relay == nil {
+		t.Fatal("missing initial relay connection")
+	}
+	if _, err := m.getReady(worker.ID(), relay); err != nil {
+		t.Fatal(err)
+	}
 
 	// Model a later DCUtR/Identify result by making a safe LAN address available after relay traffic
-	// is already flowing. No new FORWARD request or accepted client is allowed to drive this dial:
+	// is already available. No new FORWARD request or accepted client is allowed to drive this dial:
 	// the cached forward's single background upgrader must establish it on its own.
 	if err := worker.Network().Listen(multiaddr.StringCast("/ip4/0.0.0.0/tcp/0")); err != nil {
 		t.Fatal(err)
@@ -1881,7 +1944,170 @@ func TestDynamicForwardRelayOnlyTLSRoundTripDoesNotRepeatDirectWait(t *testing.T
 	if directConn(consumer, worker.ID()) == nil {
 		t.Fatal("background direct-path upgrade did not use the newly learned address")
 	}
-	roundTrip("activation-bytes-direct-upgrade")
+	m.mu.Lock()
+	f := m.entries[worker.ID()]
+	relayID := f.relayConnID
+	m.mu.Unlock()
+	if relayID != "" {
+		t.Fatalf("relay readiness survived direct connection: %q", relayID)
+	}
+}
+
+func TestDynamicForwardRelayDisconnectInvalidatesGeneration(t *testing.T) {
+	consumer, worker, relayInfo := relayOnlyTestHosts(t, 1<<20)
+	m := newForwardManager(consumer, []peer.AddrInfo{relayInfo}, 5*time.Second, nil, true)
+	defer m.close()
+	relay := relayedConn(consumer, worker.ID())
+	if relay == nil {
+		t.Fatal("missing initial relay connection")
+	}
+	if _, err := m.getReady(worker.ID(), relay); err != nil {
+		t.Fatal(err)
+	}
+	m.mu.Lock()
+	f := m.entries[worker.ID()]
+	generation := f.relayGeneration
+	m.mu.Unlock()
+	if err := relay.Close(); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		m.mu.Lock()
+		cleared := f.relayConnID == "" && f.relayGeneration > generation
+		m.mu.Unlock()
+		if cleared {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("relay disconnect did not invalidate the bound generation")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestDynamicForwardRelayStreamFailureInvalidatesAndRetriesSelectionOnce(t *testing.T) {
+	consumer, worker, relayInfo := relayOnlyTestHosts(t, 1<<20)
+	m := newForwardManager(consumer, []peer.AddrInfo{relayInfo}, time.Second, nil, true)
+	defer m.close()
+	relay := relayedConn(consumer, worker.ID())
+	if relay == nil {
+		t.Fatal("missing initial relay connection")
+	}
+	if _, err := m.getReady(worker.ID(), relay); err != nil {
+		t.Fatal(err)
+	}
+	m.mu.Lock()
+	f := m.entries[worker.ID()]
+	generation := f.relayGeneration
+	m.mu.Unlock()
+	var selections atomic.Int32
+	m.selectPath = func(context.Context, peer.ID) (bool, error) {
+		selections.Add(1)
+		return true, nil
+	}
+
+	if s, err := m.openForwardStream(f); err == nil {
+		_ = s.Close()
+		t.Fatal("relay stream unexpectedly opened without a worker handler")
+	}
+	if got := selections.Load(); got != 1 {
+		t.Fatalf("relay re-selections = %d, want exactly 1", got)
+	}
+	m.mu.Lock()
+	bound := f.relayConnID
+	finalGeneration := f.relayGeneration
+	m.mu.Unlock()
+	if bound != "" || finalGeneration <= generation {
+		t.Fatalf("failed relay stream remained ready: conn=%q generation=%d, started at %d",
+			bound, finalGeneration, generation)
+	}
+}
+
+func TestDynamicForwardDirectConnectionInvalidatesRelayReadiness(t *testing.T) {
+	newKey := func() crypto.PrivKey {
+		priv, _, err := crypto.GenerateEd25519Key(rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return priv
+	}
+	worker, err := newHost(newKey(), "/ip4/127.0.0.1/tcp/0", natOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer worker.Close()
+	workerAddr := worker.Addrs()[0].Encapsulate(multiaddr.StringCast("/p2p/" + worker.ID().String()))
+	policy, err := newOutboundDialPolicy(nil, []string{"127.0.0.1:0=" + workerAddr.String()}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	consumer, err := newHost(newKey(), "/ip4/127.0.0.1/tcp/0", natOpts{dialPolicy: policy})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer consumer.Close()
+	m := newForwardManager(consumer, nil, time.Second, policy, true)
+	defer m.close()
+	if _, err := m.get(worker.ID()); err != nil {
+		t.Fatal(err)
+	}
+	m.mu.Lock()
+	f := m.entries[worker.ID()]
+	f.relayConnID = "stale-relay-generation"
+	f.relayGeneration++
+	generation := f.relayGeneration
+	m.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := consumer.Connect(ctx, peer.AddrInfo{ID: worker.ID(), Addrs: worker.Addrs()}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		m.mu.Lock()
+		cleared := f.relayConnID == "" && f.relayGeneration > generation
+		m.mu.Unlock()
+		if cleared {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("direct connection did not invalidate relay readiness")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestDynamicForwardHostCloseDrainsUpgrader(t *testing.T) {
+	consumer, worker, relayInfo := relayOnlyTestHosts(t, 1<<20)
+	m := newForwardManager(consumer, []peer.AddrInfo{relayInfo}, 30*time.Second, nil, true)
+	defer m.close()
+	relay := relayedConn(consumer, worker.ID())
+	if relay == nil {
+		t.Fatal("missing initial relay connection")
+	}
+	if _, err := m.getReady(worker.ID(), relay); err != nil {
+		t.Fatal(err)
+	}
+	if err := consumer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-m.ctx.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("host close did not cancel forward manager lifecycle")
+	}
+	drained := make(chan struct{})
+	go func() {
+		m.upgradeWG.Wait()
+		close(drained)
+	}()
+	select {
+	case <-drained:
+	case <-time.After(2 * time.Second):
+		t.Fatal("host close did not drain direct upgrader")
+	}
 }
 
 func TestRelayDestinationWithoutReservationConsumesNoBudget(t *testing.T) {
@@ -2145,7 +2371,20 @@ func TestStaticForwardInitialConnectFailureStillRunsRelaySelection(t *testing.T)
 
 func TestRelayCircuitByteCapCutsActivation(t *testing.T) {
 	const capBytes = int64(32 << 10)
-	a, b, _ := relayOnlyTestHosts(t, capBytes)
+	a, b, relayInfo := relayOnlyTestHosts(t, capBytes)
+	m := newForwardManager(a, []peer.AddrInfo{relayInfo}, 5*time.Second, nil, true)
+	defer m.close()
+	relay := relayedConn(a, b.ID())
+	if relay == nil {
+		t.Fatal("missing initial relay connection")
+	}
+	if _, err := m.getReady(b.ID(), relay); err != nil {
+		t.Fatal(err)
+	}
+	m.mu.Lock()
+	f := m.entries[b.ID()]
+	generation := f.relayGeneration
+	m.mu.Unlock()
 	received := make(chan int64, 1)
 	b.SetStreamHandler(activationProto, func(s network.Stream) {
 		defer s.Close()
@@ -2170,4 +2409,17 @@ func TestRelayCircuitByteCapCutsActivation(t *testing.T) {
 		t.Fatal("timed out waiting for capped relay stream to close")
 	}
 	_ = s.Close()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		m.mu.Lock()
+		cleared := f.relayConnID == "" && f.relayGeneration > generation
+		m.mu.Unlock()
+		if cleared {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("relay cap/expiry did not invalidate cached readiness")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }

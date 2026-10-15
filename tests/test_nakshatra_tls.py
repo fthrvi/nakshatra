@@ -503,13 +503,19 @@ def test_probe_timeout_env_garbage_returns_default(monkeypatch):
         assert nt._probe_timeout_from_env(default=5.0) == 5.0
 
 
-def test_probe_timeout_env_zero_or_negative_returns_default(monkeypatch):
+def test_probe_timeout_env_out_of_bounds_or_nonfinite_returns_default(monkeypatch):
     """A zero-timeout probe would always raise probe_failed and silently
     degrade every chain to whatever --tls-mode policy says about
     unreachable peers. Reject and fall back to default."""
-    for bad in ("0", "0.0", "-1", "-5.5"):
+    for bad in ("nan", "inf", "-inf", "1e309", "301", "1e300", "0", "0.0", "0.09", "-1", "-5.5"):
         monkeypatch.setenv("NAKSHATRA_TLS_PROBE_TIMEOUT_S", bad)
         assert nt._probe_timeout_from_env(default=5.0) == 5.0
+
+
+def test_probe_timeout_env_accepts_documented_bounds(monkeypatch):
+    for raw, expected in (("0.1", 0.1), ("300", 300.0)):
+        monkeypatch.setenv("NAKSHATRA_TLS_PROBE_TIMEOUT_S", raw)
+        assert nt._probe_timeout_from_env(default=5.0) == expected
 
 
 def test_probe_timeout_module_constant_reflects_env_at_import_time():

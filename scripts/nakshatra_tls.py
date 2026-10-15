@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import datetime
 import hashlib
+import math
 import logging
 import os
 from pathlib import Path
@@ -256,9 +257,9 @@ def _probe_timeout_from_env(default: float = 5.0) -> float:
     probe should never refuse to run because of a typoed env var, only
     because of a genuine network problem.
 
-    Values <= 0 are also rejected (a zero-timeout TLS probe would always
-    raise ``probe_failed`` and silently degrade the chain to whatever
-    --tls-mode policy says about unreachable peers)."""
+    Only finite values in the inclusive range 0.1..300 seconds are
+    accepted. This keeps the probe bounded even when an inherited service
+    environment contains NaN, infinity, or an accidentally huge value."""
     raw = os.environ.get("NAKSHATRA_TLS_PROBE_TIMEOUT_S", "").strip()
     if not raw:
         return default
@@ -266,7 +267,7 @@ def _probe_timeout_from_env(default: float = 5.0) -> float:
         v = float(raw)
     except ValueError:
         return default
-    if v <= 0:
+    if not math.isfinite(v) or not 0.1 <= v <= 300.0:
         return default
     return v
 

@@ -1904,12 +1904,13 @@ type dynamicForward struct {
 		net.Listener
 		SetDeadline(time.Time) error
 	}
-	lastUsed      time.Time
-	active        int
-	relayReady    bool
-	upgradeActive bool
-	ctx           context.Context
-	cancel        context.CancelFunc
+	lastUsed        time.Time
+	active          int
+	relayConnID     string
+	relayGeneration uint64
+	upgradeActive   bool
+	ctx             context.Context
+	cancel          context.CancelFunc
 
 	// Accept must be atomic with the active-count transition. The evictor
 	// pauses the accept loop and takes this same lock before it decides that
@@ -1933,39 +1934,87 @@ type forwardManager struct {
 	// cacheMu serializes get/evict/close operations. mu protects entry state
 	// and stays available to an Accept that is completing while eviction waits
 	// on that forward's acceptMu.
-	cacheMu sync.Mutex
-	mu      sync.Mutex
-	entries map[peer.ID]*dynamicForward
-	now     func() time.Time
-	listen  func(network, address string) (net.Listener, error)
+	cacheMu     sync.Mutex
+	mu          sync.Mutex
+	entries     map[peer.ID]*dynamicForward
+	selecting   map[peer.ID]*forwardSelection
+	closed      bool
+	ctx         context.Context
+	cancel      context.CancelFunc
+	notifiee    *network.NotifyBundle
+	upgradeWG   sync.WaitGroup
+	lifecycleWG sync.WaitGroup
+	now         func() time.Time
+	listen      func(network, address string) (net.Listener, error)
+	selectPath  func(context.Context, peer.ID) (bool, error)
+}
+
+type forwardSelection struct {
+	done chan struct{}
+	addr string
+	err  error
+}
+
+type networkWithDone interface {
+	Done() <-chan struct{}
 }
 
 func newForwardManager(h host.Host, relays []peer.AddrInfo, directWait time.Duration, policy *outboundDialPolicy, allowRelay bool) *forwardManager {
-	return &forwardManager{
+	ctx, cancel := context.WithCancel(context.Background())
+	m := &forwardManager{
 		host: h, relays: relays, directWait: directWait, policy: policy, allowRelay: allowRelay,
-		entries: make(map[peer.ID]*dynamicForward), now: time.Now, listen: net.Listen,
+		entries: make(map[peer.ID]*dynamicForward), selecting: make(map[peer.ID]*forwardSelection),
+		ctx: ctx, cancel: cancel, now: time.Now, listen: net.Listen,
 	}
+	m.selectPath = func(ctx context.Context, p peer.ID) (bool, error) {
+		return waitActivationPath(ctx, m.host, p, m.relays, m.policy, m.allowRelay)
+	}
+	if h == nil {
+		return m
+	}
+	m.notifiee = &network.NotifyBundle{
+		ConnectedF:    func(_ network.Network, c network.Conn) { m.connected(c) },
+		DisconnectedF: func(_ network.Network, c network.Conn) { m.disconnected(c) },
+	}
+	h.Network().Notify(m.notifiee)
+	if lifecycle, ok := h.Network().(networkWithDone); ok {
+		m.lifecycleWG.Add(1)
+		go func() {
+			defer m.lifecycleWG.Done()
+			select {
+			case <-lifecycle.Done():
+				m.cancel()
+			case <-m.ctx.Done():
+			}
+		}()
+	}
+	return m
 }
 
 func (m *forwardManager) get(p peer.ID) (string, error) {
-	return m.getReady(p, false)
+	return m.getReady(p, nil)
 }
 
-// getReady returns the stable loopback listener for p and atomically records a relay path selected
-// by the FORWARD control request. The relay decision is monotonic for the lifetime of the cached
-// listener: every data connection still prefers a currently-live direct connection, while the
-// remembered relay keeps traffic flowing if that direct connection later disappears.
-func (m *forwardManager) getReady(p peer.ID, relayReady bool) (string, error) {
+// getReady returns the stable loopback listener for p and, when relay is non-nil, binds readiness
+// to that exact live relay connection. A disconnect or a later direct connection invalidates the
+// binding, so an accepted TCP connection cannot rely on readiness from an expired circuit.
+func (m *forwardManager) getReady(p peer.ID, relay network.Conn) (string, error) {
 	m.cacheMu.Lock()
 	defer m.cacheMu.Unlock()
 
 	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return "", fmt.Errorf("forward manager is closed")
+	}
 	if f := m.entries[p]; f != nil {
 		f.lastUsed = m.now()
-		f.relayReady = f.relayReady || relayReady
+		if relay != nil {
+			m.bindRelayLocked(f, relay)
+		}
 		addr := f.listener.Addr().String()
 		m.mu.Unlock()
-		if relayReady {
+		if relay != nil {
 			m.startDirectUpgrade(f)
 		}
 		return addr, nil
@@ -1989,10 +2038,13 @@ func (m *forwardManager) getReady(p peer.ID, relayReady bool) (string, error) {
 		_ = ln.Close()
 		return "", fmt.Errorf("listen for forward: listener cannot interrupt Accept")
 	}
-	forwardCtx, cancelForward := context.WithCancel(context.Background())
+	forwardCtx, cancelForward := context.WithCancel(m.ctx)
 	f := &dynamicForward{
-		peer: p, listener: deadlineLn, relayReady: relayReady,
+		peer: p, listener: deadlineLn,
 		ctx: forwardCtx, cancel: cancelForward,
+	}
+	if relay != nil {
+		m.bindRelayLocked(f, relay)
 	}
 	f.pauseCond = sync.NewCond(&f.pauseMu)
 	m.mu.Lock()
@@ -2000,7 +2052,7 @@ func (m *forwardManager) getReady(p peer.ID, relayReady bool) (string, error) {
 	m.entries[p] = f
 	m.mu.Unlock()
 	go m.accept(f)
-	if relayReady {
+	if relay != nil {
 		m.startDirectUpgrade(f)
 	}
 	log.Printf("FORWARD %s: loopback listener %s", p, ln.Addr())
@@ -2011,22 +2063,152 @@ func (m *forwardManager) getReady(p peer.ID, relayReady bool) (string, error) {
 // per-peer negative cache for direct reachability: later FORWARD requests return immediately while
 // startDirectUpgrade keeps DCUtR/direct dials alive in the background.
 func (m *forwardManager) prepare(p peer.ID) (string, error) {
-	if directConn(m.host, p) == nil {
-		m.mu.Lock()
-		cached := m.entries[p]
-		relayReady := cached != nil && cached.relayReady
+	if addr, ok := m.cachedReady(p); ok {
+		return addr, nil
+	}
+
+	m.mu.Lock()
+	if selection := m.selecting[p]; selection != nil {
 		m.mu.Unlock()
-		if relayReady && relayedConn(m.host, p) != nil {
-			return m.getReady(p, true)
+		select {
+		case <-selection.done:
+			return selection.addr, selection.err
+		case <-m.ctx.Done():
+			return "", m.ctx.Err()
 		}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), m.directWait)
+	if f := m.entries[p]; f != nil {
+		ready := m.host == nil || directConn(m.host, p) != nil || m.relayBindingLiveLocked(f)
+		if ready {
+			f.lastUsed = m.now()
+			addr := f.listener.Addr().String()
+			m.mu.Unlock()
+			return addr, nil
+		}
+	}
+	selection := &forwardSelection{done: make(chan struct{})}
+	m.selecting[p] = selection
+	m.mu.Unlock()
+
+	selection.addr, selection.err = m.prepareCold(p)
+	m.mu.Lock()
+	delete(m.selecting, p)
+	close(selection.done)
+	m.mu.Unlock()
+	return selection.addr, selection.err
+}
+
+func (m *forwardManager) cachedReady(p peer.ID) (string, bool) {
+	if m.host == nil {
+		m.mu.Lock()
+		f := m.entries[p]
+		m.mu.Unlock()
+		if f == nil {
+			return "", false
+		}
+		addr, err := m.getReady(p, nil)
+		return addr, err == nil
+	}
+	if directConn(m.host, p) != nil {
+		m.mu.Lock()
+		f := m.entries[p]
+		m.mu.Unlock()
+		if f != nil {
+			addr, err := m.getReady(p, nil)
+			return addr, err == nil
+		}
+		return "", false
+	}
+	m.mu.Lock()
+	f := m.entries[p]
+	ready := f != nil && m.relayBindingLiveLocked(f)
+	m.mu.Unlock()
+	if !ready {
+		return "", false
+	}
+	addr, err := m.getReady(p, nil)
+	return addr, err == nil
+}
+
+func (m *forwardManager) prepareCold(p peer.ID) (string, error) {
+	ctx, cancel := context.WithTimeout(m.ctx, m.directWait)
 	defer cancel()
-	relayed, err := waitActivationPath(ctx, m.host, p, m.relays, m.policy, m.allowRelay)
+	relayed, err := m.selectPath(ctx, p)
 	if err != nil {
 		return "", err
 	}
-	return m.getReady(p, relayed)
+	if !relayed {
+		return m.getReady(p, nil)
+	}
+	relay := relayedConn(m.host, p)
+	if relay == nil {
+		return "", fmt.Errorf("selected relay activation path is no longer connected")
+	}
+	return m.getReady(p, relay)
+}
+
+func (m *forwardManager) bindRelayLocked(f *dynamicForward, relay network.Conn) {
+	// Connected notifications run after the connection enters the swarm. Recheck here so a direct
+	// connection that raced the relay selector cannot leave a relay binding behind after its
+	// notification observed the entry one instruction earlier.
+	if isDirectConn(relay) || (m.host != nil && directConn(m.host, f.peer) != nil) {
+		if f.relayConnID != "" {
+			f.relayConnID = ""
+			f.relayGeneration++
+		}
+		return
+	}
+	if f.relayConnID != relay.ID() {
+		f.relayGeneration++
+	}
+	f.relayConnID = relay.ID()
+}
+
+func (m *forwardManager) relayBindingLiveLocked(f *dynamicForward) bool {
+	if f.relayConnID == "" {
+		return false
+	}
+	for _, c := range m.host.Network().ConnsToPeer(f.peer) {
+		if c.ID() == f.relayConnID && !isDirectConn(c) && !c.IsClosed() {
+			return true
+		}
+	}
+	f.relayConnID = ""
+	f.relayGeneration++
+	return false
+}
+
+func (m *forwardManager) invalidateRelay(f *dynamicForward, connID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.entries[f.peer] == f && (connID == "" || f.relayConnID == connID) {
+		f.relayConnID = ""
+		f.relayGeneration++
+	}
+}
+
+func (m *forwardManager) connected(c network.Conn) {
+	if !isDirectConn(c) {
+		return
+	}
+	m.mu.Lock()
+	if f := m.entries[c.RemotePeer()]; f != nil && f.relayConnID != "" {
+		f.relayConnID = ""
+		f.relayGeneration++
+	}
+	m.mu.Unlock()
+}
+
+func (m *forwardManager) disconnected(c network.Conn) {
+	if isDirectConn(c) {
+		return
+	}
+	m.mu.Lock()
+	if f := m.entries[c.RemotePeer()]; f != nil && f.relayConnID == c.ID() {
+		f.relayConnID = ""
+		f.relayGeneration++
+	}
+	m.mu.Unlock()
 }
 
 func (m *forwardManager) startDirectUpgrade(f *dynamicForward) {
@@ -2034,14 +2216,16 @@ func (m *forwardManager) startDirectUpgrade(f *dynamicForward) {
 		return
 	}
 	m.mu.Lock()
-	if m.entries[f.peer] != f || !f.relayReady || f.upgradeActive {
+	if m.closed || m.entries[f.peer] != f || f.relayConnID == "" || f.upgradeActive {
 		m.mu.Unlock()
 		return
 	}
 	f.upgradeActive = true
+	m.upgradeWG.Add(1)
 	m.mu.Unlock()
 
 	go func() {
+		defer m.upgradeWG.Done()
 		defer func() {
 			m.mu.Lock()
 			f.upgradeActive = false
@@ -2185,37 +2369,81 @@ func (m *forwardManager) handle(f *dynamicForward, c net.Conn) {
 }
 
 func (m *forwardManager) openForwardStream(f *dynamicForward) (network.Stream, error) {
-	if directConn(m.host, f.peer) != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), m.directWait)
-		defer cancel()
-		return openDirectStream(ctx, m.host, f.peer, m.relays, m.policy, activationProto)
-	}
-	m.mu.Lock()
-	relayReady := m.entries[f.peer] == f && f.relayReady
-	m.mu.Unlock()
-	if relayReady {
-		m.startDirectUpgrade(f)
-		if relayedConn(m.host, f.peer) == nil {
-			return nil, fmt.Errorf("selected relay activation path is no longer connected")
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		s, relayAttempt, relayID, err := m.openForwardStreamOnce(f)
+		if err == nil {
+			return s, nil
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		lastErr = err
+		if relayAttempt {
+			m.invalidateRelay(f, relayID)
+		}
+		if !relayAttempt || attempt == 1 {
+			break
+		}
+	}
+	return nil, lastErr
+}
+
+func (m *forwardManager) openForwardStreamOnce(f *dynamicForward) (network.Stream, bool, string, error) {
+	if directConn(m.host, f.peer) != nil {
+		ctx, cancel := context.WithTimeout(m.ctx, m.directWait)
 		defer cancel()
-		return openActivationStream(ctx, f.peer, m.host.NewStream)
+		s, err := openDirectStream(ctx, m.host, f.peer, m.relays, m.policy, activationProto)
+		return s, false, "", err
 	}
 
-	// Legacy/direct-only managers and a relay connection that vanished before selection retain the
-	// bounded selector. If it selects a relay, remember that result for every later accepted client.
-	s, err := openReadyActivationStream(
-		m.host, f.peer, m.relays, m.policy, m.directWait, m.allowRelay)
-	if err == nil && !isDirectConn(s.Conn()) {
+	m.mu.Lock()
+	current := m.entries[f.peer] == f
+	relayReady := current && m.relayBindingLiveLocked(f)
+	relayID := f.relayConnID
+	m.mu.Unlock()
+	if !current {
+		return nil, false, "", fmt.Errorf("forward is closed")
+	}
+	if !relayReady {
+		ctx, cancel := context.WithTimeout(m.ctx, m.directWait)
+		relayed, err := m.selectPath(ctx, f.peer)
+		cancel()
+		if err != nil {
+			return nil, false, "", err
+		}
+		if !relayed {
+			ctx, cancel = context.WithTimeout(m.ctx, m.directWait)
+			defer cancel()
+			s, err := openDirectStream(ctx, m.host, f.peer, m.relays, m.policy, activationProto)
+			return s, false, "", err
+		}
+		relay := relayedConn(m.host, f.peer)
+		if relay == nil {
+			return nil, true, "", fmt.Errorf("selected relay activation path is no longer connected")
+		}
 		m.mu.Lock()
 		if m.entries[f.peer] == f {
-			f.relayReady = true
+			m.bindRelayLocked(f, relay)
+			relayID = f.relayConnID
 		}
 		m.mu.Unlock()
-		m.startDirectUpgrade(f)
 	}
-	return s, err
+
+	m.startDirectUpgrade(f)
+	ctx, cancel := context.WithTimeout(m.ctx, 30*time.Second)
+	defer cancel()
+	s, err := openActivationStream(ctx, f.peer, m.host.NewStream)
+	if err != nil {
+		return nil, true, relayID, err
+	}
+	if isDirectConn(s.Conn()) {
+		m.invalidateRelay(f, "")
+	} else {
+		m.mu.Lock()
+		if m.entries[f.peer] == f {
+			m.bindRelayLocked(f, s.Conn())
+		}
+		m.mu.Unlock()
+	}
+	return s, true, relayID, nil
 }
 
 func (m *forwardManager) close() {
@@ -2223,6 +2451,12 @@ func (m *forwardManager) close() {
 	defer m.cacheMu.Unlock()
 
 	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return
+	}
+	m.closed = true
+	m.cancel()
 	forwards := make([]*dynamicForward, 0, len(m.entries))
 	for _, f := range m.entries {
 		forwards = append(forwards, f)
@@ -2237,6 +2471,11 @@ func (m *forwardManager) close() {
 		_ = f.listener.Close()
 		f.resumeAcceptAndUnlock()
 	}
+	if m.host != nil && m.notifiee != nil {
+		m.host.Network().StopNotify(m.notifiee)
+	}
+	m.upgradeWG.Wait()
+	m.lifecycleWG.Wait()
 }
 
 func handleDialConn(h host.Host, c net.Conn, relays []peer.AddrInfo, directWait time.Duration, policy *outboundDialPolicy) {
