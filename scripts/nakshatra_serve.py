@@ -848,6 +848,12 @@ class ChainChatBackend(ChatBackend):
                 _quiet_unlink(rcpt)
             raise ChainBackendError(
                 f"client.py exited {out.returncode}: {out.stderr.strip()[-400:]}")
+        try:
+            text = _parse_client_output(out.stdout)
+        except ChainBackendError:
+            if rcpt:
+                _quiet_unlink(rcpt)
+            raise
         settlement = None
         charged = None
         prompt_eval_count = 0
@@ -877,7 +883,7 @@ class ChainChatBackend(ChatBackend):
                 hook.settle(rcpt)
                 _quiet_unlink(rcpt)
         return GenerationResult(
-            text=_parse_client_output(out.stdout),
+            text=text,
             eval_count=eval_count if fail_closed else 0,
             prompt_eval_count=prompt_eval_count if fail_closed else 0,
             credits_charged=charged if fail_closed else None,
@@ -1004,6 +1010,7 @@ class ProxyChatBackend(ChatBackend):
         both ends. Stops at the ``data: [DONE]`` sentinel."""
         payload = self._payload(entry, prompt, max_tokens, options, stream=True)
         resp = self._call_engine(entry, payload, self._timeout(entry))
+        saw_done = False
         try:
             for raw_line in resp:
                 line = raw_line.decode("utf-8", "replace").strip()
@@ -1011,11 +1018,15 @@ class ProxyChatBackend(ChatBackend):
                     continue
                 chunk = line[len("data:"):].strip()
                 if chunk == "[DONE]":
+                    saw_done = True
                     break
                 try:
                     obj = json.loads(chunk)
                 except ValueError:
                     continue
+                if isinstance(obj.get("error"), dict):
+                    raise ChainBackendError(
+                        str(obj["error"].get("message") or "engine generation failed"))
                 delta = (obj.get("choices") or [{}])[0].get("delta") or {}
                 content = delta.get("content")
                 if content:
@@ -1025,6 +1036,8 @@ class ProxyChatBackend(ChatBackend):
                 f"engine {entry.engine_url} dropped mid-stream: {e}") from e
         finally:
             resp.close()
+        if not saw_done:
+            raise ChainBackendError("engine stream ended without [DONE]")
 
 
 class RoutingChatBackend(ChatBackend):
@@ -1598,8 +1611,8 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
         except ChainBackendError as e:
             log.error("stream backend error: %s", e)
             try:
-                _write({"model": entry.name,
-                        "error": "chain generation failed", "done": True})
+                _write({"model": entry.name, "created_at": created,
+                        "error": "chain generation failed"})
             except Exception:
                 pass  # client already gone
             return 502
@@ -1807,12 +1820,20 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-cache")
             self._cors()
             self.end_headers()
+            saw_done = False
             try:
                 for raw in resp:
                     line = raw
-                    if raw.startswith(b"data:") and b"[DONE]" not in raw:
+                    if raw.startswith(b"data:") and raw[len(b"data:"):].strip() == b"[DONE]":
+                        saw_done = True
+                    elif raw.startswith(b"data:"):
                         try:
                             obj = json.loads(raw[len(b"data:"):].strip())
+                            if isinstance(obj.get("error"), dict):
+                                self.wfile.write(b"event: error\n")
+                                self.wfile.write(("data: " + json.dumps(obj) + "\n\n").encode("utf-8"))
+                                self.wfile.flush()
+                                return 502
                             line = ("data: " + json.dumps(_pub(obj)) + "\n").encode("utf-8")
                         except ValueError:
                             pass              # not a JSON event: relay verbatim
@@ -1820,15 +1841,21 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
                     if not raw.strip():       # blank line ends an SSE event
                         self.wfile.flush()
                 self.wfile.flush()
+                if not saw_done:
+                    self.wfile.write(b'event: error\n'
+                                     b'data: {"error": {"message": "engine stream ended '
+                                     b'without [DONE]", "type": "server_error"}}\n\n')
+                    self.wfile.flush()
+                    return 502
             except (BrokenPipeError, ConnectionResetError):
                 pass                          # client went away; resp closes below
             except (urllib.error.URLError, OSError) as e:
                 log.error("passthrough: engine %s dropped mid-stream: %s",
                           entry.engine_url, e)
                 try:
-                    self.wfile.write(b'data: {"error": {"message": "engine dropped '
-                                     b'mid-stream", "type": "server_error"}}\n\n'
-                                     b"data: [DONE]\n\n")
+                    self.wfile.write(b'event: error\n'
+                                     b'data: {"error": {"message": "engine dropped '
+                                     b'mid-stream", "type": "server_error"}}\n\n')
                     self.wfile.flush()
                 except Exception:
                     pass
@@ -1869,7 +1896,8 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
                             cid, created) -> int:
         """OpenAI streaming: Server-Sent Events — ``data: {chunk}`` lines, a
         role-first delta, content deltas, a terminal ``finish_reason:stop``
-        chunk, then ``data: [DONE]``."""
+        chunk, then ``data: [DONE]``. A generation failure after headers emits
+        one explicit ``event: error`` envelope and no success terminator."""
         buffered = None
         if getattr(backend, "requires_credit_buffer", lambda: False)():
             try:
@@ -1910,9 +1938,9 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
         except ChainBackendError as e:
             log.error("stream backend error: %s", e)
             try:
-                _sse(_chunk({}, finish="stop"))
-                self.wfile.write(b"data: [DONE]\n\n")
-                self.wfile.flush()
+                self.wfile.write(b"event: error\n")
+                _sse({"error": {"message": "chain generation failed",
+                                "type": "server_error"}})
             except Exception:
                 pass
             return 502

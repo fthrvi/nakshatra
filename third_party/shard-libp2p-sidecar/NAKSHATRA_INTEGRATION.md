@@ -70,9 +70,11 @@ opt-in `nakshatra-p2p` service. Nakd uses it for both-NAT contact sessions after
 direct paths and advertise p2p. Typed inference endpoints use its dynamic `FORWARD` listener; relay
 fallback remains separately opt-in at both the consumer gateway and worker.
 
-Relay service defaults are explicitly capped at 64 MiB per direction per circuit, 10 minutes,
-64 circuits total, and 4 per peer. The 512 MiB per-peer daily budget becomes four UTC-day circuit
-admissions because go-libp2p v0.48 reports transferred bytes without the responsible peer; each
-admission is charged the full possible traffic in both directions. `nak gateway on` enables the
+Relay service defaults are explicitly capped at 64 MiB per direction per circuit, 6 hours,
+64 circuits total, and 2 per peer. Established circuits are conservatively charged their full
+128 MiB bidirectional admitted cap against persistent 20 GiB global and 2 GiB per-peer UTC-day
+budgets. `-relay-allow-file` accepts the roster's node-key hex (the release sidecar key is derived
+from that same key) or its libp2p PeerId; it does not accept the separate operator/release/package
+signing keys. `nak gateway on` enables the
 dialer fallback only in the gateway-owned `p2p.env`; `nak worker relay on|off` atomically toggles
 the worker opt-in and restarts an enabled P2P sidecar.

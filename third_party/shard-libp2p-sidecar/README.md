@@ -73,9 +73,26 @@ for a direct path first (`-direct-wait`, unchanged at 15 seconds by default), th
 limited circuit connection. The worker must independently pass `-allow-relayed-activation` alongside
 `-require-direct-activation`; otherwise it resets the relayed activation stream.
 
-`-relay` servers are explicitly capped even without extra flags: 64 MiB in each direction per
-circuit (`-relay-circuit-bytes`), 10 minutes (`-relay-circuit-duration`), 64 concurrent circuits
-total (`-relay-max-circuits`), 4 per peer (`-relay-circuits-per-peer`), and a 512 MiB per-peer UTC-day
-budget (`-relay-peer-daily-bytes`). go-libp2p's byte callback has no peer identity, so the daily
-budget is conservatively translated into circuit admissions, charging each circuit for its full
-possible bytes in both directions. The defaults therefore allow four circuits per peer per day.
+`-relay` servers are explicitly capped even without extra limit flags: 64 MiB in each direction per
+circuit (`-relay-circuit-bytes`), 6 hours (`-relay-circuit-duration`), 64 concurrent circuits total
+(`-relay-max-circuits`), and 2 per peer (`-relay-circuits-per-peer`). The global UTC-day budget is
+20 GiB (`-relay-daily-bytes`) and the per-peer budget is 2 GiB (`-relay-peer-daily-bytes`).
+go-libp2p's byte callback has no peer identity, so a circuit is charged its full admitted cap in
+both directions (128 MiB with defaults), and only after the destination reservation and STOP
+handshake succeed. State is written atomically with mode 0600 to `-relay-state`; by default this is
+`<key>.relay-state.json` (or `./relay-state.json` when no `-key` was supplied). The persisted maximum
+UTC day prevents a backward clock adjustment from granting a fresh budget.
+
+Use `-relay-allow-file PATH` to close relay admission. The file contains one identity per line,
+either a libp2p PeerId or the 64-lowercase/uppercase-hex Ed25519 **node public key**. When this flag
+is present, reservations require the destination to be listed and circuits require both source and
+destination to be listed. The file reloads when its mtime or size changes; missing, unreadable, or
+malformed files deny everyone. Without the flag, legacy open admission remains enabled and startup
+logs `relay open to any peer`.
+
+For signed Nakshatra releases, `scripts/sidecar_key.py` deterministically builds the sidecar
+`node.key` from `~/.nakshatra/keys/worker.ed25519`. Therefore the correct allow-file hex is the
+roster row's node-public-key field (the first field in `admission-peers.tsv`), and it derives the
+same PeerId printed by the sidecar. It is **not** `operator.pub.hex`, a release signing key, or a
+package signing key. A legacy sidecar key created independently is different: list its printed
+PeerId, or migrate it through `sidecar_key.py` and update every address that pins the old PeerId.

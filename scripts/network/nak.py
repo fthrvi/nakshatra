@@ -1214,11 +1214,19 @@ def _worker_relay(_sp, enabled: bool) -> None:
         _set_env_assignment(
             env_path, "NAKSHATRA_P2P_WORKER_ARGS", _worker_p2p_args(port, enabled)
         )
+        p2p_enabled = _p2p_enabled()
         try:
-            if _p2p_enabled():
+            if p2p_enabled:
                 _p2p_installer(_sp, "restart")
-        except (Exception, SystemExit):
+        except (Exception, SystemExit) as restart_error:
             _write_private(env_path, old_env)
+            try:
+                _p2p_installer(_sp, "restart")
+            except (Exception, SystemExit) as rollback_error:
+                raise SystemExit(
+                    f"relay restart failed: {restart_error}; "
+                    f"rollback restart failed: {rollback_error}"
+                ) from rollback_error
             raise
     print(f"worker relay {'ON' if enabled else 'OFF'}")
 

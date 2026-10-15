@@ -24,6 +24,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/peerstore"
 	"github.com/libp2p/go-libp2p/core/protocol"
 	relayclient "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/client"
+	pbv2 "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/pb"
 	"github.com/libp2p/go-libp2p/p2p/protocol/identify"
 	"github.com/multiformats/go-multiaddr"
 	manet "github.com/multiformats/go-multiaddr/net"
@@ -157,26 +158,27 @@ func TestRelayResourcesAreExplicitAndCapped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resources.Limit == nil || resources.Limit.Data != 64<<20 || resources.Limit.Duration != 10*time.Minute {
+	if resources.Limit == nil || resources.Limit.Data != 64<<20 || resources.Limit.Duration != 6*time.Hour {
 		t.Fatalf("relay limit = %+v", resources.Limit)
 	}
-	if resources.MaxCircuits != 4 {
-		t.Fatalf("per-peer circuits = %d, want 4", resources.MaxCircuits)
+	if resources.MaxCircuits != 2 {
+		t.Fatalf("per-peer circuits = %d, want 2", resources.MaxCircuits)
 	}
-	if guard.maxCircuits != 64 || guard.dailyCircuits != 4 {
-		t.Fatalf("guard limits = total %d daily %d, want 64 and 4", guard.maxCircuits, guard.dailyCircuits)
+	if guard.maxCircuits != 64 || guard.dailyBytes != 20<<30 || guard.peerDailyBytes != 2<<30 {
+		t.Fatalf("guard limits = total %d global %d peer %d", guard.maxCircuits, guard.dailyBytes, guard.peerDailyBytes)
 	}
 	cfg = relayServerConfig{
 		circuitBytes: 12345, circuitDuration: 42 * time.Second,
-		maxCircuits: 7, circuitsPerPeer: 2, peerDailyBytes: 6 * 12345,
+		maxCircuits: 7, circuitsPerPeer: 2, dailyBytes: 20 * 12345,
+		peerDailyBytes: 6 * 12345,
 	}
 	resources, guard, err = cfg.resources()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if resources.Limit.Data != 12345 || resources.Limit.Duration != 42*time.Second ||
-		resources.MaxCircuits != 2 || guard.maxCircuits != 7 || guard.dailyCircuits != 3 {
-		t.Fatalf("custom flag resources = %+v, guard total=%d daily=%d", resources, guard.maxCircuits, guard.dailyCircuits)
+		resources.MaxCircuits != 2 || guard.maxCircuits != 7 || guard.circuitCharge != 2*12345 {
+		t.Fatalf("custom flag resources = %+v, guard total=%d charge=%d", resources, guard.maxCircuits, guard.circuitCharge)
 	}
 
 	cfg.circuitBytes = 0
@@ -190,42 +192,186 @@ func TestRelayResourcesAreExplicitAndCapped(t *testing.T) {
 	}
 }
 
-func TestRelayDailyCircuitAccounting(t *testing.T) {
-	g := newRelayGuard(2, 1)
-	now := time.Date(2026, 10, 15, 23, 59, 0, 0, time.UTC)
-	g.now = func() time.Time { return now }
-	src, dest := testPeerID(t), testPeerID(t)
+func testRelayGuard(t *testing.T, cfg relayServerConfig) *relayGuard {
+	t.Helper()
+	g, err := newRelayGuard(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return g
+}
+
+func TestRelayChargesOnlySuccessfulEstablishedCircuits(t *testing.T) {
+	cfg := defaultRelayServerConfig()
+	cfg.circuitBytes = 100
+	cfg.dailyBytes = 1000
+	cfg.peerDailyBytes = 1000
+	g := testRelayGuard(t, cfg)
 	addr := multiaddr.StringCast("/ip4/192.0.2.1/tcp/1")
+	src, dest := testPeerID(t), testPeerID(t)
 	if !g.AllowConnect(src, addr, dest) {
-		t.Fatal("first daily circuit was refused")
+		t.Fatal("attempt was refused")
+	}
+	if g.active != 0 || len(g.state.Days) != 1 || g.state.Days[g.state.MaxDay].GlobalBytes != 0 {
+		t.Fatal("pending attempt consumed a slot or budget")
 	}
 	g.ConnectionOpened()
-	if g.AllowConnect(src, addr, dest) {
-		t.Fatal("second daily circuit was allowed")
-	}
 	g.ConnectionClosed(0)
-	now = now.Add(2 * time.Minute)
+	g.ConnectionRequestHandled(pbv2.Status_CONNECTION_FAILED)
+	if g.active != 0 || g.state.Days[g.state.MaxDay].GlobalBytes != 0 {
+		t.Fatal("failed attempt consumed a slot or budget")
+	}
 	if !g.AllowConnect(src, addr, dest) {
-		t.Fatal("new UTC-day circuit was refused")
+		t.Fatal("attempt after failure was refused")
+	}
+	g.ConnectionOpened()
+	g.ConnectionRequestHandled(pbv2.Status_OK)
+	usage := g.state.Days[g.state.MaxDay]
+	if g.active != 1 || usage.GlobalBytes != 200 || usage.Peers[src.String()].Bytes != 200 || usage.Peers[dest.String()].Bytes != 200 {
+		t.Fatalf("successful charge: active=%d usage=%+v", g.active, usage)
 	}
 }
 
-func TestRelayGlobalCircuitAccounting(t *testing.T) {
-	g := newRelayGuard(1, 10)
+func TestRelayBudgetPersistsAcrossRestartAndClockRollback(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "relay-state.json")
+	cfg := defaultRelayServerConfig()
+	cfg.circuitBytes, cfg.dailyBytes, cfg.peerDailyBytes = 100, 400, 200
+	cfg.statePath = statePath
+	now := time.Date(2026, 10, 16, 1, 0, 0, 0, time.UTC)
+	src, dest := testPeerID(t), testPeerID(t)
 	addr := multiaddr.StringCast("/ip4/192.0.2.1/tcp/1")
-	if !g.AllowConnect(testPeerID(t), addr, testPeerID(t)) {
-		t.Fatal("first circuit was refused")
-	}
-	if g.AllowConnect(testPeerID(t), addr, testPeerID(t)) {
-		t.Fatal("pending circuit did not consume the global slot")
+	g := testRelayGuard(t, cfg)
+	g.now = func() time.Time { return now }
+	if !g.AllowConnect(src, addr, dest) {
+		t.Fatal("first circuit refused")
 	}
 	g.ConnectionOpened()
-	if g.AllowConnect(testPeerID(t), addr, testPeerID(t)) {
-		t.Fatal("active circuit did not consume the global slot")
+	g.ConnectionRequestHandled(pbv2.Status_OK)
+	if mode := mustMode(t, statePath); mode != 0o600 {
+		t.Fatalf("state mode = %o, want 600", mode)
 	}
-	g.ConnectionClosed(0)
+
+	restarted := testRelayGuard(t, cfg)
+	restarted.now = func() time.Time { return now }
+	if restarted.AllowConnect(src, addr, dest) {
+		t.Fatal("restart reset per-peer budget")
+	}
+	now = now.Add(-24 * time.Hour)
+	rolledBack := testRelayGuard(t, cfg)
+	rolledBack.now = func() time.Time { return now }
+	if rolledBack.AllowConnect(src, addr, dest) {
+		t.Fatal("clock rollback granted a fresh day")
+	}
+}
+
+func TestRelayGlobalDailyBudget(t *testing.T) {
+	cfg := defaultRelayServerConfig()
+	cfg.circuitBytes, cfg.dailyBytes, cfg.peerDailyBytes = 100, 200, 1000
+	g := testRelayGuard(t, cfg)
+	addr := multiaddr.StringCast("/ip4/192.0.2.1/tcp/1")
 	if !g.AllowConnect(testPeerID(t), addr, testPeerID(t)) {
-		t.Fatal("closed circuit did not release the global slot")
+		t.Fatal("first circuit refused")
+	}
+	g.ConnectionOpened()
+	g.ConnectionRequestHandled(pbv2.Status_OK)
+	if g.AllowConnect(testPeerID(t), addr, testPeerID(t)) {
+		t.Fatal("global daily byte cap was not enforced")
+	}
+}
+
+func TestRelayAllowFileAcceptsPeerIDsAndRosterPublicKeysAndReloads(t *testing.T) {
+	privA, pubA, err := crypto.GenerateEd25519Key(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = privA
+	idA, err := peer.IDFromPublicKey(pubA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	privB, pubB, err := crypto.GenerateEd25519Key(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = privB
+	idB, err := peer.IDFromPublicKey(pubB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawB, err := pubB.Raw()
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "relay.allow")
+	if err := os.WriteFile(path, []byte(idA.String()+"\n"+fmt.Sprintf("%x\n", rawB)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := defaultRelayServerConfig()
+	cfg.allowFile = path
+	g := testRelayGuard(t, cfg)
+	addr := multiaddr.StringCast("/ip4/192.0.2.1/tcp/1")
+	if !g.AllowReserve(idA, addr) || !g.AllowReserve(idB, addr) || !g.AllowConnect(idA, addr, idB) {
+		t.Fatal("listed peer id/public key was refused")
+	}
+	g.ConnectionRequestHandled(pbv2.Status_NO_RESERVATION)
+
+	other := testPeerID(t)
+	if g.AllowReserve(other, addr) || g.AllowConnect(idA, addr, other) {
+		t.Fatal("unlisted relay identity was allowed")
+	}
+	if err := os.WriteFile(path, []byte(other.String()+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	future := time.Now().Add(2 * time.Second)
+	if err := os.Chtimes(path, future, future); err != nil {
+		t.Fatal(err)
+	}
+	if !g.AllowReserve(other, addr) || g.AllowReserve(idA, addr) {
+		t.Fatal("allow file mtime reload did not replace identities")
+	}
+}
+
+func TestRelayAllowFileFailsClosedWhenMissingOrMalformed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing.allow")
+	cfg := defaultRelayServerConfig()
+	cfg.allowFile = path
+	g := testRelayGuard(t, cfg)
+	p := testPeerID(t)
+	addr := multiaddr.StringCast("/ip4/192.0.2.1/tcp/1")
+	if g.AllowReserve(p, addr) {
+		t.Fatal("missing allow file did not fail closed")
+	}
+	if err := os.WriteFile(path, []byte("not-an-identity\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if g.AllowReserve(p, addr) {
+		t.Fatal("malformed allow file did not fail closed")
+	}
+	if err := os.WriteFile(path, []byte(p.String()+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !g.AllowReserve(p, addr) {
+		t.Fatal("valid replacement allow file was not reloaded")
+	}
+	if err := os.Chmod(path, 0); err != nil {
+		t.Fatal(err)
+	}
+	if g.AllowReserve(p, addr) {
+		t.Fatal("unreadable allow file did not fail closed")
+	}
+}
+
+func TestRelayConnectAttemptsAreRateLimitedPerSourceIP(t *testing.T) {
+	g := testRelayGuard(t, defaultRelayServerConfig())
+	addr := multiaddr.StringCast("/ip4/192.0.2.44/tcp/1")
+	for i := 0; i < int(defaultRelayRateBurst); i++ {
+		if !g.AllowConnect(testPeerID(t), addr, testPeerID(t)) {
+			t.Fatalf("attempt %d was rate-limited early", i+1)
+		}
+		g.ConnectionRequestHandled(pbv2.Status_NO_RESERVATION)
+	}
+	if g.AllowConnect(testPeerID(t), addr, testPeerID(t)) {
+		t.Fatal("source-IP burst limit was not enforced")
 	}
 }
 
@@ -1169,6 +1315,59 @@ func TestRelayedActivationRequiresBothEndsToOptIn(t *testing.T) {
 				t.Fatalf("relayed round trip succeeded=%v, want %v (err=%v)", succeeded, tc.want, err)
 			}
 		})
+	}
+}
+
+func TestStaticForwardProductionListenerRequiresDialerRelayOptIn(t *testing.T) {
+	a, b, relayInfo := relayOnlyTestHosts(t, 1<<20)
+	engine, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = engine.Close() })
+	go func() {
+		for {
+			conn, err := engine.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				_, _ = io.Copy(conn, conn)
+			}()
+		}
+	}()
+	// The worker explicitly accepts relay activation. This test must therefore fail solely because
+	// the real static -forward listener's dialer did not opt into relay fallback.
+	runInboundWithPolicy(b, engine.Addr().String(), true, true)
+	relayConn := relayedConn(a, b.ID())
+	if relayConn == nil {
+		t.Fatal("test setup has no relay-only connection")
+	}
+	peerAddr := relayConn.RemoteMultiaddr().Encapsulate(
+		multiaddr.StringCast("/p2p/" + b.ID().String())).String()
+	forward, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go serveForwardListener(a, forward, peerAddr, []peer.AddrInfo{relayInfo}, nil,
+		100*time.Millisecond, false)
+	t.Cleanup(func() { _ = forward.Close() })
+
+	client, err := net.Dial("tcp", forward.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if err := client.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Write([]byte("must-not-cross-relay")); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 1)
+	if _, err := client.Read(buf); err == nil {
+		t.Fatal("static -forward carried activation over relay without -relay-activation-fallback")
 	}
 }
 

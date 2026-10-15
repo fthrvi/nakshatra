@@ -633,7 +633,8 @@ def test_chat_streaming_backend_error_emits_terminal_chunk(tmp_path):
             "model": "llama-3.3-70b", "stream": True,
             "messages": [{"role": "user", "content": "hi"}]})
     assert chunks[0]["message"]["content"] == "part"
-    assert chunks[-1]["done"] is True and "error" in chunks[-1]
+    assert chunks[-1]["error"] == "chain generation failed"
+    assert "done" not in chunks[-1] and "done_reason" not in chunks[-1]
 
 
 def test_chat_missing_messages_is_load(tmp_path):
@@ -867,6 +868,60 @@ def test_v1_chat_completions_streaming_sse(tmp_path):
     assert all(c["object"] == "chat.completion.chunk" for c in chunks)
     content = "".join(c["choices"][0]["delta"].get("content", "") for c in chunks)
     assert content == "Paris is here"
+
+
+def test_v1_streaming_failure_emits_error_event_without_success_terminator(tmp_path):
+    class _Boom(ns.ChatBackend):
+        def generate_stream(self, *a, **k):
+            yield "partial"
+            raise ns.ChainBackendError("worker died mid-stream")
+
+    payload = {
+        "model": "llama-3.3-70b", "stream": True,
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    with _running_chat(_chat_models(tmp_path), _Boom()) as port:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/v1/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=2.0) as resp:
+            raw = resp.read().decode("utf-8")
+
+    events = [json.loads(line[len("data: "):]) for line in raw.splitlines()
+              if line.startswith("data: ")]
+    assert any((event.get("choices") or [{}])[0].get("delta", {}).get("content") == "partial"
+               for event in events)
+    assert events[-1] == {"error": {"message": "chain generation failed",
+                                    "type": "server_error"}}
+    assert "event: error" in raw
+    assert "[DONE]" not in raw
+    assert not any((event.get("choices") or [{}])[0].get("finish_reason") == "stop"
+                   for event in events)
+
+
+def test_truncated_buffered_generation_never_settles(tmp_path, monkeypatch):
+    monkeypatch.setenv("NAKSHATRA_LEDGER_MODE", "enforce")
+    backend = ns.ChainChatBackend()
+    settlements = []
+    backend._ledger_hook_cached = SimpleNamespace(
+        enabled=True, wants_receipt=True, fail_closed=True,
+        gate=lambda _cost: (True, ""),
+        settle=lambda path: settlements.append(path) or
+        {"receipt_id": "must-not-exist", "charged": 1},
+    )
+    monkeypatch.setattr(backend, "_client_env", lambda: {})
+
+    def fake_run(cmd, **_kwargs):
+        receipt = Path(cmd[cmd.index("--receipt-out") + 1])
+        receipt.write_text(json.dumps({"n_prompt": 1, "n_generated": 1}))
+        return SimpleNamespace(returncode=0, stderr="",
+                               stdout="[chain] step 1: id=1 'partial'\n")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    with pytest.raises(ns.ChainBackendError, match="produced no"):
+        backend.generate(_chat_models(tmp_path)["llama-3.3-70b"], "hi", 4, {})
+    assert settlements == []
 
 
 def test_v1_chat_completions_max_tokens_param(tmp_path):
@@ -1786,7 +1841,7 @@ def _pt_sse_events():
     ]
 
 
-def _make_rich_engine_handler(status=200, nonstream=None, sse=None):
+def _make_rich_engine_handler(status=200, nonstream=None, sse=None, sse_done=True):
     """Fake engine that records the FULL request (body + headers) and can answer
     with tool calls / usage / SSE tool-call deltas / an error status."""
     class _H(BaseHTTPRequestHandler):
@@ -1819,8 +1874,9 @@ def _make_rich_engine_handler(status=200, nonstream=None, sse=None):
                 for ev in (sse or []):
                     self.wfile.write(f"data: {json.dumps(ev)}\n\n".encode())
                     self.wfile.flush()
-                self.wfile.write(b"data: [DONE]\n\n")
-                self.wfile.flush()
+                if sse_done:
+                    self.wfile.write(b"data: [DONE]\n\n")
+                    self.wfile.flush()
                 return
             self._send(200, json.dumps(nonstream or _PT_TEXT_JSON).encode())
     return _H
@@ -1918,6 +1974,24 @@ def test_passthrough_streaming_relays_tool_call_deltas_finish_and_usage(tmp_path
     assert finishes == ["tool_calls"]                  # NOT a hardcoded "stop"
     assert chunks[-1]["usage"]["completion_tokens"] == 22
     assert raw.rstrip().endswith("data: [DONE]")
+
+
+def test_passthrough_truncated_sse_emits_error_without_done(tmp_path):
+    req = {"model": "qwen3-14b-local", "stream": True,
+           "messages": [{"role": "user", "content": "hi"}]}
+    partial = [{"model": "qwen3:14b", "choices": [{"index": 0,
+                "finish_reason": None, "delta": {"content": "partial"}}]}]
+    with _running_rich_engine(sse=partial, sse_done=False) as (url, _h):
+        with _pt_server(_pt_registry(tmp_path, url)) as port:
+            raw = urllib.request.urlopen(urllib.request.Request(
+                f"http://127.0.0.1:{port}/v1/chat/completions",
+                data=json.dumps(req).encode(),
+                headers={"Content-Type": "application/json"}, method="POST"),
+                timeout=2.0).read().decode()
+    assert "partial" in raw
+    assert "event: error" in raw
+    assert "engine stream ended without [DONE]" in raw
+    assert "data: [DONE]" not in raw
 
 
 def test_passthrough_relays_engine_error_status_and_body(tmp_path):

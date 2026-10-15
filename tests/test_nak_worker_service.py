@@ -305,13 +305,40 @@ def test_nak_worker_relay_restart_failure_restores_exact_env(tmp_path, monkeypat
     (state / "p2p.env").write_text("P2P_RELAYS=test\n")
     monkeypatch.setenv("HOME", str(home))
 
-    def fail(*_args):
-        raise SystemExit("restart failed")
+    calls = []
 
-    monkeypatch.setattr(nak, "_p2p_installer", fail)
+    def fail_once(*_args):
+        calls.append("restart")
+        if len(calls) == 1:
+            raise SystemExit("restart failed")
+
+    monkeypatch.setattr(nak, "_p2p_installer", fail_once)
     with pytest.raises(SystemExit, match="restart failed"):
         nak.main(["worker", "relay", "on"])
     assert worker_env.read_bytes() == original
+    assert calls == ["restart", "restart"]
+
+
+def test_nak_worker_relay_surfaces_restart_and_rollback_failures(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    state = home / ".nakshatra"
+    state.mkdir(parents=True)
+    worker_env = state / "worker.env"
+    original = b"PORT=5530\nEXISTING=keep\n"
+    worker_env.write_bytes(original)
+    (state / "p2p.env").write_text("P2P_RELAYS=test\n")
+    monkeypatch.setenv("HOME", str(home))
+    calls = []
+
+    def fail_both(*_args):
+        calls.append("restart")
+        raise SystemExit(f"failure-{len(calls)}")
+
+    monkeypatch.setattr(nak, "_p2p_installer", fail_both)
+    with pytest.raises(SystemExit, match=r"relay restart failed: failure-1; rollback restart failed: failure-2"):
+        nak.main(["worker", "relay", "on"])
+    assert worker_env.read_bytes() == original
+    assert calls == ["restart", "restart"]
 
 
 def test_nak_worker_on_without_p2p_reports_literal_only(tmp_path, monkeypatch, capsys):
