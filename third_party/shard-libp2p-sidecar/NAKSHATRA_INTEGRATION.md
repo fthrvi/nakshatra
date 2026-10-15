@@ -33,8 +33,9 @@ Interface (`main.go`):
 - `-dial-listen PATH` — accept `DIAL <peerid>` from nakd on a mode-0600 UNIX socket, open the dedicated nakd protocol, and return only a direct stream.
 - `-relay-activation-fallback` — after the direct wait, permit dynamic `FORWARD` activation
   streams on the existing limited relay circuit.
-- `-allow-relayed-activation` — worker opt-in that relaxes `-require-direct-activation` for
-  activation streams only. The release wiring requires both dialer and worker flags.
+- `-allow-relayed-activation` — mandatory worker opt-in for every relayed activation stream,
+  independent of the worker's `-require-direct-activation` direct-path policy. The release wiring
+  requires both dialer and worker flags.
 - `-direct-wait DURATION` — direct-path wait before fallback (default remains `15s`).
 
 ## How it plugs into nakshatra (the wiring — next step, needs Go to build)
@@ -75,8 +76,8 @@ Relay service defaults are explicitly capped at 64 MiB per direction per circuit
 128 MiB bidirectional admitted cap against persistent 20 GiB global and 2 GiB per-peer UTC-day
 budgets. `-relay-allow-file` accepts the roster's node-key hex (the release sidecar key is derived
 from that same key) or its libp2p PeerId; it does not accept the separate operator/release/package
-signing keys. Relay startup requires this file; only explicit tests/labs may bypass it with the
-loudly warned `-relay-open`. The production root-owned, group-readable
+signing keys. Relay startup requires this file; the production binary has no open-relay flag. The
+production root-owned, group-readable
 `root:nakshatra-sidecar-relay` mode 0640 allow file is accepted because it is read-only input. The
 state file, unlike the allow file, must be owned by the running relay uid and is exclusively locked
 for the process lifetime. `nak gateway on` enables the

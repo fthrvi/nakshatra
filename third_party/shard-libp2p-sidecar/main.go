@@ -23,6 +23,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"container/list"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -86,6 +87,8 @@ const (
 	defaultRelayPeerDailyBytes  = int64(2 << 30)
 	defaultRelayRateBurst       = 10.0
 	defaultRelayRatePerSecond   = 1.0
+	defaultRelayAllowStatEvery  = 250 * time.Millisecond
+	defaultRelayAllowHashEvery  = 30 * time.Second
 	maxRelayUsagePeers          = 10000
 	maxRelayRateSources         = 10000
 	maxRelayAllowFileBytes      = 1 << 20
@@ -242,6 +245,7 @@ type relayTokenBucket struct {
 	tokens   float64
 	last     time.Time
 	lastSeen time.Time
+	lru      *list.Element
 }
 
 type relayAllowSignature struct {
@@ -251,9 +255,14 @@ type relayAllowSignature struct {
 	hash     [sha256.Size]byte
 }
 
-// relayAllowlist opens the operator-owned file once per check with O_NOFOLLOW, validates and
-// reads that same descriptor, and detects changes by metadata plus content hash. An explicitly
-// configured file is fail-closed: missing, unreadable, oversized, or malformed denies everyone.
+func (s relayAllowSignature) sameMetadata(other relayAllowSignature) bool {
+	return s.dev == other.dev && s.ino == other.ino && s.size == other.size && s.mtimeNS == other.mtimeNS
+}
+
+// relayAllowlist opens the operator-owned file with O_NOFOLLOW on a bounded cadence, validates
+// metadata, and only rereads that same descriptor on metadata change or the slower hash cadence.
+// An explicitly configured file is fail-closed: missing, unreadable, oversized, or malformed
+// denies everyone.
 type relayAllowlist struct {
 	path       string
 	mu         sync.Mutex
@@ -261,6 +270,11 @@ type relayAllowlist struct {
 	loaded     bool
 	allowed    map[peer.ID]struct{}
 	lastErrKey string
+	lastStat   time.Time
+	lastHash   time.Time
+	statEvery  time.Duration
+	hashEvery  time.Duration
+	now        func() time.Time
 }
 
 func relayAllowEntry(line string) (peer.ID, error) {
@@ -287,6 +301,22 @@ func (a *relayAllowlist) containsAll(peers ...peer.ID) bool {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	now := time.Now()
+	if a.now != nil {
+		now = a.now()
+	}
+	statEvery := a.statEvery
+	if statEvery <= 0 {
+		statEvery = defaultRelayAllowStatEvery
+	}
+	hashEvery := a.hashEvery
+	if hashEvery <= 0 {
+		hashEvery = defaultRelayAllowHashEvery
+	}
+	if !a.lastStat.IsZero() && !now.Before(a.lastStat) && now.Sub(a.lastStat) < statEvery {
+		return a.containsCachedLocked(peers)
+	}
+	a.lastStat = now
 	fd, err := unix.Open(a.path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		a.failLocked(fmt.Sprintf("open: %v", err))
@@ -312,6 +342,11 @@ func (a *relayAllowlist) containsAll(peers ...peer.ID) bool {
 		a.failLocked(fmt.Sprintf("file is %d bytes; limit is %d", info.Size(), maxRelayAllowFileBytes))
 		return false
 	}
+	metadata := relayAllowSignature{dev: uint64(stat.Dev), ino: stat.Ino, size: info.Size(), mtimeNS: stat.Mtim.Nano()}
+	if a.loaded && metadata.sameMetadata(a.signature) && !a.lastHash.IsZero() &&
+		!now.Before(a.lastHash) && now.Sub(a.lastHash) < hashEvery {
+		return a.containsCachedLocked(peers)
+	}
 	body, err := io.ReadAll(io.LimitReader(f, maxRelayAllowFileBytes+1))
 	if err != nil {
 		a.failLocked(fmt.Sprintf("read: %v", err))
@@ -321,7 +356,9 @@ func (a *relayAllowlist) containsAll(peers ...peer.ID) bool {
 		a.failLocked(fmt.Sprintf("file exceeds %d-byte limit", maxRelayAllowFileBytes))
 		return false
 	}
-	sig := relayAllowSignature{dev: uint64(stat.Dev), ino: stat.Ino, size: info.Size(), mtimeNS: stat.Mtim.Nano(), hash: sha256.Sum256(body)}
+	sig := metadata
+	sig.hash = sha256.Sum256(body)
+	a.lastHash = now
 	if !a.loaded || sig != a.signature {
 		allowed := make(map[peer.ID]struct{})
 		scanner := bufio.NewScanner(bytes.NewReader(body))
@@ -352,6 +389,13 @@ func (a *relayAllowlist) containsAll(peers ...peer.ID) bool {
 		}
 		a.allowed, a.signature, a.loaded, a.lastErrKey = allowed, sig, true, ""
 		log.Printf("relay allow file %s loaded: %d identities", a.path, len(allowed))
+	}
+	return a.containsCachedLocked(peers)
+}
+
+func (a *relayAllowlist) containsCachedLocked(peers []peer.ID) bool {
+	if !a.loaded {
+		return false
 	}
 	for _, p := range peers {
 		if _, ok := a.allowed[p]; !ok {
@@ -389,7 +433,9 @@ type relayGuard struct {
 	stateLock       *os.File
 	state           relayBudgetState
 	stateBroken     bool
+	rateMu          sync.Mutex
 	rate            map[string]*relayTokenBucket
+	rateLRU         *list.List
 	now             func() time.Time
 }
 
@@ -401,7 +447,7 @@ func newRelayGuard(c relayServerConfig) (*relayGuard, error) {
 		allowlist: &relayAllowlist{path: c.allowFile}, statePath: c.statePath,
 		state:    relayBudgetState{Days: make(map[string]*relayDayUsage)},
 		attempts: make(map[uint64]*relayAttempt),
-		rate:     make(map[string]*relayTokenBucket), now: time.Now,
+		rate:     make(map[string]*relayTokenBucket), rateLRU: list.New(), now: time.Now,
 	}
 	if err := g.loadState(); err != nil {
 		g.Close()
@@ -577,9 +623,11 @@ func (g *relayGuard) Close() error {
 func (g *relayGuard) effectiveDayLocked() (string, bool) {
 	day := g.now().UTC().Format("2006-01-02")
 	changed := false
+	advanced := false
 	if g.state.MaxDay == "" || day > g.state.MaxDay {
 		g.state.MaxDay = day
 		changed = true
+		advanced = true
 	} else if day < g.state.MaxDay {
 		day = g.state.MaxDay
 	}
@@ -587,10 +635,32 @@ func (g *relayGuard) effectiveDayLocked() (string, bool) {
 		g.state.Days[day] = &relayDayUsage{Peers: make(map[string]relayPeerUsage)}
 		changed = true
 	}
+	if advanced {
+		usage := g.state.Days[day]
+		for _, attempt := range g.attempts {
+			if attempt.active {
+				g.chargeAttemptLocked(usage, attempt)
+			}
+		}
+	}
 	if g.pruneUsageLocked() {
 		changed = true
 	}
 	return day, changed
+}
+
+func (g *relayGuard) chargeAttemptLocked(usage *relayDayUsage, attempt *relayAttempt) {
+	usage.GlobalBytes += g.circuitCharge
+	for _, p := range []peer.ID{attempt.src, attempt.dest} {
+		key := p.String()
+		entry := usage.Peers[key]
+		entry.Bytes += g.circuitCharge
+		entry.LastSeen = g.now().Unix()
+		usage.Peers[key] = entry
+		if attempt.dest == attempt.src {
+			break
+		}
+	}
 }
 
 func (g *relayGuard) pruneUsageLocked() bool {
@@ -631,20 +701,34 @@ func relaySourceIP(addr multiaddr.Multiaddr) string {
 	return addr.String()
 }
 
-func (g *relayGuard) allowRateLocked(source string) bool {
+func relayRateSource(src peer.ID, addr multiaddr.Multiaddr) string {
+	return src.String() + "\x00" + relaySourceIP(addr)
+}
+
+func (g *relayGuard) allowRate(src peer.ID, addr multiaddr.Multiaddr) bool {
+	g.rateMu.Lock()
+	defer g.rateMu.Unlock()
+	source := relayRateSource(src, addr)
 	now := g.now()
-	for key, bucket := range g.rate {
-		if now.Sub(bucket.lastSeen) > 48*time.Hour {
-			delete(g.rate, key)
-		}
-	}
 	b := g.rate[source]
+	if b != nil && now.Sub(b.lastSeen) > 48*time.Hour {
+		g.rateLRU.Remove(b.lru)
+		delete(g.rate, source)
+		b = nil
+	}
 	if b == nil {
 		if len(g.rate) >= maxRelayRateSources {
-			return false
+			oldest := g.rateLRU.Back()
+			if oldest != nil {
+				delete(g.rate, oldest.Value.(string))
+				g.rateLRU.Remove(oldest)
+			}
 		}
 		b = &relayTokenBucket{tokens: defaultRelayRateBurst, last: now}
+		b.lru = g.rateLRU.PushFront(source)
 		g.rate[source] = b
+	} else {
+		g.rateLRU.MoveToFront(b.lru)
 	}
 	elapsed := now.Sub(b.last).Seconds()
 	if elapsed > 0 {
@@ -666,13 +750,17 @@ func (g *relayGuard) AllowReserve(p peer.ID, _ multiaddr.Multiaddr) bool {
 }
 
 func (g *relayGuard) AdmitConnect(src peer.ID, addr multiaddr.Multiaddr, dest peer.ID) (uint64, bool) {
+	// Authentication has already bound src to the libp2p connection. Rate-limit that identity/IP
+	// pair before any allow-file stat/read/hash work; the LRU is independent of the budget mutex.
+	if !g.allowRate(src, addr) {
+		return 0, false
+	}
 	if !g.allowlist.containsAll(src, dest) {
 		return 0, false
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if g.stateBroken || len(g.attempts) >= g.maxCircuits ||
-		!g.allowRateLocked(relaySourceIP(addr)) {
+	if g.stateBroken || len(g.attempts) >= g.maxCircuits {
 		return 0, false
 	}
 	day, changed := g.effectiveDayLocked()
@@ -754,21 +842,11 @@ func (g *relayGuard) ConnectEstablished(token uint64) {
 	if attempt == nil || attempt.active {
 		return
 	}
+	day, _ := g.effectiveDayLocked()
 	attempt.active = true
 	g.active++
-	day, _ := g.effectiveDayLocked()
 	usage := g.state.Days[day]
-	usage.GlobalBytes += g.circuitCharge
-	for _, p := range []peer.ID{attempt.src, attempt.dest} {
-		key := p.String()
-		entry := usage.Peers[key]
-		entry.Bytes += g.circuitCharge
-		entry.LastSeen = g.now().Unix()
-		usage.Peers[key] = entry
-		if attempt.dest == attempt.src {
-			break
-		}
-	}
+	g.chargeAttemptLocked(usage, attempt)
 	if err := g.persistStateLocked(); err != nil {
 		g.stateBroken = true
 		log.Printf("relay state persist failed after established circuit; denying new circuits: %v", err)
@@ -779,6 +857,15 @@ func (g *relayGuard) ConnectClosed(token uint64, _ time.Duration) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if attempt := g.attempts[token]; attempt != nil && attempt.active {
+		// Observe a UTC rollover before removing the circuit, or a circuit that crosses midnight
+		// and closes before the next admission would escape the new day's conservative charge.
+		_, changed := g.effectiveDayLocked()
+		if changed {
+			if err := g.persistStateLocked(); err != nil {
+				g.stateBroken = true
+				log.Printf("relay state persist failed after day rollover; denying new circuits: %v", err)
+			}
+		}
 		delete(g.attempts, token)
 		g.active--
 	}
@@ -1114,12 +1201,9 @@ func renewRelayReservation(h host.Host, relay peer.AddrInfo, next time.Time) {
 	}
 }
 
-func validateRelayFlags(relay, open bool, allowFile string) error {
-	if open && !relay {
-		return fmt.Errorf("-relay-open requires -relay")
-	}
-	if relay && allowFile == "" && !open {
-		return fmt.Errorf("-relay requires -relay-allow-file; use -relay-open only for explicit tests/labs")
+func validateRelayFlags(relay bool, allowFile string) error {
+	if relay && allowFile == "" {
+		return fmt.Errorf("-relay requires -relay-allow-file")
 	}
 	return nil
 }
@@ -1131,7 +1215,7 @@ func main() {
 	listenAddr := flag.String("listen", "/ip4/0.0.0.0/tcp/0", "libp2p listen multiaddr; pin the port for cross-box reach, e.g. /ip4/0.0.0.0/tcp/29600")
 	inbound := flag.String("inbound", "", "tunnel: dial this local engine addr (host:port) for each inbound libp2p stream")
 	requireDirectActivation := flag.Bool("require-direct-activation", false, "refuse inbound activation streams unless their libp2p connection is direct")
-	allowRelayedActivation := flag.Bool("allow-relayed-activation", false, "with -require-direct-activation, allow inbound activation streams over a relay circuit")
+	allowRelayedActivation := flag.Bool("allow-relayed-activation", false, "allow inbound activation streams over a relay circuit; required for every relayed activation")
 	nakdInbound := flag.String("nakd-inbound", "", "direct-only tunnel: dial this local nakd addr for each nakd libp2p stream")
 	dialListen := flag.String("dial-listen", "", "listen on this user-only UNIX socket for direct-only DIAL and activation FORWARD requests")
 	directWait := flag.Duration("direct-wait", defaultDirectWait, "maximum time to wait for a direct (non-relayed) connection")
@@ -1147,7 +1231,6 @@ func main() {
 	relayDailyBytes := flag.Int64("relay-daily-bytes", defaultRelayDailyBytes, "global UTC-day relay traffic budget, charged as admitted bidirectional circuit caps")
 	relayPeerDailyBytes := flag.Int64("relay-peer-daily-bytes", defaultRelayPeerDailyBytes, "per-peer UTC-day relay traffic budget, charged as admitted bidirectional circuit caps")
 	relayAllowFile := flag.String("relay-allow-file", "", "newline list of relay-admitted PeerIds or 64-hex Ed25519 node public keys; missing/unreadable denies all")
-	relayOpen := flag.Bool("relay-open", false, "TEST/LAB ONLY: allow -relay without an allow file")
 	relayStatePath := flag.String("relay-state", "", "persistent relay budget state (default: <key>.relay-state.json)")
 	relaysCSV := flag.String("relays", "", "comma-separated relay /p2p multiaddrs to use when behind NAT")
 	useQuic := flag.Bool("quic", false, "also listen on QUIC (udp) — better hole-punching + lossy links")
@@ -1162,7 +1245,7 @@ func main() {
 			*relayStatePath = "relay-state.json"
 		}
 	}
-	if err := validateRelayFlags(*relaySvc, *relayOpen, *relayAllowFile); err != nil {
+	if err := validateRelayFlags(*relaySvc, *relayAllowFile); err != nil {
 		log.Fatal(err)
 	}
 	if *dialListen != "" {
@@ -1247,9 +1330,6 @@ func main() {
 		log.Printf("relay caps: bytes=%d/direction duration=%s total=%d per-peer=%d daily-bytes=%d peer-daily-bytes=%d state=%s",
 			relayConfig.circuitBytes, relayConfig.circuitDuration, relayConfig.maxCircuits,
 			relayConfig.circuitsPerPeer, relayConfig.dailyBytes, relayConfig.peerDailyBytes, relayConfig.statePath)
-		if *relayAllowFile == "" {
-			log.Printf("WARNING: RELAY OPEN TO ANY PEER: -relay-open is for explicit tests/labs only; configure -relay-allow-file before production use")
-		}
 	}
 	h, err := newHost(priv, *listenAddr, natOpts{quic: *useQuic, relayService: *relaySvc, announce: *announce, staticRelays: staticRelays, dialPolicy: dialPolicy, relayConfig: relayConfig})
 	if err != nil {
@@ -1512,8 +1592,10 @@ func isDirectConn(c network.Conn) bool {
 	return directPathAllowed(c.Stat().Limited, c.RemoteMultiaddr().String())
 }
 
-func activationPathAllowed(requireDirect, allowRelayed, limited bool, remoteAddr string) bool {
-	return !requireDirect || directPathAllowed(limited, remoteAddr) || allowRelayed
+func activationPathAllowed(_ bool, allowRelayed, limited bool, remoteAddr string) bool {
+	// requireDirect controls the direct-path preference/policy, but never authorizes a relay.
+	// Every relayed inbound activation requires the worker's independent explicit opt-in.
+	return directPathAllowed(limited, remoteAddr) || allowRelayed
 }
 
 func directConn(h host.Host, p peer.ID) network.Conn {

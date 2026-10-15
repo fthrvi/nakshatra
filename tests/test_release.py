@@ -678,10 +678,11 @@ def test_go_build_uses_only_pinned_hermetic_environment(env, monkeypatch):
     subprocess.run(["git", "-C", str(env["a"]), "-c", "user.email=t@t", "-c", "user.name=t",
                     "commit", "-qm", "sidecar"], check=True)
     commit = subprocess.check_output(["git", "-C", str(env["a"]), "rev-parse", "HEAD"], text=True).strip()
-    capture, fake_go = env["tmp"] / "go.env", env["tmp"] / "go"
+    capture, capture_args, fake_go = env["tmp"] / "go.env", env["tmp"] / "go.args", env["tmp"] / "go"
     fake_go.write_text("#!/bin/sh\n"
                        "if [ \"$1\" = version ]; then echo 'go version go1.25.7 linux/amd64'; exit 0; fi\n"
                        f"/usr/bin/env | /usr/bin/sort > {capture}\n"
+                       f"printf '%s\\n' \"$@\" > {capture_args}\n"
                        "while [ $# -gt 0 ]; do if [ \"$1\" = -o ]; then printf binary > \"$2\"; exit 0; fi; shift; done\n"
                        "exit 2\n")
     fake_go.chmod(0o755)
@@ -696,6 +697,8 @@ def test_go_build_uses_only_pinned_hermetic_environment(env, monkeypatch):
     assert got["GOOS"] == "linux" and got["GOARCH"] == "amd64"
     assert "nak-go-build-" in got["GOCACHE"] and "nak-go-build-" in got["GOMODCACHE"]
     assert "nak-go-build-" in got["GOPATH"] and "SECRET_BUILD_INPUT" not in got
+    args = capture_args.read_text().splitlines()
+    assert args[0] == "build" and not any(arg == "-tags" or arg.startswith("-tags=") for arg in args)
 
 
 def test_go_build_refuses_unpinned_toolchain(env):

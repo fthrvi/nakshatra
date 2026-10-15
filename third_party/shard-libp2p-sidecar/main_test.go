@@ -11,6 +11,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -137,7 +138,9 @@ func TestDirectActivationInboundIsOptIn(t *testing.T) {
 		addr                               string
 		want                               bool
 	}{
-		{"legacy relay", false, false, true, "/ip4/1.2.3.4/tcp/1/p2p-circuit", true},
+		{"legacy relay", false, false, true, "/ip4/1.2.3.4/tcp/1/p2p-circuit", false},
+		{"legacy circuit", false, false, false, "/ip4/1.2.3.4/tcp/1/p2p-circuit", false},
+		{"legacy direct", false, false, false, "/ip4/1.2.3.4/tcp/1", true},
 		{"strict limited", true, false, true, "/ip4/1.2.3.4/tcp/1", false},
 		{"strict circuit", true, false, false, "/ip4/1.2.3.4/tcp/1/p2p-circuit", false},
 		{"strict direct", true, false, false, "/ip4/1.2.3.4/tcp/1", true},
@@ -193,18 +196,30 @@ func TestRelayResourcesAreExplicitAndCapped(t *testing.T) {
 	}
 }
 
-func TestRelayAllowFileIsMandatoryUnlessExplicitlyOpen(t *testing.T) {
-	if err := validateRelayFlags(true, false, ""); err == nil || !strings.Contains(err.Error(), "requires -relay-allow-file") {
+func TestRelayAllowFileIsMandatory(t *testing.T) {
+	if err := validateRelayFlags(true, ""); err == nil || !strings.Contains(err.Error(), "requires -relay-allow-file") {
 		t.Fatalf("missing allow file error = %v", err)
 	}
-	if err := validateRelayFlags(true, true, ""); err != nil {
-		t.Fatalf("explicit lab relay was refused: %v", err)
-	}
-	if err := validateRelayFlags(false, true, ""); err == nil {
-		t.Fatal("accepted -relay-open without -relay")
-	}
-	if err := validateRelayFlags(true, false, "/var/lib/relay.allow"); err != nil {
+	if err := validateRelayFlags(true, "/var/lib/relay.allow"); err != nil {
 		t.Fatalf("configured allow file was refused: %v", err)
+	}
+}
+
+func TestProductionBinaryHasNoRelayOpenFlag(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "nakshatra-sidecar")
+	build := exec.Command("go", "build", "-buildvcs=false", "-o", bin, ".")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build production binary: %v\n%s", err, out)
+	}
+	cmd := exec.Command(bin, "-relay-open")
+	out, err := cmd.CombinedOutput()
+	if err == nil || !strings.Contains(string(out), "flag provided but not defined: -relay-open") {
+		t.Fatalf("production -relay-open result err=%v output=%q", err, out)
+	}
+	cmd = exec.Command(bin, "-relay")
+	out, err = cmd.CombinedOutput()
+	if err == nil || !strings.Contains(string(out), "-relay requires -relay-allow-file") {
+		t.Fatalf("production relay without allow file err=%v output=%q", err, out)
 	}
 }
 
@@ -371,6 +386,59 @@ func TestRelayGlobalDailyBudget(t *testing.T) {
 	}
 }
 
+func TestRelayUTCDayRolloverChargesActiveCircuitAgainstNewDay(t *testing.T) {
+	cfg := defaultRelayServerConfig()
+	cfg.circuitBytes, cfg.dailyBytes, cfg.peerDailyBytes = 100, 200, 200
+	g := testRelayGuard(t, cfg)
+	now := time.Date(2026, 10, 15, 23, 59, 59, 0, time.UTC)
+	g.now = func() time.Time { return now }
+	src, dest := testPeerID(t), testPeerID(t)
+	addr := multiaddr.StringCast("/ip4/192.0.2.1/tcp/1")
+	token, ok := g.AdmitConnect(src, addr, dest)
+	if !ok {
+		t.Fatal("pre-midnight circuit refused")
+	}
+	g.ConnectEstablished(token)
+
+	now = now.Add(2 * time.Second)
+	if _, ok := g.AdmitConnect(testPeerID(t), addr, testPeerID(t)); ok {
+		t.Fatal("new-day admission ignored the still-active circuit's remaining cap")
+	}
+	newDay := now.Format("2006-01-02")
+	usage := g.state.Days[newDay]
+	if usage == nil || usage.GlobalBytes != g.circuitCharge ||
+		usage.Peers[src.String()].Bytes != g.circuitCharge ||
+		usage.Peers[dest.String()].Bytes != g.circuitCharge {
+		t.Fatalf("new-day active-circuit charge = %+v", usage)
+	}
+	g.ConnectClosed(token, 0)
+	if _, ok := g.AdmitConnect(testPeerID(t), addr, testPeerID(t)); ok {
+		t.Fatal("closing the rolled-over circuit refunded the conservative new-day charge")
+	}
+}
+
+func TestRelayUTCDayRolloverChargesCircuitBeforeClosingIt(t *testing.T) {
+	cfg := defaultRelayServerConfig()
+	cfg.circuitBytes, cfg.dailyBytes, cfg.peerDailyBytes = 100, 200, 200
+	g := testRelayGuard(t, cfg)
+	now := time.Date(2026, 10, 15, 23, 59, 59, 0, time.UTC)
+	g.now = func() time.Time { return now }
+	addr := multiaddr.StringCast("/ip4/192.0.2.1/tcp/1")
+	token, ok := g.AdmitConnect(testPeerID(t), addr, testPeerID(t))
+	if !ok {
+		t.Fatal("pre-midnight circuit refused")
+	}
+	g.ConnectEstablished(token)
+	now = now.Add(2 * time.Second)
+	g.ConnectClosed(token, 0)
+	if usage := g.state.Days[now.Format("2006-01-02")]; usage == nil || usage.GlobalBytes != g.circuitCharge {
+		t.Fatalf("circuit close omitted new-day charge: %+v", usage)
+	}
+	if _, ok := g.AdmitConnect(testPeerID(t), addr, testPeerID(t)); ok {
+		t.Fatal("circuit close before admission restored the new-day budget")
+	}
+}
+
 func TestRelayAllowFileAcceptsPeerIDsAndRosterPublicKeysAndReloads(t *testing.T) {
 	privA, pubA, err := crypto.GenerateEd25519Key(rand.Reader)
 	if err != nil {
@@ -401,6 +469,8 @@ func TestRelayAllowFileAcceptsPeerIDsAndRosterPublicKeysAndReloads(t *testing.T)
 	cfg := defaultRelayServerConfig()
 	cfg.allowFile = path
 	g := testRelayGuard(t, cfg)
+	allowNow := time.Now().Add(defaultRelayAllowStatEvery)
+	g.allowlist.now = func() time.Time { return allowNow }
 	addr := multiaddr.StringCast("/ip4/192.0.2.1/tcp/1")
 	token, admitted := g.AdmitConnect(idA, addr, idB)
 	if !g.AllowReserve(idA, addr) || !g.AllowReserve(idB, addr) || !admitted {
@@ -420,6 +490,7 @@ func TestRelayAllowFileAcceptsPeerIDsAndRosterPublicKeysAndReloads(t *testing.T)
 	if err := os.Chtimes(path, future, future); err != nil {
 		t.Fatal(err)
 	}
+	allowNow = allowNow.Add(defaultRelayAllowStatEvery)
 	if !g.AllowReserve(other, addr) || g.AllowReserve(idA, addr) {
 		t.Fatal("allow file mtime reload did not replace identities")
 	}
@@ -430,6 +501,8 @@ func TestRelayAllowFileFailsClosedWhenMissingOrMalformed(t *testing.T) {
 	cfg := defaultRelayServerConfig()
 	cfg.allowFile = path
 	g := testRelayGuard(t, cfg)
+	allowNow := time.Now().Add(defaultRelayAllowStatEvery)
+	g.allowlist.now = func() time.Time { return allowNow }
 	p := testPeerID(t)
 	addr := multiaddr.StringCast("/ip4/192.0.2.1/tcp/1")
 	if g.AllowReserve(p, addr) {
@@ -438,18 +511,21 @@ func TestRelayAllowFileFailsClosedWhenMissingOrMalformed(t *testing.T) {
 	if err := os.WriteFile(path, []byte("not-an-identity\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	allowNow = allowNow.Add(defaultRelayAllowStatEvery)
 	if g.AllowReserve(p, addr) {
 		t.Fatal("malformed allow file did not fail closed")
 	}
 	if err := os.WriteFile(path, []byte(p.String()+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	allowNow = allowNow.Add(defaultRelayAllowStatEvery)
 	if !g.AllowReserve(p, addr) {
 		t.Fatal("valid replacement allow file was not reloaded")
 	}
 	if err := os.Chmod(path, 0); err != nil {
 		t.Fatal(err)
 	}
+	allowNow = allowNow.Add(defaultRelayAllowStatEvery)
 	if g.AllowReserve(p, addr) {
 		t.Fatal("unreadable allow file did not fail closed")
 	}
@@ -487,7 +563,8 @@ func TestRelayAllowFileSecureLoadingAndContentHashReload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a := &relayAllowlist{path: path}
+	now := time.Now()
+	a := &relayAllowlist{path: path, now: func() time.Time { return now }}
 	if !a.contains(idA) {
 		t.Fatal("0640 allow file with comments and CRLF was refused")
 	}
@@ -501,6 +578,7 @@ func TestRelayAllowFileSecureLoadingAndContentHashReload(t *testing.T) {
 	if err := os.Chtimes(path, info.ModTime(), info.ModTime()); err != nil {
 		t.Fatal(err)
 	}
+	now = now.Add(defaultRelayAllowHashEvery)
 	if !a.contains(idB) || a.contains(idA) {
 		t.Fatal("same-size/same-mtime content replacement was not detected")
 	}
@@ -510,6 +588,46 @@ func TestRelayAllowFileSecureLoadingAndContentHashReload(t *testing.T) {
 	}
 	if (&relayAllowlist{path: symlinkPath}).contains(idB) {
 		t.Fatal("symlink allow file was accepted")
+	}
+}
+
+func TestRelayAllowFileChecksAreCachedAndRateLimitRunsFirst(t *testing.T) {
+	src, dest := testPeerID(t), testPeerID(t)
+	path := filepath.Join(t.TempDir(), "relay.allow")
+	if err := os.WriteFile(path, []byte(src.String()+"\n"+dest.String()+"\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	cfg := defaultRelayServerConfig()
+	cfg.allowFile = path
+	g := testRelayGuard(t, cfg)
+	rateNow := time.Now()
+	allowNow := rateNow
+	g.now = func() time.Time { return rateNow }
+	g.allowlist.now = func() time.Time { return allowNow }
+	addr := multiaddr.StringCast("/ip4/192.0.2.90/tcp/1")
+
+	// Exhaust the cheap bucket with failed lifecycle outcomes while the cached allowlist is valid.
+	for i := 0; i < int(defaultRelayRateBurst); i++ {
+		token, ok := g.AdmitConnect(src, addr, dest)
+		if !ok {
+			t.Fatalf("attempt %d refused early", i+1)
+		}
+		g.ConnectFailed(token)
+	}
+	// Change the file after the hash interval. If allow-file work happened before the limiter,
+	// this attempt would reload the replacement; the denied attempt must leave the cache untouched.
+	if err := os.WriteFile(path, []byte("not-an-identity\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	allowNow = allowNow.Add(defaultRelayAllowHashEvery)
+	if _, ok := g.AdmitConnect(src, addr, dest); ok {
+		t.Fatal("rate-exhausted source was admitted")
+	}
+	if !g.allowlist.loaded {
+		t.Fatal("rate-limited attempt reached and invalidated the allow-file cache")
+	}
+	if g.allowlist.lastHash.Equal(allowNow) {
+		t.Fatal("rate-limited attempt performed allow-file hash work")
 	}
 }
 
@@ -643,18 +761,54 @@ func TestRelayAdmissionConcurrentPerPeerAndBudgetBounds(t *testing.T) {
 	}
 }
 
-func TestRelayConnectAttemptsAreRateLimitedPerSourceIP(t *testing.T) {
+func TestRelayConnectAttemptsAreRateLimitedPerAuthenticatedIdentityAndIP(t *testing.T) {
 	g := testRelayGuard(t, defaultRelayServerConfig())
 	addr := multiaddr.StringCast("/ip4/192.0.2.44/tcp/1")
+	src := testPeerID(t)
 	for i := 0; i < int(defaultRelayRateBurst); i++ {
-		token, ok := g.AdmitConnect(testPeerID(t), addr, testPeerID(t))
+		token, ok := g.AdmitConnect(src, addr, testPeerID(t))
 		if !ok {
 			t.Fatalf("attempt %d was rate-limited early", i+1)
 		}
 		g.ConnectFailed(token)
 	}
-	if _, ok := g.AdmitConnect(testPeerID(t), addr, testPeerID(t)); ok {
-		t.Fatal("source-IP burst limit was not enforced")
+	if _, ok := g.AdmitConnect(src, addr, testPeerID(t)); ok {
+		t.Fatal("identity/IP burst limit was not enforced")
+	}
+	if token, ok := g.AdmitConnect(testPeerID(t), addr, testPeerID(t)); !ok {
+		t.Fatal("a distinct authenticated identity sharing the IP was rate-limited")
+	} else {
+		g.ConnectFailed(token)
+	}
+	otherAddr := multiaddr.StringCast("/ip4/192.0.2.45/tcp/1")
+	if token, ok := g.AdmitConnect(src, otherAddr, testPeerID(t)); !ok {
+		t.Fatal("the same identity from a distinct IP did not receive its own bucket")
+	} else {
+		g.ConnectFailed(token)
+	}
+}
+
+func TestRelayRateSourcesEvictLRUInsteadOfFailingClosed(t *testing.T) {
+	g := testRelayGuard(t, defaultRelayServerConfig())
+	src, dest := testPeerID(t), testPeerID(t)
+	for i := 0; i < maxRelayRateSources; i++ {
+		addr := multiaddr.StringCast(fmt.Sprintf("/ip4/198.18.%d.%d/tcp/1", i/256, i%256))
+		token, ok := g.AdmitConnect(src, addr, dest)
+		if !ok {
+			t.Fatalf("source %d refused before LRU capacity", i)
+		}
+		g.ConnectFailed(token)
+	}
+	legitimate := testPeerID(t)
+	token, ok := g.AdmitConnect(legitimate, multiaddr.StringCast("/ip4/203.0.113.99/tcp/1"), testPeerID(t))
+	if !ok {
+		t.Fatal("new legitimate source was refused at rate-source capacity")
+	}
+	g.ConnectFailed(token)
+	g.rateMu.Lock()
+	defer g.rateMu.Unlock()
+	if len(g.rate) != maxRelayRateSources || g.rateLRU.Len() != maxRelayRateSources {
+		t.Fatalf("bounded rate LRU map=%d list=%d want=%d", len(g.rate), g.rateLRU.Len(), maxRelayRateSources)
 	}
 }
 

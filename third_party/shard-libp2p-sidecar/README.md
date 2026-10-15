@@ -70,8 +70,10 @@ is never carried over the relay circuit.
 
 Dynamic inference `FORWARD` tunnels may opt into `-relay-activation-fallback`. They still wait
 for a direct path first (`-direct-wait`, unchanged at 15 seconds by default), then use the existing
-limited circuit connection. The worker must independently pass `-allow-relayed-activation` alongside
-`-require-direct-activation`; otherwise it resets the relayed activation stream.
+limited circuit connection. The worker must independently pass `-allow-relayed-activation`;
+otherwise it resets every relayed activation stream, regardless of
+`-require-direct-activation`. Managed workers continue to pass `-require-direct-activation` for
+their direct-path policy.
 
 `-relay` servers are explicitly capped even without extra limit flags: 64 MiB in each direction per
 circuit (`-relay-circuit-bytes`), 6 hours (`-relay-circuit-duration`), 64 concurrent circuits total
@@ -84,14 +86,15 @@ possible traffic in both directions (128 MiB with defaults); a failed attempt re
 reservation without charging another attempt. Admission happens only after the destination's relay
 reservation is confirmed.
 
-`-relay` requires `-relay-allow-file PATH` and refuses to start without it. `-relay-open` is an
-explicit test/lab escape hatch and emits a loud warning; do not use it in production. The allow
-file contains one identity per line,
+`-relay` requires `-relay-allow-file PATH` and refuses to start without it. There is no open-relay
+mode in the production binary. The allow file contains one identity per line,
 either a libp2p PeerId or the 64-lowercase/uppercase-hex Ed25519 **node public key**. When this flag
 is present, reservations require the destination to be listed and circuits require both source and
 destination to be listed. Blank lines and `#` comment lines are ignored, and CRLF is accepted. The
 loader uses one `O_NOFOLLOW` descriptor for validation and reading, caps the file at 1 MiB and
-10,000 entries, and detects changes by device/inode/size/nanosecond-mtime plus SHA-256. Symlinks,
+10,000 entries, and detects changes by device/inode/size/nanosecond-mtime plus a periodically
+refreshed SHA-256. Metadata checks and content rehashing are rate-limited and cached outside the
+relay budget mutex. Symlinks,
 missing/unreadable files, and any malformed non-comment line deny everyone and log its line number.
 The allow file is read-only input and need not be owned by the relay uid: the production
 `root:nakshatra-sidecar-relay` mode `0640` file is accepted.
@@ -101,7 +104,12 @@ State is written with mode 0600 to `-relay-state`; by default this is `<key>.rel
 relay lifetime, so a second process using the same state refuses to start. Existing state must be a
 non-symlink regular file owned by the running uid and not group/world writable. Corruption refuses
 startup. Writes use temp + fsync + rename + directory fsync. The persisted maximum UTC day prevents
-a backward clock adjustment from granting a fresh budget.
+a backward clock adjustment from granting a fresh budget. At a forward UTC-day rollover, every
+still-active circuit is conservatively charged its full remaining admitted cap against the new day.
+
+Connection attempts are token-bucket limited before allow-file work by authenticated source
+identity plus source IP. The bucket table uses bounded LRU eviction, so churn cannot saturate the
+table and fail closed for new peers.
 
 The VPS relay launch is:
 
