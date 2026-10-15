@@ -5,7 +5,6 @@ On create add a row (status=active, owner). On merge flip to `merged→<sha>`.
 
 | branch | sector | description | base | status | owner |
 |---|---|---|---|---|---|
-| network/gateway-p2p | network | Make consumer gateways own a dial-only libp2p sidecar without taking over operator/worker p2p configuration. | main@762b0da | active | codex/root |
 | network/gateway-discovery-retry | network | Give signed pillar GETs a per-request nonce; retry empty auto-discovery with backoff and refresh it every five minutes. | main | merged→bd57243 | codex/root |
 | network/consumer-tokenizer | network | Let consumer-only gateways fetch only the signed package metadata GGUF, verify its signer and SHA-256, and use it as the discovered model tokenizer. | forgejo/main@eea6fe8 | merged→bd57243 | codex/root |
 | network/gateway-profile-and-container | network | Own the gateway's inference profile opt-in, use safe container-specific bind/port defaults, and print host-side container MCP guidance. | main@a1110aa | merged→0999b14 | codex/root |
@@ -14,11 +13,12 @@ On create add a row (status=active, owner). On merge flip to `merged→<sha>`.
 | owner-sentinel/launcher-self-update | worker | The Windows sentinel launcher updates itself from the signed release (wsl.exe only while the distro runs, File.Replace, monotonic Launcher-Version, successor handoff under a Global per-user SID mutex); install.ps1 reuses the saved distro/user. | forgejo/main@cd3ae8b | merged→3792bf2 | claude/trisul-aa network lane (hub) |
 | network/outsider-consumer | network | Local, fail-closed consumer gateway plus MCP/OpenAI harness access for invited outsider nodes through public fronts only. | main@cd3ae8b | merged→1e53ab5 | codex/root |
 | network/gateway-p2p | network | `nak gateway on` owns a consumer libp2p dial sidecar (listener kept for DCUtR, no inbound forwarding); ownership lock, retained rollback, legacy argv byte-identical. | main@762b0da | merged→8f03796 | codex/root |
+| network/consumer-port | network | Consumer containers publish one fixed libp2p port (host==container, tcp+udp, v4/v6), no inbound forwarding; last-loaded p2p-consumer.env override; rollback-safe role transitions with per-boundary argv matrix. | main@85e5439 | merged→24b3c6f | codex/root |
 | worker/idle-unload | worker | Stop the GPU daemon after an idle window, reload it single-flight after SHA-256 re-verification, and publish loaded/standby residency. | forgejo/main@a4bbf4a | merged | codex/root |
 | worker/owner-lease | worker | Add session-release grace plus an opt-in loopback owner lease: default-deny, stale admission stop, lapse cancellation/unload, away residency, and safe CLI controls. | forgejo/main@a6eb8fc | active | codex/root |
 | client/warmup-tolerance | client | Treat pillar-projected standby residency as an expected first-RPC cold start: additive warm-up deadline, one UNAVAILABLE retry, and operator timing. | main@a4bbf4a | merged | codex/root |
 | client/admission-defaults | client | Default the release sidecar socket and pillar signing keyid from uid-owned release state; report keyid provenance on 401. | forgejo/main@b10734b | merged→252b228 | codex/root |
-| u4/c1-sidecar-forward | network | U4 C1: uid-gated dynamic activation FORWARD listeners, direct-only inference streams, optional direct-only worker inbound flags in the release p2p unit. | main@2829468 | active | codex/trisul (U4 C1 lane) |
+| u4/c1-sidecar-forward | network | U4 C1: uid-gated dynamic activation FORWARD listeners, direct-only inference streams, optional direct-only worker inbound flags in the release p2p unit. | main@2829468 | merged→via u4/c1-landing | codex/trisul (U4 C1 lane) |
 | u4/worker-invite | join | U4 phase A signed worker invites, staged onboard codes, and node-key-signed Redeem v2 with retry CLI. | forgejo/main@2829468 | merged | codex |
 | credits/s2-consumer-admission | credits | S2 consumer-only signed invites, onboarding redeem, and role-gated routing/registration. | forgejo/main@407df51 | merged→5e73ce9 | codex for claude/trisul-aa network lane (hub) |
 | u4/b2-registrar | release | Move the signed capacity registrar into Nakshatra releases, strictly reuse the one node key, and ship an opt-in hardened service. | forgejo/main@2829468 | active | codex |
