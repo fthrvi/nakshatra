@@ -1637,7 +1637,7 @@ func TestWaitDirectUsesAddressesLearnedThroughRelay(t *testing.T) {
 	}
 }
 
-func relayOnlyTestHosts(t *testing.T, circuitBytes int64) (host.Host, host.Host, peer.AddrInfo) {
+func relayTestHosts(t *testing.T, circuitBytes int64, connectCircuit bool) (host.Host, host.Host, peer.AddrInfo) {
 	t.Helper()
 	newKey := func() crypto.PrivKey {
 		priv, _, err := crypto.GenerateEd25519Key(rand.Reader)
@@ -1686,16 +1686,23 @@ func relayOnlyTestHosts(t *testing.T, circuitBytes int64) (host.Host, host.Host,
 	if _, err := relayclient.Reserve(ctx, b, relayInfo); err != nil {
 		t.Fatalf("worker reserve relay: %v", err)
 	}
-	circuitAddrs := addRelayCircuitAddrs(a, b.ID(), []peer.AddrInfo{relayInfo})
-	if err := policyA.withDialCandidates(b.ID(), circuitAddrs, func() error {
-		return a.Connect(ctx, peer.AddrInfo{ID: b.ID(), Addrs: circuitAddrs})
-	}); err != nil {
-		t.Fatalf("dial relay circuit: %v", err)
-	}
-	if directConn(a, b.ID()) != nil || relayedConn(a, b.ID()) == nil {
-		t.Fatal("test peers did not connect exclusively through the relay")
+	if connectCircuit {
+		circuitAddrs := addRelayCircuitAddrs(a, b.ID(), []peer.AddrInfo{relayInfo})
+		if err := policyA.withDialCandidates(b.ID(), circuitAddrs, func() error {
+			return a.Connect(ctx, peer.AddrInfo{ID: b.ID(), Addrs: circuitAddrs})
+		}); err != nil {
+			t.Fatalf("dial relay circuit: %v", err)
+		}
+		if directConn(a, b.ID()) != nil || relayedConn(a, b.ID()) == nil {
+			t.Fatal("test peers did not connect exclusively through the relay")
+		}
 	}
 	return a, b, relayInfo
+}
+
+func relayOnlyTestHosts(t *testing.T, circuitBytes int64) (host.Host, host.Host, peer.AddrInfo) {
+	t.Helper()
+	return relayTestHosts(t, circuitBytes, true)
 }
 
 func TestRelayDestinationWithoutReservationConsumesNoBudget(t *testing.T) {
@@ -1864,6 +1871,96 @@ func TestStaticForwardProductionListenerRequiresDialerRelayOptIn(t *testing.T) {
 	buf := make([]byte, 1)
 	if _, err := client.Read(buf); err == nil {
 		t.Fatal("static -forward carried activation over relay without -relay-activation-fallback")
+	}
+}
+
+func TestStaticForwardWaitsForAndPrefersDirectOverExistingRelay(t *testing.T) {
+	a, b, relayInfo := relayOnlyTestHosts(t, 1<<20)
+	b.SetStreamHandler(activationProto, func(s network.Stream) { _ = s.Close() })
+	relayConn := relayedConn(a, b.ID())
+	if relayConn == nil {
+		t.Fatal("test setup has no relay-only connection")
+	}
+	peerAddr := relayConn.RemoteMultiaddr().Encapsulate(
+		multiaddr.StringCast("/p2p/" + b.ID().String())).String()
+
+	directDial := make(chan error, 1)
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		if err := b.Network().Listen(multiaddr.StringCast("/ip4/0.0.0.0/tcp/0")); err != nil {
+			directDial <- err
+			return
+		}
+		addrs := preferredDirectDialAddrs(b.Addrs())
+		if len(addrs) == 0 {
+			directDial <- fmt.Errorf("test host has no non-loopback direct address")
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 700*time.Millisecond)
+		defer cancel()
+		directDial <- a.Connect(network.WithForceDirectDial(ctx, forceDirectReason), peer.AddrInfo{
+			ID: b.ID(), Addrs: addrs,
+		})
+	}()
+
+	start := time.Now()
+	s, err := openStream(a, peerAddr, []peer.AddrInfo{relayInfo}, nil, time.Second, true)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := <-directDial; err != nil {
+		t.Fatal(err)
+	}
+	if elapsed < 100*time.Millisecond {
+		t.Fatalf("existing relay was selected before the direct wait: %v", elapsed)
+	}
+	if !isDirectConn(s.Conn()) {
+		t.Fatalf("static forward used relay %s after a direct connection appeared", s.Conn().RemoteMultiaddr())
+	}
+}
+
+func TestStaticForwardInitialConnectFailureStillRunsRelaySelection(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		allowRelayed bool
+		wantStream   bool
+	}{
+		{name: "allowed", allowRelayed: true, wantStream: true},
+		{name: "refused", allowRelayed: false, wantStream: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a, b, relayInfo := relayTestHosts(t, 1<<20, false)
+			b.SetStreamHandler(activationProto, func(s network.Stream) { _ = s.Close() })
+			// Loopback is rejected by the outbound policy, so this explicit direct attempt fails
+			// immediately. Relay rendezvous must still run during the bounded selection.
+			peerAddr := fmt.Sprintf("/ip4/127.0.0.1/tcp/1/p2p/%s", b.ID())
+			start := time.Now()
+			s, err := openStream(a, peerAddr, []peer.AddrInfo{relayInfo}, nil,
+				100*time.Millisecond, tc.allowRelayed)
+			elapsed := time.Since(start)
+			if elapsed < 75*time.Millisecond {
+				t.Fatalf("relay selection returned before the direct wait: %v", elapsed)
+			}
+			if relayedConn(a, b.ID()) == nil {
+				t.Fatal("failed initial direct dial did not attempt relay rendezvous")
+			}
+			if tc.wantStream {
+				if err != nil {
+					t.Fatalf("relay fallback: %v", err)
+				}
+				defer s.Close()
+				if isDirectConn(s.Conn()) {
+					t.Fatalf("fallback stream unexpectedly direct via %s", s.Conn().RemoteMultiaddr())
+				}
+				return
+			}
+			if err == nil {
+				s.Close()
+				t.Fatal("relay fallback succeeded without dialer opt-in")
+			}
+		})
 	}
 }
 

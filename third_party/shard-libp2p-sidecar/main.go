@@ -1487,9 +1487,11 @@ func openStream(h host.Host, peerAddr string, relays []peer.AddrInfo, policy *ou
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if err := h.Connect(ctx, *info); err != nil {
-		return nil, err
-	}
+	// Seed the peerstore and make the explicit address the first direct attempt, but do not make
+	// that one address authoritative. The bounded selector below may still rendezvous through an
+	// operator-configured relay, wait for DCUtR/a learned direct address, and finally use the
+	// limited connection when relay fallback was explicitly enabled.
+	_ = h.Connect(ctx, *info)
 	return openReadyActivationStream(h, info.ID, relays, policy, directWait, allowRelayed)
 }
 
@@ -1856,9 +1858,6 @@ func openReadyActivationStream(h host.Host, p peer.ID, relays []peer.AddrInfo, p
 			return nil, err
 		}
 		return s, nil
-	}
-	if allowRelayed && relayedConn(h, p) != nil {
-		return openRelay()
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), directWait)
 	defer cancel()
