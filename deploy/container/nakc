@@ -91,6 +91,12 @@ validate_p2p_port() {
         die "NAKC_P2P_PORT must not collide with host gateway port $host_gateway_port"
 }
 
+validate_distinct_worker_p2p_ports() {
+    local worker_port="$1" p2p_port="$2"
+    [ -z "$worker_port" ] || [ "$worker_port" != "$p2p_port" ] || \
+        die "NAKC_P2P_PORT must not collide with worker port $worker_port"
+}
+
 run_args() {
     local runtime="$1" share_path share_mode worker_port gateway_on p2p_port host_gateway_port
     share_path="$(config_read share-path)"
@@ -123,6 +129,7 @@ run_args() {
     fi
     if [ -n "$worker_port" ]; then
         valid_port "$worker_port" || die "stored worker port must be a canonical port between 1 and 65535"
+        validate_distinct_worker_p2p_ports "$worker_port" "$p2p_port"
         RUN_ARGS+=(--env "NAK_CONTAINER_WORKER=1" --env "NAK_CONTAINER_P2P_PORT=$p2p_port"
             --publish "0.0.0.0:$p2p_port:$p2p_port/tcp"
             --publish "0.0.0.0:$p2p_port:$p2p_port/udp")
@@ -201,7 +208,7 @@ EOF
 
 main() {
     [ "$#" -gt 0 ] || { usage; exit 2; }
-    local command="$1" runtime port path mode old_port old_gateway old_p2p_port p2p_port item
+    local command="$1" runtime port path mode old_port old_gateway old_p2p_port p2p_port worker_port item
     shift
     runtime="$(engine)"
     case "$command" in
@@ -270,6 +277,8 @@ main() {
                 old_p2p_port="$(config_read p2p-port)"
                 p2p_port="${NAKC_P2P_PORT:-${old_p2p_port:-4001}}"
                 validate_p2p_port "$p2p_port"
+                worker_port="$(config_read worker-port)"
+                validate_distinct_worker_p2p_ports "$worker_port" "$p2p_port"
                 config_write gateway-on 1
                 config_write p2p-port "$p2p_port"
                 if ! (start_container "$runtime"); then
@@ -325,6 +334,7 @@ main() {
                 valid_port "$port" || die "worker --port must be a canonical port between 1 and 65535"
                 p2p_port="${NAKC_P2P_PORT:-${old_p2p_port:-4001}}"
                 validate_p2p_port "$p2p_port"
+                validate_distinct_worker_p2p_ports "$port" "$p2p_port"
                 config_write worker-port "$port"
                 config_write p2p-port "$p2p_port"
                 if ! (start_container "$runtime"); then

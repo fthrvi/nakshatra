@@ -259,6 +259,44 @@ def test_worker_rejects_noncanonical_ports_before_persisting(tmp_path, port):
     assert not (tmp_path / "config" / "p2p-port").exists()
 
 
+@pytest.mark.parametrize(
+    ("old_values", "worker_args", "extra_env"),
+    [
+        ({}, ("--port", "50051"), {"NAKC_P2P_PORT": "50051"}),
+        ({"worker-port": "50051", "p2p-port": "4001"}, (),
+         {"NAKC_P2P_PORT": "50051"}),
+        ({"p2p-port": "50051"}, ("--port", "50051"), {}),
+    ],
+)
+def test_worker_rejects_p2p_port_collision_without_persisting(
+        tmp_path, old_values, worker_args, extra_env):
+    config = tmp_path / "config"
+    config.mkdir()
+    for name, value in old_values.items():
+        (config / name).write_text(value + "\n")
+    before = {path.name: path.read_bytes() for path in config.iterdir()}
+
+    result = _nakc(tmp_path, "worker", "on", *worker_args, **extra_env)
+
+    assert result.returncode == 2
+    assert "NAKC_P2P_PORT must not collide with worker port 50051" in result.stderr
+    assert {path.name: path.read_bytes() for path in config.iterdir()} == before
+
+
+def test_gateway_rejects_worker_p2p_port_collision_without_persisting(tmp_path):
+    config = tmp_path / "config"
+    config.mkdir()
+    (config / "worker-port").write_text("50051\n")
+    (config / "p2p-port").write_text("4001\n")
+    before = {path.name: path.read_bytes() for path in config.iterdir()}
+
+    result = _nakc(tmp_path, "gateway", "on", NAKC_P2P_PORT="50051")
+
+    assert result.returncode == 2
+    assert "NAKC_P2P_PORT must not collide with worker port 50051" in result.stderr
+    assert {path.name: path.read_bytes() for path in config.iterdir()} == before
+
+
 def test_start_rejects_a_noncanonical_host_gateway_port(tmp_path):
     result = _nakc(tmp_path, "start", NAKC_GATEWAY_PORT="011600")
     assert result.returncode == 2
@@ -544,6 +582,28 @@ def test_container_env_keeps_worker_private_without_rewriting_gateway_files(tmp_
         "-listen /ip4/0.0.0.0/tcp/4001 -inbound=127.0.0.1:50051 "
         "-require-direct-activation"
     )
+
+
+def test_container_env_rejects_equal_worker_and_p2p_ports_without_rewriting(
+        tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    env_dir = home / ".nakshatra"
+    env_dir.mkdir(parents=True)
+    p2p_env = env_dir / "p2p.env"
+    worker_env = env_dir / "worker.env"
+    p2p_env.write_text("P2P_RELAYS=test\nNAKSHATRA_P2P_NAKD_INBOUND=127.0.0.1:51830\n")
+    worker_env.write_text("PORT=50051\nLISTEN=0.0.0.0\n")
+    before = {path: path.read_bytes() for path in (p2p_env, worker_env)}
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("NAK_CONTAINER_WORKER", "1")
+    monkeypatch.setenv("NAK_CONTAINER_P2P_PORT", "50051")
+    instance = supervisor.Supervisor(tmp_path / "prefix", tmp_path / "units", tmp_path / "sock",
+                                     refresh=False, control=False)
+
+    with pytest.raises(ValueError, match="container p2p port must not equal worker PORT 50051"):
+        instance.reconcile_container_env()
+
+    assert {path: path.read_bytes() for path in (p2p_env, worker_env)} == before
 
 
 def test_container_consumer_effective_p2p_command_listens_but_forwards_nothing(tmp_path, monkeypatch):

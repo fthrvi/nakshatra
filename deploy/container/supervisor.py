@@ -231,12 +231,14 @@ class Supervisor:
         if not 1 <= port <= 65535 or str(port) != port_text:
             raise ValueError("container p2p port must be between 1 and 65535")
         if worker_env.exists():
-            if p2p_env.exists():
-                self._set_env(p2p_env, "NAKSHATRA_P2P_NAKD_INBOUND", None)
             values = _env_file(worker_env)
             worker_port = values.get("PORT", "")
             if not worker_port.isdigit() or not 1 <= int(worker_port) <= 65535:
                 raise ValueError("worker env has an invalid PORT")
+            if int(worker_port) == port:
+                raise ValueError(f"container p2p port must not equal worker PORT {worker_port}")
+            if p2p_env.exists():
+                self._set_env(p2p_env, "NAKSHATRA_P2P_NAKD_INBOUND", None)
             self._set_env(worker_env, "LISTEN", "127.0.0.1")
             self._set_env(
                 worker_env,
