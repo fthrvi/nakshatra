@@ -5,6 +5,7 @@ import fcntl
 import json
 import stat
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -16,6 +17,7 @@ sys.path.insert(0, str(ROOT / "release"))
 
 import release_trust  # noqa: E402
 import releasekit  # noqa: E402
+import install as release_install  # noqa: E402
 
 
 def _write_signed_release(prefix: Path, private_hex: str, version: str,
@@ -147,6 +149,69 @@ def test_package_trust_refuses_transition_after_installer_lock_disappears(tmp_pa
 
     with _held_installer_lock(prefix):
         assert release_trust.load_release_package_signers(prefix) == frozenset({old_package_key})
+
+
+def test_overlapping_readers_cannot_impersonate_live_installer(tmp_path, monkeypatch):
+    prefix, _package_key, private_hex = _installed_release(tmp_path)
+    old_package_key = "35" * 32
+    _write_signed_release(prefix, private_hex, "1.2.2", old_package_key)
+    config = json.loads((prefix / "config.json").read_text())
+    _write_transition(prefix, config["pubkey"], "1.2.3", "1.2.2")
+    (prefix / "current").unlink()
+    (prefix / "current").symlink_to("releases/1.2.2")
+    (prefix / ".install.lock").touch(mode=0o600)
+
+    real_flock = release_trust.fcntl.flock
+    reader_a_inside_probe = threading.Event()
+    release_reader_a = threading.Event()
+    reader_a = None
+
+    def pause_reader_a(fd, operation):
+        real_flock(fd, operation)
+        if threading.current_thread() is reader_a and operation & fcntl.LOCK_NB:
+            reader_a_inside_probe.set()
+            assert release_reader_a.wait(5.0), "reader A was not released"
+
+    monkeypatch.setattr(release_trust.fcntl, "flock", pause_reader_a)
+    reader_a_errors = []
+
+    def read_stale_transition():
+        try:
+            release_trust.load_release_package_signers(prefix)
+        except Exception as exc:
+            reader_a_errors.append(exc)
+
+    reader_a = threading.Thread(target=read_stale_transition, name="reader-a")
+    reader_a.start()
+    assert reader_a_inside_probe.wait(5.0), "reader A did not enter its lock probe"
+    try:
+        with pytest.raises(release_trust.ReleaseTrustError, match="transition is stale"):
+            release_trust.load_release_package_signers(prefix)
+    finally:
+        release_reader_a.set()
+        reader_a.join(timeout=5.0)
+
+    assert not reader_a.is_alive()
+    assert len(reader_a_errors) == 1
+    assert isinstance(reader_a_errors[0], release_trust.ReleaseTrustError)
+    assert "transition is stale" in str(reader_a_errors[0])
+
+
+def test_real_installer_exclusive_lock_is_visible_to_trust_reader(tmp_path):
+    prefix, _package_key, private_hex = _installed_release(tmp_path)
+    old_package_key = "35" * 32
+    _write_signed_release(prefix, private_hex, "1.2.2", old_package_key)
+    config = json.loads((prefix / "config.json").read_text())
+    _write_transition(prefix, config["pubkey"], "1.2.3", "1.2.2")
+    (prefix / "current").unlink()
+    (prefix / "current").symlink_to("releases/1.2.2")
+    installer = release_install.Installer(prefix, systemd=False, make_venv=False)
+
+    with installer._install_lock():
+        assert release_trust.load_release_package_signers(prefix) == frozenset({old_package_key})
+
+    with pytest.raises(release_trust.ReleaseTrustError, match="transition is stale"):
+        release_trust.load_release_package_signers(prefix)
 
 
 @pytest.mark.parametrize("target", [

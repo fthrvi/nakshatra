@@ -17,6 +17,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from network import nak  # noqa: E402
 import client  # noqa: E402
 import nakshatra_serve as serve  # noqa: E402
+from release_trust import ReleaseTrustError  # noqa: E402
 
 
 PIN = "17" * 32
@@ -725,6 +726,33 @@ def test_auto_models_retry_409_then_appear_without_restart(tmp_path, monkeypatch
         assert appeared.wait(1.0), "409 retry did not run"
         assert _wait_for_model_names(models, ["llama32-3b"])
         assert calls[:2] == [1, 2]
+    finally:
+        models.close()
+
+
+def test_auto_models_retry_transient_release_trust_error(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    appeared = threading.Event()
+    calls = 0
+    entry = serve.ModelEntry(name="llama32-3b", tokenizer_gguf="/fake.gguf",
+                             registry_url="https://pillar.example", num_layers=28)
+
+    def discover(_url):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ReleaseTrustError("signed release transition is briefly unavailable")
+        appeared.set()
+        return {entry.name: entry}
+
+    models = serve.AutoModelRegistry(
+        "https://pillar.example", refresh_s=60,
+        retry_delays=(0.01,), discover_fn=discover)
+    try:
+        models.start()
+        assert appeared.wait(1.0), "release-trust retry did not run"
+        assert _wait_for_model_names(models, ["llama32-3b"])
+        assert calls == 2
     finally:
         models.close()
 

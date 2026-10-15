@@ -216,7 +216,7 @@ def _switch(prefix: Path, version: str) -> None:
 
 
 def _install_lock_is_held(prefix: Path) -> bool:
-    """Non-blockingly probe the exact flock used by installer operations."""
+    """Non-blockingly probe for an exclusive installer operation."""
     try:
         fd = os.open(prefix / ".install.lock", os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
     except FileNotFoundError:
@@ -226,7 +226,9 @@ def _install_lock_is_held(prefix: Path) -> bool:
         if not stat.S_ISREG(metadata.st_mode):
             raise InstallError("installer lock is not a regular file")
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # Probes are mutually compatible; only the installer's LOCK_EX makes this
+            # fail.  Otherwise one observer could look like an installer to another.
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
         except OSError as e:
             if e.errno in (errno.EACCES, errno.EAGAIN):
                 return True

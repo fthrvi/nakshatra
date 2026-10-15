@@ -2,14 +2,17 @@
 from __future__ import annotations
 
 import importlib.util
+import fcntl
 import io
 import json
 import time
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
+import threading
 from pathlib import Path
 
 import pytest
@@ -275,6 +278,11 @@ def test_c9f0fed_updater_bootstraps_transition_and_timer_crossing(env, monkeypat
         "source": str(env["dist"]), "channel": "canary", "pubkey": env["pub"],
         "current": "0.15.12", "previous": None,
     })
+    # 0.15.12 and older created this directory through generic helpers.  Exercise
+    # the real crossing with the permissive mode observed on deployed nodes.
+    state = prefix / "state"
+    state.mkdir(mode=0o775)
+    state.chmod(0o775)
 
     old = _load_c9f0fed_installer(env["tmp"])
     updater = old.Installer(
@@ -295,6 +303,7 @@ def test_c9f0fed_updater_bootstraps_transition_and_timer_crossing(env, monkeypat
     assert os.readlink(prefix / "current") == "releases/0.15.13"
     assert json.loads((prefix / "config.json").read_text())["current"] == "0.15.13"
     assert json.loads((prefix / "state" / I.TRANSITION_FILE).read_text())["from"] == "0.15.12"
+    assert stat.S_IMODE(state.stat().st_mode) == 0o700
 
     # The crossing rewrites the timer's oneshot to the installer in the signed new release. Execute
     # that exact path as the next timer tick: it must recover the completed compatibility journal.
@@ -1367,6 +1376,49 @@ def test_installer_lock_times_out_a_second_caller(tmp_path, monkeypatch):
     with first._install_lock():
         with pytest.raises(I.InstallError, match="another installer operation"):
             second.prune()
+
+
+def test_installer_exclusive_lock_waits_for_shared_probe_without_deadlock(
+        tmp_path, monkeypatch):
+    prefix = tmp_path / "node"
+    prefix.mkdir()
+    installer = I.Installer(prefix, systemd=False, make_venv=False)
+    lock_path = prefix / ".install.lock"
+    attempted = threading.Event()
+    acquired = threading.Event()
+    failures = []
+    real_flock = I.fcntl.flock
+
+    with lock_path.open("a+") as reader:
+        real_flock(reader, fcntl.LOCK_SH)
+        installer_thread = None
+
+        def observe_attempt(fd, operation):
+            if (threading.current_thread() is installer_thread
+                    and operation == (fcntl.LOCK_EX | fcntl.LOCK_NB)):
+                attempted.set()
+            return real_flock(fd, operation)
+
+        monkeypatch.setattr(I.fcntl, "flock", observe_attempt)
+
+        def acquire_installer_lock():
+            try:
+                with installer._install_lock():
+                    acquired.set()
+            except BaseException as exc:
+                failures.append(exc)
+
+        installer_thread = threading.Thread(
+            target=acquire_installer_lock, name="installer-lock-waiter")
+        installer_thread.start()
+        assert attempted.wait(1.0), "installer never attempted its exclusive lock"
+        assert not acquired.is_set()
+        real_flock(reader, fcntl.LOCK_UN)
+        installer_thread.join(timeout=1.0)
+
+    assert not installer_thread.is_alive()
+    assert acquired.is_set()
+    assert failures == []
 
 
 def _one_service_install(tmp_path, *, managed=True):

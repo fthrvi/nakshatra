@@ -56,7 +56,7 @@ def _version_tuple(version: object) -> tuple[int, ...]:
 
 
 def _installer_lock_is_held(*, root_fd: int) -> bool:
-    """Return whether the prefix's installer flock is held by another open description."""
+    """Return whether the prefix's exclusive installer flock is held."""
     try:
         fd = os.open(
             ".install.lock", os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=root_fd)
@@ -66,7 +66,9 @@ def _installer_lock_is_held(*, root_fd: int) -> bool:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise ValueError("installer lock is not a regular file")
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # Observers share this probe lock.  Only a real installer takes LOCK_EX, so
+            # overlapping readers cannot impersonate an installer to one another.
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
         except OSError as e:
             if e.errno in (errno.EACCES, errno.EAGAIN):
                 return True
