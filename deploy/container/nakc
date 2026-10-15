@@ -77,10 +77,11 @@ valid_port() {
 }
 
 run_args() {
-    local runtime="$1" share_path share_mode worker_port p2p_port
+    local runtime="$1" share_path share_mode worker_port gateway_on p2p_port
     share_path="$(config_read share-path)"
     share_mode="$(config_read share-mode)"
     worker_port="$(config_read worker-port)"
+    gateway_on="$(config_read gateway-on)"
     p2p_port="${NAKC_P2P_PORT:-$(config_read p2p-port)}"
     p2p_port="${p2p_port:-4001}"
     valid_port "$p2p_port" || die "p2p port must be between 1 and 65535"
@@ -109,6 +110,12 @@ run_args() {
         RUN_ARGS+=(--env "NAK_CONTAINER_WORKER=1" --env "NAK_CONTAINER_P2P_PORT=$p2p_port"
             --publish "0.0.0.0:$p2p_port:$p2p_port/tcp"
             --publish "0.0.0.0:$p2p_port:$p2p_port/udp")
+    elif [ -n "$gateway_on" ]; then
+        # With no host IP, Docker/Podman publish on every available IPv4 and IPv6 host
+        # address. Keeping host and container ports equal gives libp2p truthful addresses.
+        RUN_ARGS+=(--env "NAK_CONTAINER_CONSUMER_P2P_PORT=$p2p_port"
+            --publish "$p2p_port:$p2p_port/tcp"
+            --publish "$p2p_port:$p2p_port/udp")
     fi
     case "$VARIANT" in
         nvidia)
@@ -130,6 +137,9 @@ start_container() {
     run_args "$runtime"
     if [ -n "$(config_read worker-port)" ]; then
         printf 'nakc: deliberate public port: libp2p sidecar 0.0.0.0:%s (tcp+udp); worker gRPC stays on container loopback\n' \
+            "${NAKC_P2P_PORT:-$(config_read p2p-port)}" >&2
+    elif [ -n "$(config_read gateway-on)" ]; then
+        printf 'nakc: deliberate public port: libp2p sidecar 0.0.0.0:%s (tcp+udp) for direct paths; forwards nothing inbound\n' \
             "${NAKC_P2P_PORT:-$(config_read p2p-port)}" >&2
     fi
     run "$runtime" "${RUN_ARGS[@]}"
@@ -168,7 +178,7 @@ EOF
 
 main() {
     [ "$#" -gt 0 ] || { usage; exit 2; }
-    local command="$1" runtime port path mode old_port old_p2p_port p2p_port item
+    local command="$1" runtime port path mode old_port old_gateway old_p2p_port p2p_port item
     shift
     runtime="$(engine)"
     case "$command" in
@@ -230,9 +240,36 @@ main() {
                             ;;
                     esac
                 done
+                old_gateway="$(config_read gateway-on)"
+                old_p2p_port="$(config_read p2p-port)"
+                p2p_port="${NAKC_P2P_PORT:-${old_p2p_port:-4001}}"
+                valid_port "$p2p_port" || die "NAKC_P2P_PORT must be between 1 and 65535"
+                config_write gateway-on 1
+                config_write p2p-port "$p2p_port"
+                start_container "$runtime"
+                if ! run "$runtime" exec -i "$CONTAINER_NAME" nak gateway on \
+                        --bind 0.0.0.0 --port 11599 --allow-lan "$@"; then
+                    if [ -n "$old_gateway" ]; then
+                        config_write gateway-on "$old_gateway"
+                    else
+                        rm -f "$CONFIG_DIR/gateway-on"
+                    fi
+                    if [ -n "$old_p2p_port" ]; then
+                        config_write p2p-port "$old_p2p_port"
+                    else
+                        rm -f "$CONFIG_DIR/p2p-port"
+                    fi
+                    start_container "$runtime"
+                    return 1
+                fi
+            elif [ "$1" = off ]; then
+                old_gateway="$(config_read gateway-on)"
                 ensure_running "$runtime"
-                run "$runtime" exec -i "$CONTAINER_NAME" nak gateway on \
-                    --bind 0.0.0.0 --port 11599 --allow-lan "$@"
+                run "$runtime" exec -i "$CONTAINER_NAME" nak gateway "$@"
+                rm -f "$CONFIG_DIR/gateway-on"
+                if [ -n "$old_gateway" ] && [ -z "$(config_read worker-port)" ] && [ "$DRY_RUN" != 1 ]; then
+                    start_container "$runtime"
+                fi
             else
                 ensure_running "$runtime"
                 run "$runtime" exec -i "$CONTAINER_NAME" nak gateway "$@"

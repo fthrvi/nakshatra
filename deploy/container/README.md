@@ -106,12 +106,18 @@ exposed to the LAN. The worker's gRPC port always binds container
 loopback and is never published. While the worker is on, its libp2p sidecar is the one deliberate
 public ingress:
 `0.0.0.0:4001` over both TCP and UDP/QUIC by default. Set `NAKC_P2P_PORT` on the first
-`nakc worker on` to choose another fixed port. Turning the worker off removes both publications.
-Host networking is never used.
+`nakc worker on` to choose another fixed port. Turning the worker off removes both publications
+unless the consumer gateway is also on. Host networking is never used.
 
-A consumer-only sidecar still opens its authenticated libp2p listening socket because DCUtR hole
-punching requires both peers to listen. Without `worker.env`, however, its effective command has no
-`-nakd-inbound` or `-inbound` target, so it forwards no inbound streams to a local service.
+`nakc gateway on` gives a consumer the same kind of direct path: one fixed public libp2p port,
+`4001` by default, with the same number inside and outside the container over TCP and UDP/QUIC.
+The host-unspecified publication binds every available IPv4 and IPv6 host address. Set
+`NAKC_P2P_PORT` on the first `nakc gateway on` to choose another port; the choice is persisted for
+later `nakc start` runs and is shared if the node subsequently becomes a worker. The port carries
+authenticated, encrypted libp2p traffic only. A consumer's effective sidecar command deliberately
+has neither a `-nakd-inbound` nor an `-inbound` target, so it forwards nothing inbound to a local
+service. `nakc gateway off` removes the consumer publication on the next container start unless a
+configured worker still needs that same port.
 
 Tune resource ceilings without weakening the file boundary:
 

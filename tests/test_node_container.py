@@ -143,6 +143,28 @@ def test_worker_p2p_port_is_configurable_and_persisted(tmp_path):
     assert "0.0.0.0:24001:24001/tcp" in argv and "NAK_CONTAINER_P2P_PORT=24001" in argv
 
 
+def test_worker_dry_run_golden_is_byte_identical(tmp_path):
+    result = _nakc(tmp_path, "worker", "on", "--port", "50051")
+    assert result.returncode == 0
+    assert result.stderr == (
+        "nakc: deliberate public port: libp2p sidecar 0.0.0.0:4001 (tcp+udp); "
+        "worker gRPC stays on container loopback\n"
+    )
+    assert result.stdout == (
+        "+ docker run -d --name nakshatra-node --hostname nakshatra-node "
+        "--label io.nakshatra.role=node --restart unless-stopped --user 11600:11600 "
+        "--cap-drop ALL --security-opt no-new-privileges --read-only "
+        "--tmpfs /tmp:rw\\,nosuid\\,nodev\\,size=2g\\,mode=1777 --pids-limit 512 "
+        "--memory 16g --network bridge --stop-timeout 20 --publish "
+        "127.0.0.1:11600:11599/tcp --env NAK_UPDATE_INTERVAL_S=3600 --volume "
+        "nakshatra-node-state:/state --env NAK_CONTAINER_WORKER=1 --env "
+        "NAK_CONTAINER_P2P_PORT=4001 --publish 0.0.0.0:4001:4001/tcp --publish "
+        "0.0.0.0:4001:4001/udp nakshatra-node:cpu \n"
+        "+ docker exec -i nakshatra-node nak p2p on \n"
+        "+ docker exec -i nakshatra-node nak worker on --port 50051 \n"
+    )
+
+
 def test_join_dry_run_never_prints_the_invite(tmp_path):
     secret = "nki1.SUPER_SECRET_TOKEN"
     result = _nakc(tmp_path, "join", f"fake bootstrap {secret}")
@@ -169,6 +191,14 @@ def test_gateway_on_uses_fixed_internal_endpoint_and_explicit_lan_ack(tmp_path):
     run_index = next(index for index, line in enumerate(lines) if line.startswith("+ docker run "))
     exec_index = next(index for index, line in enumerate(lines) if line.startswith("+ docker exec "))
     assert run_index < exec_index
+    argv = _dry_run_argv(result.stdout)
+    assert "NAK_CONTAINER_CONSUMER_P2P_PORT=4001" in argv
+    assert "4001:4001/tcp" in argv and "4001:4001/udp" in argv
+    assert not any(item.startswith("0.0.0.0:4001:") for item in argv)
+    assert result.stderr == (
+        "nakc: deliberate public port: libp2p sidecar 0.0.0.0:4001 (tcp+udp) "
+        "for direct paths; forwards nothing inbound\n"
+    )
     assert not any(" nak p2p on " in f" {line} " for line in lines)
     command = lines[exec_index]
     assert shlex.split(command.removeprefix("+ ")) == [
@@ -177,6 +207,43 @@ def test_gateway_on_uses_fixed_internal_endpoint_and_explicit_lan_ack(tmp_path):
         "--pillar-url", "https://pillar.example", "--pillar-spki", "17" * 32,
         "--ledger-url", "https://pillar.example/ledger",
     ]
+
+
+def test_gateway_p2p_port_is_configurable_and_persisted(tmp_path):
+    enabled = _nakc(tmp_path, "gateway", "on", NAKC_P2P_PORT="24001")
+    assert enabled.returncode == 0, enabled.stderr
+    enabled_argv = _dry_run_argv(enabled.stdout)
+    assert "NAK_CONTAINER_CONSUMER_P2P_PORT=24001" in enabled_argv
+    assert "24001:24001/tcp" in enabled_argv and "24001:24001/udp" in enabled_argv
+
+    restarted_argv = _dry_run_argv(_nakc(tmp_path, "start").stdout)
+    assert "NAK_CONTAINER_CONSUMER_P2P_PORT=24001" in restarted_argv
+    assert "24001:24001/tcp" in restarted_argv and "24001:24001/udp" in restarted_argv
+
+
+def test_gateway_off_removes_consumer_publish_on_next_start(tmp_path):
+    assert _nakc(tmp_path, "gateway", "on").returncode == 0
+    disabled = _nakc(tmp_path, "gateway", "off")
+    assert disabled.returncode == 0, disabled.stderr
+    assert "+ docker exec -i nakshatra-node nak gateway off" in disabled.stdout
+
+    restarted_argv = _dry_run_argv(_nakc(tmp_path, "start").stdout)
+    assert not any(item.startswith("NAK_CONTAINER_CONSUMER_P2P_PORT=") for item in restarted_argv)
+    assert "4001:4001/tcp" not in restarted_argv
+    assert "4001:4001/udp" not in restarted_argv
+
+
+def test_gateway_off_keeps_worker_publish(tmp_path):
+    assert _nakc(tmp_path, "gateway", "on").returncode == 0
+    assert _nakc(tmp_path, "worker", "on", "--port", "50051").returncode == 0
+    assert _nakc(tmp_path, "gateway", "off").returncode == 0
+
+    restarted_argv = _dry_run_argv(_nakc(tmp_path, "start").stdout)
+    assert "NAK_CONTAINER_WORKER=1" in restarted_argv
+    assert "NAK_CONTAINER_P2P_PORT=4001" in restarted_argv
+    assert "0.0.0.0:4001:4001/tcp" in restarted_argv
+    assert "0.0.0.0:4001:4001/udp" in restarted_argv
+    assert not any(item.startswith("NAK_CONTAINER_CONSUMER_P2P_PORT=") for item in restarted_argv)
 
 
 def test_gateway_on_rejects_endpoint_overrides(tmp_path):
@@ -407,6 +474,34 @@ def test_container_consumer_effective_p2p_command_listens_but_forwards_nothing(t
     assert "-listen" in effective and "/ip4/0.0.0.0/tcp/0" in effective
     assert "-quic" in effective
     assert not any(arg.startswith(("-nakd-inbound", "-inbound")) for arg in effective)
+
+
+def test_published_container_consumer_uses_fixed_tcp_and_quic_port_without_inbound(
+        tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    env_dir = home / ".nakshatra"
+    env_dir.mkdir(parents=True)
+    p2p_env = env_dir / "p2p.env"
+    p2p_env.write_text("P2P_RELAYS=test\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("NAK_CONTAINER_WORKER", raising=False)
+    monkeypatch.setenv("NAK_CONTAINER_CONSUMER_P2P_PORT", "24001")
+    instance = supervisor.Supervisor(tmp_path / "prefix", tmp_path / "units", tmp_path / "sock",
+                                     refresh=False, control=False)
+
+    instance.reconcile_container_env()
+
+    values = supervisor._env_file(p2p_env)
+    assert values == {
+        "P2P_RELAYS": "test",
+        "NAKSHATRA_P2P_NAKD_INBOUND": "",
+        "NAKSHATRA_P2P_WORKER_ARGS": "-listen /ip4/0.0.0.0/tcp/24001",
+    }
+    effective = _effective_p2p_argv(tmp_path, home)
+    assert effective[-2:] == ["-listen", "/ip4/0.0.0.0/tcp/24001"]
+    assert "-quic" in effective  # derives /ip4/0.0.0.0/udp/24001/quic-v1
+    assert not any(arg.startswith(("-nakd-inbound", "-inbound")) for arg in effective)
+
 
 def test_supervisor_reload_refreshes_environment_file_without_starting_service(tmp_path):
     units = tmp_path / "units"
