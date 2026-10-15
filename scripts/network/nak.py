@@ -237,9 +237,11 @@ def _enable_p2p_service_locked(_sp, *, owner_token: str = "") -> None:
     env = Path.home() / ".nakshatra" / "p2p.env"
     consumer_env = Path.home() / ".nakshatra" / "p2p-consumer.env"
     created = False
-    took_over_consumer = False
+    p2p_config_changed = False
     old_env = env.read_bytes() if env.exists() else None
     old_consumer_env = consumer_env.read_bytes() if consumer_env.exists() else None
+    p2p_was_live = old_env is not None and _p2p_unit_enabled(_sp)
+    protect_gateway = False
     if not env.exists():
         env.parent.mkdir(parents=True, exist_ok=True)
         ownership = f"{GATEWAY_PROFILE_OWNER_PREFIX}{owner_token}\n" if owner_token else ""
@@ -250,17 +252,48 @@ def _enable_p2p_service_locked(_sp, *, owner_token: str = "") -> None:
         created = True
     elif not owner_token:
         # An explicit `nak p2p on` takes the gateway-created consumer sidecar over for the
-        # operator. Restore the signed unit's default nakd inbound before enabling/restarting it.
-        took_over_consumer = _remove_env_assignment(
+        # operator. Restore the signed unit's default nakd inbound in the owned base file; a live
+        # consumer-only gateway remains protected by the final override until it is stopped.
+        p2p_config_changed = _remove_env_assignment(
             env, "NAKSHATRA_P2P_NAKD_INBOUND")
-    if not owner_token and consumer_env.exists():
-        consumer_env.unlink()
-        took_over_consumer = True
+    if not owner_token:
+        protect_gateway = (
+            "NAK_CONTAINER_CONSUMER_P2P_PORT" not in os.environ
+            and _gateway_unit_enabled(_sp)
+            and not _worker_unit_enabled(_sp)
+        )
+        if protect_gateway:
+            before = consumer_env.read_bytes() if consumer_env.exists() else None
+            _write_p2p_consumer_env()
+            p2p_config_changed = p2p_config_changed or consumer_env.read_bytes() != before
+        elif consumer_env.exists():
+            consumer_env.unlink()
+            p2p_config_changed = True
     try:
         _p2p_installer(_sp, "enable")
-        if took_over_consumer:
+        if p2p_config_changed and not created:
             _p2p_installer(_sp, "restart")
     except (Exception, SystemExit) as enable_error:
+        if p2p_was_live:
+            # This was a takeover/reload of an existing sidecar, not a new service. Never stop the
+            # old generation as compensation: restore its base config and restart it, while keeping
+            # a live consumer-only gateway protected even if its pre-transition override was stale.
+            if old_env is not None:
+                _write_private(env, old_env)
+            if protect_gateway:
+                _write_p2p_consumer_env()
+            elif old_consumer_env is None:
+                consumer_env.unlink(missing_ok=True)
+            else:
+                _write_private(consumer_env, old_consumer_env)
+            try:
+                _p2p_installer(_sp, "restart")
+            except (Exception, SystemExit) as rollback_error:
+                raise SystemExit(
+                    f"{enable_error}; rollback could not restart nakshatra-p2p: {rollback_error}"
+                ) from enable_error
+            raise
+
         # A failed enable may have started the unit before its stability check failed: stop it again.
         disabled = False
         disable_error = None
@@ -270,14 +303,17 @@ def _enable_p2p_service_locked(_sp, *, owner_token: str = "") -> None:
             disable_error = error
         else:
             disabled = True
-        # A failed stop means the sidecar may still be live. Preserve both its opt-in and, for a
-        # gateway-created generation, the ownership token so `nak gateway off` can retry safely.
-        if created and disabled:
-            env.unlink(missing_ok=True)
-        elif old_env is not None:
-            _write_private(env, old_env)
-        if old_consumer_env is not None:
-            _write_private(consumer_env, old_consumer_env)
+        # Restore prior files only after a confirmed stop. If the stop failed, the sidecar may be
+        # live, so its current role-safe argv and recovery opt-in must remain authoritative.
+        if disabled:
+            if old_env is None:
+                env.unlink(missing_ok=True)
+            else:
+                _write_private(env, old_env)
+            if old_consumer_env is None:
+                consumer_env.unlink(missing_ok=True)
+            else:
+                _write_private(consumer_env, old_consumer_env)
         if disable_error is not None:
             raise SystemExit(
                 f"{enable_error}; rollback could not disable nakshatra-p2p: {disable_error}"
@@ -385,8 +421,8 @@ def _release_gateway_p2p_ownership(_sp) -> None:
         env_token = _gateway_profile_token(p2p_env)
         marker_token = _gateway_marker_token(marker)
         owned = bool(env_token and marker_token and secrets.compare_digest(env_token, marker_token))
-        worker_configured = (Path.home() / ".nakshatra" / "worker.env").is_file()
-        if owned and not worker_configured:
+        worker_enabled = _worker_unit_enabled(_sp)
+        if owned and not worker_enabled:
             _gateway_p2p_before_disable()
             # The hook is a regression-test seam for the old check/act race. Re-read all authority
             # state under the same lock immediately before the irreversible service stop.
@@ -394,8 +430,8 @@ def _release_gateway_p2p_ownership(_sp) -> None:
             marker_token = _gateway_marker_token(marker)
             owned = bool(env_token and marker_token
                          and secrets.compare_digest(env_token, marker_token))
-            worker_configured = (Path.home() / ".nakshatra" / "worker.env").is_file()
-            if owned and not worker_configured:
+            worker_enabled = _worker_unit_enabled(_sp)
+            if owned and not worker_enabled:
                 _p2p_installer(_sp, "disable")
                 p2p_env.unlink(missing_ok=True)
                 removed_consumer_override = False
@@ -606,10 +642,7 @@ def _gateway_on(_sp, args) -> None:
             profile_owner.unlink(missing_ok=True)
             raise
     made_p2p = False
-    host_consumer_override = (
-        "NAK_CONTAINER_CONSUMER_P2P_PORT" not in os.environ
-        and not (Path.home() / ".nakshatra" / "worker.env").is_file()
-    )
+    host_consumer_override = False
     consumer_env = _p2p_consumer_env_path()
     old_consumer_env = consumer_env.read_bytes() if consumer_env.exists() else None
     consumer_override_changed = False
@@ -633,6 +666,7 @@ def _gateway_on(_sp, args) -> None:
         f"NAKSHATRA_LEDGER_SPKI_SHA256={pin}\n"
     ).encode()
     action = "restart" if old_env is not None and _gateway_unit_enabled(_sp) else "enable"
+    gateway_attempted = False
     try:
         _write_private(env_path, body)
         # The existence decision, gateway ownership marker, opt-in creation, and service enable
@@ -640,6 +674,10 @@ def _gateway_on(_sp, args) -> None:
         with _p2p_ownership_lock():
             p2p_env, p2p_owner = _gateway_p2p_paths()
             made_p2p = not p2p_env.exists()
+            host_consumer_override = (
+                "NAK_CONTAINER_CONSUMER_P2P_PORT" not in os.environ
+                and not _worker_unit_enabled(_sp)
+            )
             if host_consumer_override:
                 _write_p2p_consumer_env()
                 consumer_override_changed = consumer_env.read_bytes() != old_consumer_env
@@ -649,8 +687,38 @@ def _gateway_on(_sp, args) -> None:
                 _enable_p2p_service_locked(_sp, owner_token=p2p_owner_token)
             elif consumer_override_changed:
                 _p2p_installer(_sp, "restart")
+        gateway_attempted = True
         _gateway_installer(_sp, action)
-    except (Exception, SystemExit):
+    except (Exception, SystemExit) as transition_error:
+        # A restart failure belongs to an already-live gateway generation. Restore its prior
+        # configuration, but keep the consumer override continuously in place: the failed restart
+        # may have left either generation running. A second restart is the compensating action.
+        if action == "restart":
+            if old_env is not None:
+                _write_private(env_path, old_env)
+            if gateway_attempted:
+                try:
+                    _gateway_installer(_sp, "restart")
+                except (Exception, SystemExit) as rollback_error:
+                    raise SystemExit(
+                        f"{transition_error}; rollback could not restart {GATEWAY_SERVICE}: "
+                        f"{rollback_error}"
+                    ) from transition_error
+            raise
+
+        # An enable operation can fail after systemd has started the gateway but before its
+        # stability check completes. Do not remove any protection until a compensating disable has
+        # confirmed that the gateway stopped.
+        if gateway_attempted:
+            try:
+                _gateway_installer(_sp, "disable")
+            except (Exception, SystemExit) as rollback_error:
+                raise SystemExit(
+                    f"{transition_error}; rollback could not disable {GATEWAY_SERVICE}: "
+                    f"{rollback_error}"
+                ) from transition_error
+
+        cleanup_errors = []
         if old_env is None:
             env_path.unlink(missing_ok=True)
         else:
@@ -658,8 +726,11 @@ def _gateway_on(_sp, args) -> None:
         if made_profile:
             _release_gateway_profile_ownership()
         if made_p2p:
-            _release_gateway_p2p_ownership(_sp)
-        if consumer_override_changed:
+            try:
+                _release_gateway_p2p_ownership(_sp)
+            except (Exception, SystemExit) as error:
+                cleanup_errors.append(f"could not restore p2p ownership: {error}")
+        elif consumer_override_changed:
             with _p2p_ownership_lock():
                 if old_consumer_env is None:
                     consumer_env.unlink(missing_ok=True)
@@ -668,22 +739,44 @@ def _gateway_on(_sp, args) -> None:
                 if _p2p_enabled():
                     try:
                         _p2p_installer(_sp, "restart")
-                    except (Exception, SystemExit):
-                        pass
+                    except (Exception, SystemExit) as error:
+                        cleanup_errors.append(f"could not restart restored p2p: {error}")
+        if cleanup_errors:
+            raise SystemExit(f"{transition_error}; rollback " + "; ".join(cleanup_errors)) \
+                from transition_error
         raise
     print(f"gateway ON at http://{args.bind}:{args.port}/v1 (credits enforced)")
 
 
-def _gateway_unit_enabled(_sp) -> bool:
-    try:
-        result = _sp.run(
-            ["systemctl", "--user", "is-enabled", f"{GATEWAY_SERVICE}.service"],
-            capture_output=True, text=True, check=False)
-    except OSError:
-        return False
-    return result.returncode == 0 and (result.stdout or "").strip() not in {
-        "disabled", "masked", "not-found",
+def _unit_enabled_or_active(_sp, service: str) -> bool:
+    """Conservatively recognize a unit that can still be serving traffic.
+
+    Opt-in files are configuration, not liveness. In particular, a disabled worker may retain a
+    recovery copy of worker.env after a failed transition, while an active transient unit may no
+    longer report enabled. Treat either positive systemd state as live.
+    """
+    positive = {
+        "enabled", "enabled-runtime", "linked", "linked-runtime", "alias",
+        "active", "activating", "reloading",
     }
+    for command in ("is-enabled", "is-active"):
+        try:
+            result = _sp.run(
+                ["systemctl", "--user", command, f"{service}.service"],
+                capture_output=True, text=True, check=False)
+        except (OSError, AttributeError):
+            continue
+        if result.returncode == 0 and (getattr(result, "stdout", "") or "").strip() in positive:
+            return True
+    return False
+
+
+def _gateway_unit_enabled(_sp) -> bool:
+    return _unit_enabled_or_active(_sp, GATEWAY_SERVICE)
+
+
+def _p2p_unit_enabled(_sp) -> bool:
+    return _unit_enabled_or_active(_sp, "nakshatra-p2p")
 
 
 def _gateway_off(_sp) -> None:
@@ -892,6 +985,7 @@ def _worker_enable_locked(_sp, args) -> None:
     consumer_env = _p2p_consumer_env_path()
     old_consumer_env = consumer_env.read_bytes() if consumer_env.exists() else None
     took_over_p2p = False
+    worker_was_live = old_env is not None and _worker_unit_enabled(_sp)
     if old_env is None:
         missing = [name for name in ("model_id", "package_url", "package_pubkey", "pillar_url", "layers", "port")
                    if getattr(args, name) in (None, "")]
@@ -943,8 +1037,11 @@ def _worker_enable_locked(_sp, args) -> None:
         f"-inbound=127.0.0.1:{port} -require-direct-activation",
     )
     consumer_env.unlink(missing_ok=True)
+    action = "restart" if worker_was_live else "enable"
+    worker_attempted = False
     try:
-        _worker_installer(_sp, "enable")
+        worker_attempted = True
+        _worker_installer(_sp, action)
         if _p2p_enabled():
             took_over_p2p = True
             _remove_env_assignment(p2p_env, "NAKSHATRA_P2P_NAKD_INBOUND")
@@ -953,13 +1050,47 @@ def _worker_enable_locked(_sp, args) -> None:
         else:
             took_over_p2p = True
             p2p_owner.unlink(missing_ok=True)
-    except (Exception, SystemExit):
-        # enable may have started the unit before its stability check failed. Ask the same verified
-        # installer to stop it, then restore exactly the opt-in state the operator had beforehand.
+    except (Exception, SystemExit) as transition_error:
+        # A pre-existing worker must never be stopped as compensation for a failed reconfiguration.
+        # Put its prior config back, keep the consumer override absent, and restart both readers.
+        if action == "restart":
+            if old_env is not None:
+                _write_private(env_path, old_env)
+            consumer_env.unlink(missing_ok=True)
+            rollback_errors = []
+            if _p2p_enabled():
+                try:
+                    _p2p_installer(_sp, "restart")
+                except (Exception, SystemExit) as error:
+                    rollback_errors.append(f"could not restart restored p2p: {error}")
+            if worker_attempted:
+                try:
+                    _worker_installer(_sp, "restart")
+                except (Exception, SystemExit) as error:
+                    rollback_errors.append(f"could not restart {WORKER_SERVICE}: {error}")
+            if rollback_errors:
+                raise SystemExit(f"{transition_error}; rollback " + "; ".join(rollback_errors)) \
+                    from transition_error
+            raise
+
+        # enable may have started the unit before its stability check failed. Restore prior files
+        # only after the compensating disable confirms that the worker is stopped.
         try:
             _worker_installer(_sp, "disable")
-        except (Exception, SystemExit):
-            pass
+        except (Exception, SystemExit) as disable_error:
+            restart_error = None
+            if _p2p_enabled():
+                try:
+                    _p2p_installer(_sp, "restart")
+                except (Exception, SystemExit) as error:
+                    restart_error = error
+            detail = (
+                f"{transition_error}; rollback could not disable {WORKER_SERVICE}: {disable_error}"
+            )
+            if restart_error is not None:
+                detail += f"; could not restart p2p with retained worker inbound: {restart_error}"
+            raise SystemExit(detail) from transition_error
+
         if old_env is None:
             env_path.unlink(missing_ok=True)
         else:
@@ -973,13 +1104,17 @@ def _worker_enable_locked(_sp, args) -> None:
                 p2p_owner.unlink(missing_ok=True)
             else:
                 _write_private(p2p_owner, old_p2p_owner)
-        if old_consumer_env is not None:
+        if old_consumer_env is None:
+            consumer_env.unlink(missing_ok=True)
+        else:
             _write_private(consumer_env, old_consumer_env)
         if _p2p_enabled():
             try:
                 _p2p_installer(_sp, "restart")
-            except (Exception, SystemExit):
-                pass
+            except (Exception, SystemExit) as rollback_error:
+                raise SystemExit(
+                    f"{transition_error}; rollback could not restart restored p2p: {rollback_error}"
+                ) from transition_error
         raise
     print(f"worker ON ({env_path})")
     if not _p2p_enabled():
@@ -993,15 +1128,21 @@ def _worker_disable(_sp) -> None:
 
 def _worker_disable_locked(_sp) -> None:
     _root, _record, env_path = _worker_paths()
-    old_env = env_path.read_bytes() if env_path.exists() else None
-    if old_env is not None:
-        _set_env_assignment(env_path, "NAKSHATRA_P2P_WORKER_ARGS", None)
     try:
         _worker_installer(_sp, "disable")
     except (Exception, SystemExit):
-        if old_env is not None:
-            _write_private(env_path, old_env)
         raise
+    # The worker is now confirmed stopped. A mock/dev installer may retain worker.env, so remove
+    # its stale inbound assignment explicitly; a real installer has already removed the opt-in.
+    if env_path.exists():
+        _set_env_assignment(env_path, "NAKSHATRA_P2P_WORKER_ARGS", None)
+    protect_gateway = (
+        "NAK_CONTAINER_CONSUMER_P2P_PORT" not in os.environ
+        and _gateway_unit_enabled(_sp)
+    )
+    if protect_gateway:
+        # This final override must exist before the sidecar reloads without worker inbound.
+        _write_p2p_consumer_env()
     if _p2p_enabled():
         _p2p_installer(_sp, "restart")
     print("worker OFF")
@@ -1035,16 +1176,7 @@ def _owner_lease_path() -> Path:
 
 
 def _worker_unit_enabled(_sp) -> bool:
-    try:
-        result = _sp.run(
-            ["systemctl", "--user", "is-enabled", f"{WORKER_SERVICE}.service"],
-            capture_output=True, text=True, check=False,
-        )
-    except OSError:
-        return False
-    return result.returncode == 0 and (result.stdout or "").strip() not in {
-        "disabled", "masked", "not-found",
-    }
+    return _unit_enabled_or_active(_sp, WORKER_SERVICE)
 
 
 def _owner_lease_values(path: Path) -> dict[str, str]:
@@ -1389,7 +1521,7 @@ def main(argv=None, *, http_post=None) -> int:
                 _sp.run(["systemctl", "--user", "restart", "nak-net.service"], check=False)
             # The worker reads the P2P state only at startup. Keep the ownership check and restart in
             # this same transaction so gateway release cannot race it.
-            if (Path.home() / ".nakshatra" / "worker.env").is_file():
+            if _worker_unit_enabled(_sp):
                 _worker_installer(_sp, "restart")
                 print("worker restarted so it advertises the new p2p state")
         print(f"p2p {'OFF' if a.onoff == 'off' else 'ON via ' + str(dial)}; nak-net restarted")

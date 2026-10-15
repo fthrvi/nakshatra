@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric import ed25519
@@ -18,6 +19,19 @@ import worker_service
 
 
 TREE = "6d5b567d598666d20281db6548bbefd582d26f05"
+
+
+def _worker_on_args(**overrides):
+    values = {
+        "model_id": "qwen", "package_url": "https://models.test/qwen",
+        "package_pubkey": "cd" * 32, "pillar_url": "http://localhost",
+        "pillar_spki": None, "trusted_pillar_nets": "10.42.0.0/24",
+        "listen_address": "0.0.0.0", "layers": "0-16", "port": 5530,
+        "idle_unload_s": 600.0, "release_grace_s": 30.0,
+        "warm_directives": "on", "mode": "first",
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
 
 
 def _fake_release(prefix: Path) -> Path:
@@ -160,10 +174,94 @@ def test_nak_worker_on_and_off_restart_opted_in_sidecar_through_installer(
     assert nak.main(["worker", "off"]) == 0
     assert "NAKSHATRA_P2P_WORKER_ARGS" not in (
         home / ".nakshatra" / "worker.env").read_text()
-    assert calls == [
+    installer_calls = [call for call in calls if call and call[0] == sys.executable]
+    assert installer_calls == [
         [sys.executable, str(installer), "--prefix", str(prefix), "disable", "nakshatra-worker"],
         [sys.executable, str(installer), "--prefix", str(prefix), "restart", "nakshatra-p2p"],
     ]
+
+
+def test_worker_off_with_live_gateway_writes_consumer_override_before_p2p_restart(
+        tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    state = home / ".nakshatra"
+    state.mkdir(parents=True)
+    (state / "p2p.env").write_text("P2P_RELAYS=test\n")
+    (state / "worker.env").write_text(
+        'PORT=5530\nNAKSHATRA_P2P_WORKER_ARGS="-inbound=127.0.0.1:5530"\n')
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(nak, "_worker_installer", lambda *_args: None)
+    monkeypatch.setattr(nak, "_gateway_unit_enabled", lambda _sp: True)
+    restarts = []
+
+    def p2p_installer(_sp, action):
+        assert (state / "p2p-consumer.env").exists()
+        restarts.append(action)
+
+    monkeypatch.setattr(nak, "_p2p_installer", p2p_installer)
+
+    nak._worker_disable(object())
+
+    assert restarts == ["restart"]
+    assert "NAKSHATRA_P2P_WORKER_ARGS" not in (state / "worker.env").read_text()
+    assert (state / "p2p-consumer.env").read_text() == (
+        'NAKSHATRA_P2P_NAKD_INBOUND=""\nNAKSHATRA_P2P_WORKER_ARGS=""\n')
+
+
+def test_worker_enable_failed_stop_retains_new_config_and_worker_inbound(
+        tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    state = home / ".nakshatra"
+    state.mkdir(parents=True)
+    (state / "p2p.env").write_text("P2P_RELAYS=test\n")
+    (state / "p2p-consumer.env").write_text(
+        'NAKSHATRA_P2P_NAKD_INBOUND=""\nNAKSHATRA_P2P_WORKER_ARGS=""\n')
+    monkeypatch.setenv("HOME", str(home))
+    actions = []
+
+    def worker_installer(_sp, action):
+        actions.append(action)
+        raise SystemExit(f"worker {action} failed")
+
+    monkeypatch.setattr(nak, "_worker_installer", worker_installer)
+    monkeypatch.setattr(nak, "_p2p_installer", lambda *_args: None)
+
+    with pytest.raises(SystemExit, match=r"enable failed; rollback could not disable"):
+        nak._worker_enable(object(), _worker_on_args())
+
+    worker_env = state / "worker.env"
+    assert actions == ["enable", "disable"]
+    assert worker_env.exists()
+    assert '-inbound=127.0.0.1:5530' in worker_env.read_text()
+    assert not (state / "p2p-consumer.env").exists()
+
+
+def test_worker_enable_confirmed_stop_restores_prior_consumer_state(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    state = home / ".nakshatra"
+    state.mkdir(parents=True)
+    (state / "p2p.env").write_text("P2P_RELAYS=test\n")
+    consumer = state / "p2p-consumer.env"
+    original_consumer = (
+        'NAKSHATRA_P2P_NAKD_INBOUND=""\nNAKSHATRA_P2P_WORKER_ARGS=""\n')
+    consumer.write_text(original_consumer)
+    monkeypatch.setenv("HOME", str(home))
+    actions = []
+
+    def worker_installer(_sp, action):
+        actions.append(action)
+        if action == "enable":
+            raise SystemExit("worker enable failed")
+
+    monkeypatch.setattr(nak, "_worker_installer", worker_installer)
+    monkeypatch.setattr(nak, "_p2p_installer", lambda *_args: None)
+
+    with pytest.raises(SystemExit, match="worker enable failed"):
+        nak._worker_enable(object(), _worker_on_args())
+
+    assert actions == ["enable", "disable"]
+    assert not (state / "worker.env").exists()
+    assert consumer.read_text() == original_consumer
 
 
 def test_nak_worker_on_without_p2p_reports_literal_only(tmp_path, monkeypatch, capsys):

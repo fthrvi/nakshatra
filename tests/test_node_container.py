@@ -605,7 +605,7 @@ def test_gateway_created_consumer_effective_p2p_argv_has_no_inbound(tmp_path, mo
 
 
 @pytest.mark.parametrize("assignment_prefix", [" ", " export "])
-def test_explicit_p2p_on_promotes_gateway_consumer_to_legacy_nakd_inbound(
+def test_explicit_p2p_on_keeps_live_gateway_protected_until_gateway_off(
         tmp_path, monkeypatch, assignment_prefix):
     home = tmp_path / "home"
     token = "ab" * 32
@@ -613,6 +613,9 @@ def test_explicit_p2p_on_promotes_gateway_consumer_to_legacy_nakd_inbound(
     calls = []
     monkeypatch.setattr(
         nak, "_p2p_installer", lambda _sp, action: calls.append(action))
+    monkeypatch.setattr(nak, "_gateway_unit_enabled", lambda _sp: True)
+    monkeypatch.setattr(nak, "_worker_unit_enabled", lambda _sp: False)
+    monkeypatch.setattr(nak, "_gateway_installer", lambda *_args: None)
 
     nak._enable_p2p_service(object(), owner_token=token)
     p2p_env = home / ".nakshatra" / "p2p.env"
@@ -642,10 +645,16 @@ def test_explicit_p2p_on_promotes_gateway_consumer_to_legacy_nakd_inbound(
 
     assert p2p_env.read_bytes() == expected
     assert not owner.exists()
-    assert not (home / ".nakshatra" / "p2p-consumer.env").exists()
+    assert (home / ".nakshatra" / "p2p-consumer.env").exists()
     assert calls == ["enable", "restart"]
     effective = _effective_p2p_argv(tmp_path, home)
-    assert "-nakd-inbound=127.0.0.1:51830" in effective
+    assert not any(arg.startswith(("-nakd-inbound", "-inbound")) for arg in effective)
+
+    nak._gateway_off(object())
+
+    assert not (home / ".nakshatra" / "p2p-consumer.env").exists()
+    assert calls == ["enable", "restart", "restart"]
+    assert "-nakd-inbound=127.0.0.1:51830" in _effective_p2p_argv(tmp_path, home)
 
 
 @pytest.mark.parametrize(
@@ -724,6 +733,144 @@ def test_fresh_worker_effective_p2p_argv_matches_legacy_worker(tmp_path, monkeyp
     assert _effective_p2p_argv(tmp_path, home) == _legacy_p2p_argv(
         tmp_path, home, "legacy-relay", worker_args
     )
+
+
+@pytest.mark.parametrize(("transition", "faults"), [
+    ("gateway-on", ()),
+    ("gateway-on", ("gateway:enable:1",)),
+    ("gateway-on", ("gateway:enable:1", "gateway:disable:1")),
+    ("gateway-on", ("p2p:restart:1",)),
+    ("gateway-restart", ("gateway:restart:1",)),
+    ("gateway-restart", ("gateway:restart:1", "gateway:restart:2")),
+    ("gateway-off", ()),
+    ("gateway-off", ("gateway:disable:1",)),
+    ("gateway-off", ("p2p:restart:1",)),
+    ("worker-on", ()),
+    ("worker-on", ("worker:enable:1",)),
+    ("worker-on", ("worker:enable:1", "worker:disable:1")),
+    ("worker-on", ("p2p:restart:1",)),
+    ("worker-on", ("p2p:restart:1", "worker:disable:1")),
+    ("worker-off", ()),
+    ("worker-off", ("worker:disable:1",)),
+    ("worker-off", ("p2p:restart:1",)),
+    ("p2p-on-takeover", ()),
+    ("p2p-on-takeover", ("p2p:enable:1",)),
+    ("p2p-on-takeover", ("p2p:enable:1", "p2p:restart:1")),
+    ("p2p-on-takeover", ("p2p:restart:1",)),
+    ("p2p-on-takeover", ("p2p:restart:1", "p2p:restart:2")),
+    ("p2p-off", ()),
+    ("p2p-off", ("p2p:disable:1",)),
+])
+def test_host_transition_matrix_preserves_effective_p2p_invariant(
+        tmp_path, monkeypatch, transition, faults):
+    """Every host role transition leaves effective sidecar argv safe, including rollback paths."""
+    home = tmp_path / "home"
+    state = home / ".nakshatra"
+    net = state / "net"
+    net.mkdir(parents=True)
+    (state / "p2p.env").write_text("P2P_RELAYS=test\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("NAK_NET_DIR", str(net))
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "run"))
+    monkeypatch.setattr(
+        subprocess, "run", lambda *_args, **_kwargs:
+        type("Result", (), {"returncode": 0, "stdout": ""})())
+    monkeypatch.setattr(
+        nak, "load_release_package_signers", lambda: frozenset({"23" * 32}))
+
+    live = {"gateway": False, "worker": False, "p2p": True}
+    if transition in {"gateway-restart", "gateway-off", "worker-on",
+                      "worker-off", "p2p-on-takeover"}:
+        live["gateway"] = True
+        (state / "gateway.env").write_text("PORT=11600\nOLD=1\n")
+        nak._write_p2p_consumer_env()
+    if transition in {"worker-off", "p2p-off"}:
+        live["worker"] = True
+        (state / "worker.env").write_text(
+            'PORT=5530\nNAKSHATRA_P2P_WORKER_ARGS="-inbound=127.0.0.1:5530 '
+            '-require-direct-activation"\n')
+        (state / "p2p-consumer.env").unlink(missing_ok=True)
+    if transition == "gateway-on":
+        # The reproduction: configured worker, disabled unit. Configuration must not suppress
+        # consumer protection.
+        (state / "worker.env").write_text("PORT=5530\n")
+    if transition == "p2p-on-takeover":
+        token = "ab" * 32
+        (state / "p2p.env").write_text(
+            f'P2P_RELAYS=test\nNAKSHATRA_P2P_NAKD_INBOUND=""\n'
+            f'# nak-gateway-owned: {token}\n')
+        owner = state / "gateway" / "p2p-profile-created"
+        owner.parent.mkdir(parents=True)
+        owner.write_text(token + "\n")
+
+    calls = []
+    counts = {}
+    fault_set = set(faults)
+
+    def operate(service, action):
+        key = (service, action)
+        counts[key] = counts.get(key, 0) + 1
+        calls.append(f"{service}:{action}:{counts[key]}")
+        if action in {"enable", "restart"}:
+            # enable may start before its stability check fails; restart may leave either
+            # generation live. Model the conservative live outcome.
+            live[service] = True
+        if calls[-1] in fault_set:
+            raise SystemExit(f"injected {calls[-1]} failure")
+        if action == "disable":
+            live[service] = False
+            {"gateway": state / "gateway.env", "worker": state / "worker.env",
+             "p2p": state / "p2p.env"}[service].unlink(missing_ok=True)
+
+    monkeypatch.setattr(nak, "_gateway_unit_enabled", lambda _sp: live["gateway"])
+    monkeypatch.setattr(nak, "_worker_unit_enabled", lambda _sp: live["worker"])
+    monkeypatch.setattr(nak, "_p2p_unit_enabled", lambda _sp: live["p2p"])
+    monkeypatch.setattr(nak, "_gateway_installer", lambda _sp, action: operate("gateway", action))
+    monkeypatch.setattr(nak, "_worker_installer", lambda _sp, action: operate("worker", action))
+    monkeypatch.setattr(nak, "_p2p_installer", lambda _sp, action: operate("p2p", action))
+
+    gateway_args = SimpleNamespace(
+        port=11600, bind="127.0.0.1", allow_lan=False,
+        pillar_url="https://pillar.example:7778", pillar_spki="17" * 32,
+        ledger_url="https://pillar.example/ledger", models="auto",
+        package_url="https://models.example/qwen", package_pubkey="23" * 32,
+    )
+    worker_args = SimpleNamespace(
+        model_id="qwen", package_url="https://models.example/qwen",
+        package_pubkey="cd" * 32, pillar_url="http://localhost", pillar_spki=None,
+        trusted_pillar_nets="10.42.0.0/24", listen_address="0.0.0.0",
+        layers="0-16", port=5530, idle_unload_s=600.0, release_grace_s=30.0,
+        warm_directives="on", mode="first",
+    )
+
+    def drive():
+        if transition in {"gateway-on", "gateway-restart"}:
+            nak._gateway_on(object(), gateway_args)
+        elif transition == "gateway-off":
+            nak._gateway_off(object())
+        elif transition == "worker-on":
+            nak._worker_enable(object(), worker_args)
+        elif transition == "worker-off":
+            nak._worker_disable(object())
+        elif transition == "p2p-on-takeover":
+            nak.main(["p2p", "on"])
+        else:
+            nak.main(["p2p", "off"])
+
+    if faults:
+        with pytest.raises(SystemExit, match="injected"):
+            drive()
+    else:
+        drive()
+
+    if live["p2p"] and (state / "p2p.env").exists():
+        effective = _effective_p2p_argv(tmp_path, home)
+        inbound = [arg for arg in effective if arg.startswith("-inbound=")]
+        nakd_inbound = [arg for arg in effective if arg.startswith("-nakd-inbound=")]
+        if live["worker"]:
+            assert inbound == ["-inbound=127.0.0.1:5530"], (transition, faults, calls, effective)
+        elif live["gateway"]:
+            assert inbound == [] and nakd_inbound == [], (transition, faults, calls, effective)
 
 
 def test_container_env_keeps_worker_private_without_rewriting_gateway_files(tmp_path, monkeypatch):

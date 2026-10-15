@@ -142,6 +142,30 @@ def test_gateway_on_adds_final_consumer_override_without_rewriting_operator_p2p(
     assert not (home / ".nakshatra" / "gateway" / "p2p-profile-created").exists()
 
 
+def test_gateway_on_protects_consumer_when_worker_is_configured_but_disabled(
+        tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    state = home / ".nakshatra"
+    state.mkdir(parents=True)
+    (state / "p2p.env").write_text("P2P_RELAYS=operator\n")
+    (state / "worker.env").write_text("PORT=5530\n")
+    calls = []
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(nak, "_worker_unit_enabled", lambda _sp: False)
+    monkeypatch.setattr(nak, "_gateway_unit_enabled", lambda _sp: False)
+    monkeypatch.setattr(nak, "_p2p_installer", lambda _sp, action: calls.append(("p2p", action)))
+    monkeypatch.setattr(
+        nak, "_gateway_installer", lambda _sp, action: calls.append(("gateway", action)))
+
+    nak._gateway_on(object(), _args())
+
+    assert (state / "p2p-consumer.env").read_text() == (
+        'NAKSHATRA_P2P_NAKD_INBOUND=""\n'
+        'NAKSHATRA_P2P_WORKER_ARGS=""\n'
+    )
+    assert calls == [("p2p", "restart"), ("gateway", "enable")]
+
+
 def test_gateway_off_removes_final_consumer_override_under_p2p_ownership(
         tmp_path, monkeypatch):
     home = tmp_path / "home"
@@ -198,8 +222,9 @@ def test_gateway_enable_failure_rolls_back_created_profile_ownership(tmp_path, m
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setattr(nak, "_gateway_unit_enabled", lambda _sp: False)
 
-    def fail_enable(_sp, _action):
-        raise SystemExit("enable failed")
+    def fail_enable(_sp, action):
+        if action == "enable":
+            raise SystemExit("enable failed")
 
     monkeypatch.setattr(nak, "_gateway_installer", fail_enable)
     with pytest.raises(SystemExit, match="enable failed"):
@@ -210,6 +235,58 @@ def test_gateway_enable_failure_rolls_back_created_profile_ownership(tmp_path, m
     assert not (home / ".nakshatra" / "gateway" / "inference-profile-created").exists()
     assert not (home / ".nakshatra" / "p2p.env").exists()
     assert not (home / ".nakshatra" / "gateway" / "p2p-profile-created").exists()
+
+
+def test_gateway_enable_failed_stop_retains_opt_in_and_consumer_protection(
+        tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(nak, "_gateway_unit_enabled", lambda _sp: False)
+    actions = []
+
+    def gateway_installer(_sp, action):
+        actions.append(action)
+        raise SystemExit(f"gateway {action} failed")
+
+    monkeypatch.setattr(nak, "_gateway_installer", gateway_installer)
+    with pytest.raises(SystemExit, match=r"enable failed; rollback could not disable"):
+        nak._gateway_on(object(), _args())
+
+    state = home / ".nakshatra"
+    assert actions == ["enable", "disable"]
+    assert (state / "gateway.env").exists()
+    assert (state / "inference.env").exists()
+    assert (state / "p2p.env").exists()
+    assert (state / "p2p-consumer.env").exists()
+
+
+def test_gateway_restart_rollback_keeps_consumer_override_throughout(
+        tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    state = home / ".nakshatra"
+    state.mkdir(parents=True)
+    gateway_env = state / "gateway.env"
+    gateway_env.write_text("PORT=11599\nOLD=1\n")
+    (state / "p2p.env").write_text("P2P_RELAYS=operator\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(nak, "_gateway_unit_enabled", lambda _sp: True)
+    monkeypatch.setattr(nak, "_worker_unit_enabled", lambda _sp: False)
+    monkeypatch.setattr(nak, "_p2p_installer", lambda *_args: None)
+    actions = []
+
+    def gateway_installer(_sp, action):
+        actions.append(action)
+        assert (state / "p2p-consumer.env").exists()
+        if len(actions) == 1:
+            raise SystemExit("new restart failed")
+
+    monkeypatch.setattr(nak, "_gateway_installer", gateway_installer)
+    with pytest.raises(SystemExit, match="new restart failed"):
+        nak._gateway_on(object(), _args(port=11601))
+
+    assert actions == ["restart", "restart"]
+    assert gateway_env.read_text() == "PORT=11599\nOLD=1\n"
+    assert (state / "p2p-consumer.env").exists()
 
 
 def test_gateway_enable_failed_stop_keeps_p2p_ownership_for_off_retry(tmp_path, monkeypatch):
@@ -395,6 +472,7 @@ def test_gateway_off_preserves_gateway_owned_p2p_when_worker_is_configured(tmp_p
     owner = gateway / "p2p-profile-created"
     owner.write_text(f"{token}\n")
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(nak, "_worker_unit_enabled", lambda _sp: True)
     monkeypatch.setattr(nak, "_gateway_installer", lambda *_args: None)
     monkeypatch.setattr(
         nak, "_p2p_installer", lambda *_args: pytest.fail("worker still owns p2p"))
@@ -423,10 +501,15 @@ def test_gateway_off_rechecks_worker_ownership_between_check_and_disable(tmp_pat
     monkeypatch.setattr(
         nak, "_p2p_installer", lambda _sp, action: calls.append(("p2p", action)))
 
+    worker_enabled = False
+
     def worker_takes_ownership():
+        nonlocal worker_enabled
         (state / "worker.env").write_text("PORT=50051\n")
+        worker_enabled = True
 
     monkeypatch.setattr(nak, "_gateway_p2p_before_disable", worker_takes_ownership)
+    monkeypatch.setattr(nak, "_worker_unit_enabled", lambda _sp: worker_enabled)
     nak._gateway_off(object())
 
     assert calls == [("gateway", "disable")]
