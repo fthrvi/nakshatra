@@ -32,7 +32,8 @@ Interface (`main.go`):
 - `-relay` — also be a public relay + AutoNAT server (run on a reachable box).
 - `-dial-listen PATH` — accept `DIAL <peerid>` from nakd on a mode-0600 UNIX socket, open the dedicated nakd protocol, and return only a direct stream.
 - `-relay-activation-fallback` — after the direct wait, permit dynamic `FORWARD` activation
-  streams on the existing limited relay circuit.
+  streams on the existing limited relay circuit. The per-peer relay decision is cached so accepted
+  clients do not repeat the wait; a background direct-path attempt upgrades later connections.
 - `-allow-relayed-activation` — mandatory worker opt-in for every relayed activation stream,
   independent of the worker's `-require-direct-activation` direct-path policy. The release wiring
   requires both dialer and worker flags.

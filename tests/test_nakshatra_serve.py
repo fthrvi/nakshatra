@@ -148,6 +148,14 @@ def test_chain_backend_passes_p2p_socket_to_client(monkeypatch, tmp_path):
     assert env["NAKSHATRA_P2P_SOCKET"] == "/run/user/1000/nakshatra/p2p.sock"
 
 
+def test_chain_backend_passes_tls_probe_timeout_to_client(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("NKS_REGISTRY_KEYID", "test-node")
+    monkeypatch.setenv("NAKSHATRA_TLS_PROBE_TIMEOUT_S", "25")
+    env = ns.ChainChatBackend._client_env()
+    assert env["NAKSHATRA_TLS_PROBE_TIMEOUT_S"] == "25"
+
+
 def test_chain_backend_preserves_explicit_blank_p2p_socket(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("NKS_REGISTRY_KEYID", "test-node")

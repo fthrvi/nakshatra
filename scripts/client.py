@@ -209,6 +209,11 @@ def _open_chain_channel(address: str, expected_spki: str | None,
         return _wtls.open_pinned_channel(
             address, expected_spki,
             refuse_unpinned=(tls_mode == "required"),
+            # Read this at the gateway-request boundary instead of relying on
+            # nakshatra_tls's import-time default. The gateway passes its full
+            # EnvironmentFile to this subprocess, so an operator override is
+            # now explicit in the call that owns the actual SPKI probe.
+            probe_timeout_s=_wtls._probe_timeout_from_env(),
         )
     except _wtls.PinError as e:
         sys.exit(f"[chain] TLS pin failure for {address}: {e}")

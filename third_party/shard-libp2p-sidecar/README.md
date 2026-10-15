@@ -70,7 +70,10 @@ is never carried over the relay circuit.
 
 Dynamic inference `FORWARD` tunnels may opt into `-relay-activation-fallback`. They still wait
 for a direct path first (`-direct-wait`, unchanged at 15 seconds by default), then use the existing
-limited circuit connection. The worker must independently pass `-allow-relayed-activation`;
+limited circuit connection. That path choice is completed before `FORWARD` returns and cached for
+the peer: accepted loopback connections use the relay immediately while one background direct-path
+upgrader keeps trying, then later connections prefer the upgraded direct path. The worker must
+independently pass `-allow-relayed-activation`;
 otherwise it resets every relayed activation stream, regardless of
 `-require-direct-activation`. Managed workers continue to pass `-require-direct-activation` for
 their direct-path policy.

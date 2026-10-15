@@ -5,11 +5,14 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1703,6 +1706,182 @@ func relayTestHosts(t *testing.T, circuitBytes int64, connectCircuit bool) (host
 func relayOnlyTestHosts(t *testing.T, circuitBytes int64) (host.Host, host.Host, peer.AddrInfo) {
 	t.Helper()
 	return relayTestHosts(t, circuitBytes, true)
+}
+
+func TestDynamicForwardRelayOnlyTLSRoundTripDoesNotRepeatDirectWait(t *testing.T) {
+	newKey := func() crypto.PrivKey {
+		priv, _, err := crypto.GenerateEd25519Key(rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return priv
+	}
+	consumerKey, workerKey, relayKey := newKey(), newKey(), newKey()
+	consumerID, err := peer.IDFromPrivateKey(consumerKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workerID, err := peer.IDFromPrivateKey(workerKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	allowPath := filepath.Join(t.TempDir(), "relay.allow")
+	if err := os.WriteFile(allowPath,
+		[]byte(consumerID.String()+"\n"+workerID.String()+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	config := defaultRelayServerConfig()
+	config.allowFile = allowPath
+	relay, err := newHost(relayKey, "/ip4/127.0.0.1/tcp/0", natOpts{
+		quic: true, relayService: true, relayConfig: &config,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = relay.Close() })
+	var relayQUIC []multiaddr.Multiaddr
+	for _, addr := range relay.Addrs() {
+		if strings.Contains(addr.String(), "/quic-v1") {
+			relayQUIC = append(relayQUIC, addr)
+		}
+	}
+	if len(relayQUIC) == 0 {
+		t.Skip("test relay has no QUIC address")
+	}
+	relayInfo := peer.AddrInfo{ID: relay.ID(), Addrs: relayQUIC}
+	consumerPolicy, err := newOutboundDialPolicy([]peer.AddrInfo{relayInfo}, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	workerPolicy, err := newOutboundDialPolicy([]peer.AddrInfo{relayInfo}, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	consumer, err := newHost(consumerKey, "/ip4/127.0.0.1/tcp/0", natOpts{
+		quic: true, disableHolePunching: true,
+		staticRelays: []peer.AddrInfo{relayInfo}, dialPolicy: consumerPolicy,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = consumer.Close() })
+	worker, err := newHost(workerKey, "/ip4/127.0.0.1/tcp/0", natOpts{
+		quic: true, disableHolePunching: true,
+		staticRelays: []peer.AddrInfo{relayInfo}, dialPolicy: workerPolicy,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = worker.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := worker.Connect(ctx, relayInfo); err != nil {
+		t.Fatalf("worker connect relay: %v", err)
+	}
+	if _, err := relayclient.Reserve(ctx, worker, relayInfo); err != nil {
+		t.Fatalf("worker reserve relay: %v", err)
+	}
+	circuitAddrs := addRelayCircuitAddrs(consumer, worker.ID(), []peer.AddrInfo{relayInfo})
+	if err := consumerPolicy.withDialCandidates(worker.ID(), circuitAddrs, func() error {
+		return consumer.Connect(ctx, peer.AddrInfo{ID: worker.ID(), Addrs: circuitAddrs})
+	}); err != nil {
+		t.Fatalf("consumer connect circuit: %v", err)
+	}
+	if directConn(consumer, worker.ID()) != nil || relayedConn(consumer, worker.ID()) == nil {
+		t.Fatal("test peers did not connect exclusively through the allowlisted relay")
+	}
+
+	engine := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request body: %v", err)
+			return
+		}
+		_, _ = w.Write(append([]byte("worker:"), body...))
+	}))
+	t.Cleanup(engine.Close)
+	runInboundWithPolicy(worker, engine.Listener.Addr().String(), true, true)
+
+	sockPath := filepath.Join(t.TempDir(), "nakshatra", "p2p.sock")
+	ln, err := listenDialSocket(sockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	const directWait = 5200 * time.Millisecond
+	go serveDialListener(consumer, ln, []peer.AddrInfo{relayInfo}, directWait, consumerPolicy, true)
+
+	request := "FORWARD " + worker.ID().String()
+	line := controlRequest(t, sockPath, request)
+	if !strings.HasPrefix(line, "OK 127.0.0.1:") {
+		t.Fatalf("reply = %q", line)
+	}
+	forwardAddr := strings.TrimSpace(strings.TrimPrefix(line, "OK "))
+	roundTrip := func(body string) {
+		t.Helper()
+		dialer := &net.Dialer{Timeout: 5 * time.Second}
+		tlsConn, err := tls.DialWithDialer(dialer, "tcp", forwardAddr, &tls.Config{
+			InsecureSkipVerify: true, // The assertion here is transport reachability; client.py pins SPKI.
+		})
+		if err != nil {
+			t.Fatalf("TLS handshake through dynamic FORWARD: %v", err)
+		}
+		defer tlsConn.Close()
+		if err := tlsConn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fmt.Fprintf(tlsConn,
+			"POST / HTTP/1.1\r\nHost: worker\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
+			len(body), body); err != nil {
+			t.Fatal(err)
+		}
+		response, err := http.ReadResponse(bufio.NewReader(tlsConn), &http.Request{Method: http.MethodPost})
+		if err != nil {
+			t.Fatalf("read TLS response through dynamic FORWARD: %v", err)
+		}
+		got, err := io.ReadAll(response.Body)
+		_ = response.Body.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != "worker:"+body {
+			t.Fatalf("round trip body = %q, want %q", got, "worker:"+body)
+		}
+	}
+	roundTrip("activation-bytes-1")
+
+	// A new client.py process asks FORWARD again for every gateway request. Once this peer is known
+	// to be relay-only, neither that control request nor its accepted TLS connection may pay the
+	// direct wait again; the one background upgrader remains responsible for later DCUtR success.
+	reusedAt := time.Now()
+	if reused := controlRequest(t, sockPath, request); reused != line {
+		t.Fatalf("cached reply = %q, want %q", reused, line)
+	}
+	if elapsed := time.Since(reusedAt); elapsed >= time.Second {
+		t.Fatalf("cached relay-only FORWARD repeated path selection: %v", elapsed)
+	}
+	roundTrip("activation-bytes-2")
+
+	// Model a later DCUtR/Identify result by making a safe LAN address available after relay traffic
+	// is already flowing. No new FORWARD request or accepted client is allowed to drive this dial:
+	// the cached forward's single background upgrader must establish it on its own.
+	if err := worker.Network().Listen(multiaddr.StringCast("/ip4/0.0.0.0/tcp/0")); err != nil {
+		t.Fatal(err)
+	}
+	directAddrs := preferredDirectDialAddrs(worker.Addrs())
+	if len(directAddrs) == 0 {
+		t.Skip("test host has no non-loopback LAN address for background upgrade")
+	}
+	consumer.Peerstore().AddAddrs(worker.ID(), directAddrs, peerstore.TempAddrTTL)
+	upgradeDeadline := time.Now().Add(5 * time.Second)
+	for directConn(consumer, worker.ID()) == nil && time.Now().Before(upgradeDeadline) {
+		time.Sleep(25 * time.Millisecond)
+	}
+	if directConn(consumer, worker.ID()) == nil {
+		t.Fatal("background direct-path upgrade did not use the newly learned address")
+	}
+	roundTrip("activation-bytes-direct-upgrade")
 }
 
 func TestRelayDestinationWithoutReservationConsumesNoBudget(t *testing.T) {

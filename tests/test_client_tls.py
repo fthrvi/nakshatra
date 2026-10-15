@@ -107,6 +107,7 @@ def test_open_chain_channel_auto_with_hash_pins():
         out = cli._open_chain_channel("h:1", "a" * 64, "auto")
     mock_tls.open_pinned_channel.assert_called_once_with(
         "h:1", "a" * 64, refuse_unpinned=False,
+        probe_timeout_s=mock_tls._probe_timeout_from_env.return_value,
     )
     assert out is mock_tls.open_pinned_channel.return_value
 
@@ -121,6 +122,7 @@ def test_open_chain_channel_auto_no_hash_pins_unpinned_falls_through():
         out = cli._open_chain_channel("h:1", None, "auto")
     mock_tls.open_pinned_channel.assert_called_once_with(
         "h:1", None, refuse_unpinned=False,
+        probe_timeout_s=mock_tls._probe_timeout_from_env.return_value,
     )
     assert out is ch
 
@@ -146,7 +148,19 @@ def test_open_chain_channel_required_passes_refuse_unpinned_true():
         cli._open_chain_channel("h:1", "a" * 64, "required")
     mock_tls.open_pinned_channel.assert_called_once_with(
         "h:1", "a" * 64, refuse_unpinned=True,
+        probe_timeout_s=mock_tls._probe_timeout_from_env.return_value,
     )
+
+
+def test_open_chain_channel_reads_probe_timeout_from_gateway_environment(monkeypatch):
+    monkeypatch.setenv("NAKSHATRA_TLS_PROBE_TIMEOUT_S", "25")
+    channel = MagicMock(name="channel")
+    with patch.object(nt, "open_pinned_channel", return_value=channel) as opened:
+        out = cli._open_chain_channel("h:1", "a" * 64, "required")
+    opened.assert_called_once_with(
+        "h:1", "a" * 64, refuse_unpinned=True, probe_timeout_s=25.0,
+    )
+    assert out is channel
 
 
 def test_open_chain_channel_mismatch_exits_with_both_hashes():
