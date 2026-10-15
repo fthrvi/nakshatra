@@ -77,18 +77,37 @@ limited circuit connection. The worker must independently pass `-allow-relayed-a
 circuit (`-relay-circuit-bytes`), 6 hours (`-relay-circuit-duration`), 64 concurrent circuits total
 (`-relay-max-circuits`), and 2 per peer (`-relay-circuits-per-peer`). The global UTC-day budget is
 20 GiB (`-relay-daily-bytes`) and the per-peer budget is 2 GiB (`-relay-peer-daily-bytes`).
-go-libp2p's byte callback has no peer identity, so a circuit is charged its full admitted cap in
-both directions (128 MiB with defaults), and only after the destination reservation and STOP
-handshake succeed. State is written atomically with mode 0600 to `-relay-state`; by default this is
-`<key>.relay-state.json` (or `./relay-state.json` when no `-key` was supplied). The persisted maximum
-UTC day prevents a backward clock adjustment from granting a fresh budget.
+Each attempt receives an identity-bound admission token carrying source and destination from the
+reservation check through establish, failure, and close. Pending plus active attempts share the
+global and per-peer concurrency limits. A successful circuit is conservatively charged its full
+possible traffic in both directions (128 MiB with defaults); a failed attempt releases its exact
+reservation without charging another attempt. Admission happens only after the destination's relay
+reservation is confirmed.
 
-Use `-relay-allow-file PATH` to close relay admission. The file contains one identity per line,
+`-relay` requires `-relay-allow-file PATH` and refuses to start without it. `-relay-open` is an
+explicit test/lab escape hatch and emits a loud warning; do not use it in production. The allow
+file contains one identity per line,
 either a libp2p PeerId or the 64-lowercase/uppercase-hex Ed25519 **node public key**. When this flag
 is present, reservations require the destination to be listed and circuits require both source and
-destination to be listed. The file reloads when its mtime or size changes; missing, unreadable, or
-malformed files deny everyone. Without the flag, legacy open admission remains enabled and startup
-logs `relay open to any peer`.
+destination to be listed. Blank lines and `#` comment lines are ignored, and CRLF is accepted. The
+loader uses one `O_NOFOLLOW` descriptor for validation and reading, caps the file at 1 MiB and
+10,000 entries, and detects changes by device/inode/size/nanosecond-mtime plus SHA-256. Symlinks,
+missing/unreadable files, and any malformed non-comment line deny everyone and log its line number.
+The allow file is read-only input and need not be owned by the relay uid: the production
+`root:nakshatra-sidecar-relay` mode `0640` file is accepted.
+
+State is written with mode 0600 to `-relay-state`; by default this is `<key>.relay-state.json` (or
+`./relay-state.json` when no `-key` was supplied). A sibling lock is exclusively flocked for the
+relay lifetime, so a second process using the same state refuses to start. Existing state must be a
+non-symlink regular file owned by the running uid and not group/world writable. Corruption refuses
+startup. Writes use temp + fsync + rename + directory fsync. The persisted maximum UTC day prevents
+a backward clock adjustment from granting a fresh budget.
+
+The VPS relay launch is:
+
+```bash
+nakshatra-sidecar -relay -key ... -listen /ip4/0.0.0.0/tcp/29700 -quic -announce ... -relay-allow-file /var/lib/nakshatra-sidecar-relay/relay.allow -relay-state /var/lib/nakshatra-sidecar-relay/relay-state.json
+```
 
 For signed Nakshatra releases, `scripts/sidecar_key.py` deterministically builds the sidecar
 `node.key` from `~/.nakshatra/keys/worker.ed25519`. Therefore the correct allow-file hex is the

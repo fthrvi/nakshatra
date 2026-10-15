@@ -75,6 +75,10 @@ Relay service defaults are explicitly capped at 64 MiB per direction per circuit
 128 MiB bidirectional admitted cap against persistent 20 GiB global and 2 GiB per-peer UTC-day
 budgets. `-relay-allow-file` accepts the roster's node-key hex (the release sidecar key is derived
 from that same key) or its libp2p PeerId; it does not accept the separate operator/release/package
-signing keys. `nak gateway on` enables the
+signing keys. Relay startup requires this file; only explicit tests/labs may bypass it with the
+loudly warned `-relay-open`. The production root-owned, group-readable
+`root:nakshatra-sidecar-relay` mode 0640 allow file is accepted because it is read-only input. The
+state file, unlike the allow file, must be owned by the running relay uid and is exclusively locked
+for the process lifetime. `nak gateway on` enables the
 dialer fallback only in the gateway-owned `p2p.env`; `nak worker relay on|off` atomically toggles
 the worker opt-in and restarts an enabled P2P sidecar.
