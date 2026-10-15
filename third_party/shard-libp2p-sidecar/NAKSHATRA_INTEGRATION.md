@@ -31,6 +31,11 @@ Interface (`main.go`):
 - `-forward LOCAL=PEER_MULTIADDR` — listen on a LOCAL tcp port, carry each conn to PEER (a **coordinator**: one per upstream worker, repeatable).
 - `-relay` — also be a public relay + AutoNAT server (run on a reachable box).
 - `-dial-listen PATH` — accept `DIAL <peerid>` from nakd on a mode-0600 UNIX socket, open the dedicated nakd protocol, and return only a direct stream.
+- `-relay-activation-fallback` — after the direct wait, permit dynamic `FORWARD` activation
+  streams on the existing limited relay circuit.
+- `-allow-relayed-activation` — worker opt-in that relaxes `-require-direct-activation` for
+  activation streams only. The release wiring requires both dialer and worker flags.
+- `-direct-wait DURATION` — direct-path wait before fallback (default remains `15s`).
 
 ## How it plugs into nakshatra (the wiring — next step, needs Go to build)
 The beauty: **nothing in our engine changes.** We only rewrite the chain's worker *addresses* to
@@ -62,4 +67,12 @@ Then a systemd `--user` unit per role, like `neuron-ledger.service`.
 ## Status
 The signed node release builds the pinned source as a static linux/amd64 artifact and ships the
 opt-in `nakshatra-p2p` service. Nakd uses it for both-NAT contact sessions after both contacts enable
-direct paths and advertise p2p; inference-chain tunnel configuration remains a separate deployment.
+direct paths and advertise p2p. Typed inference endpoints use its dynamic `FORWARD` listener; relay
+fallback remains separately opt-in at both the consumer gateway and worker.
+
+Relay service defaults are explicitly capped at 64 MiB per direction per circuit, 10 minutes,
+64 circuits total, and 4 per peer. The 512 MiB per-peer daily budget becomes four UTC-day circuit
+admissions because go-libp2p v0.48 reports transferred bytes without the responsible peer; each
+admission is charged the full possible traffic in both directions. `nak gateway on` enables the
+dialer fallback only in the gateway-owned `p2p.env`; `nak worker relay on|off` atomically toggles
+the worker opt-in and restarts an enabled P2P sidecar.

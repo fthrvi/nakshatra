@@ -100,6 +100,7 @@ def test_gateway_on_writes_loopback_enforced_opt_in(tmp_path, monkeypatch):
         'NAKSHATRA_P2P_NAKD_INBOUND=""\n'
         'NAKSHATRA_P2P_WORKER_ARGS=""\n'
     )
+    assert 'NAKSHATRA_P2P_GATEWAY_ARGS="-relay-activation-fallback"\n' in p2p_env.read_text()
     assert f"# nak-gateway-owned: {p2p_token}\n" in p2p_env.read_text()
     assert (home / ".nakshatra" / "p2p.lock").stat().st_mode & 0o777 == 0o600
     assert calls == ["enable"]

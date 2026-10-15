@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/peerstore"
@@ -128,17 +129,103 @@ func TestNakdInboundRequiresDirectConnection(t *testing.T) {
 }
 
 func TestDirectActivationInboundIsOptIn(t *testing.T) {
-	if !activationPathAllowed(false, true, "/ip4/1.2.3.4/tcp/1/p2p-circuit") {
-		t.Fatal("legacy activation inbound stopped allowing relay circuits")
+	tests := []struct {
+		name                               string
+		requireDirect, allowRelay, limited bool
+		addr                               string
+		want                               bool
+	}{
+		{"legacy relay", false, false, true, "/ip4/1.2.3.4/tcp/1/p2p-circuit", true},
+		{"strict limited", true, false, true, "/ip4/1.2.3.4/tcp/1", false},
+		{"strict circuit", true, false, false, "/ip4/1.2.3.4/tcp/1/p2p-circuit", false},
+		{"strict direct", true, false, false, "/ip4/1.2.3.4/tcp/1", true},
+		{"opted limited", true, true, true, "/ip4/1.2.3.4/tcp/1", true},
+		{"opted circuit", true, true, false, "/ip4/1.2.3.4/tcp/1/p2p-circuit", true},
 	}
-	if activationPathAllowed(true, true, "/ip4/1.2.3.4/tcp/1") {
-		t.Fatal("strict activation inbound accepted a limited connection")
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := activationPathAllowed(tc.requireDirect, tc.allowRelay, tc.limited, tc.addr); got != tc.want {
+				t.Fatalf("activationPathAllowed(%v, %v, %v, %q) = %v, want %v", tc.requireDirect, tc.allowRelay, tc.limited, tc.addr, got, tc.want)
+			}
+		})
 	}
-	if activationPathAllowed(true, false, "/ip4/1.2.3.4/tcp/1/p2p-circuit") {
-		t.Fatal("strict activation inbound accepted a circuit multiaddr")
+}
+
+func TestRelayResourcesAreExplicitAndCapped(t *testing.T) {
+	cfg := defaultRelayServerConfig()
+	resources, guard, err := cfg.resources()
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !activationPathAllowed(true, false, "/ip4/1.2.3.4/tcp/1") {
-		t.Fatal("strict activation inbound rejected a direct connection")
+	if resources.Limit == nil || resources.Limit.Data != 64<<20 || resources.Limit.Duration != 10*time.Minute {
+		t.Fatalf("relay limit = %+v", resources.Limit)
+	}
+	if resources.MaxCircuits != 4 {
+		t.Fatalf("per-peer circuits = %d, want 4", resources.MaxCircuits)
+	}
+	if guard.maxCircuits != 64 || guard.dailyCircuits != 4 {
+		t.Fatalf("guard limits = total %d daily %d, want 64 and 4", guard.maxCircuits, guard.dailyCircuits)
+	}
+	cfg = relayServerConfig{
+		circuitBytes: 12345, circuitDuration: 42 * time.Second,
+		maxCircuits: 7, circuitsPerPeer: 2, peerDailyBytes: 6 * 12345,
+	}
+	resources, guard, err = cfg.resources()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resources.Limit.Data != 12345 || resources.Limit.Duration != 42*time.Second ||
+		resources.MaxCircuits != 2 || guard.maxCircuits != 7 || guard.dailyCircuits != 3 {
+		t.Fatalf("custom flag resources = %+v, guard total=%d daily=%d", resources, guard.maxCircuits, guard.dailyCircuits)
+	}
+
+	cfg.circuitBytes = 0
+	if _, _, err := cfg.resources(); err == nil {
+		t.Fatal("zero circuit byte cap was accepted")
+	}
+	cfg = defaultRelayServerConfig()
+	cfg.circuitsPerPeer = cfg.maxCircuits + 1
+	if _, _, err := cfg.resources(); err == nil {
+		t.Fatal("per-peer cap above total cap was accepted")
+	}
+}
+
+func TestRelayDailyCircuitAccounting(t *testing.T) {
+	g := newRelayGuard(2, 1)
+	now := time.Date(2026, 10, 15, 23, 59, 0, 0, time.UTC)
+	g.now = func() time.Time { return now }
+	src, dest := testPeerID(t), testPeerID(t)
+	addr := multiaddr.StringCast("/ip4/192.0.2.1/tcp/1")
+	if !g.AllowConnect(src, addr, dest) {
+		t.Fatal("first daily circuit was refused")
+	}
+	g.ConnectionOpened()
+	if g.AllowConnect(src, addr, dest) {
+		t.Fatal("second daily circuit was allowed")
+	}
+	g.ConnectionClosed(0)
+	now = now.Add(2 * time.Minute)
+	if !g.AllowConnect(src, addr, dest) {
+		t.Fatal("new UTC-day circuit was refused")
+	}
+}
+
+func TestRelayGlobalCircuitAccounting(t *testing.T) {
+	g := newRelayGuard(1, 10)
+	addr := multiaddr.StringCast("/ip4/192.0.2.1/tcp/1")
+	if !g.AllowConnect(testPeerID(t), addr, testPeerID(t)) {
+		t.Fatal("first circuit was refused")
+	}
+	if g.AllowConnect(testPeerID(t), addr, testPeerID(t)) {
+		t.Fatal("pending circuit did not consume the global slot")
+	}
+	g.ConnectionOpened()
+	if g.AllowConnect(testPeerID(t), addr, testPeerID(t)) {
+		t.Fatal("active circuit did not consume the global slot")
+	}
+	g.ConnectionClosed(0)
+	if !g.AllowConnect(testPeerID(t), addr, testPeerID(t)) {
+		t.Fatal("closed circuit did not release the global slot")
 	}
 }
 
@@ -424,7 +511,7 @@ func (l *gatedAcceptListener) Accept() (net.Conn, error) {
 }
 
 func TestDynamicForwardsAreCachedAndLRUEvictIdle(t *testing.T) {
-	m := newForwardManager(nil, nil, time.Second, nil)
+	m := newForwardManager(nil, nil, time.Second, nil, false)
 	defer m.close()
 	clock := time.Unix(1, 0)
 	m.now = func() time.Time {
@@ -476,7 +563,7 @@ func TestDynamicForwardAcceptIsCountedBeforeEviction(t *testing.T) {
 	}
 	defer h.Close()
 
-	m := newForwardManager(h, nil, 2*time.Second, nil)
+	m := newForwardManager(h, nil, 2*time.Second, nil, false)
 	defer m.close()
 	clock := time.Unix(1, 0)
 	m.now = func() time.Time {
@@ -571,7 +658,7 @@ func TestDynamicForwardAcceptIsCountedBeforeEviction(t *testing.T) {
 }
 
 func TestDynamicForwardLimitDoesNotEvictBusyEntries(t *testing.T) {
-	m := newForwardManager(nil, nil, time.Second, nil)
+	m := newForwardManager(nil, nil, time.Second, nil, false)
 	defer m.close()
 	for i := 0; i < maxDynamicForwards; i++ {
 		id := testPeerID(t)
@@ -757,7 +844,7 @@ func TestDialListenerDirectRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ln.Close()
-	go serveDialListener(a, ln, nil, 5*time.Second, nil)
+	go serveDialListener(a, ln, nil, 5*time.Second, nil, false)
 	c, err := net.Dial("unix", sockPath)
 	if err != nil {
 		t.Fatal(err)
@@ -842,7 +929,7 @@ func TestForwardListenerDirectActivationRoundTripAndCache(t *testing.T) {
 			go func() { defer c.Close(); _, _ = io.Copy(c, c) }()
 		}
 	}()
-	runInboundWithPolicy(b, echo.Addr().String(), true)
+	runInboundWithPolicy(b, echo.Addr().String(), true, false)
 
 	sockPath := filepath.Join(t.TempDir(), "nakshatra", "p2p.sock")
 	ln, err := listenDialSocket(sockPath)
@@ -850,7 +937,7 @@ func TestForwardListenerDirectActivationRoundTripAndCache(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ln.Close()
-	go serveDialListener(a, ln, nil, 5*time.Second, nil)
+	go serveDialListener(a, ln, nil, 5*time.Second, nil, false)
 	request := "FORWARD " + b.ID().String()
 	line := controlRequest(t, sockPath, request)
 	if !strings.HasPrefix(line, "OK 127.0.0.1:") {
@@ -898,7 +985,7 @@ func TestForwardRequestFailsWithoutDirectPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ln.Close()
-	go serveDialListener(h, ln, nil, 50*time.Millisecond, nil)
+	go serveDialListener(h, ln, nil, 50*time.Millisecond, nil, false)
 	line := controlRequest(t, sockPath, "FORWARD "+testPeerID(t).String())
 	if !strings.HasPrefix(line, "ERR no direct connection") {
 		t.Fatalf("reply = %q", line)
@@ -965,4 +1052,151 @@ func TestWaitDirectUsesAddressesLearnedThroughRelay(t *testing.T) {
 	if manet.IsIPLoopback(remote) || manet.IsIP6LinkLocal(remote) {
 		t.Fatalf("direct dial used forbidden peer address %s", remote)
 	}
+}
+
+func relayOnlyTestHosts(t *testing.T, circuitBytes int64) (host.Host, host.Host, peer.AddrInfo) {
+	t.Helper()
+	newKey := func() crypto.PrivKey {
+		priv, _, err := crypto.GenerateEd25519Key(rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return priv
+	}
+	cfg := defaultRelayServerConfig()
+	cfg.circuitBytes = circuitBytes
+	cfg.peerDailyBytes = 32 * circuitBytes
+	relay, err := newHost(newKey(), "/ip4/127.0.0.1/tcp/0", natOpts{relayService: true, relayConfig: &cfg})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = relay.Close() })
+	relayInfo := peer.AddrInfo{ID: relay.ID(), Addrs: relay.Addrs()}
+	policyA, err := newOutboundDialPolicy([]peer.AddrInfo{relayInfo}, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	policyB, err := newOutboundDialPolicy([]peer.AddrInfo{relayInfo}, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := newHost(newKey(), "/ip4/127.0.0.1/tcp/0", natOpts{
+		disableHolePunching: true, staticRelays: []peer.AddrInfo{relayInfo}, dialPolicy: policyA,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = a.Close() })
+	b, err := newHost(newKey(), "/ip4/127.0.0.1/tcp/0", natOpts{
+		disableHolePunching: true, staticRelays: []peer.AddrInfo{relayInfo}, dialPolicy: policyB,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = b.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := b.Connect(ctx, relayInfo); err != nil {
+		t.Fatalf("worker connect relay: %v", err)
+	}
+	if _, err := relayclient.Reserve(ctx, b, relayInfo); err != nil {
+		t.Fatalf("worker reserve relay: %v", err)
+	}
+	circuitAddrs := addRelayCircuitAddrs(a, b.ID(), []peer.AddrInfo{relayInfo})
+	if err := policyA.withDialCandidates(b.ID(), circuitAddrs, func() error {
+		return a.Connect(ctx, peer.AddrInfo{ID: b.ID(), Addrs: circuitAddrs})
+	}); err != nil {
+		t.Fatalf("dial relay circuit: %v", err)
+	}
+	if directConn(a, b.ID()) != nil || relayedConn(a, b.ID()) == nil {
+		t.Fatal("test peers did not connect exclusively through the relay")
+	}
+	return a, b, relayInfo
+}
+
+func TestRelayedActivationRequiresBothEndsToOptIn(t *testing.T) {
+	for _, tc := range []struct {
+		name, dialerOpt, workerOpt string
+		want                       bool
+	}{
+		{"neither", "off", "off", false},
+		{"dialer only", "on", "off", false},
+		{"worker only", "off", "on", false},
+		{"both", "on", "on", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a, b, relayInfo := relayOnlyTestHosts(t, 1<<20)
+			payload := []byte("activation over an encrypted relay circuit")
+			workerAllows := tc.workerOpt == "on"
+			b.SetStreamHandler(activationProto, func(s network.Stream) {
+				if !activationPathAllowed(true, workerAllows, s.Conn().Stat().Limited, s.Conn().RemoteMultiaddr().String()) {
+					_ = s.Reset()
+					return
+				}
+				defer s.Close()
+				buf := make([]byte, len(payload))
+				if _, err := io.ReadFull(s, buf); err == nil {
+					_, _ = s.Write(buf)
+				}
+			})
+
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			dialerAllows := tc.dialerOpt == "on"
+			_, err := waitActivationPath(ctx, a, b.ID(), []peer.AddrInfo{relayInfo}, nil, dialerAllows)
+			cancel()
+			if err != nil {
+				if tc.want {
+					t.Fatalf("activation path: %v", err)
+				}
+				return
+			}
+			streamCtx, streamCancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer streamCancel()
+			s, err := openActivationStream(streamCtx, b.ID(), a.NewStream)
+			if err == nil {
+				_, err = s.Write(payload)
+			}
+			got := make([]byte, len(payload))
+			if err == nil {
+				_, err = io.ReadFull(s, got)
+			}
+			if s != nil {
+				_ = s.Close()
+			}
+			succeeded := err == nil && bytes.Equal(got, payload)
+			if succeeded != tc.want {
+				t.Fatalf("relayed round trip succeeded=%v, want %v (err=%v)", succeeded, tc.want, err)
+			}
+		})
+	}
+}
+
+func TestRelayCircuitByteCapCutsActivation(t *testing.T) {
+	const capBytes = int64(32 << 10)
+	a, b, _ := relayOnlyTestHosts(t, capBytes)
+	received := make(chan int64, 1)
+	b.SetStreamHandler(activationProto, func(s network.Stream) {
+		defer s.Close()
+		n, _ := io.Copy(io.Discard, s)
+		received <- n
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	s, err := openActivationStream(ctx, b.ID(), a.NewStream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := bytes.Repeat([]byte{0xa5}, int(4*capBytes))
+	_, _ = s.Write(payload)
+	_ = s.CloseWrite()
+	select {
+	case n := <-received:
+		if n >= int64(len(payload)) || n > capBytes {
+			t.Fatalf("relay delivered %d bytes from a %d-byte write with cap %d", n, len(payload), capBytes)
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for capped relay stream to close")
+	}
+	_ = s.Close()
 }

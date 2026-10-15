@@ -264,6 +264,56 @@ def test_worker_enable_confirmed_stop_restores_prior_consumer_state(tmp_path, mo
     assert consumer.read_text() == original_consumer
 
 
+def test_nak_worker_relay_toggle_is_atomic_restarts_p2p_and_shows_in_status(
+        tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    state = home / ".nakshatra"
+    state.mkdir(parents=True)
+    worker_env = state / "worker.env"
+    worker_env.write_text(
+        'PORT=5530\nNAKSHATRA_P2P_WORKER_ARGS="-inbound=127.0.0.1:5530 '
+        '-require-direct-activation"\n'
+    )
+    (state / "p2p.env").write_text("P2P_RELAYS=test\n")
+    monkeypatch.setenv("HOME", str(home))
+    calls = []
+    monkeypatch.setattr(nak, "_p2p_installer", lambda _sp, action: calls.append(action))
+
+    assert nak.main(["worker", "relay", "on"]) == 0
+    assert worker_env.read_text().count("-allow-relayed-activation") == 1
+    assert calls == ["restart"]
+
+    class StatusSP:
+        @staticmethod
+        def run(args, **_kwargs):
+            return type("R", (), {"returncode": 0, "stdout": "inactive\n"})()
+
+    assert nak._worker_status(StatusSP())["allow_relayed_activation"] is True
+    assert nak.main(["worker", "relay", "off"]) == 0
+    assert "-allow-relayed-activation" not in worker_env.read_text()
+    assert calls == ["restart", "restart"]
+    assert nak._worker_status(StatusSP())["allow_relayed_activation"] is False
+
+
+def test_nak_worker_relay_restart_failure_restores_exact_env(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    state = home / ".nakshatra"
+    state.mkdir(parents=True)
+    worker_env = state / "worker.env"
+    original = b'PORT=5530\nEXISTING=keep\n'
+    worker_env.write_bytes(original)
+    (state / "p2p.env").write_text("P2P_RELAYS=test\n")
+    monkeypatch.setenv("HOME", str(home))
+
+    def fail(*_args):
+        raise SystemExit("restart failed")
+
+    monkeypatch.setattr(nak, "_p2p_installer", fail)
+    with pytest.raises(SystemExit, match="restart failed"):
+        nak.main(["worker", "relay", "on"])
+    assert worker_env.read_bytes() == original
+
+
 def test_nak_worker_on_without_p2p_reports_literal_only(tmp_path, monkeypatch, capsys):
     home, prefix = tmp_path / "home", tmp_path / "node"
     _fake_release(prefix)

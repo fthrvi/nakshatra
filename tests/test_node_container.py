@@ -738,6 +738,7 @@ def test_gateway_created_consumer_effective_p2p_argv_has_no_inbound(tmp_path, mo
     effective = _effective_p2p_argv(tmp_path, home)
     assert "-listen" in effective and "/ip4/0.0.0.0/tcp/0" in effective
     assert "-quic" in effective
+    assert "-relay-activation-fallback" in effective
     assert not any(arg.startswith(("-nakd-inbound", "-inbound")) for arg in effective)
 
 
@@ -765,7 +766,7 @@ def test_explicit_p2p_on_keeps_live_gateway_protected_until_gateway_off(
     before = p2p_env.read_bytes()
     expected = before.replace(
         f'{assignment_prefix}NAKSHATRA_P2P_NAKD_INBOUND=""\n'.encode(), b""
-    )
+    ).replace(b'NAKSHATRA_P2P_GATEWAY_ARGS="-relay-activation-fallback"\n', b"")
     owner = home / ".nakshatra" / "gateway" / "p2p-profile-created"
     owner.parent.mkdir(parents=True)
     owner.write_text(f"{token}\n")
@@ -786,6 +787,7 @@ def test_explicit_p2p_on_keeps_live_gateway_protected_until_gateway_off(
     assert calls == ["enable", "restart"]
     effective = _effective_p2p_argv(tmp_path, home)
     assert not any(arg.startswith(("-nakd-inbound", "-inbound")) for arg in effective)
+    assert "-relay-activation-fallback" not in effective
 
     nak._gateway_off(object())
 

@@ -14,6 +14,7 @@
 //
 //	-inbound HOST:PORT            tunnel: dial the local engine for each inbound stream
 //	-nakd-inbound HOST:PORT       direct-only tunnel: dial nakd for each nakd stream
+//	-dial-listen PATH             DIAL direct-only; activation FORWARD may opt into relay fallback
 //	-forward LOCAL=PEER_MULTIADDR tunnel: listen LOCAL, carry each conn to PEER (repeatable)
 //	-peer PEER_MULTIADDR          self-test: round-trip one frame to a listener (connectivity check)
 //	(none)                        self-test listener: echo one frame back
@@ -36,6 +37,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -49,6 +51,8 @@ import (
 	"github.com/libp2p/go-libp2p/core/peerstore"
 	"github.com/libp2p/go-libp2p/core/protocol"
 	relayclient "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/client"
+	pbv2 "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/pb"
+	relayv2 "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
 	"github.com/multiformats/go-multiaddr"
 	manet "github.com/multiformats/go-multiaddr/net"
 )
@@ -69,6 +73,12 @@ const (
 	defaultDirectWait    = 15 * time.Second
 	directDialRetryDelay = 250 * time.Millisecond
 	directDialAttemptMax = 3 * time.Second
+
+	defaultRelayCircuitBytes    = int64(64 << 20)
+	defaultRelayCircuitDuration = 10 * time.Minute
+	defaultRelayMaxCircuits     = 64
+	defaultRelayCircuitsPerPeer = 4
+	defaultRelayPeerDailyBytes  = int64(512 << 20)
 )
 
 // openActivationStream opts into circuit-relay connections. go-libp2p marks
@@ -142,11 +152,139 @@ type natOpts struct {
 	announce            string
 	staticRelays        []peer.AddrInfo
 	dialPolicy          *outboundDialPolicy
+	relayConfig         *relayServerConfig
 	// ipv6Listen is a test seam for hosts where binding IPv6 fails. Production uses
 	// h.Network().Listen. IPv6 is deliberately added after the IPv4 host starts so a
 	// kernel or container without IPv6 cannot take the sidecar down.
 	ipv6Listen func(multiaddr.Multiaddr) error
 }
+
+// relayServerConfig keeps the public rendezvous useful for inference while bounding every
+// resource dimension the circuit-v2 API exposes. The API reports transferred bytes without a
+// peer id, so peerDailyBytes is enforced conservatively as a UTC-day circuit allowance: each
+// admitted circuit is charged its full possible traffic in both directions.
+type relayServerConfig struct {
+	circuitBytes    int64
+	circuitDuration time.Duration
+	maxCircuits     int
+	circuitsPerPeer int
+	peerDailyBytes  int64
+}
+
+func defaultRelayServerConfig() relayServerConfig {
+	return relayServerConfig{
+		circuitBytes: defaultRelayCircuitBytes, circuitDuration: defaultRelayCircuitDuration,
+		maxCircuits: defaultRelayMaxCircuits, circuitsPerPeer: defaultRelayCircuitsPerPeer,
+		peerDailyBytes: defaultRelayPeerDailyBytes,
+	}
+}
+
+func (c relayServerConfig) resources() (relayv2.Resources, *relayGuard, error) {
+	if c.circuitBytes <= 0 || c.circuitDuration <= 0 || c.maxCircuits <= 0 ||
+		c.circuitsPerPeer <= 0 || c.peerDailyBytes <= 0 {
+		return relayv2.Resources{}, nil, fmt.Errorf("relay limits must all be positive")
+	}
+	if c.circuitsPerPeer > c.maxCircuits {
+		return relayv2.Resources{}, nil, fmt.Errorf("relay-circuits-per-peer cannot exceed relay-max-circuits")
+	}
+	dailyCircuits := c.peerDailyBytes / c.circuitBytes / 2
+	if dailyCircuits == 0 {
+		return relayv2.Resources{}, nil, fmt.Errorf("relay-peer-daily-bytes must cover one bidirectional circuit")
+	}
+	r := relayv2.DefaultResources()
+	r.Limit = &relayv2.RelayLimit{Duration: c.circuitDuration, Data: c.circuitBytes}
+	r.MaxCircuits = c.circuitsPerPeer
+	guard := newRelayGuard(c.maxCircuits, dailyCircuits)
+	return r, guard, nil
+}
+
+type relayDailyUsage struct {
+	day   string
+	count int64
+}
+
+// relayGuard combines the ACL and metrics hooks. ACL admission accounts per-peer daily circuit
+// attempts and reserves a global slot; metrics release global slots when circuits close. Failed
+// attempts release their pending slot after circuit-v2's 30-second connect timeout.
+type relayGuard struct {
+	mu            sync.Mutex
+	maxCircuits   int
+	dailyCircuits int64
+	active        int
+	nextPending   uint64
+	pending       map[uint64]struct{}
+	usage         map[peer.ID]relayDailyUsage
+	now           func() time.Time
+	bytes         atomic.Int64
+}
+
+func newRelayGuard(maxCircuits int, dailyCircuits int64) *relayGuard {
+	return &relayGuard{
+		maxCircuits: maxCircuits, dailyCircuits: dailyCircuits,
+		pending: make(map[uint64]struct{}), usage: make(map[peer.ID]relayDailyUsage), now: time.Now,
+	}
+}
+
+func (g *relayGuard) AllowReserve(peer.ID, multiaddr.Multiaddr) bool { return true }
+
+func (g *relayGuard) AllowConnect(src peer.ID, _ multiaddr.Multiaddr, dest peer.ID) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.active+len(g.pending) >= g.maxCircuits {
+		return false
+	}
+	day := g.now().UTC().Format("2006-01-02")
+	peers := []peer.ID{src}
+	if dest != src {
+		peers = append(peers, dest)
+	}
+	for _, p := range peers {
+		u := g.usage[p]
+		if u.day == day && u.count >= g.dailyCircuits {
+			return false
+		}
+	}
+	for _, p := range peers {
+		u := g.usage[p]
+		if u.day != day {
+			u = relayDailyUsage{day: day}
+		}
+		u.count++
+		g.usage[p] = u
+	}
+	g.nextPending++
+	token := g.nextPending
+	g.pending[token] = struct{}{}
+	time.AfterFunc(relayv2.ConnectTimeout+time.Second, func() {
+		g.mu.Lock()
+		delete(g.pending, token)
+		g.mu.Unlock()
+	})
+	return true
+}
+
+func (g *relayGuard) RelayStatus(bool) {}
+func (g *relayGuard) ConnectionOpened() {
+	g.mu.Lock()
+	for token := range g.pending {
+		delete(g.pending, token)
+		break
+	}
+	g.active++
+	g.mu.Unlock()
+}
+func (g *relayGuard) ConnectionClosed(time.Duration) {
+	g.mu.Lock()
+	if g.active > 0 {
+		g.active--
+	}
+	g.mu.Unlock()
+}
+func (g *relayGuard) ConnectionRequestHandled(pbv2.Status)  {}
+func (g *relayGuard) ReservationAllowed(bool)               {}
+func (g *relayGuard) ReservationClosed(int)                 {}
+func (g *relayGuard) ReservationRequestHandled(pbv2.Status) {}
+func (g *relayGuard) BytesTransferred(n int)                { g.bytes.Add(int64(n)) }
 
 // outboundDialPolicy is the host-wide SSRF boundary for peer-supplied addresses.
 // Identify and Identify Push can replace peerstore entries at any time, so filtering
@@ -359,7 +497,22 @@ func newHost(priv crypto.PrivKey, listen string, n natOpts) (host.Host, error) {
 		// be a public relay (circuit-relay-v2) + an AutoNAT server (so NAT'd peers can
 		// learn their reachability + observed address from us). Force public reachability
 		// so the hop service activates immediately.
-		opts = append(opts, libp2p.EnableRelayService(), libp2p.ForceReachabilityPublic(), libp2p.EnableNATService())
+		cfg := defaultRelayServerConfig()
+		if n.relayConfig != nil {
+			cfg = *n.relayConfig
+		}
+		resources, guard, err := cfg.resources()
+		if err != nil {
+			return nil, err
+		}
+		opts = append(opts,
+			libp2p.EnableRelayService(
+				relayv2.WithResources(resources),
+				relayv2.WithACL(guard),
+				relayv2.WithMetricsTracer(guard),
+			),
+			libp2p.ForceReachabilityPublic(), libp2p.EnableNATService(),
+		)
 	}
 	// NAT'd nodes reserve on relays explicitly (in main) and let AutoNAT + the
 	// observed-address manager (from several observer peers) determine reachability — so
@@ -446,13 +599,20 @@ func main() {
 	listenAddr := flag.String("listen", "/ip4/0.0.0.0/tcp/0", "libp2p listen multiaddr; pin the port for cross-box reach, e.g. /ip4/0.0.0.0/tcp/29600")
 	inbound := flag.String("inbound", "", "tunnel: dial this local engine addr (host:port) for each inbound libp2p stream")
 	requireDirectActivation := flag.Bool("require-direct-activation", false, "refuse inbound activation streams unless their libp2p connection is direct")
+	allowRelayedActivation := flag.Bool("allow-relayed-activation", false, "with -require-direct-activation, allow inbound activation streams over a relay circuit")
 	nakdInbound := flag.String("nakd-inbound", "", "direct-only tunnel: dial this local nakd addr for each nakd libp2p stream")
-	dialListen := flag.String("dial-listen", "", "listen on this user-only UNIX socket for DIAL/FORWARD requests that require a direct libp2p path")
+	dialListen := flag.String("dial-listen", "", "listen on this user-only UNIX socket for direct-only DIAL and activation FORWARD requests")
 	directWait := flag.Duration("direct-wait", defaultDirectWait, "maximum time to wait for a direct (non-relayed) connection")
+	relayActivationFallback := flag.Bool("relay-activation-fallback", false, "after the direct wait, allow FORWARD activation streams over an existing relay circuit")
 	var forwards stringList
 	flag.Var(&forwards, "forward", "tunnel: localAddr=peerMultiaddr — listen localAddr, carry each conn to the peer (repeatable)")
 	size := flag.Int("size", 1<<20, "self-test frame size in bytes (default 1 MiB)")
 	relaySvc := flag.Bool("relay", false, "run as a circuit-relay-v2 server (public rendezvous for NAT'd nodes)")
+	relayCircuitBytes := flag.Int64("relay-circuit-bytes", defaultRelayCircuitBytes, "maximum bytes in each direction of one relayed connection")
+	relayCircuitDuration := flag.Duration("relay-circuit-duration", defaultRelayCircuitDuration, "maximum duration of one relayed connection")
+	relayMaxCircuits := flag.Int("relay-max-circuits", defaultRelayMaxCircuits, "maximum concurrent relayed connections in total")
+	relayCircuitsPerPeer := flag.Int("relay-circuits-per-peer", defaultRelayCircuitsPerPeer, "maximum concurrent relayed connections per peer")
+	relayPeerDailyBytes := flag.Int64("relay-peer-daily-bytes", defaultRelayPeerDailyBytes, "per-peer UTC-day traffic budget, enforced conservatively as circuit admissions")
 	relaysCSV := flag.String("relays", "", "comma-separated relay /p2p multiaddrs to use when behind NAT")
 	useQuic := flag.Bool("quic", false, "also listen on QUIC (udp) — better hole-punching + lossy links")
 	announce := flag.String("announce", "", "advertise this public multiaddr ahead of auto-detected ones (e.g. /ip4/PUBIP/tcp/PORT)")
@@ -530,7 +690,22 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	h, err := newHost(priv, *listenAddr, natOpts{quic: *useQuic, relayService: *relaySvc, announce: *announce, staticRelays: staticRelays, dialPolicy: dialPolicy})
+	var relayConfig *relayServerConfig
+	if *relaySvc {
+		relayConfig = &relayServerConfig{
+			circuitBytes: *relayCircuitBytes, circuitDuration: *relayCircuitDuration,
+			maxCircuits: *relayMaxCircuits, circuitsPerPeer: *relayCircuitsPerPeer,
+			peerDailyBytes: *relayPeerDailyBytes,
+		}
+		_, guard, err := relayConfig.resources()
+		if err != nil {
+			log.Fatalf("relay resources: %v", err)
+		}
+		log.Printf("relay caps: bytes=%d/direction duration=%s total=%d per-peer=%d daily-circuits-per-peer=%d",
+			relayConfig.circuitBytes, relayConfig.circuitDuration, relayConfig.maxCircuits,
+			relayConfig.circuitsPerPeer, guard.dailyCircuits)
+	}
+	h, err := newHost(priv, *listenAddr, natOpts{quic: *useQuic, relayService: *relaySvc, announce: *announce, staticRelays: staticRelays, dialPolicy: dialPolicy, relayConfig: relayConfig})
 	if err != nil {
 		log.Fatalf("host: %v", err)
 	}
@@ -583,7 +758,7 @@ func main() {
 	// right ring neighbour over libp2p. This is what replaces wire.py's TCP.
 	if *inbound != "" || *nakdInbound != "" || *dialListen != "" || len(forwards) > 0 {
 		if *inbound != "" {
-			runInboundWithPolicy(h, *inbound, *requireDirectActivation)
+			runInboundWithPolicy(h, *inbound, *requireDirectActivation, *allowRelayedActivation)
 		}
 		if *nakdInbound != "" {
 			runNakdInbound(h, *nakdInbound)
@@ -593,7 +768,7 @@ func main() {
 			if err != nil {
 				log.Fatalf("dial-listen %s: %v", *dialListen, err)
 			}
-			go serveDialListener(h, ln, staticRelays, *directWait, dialPolicy)
+			go serveDialListener(h, ln, staticRelays, *directWait, dialPolicy, *relayActivationFallback)
 		}
 		for _, f := range forwards {
 			pp := strings.SplitN(f, "=", 2)
@@ -602,7 +777,11 @@ func main() {
 			}
 			go runForward(h, pp[0], pp[1])
 		}
-		log.Printf("tunnel up (inbound=%q require-direct-activation=%v nakd-inbound=%q dial-listen=%q forwards=%v)", *inbound, *requireDirectActivation, *nakdInbound, *dialListen, []string(forwards))
+		if *allowRelayedActivation || *relayActivationFallback {
+			log.Printf("tunnel up (inbound=%q require-direct-activation=%v allow-relayed-activation=%v nakd-inbound=%q dial-listen=%q relay-activation-fallback=%v forwards=%v)", *inbound, *requireDirectActivation, *allowRelayedActivation, *nakdInbound, *dialListen, *relayActivationFallback, []string(forwards))
+		} else {
+			log.Printf("tunnel up (inbound=%q require-direct-activation=%v nakd-inbound=%q dial-listen=%q forwards=%v)", *inbound, *requireDirectActivation, *nakdInbound, *dialListen, []string(forwards))
+		}
 		select {}
 	}
 
@@ -784,13 +963,22 @@ func isDirectConn(c network.Conn) bool {
 	return directPathAllowed(c.Stat().Limited, c.RemoteMultiaddr().String())
 }
 
-func activationPathAllowed(requireDirect, limited bool, remoteAddr string) bool {
-	return !requireDirect || directPathAllowed(limited, remoteAddr)
+func activationPathAllowed(requireDirect, allowRelayed, limited bool, remoteAddr string) bool {
+	return !requireDirect || directPathAllowed(limited, remoteAddr) || allowRelayed
 }
 
 func directConn(h host.Host, p peer.ID) network.Conn {
 	for _, c := range h.Network().ConnsToPeer(p) {
 		if isDirectConn(c) {
+			return c
+		}
+	}
+	return nil
+}
+
+func relayedConn(h host.Host, p peer.ID) network.Conn {
+	for _, c := range h.Network().ConnsToPeer(p) {
+		if !isDirectConn(c) {
 			return c
 		}
 	}
@@ -940,9 +1128,9 @@ func retryDirectDials(ctx context.Context, h host.Host, p peer.ID, maxAttempts i
 	)
 }
 
-// addRelayCircuitAddrs teaches the host how to reach p through each configured relay. The circuit is
-// rendezvous only: waitDirect refuses it for the user's stream and waits for DCUtR to produce a
-// separate non-relayed connection.
+// addRelayCircuitAddrs teaches the host how to reach p through each configured relay. waitDirect
+// uses the circuit only to rendezvous and waits for DCUtR to produce a separate direct connection;
+// an activation caller may explicitly choose the established limited connection after that wait.
 func addRelayCircuitAddrs(h host.Host, p peer.ID, relays []peer.AddrInfo) []multiaddr.Multiaddr {
 	var added []multiaddr.Multiaddr
 	for _, relay := range relays {
@@ -1012,6 +1200,56 @@ func openDirectActivationStream(ctx context.Context, h host.Host, p peer.ID, rel
 	return openDirectStream(ctx, h, p, relays, policy, activationProto)
 }
 
+func waitActivationPath(ctx context.Context, h host.Host, p peer.ID, relays []peer.AddrInfo, policy *outboundDialPolicy, allowRelayed bool) (bool, error) {
+	err := waitDirect(ctx, h, p, relays, policy)
+	if err == nil {
+		return false, nil
+	}
+	if allowRelayed && relayedConn(h, p) != nil {
+		return true, nil
+	}
+	return false, err
+}
+
+func openReadyActivationStream(h host.Host, p peer.ID, relays []peer.AddrInfo, policy *outboundDialPolicy, directWait time.Duration, allowRelayed bool) (network.Stream, error) {
+	if directConn(h, p) != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), directWait)
+		defer cancel()
+		return openDirectStream(ctx, h, p, relays, policy, activationProto)
+	}
+	openRelay := func() (network.Stream, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		s, err := openActivationStream(ctx, p, h.NewStream)
+		if err != nil {
+			return nil, err
+		}
+		return s, nil
+	}
+	if allowRelayed && relayedConn(h, p) != nil {
+		return openRelay()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), directWait)
+	defer cancel()
+	relayed, err := waitActivationPath(ctx, h, p, relays, policy, allowRelayed)
+	if err != nil {
+		return nil, err
+	}
+	if relayed {
+		return openRelay()
+	}
+	streamCtx, streamCancel := context.WithTimeout(context.Background(), directWait)
+	defer streamCancel()
+	return openDirectStream(streamCtx, h, p, relays, policy, activationProto)
+}
+
+func relayVia(addr multiaddr.Multiaddr) string {
+	if value, err := addr.ValueForProtocol(multiaddr.P_P2P); err == nil && value != "" {
+		return value
+	}
+	return addr.String()
+}
+
 func openDirectStream(ctx context.Context, h host.Host, p peer.ID, relays []peer.AddrInfo, policy *outboundDialPolicy, proto protocol.ID) (network.Stream, error) {
 	if err := waitDirect(ctx, h, p, relays, policy); err != nil {
 		return nil, err
@@ -1056,6 +1294,7 @@ type forwardManager struct {
 	relays     []peer.AddrInfo
 	directWait time.Duration
 	policy     *outboundDialPolicy
+	allowRelay bool
 
 	// cacheMu serializes get/evict/close operations. mu protects entry state
 	// and stays available to an Accept that is completing while eviction waits
@@ -1067,9 +1306,9 @@ type forwardManager struct {
 	listen  func(network, address string) (net.Listener, error)
 }
 
-func newForwardManager(h host.Host, relays []peer.AddrInfo, directWait time.Duration, policy *outboundDialPolicy) *forwardManager {
+func newForwardManager(h host.Host, relays []peer.AddrInfo, directWait time.Duration, policy *outboundDialPolicy, allowRelay bool) *forwardManager {
 	return &forwardManager{
-		host: h, relays: relays, directWait: directWait, policy: policy,
+		host: h, relays: relays, directWait: directWait, policy: policy, allowRelay: allowRelay,
 		entries: make(map[peer.ID]*dynamicForward), now: time.Now, listen: net.Listen,
 	}
 }
@@ -1216,15 +1455,17 @@ func (m *forwardManager) handle(f *dynamicForward, c net.Conn) {
 		f.lastUsed = m.now()
 		m.mu.Unlock()
 	}()
-	ctx, cancel := context.WithTimeout(context.Background(), m.directWait)
-	defer cancel()
-	s, err := openDirectActivationStream(ctx, m.host, f.peer, m.relays, m.policy)
+	s, err := openReadyActivationStream(m.host, f.peer, m.relays, m.policy, m.directWait, m.allowRelay)
 	if err != nil {
 		log.Printf("FORWARD %s: no direct activation path: %v", f.peer, err)
 		_ = c.Close()
 		return
 	}
-	log.Printf("FORWARD %s: DIRECT via %s (%s)", f.peer, s.Conn().RemoteMultiaddr(), directPathKind(s.Conn().RemoteMultiaddr()))
+	if isDirectConn(s.Conn()) {
+		log.Printf("FORWARD %s: DIRECT via %s (%s)", f.peer, s.Conn().RemoteMultiaddr(), directPathKind(s.Conn().RemoteMultiaddr()))
+	} else {
+		log.Printf("FORWARD %s: RELAYED via %s", f.peer, relayVia(s.Conn().RemoteMultiaddr()))
+	}
 	pipe(c, s)
 }
 
@@ -1249,10 +1490,10 @@ func (m *forwardManager) close() {
 }
 
 func handleDialConn(h host.Host, c net.Conn, relays []peer.AddrInfo, directWait time.Duration, policy *outboundDialPolicy) {
-	handleControlConn(h, c, relays, directWait, policy, nil)
+	handleControlConn(h, c, relays, directWait, policy, nil, false)
 }
 
-func handleControlConn(h host.Host, c net.Conn, relays []peer.AddrInfo, directWait time.Duration, policy *outboundDialPolicy, forwards *forwardManager) {
+func handleControlConn(h host.Host, c net.Conn, relays []peer.AddrInfo, directWait time.Duration, policy *outboundDialPolicy, forwards *forwardManager, allowRelay bool) {
 	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
 	reader := bufio.NewReaderSize(c, maxDialLine+1)
 	line, err := reader.ReadSlice('\n')
@@ -1281,7 +1522,7 @@ func handleControlConn(h host.Host, c net.Conn, relays []peer.AddrInfo, directWa
 			_ = c.Close()
 			return
 		}
-		if err := waitDirect(ctx, h, p, relays, policy); err != nil {
+		if _, err := waitActivationPath(ctx, h, p, relays, policy, allowRelay); err != nil {
 			writeDialError(c, err)
 			_ = c.Close()
 			return
@@ -1311,10 +1552,14 @@ func handleControlConn(h host.Host, c net.Conn, relays []peer.AddrInfo, directWa
 	pipe(c, s)
 }
 
-func serveDialListener(h host.Host, ln net.Listener, relays []peer.AddrInfo, directWait time.Duration, policy *outboundDialPolicy) {
-	log.Printf("dial listener on %s (direct wait %s)", ln.Addr(), directWait)
+func serveDialListener(h host.Host, ln net.Listener, relays []peer.AddrInfo, directWait time.Duration, policy *outboundDialPolicy, allowRelay bool) {
+	if allowRelay {
+		log.Printf("dial listener on %s (direct wait %s; activation relay fallback enabled)", ln.Addr(), directWait)
+	} else {
+		log.Printf("dial listener on %s (direct wait %s)", ln.Addr(), directWait)
+	}
 	slots := make(chan struct{}, maxConcurrentDials)
-	forwards := newForwardManager(h, relays, directWait, policy)
+	forwards := newForwardManager(h, relays, directWait, policy, allowRelay)
 	defer forwards.close()
 	for {
 		c, err := ln.Accept()
@@ -1322,7 +1567,7 @@ func serveDialListener(h host.Host, ln net.Listener, relays []peer.AddrInfo, dir
 			return
 		}
 		dispatchDialConn(c, slots, func(c net.Conn) {
-			handleControlConn(h, c, relays, directWait, policy, forwards)
+			handleControlConn(h, c, relays, directWait, policy, forwards, allowRelay)
 		})
 	}
 }
@@ -1412,12 +1657,12 @@ func runForward(h host.Host, listenAddr, peerMaddr string) {
 // runInbound pipes each inbound libp2p stream to a fresh connection to the local
 // engine — so the engine accepts on localhost, fed by its ring neighbours.
 func runInbound(h host.Host, engineAddr string) {
-	runInboundWithPolicy(h, engineAddr, false)
+	runInboundWithPolicy(h, engineAddr, false, false)
 }
 
-func runInboundWithPolicy(h host.Host, engineAddr string, requireDirect bool) {
+func runInboundWithPolicy(h host.Host, engineAddr string, requireDirect, allowRelayed bool) {
 	h.SetStreamHandler(activationProto, func(s network.Stream) {
-		if !activationPathAllowed(requireDirect, s.Conn().Stat().Limited, s.Conn().RemoteMultiaddr().String()) {
+		if !activationPathAllowed(requireDirect, allowRelayed, s.Conn().Stat().Limited, s.Conn().RemoteMultiaddr().String()) {
 			log.Printf("refused inbound activation stream over limited/relayed connection from %s", s.Conn().RemotePeer())
 			_ = s.Reset()
 			return

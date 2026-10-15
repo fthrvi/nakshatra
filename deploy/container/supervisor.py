@@ -275,13 +275,17 @@ class Supervisor:
                 raise ValueError("worker env has an invalid PORT")
             if int(worker_port) == port:
                 raise ValueError(f"container p2p port must not equal worker PORT {worker_port}")
+            allow_relayed = "-allow-relayed-activation" in shlex.split(
+                values.get("NAKSHATRA_P2P_WORKER_ARGS", "")
+            )
             if p2p_env.exists():
                 self._stage_env(staged, p2p_env, "NAKSHATRA_P2P_NAKD_INBOUND", None)
             self._stage_env(staged, worker_env, "LISTEN", "127.0.0.1")
+            relay_arg = " -allow-relayed-activation" if allow_relayed else ""
             self._stage_env(
                 staged, worker_env, "NAKSHATRA_P2P_WORKER_ARGS",
                 f"-listen /ip4/0.0.0.0/tcp/{port} -inbound=127.0.0.1:{worker_port} "
-                "-require-direct-activation"
+                f"-require-direct-activation{relay_arg}",
             )
         if p2p_env.exists() and not worker_env.exists():
             self._stage_env(

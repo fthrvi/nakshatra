@@ -65,3 +65,17 @@ writes `DIAL <peerid>\n`. The sidecar may use a configured `-relays` circuit to 
 but waits up to `-direct-wait` (15 s by default) for a non-relayed connection and opens the stream
 only there. It replies `OK direct\n` before piping bytes, or `ERR <reason>\n` and closes. User data
 is never carried over the relay circuit.
+
+## Capped activation relay fallback
+
+Dynamic inference `FORWARD` tunnels may opt into `-relay-activation-fallback`. They still wait
+for a direct path first (`-direct-wait`, unchanged at 15 seconds by default), then use the existing
+limited circuit connection. The worker must independently pass `-allow-relayed-activation` alongside
+`-require-direct-activation`; otherwise it resets the relayed activation stream.
+
+`-relay` servers are explicitly capped even without extra flags: 64 MiB in each direction per
+circuit (`-relay-circuit-bytes`), 10 minutes (`-relay-circuit-duration`), 64 concurrent circuits
+total (`-relay-max-circuits`), 4 per peer (`-relay-circuits-per-peer`), and a 512 MiB per-peer UTC-day
+budget (`-relay-peer-daily-bytes`). go-libp2p's byte callback has no peer identity, so the daily
+budget is conservatively translated into circuit admissions, charging each circuit for its full
+possible bytes in both directions. The defaults therefore allow four circuits per peer per day.

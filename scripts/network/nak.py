@@ -24,6 +24,7 @@ import json
 import math
 import os
 import secrets
+import shlex
 import stat
 import re
 import sys
@@ -245,7 +246,11 @@ def _enable_p2p_service_locked(_sp, *, owner_token: str = "") -> None:
     if not env.exists():
         env.parent.mkdir(parents=True, exist_ok=True)
         ownership = f"{GATEWAY_PROFILE_OWNER_PREFIX}{owner_token}\n" if owner_token else ""
-        consumer = 'NAKSHATRA_P2P_NAKD_INBOUND=""\n' if owner_token else ""
+        consumer = (
+            'NAKSHATRA_P2P_NAKD_INBOUND=""\n'
+            'NAKSHATRA_P2P_GATEWAY_ARGS="-relay-activation-fallback"\n'
+            if owner_token else ""
+        )
         _write_private(
             env, f"P2P_RELAYS={DEFAULT_P2P_RELAYS}\n{consumer}{ownership}".encode()
         )
@@ -254,8 +259,8 @@ def _enable_p2p_service_locked(_sp, *, owner_token: str = "") -> None:
         # An explicit `nak p2p on` takes the gateway-created consumer sidecar over for the
         # operator. Restore the signed unit's default nakd inbound in the owned base file; a live
         # consumer-only gateway remains protected by the final override until it is stopped.
-        p2p_config_changed = _remove_env_assignment(
-            env, "NAKSHATRA_P2P_NAKD_INBOUND")
+        p2p_config_changed = _remove_env_assignments(
+            env, "NAKSHATRA_P2P_NAKD_INBOUND", "NAKSHATRA_P2P_GATEWAY_ARGS")
     if not owner_token:
         protect_gateway = (
             "NAK_CONTAINER_CONSUMER_P2P_PORT" not in os.environ
@@ -949,6 +954,11 @@ def _set_env_assignment(path: Path, name: str, value: str | None) -> None:
 
 def _remove_env_assignment(path: Path, name: str) -> bool:
     """Atomically remove one assignment without changing any other bytes in the env file."""
+    return _remove_env_assignments(path, name)
+
+
+def _remove_env_assignments(path: Path, *names: str) -> bool:
+    """Atomically remove selected assignments without changing any other bytes."""
     try:
         body = path.read_bytes()
     except OSError as e:
@@ -960,7 +970,7 @@ def _remove_env_assignment(path: Path, name: str) -> bool:
             assignment = _env_assignment(line.decode())
         except UnicodeDecodeError:
             assignment = None
-        if assignment is None or assignment[0] != name:
+        if assignment is None or assignment[0] not in names:
             kept.append(line)
     if len(kept) == len(lines):
         return False
@@ -986,6 +996,29 @@ def _env_value(value: str, name: str) -> str:
     if not value or any(c in value for c in "\r\n\0") or any(c.isspace() for c in value):
         raise SystemExit(f"--{name} must be one non-empty value without whitespace")
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _worker_relay_enabled(env_path: Path) -> bool:
+    try:
+        body = env_path.read_text()
+    except OSError:
+        return False
+    match = re.search(r"(?m)^NAKSHATRA_P2P_WORKER_ARGS=(.*)$", body)
+    if not match:
+        return False
+    try:
+        values = shlex.split(match.group(1))
+        args = shlex.split(values[0]) if len(values) == 1 else values
+        return "-allow-relayed-activation" in args
+    except ValueError:
+        return False
+
+
+def _worker_p2p_args(port: int, allow_relayed: bool) -> str:
+    args = f"-inbound=127.0.0.1:{port} -require-direct-activation"
+    if allow_relayed:
+        args += " -allow-relayed-activation"
+    return args
 
 
 def _worker_enable(_sp, args) -> None:
@@ -1053,10 +1086,11 @@ def _worker_enable_locked(_sp, args) -> None:
                 f"WARM_DIRECTIVES={'1' if args.warm_directives == 'on' else '0'}\n")
         _write_private(env_path, body.encode())
     port = _worker_port(env_path)
+    allow_relayed = _worker_relay_enabled(env_path)
     _set_env_assignment(
         env_path,
         "NAKSHATRA_P2P_WORKER_ARGS",
-        f"-inbound=127.0.0.1:{port} -require-direct-activation",
+        _worker_p2p_args(port, allow_relayed),
     )
     consumer_env.unlink(missing_ok=True)
     action = "restart" if worker_was_live else "enable"
@@ -1170,6 +1204,25 @@ def _worker_disable_locked(_sp) -> None:
     print("worker OFF")
 
 
+def _worker_relay(_sp, enabled: bool) -> None:
+    with _p2p_ownership_lock():
+        _root, _record, env_path = _worker_paths()
+        if not env_path.is_file():
+            raise SystemExit("worker relay needs a configured worker; run `nak worker on` first")
+        old_env = env_path.read_bytes()
+        port = _worker_port(env_path)
+        _set_env_assignment(
+            env_path, "NAKSHATRA_P2P_WORKER_ARGS", _worker_p2p_args(port, enabled)
+        )
+        try:
+            if _p2p_enabled():
+                _p2p_installer(_sp, "restart")
+        except (Exception, SystemExit):
+            _write_private(env_path, old_env)
+            raise
+    print(f"worker relay {'ON' if enabled else 'OFF'}")
+
+
 def _worker_status(_sp) -> dict:
     _root, record_path, env_path = _worker_paths()
     build = None
@@ -1190,7 +1243,13 @@ def _worker_status(_sp) -> dict:
             unit[prop] = (result.stdout or "").strip() or ("yes" if result.returncode == 0 else "no")
         except OSError as e:
             unit[prop] = f"unavailable: {e}"
-    return {"configured": env_path.exists(), "build_state": build_state, "build": build, "unit": unit}
+    return {
+        "configured": env_path.exists(),
+        "allow_relayed_activation": _worker_relay_enabled(env_path),
+        "build_state": build_state,
+        "build": build,
+        "unit": unit,
+    }
 
 
 def _owner_lease_path() -> Path:
@@ -1387,6 +1446,8 @@ def main(argv=None, *, http_post=None) -> int:
     q.add_argument("--mode", choices=["first", "middle", "last", "solo"], default="first")
     wsub.add_parser("off", help="disable the worker service and remove its worker.env opt-in")
     wsub.add_parser("status", help="show the verified build record and systemd unit state")
+    q = wsub.add_parser("relay", help="allow or refuse capped relay activation streams")
+    q.add_argument("relay_cmd", choices=["on", "off"])
     q = wsub.add_parser("owner-lease", help="control the local owner-sentinel lease")
     lsub = q.add_subparsers(dest="owner_lease_cmd", required=True)
     q = lsub.add_parser("on", help="create the private lease token and enable default-deny")
@@ -1426,6 +1487,8 @@ def main(argv=None, *, http_post=None) -> int:
             _worker_disable(_sp)
         elif a.worker_cmd == "status":
             print(json.dumps(_worker_status(_sp), indent=1, sort_keys=True))
+        elif a.worker_cmd == "relay":
+            _worker_relay(_sp, a.relay_cmd == "on")
         elif a.owner_lease_cmd == "on":
             _owner_lease_on(_sp, a)
         elif a.owner_lease_cmd == "off":
