@@ -155,9 +155,9 @@ run_args() {
 
 start_container() {
     local runtime="$1"
+    run_args "$runtime" || return
     ensure_image "$runtime" || return
     if container_exists; then run "$runtime" rm -f "$CONTAINER_NAME" >/dev/null || return; fi
-    run_args "$runtime" || return
     if [ -n "$(config_read worker-port)" ]; then
         printf 'nakc: deliberate public port: libp2p sidecar 0.0.0.0:%s (tcp+udp); worker gRPC stays on container loopback\n' \
             "${NAKC_P2P_PORT:-$(config_read p2p-port)}" >&2
@@ -181,15 +181,28 @@ ensure_running() {
 }
 
 worker_port_from_args() {
-    local previous='' item
+    local port='' count=0 needs_value=0 item
     for item in "$@"; do
-        if [ "$previous" = port ]; then printf '%s\n' "$item"; return; fi
+        if [ "$needs_value" = 1 ]; then
+            port="$item"
+            needs_value=0
+            continue
+        fi
         case "$item" in
-            --port) previous=port ;;
-            --port=*) printf '%s\n' "${item#--port=}"; return ;;
-            *) previous='' ;;
+            --port)
+                count=$((count + 1))
+                [ "$count" -eq 1 ] || die "worker on accepts only one --port"
+                needs_value=1
+                ;;
+            --port=*)
+                count=$((count + 1))
+                [ "$count" -eq 1 ] || die "worker on accepts only one --port"
+                port="${item#--port=}"
+                ;;
         esac
     done
+    [ "$needs_value" = 0 ] || die "worker --port needs a value"
+    [ "$count" -eq 0 ] || printf '%s\n' "$port"
 }
 
 usage() {

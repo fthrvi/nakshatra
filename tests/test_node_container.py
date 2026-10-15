@@ -260,6 +260,22 @@ def test_worker_rejects_noncanonical_ports_before_persisting(tmp_path, port):
 
 
 @pytest.mark.parametrize(
+    "worker_args",
+    [
+        ("--port", "50051", "--port", "4001"),
+        ("--port=50051", "--port=4001"),
+        ("--port", "50051", "--port", "050052"),
+    ],
+)
+def test_worker_rejects_repeated_ports_before_persisting(tmp_path, worker_args):
+    result = _nakc(tmp_path, "worker", "on", *worker_args, NAKC_P2P_PORT="4001")
+    assert result.returncode == 2
+    assert "accepts only one --port" in result.stderr
+    assert not (tmp_path / "config" / "worker-port").exists()
+    assert not (tmp_path / "config" / "p2p-port").exists()
+
+
+@pytest.mark.parametrize(
     ("old_values", "worker_args", "extra_env"),
     [
         ({}, ("--port", "50051"), {"NAKC_P2P_PORT": "50051"}),
@@ -301,6 +317,37 @@ def test_start_rejects_a_noncanonical_host_gateway_port(tmp_path):
     result = _nakc(tmp_path, "start", NAKC_GATEWAY_PORT="011600")
     assert result.returncode == 2
     assert "NAKC_GATEWAY_PORT must be a canonical port" in result.stderr
+
+
+def test_start_validates_complete_run_argv_before_touching_existing_container(tmp_path):
+    config = tmp_path / "config"
+    config.mkdir()
+    (config / "worker-port").write_text("50051\n")
+    engine_log = tmp_path / "engine.log"
+    engine = tmp_path / "logging-container-engine"
+    engine.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"$*\" >>\"$NAKC_TEST_LOG\"\n"
+        "exit 0\n"
+    )
+    engine.chmod(0o755)
+    result = subprocess.run(
+        [str(NAKC), "start"],
+        env=dict(
+            os.environ,
+            HOME=str(tmp_path / "home"),
+            NAKC_ENGINE=str(engine),
+            NAKC_CONFIG_DIR=str(config),
+            NAKC_P2P_PORT="50051",
+            NAKC_TEST_LOG=str(engine_log),
+        ),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert "NAKC_P2P_PORT must not collide with worker port 50051" in result.stderr
+    assert not engine_log.exists()
 
 
 @pytest.mark.parametrize(
@@ -606,6 +653,32 @@ def test_container_env_rejects_equal_worker_and_p2p_ports_without_rewriting(
     assert {path: path.read_bytes() for path in (p2p_env, worker_env)} == before
 
 
+def test_container_consumer_rejects_noncanonical_port_without_rewriting_any_env(
+        tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    env_dir = home / ".nakshatra"
+    env_dir.mkdir(parents=True)
+    p2p_env = env_dir / "p2p.env"
+    worker_env = env_dir / "worker.env"
+    p2p_env.write_text(
+        "P2P_RELAYS=test\nNAKSHATRA_P2P_NAKD_INBOUND=-nakd-inbound=127.0.0.1:51830\n"
+    )
+    worker_env.write_text(
+        "PORT=50051\nNAKSHATRA_P2P_WORKER_ARGS=-inbound=127.0.0.1:50051\n"
+    )
+    before = {path: path.read_bytes() for path in (p2p_env, worker_env)}
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("NAK_CONTAINER_WORKER", raising=False)
+    monkeypatch.setenv("NAK_CONTAINER_CONSUMER_P2P_PORT", "04001")
+    instance = supervisor.Supervisor(tmp_path / "prefix", tmp_path / "units", tmp_path / "sock",
+                                     refresh=False, control=False)
+
+    with pytest.raises(ValueError, match="consumer p2p port must be between 1 and 65535"):
+        instance.reconcile_container_env()
+
+    assert {path: path.read_bytes() for path in (p2p_env, worker_env)} == before
+
+
 def test_container_consumer_effective_p2p_command_listens_but_forwards_nothing(tmp_path, monkeypatch):
     home = tmp_path / "home"
     env_dir = home / ".nakshatra"
@@ -655,6 +728,32 @@ def test_published_container_consumer_uses_fixed_tcp_and_quic_port_without_inbou
     effective = _effective_p2p_argv(tmp_path, home)
     assert effective[-2:] == ["-listen", "/ip4/0.0.0.0/tcp/24001"]
     assert "-quic" in effective  # derives /ip4/0.0.0.0/udp/24001/quic-v1
+    assert not any(arg.startswith(("-nakd-inbound", "-inbound")) for arg in effective)
+
+
+def test_container_consumer_clears_stale_inbound_from_every_loaded_env_file(
+        tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    env_dir = home / ".nakshatra"
+    env_dir.mkdir(parents=True)
+    (env_dir / "p2p.env").write_text(
+        "P2P_RELAYS=test\nNAKSHATRA_P2P_NAKD_INBOUND=-nakd-inbound=127.0.0.1:51830\n"
+    )
+    (env_dir / "worker.env").write_text(
+        "PORT=50051\n"
+        "NAKSHATRA_P2P_NAKD_INBOUND=-nakd-inbound=127.0.0.1:59999\n"
+        "NAKSHATRA_P2P_WORKER_ARGS=-inbound=127.0.0.1:59998\n"
+    )
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("NAK_CONTAINER_WORKER", raising=False)
+    monkeypatch.setenv("NAK_CONTAINER_CONSUMER_P2P_PORT", "24001")
+    instance = supervisor.Supervisor(tmp_path / "prefix", tmp_path / "units", tmp_path / "sock",
+                                     refresh=False, control=False)
+
+    instance.reconcile_container_env()
+
+    effective = _effective_p2p_argv(tmp_path, home)
+    assert effective[-2:] == ["-listen", "/ip4/0.0.0.0/tcp/24001"]
     assert not any(arg.startswith(("-nakd-inbound", "-inbound")) for arg in effective)
 
 

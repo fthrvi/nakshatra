@@ -179,20 +179,38 @@ class Supervisor:
             return False
 
     @staticmethod
-    def _set_env(path: Path, name: str, value: str | None) -> None:
-        try:
-            lines = path.read_text().splitlines()
-        except FileNotFoundError:
-            lines = []
+    def _updated_env(contents: str, name: str, value: str | None) -> str:
+        lines = contents.splitlines()
         prefix = f"{name}="
         lines = [line for line in lines if not line.startswith(prefix)]
         if value is not None:
             lines.append(f'{name}="{value}"')
-        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        temporary = path.with_suffix(path.suffix + ".tmp")
-        temporary.write_text("\n".join(lines) + "\n")
-        os.chmod(temporary, 0o600)
-        os.replace(temporary, path)
+        return "\n".join(lines) + "\n"
+
+    @classmethod
+    def _stage_env(
+            cls, staged: dict[Path, str], path: Path, name: str, value: str | None) -> None:
+        contents = staged[path] if path in staged else path.read_text()
+        staged[path] = cls._updated_env(contents, name, value)
+
+    @staticmethod
+    def _replace_staged_env(staged: dict[Path, str]) -> None:
+        temporaries: list[tuple[Path, Path]] = []
+        try:
+            for path, contents in staged.items():
+                path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                temporary = path.with_suffix(path.suffix + ".tmp")
+                temporary.write_text(contents)
+                os.chmod(temporary, 0o600)
+                temporaries.append((path, temporary))
+            for path, temporary in temporaries:
+                os.replace(temporary, path)
+        finally:
+            for _, temporary in temporaries:
+                try:
+                    temporary.unlink()
+                except FileNotFoundError:
+                    pass
 
     def reconcile_container_env(self) -> None:
         """Keep worker gRPC private while exposing only its deliberate P2P listener."""
@@ -201,27 +219,32 @@ class Supervisor:
         worker_env = home / ".nakshatra" / "worker.env"
         if os.environ.get("NAK_CONTAINER_WORKER") != "1":
             consumer_port = os.environ.get("NAK_CONTAINER_CONSUMER_P2P_PORT")
+            port = None
+            if consumer_port is not None:
+                try:
+                    port = int(consumer_port)
+                except ValueError as exc:
+                    raise ValueError("container consumer p2p port must be an integer") from exc
+                if not 1 <= port <= 65535 or str(port) != consumer_port:
+                    raise ValueError("container consumer p2p port must be between 1 and 65535")
+
             # The state volume survives role changes. Strip any worker listener/forward left by a
             # former worker container and explicitly opt the consumer out of both inbound targets.
+            staged: dict[Path, str] = {}
             for path in (p2p_env, worker_env):
                 if path.exists():
-                    self._set_env(path, "NAKSHATRA_P2P_WORKER_ARGS", None)
+                    self._stage_env(staged, path, "NAKSHATRA_P2P_WORKER_ARGS", None)
+                    self._stage_env(staged, path, "NAKSHATRA_P2P_NAKD_INBOUND", None)
             if p2p_env.exists():
-                self._set_env(p2p_env, "NAKSHATRA_P2P_NAKD_INBOUND", "")
-                if consumer_port is not None:
-                    try:
-                        port = int(consumer_port)
-                    except ValueError as exc:
-                        raise ValueError("container consumer p2p port must be an integer") from exc
-                    if not 1 <= port <= 65535 or str(port) != consumer_port:
-                        raise ValueError("container consumer p2p port must be between 1 and 65535")
+                self._stage_env(staged, p2p_env, "NAKSHATRA_P2P_NAKD_INBOUND", "")
+                if port is not None:
                     # The signed unit already supplies -quic. The sidecar derives UDP/P/quic-v1
                     # (and best-effort IPv6 wildcard TCP+QUIC) from this fixed TCP listen address.
-                    self._set_env(
-                        p2p_env,
-                        "NAKSHATRA_P2P_WORKER_ARGS",
-                        f"-listen /ip4/0.0.0.0/tcp/{port}",
+                    self._stage_env(
+                        staged, p2p_env, "NAKSHATRA_P2P_WORKER_ARGS",
+                        f"-listen /ip4/0.0.0.0/tcp/{port}"
                     )
+            self._replace_staged_env(staged)
             return
         port_text = os.environ.get("NAK_CONTAINER_P2P_PORT", "4001")
         try:
@@ -230,6 +253,7 @@ class Supervisor:
             raise ValueError("container p2p port must be an integer") from exc
         if not 1 <= port <= 65535 or str(port) != port_text:
             raise ValueError("container p2p port must be between 1 and 65535")
+        staged = {}
         if worker_env.exists():
             values = _env_file(worker_env)
             worker_port = values.get("PORT", "")
@@ -238,18 +262,19 @@ class Supervisor:
             if int(worker_port) == port:
                 raise ValueError(f"container p2p port must not equal worker PORT {worker_port}")
             if p2p_env.exists():
-                self._set_env(p2p_env, "NAKSHATRA_P2P_NAKD_INBOUND", None)
-            self._set_env(worker_env, "LISTEN", "127.0.0.1")
-            self._set_env(
-                worker_env,
-                "NAKSHATRA_P2P_WORKER_ARGS",
+                self._stage_env(staged, p2p_env, "NAKSHATRA_P2P_NAKD_INBOUND", None)
+            self._stage_env(staged, worker_env, "LISTEN", "127.0.0.1")
+            self._stage_env(
+                staged, worker_env, "NAKSHATRA_P2P_WORKER_ARGS",
                 f"-listen /ip4/0.0.0.0/tcp/{port} -inbound=127.0.0.1:{worker_port} "
-                "-require-direct-activation",
+                "-require-direct-activation"
             )
         if p2p_env.exists() and not worker_env.exists():
-            self._set_env(
-                p2p_env, "NAKSHATRA_P2P_WORKER_ARGS", f"-listen /ip4/0.0.0.0/tcp/{port}"
+            self._stage_env(
+                staged, p2p_env, "NAKSHATRA_P2P_WORKER_ARGS",
+                f"-listen /ip4/0.0.0.0/tcp/{port}"
             )
+        self._replace_staged_env(staged)
 
     @staticmethod
     def _validated_names(value: object) -> list[str]:
