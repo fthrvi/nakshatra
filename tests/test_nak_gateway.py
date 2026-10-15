@@ -98,9 +98,11 @@ def test_gateway_on_writes_loopback_enforced_opt_in(tmp_path, monkeypatch):
     assert 'NAKSHATRA_P2P_NAKD_INBOUND=""\n' in p2p_env.read_text()
     assert (home / ".nakshatra" / "p2p-consumer.env").read_text() == (
         'NAKSHATRA_P2P_NAKD_INBOUND=""\n'
+        'NAKSHATRA_P2P_CONSUMER_ARGS="-relay-activation-fallback"\n'
         'NAKSHATRA_P2P_WORKER_ARGS=""\n'
     )
-    assert 'NAKSHATRA_P2P_GATEWAY_ARGS="-relay-activation-fallback"\n' in p2p_env.read_text()
+    assert "NAKSHATRA_P2P_GATEWAY_ARGS" not in p2p_env.read_text()
+    assert "relay-activation-fallback" not in p2p_env.read_text()
     assert f"# nak-gateway-owned: {p2p_token}\n" in p2p_env.read_text()
     assert (home / ".nakshatra" / "p2p.lock").stat().st_mode & 0o777 == 0o600
     assert calls == ["enable"]
@@ -125,7 +127,8 @@ def test_gateway_on_adds_final_consumer_override_without_rewriting_operator_p2p(
     p2p_env = home / ".nakshatra" / "p2p.env"
     p2p_env.parent.mkdir(parents=True)
     original = "P2P_RELAYS=/dns4/operator.example/tcp/443/p2p/operator\n"
-    p2p_env.write_text(original)
+    p2p_env.write_text(
+        original + 'NAKSHATRA_P2P_GATEWAY_ARGS="-relay-activation-fallback"\n')
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setattr(nak, "_gateway_unit_enabled", lambda _sp: False)
     p2p_calls = []
@@ -137,6 +140,7 @@ def test_gateway_on_adds_final_consumer_override_without_rewriting_operator_p2p(
     assert p2p_env.read_text() == original
     assert (home / ".nakshatra" / "p2p-consumer.env").read_text() == (
         'NAKSHATRA_P2P_NAKD_INBOUND=""\n'
+        'NAKSHATRA_P2P_CONSUMER_ARGS="-relay-activation-fallback"\n'
         'NAKSHATRA_P2P_WORKER_ARGS=""\n'
     )
     assert p2p_calls == ["restart"]
@@ -162,6 +166,7 @@ def test_gateway_on_protects_consumer_when_worker_is_configured_but_disabled(
 
     assert (state / "p2p-consumer.env").read_text() == (
         'NAKSHATRA_P2P_NAKD_INBOUND=""\n'
+        'NAKSHATRA_P2P_CONSUMER_ARGS="-relay-activation-fallback"\n'
         'NAKSHATRA_P2P_WORKER_ARGS=""\n'
     )
     assert calls == [("p2p", "restart"), ("gateway", "enable")]

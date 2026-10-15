@@ -711,12 +711,19 @@ def test_signed_p2p_unit_keeps_legacy_worker_and_hub_argv(tmp_path, monkeypatch)
     (env_dir / "p2p.env").write_text("P2P_RELAYS=legacy-relay\n")
     worker_args = ["-inbound=127.0.0.1:5530", "-require-direct-activation"]
     (env_dir / "worker.env").write_text(
-        'NAKSHATRA_P2P_WORKER_ARGS="-inbound=127.0.0.1:5530 '
+        'PORT=5530\nNAKSHATRA_P2P_WORKER_ARGS="-inbound=127.0.0.1:5530 '
         '-require-direct-activation"\n'
     )
-    assert _effective_p2p_argv(tmp_path, home) == _legacy_p2p_argv(
+    legacy_worker = _legacy_p2p_argv(
         tmp_path, home, "legacy-relay", worker_args
     )
+    assert _effective_p2p_argv(tmp_path, home) == legacy_worker
+
+    monkeypatch.setattr(nak, "_p2p_installer", lambda *_args: None)
+    nak._worker_relay(object(), True)
+    assert _effective_p2p_argv(tmp_path, home) == [
+        *legacy_worker, "-allow-relayed-activation"
+    ]
 
     # A hub that never had worker.env still gets precisely the old signed unit's nakd target.
     (env_dir / "worker.env").unlink()
@@ -766,7 +773,7 @@ def test_explicit_p2p_on_keeps_live_gateway_protected_until_gateway_off(
     before = p2p_env.read_bytes()
     expected = before.replace(
         f'{assignment_prefix}NAKSHATRA_P2P_NAKD_INBOUND=""\n'.encode(), b""
-    ).replace(b'NAKSHATRA_P2P_GATEWAY_ARGS="-relay-activation-fallback"\n', b"")
+    )
     owner = home / ".nakshatra" / "gateway" / "p2p-profile-created"
     owner.parent.mkdir(parents=True)
     owner.write_text(f"{token}\n")
@@ -901,6 +908,9 @@ def test_fresh_worker_effective_p2p_argv_matches_legacy_worker(tmp_path, monkeyp
     ("p2p-on-takeover", ("p2p:restart:1", "p2p:restart:2")),
     ("p2p-off", ()),
     ("p2p-off", ("p2p:disable:1",)),
+    ("worker-relay-on", ()),
+    ("worker-relay-on", ("p2p:restart:1",)),
+    ("gateway-worker-gateway-off", ()),
 ])
 def test_host_transition_matrix_preserves_effective_p2p_invariant(
         tmp_path, monkeypatch, transition, faults):
@@ -909,7 +919,8 @@ def test_host_transition_matrix_preserves_effective_p2p_invariant(
     state = home / ".nakshatra"
     net = state / "net"
     net.mkdir(parents=True)
-    (state / "p2p.env").write_text("P2P_RELAYS=test\n")
+    (state / "p2p.env").write_text(
+        'P2P_RELAYS=test\nNAKSHATRA_P2P_GATEWAY_ARGS="-relay-activation-fallback"\n')
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("NAK_NET_DIR", str(net))
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "run"))
@@ -925,7 +936,7 @@ def test_host_transition_matrix_preserves_effective_p2p_invariant(
         live["gateway"] = True
         (state / "gateway.env").write_text("PORT=11600\nOLD=1\n")
         nak._write_p2p_consumer_env()
-    if transition in {"worker-off", "p2p-off"}:
+    if transition in {"worker-off", "p2p-off", "worker-relay-on"}:
         live["worker"] = True
         (state / "worker.env").write_text(
             'PORT=5530\nNAKSHATRA_P2P_WORKER_ARGS="-inbound=127.0.0.1:5530 '
@@ -954,6 +965,18 @@ def test_host_transition_matrix_preserves_effective_p2p_invariant(
         effective = _effective_p2p_argv(tmp_path, home)
         inbound = [arg for arg in effective if arg.startswith("-inbound=")]
         nakd_inbound = [arg for arg in effective if arg.startswith("-nakd-inbound=")]
+        fallback = [arg for arg in effective if arg == "-relay-activation-fallback"]
+        relay_acceptance = [arg for arg in effective if arg == "-allow-relayed-activation"]
+        loaded_envs = [state / "p2p.env", state / "worker.env",
+                       state / "p2p-consumer.env"]
+        for path in loaded_envs:
+            if path.exists():
+                body = path.read_text()
+                assert "NAKSHATRA_P2P_GATEWAY_ARGS" not in body, (
+                    transition, faults, boundary, path, body)
+                if path.name != "p2p-consumer.env":
+                    assert "-relay-activation-fallback" not in body, (
+                        transition, faults, boundary, path, body)
         if live["worker"]:
             assert inbound == ["-inbound=127.0.0.1:5530"], (
                 transition, faults, boundary, calls, effective)
@@ -963,6 +986,21 @@ def test_host_transition_matrix_preserves_effective_p2p_invariant(
         else:
             assert effective == _legacy_p2p_argv(tmp_path, home, "test"), (
                 transition, faults, boundary, calls, effective)
+
+        # I4: dialer fallback belongs to the active consumer role; worker relay acceptance is an
+        # independent, explicit worker opt-in. Both are checked at every installer boundary.
+        consumer_values = supervisor._env_file(state / "p2p-consumer.env")
+        consumer_role = (
+            not live["worker"]
+            and (live["gateway"] or (state / "gateway.env").exists())
+            and consumer_values.get("NAKSHATRA_P2P_CONSUMER_ARGS")
+            == "-relay-activation-fallback"
+        )
+        assert fallback == (["-relay-activation-fallback"] if consumer_role else []), (
+            transition, faults, boundary, calls, effective)
+        worker_relay_on = live["worker"] and nak._worker_relay_enabled(state / "worker.env")
+        assert relay_acceptance == (["-allow-relayed-activation"] if worker_relay_on else []), (
+            transition, faults, boundary, calls, effective)
 
     def operate(service, action):
         key = (service, action)
@@ -1012,6 +1050,12 @@ def test_host_transition_matrix_preserves_effective_p2p_invariant(
             nak._worker_disable(object())
         elif transition == "p2p-on-takeover":
             nak.main(["p2p", "on"])
+        elif transition == "worker-relay-on":
+            nak._worker_relay(object(), True)
+        elif transition == "gateway-worker-gateway-off":
+            nak._gateway_on(object(), gateway_args)
+            nak._worker_enable(object(), worker_args)
+            nak._gateway_off(object())
         else:
             nak.main(["p2p", "off"])
 
@@ -1121,6 +1165,7 @@ def test_container_consumer_effective_p2p_command_listens_but_forwards_nothing(t
     effective = _effective_p2p_argv(tmp_path, home)
     assert "-listen" in effective and "/ip4/0.0.0.0/tcp/0" in effective
     assert "-quic" in effective
+    assert "-relay-activation-fallback" in effective
     assert not any(arg.startswith(("-nakd-inbound", "-inbound")) for arg in effective)
 
 
@@ -1144,11 +1189,13 @@ def test_published_container_consumer_uses_fixed_tcp_and_quic_port_without_inbou
     }
     assert supervisor._env_file(env_dir / "p2p-consumer.env") == {
         "NAKSHATRA_P2P_NAKD_INBOUND": "",
+        "NAKSHATRA_P2P_CONSUMER_ARGS": "-relay-activation-fallback",
         "NAKSHATRA_P2P_WORKER_ARGS": "-listen /ip4/0.0.0.0/tcp/24001",
     }
     effective = _effective_p2p_argv(tmp_path, home)
     assert effective[-2:] == ["-listen", "/ip4/0.0.0.0/tcp/24001"]
     assert "-quic" in effective  # derives /ip4/0.0.0.0/udp/24001/quic-v1
+    assert "-relay-activation-fallback" in effective
     assert not any(arg.startswith(("-nakd-inbound", "-inbound")) for arg in effective)
 
 
@@ -1161,11 +1208,13 @@ def test_container_consumer_clears_stale_inbound_from_every_loaded_env_file(
         "P2P_RELAYS=test\n"
         " NAKSHATRA_P2P_NAKD_INBOUND=-nakd-inbound=127.0.0.1:51830\n"
         " export NAKSHATRA_P2P_WORKER_ARGS=-inbound=127.0.0.1:51831\n"
+        'NAKSHATRA_P2P_GATEWAY_ARGS="-relay-activation-fallback"\n'
     )
     (env_dir / "worker.env").write_text(
         "PORT=50051\n"
         " export NAKSHATRA_P2P_NAKD_INBOUND=-nakd-inbound=127.0.0.1:59999\n"
         " NAKSHATRA_P2P_WORKER_ARGS=-inbound=127.0.0.1:59998\n"
+        'NAKSHATRA_P2P_CONSUMER_ARGS="-relay-activation-fallback"\n'
     )
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.delenv("NAK_CONTAINER_WORKER", raising=False)
@@ -1179,12 +1228,16 @@ def test_container_consumer_clears_stale_inbound_from_every_loaded_env_file(
     assert "51831" not in (env_dir / "p2p.env").read_text()
     assert "59999" not in (env_dir / "worker.env").read_text()
     assert "59998" not in (env_dir / "worker.env").read_text()
+    assert "NAKSHATRA_P2P_GATEWAY_ARGS" not in (env_dir / "p2p.env").read_text()
+    assert "NAKSHATRA_P2P_CONSUMER_ARGS" not in (env_dir / "worker.env").read_text()
     assert supervisor._env_file(env_dir / "p2p-consumer.env") == {
         "NAKSHATRA_P2P_NAKD_INBOUND": "",
+        "NAKSHATRA_P2P_CONSUMER_ARGS": "-relay-activation-fallback",
         "NAKSHATRA_P2P_WORKER_ARGS": "-listen /ip4/0.0.0.0/tcp/24001",
     }
     effective = _effective_p2p_argv(tmp_path, home)
     assert effective[-2:] == ["-listen", "/ip4/0.0.0.0/tcp/24001"]
+    assert "-relay-activation-fallback" in effective
     assert not any(arg.startswith(("-nakd-inbound", "-inbound")) for arg in effective)
 
 

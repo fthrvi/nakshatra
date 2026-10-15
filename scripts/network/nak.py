@@ -246,21 +246,24 @@ def _enable_p2p_service_locked(_sp, *, owner_token: str = "") -> None:
     if not env.exists():
         env.parent.mkdir(parents=True, exist_ok=True)
         ownership = f"{GATEWAY_PROFILE_OWNER_PREFIX}{owner_token}\n" if owner_token else ""
-        consumer = (
-            'NAKSHATRA_P2P_NAKD_INBOUND=""\n'
-            'NAKSHATRA_P2P_GATEWAY_ARGS="-relay-activation-fallback"\n'
-            if owner_token else ""
-        )
+        consumer = 'NAKSHATRA_P2P_NAKD_INBOUND=""\n' if owner_token else ""
         _write_private(
             env, f"P2P_RELAYS={DEFAULT_P2P_RELAYS}\n{consumer}{ownership}".encode()
         )
         created = True
-    elif not owner_token:
+    else:
+        # Releases before the consumer-role override put this dialer authorization in p2p.env.
+        # It must never survive an upgrade or role transition into an operator/worker generation.
+        p2p_config_changed = _remove_env_assignments(
+            env, "NAKSHATRA_P2P_GATEWAY_ARGS", "NAKSHATRA_P2P_CONSUMER_ARGS")
+    if owner_token and "NAK_CONTAINER_CONSUMER_P2P_PORT" not in os.environ:
+        _write_p2p_consumer_env()
+    if not owner_token:
         # An explicit `nak p2p on` takes the gateway-created consumer sidecar over for the
         # operator. Restore the signed unit's default nakd inbound in the owned base file; a live
         # consumer-only gateway remains protected by the final override until it is stopped.
-        p2p_config_changed = _remove_env_assignments(
-            env, "NAKSHATRA_P2P_NAKD_INBOUND", "NAKSHATRA_P2P_GATEWAY_ARGS")
+        p2p_config_changed = _remove_env_assignment(
+            env, "NAKSHATRA_P2P_NAKD_INBOUND") or p2p_config_changed
     if not owner_token:
         protect_gateway = (
             "NAK_CONTAINER_CONSUMER_P2P_PORT" not in os.environ
@@ -269,7 +272,9 @@ def _enable_p2p_service_locked(_sp, *, owner_token: str = "") -> None:
         )
         if protect_gateway:
             before = consumer_env.read_bytes() if consumer_env.exists() else None
-            _write_p2p_consumer_env()
+            # P2P is now operator-owned. Keep the final empty-inbound override which protects a
+            # still-live gateway, but retire the gateway-owned dialer fallback authorization.
+            _write_p2p_consumer_env(relay_fallback=False)
             p2p_config_changed = p2p_config_changed or consumer_env.read_bytes() != before
         elif consumer_env.exists():
             consumer_env.unlink()
@@ -285,6 +290,8 @@ def _enable_p2p_service_locked(_sp, *, owner_token: str = "") -> None:
             # a live consumer-only gateway protected even if its pre-transition override was stale.
             if old_env is not None:
                 _write_private(env, old_env)
+                _remove_env_assignments(
+                    env, "NAKSHATRA_P2P_GATEWAY_ARGS", "NAKSHATRA_P2P_CONSUMER_ARGS")
             if protect_gateway:
                 _write_p2p_consumer_env()
             elif old_consumer_env is None:
@@ -315,6 +322,8 @@ def _enable_p2p_service_locked(_sp, *, owner_token: str = "") -> None:
                 env.unlink(missing_ok=True)
             else:
                 _write_private(env, old_env)
+                _remove_env_assignments(
+                    env, "NAKSHATRA_P2P_GATEWAY_ARGS", "NAKSHATRA_P2P_CONSUMER_ARGS")
             if old_consumer_env is None:
                 consumer_env.unlink(missing_ok=True)
             else:
@@ -364,11 +373,13 @@ def _p2p_consumer_env_path() -> Path:
     return Path.home() / ".nakshatra" / "p2p-consumer.env"
 
 
-def _write_p2p_consumer_env(worker_args: str = "") -> None:
+def _write_p2p_consumer_env(worker_args: str = "", *, relay_fallback: bool = True) -> None:
     """Write the last-loaded, canonical consumer P2P override."""
+    consumer_args = "-relay-activation-fallback" if relay_fallback else ""
     _write_private(
         _p2p_consumer_env_path(),
         ('NAKSHATRA_P2P_NAKD_INBOUND=""\n'
+         f'NAKSHATRA_P2P_CONSUMER_ARGS="{consumer_args}"\n'
          f'NAKSHATRA_P2P_WORKER_ARGS="{worker_args}"\n').encode(),
     )
 
@@ -422,6 +433,10 @@ def _release_gateway_p2p_ownership(_sp) -> None:
         p2p_env, marker = _gateway_p2p_paths()
         consumer_env = _p2p_consumer_env_path()
         removed_consumer_override = consumer_env.exists()
+        removed_legacy_relay = False
+        if p2p_env.exists():
+            removed_legacy_relay = _remove_env_assignments(
+                p2p_env, "NAKSHATRA_P2P_GATEWAY_ARGS", "NAKSHATRA_P2P_CONSUMER_ARGS")
         env_token = _gateway_profile_token(p2p_env)
         marker_token = _gateway_marker_token(marker)
         owned = bool(env_token and marker_token and secrets.compare_digest(env_token, marker_token))
@@ -462,7 +477,7 @@ def _release_gateway_p2p_ownership(_sp) -> None:
                 p2p_env.unlink(missing_ok=True)
                 removed_consumer_override = False
         consumer_env.unlink(missing_ok=True)
-        if removed_consumer_override and p2p_env.exists():
+        if (removed_consumer_override or removed_legacy_relay) and p2p_env.exists():
             _p2p_installer(_sp, "restart")
         marker.unlink(missing_ok=True)
 
@@ -701,6 +716,10 @@ def _gateway_on(_sp, args) -> None:
         with _p2p_ownership_lock():
             p2p_env, p2p_owner = _gateway_p2p_paths()
             made_p2p = not p2p_env.exists()
+            scrubbed_legacy_relay = False
+            if not made_p2p:
+                scrubbed_legacy_relay = _remove_env_assignments(
+                    p2p_env, "NAKSHATRA_P2P_GATEWAY_ARGS", "NAKSHATRA_P2P_CONSUMER_ARGS")
             host_consumer_override = (
                 "NAK_CONTAINER_CONSUMER_P2P_PORT" not in os.environ
                 and not _worker_unit_enabled(_sp)
@@ -712,7 +731,7 @@ def _gateway_on(_sp, args) -> None:
                 p2p_owner_token = secrets.token_hex(32)
                 _write_private(p2p_owner, f"{p2p_owner_token}\n".encode())
                 _enable_p2p_service_locked(_sp, owner_token=p2p_owner_token)
-            elif consumer_override_changed:
+            elif consumer_override_changed or scrubbed_legacy_relay:
                 _p2p_installer(_sp, "restart")
         gateway_attempted = True
         _gateway_installer(_sp, action)
@@ -807,6 +826,10 @@ def _p2p_unit_enabled(_sp) -> bool:
 
 
 def _gateway_off(_sp) -> None:
+    p2p_env = Path.home() / ".nakshatra" / "p2p.env"
+    if p2p_env.exists():
+        _remove_env_assignments(
+            p2p_env, "NAKSHATRA_P2P_GATEWAY_ARGS", "NAKSHATRA_P2P_CONSUMER_ARGS")
     _gateway_installer(_sp, "disable")
     _gateway_paths()[1].unlink(missing_ok=True)
     _release_gateway_profile_ownership()
@@ -1087,12 +1110,17 @@ def _worker_enable_locked(_sp, args) -> None:
         _write_private(env_path, body.encode())
     port = _worker_port(env_path)
     allow_relayed = _worker_relay_enabled(env_path)
+    _remove_env_assignments(
+        env_path, "NAKSHATRA_P2P_GATEWAY_ARGS", "NAKSHATRA_P2P_CONSUMER_ARGS")
     _set_env_assignment(
         env_path,
         "NAKSHATRA_P2P_WORKER_ARGS",
         _worker_p2p_args(port, allow_relayed),
     )
     consumer_env.unlink(missing_ok=True)
+    if p2p_env.exists():
+        _remove_env_assignments(
+            p2p_env, "NAKSHATRA_P2P_GATEWAY_ARGS", "NAKSHATRA_P2P_CONSUMER_ARGS")
     action = "restart" if worker_was_live else "enable"
     worker_attempted = False
     try:
@@ -1100,7 +1128,9 @@ def _worker_enable_locked(_sp, args) -> None:
         _worker_installer(_sp, action)
         if _p2p_enabled():
             took_over_p2p = True
-            _remove_env_assignment(p2p_env, "NAKSHATRA_P2P_NAKD_INBOUND")
+            _remove_env_assignments(
+                p2p_env, "NAKSHATRA_P2P_NAKD_INBOUND",
+                "NAKSHATRA_P2P_GATEWAY_ARGS", "NAKSHATRA_P2P_CONSUMER_ARGS")
             p2p_owner.unlink(missing_ok=True)
             _p2p_installer(_sp, "restart")
         else:
@@ -1112,6 +1142,9 @@ def _worker_enable_locked(_sp, args) -> None:
         if action == "restart":
             if old_env is not None:
                 _write_private(env_path, old_env)
+                _remove_env_assignments(
+                    env_path, "NAKSHATRA_P2P_GATEWAY_ARGS",
+                    "NAKSHATRA_P2P_CONSUMER_ARGS")
             consumer_env.unlink(missing_ok=True)
             rollback_errors = []
             if _p2p_enabled():
@@ -1151,11 +1184,16 @@ def _worker_enable_locked(_sp, args) -> None:
             env_path.unlink(missing_ok=True)
         else:
             _write_private(env_path, old_env)
+            _remove_env_assignments(
+                env_path, "NAKSHATRA_P2P_GATEWAY_ARGS", "NAKSHATRA_P2P_CONSUMER_ARGS")
         if took_over_p2p:
             if old_p2p_env is None:
                 p2p_env.unlink(missing_ok=True)
             else:
                 _write_private(p2p_env, old_p2p_env)
+                _remove_env_assignments(
+                    p2p_env, "NAKSHATRA_P2P_GATEWAY_ARGS",
+                    "NAKSHATRA_P2P_CONSUMER_ARGS")
             if old_p2p_owner is None:
                 p2p_owner.unlink(missing_ok=True)
             else:
@@ -1184,6 +1222,10 @@ def _worker_disable(_sp) -> None:
 
 def _worker_disable_locked(_sp) -> None:
     _root, _record, env_path = _worker_paths()
+    p2p_env = Path.home() / ".nakshatra" / "p2p.env"
+    if p2p_env.exists():
+        _remove_env_assignments(
+            p2p_env, "NAKSHATRA_P2P_GATEWAY_ARGS", "NAKSHATRA_P2P_CONSUMER_ARGS")
     try:
         _worker_installer(_sp, "disable")
     except (Exception, SystemExit):
@@ -1191,6 +1233,8 @@ def _worker_disable_locked(_sp) -> None:
     # The worker is now confirmed stopped. A mock/dev installer may retain worker.env, so remove
     # its stale inbound assignment explicitly; a real installer has already removed the opt-in.
     if env_path.exists():
+        _remove_env_assignments(
+            env_path, "NAKSHATRA_P2P_GATEWAY_ARGS", "NAKSHATRA_P2P_CONSUMER_ARGS")
         _set_env_assignment(env_path, "NAKSHATRA_P2P_WORKER_ARGS", None)
     protect_gateway = (
         "NAK_CONTAINER_CONSUMER_P2P_PORT" not in os.environ
@@ -1211,15 +1255,23 @@ def _worker_relay(_sp, enabled: bool) -> None:
             raise SystemExit("worker relay needs a configured worker; run `nak worker on` first")
         old_env = env_path.read_bytes()
         port = _worker_port(env_path)
+        _remove_env_assignments(
+            env_path, "NAKSHATRA_P2P_GATEWAY_ARGS", "NAKSHATRA_P2P_CONSUMER_ARGS")
         _set_env_assignment(
             env_path, "NAKSHATRA_P2P_WORKER_ARGS", _worker_p2p_args(port, enabled)
         )
         p2p_enabled = _p2p_enabled()
+        p2p_env = Path.home() / ".nakshatra" / "p2p.env"
+        if p2p_enabled:
+            _remove_env_assignments(
+                p2p_env, "NAKSHATRA_P2P_GATEWAY_ARGS", "NAKSHATRA_P2P_CONSUMER_ARGS")
         try:
             if p2p_enabled:
                 _p2p_installer(_sp, "restart")
         except (Exception, SystemExit) as restart_error:
             _write_private(env_path, old_env)
+            _remove_env_assignments(
+                env_path, "NAKSHATRA_P2P_GATEWAY_ARGS", "NAKSHATRA_P2P_CONSUMER_ARGS")
             try:
                 _p2p_installer(_sp, "restart")
             except (Exception, SystemExit) as rollback_error:
@@ -1603,6 +1655,11 @@ def main(argv=None, *, http_post=None) -> int:
                 f.unlink(missing_ok=True)
                 _sp.run(["systemctl", "--user", "restart", "nak-net.service"], check=False)
                 if a.socket is None:          # a custom --socket means a sidecar we don't manage
+                    p2p_env = Path.home() / ".nakshatra" / "p2p.env"
+                    if p2p_env.exists():
+                        _remove_env_assignments(
+                            p2p_env, "NAKSHATRA_P2P_GATEWAY_ARGS",
+                            "NAKSHATRA_P2P_CONSUMER_ARGS")
                     _p2p_installer(_sp, "disable")
             else:
                 dial = a.socket or _default_p2p_socket()

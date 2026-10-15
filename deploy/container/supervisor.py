@@ -249,6 +249,8 @@ class Supervisor:
                 if path.exists():
                     self._stage_env(staged, path, "NAKSHATRA_P2P_WORKER_ARGS", None)
                     self._stage_env(staged, path, "NAKSHATRA_P2P_NAKD_INBOUND", None)
+                    self._stage_env(staged, path, "NAKSHATRA_P2P_GATEWAY_ARGS", None)
+                    self._stage_env(staged, path, "NAKSHATRA_P2P_CONSUMER_ARGS", None)
             if p2p_env.exists():
                 self._stage_env(staged, p2p_env, "NAKSHATRA_P2P_NAKD_INBOUND", "")
             # The signed unit already supplies -quic. The sidecar derives UDP/P/quic-v1
@@ -256,6 +258,7 @@ class Supervisor:
             worker_args = f"-listen /ip4/0.0.0.0/tcp/{port}" if port is not None else ""
             staged[consumer_env] = (
                 'NAKSHATRA_P2P_NAKD_INBOUND=""\n'
+                'NAKSHATRA_P2P_CONSUMER_ARGS="-relay-activation-fallback"\n'
                 f'NAKSHATRA_P2P_WORKER_ARGS="{worker_args}"\n'
             )
             self._replace_staged_env(staged)
@@ -280,6 +283,10 @@ class Supervisor:
             )
             if p2p_env.exists():
                 self._stage_env(staged, p2p_env, "NAKSHATRA_P2P_NAKD_INBOUND", None)
+                self._stage_env(staged, p2p_env, "NAKSHATRA_P2P_GATEWAY_ARGS", None)
+                self._stage_env(staged, p2p_env, "NAKSHATRA_P2P_CONSUMER_ARGS", None)
+            self._stage_env(staged, worker_env, "NAKSHATRA_P2P_GATEWAY_ARGS", None)
+            self._stage_env(staged, worker_env, "NAKSHATRA_P2P_CONSUMER_ARGS", None)
             self._stage_env(staged, worker_env, "LISTEN", "127.0.0.1")
             relay_arg = " -allow-relayed-activation" if allow_relayed else ""
             self._stage_env(
@@ -288,6 +295,8 @@ class Supervisor:
                 f"-require-direct-activation{relay_arg}",
             )
         if p2p_env.exists() and not worker_env.exists():
+            self._stage_env(staged, p2p_env, "NAKSHATRA_P2P_GATEWAY_ARGS", None)
+            self._stage_env(staged, p2p_env, "NAKSHATRA_P2P_CONSUMER_ARGS", None)
             self._stage_env(
                 staged, p2p_env, "NAKSHATRA_P2P_WORKER_ARGS",
                 f"-listen /ip4/0.0.0.0/tcp/{port}"

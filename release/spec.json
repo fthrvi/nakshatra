@@ -162,7 +162,7 @@
     "/ip4/0.0.0.0/tcp/0",
     "-quic",
     "$NAKSHATRA_P2P_NAKD_INBOUND",
-    "$NAKSHATRA_P2P_GATEWAY_ARGS",
+    "$NAKSHATRA_P2P_CONSUMER_ARGS",
     "-dial-listen=${XDG_RUNTIME_DIR}/nakshatra/p2p.sock",
     "-relays=${P2P_RELAYS}",
     "$NAKSHATRA_P2P_WORKER_ARGS"

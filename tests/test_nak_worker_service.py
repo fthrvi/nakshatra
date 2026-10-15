@@ -205,7 +205,9 @@ def test_worker_off_with_live_gateway_writes_consumer_override_before_p2p_restar
     assert restarts == ["restart"]
     assert "NAKSHATRA_P2P_WORKER_ARGS" not in (state / "worker.env").read_text()
     assert (state / "p2p-consumer.env").read_text() == (
-        'NAKSHATRA_P2P_NAKD_INBOUND=""\nNAKSHATRA_P2P_WORKER_ARGS=""\n')
+        'NAKSHATRA_P2P_NAKD_INBOUND=""\n'
+        'NAKSHATRA_P2P_CONSUMER_ARGS="-relay-activation-fallback"\n'
+        'NAKSHATRA_P2P_WORKER_ARGS=""\n')
 
 
 def test_worker_enable_failed_stop_retains_new_config_and_worker_inbound(
