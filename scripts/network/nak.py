@@ -754,14 +754,29 @@ def _p2p_enabled() -> bool:
     return (Path.home() / ".nakshatra" / "p2p.env").is_file()
 
 
+def _env_assignment(raw: str) -> tuple[str, str] | None:
+    """Normalize one systemd EnvironmentFile assignment without evaluating it."""
+    line = raw.strip()
+    if not line or line.startswith("#"):
+        return None
+    if line.startswith("export "):
+        line = line[7:].lstrip()
+    if "=" not in line:
+        return None
+    name, value = line.split("=", 1)
+    return name, value
+
+
 def _set_env_assignment(path: Path, name: str, value: str | None) -> None:
     """Replace one assignment in a release-owned env file, preserving the rest."""
     try:
         lines = path.read_text().splitlines()
     except OSError as e:
         raise SystemExit(f"cannot update {path}: {e}") from e
-    prefix = f"{name}="
-    lines = [line for line in lines if not line.startswith(prefix)]
+    lines = [
+        line for line in lines
+        if (assignment := _env_assignment(line)) is None or assignment[0] != name
+    ]
     if value is not None:
         lines.append(f'{name}="{value}"')
     _write_private(path, (("\n".join(lines) + "\n") if lines else "").encode())
@@ -773,9 +788,15 @@ def _remove_env_assignment(path: Path, name: str) -> bool:
         body = path.read_bytes()
     except OSError as e:
         raise SystemExit(f"cannot update {path}: {e}") from e
-    prefix = f"{name}=".encode()
     lines = body.splitlines(keepends=True)
-    kept = [line for line in lines if not line.startswith(prefix)]
+    kept = []
+    for line in lines:
+        try:
+            assignment = _env_assignment(line.decode())
+        except UnicodeDecodeError:
+            assignment = None
+        if assignment is None or assignment[0] != name:
+            kept.append(line)
     if len(kept) == len(lines):
         return False
     _write_private(path, b"".join(kept))

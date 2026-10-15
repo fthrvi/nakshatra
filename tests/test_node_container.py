@@ -517,8 +517,9 @@ def test_gateway_created_consumer_effective_p2p_argv_has_no_inbound(tmp_path, mo
     assert not any(arg.startswith(("-nakd-inbound", "-inbound")) for arg in effective)
 
 
+@pytest.mark.parametrize("assignment_prefix", [" ", " export "])
 def test_explicit_p2p_on_promotes_gateway_consumer_to_legacy_nakd_inbound(
-        tmp_path, monkeypatch):
+        tmp_path, monkeypatch, assignment_prefix):
     home = tmp_path / "home"
     token = "ab" * 32
     monkeypatch.setenv("HOME", str(home))
@@ -528,8 +529,14 @@ def test_explicit_p2p_on_promotes_gateway_consumer_to_legacy_nakd_inbound(
 
     nak._enable_p2p_service(object(), owner_token=token)
     p2p_env = home / ".nakshatra" / "p2p.env"
+    p2p_env.write_text(p2p_env.read_text().replace(
+        'NAKSHATRA_P2P_NAKD_INBOUND=""',
+        f'{assignment_prefix}NAKSHATRA_P2P_NAKD_INBOUND=""',
+    ))
     before = p2p_env.read_bytes()
-    expected = before.replace(b'NAKSHATRA_P2P_NAKD_INBOUND=""\n', b"")
+    expected = before.replace(
+        f'{assignment_prefix}NAKSHATRA_P2P_NAKD_INBOUND=""\n'.encode(), b""
+    )
     owner = home / ".nakshatra" / "gateway" / "p2p-profile-created"
     owner.parent.mkdir(parents=True)
     owner.write_text(f"{token}\n")
@@ -551,8 +558,12 @@ def test_explicit_p2p_on_promotes_gateway_consumer_to_legacy_nakd_inbound(
     assert "-nakd-inbound=127.0.0.1:51830" in effective
 
 
+@pytest.mark.parametrize(
+    ("nakd_prefix", "worker_prefix"),
+    [(" ", " export "), (" export ", " ")],
+)
 def test_host_worker_on_promotes_gateway_consumer_and_gateway_off_preserves_p2p(
-        tmp_path, monkeypatch):
+        tmp_path, monkeypatch, nakd_prefix, worker_prefix):
     home = tmp_path / "home"
     token = "cd" * 32
     monkeypatch.setenv("HOME", str(home))
@@ -563,6 +574,15 @@ def test_host_worker_on_promotes_gateway_consumer_and_gateway_off_preserves_p2p(
     monkeypatch.setattr(nak, "_gateway_installer", lambda *_args: None)
 
     nak._enable_p2p_service(object(), owner_token=token)
+    p2p_env = home / ".nakshatra" / "p2p.env"
+    p2p_env.write_text(p2p_env.read_text().replace(
+        'NAKSHATRA_P2P_NAKD_INBOUND=""',
+        f'{nakd_prefix}NAKSHATRA_P2P_NAKD_INBOUND=""',
+    ))
+    (home / ".nakshatra" / "worker.env").write_text(
+        "PORT=5530\n"
+        f"{worker_prefix}NAKSHATRA_P2P_WORKER_ARGS=-inbound=127.0.0.1:59998\n"
+    )
     owner = home / ".nakshatra" / "gateway" / "p2p-profile-created"
     owner.parent.mkdir(parents=True)
     owner.write_text(f"{token}\n")
@@ -573,18 +593,21 @@ def test_host_worker_on_promotes_gateway_consumer_and_gateway_off_preserves_p2p(
         "--layers", "0-16", "--port", "5530",
     ]) == 0
 
-    p2p_env = home / ".nakshatra" / "p2p.env"
     assert "NAKSHATRA_P2P_NAKD_INBOUND=" not in p2p_env.read_text()
     assert not owner.exists()
     effective = _effective_p2p_argv(tmp_path, home)
     assert "-nakd-inbound=127.0.0.1:51830" in effective
     assert "-inbound=127.0.0.1:5530" in effective
+    worker_body = (home / ".nakshatra" / "worker.env").read_text()
+    assert "59998" not in worker_body
+    assert worker_body.count("NAKSHATRA_P2P_WORKER_ARGS=") == 1
     assert p2p_calls == ["enable", "restart"]
 
     nak._gateway_off(object())
 
     assert p2p_env.exists()
     assert p2p_calls == ["enable", "restart"]
+    assert _effective_p2p_argv(tmp_path, home) == effective
 
 
 def test_fresh_worker_effective_p2p_argv_matches_legacy_worker(tmp_path, monkeypatch):
@@ -737,12 +760,14 @@ def test_container_consumer_clears_stale_inbound_from_every_loaded_env_file(
     env_dir = home / ".nakshatra"
     env_dir.mkdir(parents=True)
     (env_dir / "p2p.env").write_text(
-        "P2P_RELAYS=test\nNAKSHATRA_P2P_NAKD_INBOUND=-nakd-inbound=127.0.0.1:51830\n"
+        "P2P_RELAYS=test\n"
+        " NAKSHATRA_P2P_NAKD_INBOUND=-nakd-inbound=127.0.0.1:51830\n"
+        " export NAKSHATRA_P2P_WORKER_ARGS=-inbound=127.0.0.1:51831\n"
     )
     (env_dir / "worker.env").write_text(
         "PORT=50051\n"
-        "NAKSHATRA_P2P_NAKD_INBOUND=-nakd-inbound=127.0.0.1:59999\n"
-        "NAKSHATRA_P2P_WORKER_ARGS=-inbound=127.0.0.1:59998\n"
+        " export NAKSHATRA_P2P_NAKD_INBOUND=-nakd-inbound=127.0.0.1:59999\n"
+        " NAKSHATRA_P2P_WORKER_ARGS=-inbound=127.0.0.1:59998\n"
     )
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.delenv("NAK_CONTAINER_WORKER", raising=False)
@@ -752,6 +777,10 @@ def test_container_consumer_clears_stale_inbound_from_every_loaded_env_file(
 
     instance.reconcile_container_env()
 
+    assert "51830" not in (env_dir / "p2p.env").read_text()
+    assert "51831" not in (env_dir / "p2p.env").read_text()
+    assert "59999" not in (env_dir / "worker.env").read_text()
+    assert "59998" not in (env_dir / "worker.env").read_text()
     effective = _effective_p2p_argv(tmp_path, home)
     assert effective[-2:] == ["-listen", "/ip4/0.0.0.0/tcp/24001"]
     assert not any(arg.startswith(("-nakd-inbound", "-inbound")) for arg in effective)

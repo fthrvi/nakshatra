@@ -34,6 +34,19 @@ def _assignments(value: str) -> dict[str, str]:
     return result
 
 
+def _env_assignment(raw: str) -> tuple[str, str] | None:
+    """Normalize one EnvironmentFile assignment without evaluating it."""
+    line = raw.strip()
+    if not line or line.startswith("#"):
+        return None
+    if line.startswith("export "):
+        line = line[7:].lstrip()
+    if "=" not in line:
+        return None
+    name, value = line.split("=", 1)
+    return name, value
+
+
 def _env_file(path: Path) -> dict[str, str]:
     result = {}
     try:
@@ -41,14 +54,10 @@ def _env_file(path: Path) -> dict[str, str]:
     except OSError:
         return result
     for raw in lines:
-        line = raw.strip()
-        if not line or line.startswith("#"):
+        assignment = _env_assignment(raw)
+        if assignment is None:
             continue
-        if line.startswith("export "):
-            line = line[7:].lstrip()
-        if "=" not in line:
-            continue
-        name, value = line.split("=", 1)
+        name, value = assignment
         try:
             parsed = shlex.split(value, posix=True)
             result[name] = parsed[0] if len(parsed) == 1 else value
@@ -181,8 +190,10 @@ class Supervisor:
     @staticmethod
     def _updated_env(contents: str, name: str, value: str | None) -> str:
         lines = contents.splitlines()
-        prefix = f"{name}="
-        lines = [line for line in lines if not line.startswith(prefix)]
+        lines = [
+            line for line in lines
+            if (assignment := _env_assignment(line)) is None or assignment[0] != name
+        ]
         if value is not None:
             lines.append(f'{name}="{value}"')
         return "\n".join(lines) + "\n"
