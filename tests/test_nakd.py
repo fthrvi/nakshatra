@@ -244,7 +244,8 @@ def test_mcp_front_door(net, tmp_path):
     names = {t["name"] for t in srv.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})["result"]["tools"]}
     assert names == {"nak_status", "nak_contacts", "nak_inbox", "nak_requests", "nak_send",
                      "nak_tasks", "nak_task_post", "nak_task_claim", "nak_task_submit",
-                     "nak_models", "nak_ask", "nak_balance", "nak_worker_status"}   # no connect tools
+                     "nak_models", "nak_ask", "nak_balance", "nak_wallet",
+                     "nak_worker_status"}   # no connect tools
     call = lambda n, args: srv.handle({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
                                        "params": {"name": n, "arguments": args}})["result"]
     r = call("nak_accept", {"id": "x"})

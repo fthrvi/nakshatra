@@ -258,7 +258,9 @@ def test_nak_p2p_refuses_a_tampered_installer_before_subprocess(tmp_path, monkey
     with pytest.raises(SystemExit, match="fails signature verification"):
         nak.main(["p2p", "on"])
     assert calls == []
-    assert not (tmp_path / "home" / ".nakshatra" / "p2p.env").exists()
+    # Verification fails for both enable and the defensive disable. The opt-in is deliberately
+    # retained because rollback cannot prove that a possibly started sidecar was stopped.
+    assert (tmp_path / "home" / ".nakshatra" / "p2p.env").exists()
     assert not (tmp_path / "net" / "p2p-dial").exists()
 
 

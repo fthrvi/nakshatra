@@ -73,25 +73,41 @@ ensure_image() {
 }
 
 valid_port() {
-    [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+    [[ "$1" =~ ^[1-9][0-9]{0,4}$ ]] && [ "$1" -le 65535 ]
+}
+
+gateway_port() {
+    local port="${NAKC_GATEWAY_PORT:-11600}"
+    valid_port "$port" || die "NAKC_GATEWAY_PORT must be a canonical port between 1 and 65535"
+    printf '%s\n' "$port"
+}
+
+validate_p2p_port() {
+    local port="$1" host_gateway_port
+    valid_port "$port" || die "NAKC_P2P_PORT must be a canonical port between 1 and 65535"
+    host_gateway_port="$(gateway_port)" || return
+    [ "$port" != 11599 ] || die "NAKC_P2P_PORT must not collide with container gateway port 11599"
+    [ "$port" != "$host_gateway_port" ] || \
+        die "NAKC_P2P_PORT must not collide with host gateway port $host_gateway_port"
 }
 
 run_args() {
-    local runtime="$1" share_path share_mode worker_port gateway_on p2p_port
+    local runtime="$1" share_path share_mode worker_port gateway_on p2p_port host_gateway_port
     share_path="$(config_read share-path)"
     share_mode="$(config_read share-mode)"
     worker_port="$(config_read worker-port)"
     gateway_on="$(config_read gateway-on)"
     p2p_port="${NAKC_P2P_PORT:-$(config_read p2p-port)}"
     p2p_port="${p2p_port:-4001}"
-    valid_port "$p2p_port" || die "p2p port must be between 1 and 65535"
+    validate_p2p_port "$p2p_port" || return
+    host_gateway_port="$(gateway_port)" || return
     RUN_ARGS=(run -d --name "$CONTAINER_NAME" --hostname "$CONTAINER_NAME"
         --label io.nakshatra.role=node --restart unless-stopped
         --user 11600:11600 --cap-drop ALL --security-opt no-new-privileges
         --read-only --tmpfs "/tmp:rw,nosuid,nodev,size=${NAKC_TMPFS_SIZE:-2g},mode=1777"
         --pids-limit "${NAKC_PIDS_LIMIT:-512}" --memory "${NAKC_MEMORY:-16g}"
         --network bridge --stop-timeout "${NAKC_STOP_TIMEOUT:-20}"
-        --publish "127.0.0.1:${NAKC_GATEWAY_PORT:-11600}:11599/tcp"
+        --publish "127.0.0.1:$host_gateway_port:11599/tcp"
         --env "NAK_UPDATE_INTERVAL_S=${NAKC_UPDATE_INTERVAL_S:-3600}")
     if [ "${runtime##*/}" = podman ]; then
         RUN_ARGS+=(--volume "$VOLUME_NAME:/state:U")
@@ -106,7 +122,7 @@ run_args() {
         fi
     fi
     if [ -n "$worker_port" ]; then
-        valid_port "$worker_port" || die "stored worker port is invalid"
+        valid_port "$worker_port" || die "stored worker port must be a canonical port between 1 and 65535"
         RUN_ARGS+=(--env "NAK_CONTAINER_WORKER=1" --env "NAK_CONTAINER_P2P_PORT=$p2p_port"
             --publish "0.0.0.0:$p2p_port:$p2p_port/tcp"
             --publish "0.0.0.0:$p2p_port:$p2p_port/udp")
@@ -132,9 +148,9 @@ run_args() {
 
 start_container() {
     local runtime="$1"
-    ensure_image "$runtime"
-    if container_exists; then run "$runtime" rm -f "$CONTAINER_NAME" >/dev/null; fi
-    run_args "$runtime"
+    ensure_image "$runtime" || return
+    if container_exists; then run "$runtime" rm -f "$CONTAINER_NAME" >/dev/null || return; fi
+    run_args "$runtime" || return
     if [ -n "$(config_read worker-port)" ]; then
         printf 'nakc: deliberate public port: libp2p sidecar 0.0.0.0:%s (tcp+udp); worker gRPC stays on container loopback\n' \
             "${NAKC_P2P_PORT:-$(config_read p2p-port)}" >&2
@@ -143,6 +159,13 @@ start_container() {
             "${NAKC_P2P_PORT:-$(config_read p2p-port)}" >&2
     fi
     run "$runtime" "${RUN_ARGS[@]}"
+}
+
+restart_with_stored_p2p_port() {
+    local runtime="$1"
+    # An attempted NAKC_P2P_PORT override belongs to the failed generation. Recreate the previous
+    # generation from its restored config (or the default when it had no persisted P2P port).
+    (unset NAKC_P2P_PORT; start_container "$runtime") || true
 }
 
 ensure_running() {
@@ -235,7 +258,10 @@ main() {
                 shift
                 for item in "$@"; do
                     case "$item" in
-                        --bind|--bind=*|--port|--port=*|--allow-lan)
+                        --pillar-url|--pillar-url=*|--pillar-spki|--pillar-spki=*|\
+                        --package-url|--package-url=*|--package-pubkey|--package-pubkey=*)
+                            ;;
+                        --b*|--p*|--allow*)
                             die "nakc fixes the gateway bind and port; omit $item"
                             ;;
                     esac
@@ -243,10 +269,23 @@ main() {
                 old_gateway="$(config_read gateway-on)"
                 old_p2p_port="$(config_read p2p-port)"
                 p2p_port="${NAKC_P2P_PORT:-${old_p2p_port:-4001}}"
-                valid_port "$p2p_port" || die "NAKC_P2P_PORT must be between 1 and 65535"
+                validate_p2p_port "$p2p_port"
                 config_write gateway-on 1
                 config_write p2p-port "$p2p_port"
-                start_container "$runtime"
+                if ! (start_container "$runtime"); then
+                    if [ -n "$old_gateway" ]; then
+                        config_write gateway-on "$old_gateway"
+                    else
+                        rm -f "$CONFIG_DIR/gateway-on"
+                    fi
+                    if [ -n "$old_p2p_port" ]; then
+                        config_write p2p-port "$old_p2p_port"
+                    else
+                        rm -f "$CONFIG_DIR/p2p-port"
+                    fi
+                    restart_with_stored_p2p_port "$runtime"
+                    return 1
+                fi
                 if ! run "$runtime" exec -i "$CONTAINER_NAME" nak gateway on \
                         --bind 0.0.0.0 --port 11599 --allow-lan "$@"; then
                     if [ -n "$old_gateway" ]; then
@@ -259,7 +298,7 @@ main() {
                     else
                         rm -f "$CONFIG_DIR/p2p-port"
                     fi
-                    start_container "$runtime"
+                    restart_with_stored_p2p_port "$runtime"
                     return 1
                 fi
             elif [ "$1" = off ]; then
@@ -281,15 +320,27 @@ main() {
                 old_port="$(config_read worker-port)"
                 old_p2p_port="$(config_read p2p-port)"
                 port="$(worker_port_from_args "$@")"
-                if [ -n "$port" ]; then
-                    valid_port "$port" || die "worker --port must be between 1 and 65535"
-                    config_write worker-port "$port"
-                fi
-                [ -n "$(config_read worker-port)" ] || die "worker on needs --port on its first configuration"
+                port="${port:-$old_port}"
+                [ -n "$port" ] || die "worker on needs --port on its first configuration"
+                valid_port "$port" || die "worker --port must be a canonical port between 1 and 65535"
                 p2p_port="${NAKC_P2P_PORT:-${old_p2p_port:-4001}}"
-                valid_port "$p2p_port" || die "NAKC_P2P_PORT must be between 1 and 65535"
+                validate_p2p_port "$p2p_port"
+                config_write worker-port "$port"
                 config_write p2p-port "$p2p_port"
-                start_container "$runtime"
+                if ! (start_container "$runtime"); then
+                    if [ -n "$old_port" ]; then
+                        config_write worker-port "$old_port"
+                    else
+                        rm -f "$CONFIG_DIR/worker-port"
+                    fi
+                    if [ -n "$old_p2p_port" ]; then
+                        config_write p2p-port "$old_p2p_port"
+                    else
+                        rm -f "$CONFIG_DIR/p2p-port"
+                    fi
+                    restart_with_stored_p2p_port "$runtime"
+                    return 1
+                fi
                 if [ "$DRY_RUN" = 1 ]; then
                     run "$runtime" exec -i "$CONTAINER_NAME" nak p2p on
                     run "$runtime" exec -i "$CONTAINER_NAME" nak worker "$@"
@@ -305,7 +356,7 @@ main() {
                     else
                         rm -f "$CONFIG_DIR/p2p-port"
                     fi
-                    start_container "$runtime"
+                    restart_with_stored_p2p_port "$runtime"
                     return 1
                 fi
             else

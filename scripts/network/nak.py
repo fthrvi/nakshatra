@@ -1051,9 +1051,19 @@ def _default_p2p_socket() -> Path:
     return default_p2p_socket_path()
 
 
+class _NoAbbrevArgumentParser(argparse.ArgumentParser):
+    """Keep every parser level strict; argparse otherwise abbreviates long options."""
+
+    def __init__(self, *args, **kwargs):
+        kwargs["allow_abbrev"] = False
+        super().__init__(*args, **kwargs)
+
+
 def main(argv=None, *, http_post=None) -> int:
     default_sock = Path(os.environ.get("NAK_NET_DIR", Path.home() / ".nakshatra" / "net")) / "nakd.sock"
-    ap = argparse.ArgumentParser(prog="nak", description=__doc__.split("\n")[0])
+    # ArgumentParser uses type(self) for every nested subparser, so the strict setting propagates
+    # through gateway, wallet, worker, owner-lease, and task rather than stopping at the root.
+    ap = _NoAbbrevArgumentParser(prog="nak", description=__doc__.split("\n")[0])
     ap.add_argument("--sock", type=Path, default=default_sock)
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("status")

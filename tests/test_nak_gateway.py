@@ -270,6 +270,18 @@ def test_gateway_cli_defaults_ignore_container_environment(monkeypatch):
     assert seen.pop() == ("127.0.0.1", 11600)
 
 
+@pytest.mark.parametrize("option", ["--bi", "--po", "--allow"])
+def test_gateway_cli_rejects_long_option_abbreviations(monkeypatch, option):
+    required = ["--pillar-url", "https://pillar.example", "--pillar-spki", PIN,
+                "--ledger-url", "https://pillar.example/ledger"]
+    monkeypatch.setattr(
+        nak, "_gateway_on", lambda *_args: pytest.fail("abbreviation reached gateway mutation"))
+    abbreviated = [option] if option == "--allow" else [option, "11600"]
+    with pytest.raises(SystemExit) as exc:
+        nak.main(["gateway", "on", *required, *abbreviated])
+    assert exc.value.code == 2
+
+
 def test_gateway_allows_lan_only_with_explicit_flag(tmp_path, monkeypatch):
     home = tmp_path / "home"
     monkeypatch.setenv("HOME", str(home))

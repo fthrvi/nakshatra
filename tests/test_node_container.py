@@ -221,6 +221,91 @@ def test_gateway_p2p_port_is_configurable_and_persisted(tmp_path):
     assert "24001:24001/tcp" in restarted_argv and "24001:24001/udp" in restarted_argv
 
 
+@pytest.mark.parametrize(
+    ("p2p_port", "gateway_port", "message"),
+    [
+        ("11599", None, "container gateway port 11599"),
+        ("11600", None, "host gateway port 11600"),
+        ("24001", "24001", "host gateway port 24001"),
+    ],
+)
+def test_gateway_rejects_p2p_gateway_port_collisions_before_persisting(
+        tmp_path, p2p_port, gateway_port, message):
+    extra_env = {"NAKC_P2P_PORT": p2p_port}
+    if gateway_port is not None:
+        extra_env["NAKC_GATEWAY_PORT"] = gateway_port
+    result = _nakc(tmp_path, "gateway", "on", **extra_env)
+    assert result.returncode == 2
+    assert message in result.stderr
+    assert not (tmp_path / "config" / "gateway-on").exists()
+    assert not (tmp_path / "config" / "p2p-port").exists()
+
+
+@pytest.mark.parametrize("port", ["04001", "+4001", "-4001", "0", "65536"])
+def test_gateway_rejects_noncanonical_p2p_ports_before_persisting(tmp_path, port):
+    result = _nakc(tmp_path, "gateway", "on", NAKC_P2P_PORT=port)
+    assert result.returncode == 2
+    assert "canonical port between 1 and 65535" in result.stderr
+    assert not (tmp_path / "config" / "gateway-on").exists()
+    assert not (tmp_path / "config" / "p2p-port").exists()
+
+
+@pytest.mark.parametrize("port", ["050051", "+50051", "-50051", "0", "65536"])
+def test_worker_rejects_noncanonical_ports_before_persisting(tmp_path, port):
+    result = _nakc(tmp_path, "worker", "on", "--port", port)
+    assert result.returncode == 2
+    assert "canonical port between 1 and 65535" in result.stderr
+    assert not (tmp_path / "config" / "worker-port").exists()
+    assert not (tmp_path / "config" / "p2p-port").exists()
+
+
+def test_start_rejects_a_noncanonical_host_gateway_port(tmp_path):
+    result = _nakc(tmp_path, "start", NAKC_GATEWAY_PORT="011600")
+    assert result.returncode == 2
+    assert "NAKC_GATEWAY_PORT must be a canonical port" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("command", "old_values"),
+    [
+        (("gateway", "on"), {"gateway-on": "old", "p2p-port": "4002"}),
+        (("worker", "on", "--port", "50051"),
+         {"worker-port": "50052", "p2p-port": "4002"}),
+    ],
+)
+def test_role_enable_rolls_back_config_when_container_start_fails(
+        tmp_path, command, old_values):
+    config = tmp_path / "config"
+    config.mkdir()
+    for name, value in old_values.items():
+        (config / name).write_text(value + "\n")
+    engine = tmp_path / "failing-container-engine"
+    engine.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = image ] && [ \"$2\" = inspect ]; then exit 0; fi\n"
+        "if [ \"$1\" = container ] && [ \"$2\" = inspect ]; then exit 1; fi\n"
+        "if [ \"$1\" = run ]; then printf '%s\\n' \"$*\" >>\"$NAKC_TEST_LOG\"; exit 23; fi\n"
+        "exit 0\n"
+    )
+    engine.chmod(0o755)
+    engine_log = tmp_path / "engine.log"
+    env = dict(
+        os.environ,
+        HOME=str(tmp_path / "home"),
+        NAKC_ENGINE=str(engine),
+        NAKC_CONFIG_DIR=str(config),
+        NAKC_P2P_PORT="4001",
+        NAKC_TEST_LOG=str(engine_log),
+    )
+    result = subprocess.run(
+        [str(NAKC), *command], env=env, text=True, capture_output=True, check=False)
+    assert result.returncode != 0
+    assert {name: (config / name).read_text().strip() for name in old_values} == old_values
+    attempted, restored = engine_log.read_text().splitlines()
+    assert "4001:4001/tcp" in attempted
+    assert "4002:4002/tcp" in restored
+
+
 def test_gateway_off_removes_consumer_publish_on_next_start(tmp_path):
     assert _nakc(tmp_path, "gateway", "on").returncode == 0
     disabled = _nakc(tmp_path, "gateway", "off")
@@ -250,6 +335,16 @@ def test_gateway_on_rejects_endpoint_overrides(tmp_path):
     result = _nakc(tmp_path, "gateway", "on", "--port", "12345")
     assert result.returncode == 2
     assert "fixes the gateway bind and port" in result.stderr
+
+
+@pytest.mark.parametrize("option", ["--bi", "--p", "--p=11600", "--po", "--allow"])
+def test_gateway_on_rejects_abbreviated_endpoint_overrides_before_persisting(tmp_path, option):
+    args = (option,) if option in {"--allow", "--p=11600"} else (option, "11600")
+    result = _nakc(tmp_path, "gateway", "on", *args)
+    assert result.returncode == 2
+    assert "fixes the gateway bind and port" in result.stderr
+    assert not (tmp_path / "config" / "gateway-on").exists()
+    assert not (tmp_path / "config" / "p2p-port").exists()
 
 
 def test_bootstrap_parser_accepts_only_the_fingerprinted_join_form():
