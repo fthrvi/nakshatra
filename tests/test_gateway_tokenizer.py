@@ -1,6 +1,7 @@
 """Consumer-only tokenizer provisioning from a signed layer package."""
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import sys
@@ -192,10 +193,16 @@ def test_cached_tokenizer_verification_follows_release_switch(
     next_current.replace(prefix / "current")
 
     # Services verify their existing tokenizer cache after `current` switches
-    # but before install.py commits the new version to config.json.
-    assert gateway_tokenizer.verify_model_tokenizer(
-        "llama32-3b", root=root) == str(
-            gateway_tokenizer.tokenizer_path("llama32-3b", root))
+    # but before install.py commits the new version to config.json. The installer
+    # remains live and holds the same prefix flock throughout this window.
+    with (prefix / ".install.lock").open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            assert gateway_tokenizer.verify_model_tokenizer(
+                "llama32-3b", root=root) == str(
+                    gateway_tokenizer.tokenizer_path("llama32-3b", root))
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
 
 
 def test_model_ids_have_collision_free_cache_names(tmp_path):

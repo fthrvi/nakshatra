@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import stat
 import sys
@@ -59,6 +61,17 @@ def _write_transition(prefix: Path, pubkey: str, from_version: str | None,
     return path
 
 
+@contextlib.contextmanager
+def _held_installer_lock(prefix: Path):
+    lock = prefix / ".install.lock"
+    with lock.open("a+") as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(stream, fcntl.LOCK_UN)
+
+
 def test_package_signers_come_from_verified_release_manifest(tmp_path):
     prefix, package_key, _private_hex = _installed_release(tmp_path)
     assert release_trust.load_release_package_signers(prefix) == frozenset({package_key})
@@ -83,7 +96,8 @@ def test_package_trust_follows_atomic_current_switch_before_config_commit(tmp_pa
     (prefix / "current").unlink()
     (prefix / "current").symlink_to("releases/1.2.4")
 
-    assert release_trust.load_release_package_signers(prefix) == frozenset({package_key})
+    with _held_installer_lock(prefix):
+        assert release_trust.load_release_package_signers(prefix) == frozenset({package_key})
     assert stat.S_IMODE(transition.stat().st_mode) == 0o600
 
 
@@ -97,7 +111,8 @@ def test_package_trust_accepts_first_install_transition_without_config(tmp_path)
     _write_transition(prefix, public_hex, None, "1.2.3")
     (prefix / "current").symlink_to("releases/1.2.3")
 
-    assert release_trust.load_release_package_signers(prefix) == frozenset({package_key})
+    with _held_installer_lock(prefix):
+        assert release_trust.load_release_package_signers(prefix) == frozenset({package_key})
 
 
 def test_package_trust_refuses_manifest_not_matching_current_symlink(tmp_path):
@@ -111,10 +126,27 @@ def test_package_trust_refuses_manifest_not_matching_current_symlink(tmp_path):
     (prefix / "current").unlink()
     (prefix / "current").symlink_to("releases/1.2.4")
 
-    with pytest.raises(
-            release_trust.ReleaseTrustError,
-            match="manifest does not name the installed current version"):
+    with _held_installer_lock(prefix):
+        with pytest.raises(
+                release_trust.ReleaseTrustError,
+                match="manifest does not name the installed current version"):
+            release_trust.load_release_package_signers(prefix)
+
+
+def test_package_trust_refuses_transition_after_installer_lock_disappears(tmp_path):
+    prefix, _package_key, private_hex = _installed_release(tmp_path)
+    old_package_key = "35" * 32
+    _write_signed_release(prefix, private_hex, "1.2.2", old_package_key)
+    config = json.loads((prefix / "config.json").read_text())
+    _write_transition(prefix, config["pubkey"], "1.2.3", "1.2.2")
+    (prefix / "current").unlink()
+    (prefix / "current").symlink_to("releases/1.2.2")
+
+    with pytest.raises(release_trust.ReleaseTrustError, match="transition is stale"):
         release_trust.load_release_package_signers(prefix)
+
+    with _held_installer_lock(prefix):
+        assert release_trust.load_release_package_signers(prefix) == frozenset({old_package_key})
 
 
 @pytest.mark.parametrize("target", [

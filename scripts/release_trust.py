@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import base64
+import errno
+import fcntl
 import json
 import os
 import re
@@ -53,6 +55,29 @@ def _version_tuple(version: object) -> tuple[int, ...]:
     return tuple(int(part) for part in version.split("."))
 
 
+def _installer_lock_is_held(*, root_fd: int) -> bool:
+    """Return whether the prefix's installer flock is held by another open description."""
+    try:
+        fd = os.open(
+            ".install.lock", os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=root_fd)
+    except FileNotFoundError:
+        return False
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError("installer lock is not a regular file")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as e:
+            if e.errno in (errno.EACCES, errno.EAGAIN):
+                return True
+            raise
+        else:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return False
+    finally:
+        os.close(fd)
+
+
 def load_release_package_signers(
         prefix: str | os.PathLike[str] | None = None) -> frozenset[str]:
     """Verify the installed release manifest and return its package signer allowlist.
@@ -61,8 +86,10 @@ def load_release_package_signers(
     be exactly the relative link ``releases/<version>``. The selected directory
     and manifest are opened beneath the prefix with directory file descriptors
     and ``O_NOFOLLOW`` so a link swap cannot redirect trust outside the prefix.
-    A private installer transition record supplies the pinned key on first
-    install and authorizes exactly one in-flight target during update/rollback.
+    A private installer transition journal supplies the pinned key on first
+    install and authorizes exactly one target during update/rollback only while
+    the prefix's installer flock is demonstrably held. Same-uid integrity is out
+    of scope: filesystem permissions and flock do not constrain that attacker.
     """
     root = Path(prefix) if prefix is not None else Path(os.path.expanduser(
         os.environ.get("NAK_NODE_PREFIX", "~/.nakshatra-node")))
@@ -129,6 +156,9 @@ def load_release_package_signers(
                     if transition_from != committed or transition_to != installed_version:
                         raise ValueError(
                             f"current release {installed_version} is not the exact installer transition target")
+                    if not _installer_lock_is_held(root_fd=root_fd):
+                        raise ValueError(
+                            "release transition is stale because no installer holds the prefix lock")
                     release_key = transition.get("pubkey")
                     configured_key = config.get("pubkey")
                     if configured_key is not None and configured_key != release_key:

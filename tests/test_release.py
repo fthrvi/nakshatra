@@ -1,10 +1,12 @@
 """Tests for the signed release + installer (release/)."""
 from __future__ import annotations
 
+import importlib.util
 import io
 import json
 import time
 import os
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -87,6 +89,41 @@ def _set_package_signer(e, key: str) -> None:
     B.SPEC["package_signers"] = {
         "component": "alpha", "path": "pkg/package-signers.json",
     }
+
+
+def _load_c9f0fed_installer(tmp_path: Path):
+    old = tmp_path / "c9f0fed-installer"
+    old.mkdir()
+    for name in ("install.py", "releasekit.py"):
+        body = subprocess.check_output(
+            ["git", "show", f"c9f0fed:release/{name}"], cwd=REL.parent)
+        (old / name).write_bytes(body)
+    spec = importlib.util.spec_from_file_location("install_c9f0fed", old / "install.py")
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    original_path = list(sys.path)
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.path[:] = original_path
+    return module
+
+
+def _branch_release_repo(tmp_path: Path) -> Path:
+    """Make a commit containing the release code under test for a real signed build."""
+    repo = tmp_path / "branch-release-source"
+    (repo / "release").mkdir(parents=True)
+    (repo / "scripts").mkdir()
+    for name in ("install.py", "releasekit.py", "package-signers.json"):
+        shutil.copy2(REL / name, repo / "release" / name)
+    shutil.copy2(SCRIPTS / "release_trust.py", repo / "scripts" / "release_trust.py")
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run([
+        "git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t",
+        "commit", "-qm", "branch release under test",
+    ], check=True)
+    return repo
 
 
 def test_pure_python_verify_agrees_with_cryptography():
@@ -209,6 +246,94 @@ def test_update_installs_newer_only_and_records_previous(env):
     assert cfg["current"] == "0.1.1" and cfg["previous"] == "0.1.0"
 
 
+def test_c9f0fed_updater_bootstraps_transition_and_timer_crossing(env, monkeypatch):
+    package_key = json.loads((REL / "package-signers.json").read_text())["keys"][0]
+    source = _branch_release_repo(env["tmp"])
+    monkeypatch.setattr(B, "SPEC", {
+        "name": "nakshatra-node",
+        "python": "3.12",
+        "installer": "nakshatra/release/install.py",
+        "package_signers": {"component": "nakshatra", "path": "release/package-signers.json"},
+        "components": [{
+            "name": "nakshatra", "repo": str(source),
+            "paths": ["release", "scripts"], "pythonpath": "scripts",
+        }],
+        "requirements": [],
+        "services": {},
+        "health": [],
+    })
+    _build(env, "0.15.13")
+
+    prefix = env["tmp"] / "node"
+    old_release = prefix / "releases" / "0.15.12"
+    old_release.mkdir(parents=True)
+    (old_release / "manifest.json").write_text(json.dumps({
+        "version": "0.15.12", "components": [], "services": {}, "profiles": {},
+    }))
+    (prefix / "current").symlink_to("releases/0.15.12")
+    I._save_config(prefix, {
+        "source": str(env["dist"]), "channel": "canary", "pubkey": env["pub"],
+        "current": "0.15.12", "previous": None,
+    })
+
+    old = _load_c9f0fed_installer(env["tmp"])
+    updater = old.Installer(
+        prefix, systemd=False, make_venv=False, unit_dir=env["tmp"] / "units")
+    observed = []
+
+    def observe(stage):
+        observed.append((stage, release_trust.load_release_package_signers(prefix)))
+
+    updater.health = lambda _man: observe("health")
+    updater.restart = lambda _names, _man=None, force=False: observe("restart") or []
+
+    assert "installed 0.15.13" in updater.update()
+    assert observed == [
+        ("health", frozenset({package_key})),
+        ("restart", frozenset({package_key})),
+    ]
+    assert os.readlink(prefix / "current") == "releases/0.15.13"
+    assert json.loads((prefix / "config.json").read_text())["current"] == "0.15.13"
+    assert json.loads((prefix / "state" / I.TRANSITION_FILE).read_text())["from"] == "0.15.12"
+
+    # The crossing rewrites the timer's oneshot to the installer in the signed new release. Execute
+    # that exact path as the next timer tick: it must recover the completed compatibility journal.
+    timer_unit = (env["tmp"] / "units" / "nak-update.service").read_text()
+    new_installer = prefix / "current" / "nakshatra" / "release" / "install.py"
+    assert str(new_installer) in timer_unit and " update" in timer_unit
+    timer_home = env["tmp"] / "timer-home"
+    timer_home.mkdir()
+    timer = subprocess.run(
+        [sys.executable, str(new_installer), "--prefix", str(prefix), "update"],
+        env=dict(os.environ, HOME=str(timer_home)), capture_output=True, text=True)
+    assert timer.returncode == 0, timer.stderr
+    assert "already at 0.15.13" in timer.stdout
+    assert not (prefix / "state" / I.TRANSITION_FILE).exists()
+
+
+def test_pre_transition_bootstrap_verifies_target_with_pinned_key(tmp_path):
+    prefix = tmp_path / "node"
+    release = prefix / "releases" / "0.15.13"
+    release.mkdir(parents=True)
+    (tmp_path / "pinned").mkdir()
+    (tmp_path / "other").mkdir()
+    _pinned_key, pinned_pub = _key(tmp_path / "pinned")
+    other_key, _other_pub = _key(tmp_path / "other")
+    manifest = rk.sign({
+        "schema": rk.MANIFEST_SCHEMA, "version": "0.15.13",
+    }, other_key.read_text().strip())
+    (release / "manifest.json").write_text(json.dumps(manifest))
+    (prefix / "current").symlink_to("releases/0.15.13")
+    I._save_config(prefix, {"current": "0.15.12", "pubkey": pinned_pub})
+    inst = I.Installer(prefix, systemd=False, make_venv=False, unit_dir=tmp_path / "units")
+
+    with inst._install_lock():
+        with pytest.raises(I.InstallError, match="not the exact target signed by the pinned"):
+            inst._bootstrap_pre_transition_handoff(manifest)
+
+    assert not inst._transition_path.exists()
+
+
 def test_failed_health_check_rolls_back(env, monkeypatch):
     _build(env, "0.1.0")
     env["inst"].install(str(env["dist"]), "canary", env["pub"])
@@ -288,9 +413,6 @@ def test_next_operation_restores_a_release_left_mid_transition(env, monkeypatch)
     class SimulatedProcessDeath(BaseException):
         pass
 
-    class StopAfterRecovery(RuntimeError):
-        pass
-
     _build(env, "0.1.0")
     inst = env["inst"]
     inst.install(str(env["dist"]), "canary", env["pub"])
@@ -312,16 +434,53 @@ def test_next_operation_restores_a_release_left_mid_transition(env, monkeypatch)
         "from": "0.1.0",
         "to": "0.1.1",
     }
+    with pytest.raises(release_trust.ReleaseTrustError, match="transition is stale"):
+        release_trust.load_release_package_signers(inst.prefix)
 
-    def stop_fetch(*_args, **_kwargs):
-        raise StopAfterRecovery
-
-    monkeypatch.setattr(inst, "fetch_verified", stop_fetch)
-    with pytest.raises(StopAfterRecovery):
-        inst.update()
-
+    status = inst.status()
     assert os.readlink(inst.prefix / "current") == "releases/0.1.0"
     assert not inst._transition_path.exists()
+    assert status["release_transition"] == {
+        "state": "stale", "from": "0.1.0", "to": "0.1.1",
+        "recovery": "restored-committed",
+    }
+
+
+def test_status_reports_transition_pending_while_installer_lock_is_live(env):
+    _build(env, "0.1.0")
+    inst = env["inst"]
+    inst.install(str(env["dist"]), "canary", env["pub"])
+    _commit(env["a"], "alpha", "OK = True\nV = 4\n")
+    _build(env, "0.1.1")
+    man, work = inst.fetch_verified(str(env["dist"]), "canary", env["pub"])
+    try:
+        inst.unpack(man, work)
+    finally:
+        shutil.rmtree(work)
+
+    with inst._install_lock():
+        inst._begin_transition(env["pub"], "0.1.0", "0.1.1")
+        I._switch(inst.prefix, "0.1.1")
+        assert inst.status()["release_transition"] == {
+            "state": "pending", "from": "0.1.0", "to": "0.1.1",
+        }
+
+    recovered = inst.status()
+    assert recovered["release_transition"]["state"] == "stale"
+    assert recovered["release_transition"]["recovery"] == "restored-committed"
+    assert os.readlink(inst.prefix / "current") == "releases/0.1.0"
+
+
+def test_existing_state_directory_permissions_are_normalized(tmp_path):
+    prefix = tmp_path / "node"
+    state = prefix / "state"
+    state.mkdir(parents=True, mode=0o775)
+    state.chmod(0o775)
+
+    I._save_private_state(prefix, "test.json", {"ok": True})
+
+    assert state.stat().st_mode & 0o777 == 0o700
+    assert (state / "test.json").stat().st_mode & 0o777 == 0o600
 
 
 def test_rollback_restarts_only_units_returned_by_write_units(tmp_path, monkeypatch):

@@ -100,12 +100,24 @@ def _state_dir_fd(prefix: Path, *, create: bool = False) -> int:
             state.mkdir(mode=0o700)
         except FileExistsError:
             pass
-    return os.open(
+    fd = os.open(
         state, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        # Older installers created state through generic helpers, so an existing directory may be
+        # group/world-readable. Normalize it whenever the installer opens it.
+        os.fchmod(fd, 0o700)
+    except Exception:
+        os.close(fd)
+        raise
+    return fd
 
 
 def _save_private_state(prefix: Path, name: str, value: dict) -> None:
-    """Atomically persist installer authority with owner-only permissions."""
+    """Atomically persist a private installer recovery journal.
+
+    The permissions prevent disclosure to other OS users. Integrity against another process running
+    as this same uid is explicitly out of scope; that requires privilege separation.
+    """
     dir_fd = _state_dir_fd(prefix, create=True)
     tmp = f".{name}.{os.getpid()}.{time.time_ns()}.tmp"
     fd = -1
@@ -201,6 +213,29 @@ def _switch(prefix: Path, version: str) -> None:
         tmp.unlink()
     tmp.symlink_to(Path("releases") / version)
     os.replace(tmp, prefix / "current")
+
+
+def _install_lock_is_held(prefix: Path) -> bool:
+    """Non-blockingly probe the exact flock used by installer operations."""
+    try:
+        fd = os.open(prefix / ".install.lock", os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return False
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise InstallError("installer lock is not a regular file")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as e:
+            if e.errno in (errno.EACCES, errno.EAGAIN):
+                return True
+            raise
+        else:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return False
+    finally:
+        os.close(fd)
 
 
 def _locked_operation(fn):
@@ -398,12 +433,13 @@ class Installer:
         # retries the conservative restore. Handled success/failure always removes that authority.
         self._clear_transition()
 
-    def _recover_transition(self) -> None:
+    def _recover_transition(self) -> dict | None:
         """Resolve a transaction left by a killed installer before doing any new mutation."""
         transition = _load_private_state(self.prefix, TRANSITION_FILE)
         if transition is None:
-            return
+            return None
         pubkey, from_version, to_version = self._validated_transition(transition)
+        recovered = {"state": "stale", "from": from_version, "to": to_version}
         cfg = _load_config(self.prefix)
         committed = cfg.get("current")
         if committed != from_version and committed != to_version:
@@ -416,20 +452,73 @@ class Installer:
         if committed == to_version and current == to_version:
             # Config was committed and the process died before removing the record.
             self._clear_transition()
-            return
+            recovered["recovery"] = "cleared-committed"
+            return recovered
         if committed != from_version:
             raise InstallError("release transition has an inconsistent committed version")
         if current == from_version:
             # Either the process died before switching, or while restoring after a failed switch.
             # Conservatively re-apply the committed units/services; both states resolve identically.
             self._restore_release(from_version, restart=from_version is not None)
-            return
+            recovered["recovery"] = "reapplied-committed"
+            return recovered
         if current != to_version:
             raise InstallError(
                 f"release transition target is {to_version!r}, but current is {current!r}")
         # A killed process cannot prove that health/restarts completed. Safely restore the last
         # committed release; a first install restores the pre-install state of no current release.
         self._restore_release(from_version, restart=from_version is not None)
+        recovered["recovery"] = "restored-committed"
+        return recovered
+
+    def _bootstrap_pre_transition_handoff(self, man: dict) -> None:
+        """Journal an old installer's already-exposed switch before it runs health/restarts.
+
+        Installers predating ``nak-release-transition/1`` switch ``current`` and then invoke the
+        installer shipped by the target release to write units. Their parent process still holds the
+        prefix flock, which is the only bounded compatibility seam where the new installer may create
+        the exact committed-version -> current-link journal on their behalf.
+        """
+        cfg = _load_config(self.prefix)
+        committed = cfg.get("current")
+        current = _current(self.prefix)
+        if current == committed:
+            return
+        if not _install_lock_is_held(self.prefix):
+            raise InstallError(
+                "current differs from config.json but no installer holds the prefix lock")
+        transition = _load_private_state(self.prefix, TRANSITION_FILE)
+        if transition is not None:
+            recorded_key, recorded_from, recorded_to = self._validated_transition(transition)
+            if (recorded_from, recorded_to) != (committed, current):
+                raise InstallError("release transition does not match the locked installer handoff")
+            configured_key = cfg.get("pubkey")
+            if configured_key is not None and configured_key != recorded_key:
+                raise InstallError("release transition key conflicts with the pinned release key")
+            pubkey = recorded_key
+        else:
+            pubkey = cfg.get("pubkey")
+        if not isinstance(pubkey, str) or len(pubkey) != 64 \
+                or any(char not in "0123456789abcdef" for char in pubkey):
+            raise InstallError("config.json has no valid pinned release key")
+        if (committed is not None and not isinstance(committed, str)) or not isinstance(current, str):
+            raise InstallError("installer handoff requires valid committed and current releases")
+        try:
+            if committed is not None:
+                _vt(committed)
+            _vt(current)
+        except (TypeError, ValueError) as e:
+            raise InstallError("pre-transition handoff has malformed release versions") from e
+        if os.readlink(self.prefix / "current") != f"releases/{current}":
+            raise InstallError("current must be exactly the relative link releases/<version>")
+        if man.get("schema") != rk.MANIFEST_SCHEMA or man.get("version") != current \
+                or not rk.verify(man, pubkey):
+            raise InstallError(
+                "current release manifest is not the exact target signed by the pinned release key")
+        if transition is None:
+            if committed is None:
+                raise InstallError("pre-transition handoff requires an existing committed release")
+            self._begin_transition(pubkey, committed, current)
 
     @property
     def _service_state_path(self) -> Path:
@@ -1142,9 +1231,21 @@ class Installer:
         return f"rolled back to {prev}" + self._service_issue_summary()
 
     def status(self) -> dict:
+        transition = _load_private_state(self.prefix, TRANSITION_FILE)
+        transition_status = None
+        if transition is not None:
+            _pubkey, from_version, to_version = self._validated_transition(transition)
+            if _install_lock_is_held(self.prefix):
+                transition_status = {"state": "pending", "from": from_version, "to": to_version}
+            else:
+                # A journal without the lock is never trust authority. Recover it under the lock and
+                # report what status repaired so an operator can diagnose the interrupted install.
+                with self._install_lock():
+                    transition_status = self._recover_transition()
         cfg = _load_config(self.prefix)
         return {"current": _current(self.prefix), "previous": cfg.get("previous"), "channel": cfg.get("channel"),
                 "source": cfg.get("source"), "release_key": (cfg.get("pubkey") or "")[:16],
+                "release_transition": transition_status,
                 "service_issues": _load_json(self._service_state_path).get("services", {})}
 
 
@@ -1275,6 +1376,7 @@ def main(argv=None) -> int:
         if a.cmd == "write-units":
             w = Installer(a.prefix, systemd=not a.no_systemd, unit_dir=a.unit_dir)
             man = json.loads((a.prefix / "current" / "manifest.json").read_text())
+            w._bootstrap_pre_transition_handoff(man)
             names = w.write_units(man)
             if a.include_updater:
                 names.append("nak-update")
