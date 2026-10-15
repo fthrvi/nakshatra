@@ -27,6 +27,7 @@ import functools
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -47,6 +48,8 @@ UNIT_MARKER = "# Managed by nakshatra-node install.py"
 SERVICE_ACTIVE_TIMEOUT_S = 20.0
 SERVICE_STABILITY_S = 5.0
 INSTALL_LOCK_TIMEOUT_S = 600.0
+TRANSITION_SCHEMA = "nak-release-transition/1"
+TRANSITION_FILE = "release-transition.json"
 
 
 class InstallError(Exception):
@@ -90,6 +93,89 @@ def _save_config(prefix: Path, cfg: dict) -> None:
     os.replace(tmp, prefix / "config.json")
 
 
+def _state_dir_fd(prefix: Path, *, create: bool = False) -> int:
+    state = prefix / "state"
+    if create:
+        try:
+            state.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+    return os.open(
+        state, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+
+
+def _save_private_state(prefix: Path, name: str, value: dict) -> None:
+    """Atomically persist installer authority with owner-only permissions."""
+    dir_fd = _state_dir_fd(prefix, create=True)
+    tmp = f".{name}.{os.getpid()}.{time.time_ns()}.tmp"
+    fd = -1
+    try:
+        fd = os.open(
+            tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600, dir_fd=dir_fd)
+        payload = (json.dumps(value, indent=1, sort_keys=True) + "\n").encode("utf-8")
+        with os.fdopen(fd, "wb") as stream:
+            fd = -1
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        os.chmod(name, 0o600, dir_fd=dir_fd, follow_symlinks=False)
+        os.fsync(dir_fd)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            os.unlink(tmp, dir_fd=dir_fd)
+        except FileNotFoundError:
+            pass
+        os.close(dir_fd)
+
+
+def _load_private_state(prefix: Path, name: str) -> dict | None:
+    try:
+        dir_fd = _state_dir_fd(prefix)
+    except FileNotFoundError:
+        return None
+    fd = -1
+    try:
+        try:
+            fd = os.open(
+                name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
+        except FileNotFoundError:
+            return None
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) & 0o077:
+            raise InstallError(f"installer state {name} is not a private regular file")
+        with os.fdopen(fd, "r", encoding="utf-8") as stream:
+            fd = -1
+            value = json.load(stream)
+        if not isinstance(value, dict):
+            raise InstallError(f"installer state {name} must contain an object")
+        return value
+    except (OSError, ValueError) as e:
+        raise InstallError(f"cannot read installer state {name}: {e}") from e
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        os.close(dir_fd)
+
+
+def _remove_private_state(prefix: Path, name: str) -> None:
+    try:
+        dir_fd = _state_dir_fd(prefix)
+    except FileNotFoundError:
+        return
+    try:
+        try:
+            os.unlink(name, dir_fd=dir_fd)
+        except FileNotFoundError:
+            return
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
 def _safe_extract(tf: tarfile.TarFile, dest: Path) -> None:
     for m in tf.getmembers():
         target = (dest / m.name).resolve()
@@ -122,6 +208,8 @@ def _locked_operation(fn):
     @functools.wraps(fn)
     def locked(self, *args, **kwargs):
         with self._install_lock():
+            if self._lock_depth == 1:
+                self._recover_transition()
             return fn(self, *args, **kwargs)
     return locked
 
@@ -252,6 +340,96 @@ class Installer:
 
     def _install_lock(self):
         return self._Lock(self)
+
+    @property
+    def _transition_path(self) -> Path:
+        return self.prefix / "state" / TRANSITION_FILE
+
+    @staticmethod
+    def _validated_transition(value: dict) -> tuple[str, str | None, str]:
+        if value.get("schema") != TRANSITION_SCHEMA or set(value) != {
+                "schema", "pubkey", "from", "to"}:
+            raise InstallError("release transition record is malformed")
+        pubkey, from_version, to_version = value["pubkey"], value["from"], value["to"]
+        try:
+            if not isinstance(pubkey, str) or len(pubkey) != 64 \
+                    or any(char not in "0123456789abcdef" for char in pubkey):
+                raise ValueError
+            if from_version is not None:
+                if not isinstance(from_version, str):
+                    raise ValueError
+                _vt(from_version)
+            if not isinstance(to_version, str):
+                raise ValueError
+            _vt(to_version)
+        except (TypeError, ValueError):
+            raise InstallError("release transition record is malformed")
+        if from_version == to_version:
+            raise InstallError("release transition must change versions")
+        return pubkey, from_version, to_version
+
+    def _begin_transition(self, pubkey: str, from_version: str | None, to_version: str) -> None:
+        transition = {
+            "schema": TRANSITION_SCHEMA,
+            "pubkey": pubkey,
+            "from": from_version,
+            "to": to_version,
+        }
+        self._validated_transition(transition)
+        _save_private_state(self.prefix, TRANSITION_FILE, transition)
+
+    def _clear_transition(self) -> None:
+        _remove_private_state(self.prefix, TRANSITION_FILE)
+
+    def _restore_release(self, version: str | None, *, restart: bool) -> None:
+        if version is None:
+            (self.prefix / "current").unlink(missing_ok=True)
+        else:
+            _switch(self.prefix, version)
+        if version is not None and restart:
+            try:
+                man = json.loads((self.prefix / "releases" / version / "manifest.json").read_text())
+                self.restart(self.write_units(man), man, force=True)
+            except Exception:
+                # A handled restoration failure must not leave authority to expose the failed target.
+                self._clear_transition()
+                raise
+        # A real process death during restoration leaves the record durable so the next invocation
+        # retries the conservative restore. Handled success/failure always removes that authority.
+        self._clear_transition()
+
+    def _recover_transition(self) -> None:
+        """Resolve a transaction left by a killed installer before doing any new mutation."""
+        transition = _load_private_state(self.prefix, TRANSITION_FILE)
+        if transition is None:
+            return
+        pubkey, from_version, to_version = self._validated_transition(transition)
+        cfg = _load_config(self.prefix)
+        committed = cfg.get("current")
+        if committed != from_version and committed != to_version:
+            raise InstallError(
+                f"release transition {from_version!r}->{to_version!r} conflicts with "
+                f"committed version {committed!r}")
+        if cfg.get("pubkey") not in (None, pubkey):
+            raise InstallError("release transition key conflicts with the pinned release key")
+        current = _current(self.prefix)
+        if committed == to_version and current == to_version:
+            # Config was committed and the process died before removing the record.
+            self._clear_transition()
+            return
+        if committed != from_version:
+            raise InstallError("release transition has an inconsistent committed version")
+        if current == from_version:
+            # Either the process died before switching, or while restoring after a failed switch.
+            # Conservatively re-apply the committed units/services; both states resolve identically.
+            self._restore_release(from_version, restart=from_version is not None)
+            return
+        if current != to_version:
+            raise InstallError(
+                f"release transition target is {to_version!r}, but current is {current!r}")
+        # A killed process cannot prove that health/restarts completed. Safely restore the last
+        # committed release; a first install restores the pre-install state of no current release.
+        self._restore_release(from_version, restart=from_version is not None)
 
     @property
     def _service_state_path(self) -> Path:
@@ -829,7 +1007,7 @@ class Installer:
         # first install that died half-way must be retried, not reported as "already at X".
         prev = _current(self.prefix) if cfg.get("current") else None
         if prev:
-            if man["version"] == prev and not allow_downgrade:
+            if man["version"] == prev:
                 issues = _load_json(self._service_state_path).get("services", {})
                 retry = {name for name, issue in issues.items()
                          if issue.get("status") in ("failed", "pending")}
@@ -856,29 +1034,31 @@ class Installer:
         # Resolve `current/...` argv while it still points to the old release. A pure-Python service
         # can have no old-release mmap/fd left by the time current is switched.
         pre_switch_used = _releases_in_use(self.prefix / "releases")
-        _switch(self.prefix, man["version"])
+        self._begin_transition(pubkey, prev, man["version"])
         try:
+            _switch(self.prefix, man["version"])
             names = self._write_units_by_new_installer(man)
             self.health(man)
             self.restart(names, man)
         except Exception as e:
             if prev:
-                _switch(self.prefix, prev)
-                prev_man = json.loads((self.prefix / "releases" / prev / "manifest.json").read_text())
-                prev_names = self.write_units(prev_man)
-                self.restart(prev_names, prev_man, force=True)
+                self._restore_release(prev, restart=True)
                 raise InstallError(f"{man['version']} failed after switching and was rolled back to {prev}: {e}")
             # First install failed: leave NO half-installed node behind (no `current`, no release dir),
             # so the next attempt starts clean instead of believing it is already installed.
-            try:
-                (self.prefix / "current").unlink()
-            except OSError:
-                pass
+            self._restore_release(None, restart=False)
             shutil.rmtree(new_dir, ignore_errors=True)
             raise InstallError(f"first install of {man['version']} failed and was removed: {e}")
         cfg.update({"source": source, "channel": channel, "pubkey": pubkey, "current": man["version"],
                     "previous": prev, "updated": int(time.time())})
-        _save_config(self.prefix, cfg)
+        try:
+            _save_config(self.prefix, cfg)
+        except Exception as e:
+            self._restore_release(prev, restart=prev is not None)
+            if prev is None:
+                shutil.rmtree(new_dir, ignore_errors=True)
+            raise InstallError(f"could not commit release {man['version']}; restored {prev!r}: {e}") from e
+        self._clear_transition()
         self.prune(keep=(man["version"], prev, *pre_switch_used))
         return (f"installed {man['version']} ({channel})" + (f", previous {prev}" if prev else "") +
                 self._service_issue_summary())
@@ -944,11 +1124,21 @@ class Installer:
         if not prev or not (self.prefix / "releases" / prev).exists():
             raise InstallError("no previous release to roll back to")
         cur = _current(self.prefix)
-        _switch(self.prefix, prev)
-        man = json.loads((self.prefix / "releases" / prev / "manifest.json").read_text())
-        self.restart(self.write_units(man), man, force=True)
+        self._begin_transition(cfg["pubkey"], cur, prev)
+        try:
+            _switch(self.prefix, prev)
+            man = json.loads((self.prefix / "releases" / prev / "manifest.json").read_text())
+            self.restart(self.write_units(man), man, force=True)
+        except Exception as e:
+            self._restore_release(cur, restart=cur is not None)
+            raise InstallError(f"rollback to {prev} failed; restored {cur}: {e}") from e
         cfg.update({"current": prev, "previous": cur, "updated": int(time.time())})
-        _save_config(self.prefix, cfg)
+        try:
+            _save_config(self.prefix, cfg)
+        except Exception as e:
+            self._restore_release(cur, restart=cur is not None)
+            raise InstallError(f"could not commit rollback to {prev}; restored {cur}: {e}") from e
+        self._clear_transition()
         return f"rolled back to {prev}" + self._service_issue_summary()
 
     def status(self) -> dict:

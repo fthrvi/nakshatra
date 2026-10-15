@@ -14,6 +14,8 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 
 RELEASE_MANIFEST_SCHEMA = "nak-release/1"
 PACKAGE_SIGNER_SCHEMA = "nak-package-signers/1"
+TRANSITION_SCHEMA = "nak-release-transition/1"
+TRANSITION_FILE = "release-transition.json"
 _ED25519_PUBLIC_KEY = re.compile(r"^[0-9a-f]{64}$")
 _VERSION = re.compile(r"^[0-9]+(?:\.[0-9]+)*$")
 
@@ -28,12 +30,15 @@ def _open_dir(name: str, *, dir_fd: int) -> int:
         dir_fd=dir_fd)
 
 
-def _load_json_at(name: str, *, dir_fd: int) -> object:
+def _load_json_at(name: str, *, dir_fd: int, private: bool = False) -> object:
     fd = os.open(
         name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode):
             raise ValueError(f"{name} is not a regular file")
+        if private and stat.S_IMODE(metadata.st_mode) & 0o077:
+            raise ValueError(f"{name} is not private to its owner")
         with os.fdopen(fd, "r", encoding="utf-8") as stream:
             fd = -1
             return json.load(stream)
@@ -52,12 +57,12 @@ def load_release_package_signers(
         prefix: str | os.PathLike[str] | None = None) -> frozenset[str]:
     """Verify the installed release manifest and return its package signer allowlist.
 
-    ``config.json`` is the installer's pinned release-key root. ``current`` must
+    ``config.json`` is the installer's committed release state. ``current`` must
     be exactly the relative link ``releases/<version>``. The selected directory
     and manifest are opened beneath the prefix with directory file descriptors
     and ``O_NOFOLLOW`` so a link swap cannot redirect trust outside the prefix.
-    During an update the link may name a version newer than config's committed
-    ``current`` value, but it may never name an older signed release.
+    A private installer transition record supplies the pinned key on first
+    install and authorizes exactly one in-flight target during update/rollback.
     """
     root = Path(prefix) if prefix is not None else Path(os.path.expanduser(
         os.environ.get("NAK_NODE_PREFIX", "~/.nakshatra-node")))
@@ -65,9 +70,6 @@ def load_release_package_signers(
         root_fd = os.open(
             root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
         try:
-            config = _load_json_at("config.json", dir_fd=root_fd)
-            if not isinstance(config, dict):
-                raise ValueError("config.json must contain an object")
             target = os.readlink("current", dir_fd=root_fd)
             parts = target.split("/")
             if (len(parts) != 2 or parts[0] != "releases"
@@ -87,25 +89,58 @@ def load_release_package_signers(
                     os.close(release_fd)
             finally:
                 os.close(releases_fd)
+            try:
+                config = _load_json_at("config.json", dir_fd=root_fd)
+            except FileNotFoundError:
+                config = {}
+            if not isinstance(config, dict):
+                raise ValueError("config.json must contain an object")
+            committed = config.get("current")
+            if committed is not None:
+                _version_tuple(committed)
+            if installed_version == committed:
+                release_key = config.get("pubkey")
+            else:
+                try:
+                    state_fd = _open_dir("state", dir_fd=root_fd)
+                    try:
+                        transition = _load_json_at(
+                            TRANSITION_FILE, dir_fd=state_fd, private=True)
+                    finally:
+                        os.close(state_fd)
+                except FileNotFoundError:
+                    # Commit writes config before removing the record. If those two reads raced,
+                    # a fresh config snapshot establishes the now-committed target.
+                    config = _load_json_at("config.json", dir_fd=root_fd)
+                    if not isinstance(config, dict) or config.get("current") != installed_version:
+                        raise ValueError(
+                            f"current release {installed_version} is not the committed installer version")
+                    release_key = config.get("pubkey")
+                else:
+                    if not isinstance(transition, dict) or transition.get("schema") != TRANSITION_SCHEMA \
+                            or set(transition) != {"schema", "pubkey", "from", "to"}:
+                        raise ValueError("release transition record is malformed")
+                    transition_from, transition_to = transition["from"], transition["to"]
+                    if transition_from is not None:
+                        _version_tuple(transition_from)
+                    _version_tuple(transition_to)
+                    if transition_from == transition_to:
+                        raise ValueError("release transition does not change versions")
+                    if transition_from != committed or transition_to != installed_version:
+                        raise ValueError(
+                            f"current release {installed_version} is not the exact installer transition target")
+                    release_key = transition.get("pubkey")
+                    configured_key = config.get("pubkey")
+                    if configured_key is not None and configured_key != release_key:
+                        raise ValueError("release transition key conflicts with config.json")
         finally:
             os.close(root_fd)
-        release_key = config["pubkey"]
         if not isinstance(release_key, str) or not _ED25519_PUBLIC_KEY.fullmatch(release_key):
             raise ValueError("pinned release public key is malformed")
         if manifest.get("schema") != RELEASE_MANIFEST_SCHEMA:
             raise ValueError("release manifest schema is unsupported")
         if manifest.get("version") != installed_version:
             raise ValueError("release manifest does not name the installed current version")
-        committed_versions = [
-            config.get(name) for name in ("current", "pending", "pending_version")
-            if config.get(name) is not None
-        ]
-        installed_order = _version_tuple(installed_version)
-        for committed in committed_versions:
-            if installed_order < _version_tuple(committed):
-                raise ValueError(
-                    f"current release {installed_version} is older than installer state "
-                    f"{committed}")
         signature = manifest["sig"]
         if not isinstance(signature, dict) or signature.get("alg") != "Ed25519":
             raise ValueError("release manifest signature is malformed")

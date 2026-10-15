@@ -19,6 +19,7 @@ sys.path.insert(0, str(ROOT / "release"))
 import client  # noqa: E402
 import gateway_tokenizer  # noqa: E402
 import nakshatra_serve as serve  # noqa: E402
+import release_trust  # noqa: E402
 import releasekit  # noqa: E402
 from packaging import fetch_package  # noqa: E402
 from packaging.nakshatra_package import (  # noqa: E402
@@ -176,6 +177,16 @@ def test_cached_tokenizer_verification_follows_release_switch(
         "llama32-3b", package_url=package_server["url"], root=root)
 
     write_release("1.2.4")
+    state = prefix / "state"
+    state.mkdir()
+    transition = state / release_trust.TRANSITION_FILE
+    transition.write_text(json.dumps({
+        "schema": release_trust.TRANSITION_SCHEMA,
+        "pubkey": public_hex,
+        "from": "1.2.3",
+        "to": "1.2.4",
+    }))
+    transition.chmod(0o600)
     next_current = prefix / "current.next"
     next_current.symlink_to("releases/1.2.4")
     next_current.replace(prefix / "current")

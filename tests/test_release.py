@@ -13,11 +13,14 @@ from pathlib import Path
 import pytest
 
 REL = Path(__file__).resolve().parent.parent / "release"
+SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
 sys.path.insert(0, str(REL))
+sys.path.insert(0, str(SCRIPTS))
 
 import releasekit as rk  # noqa: E402
 import build as B  # noqa: E402
 import install as I  # noqa: E402
+import release_trust  # noqa: E402
 
 from cryptography.hazmat.primitives.asymmetric import ed25519  # noqa: E402
 
@@ -70,6 +73,22 @@ def _build(e, version, **kw):
     return B.build(version, "canary", {}, e["key"], e["dist"], e["uv"], **kw)
 
 
+def _set_package_signer(e, key: str) -> None:
+    policy = e["a"] / "pkg" / "package-signers.json"
+    policy.write_text(json.dumps({
+        "schema": "nak-package-signers/1",
+        "keys": [key],
+    }))
+    subprocess.run(["git", "-C", str(e["a"]), "add", "."], check=True)
+    subprocess.run([
+        "git", "-C", str(e["a"]), "-c", "user.email=t@t", "-c", "user.name=t",
+        "commit", "-qm", "package trust",
+    ], check=True)
+    B.SPEC["package_signers"] = {
+        "component": "alpha", "path": "pkg/package-signers.json",
+    }
+
+
 def test_pure_python_verify_agrees_with_cryptography():
     k = ed25519.Ed25519PrivateKey.generate()
     pub = k.public_key().public_bytes_raw().hex()
@@ -88,6 +107,41 @@ def test_build_install_happy_path(env):
     assert os.readlink(node / "current") == "releases/0.1.0"
     assert (node / "bin" / "install.py").exists() and (env["tmp"] / "units" / "nak-update.timer").exists()
     assert json.loads((node / "config.json").read_text())["pubkey"] == env["pub"]
+
+
+def test_first_install_health_can_load_release_package_signers(env, monkeypatch):
+    package_key = "12" * 32
+    _set_package_signer(env, package_key)
+    _build(env, "0.1.0")
+    inst = env["inst"]
+    real_health = inst.health
+    observed = []
+
+    def health(man):
+        transition = inst._transition_path
+        observed.append({
+            "signers": release_trust.load_release_package_signers(inst.prefix),
+            "transition": json.loads(transition.read_text()),
+            "mode": transition.stat().st_mode & 0o777,
+            "config_exists": (inst.prefix / "config.json").exists(),
+        })
+        return real_health(man)
+
+    monkeypatch.setattr(inst, "health", health)
+    inst.install(str(env["dist"]), "canary", env["pub"])
+
+    assert observed == [{
+        "signers": frozenset({package_key}),
+        "transition": {
+            "schema": I.TRANSITION_SCHEMA,
+            "pubkey": env["pub"],
+            "from": None,
+            "to": "0.1.0",
+        },
+        "mode": 0o600,
+        "config_exists": False,
+    }]
+    assert not inst._transition_path.exists()
 
 
 def test_build_pins_package_signers_from_exact_component_commit(env, monkeypatch):
@@ -163,6 +217,7 @@ def test_failed_health_check_rolls_back(env, monkeypatch):
     with pytest.raises(I.InstallError, match="rolled back to 0.1.0"):
         env["inst"].update()
     assert os.readlink(env["tmp"] / "node" / "current") == "releases/0.1.0"
+    assert not env["inst"]._transition_path.exists()
 
 
 def test_manual_rollback(env):
@@ -175,6 +230,100 @@ def test_manual_rollback(env):
     assert os.readlink(env["tmp"] / "node" / "current") == "releases/0.1.0"
 
 
+def test_installer_rollback_restart_can_load_release_package_signers(env, monkeypatch):
+    old_package_key = "12" * 32
+    new_package_key = "34" * 32
+    _set_package_signer(env, old_package_key)
+    _build(env, "0.1.0")
+    inst = env["inst"]
+    inst.install(str(env["dist"]), "canary", env["pub"])
+    (env["a"] / "pkg" / "package-signers.json").write_text(json.dumps({
+        "schema": "nak-package-signers/1", "keys": [new_package_key],
+    }))
+    _commit(env["a"], "alpha", "OK = True\nV = 3\n")
+    _build(env, "0.1.1")
+    inst.update()
+    real_restart = inst.restart
+    observed = []
+
+    def restart(names, man=None, *, force=False):
+        observed.append(release_trust.load_release_package_signers(inst.prefix))
+        return real_restart(names, man, force=force)
+
+    monkeypatch.setattr(inst, "restart", restart)
+    assert "rolled back to 0.1.0" in inst.rollback()
+
+    assert observed == [frozenset({old_package_key})]
+    assert not inst._transition_path.exists()
+
+
+def test_failed_installer_rollback_restores_committed_release(env, monkeypatch):
+    _build(env, "0.1.0")
+    inst = env["inst"]
+    inst.install(str(env["dist"]), "canary", env["pub"])
+    _commit(env["a"], "alpha", "OK = True\nV = 3\n")
+    _build(env, "0.1.1")
+    inst.update()
+    real_restart = inst.restart
+    calls = 0
+
+    def fail_target_restart(names, man=None, *, force=False):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise I.InstallError("target restart failed")
+        return real_restart(names, man, force=force)
+
+    monkeypatch.setattr(inst, "restart", fail_target_restart)
+    with pytest.raises(I.InstallError, match="rollback to 0.1.0 failed; restored 0.1.1"):
+        inst.rollback()
+
+    assert calls == 2
+    assert os.readlink(inst.prefix / "current") == "releases/0.1.1"
+    assert json.loads((inst.prefix / "config.json").read_text())["current"] == "0.1.1"
+    assert not inst._transition_path.exists()
+
+
+def test_next_operation_restores_a_release_left_mid_transition(env, monkeypatch):
+    class SimulatedProcessDeath(BaseException):
+        pass
+
+    class StopAfterRecovery(RuntimeError):
+        pass
+
+    _build(env, "0.1.0")
+    inst = env["inst"]
+    inst.install(str(env["dist"]), "canary", env["pub"])
+    _commit(env["a"], "alpha", "OK = True\nV = 4\n")
+    _build(env, "0.1.1")
+
+    def die_after_switch(_man):
+        raise SimulatedProcessDeath
+
+    monkeypatch.setattr(inst, "health", die_after_switch)
+    with pytest.raises(SimulatedProcessDeath):
+        inst.update()
+
+    assert os.readlink(inst.prefix / "current") == "releases/0.1.1"
+    assert json.loads((inst.prefix / "config.json").read_text())["current"] == "0.1.0"
+    assert json.loads(inst._transition_path.read_text()) == {
+        "schema": I.TRANSITION_SCHEMA,
+        "pubkey": env["pub"],
+        "from": "0.1.0",
+        "to": "0.1.1",
+    }
+
+    def stop_fetch(*_args, **_kwargs):
+        raise StopAfterRecovery
+
+    monkeypatch.setattr(inst, "fetch_verified", stop_fetch)
+    with pytest.raises(StopAfterRecovery):
+        inst.update()
+
+    assert os.readlink(inst.prefix / "current") == "releases/0.1.0"
+    assert not inst._transition_path.exists()
+
+
 def test_rollback_restarts_only_units_returned_by_write_units(tmp_path, monkeypatch):
     prefix = tmp_path / "node"
     old = prefix / "releases" / "0.1.0"
@@ -184,7 +333,9 @@ def test_rollback_restarts_only_units_returned_by_write_units(tmp_path, monkeypa
     old_man = {"version": "0.1.0", "services": {"kept": {}, "opted-out": {}}}
     (old / "manifest.json").write_text(json.dumps(old_man))
     (prefix / "current").symlink_to("releases/0.1.1")
-    (prefix / "config.json").write_text(json.dumps({"current": "0.1.1", "previous": "0.1.0"}))
+    (prefix / "config.json").write_text(json.dumps({
+        "current": "0.1.1", "previous": "0.1.0", "pubkey": "12" * 32,
+    }))
     inst = I.Installer(prefix, systemd=True, make_venv=False, unit_dir=tmp_path / "units")
     restarted = []
     monkeypatch.setattr(inst, "write_units", lambda man: ["kept"])
@@ -293,6 +444,7 @@ def test_failed_first_install_leaves_nothing_half_installed(env, monkeypatch):
             inst.install(str(env["dist"]), "canary", env["pub"])
     node = env["tmp"] / "node"
     assert not (node / "current").exists() and not (node / "releases" / "0.1.0").exists()
+    assert not inst._transition_path.exists()
     assert "installed 0.1.0" in inst.install(str(env["dist"]), "canary", env["pub"])     # retry works
 
 
