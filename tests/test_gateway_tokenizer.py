@@ -14,10 +14,12 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
+sys.path.insert(0, str(ROOT / "release"))
 
 import client  # noqa: E402
 import gateway_tokenizer  # noqa: E402
 import nakshatra_serve as serve  # noqa: E402
+import releasekit  # noqa: E402
 from packaging import fetch_package  # noqa: E402
 from packaging.nakshatra_package import (  # noqa: E402
     Artifact, KIND_SHARED, NakshatraPackage, PackageError, ROLE_METADATA,
@@ -141,6 +143,48 @@ def test_tampered_cached_metadata_is_never_advertised(package_server, tmp_path, 
         gateway_tokenizer, "load_release_package_signers",
         lambda: frozenset({package_server["pubkey"]}))
     assert serve._local_tokenizers({"llama32-3b"}) == {}
+
+
+def test_cached_tokenizer_verification_follows_release_switch(
+        package_server, tmp_path, monkeypatch):
+    prefix = tmp_path / "node"
+    release_key = ed25519.Ed25519PrivateKey.generate()
+    private_hex = release_key.private_bytes_raw().hex()
+    public_hex = release_key.public_key().public_bytes_raw().hex()
+
+    def write_release(version: str) -> None:
+        release_dir = prefix / "releases" / version
+        release_dir.mkdir(parents=True)
+        manifest = releasekit.sign({
+            "schema": "nak-release/1",
+            "version": version,
+            "package_signers": {
+                "schema": "nak-package-signers/1",
+                "keys": [package_server["pubkey"]],
+            },
+        }, private_hex)
+        (release_dir / "manifest.json").write_text(json.dumps(manifest))
+
+    write_release("1.2.3")
+    (prefix / "current").symlink_to("releases/1.2.3")
+    (prefix / "config.json").write_text(json.dumps({
+        "current": "1.2.3", "pubkey": public_hex,
+    }))
+    monkeypatch.setenv("NAK_NODE_PREFIX", str(prefix))
+    root = tmp_path / "models"
+    gateway_tokenizer.fetch_model_tokenizer(
+        "llama32-3b", package_url=package_server["url"], root=root)
+
+    write_release("1.2.4")
+    next_current = prefix / "current.next"
+    next_current.symlink_to("releases/1.2.4")
+    next_current.replace(prefix / "current")
+
+    # Services verify their existing tokenizer cache after `current` switches
+    # but before install.py commits the new version to config.json.
+    assert gateway_tokenizer.verify_model_tokenizer(
+        "llama32-3b", root=root) == str(
+            gateway_tokenizer.tokenizer_path("llama32-3b", root))
 
 
 def test_model_ids_have_collision_free_cache_names(tmp_path):
