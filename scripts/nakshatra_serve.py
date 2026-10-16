@@ -515,6 +515,7 @@ class GenerationResult:
     prompt_eval_count: int = 0   # prompt tokens
     done_reason: str = "stop"
     credits_charged: Optional[int] = None
+    audit_receipt: Optional[dict] = None
 
 
 def _credit_error_status(error: Exception) -> int:
@@ -664,9 +665,10 @@ class ChainChatBackend(ChatBackend):
     _STEP_RE = re.compile(r"\[chain\] step \d+: id=\S+ '(.*)'\s*$")
 
     def __init__(self, scripts_dir: Optional[str] = None,
-                 timeout_s: float = 1800.0):
+                 timeout_s: float = 1800.0, *, paid_admission: bool = False):
         self._scripts = scripts_dir or os.path.dirname(os.path.abspath(__file__))
         self._timeout = timeout_s
+        self._paid_admission = bool(paid_admission)
 
     def _tokenizer_socket(self, tokenizer_gguf: str) -> str:
         """2026-09-12 (perf/resident-tokenizer-cache): NKS_TOKENIZER_DAEMON=1 opt-in. Ensures a
@@ -718,7 +720,9 @@ class ChainChatBackend(ChatBackend):
             _time.sleep(0.1)
         return ""   # didn't come up in time — caller falls back to a local load, not an error
 
-    def _cmd(self, entry, prompt, max_tokens, receipt_path=None) -> list:
+    def _cmd(self, entry, prompt, max_tokens, receipt_path=None, *,
+             config_path=None, paid_admission_fd=None,
+             paid_progress_fd=None) -> list:
         cmd = [sys.executable, os.path.join(self._scripts, "client.py"),
                "--model-path", entry.tokenizer_gguf,
                "--prompt", prompt, "--max-tokens", str(max_tokens),
@@ -735,7 +739,13 @@ class ChainChatBackend(ChatBackend):
             cmd += ["--tokenizer-socket", tok_sock]
         if receipt_path:                       # only when the credit hook is enabled
             cmd += ["--receipt-out", receipt_path]
-        if entry.from_roster:
+        if paid_admission_fd is not None:
+            cmd += ["--paid-admission-fd", str(paid_admission_fd),
+                    "--paid-progress-fd", str(paid_progress_fd),
+                    "--model-id", entry.name]
+        if config_path:
+            cmd += ["--config", config_path]
+        elif entry.from_roster:
             cmd += ["--config", self._roster_chain_yaml(entry)]
         elif entry.chain_yaml:
             cmd += ["--config", entry.chain_yaml]
@@ -780,11 +790,11 @@ class ChainChatBackend(ChatBackend):
     def requires_credit_buffer(self) -> bool:
         """Strict mode buffers output, without constructing the default-off hook."""
         cached = getattr(self, "_ledger_hook_cached", None)
-        return _ledger_enforced() or bool(
+        return self._paid_admission or _ledger_enforced() or bool(
             cached is not None and getattr(cached, "fail_closed", False)
         )
 
-    def _roster_chain_yaml(self, entry) -> str:
+    def _roster_chain_yaml(self, entry, *, paid: bool = False) -> str:
         """from_roster: GENERATE the chain from the live roster at request time (firewall-gated +
         package-sliced). Generated fresh per call — cheap, since PackageSlicer caches the slices —
         so the chain tracks roster/policy changes. Raises ChainBackendError (→502) if the firewall
@@ -800,6 +810,7 @@ class ChainChatBackend(ChatBackend):
             return build_chain_from_roster(
                 entry.name, hidden_size=entry.hidden_size, num_layers=entry.num_layers,
                 wire_dtype=entry.wire_dtype, package_location=entry.package,
+                include_public_keys=paid,
                 # NKS_SMART_PLACEMENT inputs (no-ops unless the flag is set in serve_chain):
                 model_size_gb=getattr(entry, "model_size_gb", None),
                 pillar_url=(os.environ.get("NAKSHATRA_PILLAR_URL")
@@ -808,8 +819,263 @@ class ChainChatBackend(ChatBackend):
         except (PermissionError, FileNotFoundError, ValueError) as e:
             raise ChainBackendError(f"from_roster chain generation failed: {e}")
 
+    def _paid_chain_config(self, entry):
+        """Freeze one read-only plan and return (config path, plan, owned)."""
+        import tempfile
+        import yaml
+        if self._scripts not in sys.path:
+            sys.path.insert(0, self._scripts)
+        import client as chain_client
+        import paid_client
+
+        if entry.from_roster:
+            source_path = self._roster_chain_yaml(entry, paid=True)
+            with open(source_path, encoding="utf-8") as config:
+                document = yaml.safe_load(config)
+        elif entry.chain_yaml:
+            with open(entry.chain_yaml, encoding="utf-8") as config:
+                document = yaml.safe_load(config)
+        else:
+            workers = chain_client.build_chain_from_registry(
+                entry.registry_url or "", entry.name)
+            document = {
+                "model": {"id": entry.name}, "workers": workers,
+            }
+        workers = document.get("workers") if isinstance(document, dict) else None
+        if not isinstance(workers, list):
+            raise paid_client.PaidAdmissionError(
+                "paid chain config has no workers list")
+        paid_client.require_paid_tls_pins(workers)
+        plan = paid_client.exact_chain_plan(workers)
+
+        # Even a static chain path can be edited between authorization and
+        # client startup. Give the client an immutable snapshot owned by this
+        # request; its runtime Info comparison remains the second line of
+        # defense against a dial-time identity/span change.
+        fd, path = tempfile.mkstemp(prefix="nak-paid-plan-", suffix=".yaml")
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as config:
+                yaml.safe_dump(document, config, sort_keys=False)
+            return path, plan, True
+        except Exception:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            _quiet_unlink(path)
+            raise
+
+    def _paid_prompt_tokens(self, entry, prompt: str) -> int:
+        if self._scripts not in sys.path:
+            sys.path.insert(0, self._scripts)
+        import client as chain_client
+        tokenizer = None
+        try:
+            tokens, tokenizer = chain_client.tokenize_local(
+                entry.tokenizer_gguf, prompt,
+                self._tokenizer_socket(entry.tokenizer_gguf),
+            )
+            return len(tokens)
+        finally:
+            close = getattr(tokenizer, "close", None)
+            if callable(close):
+                close()
+
+    @staticmethod
+    def _read_fd_all(fd: int) -> bytes:
+        chunks = []
+        try:
+            while True:
+                chunk = os.read(fd, 8192)
+                if not chunk:
+                    return b"".join(chunks)
+                chunks.append(chunk)
+        finally:
+            os.close(fd)
+
+    def _close_paid_hold(self, hook, request, authorization, used: set[str]):
+        """Abandon provably untouched entries, then always request release."""
+        import paid_client
+        errors = []
+        planned = {stage["worker_keyid"] for stage in request["workers"]}
+        for worker_key in sorted(planned - used):
+            try:
+                paid_client.validate_status(
+                    hook.abandon_spend(authorization["hold_id"], worker_key),
+                    request=request, authorization=authorization)
+            except Exception as exc:  # keep releasing the rest of the hold
+                errors.append(exc)
+        try:
+            paid_client.validate_status(
+                hook.release_spend(authorization["hold_id"]),
+                request=request, authorization=authorization)
+        except Exception as exc:
+            errors.append(exc)
+        if errors:
+            raise paid_client.PaidAdmissionError(
+                "paid hold abandonment/release failed") from errors[0]
+
+    def _poll_paid_status(self, hook, request, authorization, used: set[str]):
+        import paid_client
+        try:
+            timeout = max(0.0, float(os.environ.get(
+                "NAKSHATRA_PAID_STATUS_TIMEOUT", "30")))
+            interval = max(0.01, float(os.environ.get(
+                "NAKSHATRA_PAID_STATUS_INTERVAL", "0.25")))
+        except ValueError as exc:
+            raise paid_client.PaidAdmissionError(
+                "invalid paid status polling configuration") from exc
+        deadline = time.monotonic() + timeout
+        while True:
+            status = paid_client.validate_status(
+                hook.spend_status(authorization["hold_id"]),
+                request=request, authorization=authorization)
+            if status["state"] == "settled":
+                paid_client.require_releasable_status(status, used=used)
+                return status
+            if status["state"] in {"expired", "cancelled", "disputed"}:
+                raise paid_client.PaidAdmissionError(
+                    f"paid hold ended as {status['state']}")
+            if time.monotonic() >= deadline:
+                raise paid_client.PaidAdmissionError(
+                    "paid status did not reach settled")
+            time.sleep(min(interval, max(0.0, deadline - time.monotonic())))
+
+    def _generate_paid(self, entry, prompt, max_tokens, options):
+        """G1/G2: authorize one exact direct chain and buffer through finality."""
+        import subprocess
+        import tempfile
+        import uuid
+        import paid_client
+
+        hook = self._ledger_hook()
+        try:
+            hook.require_paid_spend()
+        except Exception as exc:
+            raise CreditGateError(f"paid ledger unavailable: {exc}", 503) from exc
+
+        config_path = None
+        config_owned = False
+        request = authorization = None
+        used: set[str] = set()
+        text = None
+        run_error = None
+        try:
+            config_path, plan, config_owned = self._paid_chain_config(entry)
+            prompt_tokens = self._paid_prompt_tokens(entry, prompt)
+            session_id = uuid.uuid4().hex
+            request = paid_client.authorize_request(
+                client_nonce=uuid.uuid4().hex,
+                session_id=session_id,
+                model_id=entry.name,
+                prompt_tokens=prompt_tokens,
+                output_tokens=int(max_tokens),
+                plan=plan,
+            )
+            authorization = paid_client.validate_authorization(
+                hook.authorize_spend(request), request)
+            envelope = paid_client.make_paid_envelope(
+                claim_token=authorization["claim_token"],
+                hold_id=authorization["hold_id"],
+                session_id=session_id,
+                model_id=entry.name,
+                max_prompt_tokens=prompt_tokens,
+                max_output_tokens=int(max_tokens),
+                plan=plan,
+            )
+
+            token_file = tempfile.TemporaryFile(prefix="nak-paid-token-")
+            progress_read, progress_write = os.pipe()
+            try:
+                os.fchmod(token_file.fileno(), 0o600)
+                token_bytes = json.dumps(
+                    envelope, sort_keys=True, separators=(",", ":")).encode()
+                token_file.write(token_bytes)
+                token_file.flush()
+                token_file.seek(0)
+                token_read = token_file.fileno()
+                out = None
+                client_error = None
+                try:
+                    out = subprocess.run(
+                        self._cmd(
+                            entry, prompt, max_tokens,
+                            config_path=config_path,
+                            paid_admission_fd=token_read,
+                            paid_progress_fd=progress_write,
+                        ),
+                        capture_output=True, text=True,
+                        timeout=self._timeout, env=self._client_env(),
+                        pass_fds=(token_read, progress_write),
+                    )
+                except Exception as exc:
+                    client_error = exc
+                finally:
+                    os.close(progress_write)
+                progress_write = -1
+                progress = self._read_fd_all(progress_read)
+                progress_read = -1
+                try:
+                    used = paid_client.parse_invocation_events(progress, plan)
+                except Exception:
+                    # A corrupt/missing progress record can never license an
+                    # abandon. Conservatively retain every stage as possibly used.
+                    used = {stage["worker_keyid"] for stage in plan}
+                    raise
+                if client_error is not None:
+                    raise client_error
+                if out.returncode != 0:
+                    raise paid_client.PaidAdmissionError(
+                        f"paid client exited {out.returncode}")
+                text = _parse_client_output(out.stdout)
+            finally:
+                token_file.close()
+                for fd in (progress_read, progress_write):
+                    if isinstance(fd, int) and fd >= 0:
+                        try:
+                            os.close(fd)
+                        except OSError:
+                            pass
+        except Exception as exc:
+            run_error = exc
+        finally:
+            if config_owned and config_path:
+                _quiet_unlink(config_path)
+
+        close_error = None
+        if authorization is not None:
+            try:
+                self._close_paid_hold(hook, request, authorization, used)
+            except Exception as exc:
+                close_error = exc
+        if run_error is not None or close_error is not None:
+            cause = run_error if run_error is not None else close_error
+            raise CreditGateError("paid generation failed closed", 503) from cause
+
+        try:
+            status = self._poll_paid_status(
+                hook, request, authorization, used)
+            audit = paid_client.audit_receipt(
+                status, output_text=text, used=used)
+        except Exception as exc:
+            raise CreditGateError("paid finality unavailable", 503) from exc
+        prompt_count = status["max_prompt_tokens"]
+        generated_count = next(
+            worker["cumulative_generated_tokens"] for worker in status["workers"]
+            if worker["worker_keyid"] in used)
+        return GenerationResult(
+            text=text,
+            eval_count=generated_count,
+            prompt_eval_count=prompt_count,
+            credits_charged=audit["charged"],
+            audit_receipt=audit,
+        )
+
     def generate(self, entry, prompt, max_tokens, options):
         import subprocess, tempfile
+        if self._paid_admission:
+            return self._generate_paid(entry, prompt, max_tokens, options)
         hook = self._ledger_hook()
         # gate before the run (no-op/advisory for the hub; mandatory for outsider gateways)
         est = int(max_tokens) * int(getattr(entry, "num_layers", 0) or 0)
@@ -1536,8 +1802,12 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
                 "prompt_eval_count": result.prompt_eval_count,
                 "eval_count": result.eval_count,
             }
-            if result.credits_charged is not None:
-                response["nakshatra"] = {"credits_charged": result.credits_charged}
+            if result.credits_charged is not None or result.audit_receipt is not None:
+                response["nakshatra"] = {}
+                if result.credits_charged is not None:
+                    response["nakshatra"]["credits_charged"] = result.credits_charged
+                if result.audit_receipt is not None:
+                    response["nakshatra"]["audit_receipt"] = result.audit_receipt
             self._json(HTTPStatus.OK, response)
             return 200
         finally:
@@ -1624,8 +1894,13 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
                                else eval_count)}
         if buffered is not None:
             final["prompt_eval_count"] = buffered.prompt_eval_count
-        if buffered is not None and buffered.credits_charged is not None:
-            final["nakshatra"] = {"credits_charged": buffered.credits_charged}
+        if buffered is not None and (buffered.credits_charged is not None
+                                     or buffered.audit_receipt is not None):
+            final["nakshatra"] = {}
+            if buffered.credits_charged is not None:
+                final["nakshatra"]["credits_charged"] = buffered.credits_charged
+            if buffered.audit_receipt is not None:
+                final["nakshatra"]["audit_receipt"] = buffered.audit_receipt
         _write(final)
         return 200
 
@@ -1747,8 +2022,12 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
                 "usage": {"prompt_tokens": p, "completion_tokens": c,
                           "total_tokens": p + c},
             }
-            if result.credits_charged is not None:
-                response["nakshatra"] = {"credits_charged": result.credits_charged}
+            if result.credits_charged is not None or result.audit_receipt is not None:
+                response["nakshatra"] = {}
+                if result.credits_charged is not None:
+                    response["nakshatra"]["credits_charged"] = result.credits_charged
+                if result.audit_receipt is not None:
+                    response["nakshatra"]["audit_receipt"] = result.audit_receipt
             self._json(HTTPStatus.OK, response)
             return 200
         finally:
@@ -1948,7 +2227,13 @@ class NakshatraServeHandler(BaseHTTPRequestHandler):
             for kind, text in think_filter.close():
                 _sse(_chunk({"reasoning_content": text} if kind == "reasoning"
                             else {"content": text}))
-        _sse(_chunk({}, finish="stop"))
+        terminal = _chunk({}, finish="stop")
+        if buffered is not None and buffered.audit_receipt is not None:
+            terminal["nakshatra"] = {
+                "credits_charged": buffered.credits_charged,
+                "audit_receipt": buffered.audit_receipt,
+            }
+        _sse(terminal)
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
         return 200
@@ -2120,6 +2405,9 @@ def main(argv: Optional[list[str]] = None) -> int:
                          "from signed pillar /peers using local tokenizer GGUFs. "
                          "Omit to run with an empty registry "
                          "(/api/tags returns []).")
+    ap.add_argument("--paid-admission", action="store_true",
+                    help="enable payment-bound G1/G2 admission for enforce-mode "
+                         "chain requests (default off)")
     ap.add_argument("--stub-backend", nargs="?", const="Hello from a stubbed "
                     "Nakshatra gateway (the chain is not wired — this is a "
                     "canned reply for wire-smoke).", default=None, metavar="REPLY",
@@ -2132,6 +2420,9 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if _ledger_enforced() and args.stub_backend is not None:
         log.error("%s", _UNMETERED_ENFORCE_REFUSAL)
+        return 2
+    if args.paid_admission and not _ledger_enforced():
+        log.error("--paid-admission requires NAKSHATRA_LEDGER_MODE=enforce")
         return 2
 
     models: dict[str, ModelEntry] = {}
@@ -2156,7 +2447,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         chat_backend = StubChatBackend(args.stub_backend)
         log.info("serving STUB backend (no chain): %r", args.stub_backend[:60])
     else:
-        chat_backend = RoutingChatBackend(ChainChatBackend()) if args.models else None
+        chat_backend = RoutingChatBackend(ChainChatBackend(
+            paid_admission=args.paid_admission)) if args.models else None
     # Scale-to-zero lifecycle (compute is summoned, not squatted). Active only
     # when NAKSHATRA_LIFECYCLE_UNITS is set; otherwise None → always-on legacy.
     chat_lifecycle = None

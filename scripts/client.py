@@ -42,6 +42,7 @@ from client_defaults import (
     resolve_p2p_socket,
     resolve_registry_keyid,
 )
+import paid_client
 from step_text import escape_step_text   # one token = one output line (see step_text.py)
 from edge_health import EdgeError, EdgeFailureKind   # #17 live seam: typed edge faults so the
 # recovery loop can swap a dead worker instead of the process dying. Pure stdlib (duck-types grpc).
@@ -446,7 +447,8 @@ class InferenceStream:
 
 def call_inference_step(streamer, payload, n_tokens, has_token_ids,
                          session_id, step_idx, prefix_length, timing=None,
-                         next_server=None, chain=None, all_logits=False):
+                         next_server=None, chain=None, all_logits=False,
+                         spend_claim_token=""):
     """v0.5 M0.5.1 streaming equivalent of call_forward. Returns raw bytes
     matching Forward's return shape (hidden state OR int32 token id), so
     chain-walk code consumes the result identically.
@@ -470,6 +472,7 @@ def call_inference_step(streamer, payload, n_tokens, has_token_ids,
         step_id=f"step-{step_idx}",
         prefix_length=prefix_length,
         all_logits=all_logits,
+        spend_claim_token=spend_claim_token,
     )
     if has_token_ids:
         ids = list(struct.unpack(f"<{n_tokens}i", payload))
@@ -1407,14 +1410,41 @@ def main():
                     help="EAGLE base model dir (HF config source) for the head")
     ap.add_argument("--eagle-config", type=str, default="",
                     help="EAGLE head config json (draft_vocab etc.)")
+    ap.add_argument("--paid-admission-fd", type=int, default=-1,
+                    help=argparse.SUPPRESS)
+    ap.add_argument("--paid-progress-fd", type=int, default=-1,
+                    help=argparse.SUPPRESS)
     args = ap.parse_args()
+    paid = None
+    if args.paid_admission_fd >= 0:
+        try:
+            paid = paid_client.read_paid_envelope(args.paid_admission_fd)
+        except paid_client.PaidAdmissionError as exc:
+            sys.exit(f"[paid] admission envelope refused: {exc}")
+        refusal = paid_client.paid_mode_refusal(
+            push=args.use_streaming_push,
+            speculative=args.speculative,
+            stream_spec=args.stream_spec,
+            async_pipeline=args.async_pipeline,
+            eagle=bool(args.eagle_head),
+        )
+        if refusal:
+            sys.exit(f"[paid] paid sessions refuse {refusal} execution")
+        if not args.use_streaming:
+            sys.exit("[paid] paid sessions require direct streaming calls")
+        if args.paid_progress_fd < 0:
+            sys.exit("[paid] paid sessions require an invocation progress descriptor")
     if os.environ.get("NAKSHATRA_SPECULATIVE", "") in ("1", "true", "True"):
         args.speculative = True
+        if paid is not None:
+            sys.exit("[paid] paid sessions refuse non-greedy execution")
     # --use-streaming-push implies --use-streaming
     if args.use_streaming_push:
         args.use_streaming = True
     # --tls-mode=required is only meaningful if the TLS module is importable.
     # Fail loud rather than silently downgrading to insecure.
+    if paid is not None and not _TLS_AVAILABLE:
+        sys.exit("[paid] pinned TLS support is unavailable")
     if args.tls_mode == "required" and not _TLS_AVAILABLE:
         sys.exit("--tls-mode=required but nakshatra_tls module is not "
                  "importable; cannot pin channels. Install the Phase 2 TLS "
@@ -1485,6 +1515,12 @@ def main():
                     _admit_activation_workers(
                         configured_model, [candidate], [candidate])
 
+    if paid is not None and any(
+            candidate.get("endpoint") is not None
+            for worker in workers
+            for candidate in [worker, *(worker.get("alternates") or [])]):
+        sys.exit("[paid] paid sessions refuse fabric execution")
+
     # v0.5 M0.5.4 v1: alternate-worker recovery. Each worker has a list of
     # candidates: primary first, then optional alternates from yaml. A
     # per-worker cursor selects the active candidate. On failure, the
@@ -1528,16 +1564,31 @@ def main():
             resolved_spec = _resolve_activation_endpoint(
                 spec, tls_mode=args.tls_mode)
             addr = resolved_spec[_CLIENT_DIAL_ADDRESS]
+            if paid is not None and not resolved_spec.get("peer_spki_hash"):
+                sys.exit(
+                    f"[paid] pre-compute admission refused: {w['id']} has no valid TLS SPKI pin")
             # 2026-05-26 SPKI: build a TLS-pinned channel when we have a
             # hash, falling back per --tls-mode policy. Same channel is
             # reused by every later Forward / Inference RPC, so fixing
             # this single call site lights up the whole chain.
             ch = _open_chain_channel(
                 addr, resolved_spec.get("peer_spki_hash") or None,
-                "required" if spec.get("endpoint") is not None else args.tls_mode,
+                ("required" if paid is not None or spec.get("endpoint") is not None
+                 else args.tls_mode),
             )
             stub = pb_grpc.NakshatraStub(ch)
-            info = info_with_startup_wait(stub, pb.InfoRequest(), timeout=10.0)
+            identity_challenge = (
+                paid_client.make_info_challenge() if paid is not None else b"")
+            info = info_with_startup_wait(
+                stub, pb.InfoRequest(identity_challenge=identity_challenge),
+                timeout=10.0)
+            attested_worker_keyid = None
+            if paid is not None:
+                try:
+                    attested_worker_keyid = paid_client.verify_info_attestation(
+                        info, identity_challenge)
+                except paid_client.PaidAdmissionError as exc:
+                    sys.exit(f"[paid] pre-compute admission refused: {exc}")
             caps = list(info.protocol_capabilities)
             # v1.0 §7 — negotiate the control-protocol version on the same
             # handshake. Refuse to build a chain with a worker we can't speak
@@ -1565,6 +1616,8 @@ def main():
             # legacy address and may no longer even be the active alternate).
             active_w = dict(w)
             active_w.update(resolved_spec)
+            if attested_worker_keyid is not None:
+                active_w["_paid_attested_worker_keyid"] = attested_worker_keyid
             policy_key = (
                 active_w.get("node_id") or active_w.get("id"),
                 active_w.get(_CLIENT_DIAL_ADDRESS),
@@ -1616,10 +1669,31 @@ def main():
     sorted_stubs, n_embd = _setup_chain()
     print(f"[chain] OK: contiguous coverage of [{sorted_stubs[0][2].layer_start}, {sorted_stubs[-1][2].layer_end})")
 
+    # Paid authorization freezes both topology and the complete enforcement
+    # capability set.  Info calls are read-only; no activation/KV/daemon work
+    # happens until both comparisons pass.
+    if paid is not None:
+        try:
+            paid_client.require_paid_capabilities(sorted_stubs)
+            paid_client.require_exact_runtime_plan(paid["plan"], sorted_stubs)
+            if args.model_id and args.model_id != paid["model_id"]:
+                raise paid_client.PaidAdmissionError(
+                    "paid model differs from the authorized model")
+        except paid_client.PaidAdmissionError as exc:
+            sys.exit(f"[paid] pre-compute admission refused: {exc}")
+
     # Tokenize
     print(f"[chain] tokenizing locally")
     tokens, llama = tokenize_local(args.model_path, args.prompt, args.tokenizer_socket)
-    print(f"[chain] {len(tokens)} prompt tokens: {tokens}")
+    if paid is None:
+        print(f"[chain] {len(tokens)} prompt tokens: {tokens}")
+    else:
+        print(f"[chain] {len(tokens)} prompt tokens")
+    if paid is not None:
+        if len(tokens) != paid["max_prompt_tokens"]:
+            sys.exit("[paid] tokenized prompt differs from the authorized prompt cap")
+        if args.max_tokens != paid["max_output_tokens"]:
+            sys.exit("[paid] output cap differs from authorization")
 
     # ── Speculative decoding setup (slice 1) ──────────────────────────────────
     # Engages only when explicitly enabled, a draft model is given, we're in unary
@@ -1718,6 +1792,7 @@ def main():
 
     streamers: list = []
     session_id = ""
+    paid_invoked: set[str] = set()
     # Streamers are opened/re-opened by the recovery loop below — see M0.5.4 v0.
 
     def _next_server_for(idx):
@@ -1752,9 +1827,21 @@ def main():
                                        prefix_length=prefix_length, timing=timing,
                                        chain=chain)
         if args.use_streaming:
+            spend_claim_token = ""
+            if paid is not None:
+                worker_key = paid_client.worker_keyid(w)
+                if worker_key not in paid_invoked:
+                    # Record conservatively before the RPC. If the process
+                    # dies after this write, the gateway will never abandon
+                    # an entry that might have reached its worker.
+                    paid_client.write_invocation_event(
+                        args.paid_progress_fd, worker_key)
+                    paid_invoked.add(worker_key)
+                    spend_claim_token = paid["claim_token"]
             return call_inference_step(streamers[idx], payload, n, has_tok,
                                        session_id=session_id, step_idx=step,
-                                       prefix_length=prefix_length, timing=timing)
+                                       prefix_length=prefix_length, timing=timing,
+                                       spend_claim_token=spend_claim_token)
         return call_forward(stub_tup[1], payload, n, has_token_ids=has_tok,
                             worker_id=w["id"],
                             keep_kv=keep_kv, start_pos=prefix_length, timing=timing,
@@ -1841,7 +1928,7 @@ def main():
             s.close()
         streamers.clear()
         if args.use_streaming:
-            session_id = uuid.uuid4().hex
+            session_id = paid["session_id"] if paid is not None else uuid.uuid4().hex
             if args.use_streaming_push:
                 first_w, first_stub, _ = sorted_stubs[0]
                 streamer = InferenceStream(first_stub, first_w["id"])
@@ -2053,7 +2140,10 @@ def main():
                 if next_id in LLAMA3_EOS_IDS:
                     print(f"[chain] step {step+1}: EOS {next_id} — stopping")
                     break
-                print(f"[chain] step {step+1}: id={next_id} '{escape_step_text(detok_one(llama, next_id))}'", flush=True)
+                if paid is None:
+                    print(f"[chain] step {step+1}: id={next_id} '{escape_step_text(detok_one(llama, next_id))}'", flush=True)
+                else:
+                    print(f"[chain] step {step+1}: '{escape_step_text(detok_one(llama, next_id))}'", flush=True)
 
                 # v0.5 M0.5.4 v0: synthetic failure injection for testing.
                 # Triggers AFTER step `simulate_fail_step` completes, so the
@@ -2068,6 +2158,13 @@ def main():
                     )
         except (grpc.RpcError, RuntimeError, SimulatedFailure) as e:
             recovery_attempts += 1
+            if paid is not None:
+                # Authorization pins one topology and one stable session. A
+                # paid run never swaps candidates, changes capabilities, or
+                # replays on a new session after any compute may have run.
+                for s in streamers:
+                    s.close()
+                raise
             if spec_active:
                 # A speculative step may have left KV inconsistent across workers
                 # (partial TruncateKV). Recovery resets ALL KV via cold replay; also
@@ -2266,9 +2363,11 @@ def main():
         avg_first = ts[0] if ts else 0.0
         avg_rest = sum(ts[1:]) / max(1, len(ts) - 1)
         print(f"    {wid:14s}  step1(prefill)={avg_first*1000:.0f}ms  steps2-N(stream) avg={avg_rest*1000:.0f}ms  total={sum(ts):.2f}s  n_calls={len(ts)}")
-    print(f"[chain] full: {full!r}")
+    if paid is None:
+        print(f"[chain] full: {full!r}")
     print(f"[chain] gen:  {gen!r}")
-    print(f"TOPTOKS_CHAIN {' '.join(str(t) for t in generated)}")
+    if paid is None:
+        print(f"TOPTOKS_CHAIN {' '.join(str(t) for t in generated)}")
 
 
 if __name__ == "__main__":
