@@ -512,7 +512,7 @@ def _paid_backend(tmp_path, hook):
     return backend, entry
 
 
-def test_paid_gateway_refuses_missing_spki_before_authorize(tmp_path):
+def test_paid_gateway_refuses_missing_spki_before_authorize(tmp_path, caplog):
     config = tmp_path / "chain.yaml"
     config.write_text(
         "workers:\n"
@@ -528,6 +528,9 @@ def test_paid_gateway_refuses_missing_spki_before_authorize(tmp_path):
         backend.generate(entry, "prompt", 2, {})
     assert caught.value.status == 503
     assert hook.calls == []
+    assert "paid pre-client planning failure" in caplog.text
+    assert ("PaidAdmissionError: paid chain hop has no valid TLS SPKI pin"
+            in caplog.text)
 
 
 def _successful_client_run(cmd, *, env, pass_fds, **_kwargs):
@@ -712,6 +715,41 @@ def test_precompute_client_rejection_abandons_every_stage_then_releases(
     assert ("abandon", "hold", KEY1) in hook.calls
     assert ("abandon", "hold", KEY2) in hook.calls
     assert ("release", "hold") in hook.calls
+
+
+def test_paid_failure_log_redacts_token_keys_and_base64_and_tails_stderr(
+        tmp_path, monkeypatch, caplog):
+    hook = _PaidHook()
+    backend, entry = _paid_backend(tmp_path, hook)
+    seen_token = []
+    hex_key = "de" * 32
+    base64_blob = "c2Vuc2l0aXZlLXBheW1lbnQtYXV0aG9yaXR5LWJsb2ItMDEyMzQ1Njc4OQ=="
+
+    def failed_client(cmd, *, env, pass_fds, **_kwargs):
+        token_fd = int(cmd[cmd.index("--paid-admission-fd") + 1])
+        envelope = paid.read_paid_envelope(os.dup(token_fd))
+        seen_token.append(envelope["claim_token"])
+        lines = ["outside retained stderr tail"]
+        lines.extend(f"diagnostic line {number}" for number in range(38))
+        lines.extend([
+            f"claim_token={envelope['claim_token']}",
+            f"worker_key={hex_key}",
+            f"response_blob={base64_blob}",
+        ])
+        return SimpleNamespace(returncode=2, stdout="", stderr="\n".join(lines))
+
+    monkeypatch.setattr(subprocess, "run", failed_client)
+    with pytest.raises(serve.CreditGateError):
+        backend.generate(entry, "prompt", 2, {})
+
+    assert seen_token
+    assert seen_token[0] not in caplog.text
+    assert hex_key not in caplog.text
+    assert base64_blob not in caplog.text
+    assert "<redacted>" in caplog.text
+    assert "PaidAdmissionError: paid client exited 2" in caplog.text
+    assert "diagnostic line 1" in caplog.text
+    assert "outside retained stderr tail" not in caplog.text
 
 
 @pytest.mark.parametrize("status", [

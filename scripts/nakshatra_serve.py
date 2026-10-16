@@ -71,6 +71,60 @@ VERSION_STRING = "nakshatra-0.1.0-ollama-compat"
 log = logging.getLogger("nakshatra_serve")
 
 
+# Paid failures cross two process boundaries (gateway -> client -> worker), and
+# the useful detail is normally in client.py's captured stderr. Keep that
+# detail operator-visible without ever putting payment tokens or key material
+# into the gateway journal. The broad base64/url-safe form intentionally
+# prefers an occasional false-positive over leaking an opaque credential.
+_PAID_SECRET_LIKE_RE = re.compile(
+    r"(?<![A-Za-z0-9+/_-])[A-Za-z0-9+/_-]{32,}={0,2}"
+    r"(?![A-Za-z0-9+/_=-])"
+)
+
+
+def _redact_paid_diagnostic(value, *, secrets=()) -> str:
+    if isinstance(value, bytes):
+        text = value.decode("utf-8", errors="replace")
+    else:
+        text = str(value or "")
+    for secret in secrets:
+        if secret:
+            text = text.replace(str(secret), "<redacted>")
+    return _PAID_SECRET_LIKE_RE.sub("<redacted>", text)
+
+
+def _paid_exception_chain(exc: BaseException) -> str:
+    parts = []
+    seen = set()
+    current = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        message = str(current)
+        parts.append(
+            f"{type(current).__name__}: {message}"
+            if message else type(current).__name__
+        )
+        if current.__cause__ is not None:
+            current = current.__cause__
+        elif not current.__suppress_context__:
+            current = current.__context__
+        else:
+            current = None
+    return " <- ".join(parts)
+
+
+def _log_paid_failure(phase: str, exc: BaseException, *, client_stderr="",
+                      secrets=()) -> None:
+    detail = _redact_paid_diagnostic(
+        _paid_exception_chain(exc), secrets=secrets)
+    stderr_lines = _redact_paid_diagnostic(
+        client_stderr, secrets=secrets).splitlines()[-40:]
+    if stderr_lines:
+        detail += (f"\npaid client stderr (last {len(stderr_lines)} lines):\n"
+                   + "\n".join(stderr_lines))
+    log.warning("paid %s failure: %s", phase, detail)
+
+
 # ── Model registry (Phase B) ────────────────────────────────────────
 
 
@@ -953,6 +1007,7 @@ class ChainChatBackend(ChatBackend):
         try:
             hook.require_paid_spend()
         except Exception as exc:
+            _log_paid_failure("ledger preflight", exc)
             raise CreditGateError(f"paid ledger unavailable: {exc}", 503) from exc
 
         config_path = None
@@ -961,6 +1016,8 @@ class ChainChatBackend(ChatBackend):
         used: set[str] = set()
         text = None
         run_error = None
+        client_stderr = ""
+        client_started = False
         try:
             config_path, plan, config_owned = self._paid_chain_config(entry)
             prompt_tokens = self._paid_prompt_tokens(entry, prompt)
@@ -998,6 +1055,7 @@ class ChainChatBackend(ChatBackend):
                 out = None
                 client_error = None
                 try:
+                    client_started = True
                     out = subprocess.run(
                         self._cmd(
                             entry, prompt, max_tokens,
@@ -1011,6 +1069,9 @@ class ChainChatBackend(ChatBackend):
                     )
                 except Exception as exc:
                     client_error = exc
+                    client_stderr = getattr(exc, "stderr", "") or ""
+                else:
+                    client_stderr = out.stderr or ""
                 finally:
                     os.close(progress_write)
                 progress_write = -1
@@ -1050,6 +1111,15 @@ class ChainChatBackend(ChatBackend):
             except Exception as exc:
                 close_error = exc
         if run_error is not None or close_error is not None:
+            secrets = ((authorization or {}).get("claim_token"),)
+            if run_error is not None:
+                _log_paid_failure(
+                    "generation" if client_started else "pre-client planning",
+                    run_error, client_stderr=client_stderr, secrets=secrets)
+            if close_error is not None:
+                _log_paid_failure(
+                    "hold close", close_error, client_stderr=client_stderr,
+                    secrets=secrets)
             cause = run_error if run_error is not None else close_error
             raise CreditGateError("paid generation failed closed", 503) from cause
 
@@ -1059,6 +1129,9 @@ class ChainChatBackend(ChatBackend):
             audit = paid_client.audit_receipt(
                 status, output_text=text, used=used)
         except Exception as exc:
+            _log_paid_failure(
+                "finality", exc, client_stderr=client_stderr,
+                secrets=((authorization or {}).get("claim_token"),))
             raise CreditGateError("paid finality unavailable", 503) from exc
         prompt_count = status["max_prompt_tokens"]
         generated_count = next(
