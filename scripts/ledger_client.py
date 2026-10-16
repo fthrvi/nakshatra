@@ -32,6 +32,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -147,6 +148,13 @@ class LedgerHook:
         try:
             with open(receipt_path) as f:
                 receipt = json.load(f)
+            # G2 aggregate evidence is deliberately outside every economic
+            # namespace.  Refuse it locally so a caller cannot accidentally
+            # feed it to legacy /settle even before the ledger's own strict
+            # schema rejection runs.
+            if (receipt.get("economic") is False
+                    or receipt.get("kind") == "nakshatra-run-audit"):
+                raise LedgerUnavailable("audit-only receipt cannot be settled")
             receipt_id = self._receipt_id(receipt)
             if receipt_id in self._rejected_receipts:
                 if self.fail_closed:
@@ -215,6 +223,44 @@ class LedgerHook:
             if self.fail_closed:
                 raise LedgerUnavailable(f"ledger settle failed ({e})") from e
             return None
+
+    def require_paid_spend(self) -> None:
+        """Prove that this hook is the pinned, fail-closed spend client."""
+        if not self.enabled or not self.fail_closed:
+            raise LedgerUnavailable("paid spend requires fail-closed ledger mode")
+        if self._private_key is None:
+            raise LedgerUnavailable("ledger signing key unavailable")
+        parsed = urllib.parse.urlparse(self.url)
+        if (parsed.scheme != "https" or not parsed.netloc
+                or parsed.username is not None or parsed.password is not None
+                or parsed.query or parsed.fragment
+                or not self.spki_hash
+                or re.fullmatch(r"[0-9a-f]{64}", self.spki_hash) is None):
+            raise LedgerUnavailable("paid spend requires an HTTPS ledger URL and SPKI pin")
+
+    def authorize_spend(self, request: dict) -> dict:
+        self.require_paid_spend()
+        return self._required_post("/spend/authorize", request, "spend authorize")
+
+    def abandon_spend(self, hold_id: str, worker_keyid: str) -> dict:
+        self.require_paid_spend()
+        return self._required_post(
+            "/spend/abandon",
+            {"hold_id": hold_id, "worker_keyid": worker_keyid},
+            "spend abandon",
+        )
+
+    def release_spend(self, hold_id: str) -> dict:
+        self.require_paid_spend()
+        return self._required_post(
+            "/spend/release", {"hold_id": hold_id}, "spend release")
+
+    def spend_status(self, hold_id: str) -> dict:
+        self.require_paid_spend()
+        if not isinstance(hold_id, str) or not hold_id:
+            raise LedgerUnavailable("hold_id is required")
+        path = "/spend/status?" + urllib.parse.urlencode({"hold_id": hold_id})
+        return self._required_get(path, "spend status")
 
     @staticmethod
     def _affirmative_settlement(value) -> bool:

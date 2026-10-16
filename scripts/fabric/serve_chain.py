@@ -91,7 +91,8 @@ def build_chain_from_roster(model_id: str, *, hidden_size: int,
                             rank: Optional[dict] = None,
                             model_size_gb: Optional[float] = None,
                             pillar_url: Optional[str] = None,
-                            peers_fetcher: Optional[Callable] = None) -> str:
+                            peers_fetcher: Optional[Callable] = None,
+                            include_public_keys: bool = False) -> str:
     """Generate a client.py chain YAML for `model_id` from the live roster, gated by the identity
     firewall, with slices provisioned from the model's content-addressed package. Returns the YAML
     path. Raises if no rostered worker is firewall-eligible (default-deny — the serve then 502s
@@ -130,6 +131,8 @@ def build_chain_from_roster(model_id: str, *, hidden_size: int,
     plan_fn = planner or sp.plan_chain
     _kw = dict(num_layers=num_layers, hidden_size=hidden_size, wire_dtype=wire_dtype,
                slice_for=slicer.slice_for, min_tier_fn=min_tier_fn, rank=rank)
+    if plan_fn is sp.plan_chain:
+        _kw["include_public_keys"] = include_public_keys
     if _max_stages and plan_fn is sp.plan_chain:
         _kw["max_stages"] = _max_stages
     # SMART PLACEMENT (NKS_SMART_PLACEMENT): capacity-aware placement on MEASURED data — route the
