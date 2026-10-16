@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import math
 import queue
+import struct
 import sys
 import threading
 import time
@@ -33,6 +34,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 import worker  # noqa: E402
+import nakshatra_pb2 as pb  # noqa: E402
 
 
 # ── A1: gRPC message-size cap is set as an explicit constant ─────────
@@ -123,6 +125,79 @@ def test_a3_peer_streams_uses_ordered_dict():
     )
     assert isinstance(servicer._peer_streams, _c.OrderedDict)
     assert servicer._peer_evictions == 0
+
+
+def test_a3_three_stage_push_uses_new_downstream_stream_per_session(monkeypatch):
+    class Daemon:
+        def __init__(self, final=False):
+            self.final = final
+            self._owner_lock = threading.Lock()
+            self._owner_session = None
+            self._owner_since = 0.0
+        acquire_session = worker.DaemonClient.acquire_session
+        release_session = worker.DaemonClient.release_session
+        current_owner = worker.DaemonClient.current_owner
+        def info(self):
+            return {"n_embd": 4, "n_layers": 1, "gpu_offload_status": {}}
+        def call(self, cmd, n_tokens, payload, start_pos=0, flags=0):
+            body = struct.pack("<i", 77) if self.final else b"\0" * (n_tokens * 16)
+            return 0, struct.pack("<I", 0) + body
+
+    class Context:
+        def invocation_metadata(self): return []
+        def set_code(self, code): self.code = code
+        def set_details(self, details): self.details = details
+
+    stages = {
+        "stage-2": worker.WorkerServicer(
+            Daemon(), "middle", 1, 2, "m",
+            refuse_unregistered_peers=False, refuse_unpinned_peers=False),
+        "stage-3": worker.WorkerServicer(
+            Daemon(final=True), "last", 2, 3, "m",
+            refuse_unregistered_peers=False, refuse_unpinned_peers=False),
+    }
+    stage_1 = worker.WorkerServicer(
+        Daemon(), "first", 0, 1, "m",
+        refuse_unregistered_peers=False, refuse_unpinned_peers=False)
+    openings = []
+
+    class Channel:
+        def __init__(self, address):
+            self.address = address
+            self.iterator = None
+        def close(self):
+            if self.iterator is not None:
+                self.iterator.close()
+
+    class Stub:
+        def __init__(self, channel):
+            self.channel = channel
+        def Inference(self, request_iterator):
+            openings.append(self.channel.address)
+            iterator = stages[self.channel.address].Inference(
+                request_iterator, Context())
+            self.channel.iterator = iterator
+            return iterator
+
+    monkeypatch.setattr(worker.pb_grpc, "NakshatraStub", Stub)
+    for servicer in (stage_1, *stages.values()):
+        servicer._open_outbound_channel = lambda address: Channel(address)
+
+    for session in ("session-1", "session-2"):
+        step = pb.InferenceStep(session_id=session, step_id="prefill")
+        step.token_ids.ids.append(1)
+        step.chain.extend([
+            pb.NextServer(address="stage-2", session_id=session),
+            pb.NextServer(address="stage-3", session_id=session),
+        ])
+        response = list(stage_1.Inference(iter([step]), Context()))
+        assert len(response) == 1
+        assert list(response[0].token_ids.ids) == [77]
+
+    assert openings.count("stage-2") == 2
+    assert openings.count("stage-3") == 2
+    assert not stage_1._peer_streams
+    assert not stages["stage-2"]._peer_streams
 
 
 # ── A4: validate_spki_hash_env ───────────────────────────────────────

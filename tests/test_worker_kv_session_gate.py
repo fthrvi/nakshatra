@@ -34,6 +34,7 @@ import time
 from pathlib import Path
 
 import pytest
+import grpc
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
@@ -328,3 +329,102 @@ def test_forward_refused_while_a_real_session_is_active():
 
     # Finish session A so the daemon isn't left owned past this test.
     list(gen_a)
+
+
+def _authenticated(servicer, keyid: str):
+    servicer._check_grpc_auth = lambda *a, **k: worker.AuthenticatedKeyId(
+        keyid, worker._wgrpcauth.ROLE_PEER)
+
+
+def test_same_key_a_b_a_cached_retry_requires_typed_cold_replay():
+    daemon = _GateRecordingDaemon()
+    servicer = _build_servicer(daemon=daemon)
+    _authenticated(servicer, "a" * 64)
+
+    assert not list(servicer.Inference(
+        iter([_step("A", "A0")]), _FakeContext()))[0].error
+    calls_after_a = len(daemon.calls)
+    # With no intervening replacement, the duplicate is a real idempotent hit.
+    assert not list(servicer.Inference(
+        iter([_step("A", "A0")]), _FakeContext()))[0].error
+    assert len(daemon.calls) == calls_after_a
+
+    assert not list(servicer.Inference(
+        iter([_step("B", "B0")]), _FakeContext()))[0].error
+    calls_after_b = len(daemon.calls)
+
+    lost_context = _FakeContext()
+    lost = list(servicer.Inference(
+        iter([_step("A", "A0")]), lost_context))[0]
+    assert lost.error.startswith(b"KV_RESIDENCY_LOST:")
+    assert lost_context._code == grpc.StatusCode.FAILED_PRECONDITION
+    assert len(daemon.calls) == calls_after_b
+
+    # A new cold replay step re-establishes A and advances the resident epoch.
+    replay = list(servicer.Inference(
+        iter([_step("A", "A0-cold-replay")]), _FakeContext()))[0]
+    assert not replay.error
+    assert len(daemon.calls) == calls_after_b + 1
+    assert daemon.calls[-1]["flags"] & 0x1 == 0
+
+
+def test_alternating_authenticated_cold_peers_do_not_pretruncate():
+    daemon = _GateRecordingDaemon()
+    servicer = _build_servicer(daemon=daemon)
+
+    class KeyContext(_FakeContext):
+        def __init__(self, keyid):
+            super().__init__()
+            self.keyid = keyid
+
+    servicer._check_grpc_auth = lambda context, *a, **k: worker.AuthenticatedKeyId(
+        context.keyid, worker._wgrpcauth.ROLE_PEER)
+    for index, keyid in enumerate(("a" * 64, "b" * 64) * 3):
+        response = list(servicer.Inference(
+            iter([_step(f"session-{index}", f"step-{index}")]),
+            KeyContext(keyid)))
+        assert response and not response[0].error
+
+    assert sum(call["cmd"] == worker.CMD_TOKEN_DECODE
+               for call in daemon.calls) == 6
+    assert not any(call["cmd"] == worker.CMD_KV_TRUNCATE
+                   for call in daemon.calls)
+
+    # A stateful reuse by the non-resident principal is refused without any
+    # clearing mutation or decode.
+    before = len(daemon.calls)
+    request = pb.ForwardRequest(
+        hidden_in=struct.pack("<4f", 0.0, 0.0, 0.0, 0.0),
+        n_tokens=1, keep_kv=True, start_pos=1, session_id="stateful-a")
+    response = servicer.Forward(request, KeyContext("a" * 64))
+    assert not response.hidden_out
+    assert len(daemon.calls) == before
+
+
+def test_truncate_capability_and_old_client_owner_inference():
+    daemon = _GateRecordingDaemon()
+    servicer = _build_servicer(daemon=daemon)
+    _authenticated(servicer, "a" * 64)
+    capabilities = servicer.Info(pb.InfoRequest(), _FakeContext()).protocol_capabilities
+    assert "truncate_session_owner" in capabilities
+
+    stream = servicer.Inference(
+        iter([_step("owned", "s0"), _step("owned", "s1", 1)]),
+        _FakeContext())
+    assert not next(stream).error
+
+    # An old peer omitted field 2. The new worker may infer the sole active
+    # owner because its authenticated key matches exactly.
+    old_context = _FakeContext()
+    servicer.TruncateKV(pb.TruncateRequest(n_keep=1), old_context)
+    assert old_context._code is None
+    assert daemon.calls[-1]["cmd"] == worker.CMD_KV_TRUNCATE
+
+    # A new request naming another session is never inferred or downgraded.
+    bad_context = _FakeContext()
+    before = len(daemon.calls)
+    servicer.TruncateKV(
+        pb.TruncateRequest(n_keep=0, session_id="other"), bad_context)
+    assert bad_context._code == grpc.StatusCode.PERMISSION_DENIED
+    assert len(daemon.calls) == before
+    list(stream)

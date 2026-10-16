@@ -5,6 +5,7 @@ On create add a row (status=active, owner). On merge flip to `merged→<sha>`.
 
 | branch | sector | description | base | status | owner |
 |---|---|---|---|---|---|
+| worker/paid-admission | worker | Bind paid Info to the worker Ed25519 identity; fix output metering, per-session serialization, deadline completion timestamps, and bounded receipt checkpoints. | main@f0d9e63 | active | codex/root |
 | network/relay-live-fix | network | Reproduce and fix relay-only dynamic FORWARD TLS stalls; cache relay path selection while direct upgrade continues; preserve gateway probe timeout configuration. | forgejo/main@f888fe6 | active | codex/root |
 | network/relay-fallback | network | Harden opt-in activation relay fallback, relay admission/budgets, worker rollback, and truncated streaming errors. | forgejo/main@85e5439 | merged→698d3d7 | codex/root |
 | network/gateway-discovery-retry | network | Give signed pillar GETs a per-request nonce; retry empty auto-discovery with backoff and refresh it every five minutes. | main | merged→bd57243 | codex/root |

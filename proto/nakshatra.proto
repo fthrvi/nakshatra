@@ -42,7 +42,13 @@ service Nakshatra {
   rpc SignParticipation(SignParticipationRequest) returns (SignParticipationResponse);
 }
 
-message InfoRequest {}
+message InfoRequest {
+  // Paid direct calls send a fresh 32-byte challenge. The worker signs the
+  // domain-separated challenge with its persistent Ed25519 roster key so the
+  // client can bind that economic identity to this SPKI-pinned TLS channel.
+  // Empty preserves the legacy/readiness-probe handshake.
+  bytes identity_challenge = 1;
+}
 
 message InfoResponse {
   string protocol_version    = 1;   // semver, e.g. "0.1.0"
@@ -69,6 +75,11 @@ message InfoResponse {
   //   "stream_spec"        — InferenceStep.all_logits honoured on the streaming
   //                          Inference RPC (speculative decode on the stream, 2026-07-29)
   repeated string protocol_capabilities = 12;
+  // Present only when InfoRequest.identity_challenge is non-empty. Signature
+  // is raw Ed25519 over ASCII "nakshatra-paid-info-v1", one NUL byte,
+  // then the challenge.
+  string worker_keyid       = 13;
+  bytes  identity_signature = 14;
 }
 
 message ForwardRequest {
@@ -88,6 +99,11 @@ message ForwardRequest {
   // Default false → normal forward, unchanged. Set only on the FIRST worker by an
   // --eagle-head client; the head consumes these to propose tokens.
   bool   eagle_hidden  = 8;
+  // Payment-bound admission v2. These fields are additive and remain absent
+  // for legacy peer Forward calls. Paid Forward is explicitly stateless.
+  string session_id = 9;
+  string step_id = 10;
+  string spend_claim_token = 11;
 }
 
 message ForwardResponse {
@@ -98,6 +114,7 @@ message ForwardResponse {
 // discarding the rejected speculative tail. Driven by daemon cmd=4 (KV_TRUNCATE).
 message TruncateRequest {
   int32 n_keep = 1;   // number of leading KV positions to keep for seq 0
+  string session_id = 2; // active Inference session whose KV may be truncated
 }
 
 message TruncateResponse {}
@@ -150,6 +167,9 @@ message InferenceStep {
   // otherwise an old worker would return a single token where K+1 were expected, corrupting
   // accept() silently instead of failing loud.
   bool       all_logits  = 17;
+  // Opaque online-claim token. Present only on the first paid frame and never
+  // logged or persisted in plaintext by the worker.
+  string     spend_claim_token = 18;
 }
 
 message NextServer {

@@ -58,6 +58,7 @@ import re
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from typing import Callable, Optional
 from urllib import request as urlrequest, error as urlerror
 
@@ -77,6 +78,18 @@ DEFAULT_TIMESTAMP_WINDOW_S = auth.DEFAULT_TIMESTAMP_WINDOW_S
 # endpoint (different method = different canonical string).
 GRPC_METHOD_UNARY = "POST"        # matches HTTP/2 reality of unary RPCs
 GRPC_METHOD_STREAM = "STREAM"     # first-frame-only signing model
+
+ROLE_PEER = "peer"
+ROLE_CONSUMER = "consumer"
+
+
+@dataclass(frozen=True)
+class ResolvedIdentity:
+    """A pillar-attested caller identity and its worker-side authority."""
+
+    keyid: str
+    public_key_hex: str
+    role: str
 
 
 # Cache shape: refresh interval, age cap (after which the resolver
@@ -204,6 +217,7 @@ class PillarPeerKeyResolver:
         priv_key: Optional[bytes] = None,
         own_node_id: Optional[str] = None,
         spki_hash: Optional[str] = None,
+        enable_consumers: bool = False,
     ):
         self._pillar_url = (pillar_url or "").rstrip("/")
         self._refresh_interval = refresh_interval_s
@@ -211,8 +225,13 @@ class PillarPeerKeyResolver:
         self._priv_key = priv_key
         self._own_node_id = own_node_id
         self._spki_hash = spki_hash
+        # Payment-bound admission owns this switch.  Keeping it false preserves
+        # the historical one-request /peers refresh and makes it impossible to
+        # resolve a consumer without spend enforcement being active and ready.
+        self._enable_consumers = bool(enable_consumers)
         self._lock = threading.Lock()
         self._cache: dict[str, str] = {}
+        self._roles: dict[str, str] = {}
         self._addresses: set[str] = set()
         # 2026-05-21 SPKI Phase 3.1: node_id → peer_spki_hash projection
         # from /peers. Empty value = peer has not declared a hash
@@ -227,6 +246,7 @@ class PillarPeerKeyResolver:
         self._addr_to_node: dict[str, str] = {}
         self._last_refresh: float = 0.0
         self._refresh_failures: int = 0
+        self._readers_compat_logged = False
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -266,19 +286,9 @@ class PillarPeerKeyResolver:
     def refresh_once(self) -> None:
         """Synchronous single-shot refresh. Public for testing + force
         refresh from external callers."""
-        url = f"{self._pillar_url}/peers"
-        headers: dict[str, str] = {}
-        if self._priv_key and self._own_node_id:
-            header_val, _ts = auth.build_signed_envelope(
-                self._priv_key, self._own_node_id, "GET", "/peers", b"",
-            )
-            headers["Authorization"] = header_val
-        req = urlrequest.Request(url, headers=headers, method="GET")
         try:
-            with auth.open_pillar_url(
-                req, timeout=10, expected_spki_hash=self._spki_hash,
-            ) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
+            data = self._fetch_projection("/peers")
+            readers = self._fetch_readers_projection() if self._enable_consumers else []
         except (urlerror.URLError, OSError, TimeoutError, ValueError,
                 auth.PillarSpkiMismatch) as e:
             with self._lock:
@@ -288,6 +298,7 @@ class PillarPeerKeyResolver:
             ) from e
 
         new_cache: dict[str, str] = {}
+        new_roles: dict[str, str] = {}
         new_addrs: set[str] = set()
         new_spki: dict[str, str] = {}
         new_addr_to_node: dict[str, str] = {}
@@ -323,6 +334,7 @@ class PillarPeerKeyResolver:
                 except ValueError:
                     continue
                 new_cache[node_id] = pub_hex.lower()
+                new_roles[node_id] = ROLE_PEER
             # SPKI cache + reverse address index: populated for any
             # peer with a node_id, regardless of pubkey validity.
             # Address-only or node_id-only entries don't enter the
@@ -332,13 +344,60 @@ class PillarPeerKeyResolver:
                 new_spki[node_id] = spki_in
                 if address:
                     new_addr_to_node[address] = node_id
+        for public_key in readers:
+            # Peer authority wins on overlap. A reader key never gains peer
+            # control authority merely because it appears in both projections.
+            if public_key not in new_cache:
+                new_cache[public_key] = public_key
+                new_roles[public_key] = ROLE_CONSUMER
         with self._lock:
             self._cache = new_cache
+            self._roles = new_roles
             self._addresses = new_addrs
             self._spki_cache = new_spki
             self._addr_to_node = new_addr_to_node
             self._last_refresh = time.time()
             self._refresh_failures = 0
+
+    def _fetch_projection(self, path: str) -> object:
+        headers: dict[str, str] = {}
+        if self._priv_key and self._own_node_id:
+            header_val, _ts = auth.build_signed_envelope(
+                self._priv_key, self._own_node_id, "GET", path, b"",
+            )
+            headers["Authorization"] = header_val
+        req = urlrequest.Request(
+            f"{self._pillar_url}{path}", headers=headers, method="GET")
+        with auth.open_pillar_url(
+                req, timeout=10, expected_spki_hash=self._spki_hash) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    def _fetch_readers_projection(self) -> list[str]:
+        try:
+            data = self._fetch_projection("/readers")
+        except urlerror.HTTPError as exc:
+            if exc.code not in (403, 404):
+                raise
+            if not self._readers_compat_logged:
+                sys.stderr.write(
+                    f"[grpc-auth] pillar /readers unavailable ({exc.code}); "
+                    "continuing with peers-only caller authorization\n")
+                self._readers_compat_logged = True
+            return []
+        values = data.get("readers", []) if isinstance(data, dict) else []
+        if not isinstance(values, list):
+            return []
+        readers: list[str] = []
+        for value in values:
+            public_key = str(value or "").strip().lower()
+            if len(public_key) != 64:
+                continue
+            try:
+                bytes.fromhex(public_key)
+            except ValueError:
+                continue
+            readers.append(public_key)
+        return list(dict.fromkeys(readers))
 
     # ── Queries ──────────────────────────────────────────────────────
 
@@ -350,6 +409,17 @@ class PillarPeerKeyResolver:
             if self._is_stale_locked():
                 return None
             return self._cache.get(node_id)
+
+    def resolve_identity(self, keyid: str) -> Optional[ResolvedIdentity]:
+        """Resolve a fresh identity together with its least authority role."""
+        with self._lock:
+            if self._is_stale_locked():
+                return None
+            public_key = self._cache.get(keyid)
+            role = self._roles.get(keyid)
+            if not public_key or role not in (ROLE_PEER, ROLE_CONSUMER):
+                return None
+            return ResolvedIdentity(keyid, public_key, role)
 
     def is_registered_address(self, address: str) -> bool:
         """Phase B5 SSRF defense. ``True`` iff ``address`` matches a
@@ -401,7 +471,8 @@ class PillarPeerKeyResolver:
 
     def known_node_ids(self) -> set[str]:
         with self._lock:
-            return set(self._cache.keys())
+            return {keyid for keyid, role in self._roles.items()
+                    if role == ROLE_PEER}
 
     def known_addresses(self) -> set[str]:
         with self._lock:
@@ -416,8 +487,15 @@ class PillarPeerKeyResolver:
 
     def stats(self) -> dict:
         with self._lock:
+            peer_count = sum(1 for role in self._roles.values()
+                             if role == ROLE_PEER)
             return {
-                "cached_node_ids": len(self._cache),
+                "cached_node_ids": peer_count,
+                "cached_identities": len(self._cache),
+                "cached_peer_identities": peer_count,
+                "cached_consumer_identities": sum(
+                    1 for role in self._roles.values()
+                    if role == ROLE_CONSUMER),
                 "cached_addresses": len(self._addresses),
                 # 2026-05-21 SPKI Phase 3.1: surfaces in /healthz for
                 # operator observability — "how many peers in the
