@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
 import stat
 import struct
 import sys
+import threading
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import grpc
@@ -35,7 +38,7 @@ def _canonical(value):
 
 def _claim(worker_keyid: str, claim_instance: str = "instance-1", *,
            session_id: str = "paid-session", token: str = TOKEN,
-           server_time: int = 100) -> dict:
+           server_time: int = 100, max_output_tokens: int = 16) -> dict:
     response = {
         "v": 1,
         "hold_id": "hold-1",
@@ -53,9 +56,9 @@ def _claim(worker_keyid: str, claim_instance: str = "instance-1", *,
         "layer_end": 4,
         "price_multiplier": 2,
         "max_prompt_tokens": 16,
-        "max_output_tokens": 8,
-        "max_token_layers": 96,
-        "max_cost": 192,
+        "max_output_tokens": max_output_tokens,
+        "max_token_layers": (16 + max_output_tokens) * 4,
+        "max_cost": (16 + max_output_tokens) * 8,
         "execution_deadline": 1000,
         "settlement_deadline": 87400,
         "server_time": server_time,
@@ -203,12 +206,15 @@ def test_every_claim_integer_field_rejects_booleans(field, replacement):
 
 
 def test_receipts_match_strict_n2_schema_id_and_signature(tmp_path):
-    manager, ledger, private, public = _manager(tmp_path)
+    now = [200]
+    manager, ledger, private, public = _manager(
+        tmp_path, clock=lambda: now[0])
     claim = manager.claim(PAYER, "paid-session", TOKEN)
     duplicate, prompt, generated = manager.prepare_step(
         claim, "step-0", "1" * 64, 3)
-    assert (duplicate, prompt, generated) == (False, 3, 0)
+    assert (duplicate, prompt, generated) == (False, 3, 1)
     first = manager.commit_step(claim, "step-0", "1" * 64, prompt, generated, 1)
+    now[0] += 15
     duplicate, prompt, generated = manager.prepare_step(
         claim, "step-1", "2" * 64, 1)
     assert (duplicate, prompt, generated) == (False, 0, 1)
@@ -216,8 +222,8 @@ def test_receipts_match_strict_n2_schema_id_and_signature(tmp_path):
     final = manager.finalize(claim, "normal")
 
     assert set(first) == paid.USAGE_FIELDS
-    assert (first["cumulative_prompt_tokens"], first["cumulative_generated_tokens"]) == (3, 0)
-    assert (second["cumulative_prompt_tokens"], second["cumulative_generated_tokens"]) == (3, 1)
+    assert (first["cumulative_prompt_tokens"], first["cumulative_generated_tokens"]) == (3, 1)
+    assert (second["cumulative_prompt_tokens"], second["cumulative_generated_tokens"]) == (3, 2)
     assert final["final"] is True
     assert final["sequence"] == 3
     assert final["cumulative_cost"] == second["cumulative_cost"]
@@ -340,6 +346,94 @@ class _Context:
         raise RuntimeError(details)
 
 
+def _gateway_paid_client():
+    path = (Path(__file__).resolve().parents[2] / "nak-g1" /
+            "scripts" / "paid_client.py")
+    if not path.is_file():
+        pytest.skip("gateway paid_client.py is not available")
+    spec = importlib.util.spec_from_file_location("gateway_paid_client", path)
+    if spec is None or spec.loader is None:
+        pytest.skip("gateway paid_client.py is not importable")
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except ImportError as exc:
+        pytest.skip(f"gateway paid_client.py dependency unavailable: {exc}")
+    return module
+
+
+def test_info_identity_attestation_interoperates_with_gateway_verifier():
+    private, public = auth.generate_keypair()
+    servicer = worker.WorkerServicer(
+        _Daemon(), "last", 0, 4, MODEL,
+        worker_priv=private, worker_pub_hex=public)
+    challenge = bytes(range(32))
+    response = servicer.Info(
+        pb.InfoRequest(identity_challenge=challenge), _Context())
+
+    assert response.worker_keyid == public
+    assert len(response.identity_signature) == 64
+    ed25519.Ed25519PublicKey.from_public_bytes(bytes.fromhex(public)).verify(
+        response.identity_signature,
+        b"nakshatra-paid-info-v1\0" + challenge)
+    assert _gateway_paid_client().verify_info_attestation(
+        response, challenge) == public
+
+
+def test_empty_info_challenge_is_byte_identical_to_legacy_probe():
+    private, public = auth.generate_keypair()
+    keyed = worker.WorkerServicer(
+        _Daemon(), "last", 0, 4, MODEL,
+        worker_priv=private, worker_pub_hex=public)
+    legacy = worker.WorkerServicer(_Daemon(), "last", 0, 4, MODEL)
+
+    keyed_response = keyed.Info(pb.InfoRequest(), _Context())
+    legacy_response = legacy.Info(pb.InfoRequest(), _Context())
+    assert keyed_response.SerializeToString() == legacy_response.SerializeToString()
+    assert keyed_response.worker_keyid == ""
+    assert keyed_response.identity_signature == b""
+
+
+@pytest.mark.parametrize("challenge", [b"x", b"x" * 31, b"x" * 33])
+def test_info_identity_rejects_malformed_nonempty_challenge(challenge):
+    private, public = auth.generate_keypair()
+    servicer = worker.WorkerServicer(
+        _Daemon(), "last", 0, 4, MODEL,
+        worker_priv=private, worker_pub_hex=public)
+    context = _Context()
+    with pytest.raises(RuntimeError, match="exactly 32 bytes"):
+        servicer.Info(pb.InfoRequest(identity_challenge=challenge), context)
+    assert context._code == grpc.StatusCode.INVALID_ARGUMENT
+
+
+def test_info_identity_requires_available_matching_worker_key():
+    private, public = auth.generate_keypair()
+    other_private, _other_public = auth.generate_keypair()
+    for servicer in (
+        worker.WorkerServicer(_Daemon(), "last", 0, 4, MODEL),
+        worker.WorkerServicer(
+            _Daemon(), "last", 0, 4, MODEL,
+            worker_priv=other_private, worker_pub_hex=public),
+    ):
+        context = _Context()
+        with pytest.raises(RuntimeError, match="identity is unavailable"):
+            servicer.Info(
+                pb.InfoRequest(identity_challenge=b"x" * 32), context)
+        assert context._code == grpc.StatusCode.FAILED_PRECONDITION
+
+
+def test_new_paid_client_rejects_old_worker_without_truncate_capability():
+    gateway = _gateway_paid_client()
+    old_info = SimpleNamespace(protocol_capabilities=[
+        capability for capability in gateway.REQUIRED_PAID_CAPABILITIES
+        if capability != "truncate_session_owner"
+    ])
+    with pytest.raises(
+            gateway.PaidAdmissionError, match="truncate_session_owner"):
+        gateway.require_paid_capabilities(
+            [({"id": "old-worker"}, object(), old_info)])
+
+
 def _servicer(tmp_path: Path, *, role=grpc_auth.ROLE_CONSUMER):
     manager, ledger, _private, _public = _manager(tmp_path)
     daemon = _Daemon()
@@ -399,11 +493,152 @@ def test_paid_stream_meters_prompt_and_output_and_finalizes(tmp_path):
     responses = list(servicer.Inference(iter([first, second]), _Context()))
     assert [list(response.token_ids.ids) for response in responses] == [[42], [42]]
     meter = manager.store.meter(PAYER, "paid-session")
-    assert (meter["prompt_tokens"], meter["generated_tokens"]) == (3, 1)
-    assert meter["receipt_sequence"] == 3
+    assert (meter["prompt_tokens"], meter["generated_tokens"]) == (3, 2)
+    assert meter["receipt_sequence"] == 2
     assert meter["final"] == 1
     assert len(daemon.calls) == 2
-    assert len(ledger.settle_calls) == 3
+    assert len(ledger.settle_calls) == 2
+    manager.store.close()
+
+
+@pytest.mark.parametrize("mode", ["first", "middle", "last", "solo"])
+def test_prefill_meters_first_emitted_token_on_every_stage(tmp_path, mode):
+    manager, _ledger, _private, _public = _manager(tmp_path)
+    daemon = _Daemon()
+    servicer = worker.WorkerServicer(
+        daemon, mode, 0, 4, MODEL, paid_admission=manager,
+        refuse_unregistered_peers=False, refuse_unpinned_peers=False)
+    servicer._check_grpc_auth = lambda *_args, **_kwargs: (
+        worker.AuthenticatedKeyId(PAYER, grpc_auth.ROLE_CONSUMER))
+
+    responses = list(servicer.Inference(iter([_step()]), _Context()))
+    meter = manager.store.meter(PAYER, "paid-session")
+
+    assert len(responses) == 1
+    assert meter["prompt_tokens"] == 3
+    assert meter["generated_tokens"] == 1
+    assert meter["final"] == 1
+    manager.store.close()
+
+
+def test_receipts_checkpoint_after_eight_generated_tokens(tmp_path):
+    manager, _ledger, _private, _public = _manager(tmp_path)
+    claim = manager.claim(PAYER, "paid-session", TOKEN)
+    emitted = []
+    for index in range(9):
+        n_tokens = 3 if index == 0 else 1
+        _, prompt, generated = manager.prepare_step(
+            claim, f"step-{index}", f"{index + 1:064x}", n_tokens)
+        receipt = manager.commit_step(
+            claim, f"step-{index}", f"{index + 1:064x}",
+            prompt, generated, 1)
+        if receipt is not None:
+            emitted.append(receipt)
+    final = manager.finalize(claim, "normal")
+
+    assert [item["cumulative_generated_tokens"] for item in emitted] == [1, 9]
+    assert [item["sequence"] for item in emitted] == [1, 2]
+    assert final["sequence"] == 3
+    assert final["cumulative_generated_tokens"] == 9
+    manager.store.close()
+
+
+def test_same_paid_session_is_serialized_through_finalization(tmp_path):
+    class BlockingDaemon(_Daemon):
+        def __init__(self):
+            super().__init__()
+            self.entered = threading.Event()
+            self.release = threading.Event()
+
+        def call(self, cmd, n_tokens, payload, start_pos=0, flags=0):
+            self.calls.append((cmd, n_tokens, start_pos, flags))
+            self.entered.set()
+            assert self.release.wait(timeout=5)
+            return 0, struct.pack("<Ii", 0, 42)
+
+    manager, ledger, _private, _public = _manager(tmp_path)
+    daemon = BlockingDaemon()
+    servicer = worker.WorkerServicer(
+        daemon, "last", 0, 4, MODEL, paid_admission=manager,
+        refuse_unregistered_peers=False, refuse_unpinned_peers=False)
+    servicer._check_grpc_auth = lambda *_args, **_kwargs: (
+        worker.AuthenticatedKeyId(PAYER, grpc_auth.ROLE_CONSUMER))
+    first = pb.ForwardRequest(
+        hidden_in=struct.pack("<2i", 1, 2), n_tokens=2,
+        has_token_ids=True, session_id="paid-session",
+        step_id="forward-0", spend_claim_token=TOKEN)
+    second = pb.ForwardRequest(
+        hidden_in=struct.pack("<2i", 3, 4), n_tokens=2,
+        has_token_ids=True, session_id="paid-session", step_id="forward-1")
+    contexts = [_Context(), _Context()]
+    responses = [None, None]
+    errors = []
+
+    def invoke(index, request):
+        try:
+            responses[index] = servicer.Forward(request, contexts[index])
+        except Exception as exc:  # pragma: no cover - assertion aid
+            errors.append(exc)
+
+    winner = threading.Thread(target=invoke, args=(0, first))
+    loser = threading.Thread(target=invoke, args=(1, second))
+    winner.start()
+    assert daemon.entered.wait(timeout=5)
+    loser.start()
+    loser.join(timeout=0.1)
+    assert loser.is_alive()
+    assert len(daemon.calls) == 1
+    daemon.release.set()
+    winner.join(timeout=5)
+    loser.join(timeout=5)
+
+    assert not errors
+    assert responses[0].hidden_out == struct.pack("<i", 42)
+    assert responses[1] == pb.ForwardResponse()
+    assert contexts[1]._code == grpc.StatusCode.PERMISSION_DENIED
+    assert "already final" in contexts[1]._details
+    assert len(daemon.calls) == 1
+    assert len(ledger.settle_calls) == 2
+    manager.store.close()
+
+
+def test_late_daemon_completion_releases_no_output_or_usage(tmp_path):
+    now = [999.0]
+
+    class AdvancingDaemon(_Daemon):
+        def call(self, cmd, n_tokens, payload, start_pos=0, flags=0):
+            result = super().call(cmd, n_tokens, payload, start_pos, flags)
+            if len(self.calls) == 2:
+                now[0] = 1001.0
+            return result
+
+    manager, ledger, _private, _public = _manager(
+        tmp_path, clock=lambda: now[0])
+    daemon = AdvancingDaemon()
+    servicer = worker.WorkerServicer(
+        daemon, "last", 0, 4, MODEL, paid_admission=manager,
+        refuse_unregistered_peers=False, refuse_unpinned_peers=False)
+    servicer._check_grpc_auth = lambda *_args, **_kwargs: (
+        worker.AuthenticatedKeyId(PAYER, grpc_auth.ROLE_CONSUMER))
+    first = _step()
+    second = pb.InferenceStep(
+        session_id="paid-session", step_id="step-1", prefix_length=3)
+    second.token_ids.ids.append(42)
+    context = _Context()
+
+    responses = list(servicer.Inference(iter([first, second]), context))
+    meter = manager.store.meter(PAYER, "paid-session")
+    settled = [receipt for receipt, _signature in ledger.settle_calls]
+
+    assert [list(response.token_ids.ids) for response in responses] == [[42]]
+    assert context._code == grpc.StatusCode.DEADLINE_EXCEEDED
+    assert "completed after" in context._details
+    assert len(daemon.calls) == 2
+    assert (meter["prompt_tokens"], meter["generated_tokens"]) == (3, 1)
+    assert meter["final"] == 1
+    assert [receipt["final"] for receipt in settled] == [False, True]
+    assert [receipt["work_completed_at"] for receipt in settled] == [999, 999]
+    assert [receipt["cumulative_generated_tokens"] for receipt in settled] == [1, 1]
     manager.store.close()
 
 

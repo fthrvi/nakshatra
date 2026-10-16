@@ -47,6 +47,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 import grpc
 import nakshatra_pb2 as pb
 import nakshatra_pb2_grpc as pb_grpc
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ed25519
 from worker_service import (
     DEFAULT_TRUSTED_PILLAR_NETS,
     WorkerServiceError,
@@ -99,6 +101,8 @@ _CONSUMER_INFERENCE_GRPC_METHODS = frozenset({
     "/nakshatra.Nakshatra/Inference",
     "/nakshatra.Nakshatra/TruncateKV",
 })
+_INFO_ATTESTATION_DOMAIN = b"nakshatra-paid-info-v1\0"
+_INFO_CHALLENGE_BYTES = 32
 
 
 class AuthenticatedKeyId(str):
@@ -1838,7 +1842,8 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                  peer_resolver=None, auth_required: bool = False,
                  refuse_unregistered_peers: bool = True,
                  refuse_unpinned_peers: bool = True,
-                 paid_admission=None):
+                 paid_admission=None, worker_priv: Optional[bytes] = None,
+                 worker_pub_hex: str = ""):
         self.daemon = daemon
         self.mode = mode
         self.layer_start = layer_start
@@ -1852,6 +1857,21 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
         self.auth_required = auth_required
         self.paid_admission = paid_admission
         self.paid_gate_enabled = paid_admission is not None
+        self.worker_priv = worker_priv
+        self.worker_pub_hex = worker_pub_hex
+        self._worker_identity_ready = False
+        if (isinstance(worker_priv, bytes) and len(worker_priv) == 32
+                and isinstance(worker_pub_hex, str)
+                and re.fullmatch(r"[0-9a-f]{64}", worker_pub_hex)):
+            try:
+                derived = ed25519.Ed25519PrivateKey.from_private_bytes(
+                    worker_priv).public_key().public_bytes(
+                        encoding=serialization.Encoding.Raw,
+                        format=serialization.PublicFormat.Raw).hex()
+                self._worker_identity_ready = hmac.compare_digest(
+                    derived, worker_pub_hex)
+            except Exception:
+                self._worker_identity_ready = False
         self.fabric_transport_enabled = False
         # Session ownership and resident KV are deliberately distinct. A
         # stream releases active ownership when it closes, while seq-0 remains
@@ -2323,9 +2343,24 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
         # Info is auth-exempt, so it is what a readiness probe can call. While the worker is still registering it must
         # NOT report healthy - a bound port + a TLS handshake was all a probe could see, and the first authenticated
         # request then hit "no peer resolver configured" (2026-09-21 cold start).
+        challenge = bytes(getattr(request, "identity_challenge", b""))
+        if challenge and len(challenge) != _INFO_CHALLENGE_BYTES:
+            context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                "identity_challenge must be exactly 32 bytes")
         if self.starting:
             context.abort(grpc.StatusCode.UNAVAILABLE,
                           "worker starting: " + (self.starting_reason or "registration with the pillar not finished"))
+        worker_keyid = ""
+        identity_signature = b""
+        if challenge:
+            if not self._worker_identity_ready:
+                context.abort(
+                    grpc.StatusCode.FAILED_PRECONDITION,
+                    "worker Ed25519 identity is unavailable")
+            worker_keyid = self.worker_pub_hex
+            identity_signature = ed25519.Ed25519PrivateKey.from_private_bytes(
+                self.worker_priv).sign(_INFO_ATTESTATION_DOMAIN + challenge)
         return pb.InfoResponse(
             protocol_version="0.1.0",
             backend="llamacpp-cpu-patched",
@@ -2338,6 +2373,8 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
             kv_cache_tokens_free=256,
             has_token_embd=(self.mode in ("first", "solo")),
             has_lm_head=(self.mode in ("last", "solo")),
+            worker_keyid=worker_keyid,
+            identity_signature=identity_signature,
             # v0.5 §9.1 closure — advertised features so the client can
             # negotiate push at session start without runtime probing.
             # v1.0 §7 — append control/vN tokens so the client can negotiate
@@ -2476,6 +2513,7 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
         forward_principal = self._session_principal(
             authenticated_keyid, forward_session_id)
         paid_claim = None
+        paid_session_lock = None
         paid_committed = False
         paid_selected = bool(request.spend_claim_token)
         if (paid_admission is not None and authenticated_keyid is not None
@@ -2525,6 +2563,8 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                 paid_claim = paid_admission.claim(
                     str(authenticated_keyid), explicit_session,
                     request.spend_claim_token)
+                paid_session_lock = paid_admission.session_lock(paid_claim)
+                paid_session_lock.acquire()
                 request_sha256 = paid_admission.request_digest(request)
                 duplicate, paid_prompt_delta, paid_generated_delta = (
                     paid_admission.prepare_step(
@@ -2533,11 +2573,28 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                     context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
                     context.set_details(
                         "KV_RESIDENCY_LOST: durable paid step requires cold replay")
+                    paid_session_lock.release()
+                    paid_session_lock = None
                     return pb.ForwardResponse()
+            except _paid.PaidExecutionDeadline as exc:
+                if paid_session_lock is not None:
+                    paid_session_lock.release()
+                    paid_session_lock = None
+                context.set_code(grpc.StatusCode.DEADLINE_EXCEEDED)
+                context.set_details(str(exc))
+                return pb.ForwardResponse()
             except _paid.PaidAdmissionError as exc:
+                if paid_session_lock is not None:
+                    paid_session_lock.release()
+                    paid_session_lock = None
                 context.set_code(grpc.StatusCode.PERMISSION_DENIED)
                 context.set_details(str(exc))
                 return pb.ForwardResponse()
+            except Exception:
+                if paid_session_lock is not None:
+                    paid_session_lock.release()
+                    paid_session_lock = None
+                raise
         # A stateful Forward may continue only the KV currently resident for
         # this exact authenticated principal. Refuse before any daemon call;
         # clearing another principal and then decoding with keep_kv would be
@@ -2547,16 +2604,26 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
             context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
             context.set_details(
                 "KV_RESIDENCY_LOST: stateful Forward does not own resident KV")
+            if paid_session_lock is not None:
+                paid_session_lock.release()
             return pb.ForwardResponse()
         acquired_principal = None
         try:
             acquired_principal = self._acquire_kv_session(
                 authenticated_keyid, forward_session_id)
         except DaemonUnavailableError as e:
+            if paid_session_lock is not None:
+                paid_session_lock.release()
             context.set_code(grpc.StatusCode.UNAVAILABLE)
             context.set_details(str(e))
             return pb.ForwardResponse()
+        except Exception:
+            if paid_session_lock is not None:
+                paid_session_lock.release()
+            raise
         if acquired_principal is None:
+            if paid_session_lock is not None:
+                paid_session_lock.release()
             context.set_code(grpc.StatusCode.RESOURCE_EXHAUSTED)
             context.set_details(
                 f"worker busy serving another session "
@@ -2584,11 +2651,23 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                 context.set_code(grpc.StatusCode.UNAVAILABLE)
                 context.set_details(str(e))
                 return pb.ForwardResponse()
+            except _paid.PaidExecutionDeadline as e:
+                context.set_code(grpc.StatusCode.DEADLINE_EXCEEDED)
+                context.set_details(str(e))
+                return pb.ForwardResponse()
+            except _paid.PaidAdmissionError as e:
+                context.set_code(grpc.StatusCode.PERMISSION_DENIED)
+                context.set_details(str(e))
+                return pb.ForwardResponse()
         finally:
             self._release_kv_session(acquired_principal)
-            if paid_claim is not None and paid_committed:
-                paid_admission.finalize(paid_claim, "normal")
-                paid_admission.flush_outbox()
+            try:
+                if paid_claim is not None and paid_committed:
+                    paid_admission.finalize(paid_claim, "normal")
+                    paid_admission.flush_outbox()
+            finally:
+                if paid_session_lock is not None:
+                    paid_session_lock.release()
         if not result.ok:
             context.set_code(
                 grpc.StatusCode.INVALID_ARGUMENT if result.client_error
@@ -2860,6 +2939,7 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
         authenticated_keyid = None
         stream_kv_epoch = None
         paid_claim = None
+        paid_session_lock = None
         paid_termination = "cancelled"
         paid_admission = getattr(self, "paid_admission", None)
         fabric_transport_enabled = getattr(
@@ -2917,6 +2997,8 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                         paid_claim = paid_admission.claim(
                             str(authenticated_keyid), stream_session_id,
                             step.spend_claim_token)
+                        paid_session_lock = paid_admission.session_lock(paid_claim)
+                        paid_session_lock.acquire()
                     else:
                         # Peers acquire immediately. Paid requests defer this
                         # until every cap/schema rejection has passed, ensuring
@@ -3329,6 +3411,11 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                     request_sha256)
                 yield out
             paid_termination = "normal"
+        except _paid.PaidExecutionDeadline as e:
+            paid_termination = "execution_deadline"
+            context.set_code(grpc.StatusCode.DEADLINE_EXCEEDED)
+            context.set_details(str(e))
+            return
         except _paid.PaidAdmissionError as e:
             paid_termination = "cancelled"
             context.set_code(grpc.StatusCode.PERMISSION_DENIED)
@@ -3365,15 +3452,19 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
             if owned_principal is not None:
                 self._close_peer_streams(session_principal)
                 self._release_kv_session(owned_principal)
-            if paid_claim is not None:
-                try:
-                    paid_admission.finalize(
-                        paid_claim, paid_termination)
-                    paid_admission.flush_outbox()
-                except _paid.PaidAdmissionError:
-                    # The durable nonfinal receipt remains replayable; never
-                    # leak receipt or payer material into daemon logs.
-                    pass
+            try:
+                if paid_claim is not None:
+                    try:
+                        paid_admission.finalize(
+                            paid_claim, paid_termination)
+                        paid_admission.flush_outbox()
+                    except _paid.PaidAdmissionError:
+                        # The durable nonfinal receipt remains replayable; never
+                        # leak receipt or payer material into daemon logs.
+                        pass
+            finally:
+                if paid_session_lock is not None:
+                    paid_session_lock.release()
             # worker/kv-session-ownership-gate: release on EVERY exit path —
             # normal completion, an early `return` above, the idle-timeout or
             # generic-exception handlers, or the client dropping the stream.
@@ -5086,7 +5177,9 @@ def main():
                               auth_required=auth_required,
                               refuse_unregistered_peers=refuse_unregistered_peers,
                               refuse_unpinned_peers=refuse_unpinned_peers,
-                              paid_admission=paid_admission)
+                              paid_admission=paid_admission,
+                              worker_priv=worker_priv,
+                              worker_pub_hex=worker_pub_hex)
     servicer.paid_gate_enabled = bool(args.paid_admission)
     servicer.fabric_transport_enabled = args.transport == "fabric"
     # Registration (and with it the peer-key resolver) happens AFTER the port is bound; until then report STARTING.

@@ -72,6 +72,10 @@ class PaidAdmissionConflict(PaidAdmissionError):
     """A session or step identifier was reused with different bytes."""
 
 
+class PaidExecutionDeadline(PaidAdmissionError):
+    """A paid step started or completed outside its execution window."""
+
+
 def _canonical(value: object) -> bytes:
     return json.dumps(
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
@@ -314,6 +318,9 @@ class PaidAdmissionStore:
               receipt_sequence INTEGER NOT NULL DEFAULT 0,
               final INTEGER NOT NULL DEFAULT 0,
               last_checkpoint_at INTEGER NOT NULL DEFAULT 0,
+              last_checkpoint_prompt_tokens INTEGER NOT NULL DEFAULT 0,
+              last_checkpoint_generated_tokens INTEGER NOT NULL DEFAULT 0,
+              last_work_completed_at INTEGER NOT NULL DEFAULT 0,
               PRIMARY KEY(payer_keyid, session_id));
             CREATE TABLE IF NOT EXISTS steps(
               payer_keyid TEXT NOT NULL, session_id TEXT NOT NULL,
@@ -332,6 +339,23 @@ class PaidAdmissionStore:
               payer_keyid TEXT, session_id TEXT, kv_epoch INTEGER NOT NULL);
             INSERT OR IGNORE INTO kv_state(singleton, kv_epoch) VALUES(1, 0);
             """)
+            claim_columns = {
+                str(row[1]) for row in self._db.execute("PRAGMA table_info(claims)")
+            }
+            for name in (
+                "last_checkpoint_prompt_tokens",
+                "last_checkpoint_generated_tokens",
+                "last_work_completed_at",
+            ):
+                if name not in claim_columns:
+                    self._db.execute(
+                        f"ALTER TABLE claims ADD COLUMN {name} "
+                        "INTEGER NOT NULL DEFAULT 0")
+            self._db.execute(
+                "UPDATE claims SET last_checkpoint_prompt_tokens=prompt_tokens, "
+                "last_checkpoint_generated_tokens=generated_tokens, "
+                "last_work_completed_at=last_checkpoint_at "
+                "WHERE receipt_sequence>0 AND last_work_completed_at=0")
 
     def close(self) -> None:
         with self._lock:
@@ -406,9 +430,10 @@ class PaidAdmissionStore:
 
     def commit_step(self, claim: dict, step_id: str, request_sha256: str,
                     prompt_delta: int, generated_delta: int, kv_epoch: int,
-                    receipt: dict, signature: str) -> None:
-        canonical_receipt = _canonical(receipt).decode("utf-8")
-        now = int(receipt["work_completed_at"])
+                    completed_at: int, receipt: Optional[dict] = None,
+                    signature: str = "") -> None:
+        canonical_receipt = (
+            _canonical(receipt).decode("utf-8") if receipt is not None else "")
         with self._lock:
             self._db.execute("BEGIN IMMEDIATE")
             try:
@@ -429,29 +454,46 @@ class PaidAdmissionStore:
                 if meter is None or meter["final"]:
                     raise PaidAdmissionConflict(
                         "paid session became unavailable before usage commit")
-                if int(receipt["sequence"]) != int(meter["receipt_sequence"]) + 1:
-                    raise PaidAdmissionConflict("paid receipt sequence raced another stream")
-                if (int(receipt["cumulative_prompt_tokens"])
-                        != int(meter["prompt_tokens"]) + prompt_delta
-                        or int(receipt["cumulative_generated_tokens"])
-                        != int(meter["generated_tokens"]) + generated_delta):
-                    raise PaidAdmissionConflict("paid cumulative meter changed before commit")
+                prompt = int(meter["prompt_tokens"]) + prompt_delta
+                generated = int(meter["generated_tokens"]) + generated_delta
+                if receipt is not None:
+                    if (int(receipt["sequence"])
+                            != int(meter["receipt_sequence"]) + 1):
+                        raise PaidAdmissionConflict(
+                            "paid receipt sequence raced another stream")
+                    if (int(receipt["cumulative_prompt_tokens"]) != prompt
+                            or int(receipt["cumulative_generated_tokens"])
+                            != generated):
+                        raise PaidAdmissionConflict(
+                            "paid cumulative meter changed before commit")
                 self._db.execute(
-                    "INSERT INTO steps(payer_keyid,session_id,step_id,request_sha256," 
+                    "INSERT INTO steps(payer_keyid,session_id,step_id,request_sha256,"
                     "kv_epoch,committed_at) VALUES(?,?,?,?,?,?)",
                     (claim["payer_keyid"], claim["session_id"], step_id,
-                     request_sha256, kv_epoch, now))
-                self._db.execute(
-                    "UPDATE claims SET prompt_tokens=prompt_tokens+?, "
-                    "generated_tokens=generated_tokens+?, receipt_sequence=?, "
-                    "last_checkpoint_at=? WHERE payer_keyid=? AND session_id=?",
-                    (prompt_delta, generated_delta, receipt["sequence"], now,
-                     claim["payer_keyid"], claim["session_id"]))
-                self._db.execute(
-                    "INSERT INTO outbox(receipt_id,payer_keyid,session_id,sequence," 
-                    "receipt_json,signature) VALUES(?,?,?,?,?,?)",
-                    (receipt["receipt_id"], claim["payer_keyid"], claim["session_id"],
-                     receipt["sequence"], canonical_receipt, signature))
+                     request_sha256, kv_epoch, completed_at))
+                if receipt is None:
+                    self._db.execute(
+                        "UPDATE claims SET prompt_tokens=?,generated_tokens=?, "
+                        "last_work_completed_at=? WHERE payer_keyid=? AND session_id=?",
+                        (prompt, generated, completed_at, claim["payer_keyid"],
+                         claim["session_id"]))
+                else:
+                    self._db.execute(
+                        "UPDATE claims SET prompt_tokens=?,generated_tokens=?, "
+                        "receipt_sequence=?,last_checkpoint_at=?, "
+                        "last_checkpoint_prompt_tokens=?, "
+                        "last_checkpoint_generated_tokens=?, "
+                        "last_work_completed_at=? "
+                        "WHERE payer_keyid=? AND session_id=?",
+                        (prompt, generated, receipt["sequence"], completed_at,
+                         prompt, generated, completed_at, claim["payer_keyid"],
+                         claim["session_id"]))
+                    self._db.execute(
+                        "INSERT INTO outbox(receipt_id,payer_keyid,session_id,sequence,"
+                        "receipt_json,signature) VALUES(?,?,?,?,?,?)",
+                        (receipt["receipt_id"], claim["payer_keyid"],
+                         claim["session_id"], receipt["sequence"],
+                         canonical_receipt, signature))
                 self._db.execute(
                     "UPDATE kv_state SET payer_keyid=?,session_id=?,kv_epoch=? "
                     "WHERE singleton=1",
@@ -484,11 +526,16 @@ class PaidAdmissionStore:
                     raise PaidAdmissionConflict(
                         "paid final receipt raced cumulative usage")
                 self._db.execute(
-                    "UPDATE claims SET final=1,receipt_sequence=? WHERE payer_keyid=? "
-                    "AND session_id=?", (receipt["sequence"], claim["payer_keyid"],
-                                         claim["session_id"]))
+                    "UPDATE claims SET final=1,receipt_sequence=?, "
+                    "last_checkpoint_at=?,last_checkpoint_prompt_tokens=?, "
+                    "last_checkpoint_generated_tokens=? WHERE payer_keyid=? "
+                    "AND session_id=?",
+                    (receipt["sequence"], receipt["work_completed_at"],
+                     receipt["cumulative_prompt_tokens"],
+                     receipt["cumulative_generated_tokens"],
+                     claim["payer_keyid"], claim["session_id"]))
                 self._db.execute(
-                    "INSERT INTO outbox(receipt_id,payer_keyid,session_id,sequence," 
+                    "INSERT INTO outbox(receipt_id,payer_keyid,session_id,sequence,"
                     "receipt_json,signature) VALUES(?,?,?,?,?,?)",
                     (receipt["receipt_id"], claim["payer_keyid"], claim["session_id"],
                      receipt["sequence"], canonical_receipt, signature))
@@ -507,7 +554,7 @@ class PaidAdmissionStore:
     def mark_sent(self, receipt_id: str, response: dict) -> None:
         with self._lock:
             self._db.execute(
-                "UPDATE outbox SET state='sent',attempts=attempts+1,last_error=''," 
+                "UPDATE outbox SET state='sent',attempts=attempts+1,last_error='',"
                 "response_json=? WHERE receipt_id=? AND state='pending'",
                 (_canonical(response).decode("utf-8"), receipt_id))
 
@@ -536,6 +583,14 @@ class PaidAdmission:
         self.ready = False
         self.readiness_error = "not probed"
         self._outbox_lock = threading.Lock()
+        self._session_locks_lock = threading.Lock()
+        self._session_locks: dict[tuple[str, str], threading.RLock] = {}
+
+    def session_lock(self, claim: Mapping[str, object]) -> threading.RLock:
+        """Return the in-process lock serializing one durable paid session."""
+        key = (str(claim["payer_keyid"]), str(claim["session_id"]))
+        with self._session_locks_lock:
+            return self._session_locks.setdefault(key, threading.RLock())
 
     def check_ready(self) -> bool:
         try:
@@ -584,7 +639,7 @@ class PaidAdmission:
             if claim.get(name) != value:
                 raise PaidAdmissionError(f"spend claim {name} does not match this call")
         if int(self.clock()) >= int(claim["execution_deadline"]):
-            raise PaidAdmissionError("spend execution deadline has passed")
+            raise PaidExecutionDeadline("spend execution deadline has passed")
 
     @staticmethod
     def request_digest(message) -> str:
@@ -599,7 +654,7 @@ class PaidAdmission:
         if not step_id or len(step_id.encode("utf-8")) > _MAX_TEXT_BYTES:
             raise PaidAdmissionError("paid step_id is invalid")
         if int(self.clock()) >= int(claim["execution_deadline"]):
-            raise PaidAdmissionError("spend execution deadline has passed")
+            raise PaidExecutionDeadline("spend execution deadline has passed")
         if self.store.inspect_step(
                 claim["payer_keyid"], claim["session_id"], step_id,
                 request_sha256):
@@ -607,8 +662,8 @@ class PaidAdmission:
         row = self.store.meter(claim["payer_keyid"], claim["session_id"])
         if row["final"]:
             raise PaidAdmissionError("paid session is already final")
-        if int(row["receipt_sequence"]) == 0:
-            prompt_delta, generated_delta = n_tokens, 0
+        if int(row["prompt_tokens"]) == 0:
+            prompt_delta, generated_delta = n_tokens, 1
         else:
             if n_tokens != 1:
                 raise PaidAdmissionError("paid post-prefill steps must contain one token")
@@ -621,7 +676,8 @@ class PaidAdmission:
         return False, prompt_delta, generated_delta
 
     def _receipt(self, claim: dict, sequence: int, prompt: int, generated: int,
-                 *, final: bool, termination: str) -> tuple[dict, str]:
+                 *, completed_at: int, final: bool,
+                 termination: str) -> tuple[dict, str]:
         layers = int(claim["layer_end"]) - int(claim["layer_start"])
         token_layers = (prompt + generated) * layers
         cost = (token_layers * int(claim["price_multiplier"])
@@ -647,9 +703,7 @@ class PaidAdmission:
             "cumulative_generated_tokens": generated,
             "cumulative_token_layers": token_layers,
             "cumulative_cost": cost,
-            "work_completed_at": min(
-                max(int(self.clock()), int(claim["server_time"])),
-                int(claim["execution_deadline"])),
+            "work_completed_at": int(completed_at),
             "final": bool(final),
             "termination": termination,
             "output_sha256": "",
@@ -666,27 +720,49 @@ class PaidAdmission:
 
     def commit_step(self, claim: dict, step_id: str, request_sha256: str,
                     prompt_delta: int, generated_delta: int,
-                    kv_epoch: int) -> dict:
+                    kv_epoch: int) -> Optional[dict]:
+        completed_now = self.clock()
+        if completed_now > int(claim["execution_deadline"]):
+            raise PaidExecutionDeadline(
+                "paid work completed after the execution deadline")
+        completed_at = int(completed_now)
         row = self.store.meter(claim["payer_keyid"], claim["session_id"])
-        sequence = int(row["receipt_sequence"]) + 1
         prompt = int(row["prompt_tokens"]) + prompt_delta
         generated = int(row["generated_tokens"]) + generated_delta
-        receipt, signature = self._receipt(
-            claim, sequence, prompt, generated,
-            final=False, termination="checkpoint")
+        checkpoint_due = (
+            prompt_delta > 0
+            or generated - int(row["last_checkpoint_generated_tokens"]) >= 8
+            or completed_at - int(row["last_checkpoint_at"]) >= 15
+        )
+        receipt = None
+        signature = ""
+        if checkpoint_due:
+            receipt, signature = self._receipt(
+                claim, int(row["receipt_sequence"]) + 1, prompt, generated,
+                completed_at=completed_at, final=False,
+                termination="checkpoint")
         self.store.commit_step(
             claim, step_id, request_sha256, prompt_delta, generated_delta,
-            kv_epoch, receipt, signature)
+            kv_epoch, completed_at, receipt, signature)
         return receipt
 
     def finalize(self, claim: dict, termination: str) -> Optional[dict]:
         row = self.store.meter(claim["payer_keyid"], claim["session_id"])
         if row["final"] or int(row["receipt_sequence"]) == 0:
             return None
+        has_uncheckpointed_usage = (
+            int(row["prompt_tokens"])
+            != int(row["last_checkpoint_prompt_tokens"])
+            or int(row["generated_tokens"])
+            != int(row["last_checkpoint_generated_tokens"])
+        )
+        completed_at = int(
+            row["last_work_completed_at"] if has_uncheckpointed_usage
+            else row["last_checkpoint_at"])
         receipt, signature = self._receipt(
             claim, int(row["receipt_sequence"]) + 1,
             int(row["prompt_tokens"]), int(row["generated_tokens"]),
-            final=True, termination=termination)
+            completed_at=completed_at, final=True, termination=termination)
         return receipt if self.store.commit_final(claim, receipt, signature) else None
 
     def flush_outbox(self) -> int:
