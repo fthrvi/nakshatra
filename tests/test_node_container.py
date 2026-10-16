@@ -454,6 +454,34 @@ def test_nakc_paid_commands_pass_through_without_role_reconfiguration(
     assert not (tmp_path / "config" / "worker-port").exists()
 
 
+def test_nakc_paid_passthrough_quotes_shell_looking_unknown_args_without_outer_effects(
+        tmp_path):
+    config = tmp_path / "config"
+    config.mkdir()
+    (config / "gateway-on").write_text("1\n")
+    (config / "p2p-port").write_text("24001\n")
+    marker = tmp_path / "shell-argument-ran"
+    before = {path.name: path.read_bytes() for path in config.iterdir()}
+    baseline_run = _dry_run_argv(_nakc(tmp_path, "start").stdout)
+    hostile = (
+        "--unknown", f"$(touch {marker})", "--privileged",
+        "--volume=/tmp:/host", "--name=outer-state-changed", f"; touch {marker}",
+    )
+
+    result = _nakc(tmp_path, "gateway", "paid", "on", *hostile)
+
+    assert result.returncode == 0, result.stderr
+    assert _dry_run_argv(result.stdout) == baseline_run
+    exec_lines = [line for line in result.stdout.splitlines()
+                  if line.startswith("+ docker exec ")]
+    assert shlex.split(exec_lines[-1].removeprefix("+ ")) == [
+        "docker", "exec", "-i", "nakshatra-node",
+        "nak", "gateway", "paid", "on", *hostile,
+    ]
+    assert not marker.exists()
+    assert {path.name: path.read_bytes() for path in config.iterdir()} == before
+
+
 def test_gateway_p2p_port_is_configurable_and_persisted(tmp_path):
     enabled = _nakc(tmp_path, "gateway", "on", NAKC_P2P_PORT="24001")
     assert enabled.returncode == 0, enabled.stderr

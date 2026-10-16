@@ -1028,7 +1028,13 @@ def _gateway_paid(_sp, action: str) -> dict | None:
                 if not _wait_gateway_ready(env_path):
                     raise SystemExit("gateway paid restart did not become ready")
             except (Exception, SystemExit) as transition_error:
-                _write_private(env_path, old_env)
+                try:
+                    _write_private(env_path, old_env)
+                except (Exception, SystemExit) as restore_error:
+                    raise SystemExit(
+                        f"{transition_error}; rollback could not restore {env_path}: "
+                        f"{restore_error}"
+                    ) from transition_error
                 try:
                     _gateway_installer(_sp, "restart")
                 except (Exception, SystemExit) as rollback_error:
@@ -1587,7 +1593,13 @@ def _worker_paid(_sp, action: str, args=None) -> dict | None:
                 if not _wait_worker_paid_ready(env_path):
                     raise SystemExit("worker paid restart did not advertise paid readiness")
             except (Exception, SystemExit) as transition_error:
-                _write_private(env_path, old_env)
+                try:
+                    _write_private(env_path, old_env)
+                except (Exception, SystemExit) as restore_error:
+                    raise SystemExit(
+                        f"{transition_error}; rollback could not restore {env_path}: "
+                        f"{restore_error}"
+                    ) from transition_error
                 try:
                     _worker_installer(_sp, "restart")
                 except (Exception, SystemExit) as rollback_error:

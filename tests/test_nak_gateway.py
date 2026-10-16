@@ -192,6 +192,82 @@ def test_gateway_paid_failed_readiness_rolls_back_exact_env_and_restarts(
     assert env_path.read_bytes() == original
 
 
+def test_gateway_paid_rollback_env_write_failure_preserves_both_errors_without_restart(
+        tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    env_path = home / ".nakshatra" / "gateway.env"
+    env_path.parent.mkdir(parents=True)
+    original = (
+        b"PORT=11600\nNAKSHATRA_LEDGER_MODE=enforce\n"
+        b"NAKSHATRA_LEDGER_URL=https://ledger.test\n"
+        + f"NAKSHATRA_LEDGER_SPKI_SHA256={'ab' * 32}\n".encode()
+        + b"ODD='leave me'\n"
+    )
+    enabled = original + b'NAKSHATRA_GATEWAY_PAID="1"\n'
+    env_path.write_bytes(original)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(nak, "_paid_probe", lambda *_args: {"ready": True})
+    writes = []
+    real_write = nak._write_private
+
+    def fail_restore(path, data):
+        writes.append((path, data))
+        if len(writes) == 2:
+            raise OSError("rollback env write failed")
+        real_write(path, data)
+
+    actions = []
+
+    def fail_transition(_sp, action):
+        actions.append(action)
+        raise SystemExit("gateway transition failed")
+
+    monkeypatch.setattr(nak, "_write_private", fail_restore)
+    monkeypatch.setattr(nak, "_gateway_installer", fail_transition)
+
+    with pytest.raises(SystemExit) as raised:
+        nak._gateway_paid(object(), "on")
+
+    message = str(raised.value)
+    assert "gateway transition failed" in message
+    assert "rollback env write failed" in message
+    assert actions == ["restart"]
+    assert writes == [(env_path, enabled), (env_path, original)]
+    assert env_path.read_bytes() == enabled
+
+
+def test_gateway_paid_rollback_restart_failure_preserves_all_errors_and_env(
+        tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    env_path = home / ".nakshatra" / "gateway.env"
+    env_path.parent.mkdir(parents=True)
+    original = (
+        b"PORT=11600\nNAKSHATRA_LEDGER_MODE=enforce\n"
+        b"NAKSHATRA_LEDGER_URL=https://ledger.test\n"
+        + f"NAKSHATRA_LEDGER_SPKI_SHA256={'ab' * 32}\n".encode()
+        + b"ODD='leave me'\n"
+    )
+    env_path.write_bytes(original)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(nak, "_paid_probe", lambda *_args: {"ready": True})
+    actions = []
+
+    def fail_both(_sp, action):
+        actions.append(action)
+        raise SystemExit(f"gateway restart failure {len(actions)}")
+
+    monkeypatch.setattr(nak, "_gateway_installer", fail_both)
+
+    with pytest.raises(SystemExit) as raised:
+        nak._gateway_paid(object(), "on")
+
+    message = str(raised.value)
+    assert "gateway restart failure 1" in message
+    assert "gateway restart failure 2" in message
+    assert actions == ["restart", "restart"]
+    assert env_path.read_bytes() == original
+
+
 def test_gateway_paid_off_removes_only_gate(tmp_path, monkeypatch):
     home = tmp_path / "home"
     env_path = home / ".nakshatra" / "gateway.env"
