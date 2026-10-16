@@ -21,8 +21,10 @@ from fabric import worker_join as wj  # noqa: E402
 from sidecar_key import peer_id_from_node_pub  # noqa: E402
 
 
-PEER_ID = "12D3KooWorkerActivationPeer"
 PUBKEY = "ab" * 32
+ALT_PUBKEY = "ef" * 32
+PEER_ID = "12D3KooWorkerActivationPeer"
+PAID_PEER_ID = peer_id_from_node_pub(PUBKEY)
 SPKI = "cd" * 32
 
 
@@ -88,6 +90,32 @@ def _chain_entry():
         "layer_start": 0, "layer_end": 8,
         "peer_spki_hash": SPKI, "endpoint": _endpoint(),
     }
+
+
+def _paid_chain_entry(**updates):
+    entry = _chain_entry()
+    entry.update({
+        "node_id": PUBKEY[:14],
+        "public_key_hex": PUBKEY,
+        "endpoint": {
+            "kind": cli.ACTIVATION_ENDPOINT_KIND,
+            "peer_id": PAID_PEER_ID,
+        },
+    })
+    entry.update(updates)
+    return entry
+
+
+def _paid_peer(**updates):
+    fields = {
+        "node_id": PUBKEY[:14],
+        "endpoint": {
+            "kind": cli.ACTIVATION_ENDPOINT_KIND,
+            "peer_id": PAID_PEER_ID,
+        },
+    }
+    fields.update(updates)
+    return _peer(**fields)
 
 
 def _eligible_at(min_tier: str):
@@ -166,10 +194,8 @@ def test_chain_spki_must_match_full_node_record():
 def test_paid_pinned_projection_strictly_preserves_or_merges_spki(
         monkeypatch, chain_spki, peer_spki, expected):
     monkeypatch.setenv("STHAMBHA_PILLAR_SPKI_SHA256", "aa" * 32)
-    chain_entry = _chain_entry()
-    chain_entry["public_key_hex"] = PUBKEY
-    chain_entry["peer_spki_hash"] = chain_spki
-    peer = _peer(peer_spki_hash=peer_spki)
+    chain_entry = _paid_chain_entry(peer_spki_hash=chain_spki)
+    peer = _paid_peer(peer_spki_hash=peer_spki)
     roster = {PUBKEY: {"tier": "stranger", "tenant": "outside"}}
     with patch.object(cli, "_registry_urlopen", side_effect=_pillar_open(
             [peer], [chain_entry])):
@@ -181,11 +207,9 @@ def test_paid_pinned_projection_strictly_preserves_or_merges_spki(
 
 def test_paid_pinned_projection_rejects_conflicting_spki(monkeypatch):
     monkeypatch.setenv("STHAMBHA_PILLAR_SPKI_SHA256", "aa" * 32)
-    chain_entry = _chain_entry()
-    chain_entry["public_key_hex"] = PUBKEY
-    chain_entry["peer_spki_hash"] = "ef" * 32
+    chain_entry = _paid_chain_entry(peer_spki_hash="ef" * 32)
     with patch.object(cli, "_registry_urlopen", side_effect=_pillar_open(
-            [_peer()], [chain_entry])):
+            [_paid_peer()], [chain_entry])):
         with pytest.raises(PermissionError, match="SPKI conflicts"):
             cli.build_chain_from_registry(
                 "https://pillar", "public-model",
@@ -194,11 +218,9 @@ def test_paid_pinned_projection_rejects_conflicting_spki(monkeypatch):
 
 def test_paid_pinned_projection_rejects_when_both_spkis_missing(monkeypatch):
     monkeypatch.setenv("STHAMBHA_PILLAR_SPKI_SHA256", "aa" * 32)
-    chain_entry = _chain_entry()
-    chain_entry["public_key_hex"] = PUBKEY
-    chain_entry["peer_spki_hash"] = ""
+    chain_entry = _paid_chain_entry(peer_spki_hash="")
     with patch.object(cli, "_registry_urlopen", side_effect=_pillar_open(
-            [_peer(peer_spki_hash="")], [chain_entry])):
+            [_paid_peer(peer_spki_hash="")], [chain_entry])):
         with pytest.raises(PermissionError, match="neither chain nor /peers.*re-register"):
             cli.build_chain_from_registry(
                 "https://pillar", "public-model",
@@ -208,18 +230,66 @@ def test_paid_pinned_projection_rejects_when_both_spkis_missing(monkeypatch):
 def test_paid_pinned_projection_rejects_identity_or_endpoint_disagreement(
         monkeypatch):
     monkeypatch.setenv("STHAMBHA_PILLAR_SPKI_SHA256", "aa" * 32)
-    chain_entry = _chain_entry()
-    chain_entry["public_key_hex"] = PUBKEY
-    mismatched = _peer(endpoint={
+    chain_entry = _paid_chain_entry()
+    mismatched = _paid_peer(endpoint={
         "kind": cli.ACTIVATION_ENDPOINT_KIND,
         "peer_id": "12D3KooDifferentWorker",
     })
     with patch.object(cli, "_registry_urlopen", side_effect=_pillar_open(
             [mismatched], [chain_entry])):
-        with pytest.raises(PermissionError, match="PeerId disagrees"):
+        with pytest.raises(PermissionError, match="PeerId does not match"):
             cli.build_chain_from_registry(
                 "https://pillar", "public-model",
                 strict_pinned_projection=True)
+
+
+def test_paid_pinned_projection_rejects_missing_chain_public_key():
+    chain_entry = _paid_chain_entry()
+    chain_entry.pop("public_key_hex")
+
+    with pytest.raises(
+            PermissionError, match="chain worker has no full Ed25519 public key"):
+        cli._merge_paid_pillar_projection([chain_entry], [_paid_peer()])
+
+
+def test_paid_pinned_projection_rejects_node_id_not_key_prefix():
+    chain_entry = _paid_chain_entry(node_id=ALT_PUBKEY[:14])
+
+    with pytest.raises(PermissionError, match="not a prefix"):
+        cli._merge_paid_pillar_projection([chain_entry], [])
+
+
+def test_paid_pinned_projection_rejects_endpoint_not_derived_from_key():
+    chain_entry = _paid_chain_entry(endpoint={
+        "kind": cli.ACTIVATION_ENDPOINT_KIND,
+        "peer_id": peer_id_from_node_pub(ALT_PUBKEY),
+    })
+
+    with pytest.raises(PermissionError, match="PeerId does not match"):
+        cli._merge_paid_pillar_projection([chain_entry], [])
+
+
+def test_paid_pinned_projection_cross_checks_peer_key():
+    chain_entry = _paid_chain_entry()
+    peer = _paid_peer(
+        public_key_hex=ALT_PUBKEY,
+        endpoint={
+            "kind": cli.ACTIVATION_ENDPOINT_KIND,
+            "peer_id": peer_id_from_node_pub(ALT_PUBKEY),
+        },
+    )
+
+    with pytest.raises(PermissionError, match="public key disagrees"):
+        cli._merge_paid_pillar_projection([chain_entry], [peer])
+
+
+def test_paid_pinned_projection_accepts_complete_chain_without_peer_row():
+    chain_entry = _paid_chain_entry()
+
+    cli._merge_paid_pillar_projection([chain_entry], [])
+
+    assert chain_entry["public_key_hex"] == PUBKEY
+    assert chain_entry["peer_spki_hash"] == SPKI
 
 
 @pytest.mark.parametrize("url", [
