@@ -1042,12 +1042,12 @@ def _paid_chain_identity(record: dict, label: str) -> tuple[str, str, dict | Non
             "chain worker has no full Ed25519 public key"
         )
 
-    node_id = str(record.get("node_id") or "").strip().lower()
-    if node_id and (re.fullmatch(r"[0-9a-f]{12,64}", node_id) is None
-                    or not key.startswith(node_id)):
+    raw_node_id = record.get("node_id")
+    node_id = raw_node_id if isinstance(raw_node_id, str) else ""
+    if not node_id.strip():
         raise PermissionError(
-            f"paid SPKI enrichment refused for {label!r}: node identity "
-            "is not a prefix of the worker public key"
+            f"paid SPKI enrichment refused for {label!r}: chain worker "
+            "has no nonempty node_id"
         )
 
     try:
@@ -1074,17 +1074,17 @@ def _merge_paid_pillar_projection(workers: list[dict], peers: list[dict], *,
 
     The caller owns transport authentication and Pillar SPKI pinning. This
     function owns the cross-projection join. The signed ``/chain`` hop's full
-    worker key is primary and must bind its node-id prefix and activation
-    PeerId. A matching ``/peers`` row is an additional pinned cross-check;
-    its absence does not erase a complete chain hop. Only reachability and TLS
-    SPKI are imported; roster trust tier and placement remain untouched.
-    There is deliberately no address-keyed or TOFU path.
+    worker key is primary. A node id equal to that key is self-authenticating;
+    every other node id requires one exact ``/peers`` row with the same key,
+    node id, and activation endpoint. Only reachability and TLS SPKI are
+    imported; roster trust tier and placement remain untouched. There is
+    deliberately no address-keyed, prefix, or TOFU path.
     """
     by_key: dict[str, list[dict]] = {}
     by_node: dict[str, list[dict]] = {}
     for peer in peers:
-        node_id = str(peer.get("node_id") or peer.get("id") or "").strip().lower()
-        if node_id:
+        node_id = peer.get("node_id")
+        if isinstance(node_id, str) and node_id.strip():
             by_node.setdefault(node_id, []).append(peer)
         key = _paid_worker_key(peer)
         if key:
@@ -1094,11 +1094,16 @@ def _merge_paid_pillar_projection(workers: list[dict], peers: list[dict], *,
         label = str(worker.get("node_id") or worker.get("id") or "<unknown>")
         key, worker_node, worker_endpoint = _paid_chain_identity(worker, label)
         matches = by_key.get(key, [])
-        node_matches = by_node.get(worker_node, []) if worker_node else []
+        node_matches = by_node.get(worker_node, [])
         if len(matches) > 1 or len(node_matches) > 1:
             raise PermissionError(
                 f"paid SPKI enrichment refused for {label!r}: worker key is "
                 "ambiguous in the pinned Pillar /peers projection"
+            )
+        if matches and node_matches and matches[0] is not node_matches[0]:
+            raise PermissionError(
+                f"paid SPKI enrichment refused for {label!r}: worker identity "
+                "selects different rows in the pinned Pillar /peers projection"
             )
         if node_matches and _paid_worker_key(node_matches[0]) != key:
             raise PermissionError(
@@ -1106,6 +1111,7 @@ def _merge_paid_pillar_projection(workers: list[dict], peers: list[dict], *,
                 "key disagrees between chain and /peers"
             )
         peer = matches[0] if matches else (node_matches[0] if node_matches else None)
+        canonical_node = worker_node == key
 
         worker_raw_spki = str(worker.get("peer_spki_hash") or "").strip()
         worker_spki = _sanitize_spki(worker_raw_spki)
@@ -1116,6 +1122,12 @@ def _merge_paid_pillar_projection(workers: list[dict], peers: list[dict], *,
             )
 
         if peer is None:
+            if not canonical_node:
+                raise PermissionError(
+                    f"paid SPKI enrichment refused for {label!r}: noncanonical "
+                    "node_id requires an exact pinned /peers row with the same "
+                    "public key, node_id, and endpoint"
+                )
             if not worker_spki:
                 raise PermissionError(
                     f"paid SPKI enrichment refused for {label!r}: neither chain "
@@ -1131,24 +1143,17 @@ def _merge_paid_pillar_projection(workers: list[dict], peers: list[dict], *,
                 f"paid SPKI enrichment refused for {label!r}: worker public "
                 "key disagrees between chain and /peers"
             )
-        if not peer_node:
-            raise PermissionError(
-                f"paid SPKI enrichment refused for {label!r}: pinned Pillar "
-                "peer has no node identity"
-            )
-        if worker_node and worker_node != peer_node:
+        if worker_node != peer_node:
             raise PermissionError(
                 f"paid SPKI enrichment refused for {label!r}: node identity "
                 "disagrees between chain and /peers"
             )
 
-        if worker_endpoint is not None:
-            if (peer_endpoint is None
-                    or worker_endpoint["peer_id"] != peer_endpoint["peer_id"]):
-                raise PermissionError(
-                    f"paid SPKI enrichment refused for {label!r}: activation "
-                    "PeerId disagrees between chain and /peers"
-                )
+        if worker_endpoint != peer_endpoint:
+            raise PermissionError(
+                f"paid SPKI enrichment refused for {label!r}: activation "
+                "endpoint disagrees between chain and /peers"
+            )
 
         peer_raw_spki = str(peer.get("peer_spki_hash") or "").strip()
         peer_spki = _sanitize_spki(peer_raw_spki)

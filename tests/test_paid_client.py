@@ -615,9 +615,12 @@ def test_paid_from_roster_keeps_local_authority_and_enriches_pillar_transport(
     source = tmp_path / "roster-chain.yaml"
     source.write_text(
         "model: {id: model}\nworkers:\n"
-        f"  - id: local-roster-name\n    public_key_hex: {KEY1}\n"
+        f"  - id: local-roster-name\n    node_id: local-roster-name\n"
+        f"    public_key_hex: {KEY1}\n"
         "    peer_spki_hash: ''\n"
         "    address: stale.local\n    port: 1\n"
+        f"    endpoint: {{kind: {client.ACTIVATION_ENDPOINT_KIND}, "
+        f"peer_id: {peer_id_from_node_pub(KEY1)}}}\n"
         "    layer_range: [0, 2]\n    mode: solo\n"
     )
     endpoint = {
@@ -625,7 +628,7 @@ def test_paid_from_roster_keeps_local_authority_and_enriches_pillar_transport(
         "peer_id": peer_id_from_node_pub(KEY1),
     }
     peer = {
-        "node_id": KEY1[:14],
+        "node_id": "local-roster-name",
         "public_key_hex": KEY1,
         "peer_spki_hash": SPKI1,
         "address": "fresh.example:5540",
@@ -653,7 +656,7 @@ def test_paid_from_roster_keeps_local_authority_and_enriches_pillar_transport(
     assert worker["id"] == "local-roster-name"
     assert worker["public_key_hex"] == KEY1
     assert "tier" not in worker
-    assert worker["node_id"] == KEY1[:14]
+    assert worker["node_id"] == "local-roster-name"
     assert worker["endpoint"] == endpoint
     assert worker["peer_spki_hash"] == SPKI1
     assert (worker["address"], worker["port"]) == ("fresh.example", 5540)

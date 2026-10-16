@@ -95,7 +95,7 @@ def _chain_entry():
 def _paid_chain_entry(**updates):
     entry = _chain_entry()
     entry.update({
-        "node_id": PUBKEY[:14],
+        "node_id": PUBKEY,
         "public_key_hex": PUBKEY,
         "endpoint": {
             "kind": cli.ACTIVATION_ENDPOINT_KIND,
@@ -108,7 +108,7 @@ def _paid_chain_entry(**updates):
 
 def _paid_peer(**updates):
     fields = {
-        "node_id": PUBKEY[:14],
+        "node_id": PUBKEY,
         "endpoint": {
             "kind": cli.ACTIVATION_ENDPOINT_KIND,
             "peer_id": PAID_PEER_ID,
@@ -252,10 +252,18 @@ def test_paid_pinned_projection_rejects_missing_chain_public_key():
         cli._merge_paid_pillar_projection([chain_entry], [_paid_peer()])
 
 
-def test_paid_pinned_projection_rejects_node_id_not_key_prefix():
-    chain_entry = _paid_chain_entry(node_id=ALT_PUBKEY[:14])
+def test_paid_pinned_projection_rejects_shortened_key_without_peer_row():
+    chain_entry = _paid_chain_entry(node_id=PUBKEY[:12])
 
-    with pytest.raises(PermissionError, match="not a prefix"):
+    with pytest.raises(
+            PermissionError, match="noncanonical node_id requires an exact"):
+        cli._merge_paid_pillar_projection([chain_entry], [])
+
+
+def test_paid_pinned_projection_rejects_empty_node_id():
+    chain_entry = _paid_chain_entry(node_id="")
+
+    with pytest.raises(PermissionError, match="has no nonempty node_id"):
         cli._merge_paid_pillar_projection([chain_entry], [])
 
 
@@ -290,6 +298,47 @@ def test_paid_pinned_projection_accepts_complete_chain_without_peer_row():
 
     assert chain_entry["public_key_hex"] == PUBKEY
     assert chain_entry["peer_spki_hash"] == SPKI
+
+
+def test_paid_pinned_projection_accepts_noncanonical_node_with_exact_peer_row():
+    chain_entry = _paid_chain_entry(node_id="worker-friendly")
+    peer = _paid_peer(node_id="worker-friendly")
+
+    cli._merge_paid_pillar_projection([chain_entry], [peer])
+
+    assert chain_entry["public_key_hex"] == PUBKEY
+    assert chain_entry["node_id"] == "worker-friendly"
+
+
+@pytest.mark.parametrize(
+    "peer",
+    [
+        _paid_peer(node_id="different-worker"),
+        _paid_peer(
+            node_id="worker-friendly",
+            endpoint={
+                "kind": cli.ACTIVATION_ENDPOINT_KIND,
+                "peer_id": PAID_PEER_ID,
+                "addrs": ["/ip4/192.0.2.1/tcp/1234"],
+            },
+        ),
+        _paid_peer(
+            node_id="worker-friendly",
+            public_key_hex=ALT_PUBKEY,
+            endpoint={
+                "kind": cli.ACTIVATION_ENDPOINT_KIND,
+                "peer_id": peer_id_from_node_pub(ALT_PUBKEY),
+            },
+        ),
+    ],
+    ids=["node-id", "endpoint", "public-key"],
+)
+def test_paid_pinned_projection_rejects_noncanonical_node_with_mismatched_peer(
+        peer):
+    chain_entry = _paid_chain_entry(node_id="worker-friendly")
+
+    with pytest.raises(PermissionError):
+        cli._merge_paid_pillar_projection([chain_entry], [peer])
 
 
 @pytest.mark.parametrize("url", [
