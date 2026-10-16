@@ -646,6 +646,120 @@ def test_worker_launcher_passes_idle_unload_and_defaults_old_env_to_600(
     assert worker_service.worker_command(args)[1]["NAKSHATRA_WORKER_WARM_DIRECTIVES"] == "0"
 
 
+def test_worker_launcher_paid_argv_goldens_off_on_and_off_again(tmp_path, monkeypatch):
+    root = tmp_path / "worker"
+    daemon = root / "daemon"
+    daemon.parent.mkdir(parents=True)
+    daemon.write_text("binary")
+    daemon.chmod(0o755)
+    build = root / "build.json"
+    build.write_text(json.dumps({"daemon_bin": str(daemon), "backend": "cpu",
+                                 "n_gpu_layers": 0, "engine_tree": TREE}))
+    base = tmp_path / "BASE"
+    base.write_text(f"TREE={TREE}\n")
+    worker_script = tmp_path / "worker.py"
+    worker_script.write_text("# release worker\n")
+    key = tmp_path / "worker.ed25519"
+    key.write_bytes(ed25519.Ed25519PrivateKey.generate().private_bytes_raw())
+    key.chmod(0o600)
+    args = SimpleNamespace(
+        build_json=build, engine_base=base, worker_root=root,
+        worker_script=worker_script, node_key=key, p2p_opt_in=None,
+        port=5530, sub_gguf=root / "slice.gguf", mode="first",
+        layer_start=0, layer_end=1, model_id="qwen", n_ctx=2048,
+    )
+    monkeypatch.setenv("PILLAR_URL", "https://pillar.test")
+    monkeypatch.setenv("PILLAR_SPKI_SHA256", "ab" * 32)
+    monkeypatch.setenv("PACKAGE_URL", "https://models.test/qwen")
+    monkeypatch.setenv("PACKAGE_TRUSTED_PUBKEY", "cd" * 32)
+    for name in worker_service._PAID_ENV_NAMES:
+        monkeypatch.delenv(name, raising=False)
+
+    off_argv, off_env = worker_service.worker_command(args)
+    assert not any(arg.startswith("--paid-") for arg in off_argv)
+    assert all(name not in off_env for name in worker_service._PAID_ENV_NAMES)
+
+    monkeypatch.setenv("NAKSHATRA_PAID_ADMISSION", "1")
+    monkeypatch.setenv("NAKSHATRA_PAID_LEDGER_URL", "https://ledger.test/api")
+    monkeypatch.setenv("NAKSHATRA_PAID_LEDGER_SPKI_SHA256", "ef" * 32)
+    on_argv, on_env = worker_service.worker_command(args)
+    assert on_argv == off_argv + [
+        "--paid-admission",
+        "--paid-ledger-url", "https://ledger.test/api",
+        "--paid-ledger-spki-sha256", "ef" * 32,
+        "--paid-store", str(root.resolve() / "paid.sqlite"),
+    ]
+    assert all(name not in on_env for name in worker_service._PAID_ENV_NAMES)
+
+    monkeypatch.delenv("NAKSHATRA_PAID_ADMISSION")
+    assert worker_service.worker_command(args)[0] == off_argv
+
+
+def test_worker_paid_preflight_failure_leaves_env_untouched(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    env_path = home / ".nakshatra" / "worker.env"
+    env_path.parent.mkdir(parents=True)
+    original = b"PORT=5530\n# preserve exactly\n"
+    env_path.write_bytes(original)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(
+        nak, "_paid_probe", lambda *_args: (_ for _ in ()).throw(SystemExit("probe failed")))
+    monkeypatch.setattr(nak, "_worker_installer", lambda *_args: pytest.fail("must not restart"))
+    args = SimpleNamespace(
+        ledger_url="https://ledger.test", ledger_spki="ab" * 32, store=None)
+
+    with pytest.raises(SystemExit, match="probe failed"):
+        nak._worker_paid(object(), "on", args)
+
+    assert env_path.read_bytes() == original
+
+
+def test_worker_paid_failed_readiness_rolls_back_exact_env_and_restarts(
+        tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    env_path = home / ".nakshatra" / "worker.env"
+    env_path.parent.mkdir(parents=True)
+    original = b"PORT=5530\nODD='leave me'\n"
+    env_path.write_bytes(original)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(nak, "_paid_probe", lambda *_args: {"ready": True})
+    monkeypatch.setattr(nak, "_wait_worker_paid_ready", lambda *_args: False)
+    actions = []
+    monkeypatch.setattr(nak, "_worker_installer", lambda _sp, action: actions.append(action))
+    args = SimpleNamespace(
+        ledger_url="https://ledger.test", ledger_spki="ab" * 32,
+        store=home / ".nakshatra" / "worker" / "paid.sqlite")
+
+    with pytest.raises(SystemExit, match="did not advertise paid readiness"):
+        nak._worker_paid(object(), "on", args)
+
+    assert actions == ["restart", "restart"]
+    assert env_path.read_bytes() == original
+    assert (home / ".nakshatra" / "worker" / "paid.sqlite").stat().st_mode & 0o777 == 0o600
+
+
+def test_worker_paid_off_removes_only_gate_and_restores_legacy_launcher_argv(
+        tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    env_path = home / ".nakshatra" / "worker.env"
+    env_path.parent.mkdir(parents=True)
+    env_path.write_text(
+        "PORT=5530\n"
+        "NAKSHATRA_PAID_ADMISSION=1\n"
+        "NAKSHATRA_PAID_LEDGER_URL=\"https://ledger.test\"\n"
+        f"NAKSHATRA_PAID_LEDGER_SPKI_SHA256={'ab' * 32}\n"
+        f"NAKSHATRA_PAID_STORE={home / '.nakshatra' / 'worker' / 'paid.sqlite'}\n"
+        "KEEP=exact\n")
+    monkeypatch.setenv("HOME", str(home))
+    actions = []
+    monkeypatch.setattr(nak, "_worker_installer", lambda _sp, action: actions.append(action))
+
+    nak._worker_paid(object(), "off")
+
+    assert env_path.read_bytes() == b"PORT=5530\nKEEP=exact\n"
+    assert actions == ["restart"]
+
+
 def test_worker_launcher_validates_and_passes_owner_lease(tmp_path, monkeypatch):
     root = tmp_path / "worker"
     daemon = root / "daemon"

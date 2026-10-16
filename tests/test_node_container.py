@@ -433,6 +433,27 @@ def test_gateway_on_uses_fixed_internal_endpoint_and_explicit_lan_ack(tmp_path):
     ]
 
 
+@pytest.mark.parametrize(("args", "expected"), [
+    (("gateway", "paid", "on"), ["nak", "gateway", "paid", "on"]),
+    (("gateway", "paid", "off"), ["nak", "gateway", "paid", "off"]),
+    (("worker", "paid", "on", "--ledger-url", "https://ledger.test",
+      "--ledger-spki", "ab" * 32),
+     ["nak", "worker", "paid", "on", "--ledger-url", "https://ledger.test",
+      "--ledger-spki", "ab" * 32]),
+    (("worker", "paid", "off"), ["nak", "worker", "paid", "off"]),
+])
+def test_nakc_paid_commands_pass_through_without_role_reconfiguration(
+        tmp_path, args, expected):
+    result = _nakc(tmp_path, *args)
+    assert result.returncode == 0, result.stderr
+    exec_lines = [line for line in result.stdout.splitlines()
+                  if line.startswith("+ docker exec ")]
+    assert shlex.split(exec_lines[-1].removeprefix("+ ")) == [
+        "docker", "exec", "-i", "nakshatra-node", *expected]
+    assert not (tmp_path / "config" / "gateway-on").exists()
+    assert not (tmp_path / "config" / "worker-port").exists()
+
+
 def test_gateway_p2p_port_is_configurable_and_persisted(tmp_path):
     enabled = _nakc(tmp_path, "gateway", "on", NAKC_P2P_PORT="24001")
     assert enabled.returncode == 0, enabled.stderr

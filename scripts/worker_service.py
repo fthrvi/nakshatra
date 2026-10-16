@@ -25,6 +25,12 @@ class WorkerServiceError(RuntimeError):
 
 DEFAULT_TRUSTED_PILLAR_NETS = "10.42.0.0/24"
 _SPKI_RE = re.compile(r"[0-9a-fA-F]{64}")
+_PAID_ENV_NAMES = (
+    "NAKSHATRA_PAID_ADMISSION",
+    "NAKSHATRA_PAID_LEDGER_URL",
+    "NAKSHATRA_PAID_LEDGER_SPKI_SHA256",
+    "NAKSHATRA_PAID_STORE",
+)
 
 
 def validate_pillar_transport(
@@ -253,6 +259,30 @@ def worker_command(args) -> tuple[list[str], dict[str, str]]:
         "--no-file-server",
         "--package-trusted-pubkey", package_pubkey,
     ]
+    paid_enabled = os.environ.get("NAKSHATRA_PAID_ADMISSION", "").strip() == "1"
+    if paid_enabled:
+        paid_url = os.environ.get("NAKSHATRA_PAID_LEDGER_URL", "").strip()
+        paid_pin = os.environ.get("NAKSHATRA_PAID_LEDGER_SPKI_SHA256", "").strip().lower()
+        paid_store = os.environ.get("NAKSHATRA_PAID_STORE", "").strip()
+        if not paid_store:
+            paid_store = str(worker_root / "paid.sqlite")
+        if not paid_url.startswith("https://"):
+            raise WorkerServiceError(
+                "NAKSHATRA_PAID_LEDGER_URL must use HTTPS when paid admission is enabled"
+            )
+        if not re.fullmatch(r"[0-9a-f]{64}", paid_pin):
+            raise WorkerServiceError(
+                "NAKSHATRA_PAID_LEDGER_SPKI_SHA256 must be 64 lowercase hexadecimal characters"
+            )
+        paid_path = Path(paid_store).expanduser()
+        if not paid_path.is_absolute():
+            raise WorkerServiceError("NAKSHATRA_PAID_STORE must be an absolute path")
+        command.extend([
+            "--paid-admission",
+            "--paid-ledger-url", paid_url,
+            "--paid-ledger-spki-sha256", paid_pin,
+            "--paid-store", str(paid_path),
+        ])
     env = dict(
         os.environ,
         NAKSHATRA_NODE_ID=node_id,
@@ -276,6 +306,11 @@ def worker_command(args) -> tuple[list[str], dict[str, str]]:
     ):
         env.pop(name, None)
     env.update(owner_values)
+    # These variables are launcher inputs only. worker.py receives the complete
+    # paid configuration as argv, so do not leave a second ambient authority
+    # path (or expose it through a child environment dump).
+    for name in _PAID_ENV_NAMES:
+        env.pop(name, None)
     # Never trust an ambient PeerId.  The endpoint is advertised only while
     # this node has opted into the release-managed sidecar, and is derived
     # from the same node key that signs the worker's pillar registration.

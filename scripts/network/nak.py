@@ -352,6 +352,13 @@ GATEWAY_PROFILE = "inference.env"
 GATEWAY_PROFILE_OWNER = "inference-profile-created"
 GATEWAY_P2P_OWNER = "p2p-profile-created"
 GATEWAY_PROFILE_OWNER_PREFIX = "# nak-gateway-owned: "
+WORKER_PAID_ENV = (
+    "NAKSHATRA_PAID_ADMISSION",
+    "NAKSHATRA_PAID_LEDGER_URL",
+    "NAKSHATRA_PAID_LEDGER_SPKI_SHA256",
+    "NAKSHATRA_PAID_STORE",
+)
+GATEWAY_PAID_ENV = "NAKSHATRA_GATEWAY_PAID"
 
 
 def _gateway_paths() -> tuple[Path, Path]:
@@ -498,6 +505,24 @@ def _gateway_values() -> dict[str, str]:
     return values
 
 
+def _env_file_values(path: Path) -> dict[str, str]:
+    values = {}
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return values
+    for line in lines:
+        assignment = _env_assignment(line)
+        if assignment is not None:
+            key, value = assignment
+            try:
+                parsed = shlex.split(value, posix=True)
+            except ValueError:
+                parsed = []
+            values[key] = parsed[0] if len(parsed) == 1 else value.strip().strip("\"'")
+    return values
+
+
 def _gateway_package_defaults() -> tuple[str, str]:
     """Load an untrusted package location and an optional prior local narrowing."""
     standing = Path.home() / ".nakshatra" / "consumer-standing.json"
@@ -598,6 +623,144 @@ def _bare_http_url(value: str, name: str, *, allow_path: bool = False) -> str:
         kind = "base URL without credentials, query, or fragment" if allow_path else "bare origin"
         raise SystemExit(f"--{name} must be an http(s) {kind}")
     return value.rstrip("/")
+
+
+def _paid_probe(ledger_url: str, ledger_spki: str) -> dict:
+    """Run the authenticated claim-capability probe used by worker.py itself."""
+    ledger = _bare_http_url(ledger_url, "ledger-url", allow_path=True)
+    if urlsplit(ledger).scheme != "https":
+        raise SystemExit("paid admission requires an https --ledger-url")
+    pin = (ledger_spki or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", pin):
+        raise SystemExit("--ledger-spki must be a 64-character SHA-256 hex digest")
+    try:
+        from nakshatra_auth import load_worker_key
+        from paid_admission import SpendLedgerClient
+        private, keyid = load_worker_key(
+            Path.home() / ".nakshatra" / "keys" / "worker.ed25519")
+        return SpendLedgerClient(ledger, pin, private, keyid).probe()
+    except Exception as exc:
+        raise SystemExit(f"paid admission preflight failed: {exc}") from exc
+
+
+def _paid_store_preflight(path: Path) -> Path:
+    """Open, recover-check, and leave the durable paid store owner-only."""
+    path = path.expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    try:
+        from paid_admission import PaidAdmissionStore
+        store = PaidAdmissionStore(path)
+        store.close()
+        metadata = path.stat()
+    except Exception as exc:
+        raise SystemExit(f"paid store preflight failed for {path}: {exc}") from exc
+    if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o600:
+        raise SystemExit(f"paid store preflight failed for {path}: store is not a 0600 regular file")
+    return path
+
+
+def _replace_env_assignments(path: Path, updates: dict[str, str | None]) -> None:
+    """Atomically replace selected assignments while preserving every unrelated byte."""
+    try:
+        body = path.read_bytes()
+    except OSError as exc:
+        raise SystemExit(f"cannot update {path}: {exc}") from exc
+    kept = []
+    for line in body.splitlines(keepends=True):
+        try:
+            assignment = _env_assignment(line.decode())
+        except UnicodeDecodeError:
+            assignment = None
+        if assignment is None or assignment[0] not in updates:
+            kept.append(line)
+    result = b"".join(kept)
+    additions = []
+    for name, value in updates.items():
+        if value is not None:
+            if not value or any(c in value for c in "\r\n\0"):
+                raise SystemExit(f"{name} must be one non-empty environment-file value")
+            quoted = '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+            additions.append(f"{name}={quoted}\n".encode())
+    if additions and result and not result.endswith((b"\n", b"\r")):
+        result += b"\n"
+    _write_private(path, result + b"".join(additions))
+
+
+def _worker_paid_info(env_path: Path, timeout_s: float = 3.0):
+    """Return local worker Info over its real gRPC transport, or raise."""
+    import grpc
+    import nakshatra_pb2 as pb
+    import nakshatra_pb2_grpc as pbg
+
+    values = _env_file_values(env_path)
+    port = _worker_port(env_path)
+    listen = values.get("LISTEN", "[::]").strip()
+    if listen in {"0.0.0.0", "*"}:
+        host = "127.0.0.1"
+    elif listen in {"[::]", "::"}:
+        host = "[::1]"
+    elif listen.startswith("[") and listen.endswith("]"):
+        host = listen
+    elif ":" in listen:
+        host = f"[{listen}]"
+    else:
+        host = listen
+    target = f"{host}:{port}"
+    try:
+        with grpc.insecure_channel(target) as channel:
+            return pbg.NakshatraStub(channel).Info(pb.InfoRequest(), timeout=timeout_s)
+    except Exception:
+        cert = Path.home() / ".nakshatra" / "tls" / "worker-cert.pem"
+        roots = cert.read_bytes()
+        credentials = grpc.ssl_channel_credentials(root_certificates=roots)
+        with grpc.secure_channel(
+                target, credentials,
+                options=[("grpc.ssl_target_name_override", "nakshatra.local")]) as channel:
+            return pbg.NakshatraStub(channel).Info(pb.InfoRequest(), timeout=timeout_s)
+
+
+def _wait_worker_paid_ready(env_path: Path, timeout_s: float = 90.0) -> bool:
+    from paid_admission import PAID_CAPABILITIES
+    deadline = time.monotonic() + timeout_s
+    while True:
+        try:
+            info = _worker_paid_info(env_path)
+            if set(PAID_CAPABILITIES) <= set(info.protocol_capabilities):
+                return True
+        except Exception:
+            pass
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.25)
+
+
+def _gateway_probe_url(env_path: Path) -> str:
+    values = _env_file_values(env_path)
+    bind = values.get("BIND", "127.0.0.1")
+    port = values.get("PORT", "11600")
+    if bind in {"0.0.0.0", "*"}:
+        bind = "127.0.0.1"
+    elif bind in {"::", "[::]"}:
+        bind = "[::1]"
+    elif ":" in bind and not bind.startswith("["):
+        bind = f"[{bind}]"
+    return f"http://{bind}:{port}/v1/models"
+
+
+def _wait_gateway_ready(env_path: Path, timeout_s: float = 30.0) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while True:
+        try:
+            with urlopen(_gateway_probe_url(env_path), timeout=2.0) as response:
+                value = json.loads(response.read().decode())
+            if isinstance(value, dict) and isinstance(value.get("data"), list):
+                return True
+        except Exception:
+            pass
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.25)
 
 
 def _loopback_bind(value: str) -> bool:
@@ -837,6 +1000,56 @@ def _gateway_off(_sp) -> None:
     print("gateway OFF")
 
 
+def _gateway_paid(_sp, action: str) -> dict | None:
+    _root, env_path = _gateway_paths()
+    if action == "status":
+        values = _env_file_values(env_path)
+        return {
+            "enabled": values.get(GATEWAY_PAID_ENV) == "1",
+            "configured": env_path.is_file(),
+            "ledger_mode": values.get("NAKSHATRA_LEDGER_MODE"),
+            "ledger_url": values.get("NAKSHATRA_LEDGER_URL"),
+        }
+    with _p2p_ownership_lock():
+        if not env_path.is_file():
+            raise SystemExit("gateway paid mode needs a configured gateway; run `nak gateway on` first")
+        old_env = env_path.read_bytes()
+        values = _env_file_values(env_path)
+        if action == "on":
+            if values.get("NAKSHATRA_LEDGER_MODE") != "enforce":
+                raise SystemExit("gateway paid mode requires NAKSHATRA_LEDGER_MODE=enforce")
+            _paid_probe(
+                values.get("NAKSHATRA_LEDGER_URL", ""),
+                values.get("NAKSHATRA_LEDGER_SPKI_SHA256", ""),
+            )
+            _replace_env_assignments(env_path, {GATEWAY_PAID_ENV: "1"})
+            try:
+                _gateway_installer(_sp, "restart")
+                if not _wait_gateway_ready(env_path):
+                    raise SystemExit("gateway paid restart did not become ready")
+            except (Exception, SystemExit) as transition_error:
+                _write_private(env_path, old_env)
+                try:
+                    _gateway_installer(_sp, "restart")
+                except (Exception, SystemExit) as rollback_error:
+                    raise SystemExit(
+                        f"{transition_error}; rollback could not restart {GATEWAY_SERVICE}: "
+                        f"{rollback_error}"
+                    ) from transition_error
+                raise
+            print("gateway paid ON")
+            return None
+
+        changed = values.get(GATEWAY_PAID_ENV) == "1"
+        _replace_env_assignments(env_path, {GATEWAY_PAID_ENV: None})
+        if changed:
+            # Fail safe: the on-disk routing gate remains off even if this
+            # restart fails. A later service recovery therefore comes up legacy.
+            _gateway_installer(_sp, "restart")
+        print("gateway paid OFF")
+        return None
+
+
 def _gateway_status(_sp) -> dict:
     _root, env_path = _gateway_paths()
     values = _gateway_values()
@@ -854,7 +1067,8 @@ def _gateway_status(_sp) -> dict:
         "bind": values.get("BIND"), "port": int(values["PORT"]) if values.get("PORT", "").isdigit() else None,
         "models": values.get("MODELS"), "pillar_url": values.get("NAKSHATRA_PILLAR_URL"),
         "ledger_url": values.get("NAKSHATRA_LEDGER_URL"),
-        "ledger_mode": values.get("NAKSHATRA_LEDGER_MODE"), "unit": unit,
+        "ledger_mode": values.get("NAKSHATRA_LEDGER_MODE"),
+        "paid_admission": values.get(GATEWAY_PAID_ENV) == "1", "unit": unit,
     }
 
 
@@ -1303,13 +1517,96 @@ def _worker_status(_sp) -> dict:
             unit[prop] = (result.stdout or "").strip() or ("yes" if result.returncode == 0 else "no")
         except OSError as e:
             unit[prop] = f"unavailable: {e}"
+    paid_values = _env_file_values(env_path)
     return {
         "configured": env_path.exists(),
         "allow_relayed_activation": _worker_relay_enabled(env_path),
+        "paid_admission": paid_values.get("NAKSHATRA_PAID_ADMISSION") == "1",
+        "paid_ledger_url": paid_values.get("NAKSHATRA_PAID_LEDGER_URL"),
+        "paid_store": paid_values.get("NAKSHATRA_PAID_STORE"),
         "build_state": build_state,
         "build": build,
         "unit": unit,
     }
+
+
+def _worker_paid(_sp, action: str, args=None) -> dict | None:
+    root, _record, env_path = _worker_paths()
+    if action == "status":
+        values = _env_file_values(env_path)
+        store = values.get("NAKSHATRA_PAID_STORE")
+        if values.get("NAKSHATRA_PAID_ADMISSION") == "1" and not store:
+            store = str(root / "paid.sqlite")
+        owner_only = False
+        if store:
+            try:
+                metadata = Path(store).lstat()
+                owner_only = (
+                    stat.S_ISREG(metadata.st_mode)
+                    and metadata.st_uid == os.geteuid()
+                    and stat.S_IMODE(metadata.st_mode) == 0o600
+                )
+            except OSError:
+                pass
+        return {
+            "enabled": values.get("NAKSHATRA_PAID_ADMISSION") == "1",
+            "configured": env_path.is_file(),
+            "ledger_url": values.get("NAKSHATRA_PAID_LEDGER_URL"),
+            "store": store,
+            "store_owner_only": owner_only,
+        }
+    with _p2p_ownership_lock():
+        if not env_path.is_file():
+            raise SystemExit("worker paid mode needs a configured worker; run `nak worker on` first")
+        old_env = env_path.read_bytes()
+        values = _env_file_values(env_path)
+        if action == "on":
+            ledger = _bare_http_url(args.ledger_url, "ledger-url", allow_path=True)
+            pin = (args.ledger_spki or "").strip().lower()
+            store_arg = args.store or (root / "paid.sqlite")
+            _paid_probe(ledger, pin)
+            store_path = Path(store_arg).expanduser()
+            if not store_path.is_absolute():
+                store_path = Path.cwd() / store_path
+            store_path = Path(os.path.abspath(store_path))
+            worker_root = root.resolve()
+            if (not store_path.is_relative_to(worker_root)
+                    or not store_path.parent.resolve().is_relative_to(worker_root)):
+                raise SystemExit(
+                    f"--store must be inside {root} (the signed worker unit's writable root)"
+                )
+            store = _paid_store_preflight(store_path)
+            _replace_env_assignments(env_path, {
+                "NAKSHATRA_PAID_ADMISSION": "1",
+                "NAKSHATRA_PAID_LEDGER_URL": ledger,
+                "NAKSHATRA_PAID_LEDGER_SPKI_SHA256": pin,
+                "NAKSHATRA_PAID_STORE": str(store),
+            })
+            try:
+                _worker_installer(_sp, "restart")
+                if not _wait_worker_paid_ready(env_path):
+                    raise SystemExit("worker paid restart did not advertise paid readiness")
+            except (Exception, SystemExit) as transition_error:
+                _write_private(env_path, old_env)
+                try:
+                    _worker_installer(_sp, "restart")
+                except (Exception, SystemExit) as rollback_error:
+                    raise SystemExit(
+                        f"{transition_error}; rollback could not restart {WORKER_SERVICE}: "
+                        f"{rollback_error}"
+                    ) from transition_error
+                raise
+            print("worker paid ON")
+            return None
+
+        changed = any(name in values for name in WORKER_PAID_ENV)
+        _replace_env_assignments(env_path, {name: None for name in WORKER_PAID_ENV})
+        if changed:
+            # Consumer resolution is disabled on disk before the restart. Do
+            # not restore it if the stop/start path itself is unhealthy.
+            _worker_installer(_sp, "restart")
+        print("worker paid OFF")
+        return None
 
 
 def _owner_lease_path() -> Path:
@@ -1477,6 +1774,11 @@ def main(argv=None, *, http_post=None) -> int:
                    help="optionally narrow the signed release's package signer allowlist (64 hex)")
     gsub.add_parser("off", help="disable the gateway and remove its opt-in")
     gsub.add_parser("status", help="show configuration and unit state without key material")
+    q = gsub.add_parser("paid", help="atomically control payment-bound gateway routing")
+    gpsub = q.add_subparsers(dest="gateway_paid_cmd", required=True)
+    gpsub.add_parser("on", help="preflight and enable payment-bound routing")
+    gpsub.add_parser("off", help="disable payment-bound routing before restarting")
+    gpsub.add_parser("status", help="show the payment-bound routing gate")
     p = sub.add_parser("worker", help="build and operate this node's signed-release inference worker")
     wsub = p.add_subparsers(dest="worker_cmd", required=True)
     wsub.add_parser("build", help="compile the current release's verified engine for this GPU")
@@ -1506,6 +1808,18 @@ def main(argv=None, *, http_post=None) -> int:
     q.add_argument("--mode", choices=["first", "middle", "last", "solo"], default="first")
     wsub.add_parser("off", help="disable the worker service and remove its worker.env opt-in")
     wsub.add_parser("status", help="show the verified build record and systemd unit state")
+    q = wsub.add_parser("paid", help="atomically control payment-bound worker admission")
+    wpsub = q.add_subparsers(dest="worker_paid_cmd", required=True)
+    q = wpsub.add_parser("on", help="preflight and enable payment-bound admission")
+    q.add_argument("--ledger-url", required=True,
+                   help="HTTPS spend API base URL")
+    q.add_argument("--ledger-spki", required=True,
+                   help="TLS SPKI SHA-256 pin for the spend front")
+    q.add_argument("--store", type=Path,
+                   help="durable SQLite store inside ~/.nakshatra/worker "
+                        "(default: paid.sqlite)")
+    wpsub.add_parser("off", help="disable consumer resolution and paid admission")
+    wpsub.add_parser("status", help="show paid admission state without the TLS pin")
     q = wsub.add_parser("relay", help="allow or refuse capped relay activation streams")
     q.add_argument("relay_cmd", choices=["on", "off"])
     q = wsub.add_parser("owner-lease", help="control the local owner-sentinel lease")
@@ -1535,6 +1849,10 @@ def main(argv=None, *, http_post=None) -> int:
             _gateway_on(_sp, a)
         elif a.gateway_cmd == "off":
             _gateway_off(_sp)
+        elif a.gateway_cmd == "paid":
+            result = _gateway_paid(_sp, a.gateway_paid_cmd)
+            if result is not None:
+                print(json.dumps(result, indent=1, sort_keys=True))
         else:
             print(json.dumps(_gateway_status(_sp), indent=1, sort_keys=True))
     elif a.cmd == "worker":
@@ -1549,6 +1867,10 @@ def main(argv=None, *, http_post=None) -> int:
             print(json.dumps(_worker_status(_sp), indent=1, sort_keys=True))
         elif a.worker_cmd == "relay":
             _worker_relay(_sp, a.relay_cmd == "on")
+        elif a.worker_cmd == "paid":
+            result = _worker_paid(_sp, a.worker_paid_cmd, a)
+            if result is not None:
+                print(json.dumps(result, indent=1, sort_keys=True))
         elif a.owner_lease_cmd == "on":
             _owner_lease_on(_sp, a)
         elif a.owner_lease_cmd == "off":

@@ -2406,8 +2406,9 @@ def main(argv: Optional[list[str]] = None) -> int:
                          "Omit to run with an empty registry "
                          "(/api/tags returns []).")
     ap.add_argument("--paid-admission", action="store_true",
+                    default=os.environ.get("NAKSHATRA_GATEWAY_PAID", "").strip() == "1",
                     help="enable payment-bound G1/G2 admission for enforce-mode "
-                         "chain requests (default off)")
+                         "chain requests (default: NAKSHATRA_GATEWAY_PAID=1)")
     ap.add_argument("--stub-backend", nargs="?", const="Hello from a stubbed "
                     "Nakshatra gateway (the chain is not wired — this is a "
                     "canned reply for wire-smoke).", default=None, metavar="REPLY",

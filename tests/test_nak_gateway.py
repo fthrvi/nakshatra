@@ -109,6 +109,104 @@ def test_gateway_on_writes_loopback_enforced_opt_in(tmp_path, monkeypatch):
     assert calls == ["enable"]
 
 
+def test_gateway_signed_unit_argv_defaults_paid_gate_only_from_exact_env(
+        tmp_path, monkeypatch):
+    models = {"model": object()}
+    observed = []
+
+    class Server:
+        server_address = ("127.0.0.1", 11600)
+
+        def serve_forever(self):
+            return None
+
+        def shutdown(self):
+            return None
+
+        def server_close(self):
+            return None
+
+    def build_server(_bind, _port, _models, backend, _lifecycle):
+        observed.append(backend._chain._paid_admission)
+        return Server()
+
+    monkeypatch.setattr(serve, "_load_models", lambda _path: models)
+    monkeypatch.setattr(serve, "build_server", build_server)
+    monkeypatch.setattr(serve, "_maybe_start_proposals_server", lambda: None)
+    monkeypatch.setenv("NAKSHATRA_LEDGER_MODE", "enforce")
+    monkeypatch.delenv("NAKSHATRA_GATEWAY_PAID", raising=False)
+    argv = ["--models", str(tmp_path / "models.yaml")]
+
+    assert serve.main(argv) == 0
+    monkeypatch.setenv("NAKSHATRA_GATEWAY_PAID", "1")
+    assert serve.main(argv) == 0
+    monkeypatch.delenv("NAKSHATRA_GATEWAY_PAID")
+    assert serve.main(argv) == 0
+
+    assert observed == [False, True, False]
+
+
+def test_gateway_paid_preflight_failure_leaves_env_untouched(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    env_path = home / ".nakshatra" / "gateway.env"
+    env_path.parent.mkdir(parents=True)
+    original = (
+        b"NAKSHATRA_LEDGER_MODE=enforce\n"
+        b"NAKSHATRA_LEDGER_URL=https://ledger.test\n"
+        + f"NAKSHATRA_LEDGER_SPKI_SHA256={'ab' * 32}\n".encode()
+    )
+    env_path.write_bytes(original)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(
+        nak, "_paid_probe", lambda *_args: (_ for _ in ()).throw(SystemExit("probe failed")))
+    monkeypatch.setattr(nak, "_gateway_installer", lambda *_args: pytest.fail("must not restart"))
+
+    with pytest.raises(SystemExit, match="probe failed"):
+        nak._gateway_paid(object(), "on")
+
+    assert env_path.read_bytes() == original
+
+
+def test_gateway_paid_failed_readiness_rolls_back_exact_env_and_restarts(
+        tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    env_path = home / ".nakshatra" / "gateway.env"
+    env_path.parent.mkdir(parents=True)
+    original = (
+        b"PORT=11600\nNAKSHATRA_LEDGER_MODE=enforce\n"
+        b"NAKSHATRA_LEDGER_URL=https://ledger.test\n"
+        + f"NAKSHATRA_LEDGER_SPKI_SHA256={'ab' * 32}\n".encode()
+        + b"ODD='leave me'\n"
+    )
+    env_path.write_bytes(original)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(nak, "_paid_probe", lambda *_args: {"ready": True})
+    monkeypatch.setattr(nak, "_wait_gateway_ready", lambda *_args: False)
+    actions = []
+    monkeypatch.setattr(nak, "_gateway_installer", lambda _sp, action: actions.append(action))
+
+    with pytest.raises(SystemExit, match="did not become ready"):
+        nak._gateway_paid(object(), "on")
+
+    assert actions == ["restart", "restart"]
+    assert env_path.read_bytes() == original
+
+
+def test_gateway_paid_off_removes_only_gate(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    env_path = home / ".nakshatra" / "gateway.env"
+    env_path.parent.mkdir(parents=True)
+    env_path.write_bytes(b"PORT=11600\nNAKSHATRA_GATEWAY_PAID=1\nKEEP=exact\n")
+    monkeypatch.setenv("HOME", str(home))
+    actions = []
+    monkeypatch.setattr(nak, "_gateway_installer", lambda _sp, action: actions.append(action))
+
+    nak._gateway_paid(object(), "off")
+
+    assert env_path.read_bytes() == b"PORT=11600\nKEEP=exact\n"
+    assert actions == ["restart"]
+
+
 def test_gateway_on_enables_p2p_before_gateway_when_absent(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     calls = []
