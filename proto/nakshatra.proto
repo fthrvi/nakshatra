@@ -88,6 +88,11 @@ message ForwardRequest {
   // Default false → normal forward, unchanged. Set only on the FIRST worker by an
   // --eagle-head client; the head consumes these to propose tokens.
   bool   eagle_hidden  = 8;
+  // Payment-bound admission v2. These fields are additive and remain absent
+  // for legacy peer Forward calls. Paid Forward is explicitly stateless.
+  string session_id = 9;
+  string step_id = 10;
+  string spend_claim_token = 11;
 }
 
 message ForwardResponse {
@@ -98,6 +103,7 @@ message ForwardResponse {
 // discarding the rejected speculative tail. Driven by daemon cmd=4 (KV_TRUNCATE).
 message TruncateRequest {
   int32 n_keep = 1;   // number of leading KV positions to keep for seq 0
+  string session_id = 2; // active Inference session whose KV may be truncated
 }
 
 message TruncateResponse {}
@@ -150,6 +156,9 @@ message InferenceStep {
   // otherwise an old worker would return a single token where K+1 were expected, corrupting
   // accept() silently instead of failing loud.
   bool       all_logits  = 17;
+  // Opaque online-claim token. Present only on the first paid frame and never
+  // logged or persisted in plaintext by the worker.
+  string     spend_claim_token = 18;
 }
 
 message NextServer {
