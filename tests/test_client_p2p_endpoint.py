@@ -153,6 +153,73 @@ def test_chain_spki_must_match_full_node_record():
                 eligible_fn=_eligible_at("stranger"))
 
 
+@pytest.mark.parametrize(
+    ("chain_spki", "peer_spki", "expected"),
+    [
+        (SPKI, SPKI, SPKI),
+        ("", SPKI, SPKI),
+    ],
+    ids=["present", "missing-chain-merged"],
+)
+def test_paid_pinned_projection_strictly_preserves_or_merges_spki(
+        monkeypatch, chain_spki, peer_spki, expected):
+    monkeypatch.setenv("STHAMBHA_PILLAR_SPKI_SHA256", "aa" * 32)
+    chain_entry = _chain_entry()
+    chain_entry["public_key_hex"] = PUBKEY
+    chain_entry["peer_spki_hash"] = chain_spki
+    peer = _peer(peer_spki_hash=peer_spki)
+    roster = {PUBKEY: {"tier": "stranger", "tenant": "outside"}}
+    with patch.object(cli, "_registry_urlopen", side_effect=_pillar_open(
+            [peer], [chain_entry])):
+        chain = cli.build_chain_from_registry(
+            "https://pillar", "public-model", roster_loader=lambda: roster,
+            eligible_fn=_eligible_at("stranger"), strict_pinned_projection=True)
+    assert chain[0]["peer_spki_hash"] == expected
+
+
+def test_paid_pinned_projection_rejects_conflicting_spki(monkeypatch):
+    monkeypatch.setenv("STHAMBHA_PILLAR_SPKI_SHA256", "aa" * 32)
+    chain_entry = _chain_entry()
+    chain_entry["public_key_hex"] = PUBKEY
+    chain_entry["peer_spki_hash"] = "ef" * 32
+    with patch.object(cli, "_registry_urlopen", side_effect=_pillar_open(
+            [_peer()], [chain_entry])):
+        with pytest.raises(PermissionError, match="SPKI conflicts"):
+            cli.build_chain_from_registry(
+                "https://pillar", "public-model",
+                strict_pinned_projection=True)
+
+
+def test_paid_pinned_projection_rejects_when_both_spkis_missing(monkeypatch):
+    monkeypatch.setenv("STHAMBHA_PILLAR_SPKI_SHA256", "aa" * 32)
+    chain_entry = _chain_entry()
+    chain_entry["public_key_hex"] = PUBKEY
+    chain_entry["peer_spki_hash"] = ""
+    with patch.object(cli, "_registry_urlopen", side_effect=_pillar_open(
+            [_peer(peer_spki_hash="")], [chain_entry])):
+        with pytest.raises(PermissionError, match="neither chain nor /peers.*re-register"):
+            cli.build_chain_from_registry(
+                "https://pillar", "public-model",
+                strict_pinned_projection=True)
+
+
+def test_paid_pinned_projection_rejects_identity_or_endpoint_disagreement(
+        monkeypatch):
+    monkeypatch.setenv("STHAMBHA_PILLAR_SPKI_SHA256", "aa" * 32)
+    chain_entry = _chain_entry()
+    chain_entry["public_key_hex"] = PUBKEY
+    mismatched = _peer(endpoint={
+        "kind": cli.ACTIVATION_ENDPOINT_KIND,
+        "peer_id": "12D3KooDifferentWorker",
+    })
+    with patch.object(cli, "_registry_urlopen", side_effect=_pillar_open(
+            [mismatched], [chain_entry])):
+        with pytest.raises(PermissionError, match="PeerId disagrees"):
+            cli.build_chain_from_registry(
+                "https://pillar", "public-model",
+                strict_pinned_projection=True)
+
+
 def test_sidecar_forward_socket_and_spki_preservation():
     class ControlSocket:
         def __init__(self, response):
@@ -235,7 +302,8 @@ def test_self_hop_by_sidecar_peer_id_and_remote_hop_form_mixed_chain(
     assert [hop[cli._CLIENT_DIAL_ADDRESS] for hop in resolved] == [
         "127.0.0.1:5544", "127.0.0.1:43123",
     ]
-    forward.assert_called_once_with(PEER_ID, socket_path=None)
+    forward.assert_called_once_with(
+        PEER_ID, socket_path=None, require_uid_owned=False)
     assert [hop["peer_spki_hash"] for hop in resolved] == ["11" * 32, SPKI]
 
 
@@ -355,7 +423,8 @@ def test_recovery_rebuild_downgrades_push_when_alternate_is_typed(capsys):
         True, rebuilt, context="recovery") is False
     assert resolved_alternate[cli._CLIENT_DIAL_ADDRESS] == "127.0.0.1:43123"
     assert resolved_alternate[cli._PUSH_DIAL_ADDRESS] is None
-    forward.assert_called_once_with(PEER_ID, socket_path=None)
+    forward.assert_called_once_with(
+        PEER_ID, socket_path=None, require_uid_owned=False)
     assert "[recovery] WARNING" in capsys.readouterr().err
 
 
@@ -441,7 +510,8 @@ workers:
     # First attempt used one server-to-server push.  After the typed alternate
     # replaced the downstream hop, recovery relayed through both client streams.
     assert calls == [("first", True), ("first", False), ("last-alt", False)]
-    forward.assert_called_once_with(PEER_ID, socket_path=None)
+    forward.assert_called_once_with(
+        PEER_ID, socket_path=None, require_uid_owned=False)
     err = capsys.readouterr().err
     assert "[recovery] WARNING: push requested with typed activation" in err
     assert "attempts exhausted" not in err
@@ -464,6 +534,14 @@ def test_sidecar_forward_wraps_socket_creation_failure():
     with patch.object(cli.socket, "socket", side_effect=OSError("socket denied")):
         with pytest.raises(RuntimeError, match="sidecar FORWARD failed: socket denied"):
             cli._sidecar_forward(PEER_ID, "/run/user/1000/nakshatra/p2p.sock")
+
+
+def test_paid_sidecar_forward_requires_uid_owned_unix_socket(tmp_path):
+    impostor = tmp_path / "p2p.sock"
+    impostor.write_text("not a socket")
+    with pytest.raises(RuntimeError, match="uid-owned Unix sidecar socket"):
+        cli._sidecar_forward(
+            PEER_ID, str(impostor), require_uid_owned=True)
 
 
 def test_activation_peer_id_must_be_ascii():

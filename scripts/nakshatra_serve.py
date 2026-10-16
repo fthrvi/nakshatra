@@ -886,12 +886,35 @@ class ChainChatBackend(ChatBackend):
             source_path = self._roster_chain_yaml(entry, paid=True)
             with open(source_path, encoding="utf-8") as config:
                 document = yaml.safe_load(config)
+            registry_url = (os.environ.get("NAKSHATRA_PILLAR_URL")
+                            or os.environ.get("NAKSHATRA_LIFECYCLE_PILLAR_URL")
+                            or entry.registry_url or "")
+            if not registry_url:
+                raise paid_client.PaidAdmissionError(
+                    "paid from_roster SPKI enrichment requires a pinned Pillar URL")
+            try:
+                chain_client._require_pinned_pillar_projection()
+                peers = chain_client._fetch_registry_peers(
+                    registry_url, entry.name)
+                workers = (document.get("workers")
+                           if isinstance(document, dict) else None)
+                if not isinstance(workers, list):
+                    raise paid_client.PaidAdmissionError(
+                        "paid chain config has no workers list")
+                chain_client._merge_paid_pillar_projection(
+                    workers, peers, enrich_reachability=True)
+            except PermissionError as exc:
+                raise paid_client.PaidAdmissionError(str(exc)) from exc
         elif entry.chain_yaml:
             with open(entry.chain_yaml, encoding="utf-8") as config:
                 document = yaml.safe_load(config)
         else:
-            workers = chain_client.build_chain_from_registry(
-                entry.registry_url or "", entry.name)
+            try:
+                workers = chain_client.build_chain_from_registry(
+                    entry.registry_url or "", entry.name,
+                    strict_pinned_projection=True)
+            except PermissionError as exc:
+                raise paid_client.PaidAdmissionError(str(exc)) from exc
             document = {
                 "model": {"id": entry.name}, "workers": workers,
             }

@@ -234,10 +234,53 @@ def test_info_attestation_rejects_wrong_signature_and_unattested_runtime():
         )
 
 
-def test_paid_mode_refuses_push_fabric_and_non_greedy_locally():
+def test_paid_mode_refuses_push_and_non_greedy_locally():
     assert paid.paid_mode_refusal(
-        push=True, fabric=True, speculative=True, stream_spec=False,
-        async_pipeline=False, eagle=False) == "push, fabric, non-greedy"
+        push=True, speculative=True, stream_spec=False,
+        async_pipeline=False, eagle=False) == "push, non-greedy"
+
+
+def test_paid_client_refuses_alternate_failover_before_worker_contact(
+        tmp_path, monkeypatch):
+    config = tmp_path / "chain.yaml"
+    config.write_text(
+        "model: {id: model}\nworkers:\n"
+        f"  - id: one\n    public_key_hex: {KEY1}\n"
+        f"    peer_spki_hash: {SPKI1}\n"
+        "    address: 127.0.0.1\n    port: 5540\n"
+        "    layer_range: [0, 2]\n    mode: solo\n"
+        "    alternates:\n"
+        f"      - id: backup\n        public_key_hex: {KEY2}\n"
+        f"        peer_spki_hash: {SPKI2}\n"
+        "        address: 127.0.0.1\n        port: 5541\n"
+        "        layer_range: [0, 2]\n        mode: solo\n"
+    )
+    envelope = paid.make_paid_envelope(
+        claim_token="A" * 43, hold_id="hold", session_id="session",
+        model_id="model", max_prompt_tokens=3, max_output_tokens=2,
+        plan=[{"worker_keyid": KEY1, "layer_start": 0, "layer_end": 2}],
+    )
+    admission_read, admission_write = os.pipe()
+    progress_read, progress_write = os.pipe()
+    os.write(admission_write, json.dumps(envelope).encode())
+    os.close(admission_write)
+    monkeypatch.setattr(client, "_TLS_AVAILABLE", True)
+    monkeypatch.setattr(
+        client, "_open_chain_channel",
+        lambda *_args, **_kwargs: pytest.fail("alternate plan reached worker contact"))
+    monkeypatch.setattr(sys, "argv", [
+        "client.py", "--config", str(config), "--model-id", "model",
+        "--model-path", "/unused.gguf", "--prompt", "prompt",
+        "--max-tokens", "2", "--use-streaming",
+        "--paid-admission-fd", str(admission_read),
+        "--paid-progress-fd", str(progress_write),
+    ])
+    try:
+        with pytest.raises(SystemExit, match="alternate failover"):
+            client.main()
+    finally:
+        os.close(progress_read)
+        os.close(progress_write)
 
 
 def test_proto_field_numbers_match_the_worker_merge_contract():
@@ -531,6 +574,55 @@ def test_paid_gateway_refuses_missing_spki_before_authorize(tmp_path, caplog):
     assert "paid pre-client planning failure" in caplog.text
     assert ("PaidAdmissionError: paid chain hop has no valid TLS SPKI pin"
             in caplog.text)
+
+
+def test_paid_from_roster_keeps_local_authority_and_enriches_pillar_transport(
+        tmp_path, monkeypatch):
+    source = tmp_path / "roster-chain.yaml"
+    source.write_text(
+        "model: {id: model}\nworkers:\n"
+        f"  - id: local-roster-name\n    public_key_hex: {KEY1}\n"
+        "    peer_spki_hash: ''\n"
+        "    address: stale.local\n    port: 1\n"
+        "    layer_range: [0, 2]\n    mode: solo\n"
+    )
+    endpoint = {
+        "kind": client.ACTIVATION_ENDPOINT_KIND,
+        "peer_id": "12D3KooPinnedRosterWorker",
+    }
+    peer = {
+        "node_id": "pillar-node-id",
+        "public_key_hex": KEY1,
+        "peer_spki_hash": SPKI1,
+        "address": "fresh.example:5540",
+        "endpoint": endpoint,
+        "tier": "self",  # never imported; the local roster chose the worker
+    }
+    backend = serve.ChainChatBackend(paid_admission=True)
+    backend._roster_chain_yaml = lambda _entry, paid=False: str(source)
+    monkeypatch.setenv("NAKSHATRA_PILLAR_URL", "https://pillar.example")
+    monkeypatch.setenv("STHAMBHA_PILLAR_SPKI_SHA256", "aa" * 32)
+    monkeypatch.setattr(client, "_fetch_registry_peers", lambda *_args: [peer])
+    entry = serve.ModelEntry(
+        name="model", tokenizer_gguf="/tokenizer", from_roster=True,
+        hidden_size=1)
+
+    path, plan, owned = backend._paid_chain_config(entry)
+    try:
+        document = client.yaml.safe_load(Path(path).read_text())
+    finally:
+        Path(path).unlink()
+
+    assert owned is True
+    assert plan == [{"worker_keyid": KEY1, "layer_start": 0, "layer_end": 2}]
+    worker = document["workers"][0]
+    assert worker["id"] == "local-roster-name"
+    assert worker["public_key_hex"] == KEY1
+    assert "tier" not in worker
+    assert worker["node_id"] == "pillar-node-id"
+    assert worker["endpoint"] == endpoint
+    assert worker["peer_spki_hash"] == SPKI1
+    assert (worker["address"], worker["port"]) == ("fresh.example", 5540)
 
 
 def _successful_client_run(cmd, *, env, pass_fds, **_kwargs):

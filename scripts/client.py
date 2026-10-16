@@ -25,6 +25,7 @@ import os
 import queue
 import re
 import socket
+import stat
 import struct
 import sys
 import threading
@@ -763,7 +764,8 @@ def _parse_activation_endpoint(raw) -> dict | None:
 
 
 def _sidecar_forward(peer_id: str, socket_path: str | None = None,
-                     timeout: float = SIDECAR_FORWARD_CONTROL_TIMEOUT_S) -> tuple[str, int]:
+                     timeout: float = SIDECAR_FORWARD_CONTROL_TIMEOUT_S,
+                     *, require_uid_owned: bool = False) -> tuple[str, int]:
     """Ask the uid-protected sidecar for a cached activation forward.
 
     The sidecar is a byte pipe only.  TLS and the registered worker SPKI are
@@ -781,6 +783,18 @@ def _sidecar_forward(peer_id: str, socket_path: str | None = None,
             "libp2p activation endpoint requires NAKSHATRA_P2P_SOCKET")
     if not os.path.isabs(socket_path):
         raise RuntimeError("NAKSHATRA_P2P_SOCKET must be an absolute path")
+    if require_uid_owned:
+        try:
+            socket_info = os.lstat(socket_path)
+        except OSError as exc:
+            raise RuntimeError(
+                f"paid libp2p activation requires a live uid-owned sidecar socket: {exc}"
+            ) from exc
+        if (not stat.S_ISSOCK(socket_info.st_mode)
+                or socket_info.st_uid != os.getuid()):
+            raise RuntimeError(
+                "paid libp2p activation requires a uid-owned Unix sidecar socket"
+            )
 
     control = None
     try:
@@ -820,7 +834,8 @@ def _sidecar_forward(peer_id: str, socket_path: str | None = None,
 
 def _resolve_activation_endpoint(spec: dict, *, socket_path: str | None = None,
                                  tls_mode: str = "auto",
-                                 home: Path | None = None) -> dict:
+                                 home: Path | None = None,
+                                 require_uid_sidecar: bool = False) -> dict:
     """Resolve every supported hop to its authoritative dial addresses.
 
     This is the single address-selection boundary for client.py.  Legacy hops
@@ -867,7 +882,8 @@ def _resolve_activation_endpoint(spec: dict, *, socket_path: str | None = None,
             "libp2p activation endpoint has no valid registered worker SPKI")
     local = _self_hop_loopback(spec, endpoint, home=home)
     host, port = local or _sidecar_forward(
-        endpoint["peer_id"], socket_path=socket_path
+        endpoint["peer_id"], socket_path=socket_path,
+        require_uid_owned=require_uid_sidecar,
     )
     resolved["address"] = host
     resolved["port"] = port
@@ -943,6 +959,143 @@ def _fetch_registry_peers(registry_url: str, model_id: str = "") -> list[dict]:
     return [p for p in peers if isinstance(p, dict)]
 
 
+def _require_pinned_pillar_projection() -> str:
+    """Return the configured Pillar SPKI or refuse paid projection data.
+
+    ``_registry_urlopen`` supplies request authentication and passes this pin
+    to the HTTPS opener. Paid planning must never import identity, endpoint,
+    or worker-pin facts from an unpinned response.
+    """
+    pin = _sanitize_spki(os.environ.get("STHAMBHA_PILLAR_SPKI_SHA256"))
+    if not pin:
+        raise PermissionError(
+            "paid chain projection requires a valid pinned Pillar SPKI"
+        )
+    return pin
+
+
+def _paid_worker_key(record: dict) -> str:
+    """Return one canonical Ed25519 worker key, or ``""`` when absent."""
+    value = str(
+        record.get("public_key_hex") or record.get("worker_keyid") or ""
+    ).strip().lower()
+    return value if re.fullmatch(r"[0-9a-f]{64}", value) else ""
+
+
+def _merge_paid_pillar_projection(workers: list[dict], peers: list[dict], *,
+                                  enrich_reachability: bool = False) -> None:
+    """Strictly bind paid workers to the pinned Pillar ``/peers`` view.
+
+    The caller owns transport authentication and Pillar SPKI pinning. This
+    function owns the cross-projection join: the full worker key selects one
+    peer, while an existing node id and activation PeerId must agree. Only
+    reachability and TLS SPKI are imported; roster trust tier and placement
+    remain untouched. There is deliberately no address-keyed or TOFU path.
+    """
+    by_key: dict[str, list[dict]] = {}
+    for peer in peers:
+        key = _paid_worker_key(peer)
+        if key:
+            by_key.setdefault(key, []).append(peer)
+
+    for worker in workers:
+        label = str(worker.get("node_id") or worker.get("id") or "<unknown>")
+        key = _paid_worker_key(worker)
+        if not key:
+            raise PermissionError(
+                f"paid SPKI enrichment refused for {label!r}: "
+                "chain worker has no full Ed25519 public key"
+            )
+        matches = by_key.get(key, [])
+        if len(matches) != 1:
+            detail = "absent" if not matches else "ambiguous"
+            raise PermissionError(
+                f"paid SPKI enrichment refused for {label!r}: worker key is "
+                f"{detail} in the pinned Pillar /peers projection"
+            )
+        peer = matches[0]
+        peer_node = str(peer.get("node_id") or peer.get("id") or "").strip()
+        worker_node = str(worker.get("node_id") or "").strip()
+        if not peer_node:
+            raise PermissionError(
+                f"paid SPKI enrichment refused for {label!r}: pinned Pillar "
+                "peer has no node identity"
+            )
+        if worker_node and worker_node != peer_node:
+            raise PermissionError(
+                f"paid SPKI enrichment refused for {label!r}: node identity "
+                "disagrees between chain and /peers"
+            )
+
+        try:
+            worker_endpoint = _parse_activation_endpoint(worker.get("endpoint"))
+            peer_endpoint = _parse_activation_endpoint(peer.get("endpoint"))
+        except RuntimeError as exc:
+            raise PermissionError(
+                f"paid SPKI enrichment refused for {label!r}: invalid activation endpoint"
+            ) from exc
+        if worker_endpoint is not None:
+            if (peer_endpoint is None
+                    or worker_endpoint["peer_id"] != peer_endpoint["peer_id"]):
+                raise PermissionError(
+                    f"paid SPKI enrichment refused for {label!r}: activation "
+                    "PeerId disagrees between chain and /peers"
+                )
+
+        worker_raw_spki = str(worker.get("peer_spki_hash") or "").strip()
+        peer_raw_spki = str(peer.get("peer_spki_hash") or "").strip()
+        worker_spki = _sanitize_spki(worker_raw_spki)
+        peer_spki = _sanitize_spki(peer_raw_spki)
+        if worker_raw_spki and not worker_spki:
+            raise PermissionError(
+                f"paid SPKI enrichment refused for {label!r}: chain has an "
+                "invalid worker SPKI"
+            )
+        if peer_raw_spki and not peer_spki:
+            raise PermissionError(
+                f"paid SPKI enrichment refused for {label!r}: /peers has an "
+                "invalid worker SPKI"
+            )
+        if worker_spki and peer_spki and worker_spki != peer_spki:
+            raise PermissionError(
+                f"paid SPKI enrichment refused for {label!r}: worker SPKI "
+                "conflicts between chain and /peers"
+            )
+        merged_spki = worker_spki or peer_spki
+        if not merged_spki:
+            raise PermissionError(
+                f"paid SPKI enrichment refused for {label!r}: neither chain "
+                "nor /peers has a valid worker SPKI; worker must re-register"
+            )
+        worker["peer_spki_hash"] = merged_spki
+
+        if enrich_reachability:
+            worker["node_id"] = peer_node
+            if peer_endpoint is not None:
+                worker["endpoint"] = peer_endpoint
+            address = str(peer.get("address") or "").strip()
+            valid_address = False
+            if address:
+                host, separator, port_text = address.rpartition(":")
+                if (separator and host and port_text.isdigit()
+                        and 1 <= int(port_text) <= 65535):
+                    worker["address"] = host
+                    worker["port"] = int(port_text)
+                    valid_address = True
+                elif peer_endpoint is None:
+                    raise PermissionError(
+                        f"paid SPKI enrichment refused for {label!r}: /peers "
+                        "has invalid legacy reachability"
+                    )
+            if peer_endpoint is None and not valid_address:
+                raise PermissionError(
+                    f"paid SPKI enrichment refused for {label!r}: /peers has "
+                    "no usable worker reachability"
+                )
+            if "residency" in peer:
+                worker["residency"] = _residency(peer.get("residency"))
+
+
 def _admit_activation_workers(model_id: str, workers: list[dict],
                               peers: list[dict], *, roster_loader=None,
                               eligible_fn=None) -> None:
@@ -963,16 +1116,17 @@ def _admit_activation_workers(model_id: str, workers: list[dict],
         "1", "true", "yes", "on",
     }
     pillar_pin = os.environ.get("STHAMBHA_PILLAR_SPKI_SHA256", "").strip()
-    if trust_pillar and re.fullmatch(r"[0-9a-fA-F]{64}", pillar_pin):
-        return
-    from fabric import worker_join as wj
-
     by_node = {str(p.get("node_id") or p.get("id") or ""): p for p in peers}
-
-    if roster_loader is None:
-        admission = wj._load_admission()
-        roster_loader = admission.load_peers
-    roster = roster_loader() or {}
+    pillar_is_authority = (
+        trust_pillar and re.fullmatch(r"[0-9a-fA-F]{64}", pillar_pin) is not None
+    )
+    roster = {}
+    if not pillar_is_authority:
+        from fabric import worker_join as wj
+        if roster_loader is None:
+            admission = wj._load_admission()
+            roster_loader = admission.load_peers
+        roster = roster_loader() or {}
     standings = []
     for hop in typed:
         endpoint = _parse_activation_endpoint(hop.get("endpoint"))
@@ -989,15 +1143,23 @@ def _admit_activation_workers(model_id: str, workers: list[dict],
         if not pubkey:
             raise PermissionError(
                 f"identity firewall: activation peer {node_id!r} has no node public key")
+        inline_pubkey = str(hop.get("public_key_hex") or "").strip().lower()
+        if inline_pubkey and inline_pubkey != pubkey:
+            raise PermissionError(
+                f"identity firewall: public-key mismatch for activation peer {node_id!r}")
+        hop["public_key_hex"] = pubkey
         registered_spki = _sanitize_spki(peer.get("peer_spki_hash"))
         inline_spki = _sanitize_spki(hop.get("peer_spki_hash"))
-        if not registered_spki:
+        if not registered_spki and not inline_spki:
             raise PermissionError(
-                f"identity firewall: activation peer {node_id!r} has no registered worker SPKI")
-        if inline_spki and inline_spki != registered_spki:
+                f"identity firewall: activation peer {node_id!r} has no worker "
+                "SPKI in either /chain or /peers; worker must re-register")
+        if inline_spki and registered_spki and inline_spki != registered_spki:
             raise PermissionError(
                 f"identity firewall: SPKI mismatch for activation peer {node_id!r}")
-        hop["peer_spki_hash"] = registered_spki
+        hop["peer_spki_hash"] = inline_spki or registered_spki
+        if pillar_is_authority:
+            continue
         roster_peer = roster.get(pubkey)
         worker_role = (roster_peer or {}).get("role", "worker")
         standing = wj.WorkerStanding(
@@ -1007,6 +1169,8 @@ def _admit_activation_workers(model_id: str, workers: list[dict],
             tenant=(roster_peer or {}).get("tenant"), capabilities={})
         standings.append(standing)
 
+    if pillar_is_authority:
+        return
     if eligible_fn is None:
         eligible, rejected = wj.eligible_workers(model_id, standings)
     else:
@@ -1194,7 +1358,8 @@ def _try_pillar_chain(registry_url: str, model_id: str) -> list | None:
 
 
 def build_chain_from_registry(registry_url: str, model_id: str, *,
-                              roster_loader=None, eligible_fn=None) -> list:
+                              roster_loader=None, eligible_fn=None,
+                              strict_pinned_projection: bool = False) -> list:
     """Query Sthambha registry, return a contiguous chain plan for `model_id`.
 
     Phase I: prefer the pillar's own /chain endpoint; if absent, fall
@@ -1207,10 +1372,18 @@ def build_chain_from_registry(registry_url: str, model_id: str, *,
 
     Raises RuntimeError if no contiguous chain can be built.
     """
+    if strict_pinned_projection:
+        _require_pinned_pillar_projection()
     pillar_chain = _try_pillar_chain(registry_url, model_id)
     if pillar_chain is not None:
-        if any(w.get("endpoint") is not None for w in pillar_chain):
+        peers = []
+        if (strict_pinned_projection
+                or any(w.get("endpoint") is not None for w in pillar_chain)):
             peers = _fetch_registry_peers(registry_url, model_id)
+        if strict_pinned_projection:
+            _merge_paid_pillar_projection(
+                pillar_chain, peers, enrich_reachability=True)
+        if any(w.get("endpoint") is not None for w in pillar_chain):
             _admit_activation_workers(
                 model_id, pillar_chain, peers, roster_loader=roster_loader,
                 eligible_fn=eligible_fn)
@@ -1298,6 +1471,9 @@ def build_chain_from_registry(registry_url: str, model_id: str, *,
     _admit_activation_workers(
         model_id, chain, peers, roster_loader=roster_loader,
         eligible_fn=eligible_fn)
+    if strict_pinned_projection:
+        _merge_paid_pillar_projection(
+            chain, peers, enrich_reachability=True)
 
     return chain
 
@@ -1515,11 +1691,13 @@ def main():
                     _admit_activation_workers(
                         configured_model, [candidate], [candidate])
 
-    if paid is not None and any(
-            candidate.get("endpoint") is not None
-            for worker in workers
-            for candidate in [worker, *(worker.get("alternates") or [])]):
-        sys.exit("[paid] paid sessions refuse fabric execution")
+    if paid is not None and any(worker.get("alternates") for worker in workers):
+        # A paid authorization freezes one exact worker identity/span plan.
+        # Typed PRIMARY hops are safe through the uid-protected sidecar because
+        # its loopback FORWARD remains a byte pipe: the channel still pins and
+        # attests the remote worker. Alternate selection would instead mutate
+        # that authorized topology and is never allowed.
+        sys.exit("[paid] paid sessions refuse alternate failover execution")
 
     # v0.5 M0.5.4 v1: alternate-worker recovery. Each worker has a list of
     # candidates: primary first, then optional alternates from yaml. A
@@ -1562,7 +1740,8 @@ def main():
         for w in workers:
             spec = _spec(w)
             resolved_spec = _resolve_activation_endpoint(
-                spec, tls_mode=args.tls_mode)
+                spec, tls_mode=args.tls_mode,
+                require_uid_sidecar=(paid is not None))
             addr = resolved_spec[_CLIENT_DIAL_ADDRESS]
             if paid is not None and not resolved_spec.get("peer_spki_hash"):
                 sys.exit(

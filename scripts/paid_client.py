@@ -232,12 +232,10 @@ def require_paid_capabilities(sorted_stubs: Iterable[tuple]) -> None:
 
 
 def paid_mode_refusal(*, push: bool, speculative: bool, stream_spec: bool,
-                      async_pipeline: bool, eagle: bool, fabric: bool = False) -> str:
+                      async_pipeline: bool, eagle: bool) -> str:
     selected = []
     if push:
         selected.append("push")
-    if fabric:
-        selected.append("fabric")
     if speculative or stream_spec or async_pipeline or eagle:
         selected.append("non-greedy")
     return ", ".join(selected)

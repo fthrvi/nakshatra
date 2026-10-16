@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import socket
 import socketserver
 import ssl
 import struct
@@ -194,6 +195,136 @@ class _TokenizerServer:
         self.thread.join(timeout=5)
 
 
+class _ForwardControlHandler(socketserver.StreamRequestHandler):
+    def handle(self):
+        line = self.rfile.readline(4097).decode("ascii", errors="replace").strip()
+        if not line.startswith("FORWARD "):
+            self.wfile.write(b"ERR malformed request\n")
+            return
+        peer_id = line.removeprefix("FORWARD ")
+        try:
+            port = self.server.owner.open_forward(peer_id)
+        except KeyError:
+            self.wfile.write(b"ERR unknown peer\n")
+            return
+        self.wfile.write(f"OK 127.0.0.1:{port}\n".encode("ascii"))
+        self.wfile.flush()
+
+
+class _ForwardSidecar:
+    """Faithful uid-local FORWARD fake: each reply is a loopback TCP pipe."""
+
+    def __init__(self, path: Path, targets: dict[str, int]):
+        self.path = path
+        self.targets = dict(targets)
+        self.requests = []
+        self._listeners = []
+        self._threads = []
+        self._lock = threading.Lock()
+        self._closed = threading.Event()
+        self.server = socketserver.ThreadingUnixStreamServer(
+            str(path), _ForwardControlHandler)
+        self.server.daemon_threads = True
+        self.server.owner = self
+        self.thread = threading.Thread(
+            target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    @staticmethod
+    def _pump(source: socket.socket, destination: socket.socket):
+        try:
+            while True:
+                chunk = source.recv(64 * 1024)
+                if not chunk:
+                    break
+                destination.sendall(chunk)
+        except OSError:
+            pass
+        finally:
+            try:
+                destination.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+
+    def open_forward(self, peer_id: str) -> int:
+        target_port = self.targets[peer_id]
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = int(listener.getsockname()[1])
+        with self._lock:
+            self.requests.append(peer_id)
+            self._listeners.append(listener)
+
+        listener.settimeout(0.2)
+
+        def relay_connection(client):
+            upstream = None
+            try:
+                upstream = socket.create_connection(("127.0.0.1", target_port), timeout=5)
+                upstream.settimeout(None)
+                pumps = [
+                    threading.Thread(
+                        target=self._pump, args=(client, upstream), daemon=True),
+                    threading.Thread(
+                        target=self._pump, args=(upstream, client), daemon=True),
+                ]
+                for pump in pumps:
+                    pump.start()
+                for pump in pumps:
+                    pump.join(timeout=30)
+            finally:
+                for stream in (client, upstream):
+                    if stream is not None:
+                        try:
+                            stream.close()
+                        except OSError:
+                            pass
+
+        def relay():
+            try:
+                while not self._closed.is_set():
+                    try:
+                        client, _address = listener.accept()
+                    except TimeoutError:
+                        continue
+                    except OSError:
+                        break
+                    connection = threading.Thread(
+                        target=relay_connection, args=(client,), daemon=True)
+                    with self._lock:
+                        self._threads.append(connection)
+                    connection.start()
+            finally:
+                try:
+                    listener.close()
+                except OSError:
+                    pass
+
+        thread = threading.Thread(target=relay, daemon=True)
+        with self._lock:
+            self._threads.append(thread)
+        thread.start()
+        return port
+
+    def close(self):
+        self._closed.set()
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+        with self._lock:
+            listeners = list(self._listeners)
+            threads = list(self._threads)
+        for listener in listeners:
+            try:
+                listener.close()
+            except OSError:
+                pass
+        for thread in threads:
+            thread.join(timeout=5)
+
+
 class _PinnedLedgerServer:
     def __init__(self, service: V2LedgerService, tls_dir: Path):
         self.service = service
@@ -337,6 +468,7 @@ class _PaidStack:
     gateway_thread: threading.Thread
     tokenizer: _TokenizerServer
     chain_path: Path
+    sidecar: _ForwardSidecar | None
 
     @property
     def gateway_url(self):
@@ -351,6 +483,8 @@ class _PaidStack:
         self.ledger.close()
         self.service.close()
         self.tokenizer.close()
+        if self.sidecar is not None:
+            self.sidecar.close()
 
 
 @contextmanager
@@ -361,6 +495,7 @@ def _paid_stack(
     *,
     dial_identity_as: int | None = None,
     stop_ledger_on_compute: bool = False,
+    relay_endpoint: bool = False,
 ):
     consumer = _identity("paid-e2e-consumer", "consumer", grpc_auth.ROLE_CONSUMER)
     identity_count = max(
@@ -409,6 +544,7 @@ def _paid_stack(
     workers = []
     callback = ledger.stop if stop_ledger_on_compute else None
     tokenizer = None
+    sidecar = None
     gateway = None
     gateway_thread = None
     try:
@@ -425,6 +561,15 @@ def _paid_stack(
                     on_first_call=callback if index == 0 else None,
                 )
             )
+        if relay_endpoint:
+            targets = {
+                f"12D3KooPaidWorker{index}": item.port
+                for index, item in enumerate(workers)
+            }
+            sidecar = _ForwardSidecar(tmp_path / "p2p.sock", targets)
+            monkeypatch.setenv("NAKSHATRA_P2P_SOCKET", str(sidecar.path))
+            monkeypatch.setenv("NKS_TRUST_PINNED_PILLAR", "1")
+            monkeypatch.setenv("STHAMBHA_PILLAR_SPKI_SHA256", "aa" * 32)
         chain_workers = []
         for index, item in enumerate(workers):
             declared = (
@@ -433,8 +578,7 @@ def _paid_stack(
                 else item.identity
             )
             layer_start, layer_end, mode = spans[index]
-            chain_workers.append(
-                {
+            chain_worker = {
                     "id": f"stage-{index}",
                     "address": "127.0.0.1",
                     "port": item.port,
@@ -443,7 +587,16 @@ def _paid_stack(
                     "peer_spki_hash": item.spki,
                     "public_key_hex": declared.public,
                 }
-            )
+            if relay_endpoint:
+                chain_worker.update({
+                    "address": "",
+                    "port": 0,
+                    "endpoint": {
+                        "kind": "libp2p-activation-v1",
+                        "peer_id": f"12D3KooPaidWorker{index}",
+                    },
+                })
+            chain_workers.append(chain_worker)
         chain_path = tmp_path / "chain.yaml"
         chain_path.write_text(
             yaml.safe_dump(
@@ -485,6 +638,7 @@ def _paid_stack(
             gateway_thread,
             tokenizer,
             chain_path,
+            sidecar,
         )
     finally:
         if gateway is not None:
@@ -493,6 +647,8 @@ def _paid_stack(
             gateway_thread.join(timeout=5)
         for item in workers:
             item.close()
+        if sidecar is not None:
+            sidecar.close()
         ledger.close()
         service.close()
         if tokenizer is not None:
@@ -592,6 +748,27 @@ def test_paid_happy_path_settles_before_release_and_preserves_value(
         }
 
 
+def test_paid_libp2p_primary_forward_succeeds_and_settles(
+    tmp_path, monkeypatch
+):
+    with _paid_stack(
+        tmp_path, monkeypatch,
+        [(0, TOTAL_LAYERS, "solo")],
+        relay_endpoint=True,
+    ) as stack:
+        status, response, _response_at = _chat(stack.gateway_url)
+        hold = _only_hold(stack.service)
+
+        assert status == 200
+        assert response["choices"][0]["message"]["content"] == "AB"
+        assert hold["state"] == "settled"
+        assert hold["escrow_balance"] == 0
+        assert [entry["state"] for entry in hold["workers"]] == ["final"]
+        assert stack.sidecar is not None
+        assert stack.sidecar.requests == ["12D3KooPaidWorker0"]
+        _assert_zero_sum(stack.service)
+
+
 def test_paid_runtime_worker_identity_mismatch_never_computes_and_releases_hold(
     tmp_path, monkeypatch
 ):
@@ -613,6 +790,30 @@ def test_paid_runtime_worker_identity_mismatch_never_computes_and_releases_hold(
         assert [entry["state"] for entry in hold["workers"]] == ["abandoned"]
         assert hold["escrow_balance"] == 0
         assert stack.service.store.balance(stack.consumer.operator) == FUNDED
+        _assert_zero_sum(stack.service)
+
+
+def test_paid_relay_attestation_mismatch_rejects_before_compute(
+    tmp_path, monkeypatch
+):
+    with _paid_stack(
+        tmp_path,
+        monkeypatch,
+        [(0, TOTAL_LAYERS, "solo")],
+        dial_identity_as=1,
+        relay_endpoint=True,
+    ) as stack:
+        status, response, _ = _chat(stack.gateway_url)
+        hold = _only_hold(stack.service)
+
+        assert status == 503
+        assert "AB" not in json.dumps(response)
+        assert stack.workers[0].daemon.calls == []
+        assert hold["state"] == "settled"
+        assert [entry["state"] for entry in hold["workers"]] == ["abandoned"]
+        assert stack.service.store.balance(stack.consumer.operator) == FUNDED
+        assert stack.sidecar is not None
+        assert stack.sidecar.requests == ["12D3KooPaidWorker0"]
         _assert_zero_sum(stack.service)
 
 
