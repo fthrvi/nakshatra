@@ -139,11 +139,15 @@ def test_an_unserved_run_id_is_refused_even_with_recent_unrelated_activity(tmp_p
     assert resp.sig == ""
 
 
-def test_a_forged_output_hash_for_a_real_run_is_refused_when_this_worker_produced_the_tokens():
+def test_a_forged_output_hash_for_a_real_run_is_refused_when_this_worker_produced_the_tokens(
+        tmp_path, monkeypatch):
     """This worker WAS mode="last" for run "r" and actually emitted tokens [1, 2, 3] — the
     real output_sha256 is `receipt.output_sha256([1,2,3])`. A caller claiming a DIFFERENT hash
     for the same run_id must be refused: the worker can check this one itself, and does."""
     from receipt import output_sha256 as real_output_sha256
+    key_path = tmp_path / "worker.key"
+    key_path.write_bytes(os.urandom(32))
+    monkeypatch.setattr(wauth, "WORKER_KEY_PATH", key_path)
     s = _servicer()
     s._record_session_activity("r", token_id=1)
     s._record_session_activity("r", token_id=2)
