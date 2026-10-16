@@ -107,6 +107,18 @@ def test_worker_endpoint_flows_into_yaml():
     assert w["address"] == "10.42.0.1" and w["port"] == 5540
 
 
+def test_public_keys_are_paid_only_additive_output():
+    pool = [_w("prithvi-self", "self")]
+    legacy = sp.plan_chain(
+        "prithvi-private", pool, num_layers=16, hidden_size=4096,
+        min_tier_fn=MT, rank=RANK)
+    paid = sp.plan_chain(
+        "prithvi-private", pool, num_layers=16, hidden_size=4096,
+        min_tier_fn=MT, rank=RANK, include_public_keys=True)
+    assert "public_key_hex" not in legacy.chain["workers"][0]
+    assert paid.chain["workers"][0]["public_key_hex"] == "prithvi-self-key"
+
+
 def test_max_stages_caps_hops_for_wan():
     # FEWER-HOP placement: 4 eligible self workers, but cap to 2 stages (each holds more layers) — the
     # WAN win (each chain hop is a latency-bound round-trip; 2 stages ~= 2x faster than 4).
