@@ -783,24 +783,67 @@ def _sidecar_forward(peer_id: str, socket_path: str | None = None,
             "libp2p activation endpoint requires NAKSHATRA_P2P_SOCKET")
     if not os.path.isabs(socket_path):
         raise RuntimeError("NAKSHATRA_P2P_SOCKET must be an absolute path")
-    if require_uid_owned:
-        try:
-            socket_info = os.lstat(socket_path)
-        except OSError as exc:
-            raise RuntimeError(
-                f"paid libp2p activation requires a live uid-owned sidecar socket: {exc}"
-            ) from exc
-        if (not stat.S_ISSOCK(socket_info.st_mode)
-                or socket_info.st_uid != os.getuid()):
-            raise RuntimeError(
-                "paid libp2p activation requires a uid-owned Unix sidecar socket"
-            )
-
     control = None
+    path_handle = None
     try:
+        socket_info = None
+        if require_uid_owned:
+            try:
+                socket_info = os.lstat(socket_path)
+                if (not stat.S_ISSOCK(socket_info.st_mode)
+                        or socket_info.st_uid != os.getuid()):
+                    raise RuntimeError(
+                        "paid libp2p activation requires a uid-owned Unix sidecar socket"
+                    )
+                path_handle = os.open(
+                    socket_path,
+                    os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC,
+                )
+                pinned_info = os.fstat(path_handle)
+            except RuntimeError:
+                raise
+            except OSError as exc:
+                raise RuntimeError(
+                    "paid libp2p activation requires a live uid-owned "
+                    f"sidecar socket: {exc}"
+                ) from exc
+            if ((pinned_info.st_dev, pinned_info.st_ino)
+                    != (socket_info.st_dev, socket_info.st_ino)
+                    or not stat.S_ISSOCK(pinned_info.st_mode)
+                    or pinned_info.st_uid != os.getuid()):
+                raise RuntimeError(
+                    "paid libp2p activation sidecar socket changed before connect"
+                )
+
         control = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         control.settimeout(timeout)
         control.connect(socket_path)
+        if require_uid_owned:
+            try:
+                credentials = control.getsockopt(
+                    socket.SOL_SOCKET, socket.SO_PEERCRED,
+                    struct.calcsize("3i"),
+                )
+                _pid, peer_uid, _gid = struct.unpack("3i", credentials)
+                pinned_after = os.fstat(path_handle)
+                current_info = os.lstat(socket_path)
+            except (OSError, struct.error) as exc:
+                raise RuntimeError(
+                    f"paid libp2p activation could not authenticate sidecar: {exc}"
+                ) from exc
+            if peer_uid != os.getuid():
+                raise RuntimeError(
+                    "paid libp2p activation requires a same-uid sidecar listener"
+                )
+            pinned_identity = (pinned_after.st_dev, pinned_after.st_ino)
+            if (pinned_identity != (socket_info.st_dev, socket_info.st_ino)
+                    or pinned_identity
+                    != (current_info.st_dev, current_info.st_ino)
+                    or not stat.S_ISSOCK(current_info.st_mode)
+                    or current_info.st_uid != os.getuid()):
+                raise RuntimeError(
+                    "paid libp2p activation sidecar socket changed during connect"
+                )
         control.sendall(f"FORWARD {endpoint['peer_id']}\n".encode("ascii"))
         response = b""
         while b"\n" not in response and len(response) <= 4096:
@@ -813,6 +856,8 @@ def _sidecar_forward(peer_id: str, socket_path: str | None = None,
     finally:
         if control is not None:
             control.close()
+        if path_handle is not None:
+            os.close(path_handle)
     if len(response) > 4096 or b"\n" not in response:
         raise RuntimeError("sidecar FORWARD returned an unterminated response")
     try:
@@ -959,13 +1004,19 @@ def _fetch_registry_peers(registry_url: str, model_id: str = "") -> list[dict]:
     return [p for p in peers if isinstance(p, dict)]
 
 
-def _require_pinned_pillar_projection() -> str:
+def _require_pinned_pillar_projection(registry_url: str) -> str:
     """Return the configured Pillar SPKI or refuse paid projection data.
 
     ``_registry_urlopen`` supplies request authentication and passes this pin
     to the HTTPS opener. Paid planning must never import identity, endpoint,
     or worker-pin facts from an unpinned response.
     """
+    from urllib.parse import urlsplit
+
+    if urlsplit(registry_url).scheme.lower() != "https":
+        raise PermissionError(
+            "paid chain projection requires an HTTPS Pillar URL"
+        )
     pin = _sanitize_spki(os.environ.get("STHAMBHA_PILLAR_SPKI_SHA256"))
     if not pin:
         raise PermissionError(
@@ -1116,17 +1167,16 @@ def _admit_activation_workers(model_id: str, workers: list[dict],
         "1", "true", "yes", "on",
     }
     pillar_pin = os.environ.get("STHAMBHA_PILLAR_SPKI_SHA256", "").strip()
+    if trust_pillar and re.fullmatch(r"[0-9a-fA-F]{64}", pillar_pin):
+        return
+    from fabric import worker_join as wj
+
     by_node = {str(p.get("node_id") or p.get("id") or ""): p for p in peers}
-    pillar_is_authority = (
-        trust_pillar and re.fullmatch(r"[0-9a-fA-F]{64}", pillar_pin) is not None
-    )
-    roster = {}
-    if not pillar_is_authority:
-        from fabric import worker_join as wj
-        if roster_loader is None:
-            admission = wj._load_admission()
-            roster_loader = admission.load_peers
-        roster = roster_loader() or {}
+
+    if roster_loader is None:
+        admission = wj._load_admission()
+        roster_loader = admission.load_peers
+    roster = roster_loader() or {}
     standings = []
     for hop in typed:
         endpoint = _parse_activation_endpoint(hop.get("endpoint"))
@@ -1143,23 +1193,15 @@ def _admit_activation_workers(model_id: str, workers: list[dict],
         if not pubkey:
             raise PermissionError(
                 f"identity firewall: activation peer {node_id!r} has no node public key")
-        inline_pubkey = str(hop.get("public_key_hex") or "").strip().lower()
-        if inline_pubkey and inline_pubkey != pubkey:
-            raise PermissionError(
-                f"identity firewall: public-key mismatch for activation peer {node_id!r}")
-        hop["public_key_hex"] = pubkey
         registered_spki = _sanitize_spki(peer.get("peer_spki_hash"))
         inline_spki = _sanitize_spki(hop.get("peer_spki_hash"))
-        if not registered_spki and not inline_spki:
+        if not registered_spki:
             raise PermissionError(
-                f"identity firewall: activation peer {node_id!r} has no worker "
-                "SPKI in either /chain or /peers; worker must re-register")
-        if inline_spki and registered_spki and inline_spki != registered_spki:
+                f"identity firewall: activation peer {node_id!r} has no registered worker SPKI")
+        if inline_spki and inline_spki != registered_spki:
             raise PermissionError(
                 f"identity firewall: SPKI mismatch for activation peer {node_id!r}")
-        hop["peer_spki_hash"] = inline_spki or registered_spki
-        if pillar_is_authority:
-            continue
+        hop["peer_spki_hash"] = registered_spki
         roster_peer = roster.get(pubkey)
         worker_role = (roster_peer or {}).get("role", "worker")
         standing = wj.WorkerStanding(
@@ -1169,8 +1211,6 @@ def _admit_activation_workers(model_id: str, workers: list[dict],
             tenant=(roster_peer or {}).get("tenant"), capabilities={})
         standings.append(standing)
 
-    if pillar_is_authority:
-        return
     if eligible_fn is None:
         eligible, rejected = wj.eligible_workers(model_id, standings)
     else:
@@ -1373,7 +1413,7 @@ def build_chain_from_registry(registry_url: str, model_id: str, *,
     Raises RuntimeError if no contiguous chain can be built.
     """
     if strict_pinned_projection:
-        _require_pinned_pillar_projection()
+        _require_pinned_pillar_projection(registry_url)
     pillar_chain = _try_pillar_chain(registry_url, model_id)
     if pillar_chain is not None:
         peers = []

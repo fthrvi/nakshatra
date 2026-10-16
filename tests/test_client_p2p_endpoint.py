@@ -1,9 +1,11 @@
 """U4 C3: roster-gated libp2p activation endpoints in the hub client."""
 from __future__ import annotations
 
+import ast
 import io
 import json
 import struct
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -218,6 +220,36 @@ def test_paid_pinned_projection_rejects_identity_or_endpoint_disagreement(
             cli.build_chain_from_registry(
                 "https://pillar", "public-model",
                 strict_pinned_projection=True)
+
+
+@pytest.mark.parametrize("url", [
+    "http://attacker.invalid/chain?model=public-model",
+    "http://attacker.invalid/peers?model=public-model",
+    "ftp://attacker.invalid/chain?model=public-model",
+    "file:///tmp/forged-peers",
+])
+def test_paid_pinned_projection_rejects_every_non_https_url(monkeypatch, url):
+    monkeypatch.setenv("STHAMBHA_PILLAR_SPKI_SHA256", "aa" * 32)
+    with pytest.raises(PermissionError, match="HTTPS Pillar URL"):
+        cli._require_pinned_pillar_projection(url)
+
+
+def test_gate_off_activation_admission_is_byte_identical_to_parent():
+    def function_source(source: str, name: str) -> str:
+        tree = ast.parse(source)
+        node = next(item for item in tree.body
+                    if isinstance(item, ast.FunctionDef) and item.name == name)
+        lines = source.splitlines(keepends=True)
+        return "".join(lines[node.lineno - 1:node.end_lineno])
+
+    current = Path(cli.__file__).read_text()
+    parent = subprocess.run(
+        ["git", "show", "b78c240:scripts/client.py"],
+        cwd=Path(__file__).resolve().parent.parent,
+        check=True, capture_output=True, text=True,
+    ).stdout
+    assert function_source(current, "_admit_activation_workers") == \
+        function_source(parent, "_admit_activation_workers")
 
 
 def test_sidecar_forward_socket_and_spki_preservation():
@@ -542,6 +574,88 @@ def test_paid_sidecar_forward_requires_uid_owned_unix_socket(tmp_path):
     with pytest.raises(RuntimeError, match="uid-owned Unix sidecar socket"):
         cli._sidecar_forward(
             PEER_ID, str(impostor), require_uid_owned=True)
+
+
+def test_paid_sidecar_forward_rejects_symlink(tmp_path):
+    target = tmp_path / "actual.sock"
+    target.write_text("not reached")
+    impostor = tmp_path / "p2p.sock"
+    impostor.symlink_to(target)
+    with pytest.raises(RuntimeError, match="uid-owned Unix sidecar socket"):
+        cli._sidecar_forward(
+            PEER_ID, str(impostor), require_uid_owned=True)
+
+
+class _CredentialedControlSocket:
+    def __init__(self, peer_uid):
+        self.peer_uid = peer_uid
+        self.sent = b""
+
+    def settimeout(self, timeout):
+        self.timeout = timeout
+
+    def connect(self, path):
+        self.path = path
+
+    def getsockopt(self, level, option, size):
+        assert (level, option, size) == (
+            cli.socket.SOL_SOCKET, cli.socket.SO_PEERCRED,
+            struct.calcsize("3i"),
+        )
+        return struct.pack("3i", 1234, self.peer_uid, 1234)
+
+    def sendall(self, data):
+        self.sent += data
+
+    def recv(self, size):
+        return b"OK 127.0.0.1:43123\n"
+
+    def close(self):
+        pass
+
+
+def _socket_stat(inode, uid):
+    return SimpleNamespace(
+        st_dev=42, st_ino=inode, st_uid=uid,
+        st_mode=cli.stat.S_IFSOCK | 0o600,
+    )
+
+
+def test_paid_sidecar_forward_rejects_foreign_listener_credentials():
+    our_uid = cli.os.getuid()
+    info = _socket_stat(100, our_uid)
+    control = _CredentialedControlSocket(our_uid + 1)
+    with (
+        patch.object(cli.os, "lstat", return_value=info),
+        patch.object(cli.os, "open", return_value=77),
+        patch.object(cli.os, "fstat", return_value=info),
+        patch.object(cli.os, "close"),
+        patch.object(cli.socket, "socket", return_value=control),
+    ):
+        with pytest.raises(RuntimeError, match="same-uid sidecar listener"):
+            cli._sidecar_forward(
+                PEER_ID, "/run/user/1000/nakshatra/p2p.sock",
+                require_uid_owned=True)
+    assert control.sent == b""
+
+
+def test_paid_sidecar_forward_rejects_path_replacement_during_connect():
+    our_uid = cli.os.getuid()
+    original = _socket_stat(100, our_uid)
+    replacement = _socket_stat(101, our_uid)
+    control = _CredentialedControlSocket(our_uid)
+    with (
+        patch.object(cli.os, "lstat", side_effect=[original, replacement]),
+        patch.object(cli.os, "open", return_value=77),
+        patch.object(cli.os, "fstat", return_value=original),
+        patch.object(cli.os, "close"),
+        patch.object(cli.socket, "socket", return_value=control),
+    ):
+        with pytest.raises(RuntimeError, match="changed during connect"):
+            cli._sidecar_forward(
+                PEER_ID, "/run/user/1000/nakshatra/p2p.sock",
+                require_uid_owned=True)
+    assert control.sent == b""
 
 
 def test_activation_peer_id_must_be_ascii():

@@ -893,7 +893,7 @@ class ChainChatBackend(ChatBackend):
                 raise paid_client.PaidAdmissionError(
                     "paid from_roster SPKI enrichment requires a pinned Pillar URL")
             try:
-                chain_client._require_pinned_pillar_projection()
+                chain_client._require_pinned_pillar_projection(registry_url)
                 peers = chain_client._fetch_registry_peers(
                     registry_url, entry.name)
                 workers = (document.get("workers")

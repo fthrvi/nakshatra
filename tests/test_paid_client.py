@@ -828,7 +828,10 @@ def test_paid_failure_log_redacts_token_keys_and_base64_and_tails_stderr(
             f"worker_key={hex_key}",
             f"response_blob={base64_blob}",
         ])
-        return SimpleNamespace(returncode=2, stdout="", stderr="\n".join(lines))
+        error = RuntimeError(
+            f"client transport failed with claim_token={envelope['claim_token']}")
+        error.stderr = "\n".join(lines)
+        raise error
 
     monkeypatch.setattr(subprocess, "run", failed_client)
     with pytest.raises(serve.CreditGateError):
@@ -839,7 +842,8 @@ def test_paid_failure_log_redacts_token_keys_and_base64_and_tails_stderr(
     assert hex_key not in caplog.text
     assert base64_blob not in caplog.text
     assert "<redacted>" in caplog.text
-    assert "PaidAdmissionError: paid client exited 2" in caplog.text
+    assert "RuntimeError: client transport failed with claim_token=<redacted>" \
+        in caplog.text
     assert "diagnostic line 1" in caplog.text
     assert "outside retained stderr tail" not in caplog.text
 
