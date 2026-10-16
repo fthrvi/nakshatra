@@ -2458,6 +2458,9 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
             is_streaming=False,
         )
         caller_role = getattr(authenticated_keyid, "role", None)
+        paid_admission = getattr(self, "paid_admission", None)
+        fabric_transport_enabled = getattr(
+            self, "fabric_transport_enabled", False)
         # worker/kv-session-ownership-gate (2026-09-12): legacy Forward has no
         # required session_id (paid Forward now does), but it still calls into
         # the SAME daemon/KV state as an Inference stream. Without this, a
@@ -2475,14 +2478,14 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
         paid_claim = None
         paid_committed = False
         paid_selected = bool(request.spend_claim_token)
-        if (self.paid_admission is not None and authenticated_keyid is not None
+        if (paid_admission is not None and authenticated_keyid is not None
                 and explicit_session):
-            paid_selected = paid_selected or self.paid_admission.store.get_claim(
+            paid_selected = paid_selected or paid_admission.store.get_claim(
                 str(authenticated_keyid), explicit_session) is not None
         paid_selected = paid_selected or caller_role == _wgrpcauth.ROLE_CONSUMER
         if paid_selected:
             try:
-                if self.paid_admission is None or not self.paid_admission.ready:
+                if paid_admission is None or not paid_admission.ready:
                     raise _paid.PaidAdmissionUnavailable(
                         "paid admission is not ready")
                 if authenticated_keyid is None:
@@ -2499,7 +2502,7 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                 if (request.keep_kv or int(request.start_pos) != 0
                         or request.all_logits or request.eagle_hidden
                         or self.fabric_first_worker_bridge is not None
-                        or self.fabric_transport_enabled):
+                        or fabric_transport_enabled):
                     raise _paid.PaidAdmissionError(
                         "paid Forward must be stateless, cold, direct, greedy, "
                         "and outside the fabric transport")
@@ -2519,12 +2522,12 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                 if not valid_size:
                     raise _paid.PaidAdmissionError(
                         "paid Forward input dimensions are invalid")
-                paid_claim = self.paid_admission.claim(
+                paid_claim = paid_admission.claim(
                     str(authenticated_keyid), explicit_session,
                     request.spend_claim_token)
-                request_sha256 = self.paid_admission.request_digest(request)
+                request_sha256 = paid_admission.request_digest(request)
                 duplicate, paid_prompt_delta, paid_generated_delta = (
-                    self.paid_admission.prepare_step(
+                    paid_admission.prepare_step(
                         paid_claim, request.step_id, request_sha256, n_tokens))
                 if duplicate:
                     context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
@@ -2571,12 +2574,12 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                     forward_kv_epoch = self._mark_cold_kv_replacement(
                         forward_principal)
                     if paid_claim is not None:
-                        self.paid_admission.commit_step(
+                        paid_admission.commit_step(
                             paid_claim, request.step_id, request_sha256,
                             paid_prompt_delta, paid_generated_delta,
                             forward_kv_epoch)
                         paid_committed = True
-                        self.paid_admission.flush_outbox()
+                        paid_admission.flush_outbox()
             except DaemonUnavailableError as e:
                 context.set_code(grpc.StatusCode.UNAVAILABLE)
                 context.set_details(str(e))
@@ -2584,8 +2587,8 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
         finally:
             self._release_kv_session(acquired_principal)
             if paid_claim is not None and paid_committed:
-                self.paid_admission.finalize(paid_claim, "normal")
-                self.paid_admission.flush_outbox()
+                paid_admission.finalize(paid_claim, "normal")
+                paid_admission.flush_outbox()
         if not result.ok:
             context.set_code(
                 grpc.StatusCode.INVALID_ARGUMENT if result.client_error
@@ -2858,6 +2861,9 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
         stream_kv_epoch = None
         paid_claim = None
         paid_termination = "cancelled"
+        paid_admission = getattr(self, "paid_admission", None)
+        fabric_transport_enabled = getattr(
+            self, "fabric_transport_enabled", False)
         try:
             for step in _iter_with_idle_timeout(
                 request_iterator, INFERENCE_STREAM_IDLE_TIMEOUT_S
@@ -2887,9 +2893,9 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                     caller_role = getattr(authenticated_keyid, "role", None)
                     token_present = bool(step.spend_claim_token)
                     existing_paid = None
-                    if (self.paid_admission is not None
+                    if (paid_admission is not None
                             and authenticated_keyid is not None):
-                        existing_paid = self.paid_admission.store.get_claim(
+                        existing_paid = paid_admission.store.get_claim(
                             str(authenticated_keyid), stream_session_id)
                     paid_selected = (
                         caller_role == _wgrpcauth.ROLE_CONSUMER
@@ -2897,18 +2903,18 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                     if paid_selected:
                         # Direct-only is checked before the online claim so a
                         # forbidden topology cannot burn a claim or touch KV.
-                        if (self.paid_admission is None
-                                or not self.paid_admission.ready):
+                        if (paid_admission is None
+                                or not paid_admission.ready):
                             raise _paid.PaidAdmissionUnavailable(
                                 "paid admission is not ready")
                         if (step.chain or step.next_server.address or step.pushed
                                 or step.all_logits
                                 or self.fabric_first_worker_bridge is not None
-                                or self.fabric_transport_enabled):
+                                or fabric_transport_enabled):
                             raise _paid.PaidAdmissionError(
                                 "paid sessions require direct greedy inference; "
                                 "chain, next_server, push, speculation, and fabric are forbidden")
-                        paid_claim = self.paid_admission.claim(
+                        paid_claim = paid_admission.claim(
                             str(authenticated_keyid), stream_session_id,
                             step.spend_claim_token)
                     else:
@@ -2946,7 +2952,7 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                     if (step.chain or step.next_server.address or step.pushed
                             or step.all_logits
                             or self.fabric_first_worker_bridge is not None
-                            or self.fabric_transport_enabled):
+                            or fabric_transport_enabled):
                         raise _paid.PaidAdmissionError(
                             "paid sessions require direct greedy inference; "
                             "chain, next_server, push, speculation, and fabric are forbidden")
@@ -3044,7 +3050,7 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                 paid_generated_delta = 0
                 if paid_claim is not None:
                     duplicate, paid_prompt_delta, paid_generated_delta = (
-                        self.paid_admission.prepare_step(
+                        paid_admission.prepare_step(
                             paid_claim, step.step_id, request_sha256, n_tokens))
                     if duplicate:
                         context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
@@ -3052,7 +3058,7 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                             "KV_RESIDENCY_LOST: durable paid step requires cold replay")
                         yield self._kv_lost_step(step)
                         return
-                    paid_meter = self.paid_admission.store.meter(
+                    paid_meter = paid_admission.store.meter(
                         paid_claim["payer_keyid"], paid_claim["session_id"])
                     if (int(paid_meter["receipt_sequence"]) > 0
                             and self._resident_epoch(session_principal) is None):
@@ -3183,11 +3189,11 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                 if paid_claim is not None:
                     # The usage journal and signed outbox entry are durable
                     # before any successful paid response can escape.
-                    self.paid_admission.commit_step(
+                    paid_admission.commit_step(
                         paid_claim, step.step_id, request_sha256,
                         paid_prompt_delta, paid_generated_delta,
                         stream_kv_epoch)
-                    self.paid_admission.flush_outbox()
+                    paid_admission.flush_outbox()
                 # 2026-09-12 participation binding — see SignParticipation's docstring.
                 # Records that THIS worker served THIS session (every mode), and — only for
                 # a real accepted final token — the exact id, so `_participation_evidence`
@@ -3361,9 +3367,9 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                 self._release_kv_session(owned_principal)
             if paid_claim is not None:
                 try:
-                    self.paid_admission.finalize(
+                    paid_admission.finalize(
                         paid_claim, paid_termination)
-                    self.paid_admission.flush_outbox()
+                    paid_admission.flush_outbox()
                 except _paid.PaidAdmissionError:
                     # The durable nonfinal receipt remains replayable; never
                     # leak receipt or payer material into daemon logs.
