@@ -42,7 +42,13 @@ service Nakshatra {
   rpc SignParticipation(SignParticipationRequest) returns (SignParticipationResponse);
 }
 
-message InfoRequest {}
+message InfoRequest {
+  // Paid direct calls send a fresh 32-byte challenge. The worker signs the
+  // domain-separated challenge with its persistent Ed25519 roster key so the
+  // client can bind that economic identity to this SPKI-pinned TLS channel.
+  // Empty preserves the legacy/readiness-probe handshake.
+  bytes identity_challenge = 1;
+}
 
 message InfoResponse {
   string protocol_version    = 1;   // semver, e.g. "0.1.0"
@@ -69,6 +75,11 @@ message InfoResponse {
   //   "stream_spec"        — InferenceStep.all_logits honoured on the streaming
   //                          Inference RPC (speculative decode on the stream, 2026-07-29)
   repeated string protocol_capabilities = 12;
+  // Present only when InfoRequest.identity_challenge is non-empty. Signature
+  // is raw Ed25519 over ASCII "nakshatra-paid-info-v1", one NUL byte,
+  // then the challenge.
+  string worker_keyid       = 13;
+  bytes  identity_signature = 14;
 }
 
 message ForwardRequest {

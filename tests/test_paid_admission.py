@@ -185,6 +185,23 @@ def test_spend_client_uses_exact_n3_routes_and_request_schemas():
     assert all(pin == "1" * 64 for _method, _path, _body, pin in seen)
 
 
+@pytest.mark.parametrize("field", [
+    "v", "layer_start", "layer_end", "price_multiplier",
+    "max_prompt_tokens", "max_output_tokens", "max_token_layers", "max_cost",
+    "execution_deadline", "settlement_deadline", "server_time",
+])
+@pytest.mark.parametrize("replacement", [True, False])
+def test_every_claim_integer_field_rejects_booleans(field, replacement):
+    private, public = auth.generate_keypair()
+    client = paid.SpendLedgerClient(
+        "https://ledger.example", "1" * 64, private, public,
+        opener=lambda *_args, **_kwargs: None)
+    response = _claim(public, "stable-instance")
+    response[field] = replacement
+    with pytest.raises(paid.PaidAdmissionUnavailable):
+        client._validate_claim(response, TOKEN, "stable-instance")
+
+
 def test_receipts_match_strict_n2_schema_id_and_signature(tmp_path):
     manager, ledger, private, public = _manager(tmp_path)
     claim = manager.claim(PAYER, "paid-session", TOKEN)
