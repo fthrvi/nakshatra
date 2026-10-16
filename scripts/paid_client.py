@@ -1,4 +1,4 @@
-"""Payment-bound gateway/client invariants shared by the two processes.
+"""Payment-bound gateway/client invariants shared by the gateway and client.
 
 This module is intentionally pure: it plans exact worker identities/spans,
 validates the strict Neuron wire shapes, and decides whether buffered output
@@ -10,7 +10,11 @@ import hashlib
 import json
 import os
 import re
+import secrets
 from typing import Iterable, Mapping, Sequence
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric import ed25519
 
 
 REQUIRED_PAID_CAPABILITIES = frozenset({
@@ -58,6 +62,8 @@ _MAX_ENVELOPE_BYTES = 64 * 1024
 _MAX_WORKERS = 128
 _MAX_TOKENS = 1_000_000
 _MAX_LAYERS = 1_000_000
+INFO_ATTESTATION_DOMAIN = b"nakshatra-paid-info-v1\0"
+INFO_CHALLENGE_BYTES = 32
 
 
 class PaidAdmissionError(RuntimeError):
@@ -118,6 +124,27 @@ def worker_keyid(worker: Mapping[str, object]) -> str:
     raise PaidAdmissionError("paid chain hop has no full worker public key")
 
 
+def make_info_challenge() -> bytes:
+    """Return a fresh challenge for one paid worker's channel-bound Info."""
+    return secrets.token_bytes(INFO_CHALLENGE_BYTES)
+
+
+def verify_info_attestation(info: object, challenge: bytes) -> str:
+    """Return the Ed25519 key proven by Info on this pinned TLS channel."""
+    if not isinstance(challenge, bytes) or len(challenge) != INFO_CHALLENGE_BYTES:
+        raise PaidAdmissionError("paid Info challenge is invalid")
+    keyid = _keyid(getattr(info, "worker_keyid", None), "worker_keyid")
+    signature = getattr(info, "identity_signature", None)
+    if not isinstance(signature, bytes) or len(signature) != 64:
+        raise PaidAdmissionError("paid worker identity signature is invalid")
+    try:
+        ed25519.Ed25519PublicKey.from_public_bytes(bytes.fromhex(keyid)).verify(
+            signature, INFO_ATTESTATION_DOMAIN + challenge)
+    except (InvalidSignature, ValueError, TypeError) as exc:
+        raise PaidAdmissionError("paid worker identity signature is invalid") from exc
+    return keyid
+
+
 def exact_chain_plan(workers: Iterable[Mapping[str, object]]) -> list[dict]:
     """Freeze the precise economic chain in layer order.
 
@@ -151,19 +178,32 @@ def exact_chain_plan(workers: Iterable[Mapping[str, object]]) -> list[dict]:
     return stages
 
 
+def require_paid_tls_pins(workers: Iterable[Mapping[str, object]]) -> None:
+    """Require one signed-roster SPKI hash for every paid direct hop."""
+    seen = False
+    for worker in workers:
+        seen = True
+        pin = worker.get("peer_spki_hash")
+        if not isinstance(pin, str) or _SHA256_RE.fullmatch(pin) is None:
+            raise PaidAdmissionError("paid chain hop has no valid TLS SPKI pin")
+    if not seen:
+        raise PaidAdmissionError("paid chain is empty")
+
+
 def plan_sha256(plan: Sequence[Mapping[str, object]]) -> str:
     canonical = json.dumps(list(plan), sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(canonical).hexdigest()
 
 
 def runtime_chain_plan(sorted_stubs: Iterable[tuple]) -> list[dict]:
-    """Describe the identities/spans the client is about to call."""
+    """Describe the attested identities/spans the client is about to call."""
     stages = []
     for worker, _stub, info in sorted_stubs:
         stages.append({
-            "worker_keyid": worker_keyid(worker),
-            "layer_start": int(info.layer_start),
-            "layer_end": int(info.layer_end),
+            "worker_keyid": _keyid(
+                worker.get("_paid_attested_worker_keyid"), "worker_keyid"),
+            "layer_start": _integer(info.layer_start, "layer_start"),
+            "layer_end": _integer(info.layer_end, "layer_end", minimum=1),
         })
     return exact_chain_plan(stages)
 
@@ -335,6 +375,15 @@ def validate_status(value: object, *, request: Mapping[str, object],
     status = _exact_object(value, STATUS_FIELDS, "spend status response")
     if status["v"] != 1 or isinstance(status["v"], bool):
         raise PaidAdmissionError("unknown spend status response version")
+    for field in (
+        "max_prompt_tokens", "max_output_tokens", "max_token_layers", "max_cost",
+        "authorized_at", "execution_deadline", "settlement_deadline",
+        "escrow_balance",
+    ):
+        _integer(status[field], field, minimum=(1 if field in {
+            "authorized_at", "execution_deadline", "settlement_deadline"} else 0))
+    if status["terminal_at"] is not None:
+        _integer(status["terminal_at"], "terminal_at", minimum=1)
     immutable = {
         "hold_id": authorization["hold_id"],
         "session_id": request["session_id"],
@@ -353,10 +402,6 @@ def validate_status(value: object, *, request: Mapping[str, object],
     _text(status["payer_account_at_authorize"], "payer_account_at_authorize")
     if status["state"] not in _HOLD_STATES or not isinstance(status["release_requested"], bool):
         raise PaidAdmissionError("unknown spend hold state")
-    _integer(status["authorized_at"], "authorized_at", minimum=1)
-    if status["terminal_at"] is not None:
-        _integer(status["terminal_at"], "terminal_at", minimum=1)
-    _integer(status["escrow_balance"], "escrow_balance")
     raw_workers = status["workers"]
     if not isinstance(raw_workers, list):
         raise PaidAdmissionError("unknown spend status workers schema")
@@ -371,6 +416,15 @@ def validate_status(value: object, *, request: Mapping[str, object],
         seen.add(key)
         stage = expected_plan[key]
         auth_worker = auth_workers[key]
+        for field in (
+            "layer_start", "layer_end", "price_multiplier", "max_prompt_tokens",
+            "max_output_tokens", "max_token_layers", "max_cost",
+            "cumulative_prompt_tokens", "cumulative_generated_tokens",
+            "cumulative_token_layers", "cumulative_cost",
+        ):
+            _integer(worker[field], field, minimum=(1 if field == "layer_end" else 0))
+        if worker["claimed_at"] is not None:
+            _integer(worker["claimed_at"], "claimed_at", minimum=1)
         if (worker["layer_start"], worker["layer_end"]) != (
                 stage["layer_start"], stage["layer_end"]):
             raise PaidAdmissionError("status worker span differs from the plan")
@@ -384,14 +438,6 @@ def validate_status(value: object, *, request: Mapping[str, object],
         if worker["state"] not in _ENTRY_STATES or not isinstance(worker["final"], bool):
             raise PaidAdmissionError("unknown spend worker state")
         _text(worker["worker_account_at_authorize"], "worker_account_at_authorize")
-        for field in (
-            "cumulative_prompt_tokens", "cumulative_generated_tokens",
-            "cumulative_token_layers", "cumulative_cost",
-        ):
-            _integer(worker[field], field)
-        for field in ("claimed_at",):
-            if worker[field] is not None:
-                _integer(worker[field], field, minimum=1)
         receipt_id = worker["final_receipt_id"]
         if (receipt_id is not None
                 and (not isinstance(receipt_id, str)

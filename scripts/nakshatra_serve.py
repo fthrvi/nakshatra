@@ -826,7 +826,7 @@ class ChainChatBackend(ChatBackend):
         if self._scripts not in sys.path:
             sys.path.insert(0, self._scripts)
         import client as chain_client
-        import paid_admission
+        import paid_client
 
         if entry.from_roster:
             source_path = self._roster_chain_yaml(entry, paid=True)
@@ -843,9 +843,10 @@ class ChainChatBackend(ChatBackend):
             }
         workers = document.get("workers") if isinstance(document, dict) else None
         if not isinstance(workers, list):
-            raise paid_admission.PaidAdmissionError(
+            raise paid_client.PaidAdmissionError(
                 "paid chain config has no workers list")
-        plan = paid_admission.exact_chain_plan(workers)
+        paid_client.require_paid_tls_pins(workers)
+        plan = paid_client.exact_chain_plan(workers)
 
         # Even a static chain path can be edited between authorization and
         # client startup. Give the client an immutable snapshot owned by this
@@ -895,49 +896,49 @@ class ChainChatBackend(ChatBackend):
 
     def _close_paid_hold(self, hook, request, authorization, used: set[str]):
         """Abandon provably untouched entries, then always request release."""
-        import paid_admission
+        import paid_client
         errors = []
         planned = {stage["worker_keyid"] for stage in request["workers"]}
         for worker_key in sorted(planned - used):
             try:
-                paid_admission.validate_status(
+                paid_client.validate_status(
                     hook.abandon_spend(authorization["hold_id"], worker_key),
                     request=request, authorization=authorization)
             except Exception as exc:  # keep releasing the rest of the hold
                 errors.append(exc)
         try:
-            paid_admission.validate_status(
+            paid_client.validate_status(
                 hook.release_spend(authorization["hold_id"]),
                 request=request, authorization=authorization)
         except Exception as exc:
             errors.append(exc)
         if errors:
-            raise paid_admission.PaidAdmissionError(
+            raise paid_client.PaidAdmissionError(
                 "paid hold abandonment/release failed") from errors[0]
 
     def _poll_paid_status(self, hook, request, authorization, used: set[str]):
-        import paid_admission
+        import paid_client
         try:
             timeout = max(0.0, float(os.environ.get(
                 "NAKSHATRA_PAID_STATUS_TIMEOUT", "30")))
             interval = max(0.01, float(os.environ.get(
                 "NAKSHATRA_PAID_STATUS_INTERVAL", "0.25")))
         except ValueError as exc:
-            raise paid_admission.PaidAdmissionError(
+            raise paid_client.PaidAdmissionError(
                 "invalid paid status polling configuration") from exc
         deadline = time.monotonic() + timeout
         while True:
-            status = paid_admission.validate_status(
+            status = paid_client.validate_status(
                 hook.spend_status(authorization["hold_id"]),
                 request=request, authorization=authorization)
             if status["state"] == "settled":
-                paid_admission.require_releasable_status(status, used=used)
+                paid_client.require_releasable_status(status, used=used)
                 return status
             if status["state"] in {"expired", "cancelled", "disputed"}:
-                raise paid_admission.PaidAdmissionError(
+                raise paid_client.PaidAdmissionError(
                     f"paid hold ended as {status['state']}")
             if time.monotonic() >= deadline:
-                raise paid_admission.PaidAdmissionError(
+                raise paid_client.PaidAdmissionError(
                     "paid status did not reach settled")
             time.sleep(min(interval, max(0.0, deadline - time.monotonic())))
 
@@ -946,7 +947,7 @@ class ChainChatBackend(ChatBackend):
         import subprocess
         import tempfile
         import uuid
-        import paid_admission
+        import paid_client
 
         hook = self._ledger_hook()
         try:
@@ -964,7 +965,7 @@ class ChainChatBackend(ChatBackend):
             config_path, plan, config_owned = self._paid_chain_config(entry)
             prompt_tokens = self._paid_prompt_tokens(entry, prompt)
             session_id = uuid.uuid4().hex
-            request = paid_admission.authorize_request(
+            request = paid_client.authorize_request(
                 client_nonce=uuid.uuid4().hex,
                 session_id=session_id,
                 model_id=entry.name,
@@ -972,9 +973,9 @@ class ChainChatBackend(ChatBackend):
                 output_tokens=int(max_tokens),
                 plan=plan,
             )
-            authorization = paid_admission.validate_authorization(
+            authorization = paid_client.validate_authorization(
                 hook.authorize_spend(request), request)
-            envelope = paid_admission.make_paid_envelope(
+            envelope = paid_client.make_paid_envelope(
                 claim_token=authorization["claim_token"],
                 hold_id=authorization["hold_id"],
                 session_id=session_id,
@@ -1016,7 +1017,7 @@ class ChainChatBackend(ChatBackend):
                 progress = self._read_fd_all(progress_read)
                 progress_read = -1
                 try:
-                    used = paid_admission.parse_invocation_events(progress, plan)
+                    used = paid_client.parse_invocation_events(progress, plan)
                 except Exception:
                     # A corrupt/missing progress record can never license an
                     # abandon. Conservatively retain every stage as possibly used.
@@ -1025,7 +1026,7 @@ class ChainChatBackend(ChatBackend):
                 if client_error is not None:
                     raise client_error
                 if out.returncode != 0:
-                    raise paid_admission.PaidAdmissionError(
+                    raise paid_client.PaidAdmissionError(
                         f"paid client exited {out.returncode}")
                 text = _parse_client_output(out.stdout)
             finally:
@@ -1055,7 +1056,7 @@ class ChainChatBackend(ChatBackend):
         try:
             status = self._poll_paid_status(
                 hook, request, authorization, used)
-            audit = paid_admission.audit_receipt(
+            audit = paid_client.audit_receipt(
                 status, output_text=text, used=used)
         except Exception as exc:
             raise CreditGateError("paid finality unavailable", 503) from exc

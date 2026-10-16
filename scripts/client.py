@@ -42,7 +42,7 @@ from client_defaults import (
     resolve_p2p_socket,
     resolve_registry_keyid,
 )
-import paid_admission
+import paid_client
 from step_text import escape_step_text   # one token = one output line (see step_text.py)
 from edge_health import EdgeError, EdgeFailureKind   # #17 live seam: typed edge faults so the
 # recovery loop can swap a dead worker instead of the process dying. Pure stdlib (duck-types grpc).
@@ -1418,10 +1418,10 @@ def main():
     paid = None
     if args.paid_admission_fd >= 0:
         try:
-            paid = paid_admission.read_paid_envelope(args.paid_admission_fd)
-        except paid_admission.PaidAdmissionError as exc:
+            paid = paid_client.read_paid_envelope(args.paid_admission_fd)
+        except paid_client.PaidAdmissionError as exc:
             sys.exit(f"[paid] admission envelope refused: {exc}")
-        refusal = paid_admission.paid_mode_refusal(
+        refusal = paid_client.paid_mode_refusal(
             push=args.use_streaming_push,
             speculative=args.speculative,
             stream_spec=args.stream_spec,
@@ -1443,6 +1443,8 @@ def main():
         args.use_streaming = True
     # --tls-mode=required is only meaningful if the TLS module is importable.
     # Fail loud rather than silently downgrading to insecure.
+    if paid is not None and not _TLS_AVAILABLE:
+        sys.exit("[paid] pinned TLS support is unavailable")
     if args.tls_mode == "required" and not _TLS_AVAILABLE:
         sys.exit("--tls-mode=required but nakshatra_tls module is not "
                  "importable; cannot pin channels. Install the Phase 2 TLS "
@@ -1562,16 +1564,31 @@ def main():
             resolved_spec = _resolve_activation_endpoint(
                 spec, tls_mode=args.tls_mode)
             addr = resolved_spec[_CLIENT_DIAL_ADDRESS]
+            if paid is not None and not resolved_spec.get("peer_spki_hash"):
+                sys.exit(
+                    f"[paid] pre-compute admission refused: {w['id']} has no valid TLS SPKI pin")
             # 2026-05-26 SPKI: build a TLS-pinned channel when we have a
             # hash, falling back per --tls-mode policy. Same channel is
             # reused by every later Forward / Inference RPC, so fixing
             # this single call site lights up the whole chain.
             ch = _open_chain_channel(
                 addr, resolved_spec.get("peer_spki_hash") or None,
-                "required" if spec.get("endpoint") is not None else args.tls_mode,
+                ("required" if paid is not None or spec.get("endpoint") is not None
+                 else args.tls_mode),
             )
             stub = pb_grpc.NakshatraStub(ch)
-            info = info_with_startup_wait(stub, pb.InfoRequest(), timeout=10.0)
+            identity_challenge = (
+                paid_client.make_info_challenge() if paid is not None else b"")
+            info = info_with_startup_wait(
+                stub, pb.InfoRequest(identity_challenge=identity_challenge),
+                timeout=10.0)
+            attested_worker_keyid = None
+            if paid is not None:
+                try:
+                    attested_worker_keyid = paid_client.verify_info_attestation(
+                        info, identity_challenge)
+                except paid_client.PaidAdmissionError as exc:
+                    sys.exit(f"[paid] pre-compute admission refused: {exc}")
             caps = list(info.protocol_capabilities)
             # v1.0 §7 — negotiate the control-protocol version on the same
             # handshake. Refuse to build a chain with a worker we can't speak
@@ -1599,6 +1616,8 @@ def main():
             # legacy address and may no longer even be the active alternate).
             active_w = dict(w)
             active_w.update(resolved_spec)
+            if attested_worker_keyid is not None:
+                active_w["_paid_attested_worker_keyid"] = attested_worker_keyid
             policy_key = (
                 active_w.get("node_id") or active_w.get("id"),
                 active_w.get(_CLIENT_DIAL_ADDRESS),
@@ -1655,12 +1674,12 @@ def main():
     # happens until both comparisons pass.
     if paid is not None:
         try:
-            paid_admission.require_paid_capabilities(sorted_stubs)
-            paid_admission.require_exact_runtime_plan(paid["plan"], sorted_stubs)
+            paid_client.require_paid_capabilities(sorted_stubs)
+            paid_client.require_exact_runtime_plan(paid["plan"], sorted_stubs)
             if args.model_id and args.model_id != paid["model_id"]:
-                raise paid_admission.PaidAdmissionError(
+                raise paid_client.PaidAdmissionError(
                     "paid model differs from the authorized model")
-        except paid_admission.PaidAdmissionError as exc:
+        except paid_client.PaidAdmissionError as exc:
             sys.exit(f"[paid] pre-compute admission refused: {exc}")
 
     # Tokenize
@@ -1810,12 +1829,12 @@ def main():
         if args.use_streaming:
             spend_claim_token = ""
             if paid is not None:
-                worker_key = paid_admission.worker_keyid(w)
+                worker_key = paid_client.worker_keyid(w)
                 if worker_key not in paid_invoked:
                     # Record conservatively before the RPC. If the process
                     # dies after this write, the gateway will never abandon
                     # an entry that might have reached its worker.
-                    paid_admission.write_invocation_event(
+                    paid_client.write_invocation_event(
                         args.paid_progress_fd, worker_key)
                     paid_invoked.add(worker_key)
                     spend_claim_token = paid["claim_token"]

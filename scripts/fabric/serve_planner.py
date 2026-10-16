@@ -181,6 +181,8 @@ def plan_chain(model_id: str, workers: Sequence[wj.WorkerStanding], *,
         }
         if include_public_keys:
             worker_yaml["public_key_hex"] = w.pubkey
+            worker_yaml["peer_spki_hash"] = str(
+                (w.capabilities or {}).get("peer_spki_hash") or "")
         workers_yaml.append(worker_yaml)
     chain = {"model": {"id": model_id, "hidden_size": hidden_size,
                        "num_blocks": num_layers, "wire_dtype": wire_dtype},
@@ -207,7 +209,11 @@ def standings_from_roster(*, roster_loader: Optional[Callable[[], dict]] = None)
         standings.append(wj.WorkerStanding(
             node_id=p.get("name") or pub[:12], pubkey=pub, admitted=True,
             tier=p.get("tier", "stranger"), tenant=p.get("tenant"),
-            capabilities={"address": addr or "127.0.0.1", "port": int(port) if port.isdigit() else 0}))
+            capabilities={
+                "address": addr or "127.0.0.1",
+                "port": int(port) if port.isdigit() else 0,
+                "peer_spki_hash": str(p.get("peer_spki_hash") or "").strip().lower(),
+            }))
     return standings
 
 

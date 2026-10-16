@@ -29,6 +29,7 @@ Env:
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import logging
 import os
@@ -46,6 +47,10 @@ _LOG = logging.getLogger(__name__)
 
 class LedgerUnavailable(RuntimeError):
     """Strict accounting could not prove that the run was chargeable/settled."""
+
+
+class LedgerConflict(LedgerUnavailable):
+    """The ledger explicitly rejected an idempotent spend operation as 409."""
 
 
 def _truthy(v: str) -> bool:
@@ -240,7 +245,10 @@ class LedgerHook:
 
     def authorize_spend(self, request: dict) -> dict:
         self.require_paid_spend()
-        return self._required_post("/spend/authorize", request, "spend authorize")
+        return self._required_post(
+            "/spend/authorize", request, "spend authorize",
+            retry_ambiguous_transport=True,
+        )
 
     def abandon_spend(self, hold_id: str, worker_keyid: str) -> dict:
         self.require_paid_spend()
@@ -332,21 +340,35 @@ class LedgerHook:
             raise LedgerUnavailable(f"ledger returned an invalid {label} response")
         return value
 
-    def _required_post(self, path: str, body: dict, label: str) -> dict:
+    def _required_post(self, path: str, body: dict, label: str, *,
+                       retry_ambiguous_transport: bool = False) -> dict:
         if not self.enabled:
             raise LedgerUnavailable("ledger accounting is disabled")
         if self._private_key is None:
             raise LedgerUnavailable("ledger signing key unavailable")
-        try:
-            value = self._post(path, body)
-        except urllib.error.HTTPError as e:
-            if e.code == 401:
-                self._log_signature_refusal()
-            detail = self._http_error_json(e).get("error")
-            suffix = f": {detail}" if isinstance(detail, str) and detail else ""
-            raise LedgerUnavailable(f"ledger {label} HTTP {e.code}{suffix}") from e
-        except Exception as e:
-            raise LedgerUnavailable(f"ledger {label} unavailable ({e})") from e
+        attempts = 2 if retry_ambiguous_transport else 1
+        for attempt in range(attempts):
+            try:
+                value = self._post(path, body)
+                break
+            except urllib.error.HTTPError as e:
+                if e.code == 401:
+                    self._log_signature_refusal()
+                detail = self._http_error_json(e).get("error")
+                suffix = f": {detail}" if isinstance(detail, str) and detail else ""
+                if e.code == 409:
+                    raise LedgerConflict(
+                        f"ledger {label} conflict (HTTP 409){suffix}") from e
+                raise LedgerUnavailable(f"ledger {label} HTTP {e.code}{suffix}") from e
+            except (urllib.error.URLError, OSError, TimeoutError,
+                    http.client.HTTPException) as e:
+                if attempt + 1 < attempts:
+                    continue
+                raise LedgerUnavailable(
+                    f"ledger {label} unavailable after bounded retry ({type(e).__name__})"
+                ) from e
+            except Exception as e:
+                raise LedgerUnavailable(f"ledger {label} unavailable ({e})") from e
         if not isinstance(value, dict):
             raise LedgerUnavailable(f"ledger returned an invalid {label} response")
         return value

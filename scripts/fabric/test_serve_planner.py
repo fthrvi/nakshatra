@@ -16,9 +16,10 @@ MODEL_MIN = {"prithvi-private": "self", "deepseek-r1-distill-llama-8b": "trusted
 MT = lambda m: MODEL_MIN.get(m, "self")  # unlisted -> strictest (fail-safe), like admission.py
 
 
-def _w(node, tier, addr="127.0.0.1", port=5540):
+def _w(node, tier, addr="127.0.0.1", port=5540, spki="f" * 64):
     return wj.WorkerStanding(node, node + "-key", True, tier, "op",
-                             {"address": addr, "port": port})
+                             {"address": addr, "port": port,
+                              "peer_spki_hash": spki})
 
 
 # ── the built-in contiguous partition honors the chain contract ─────────────────────────────────────
@@ -116,7 +117,9 @@ def test_public_keys_are_paid_only_additive_output():
         "prithvi-private", pool, num_layers=16, hidden_size=4096,
         min_tier_fn=MT, rank=RANK, include_public_keys=True)
     assert "public_key_hex" not in legacy.chain["workers"][0]
+    assert "peer_spki_hash" not in legacy.chain["workers"][0]
     assert paid.chain["workers"][0]["public_key_hex"] == "prithvi-self-key"
+    assert paid.chain["workers"][0]["peer_spki_hash"] == "f" * 64
 
 
 def test_max_stages_caps_hops_for_wan():
@@ -139,7 +142,8 @@ def test_max_stages_caps_hops_for_wan():
 def test_standings_from_roster():
     roster = {
         "pk-self": {"pubkey": "pk-self", "name": "prithvi-self", "operator": "me",
-                    "tier": "self", "tenant": "home", "coord": "127.0.0.1:5540"},
+                    "tier": "self", "tenant": "home", "coord": "127.0.0.1:5540",
+                    "peer_spki_hash": "a" * 64},
         "pk-strange": {"pubkey": "pk-strange", "name": "opB-gpu", "operator": "opB",
                        "tier": "stranger", "tenant": "opB", "coord": "10.50.0.9:5540"},
         "pk-consumer": {"pubkey": "pk-consumer", "name": "laptop", "operator": "opB",
@@ -148,7 +152,9 @@ def test_standings_from_roster():
     standings = sp.standings_from_roster(roster_loader=lambda: roster)
     by = {s.node_id: s for s in standings}
     assert by["prithvi-self"].tier == "self"
-    assert by["prithvi-self"].capabilities == {"address": "127.0.0.1", "port": 5540}
+    assert by["prithvi-self"].capabilities == {
+        "address": "127.0.0.1", "port": 5540,
+        "peer_spki_hash": "a" * 64}
     assert by["opB-gpu"].capabilities["address"] == "10.50.0.9"
     assert "laptop" not in by
     # firewall still applies end-to-end through the roster bridge
