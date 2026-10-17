@@ -27,6 +27,7 @@ import functools
 import json
 import os
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -47,6 +48,7 @@ _THIS_FILE = Path(__file__).resolve()      # resolved at LOAD time, before any `
 UNIT_MARKER = "# Managed by nakshatra-node install.py"
 SERVICE_ACTIVE_TIMEOUT_S = 20.0
 SERVICE_STABILITY_S = 5.0
+SIGNER_READY_TIMEOUT_S = 20.0
 INSTALL_LOCK_TIMEOUT_S = 600.0
 TRANSITION_SCHEMA = "nak-release-transition/1"
 TRANSITION_FILE = "release-transition.json"
@@ -91,6 +93,18 @@ def _save_config(prefix: Path, cfg: dict) -> None:
     tmp = prefix / "config.json.tmp"
     tmp.write_text(json.dumps(cfg, indent=1, sort_keys=True))
     os.replace(tmp, prefix / "config.json")
+
+
+def _harden_release_url() -> None:
+    """Normalize the optional public release-host override without following a symlink."""
+    path = Path(os.environ.get("NAK_NET_DIR", Path.home() / ".nakshatra" / "net")) / "release-url"
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return
+    if not stat.S_ISREG(metadata.st_mode):
+        raise InstallError(f"release-url is not a regular file: {path}")
+    os.chmod(path, 0o600, follow_symlinks=False)
 
 
 def _state_dir_fd(prefix: Path, *, create: bool = False) -> int:
@@ -963,10 +977,20 @@ class Installer:
                 self._clear_service_issue(n)
                 continue
             todo.append((n, fp))
+        # Manifest JSON is canonicalized with sorted keys, which puts nak-net before nak-signer.
+        # That ordering is unsafe across signer protocol changes: net can start against the old
+        # signer and fail once before systemd retries it. Preserve relative order otherwise.
+        todo.sort(key=lambda item: 0 if item[0] == "nak-signer" else 2 if item[0] == "nak-net" else 1)
         if todo:
             subprocess.run(["systemctl", "--user", "enable", *[f"{n}.service" for n, _ in todo]], check=False)
         restarted = []
         for n, fp in todo:
+            if n == "nak-net" and not self._wait_signer_ready(SIGNER_READY_TIMEOUT_S):
+                detail = "signer socket did not answer data_key; restart deferred"
+                self._record_service_issue(n, "pending", detail)
+                if force:
+                    raise InstallError(f"{n}.service {detail}")
+                continue
             drain = services.get(n, {}).get("drain") if not force else None
             if drain:
                 if not self._wait_idle(int(drain["port"]), float(drain.get("max_wait_s", 900))):
@@ -989,6 +1013,35 @@ class Installer:
                 fps[n] = fp
         _save_json(self.prefix / "state" / "fingerprints.json", fps)
         return restarted
+
+    @staticmethod
+    def _signer_answers() -> bool:
+        """Probe the operation nak-net needs, not merely whether the socket path exists."""
+        path = Path(os.environ.get(
+            "NAK_SIGNER_SOCK", Path.home() / ".sthambha" / "signer" / "signer.sock"))
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(1.0)
+        try:
+            sock.connect(str(path))
+            with sock.makefile("rwb") as stream:
+                stream.write(b'{"op":"data_key"}\n')
+                stream.flush()
+                line = stream.readline(65537)
+            reply = json.loads(line) if line and len(line) <= 65536 else {}
+            return reply.get("ok") is True and isinstance(reply.get("data_key"), str)
+        except (OSError, ValueError, TypeError):
+            return False
+        finally:
+            sock.close()
+
+    def _wait_signer_ready(self, timeout_s: float) -> bool:
+        deadline = time.monotonic() + timeout_s
+        while True:
+            if self._signer_answers():
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.2)
 
     def _fingerprint(self, name: str, man: dict) -> str:
         import hashlib
@@ -1082,6 +1135,7 @@ class Installer:
     def install(self, source: str, channel: str, pubkey: str, version=None, *, allow_downgrade=False,
                 min_version: str = "") -> str:
         self.prefix.mkdir(parents=True, exist_ok=True)
+        _harden_release_url()
         cfg = _load_config(self.prefix)
         pinned = cfg.get("pubkey")
         if pinned and pubkey and pinned != pubkey:

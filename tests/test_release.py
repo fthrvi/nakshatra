@@ -8,6 +8,7 @@ import json
 import time
 import os
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -1200,6 +1201,79 @@ def test_restart_only_services_whose_inputs_changed_and_drain_busy_ones(tmp_path
     calls.clear()
     assert inst.restart(["sig", "gw"], _svc_man(["n2", "s1"])) == []        # nothing changed: nothing restarted
     assert inst.restart(["sig", "gw"], _svc_man(["n2", "s1"]), force=True) == ["sig", "gw"]   # rollback: all
+
+
+def test_update_restarts_signer_then_waits_for_data_key_before_net(tmp_path, monkeypatch):
+    inst = I.Installer(tmp_path / "node", systemd=True, make_venv=False, unit_dir=tmp_path / "units")
+    calls = []
+
+    def systemctl(args, **kwargs):
+        calls.append(args)
+        stdout = "ActiveState=active\nMainPID=42\nNRestarts=0\n" if "show" in args else ""
+        return type("R", (), {"returncode": 0, "stdout": stdout, "stderr": ""})()
+
+    monkeypatch.setattr(I.subprocess, "run", systemctl)
+    monkeypatch.setattr(I, "SERVICE_STABILITY_S", 0)
+    probes = []
+    monkeypatch.setattr(I.Installer, "_wait_signer_ready",
+                        lambda self, timeout: probes.append(timeout) or True)
+    man = {"version": "1.0.0", "components": [], "profiles": {}, "services": {
+        "nak-net": {"description": "net", "exec": ["net"]},
+        "nak-signer": {"description": "signer", "exec": ["signer"]},
+    }}
+
+    assert inst.restart(["nak-net", "nak-signer"], man) == ["nak-signer", "nak-net"]
+    restarts = [call[-1] for call in calls if call[:3] == ["systemctl", "--user", "restart"]]
+    assert restarts == ["nak-signer.service", "nak-net.service"]
+    assert probes == [I.SIGNER_READY_TIMEOUT_S]
+
+
+def test_signer_readiness_probe_requires_data_key_answer(tmp_path, monkeypatch):
+    path = tmp_path / "signer.sock"
+    ready = threading.Event()
+
+    def signer():
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(str(path))
+        server.listen(1)
+        ready.set()
+        conn, _ = server.accept()
+        with conn:
+            assert conn.makefile("rb").readline() == b'{"op":"data_key"}\n'
+            conn.sendall(b'{"ok":true,"data_key":"test-value"}\n')
+        server.close()
+
+    thread = threading.Thread(target=signer, daemon=True)
+    thread.start()
+    assert ready.wait(1)
+    monkeypatch.setenv("NAK_SIGNER_SOCK", str(path))
+    assert I.Installer._signer_answers()
+    thread.join(timeout=1)
+    assert not thread.is_alive()
+
+
+def test_net_restart_is_deferred_when_new_signer_protocol_does_not_answer(tmp_path, monkeypatch):
+    inst = I.Installer(tmp_path / "node", systemd=True, make_venv=False, unit_dir=tmp_path / "units")
+    calls = []
+    monkeypatch.setattr(I.subprocess, "run", lambda args, **kwargs: calls.append(args) or
+                        type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})())
+    monkeypatch.setattr(I.Installer, "_wait_signer_ready", lambda self, timeout: False)
+    assert inst.restart(["nak-net"], {"version": "1", "components": [], "profiles": {},
+                                      "services": {"nak-net": {"description": "net", "exec": ["net"]}}}) == []
+    assert not any(call[:3] == ["systemctl", "--user", "restart"] for call in calls)
+    assert json.loads(inst._service_state_path.read_text())["services"]["nak-net"]["status"] == "pending"
+
+
+def test_install_hardens_release_url_to_0600(env, monkeypatch):
+    net = env["tmp"] / "net"
+    net.mkdir()
+    release_url = net / "release-url"
+    release_url.write_text("https://releases.example\n")
+    release_url.chmod(0o644)
+    monkeypatch.setenv("NAK_NET_DIR", str(net))
+    _build(env, "0.1.0")
+    env["inst"].install(str(env["dist"]), "canary", env["pub"])
+    assert stat.S_IMODE(release_url.stat().st_mode) == 0o600
 
 
 def test_unstable_restarted_service_is_reported_without_release_rollback(env, monkeypatch):
