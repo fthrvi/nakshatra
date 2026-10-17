@@ -5,6 +5,7 @@ On create add a row (status=active, owner). On merge flip to `merged→<sha>`.
 
 | branch | sector | description | base | status | owner |
 |---|---|---|---|---|---|
+| net/agent-msg-v1 | network | M1: typed threaded `agent.msg` v1 and contact-only agent cards (encrypted at rest, per-contact threads, CLI + MCP); installer restarts signer and checks its data key before nak-net; release-url 0600. | forgejo/main@4c77d79 | merged→0f247f2 | codex (network lane) |
 | net/grant-visibility-at-rest | network | M0.5 synchronous grant-status checks, operator visibility, encrypted messaging store/raw log migration, and private state-file modes. | forgejo/main@4e738e2 | merged→2a971dd | codex (network lane) |
 | deploy/image-freshness | deploy | nakc rebuilds a stale container image (input fingerprint label), keeps -prev for rollback, and nakc update recreates containers on an old image. | forgejo/main@e0fa53c | merged→3384d49 | codex (network lane) |
 | worker/paid-admission | worker | Bind paid Info to the worker Ed25519 identity; fix output metering, per-session serialization, deadline completion timestamps, and bounded receipt checkpoints. | main@f0d9e63 | merged→f507bf0 | codex/root |
