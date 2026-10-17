@@ -1073,6 +1073,19 @@ def test_bootstrap_parser_accepts_only_the_fingerprinted_join_form():
             raise AssertionError("unsafe bootstrap line was accepted")
 
 
+def test_container_join_keeps_state_volume_home_through_the_shared_identity_gate():
+    containerfile = (CONTAINER / "Containerfile").read_text()
+    bootstrap_source = (CONTAINER / "bootstrap.py").read_text()
+    installer_source = (ROOT / "release" / "install.py").read_text()
+    assert "--home-dir /state" in containerfile
+    assert "ENV HOME=/state" in containerfile
+    assert 'VOLUME ["/state"]' in containerfile
+    assert "env = dict(os.environ)" in bootstrap_source
+    assert '"install.py"), "--prefix", prefix, "join", invite' in bootstrap_source
+    assert "env = dict(os.environ, PYTHONPATH=inst._pythonpath(man))" in installer_source
+    assert '"-m", "network.join_setup", "--invite", code' in installer_source
+
+
 def test_generated_unit_parser_expands_env_files_without_copying_commands(tmp_path):
     env_file = tmp_path / "worker.env"
     env_file.write_text('PORT=50051\nEXTRA="--one two"\n')

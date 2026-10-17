@@ -18,6 +18,7 @@ import argparse
 from http.client import HTTPException
 import json
 import os
+import shlex
 import stat
 import subprocess
 import sys
@@ -221,11 +222,136 @@ def retry_worker_redeem(home: Path, *, name: str = "", http_post=None) -> dict:
     return result
 
 
+def _delegate_command(state: Path, person_key: Path, agent: str, caps, *, reuse_key: bool) -> str:
+    argv = ["python", "-m", "sthambha.signer", "delegate", "--state", str(state),
+            "--person-key", str(person_key), "--agent", agent,
+            "--caps", ",".join(sorted(set(caps))), "--ttl", str(AGENT_TTL_S)]
+    if reuse_key:
+        argv.append("--reuse-key")
+    return shlex.join(argv)
+
+
+def _established_identity(home: Path, state: Path, net: Path, person_path: Path,
+                          node_key: Path) -> dict:
+    """Read and validate an established node without changing a single file."""
+    from sthambha import signer as S
+
+    person_pub_path, node_pub_path, agent_path = (
+        state / "person.pub", state / "node.pub", net / "agent")
+    missing_identity = [str(path) for path in (person_pub_path, node_pub_path, agent_path)
+                        if not path.exists()]
+    if missing_identity:
+        raise SystemExit("established node identity is incomplete; refusing automatic repair and leaving all "
+                         "files untouched. Restore the missing identity file(s): " +
+                         ", ".join(missing_identity))
+    try:
+        agent = agent_path.read_text().strip()
+        if not agent or "/" in agent or agent.startswith("."):
+            raise ValueError("invalid agent name")
+        person_pub = person_pub_path.read_text().strip()
+        node_pub = node_pub_path.read_text().strip()
+        if not node_key.exists():
+            raise ValueError(f"node key {node_key} is missing")
+        if S._node_pub_from_key(node_key) != node_pub:  # noqa: SLF001 — signer owns this format
+            raise ValueError("the node key does not match signer node.pub")
+        if person_path.exists():
+            _, stored_person_pub = S.load_key(person_path)
+            if stored_person_pub != person_pub:
+                raise ValueError("the TEST custody person key does not match signer person.pub")
+    except (OSError, UnicodeError, ValueError, S.SignerError) as exc:
+        raise SystemExit(f"established node identity is inconsistent; refusing automatic repair and leaving all "
+                         f"files untouched: {exc}") from exc
+
+    key_path = state / "agents" / f"{agent}.key"
+    grant_path = state / "agents" / f"{agent}.grant.json"
+    key_exists, grant_exists = key_path.exists(), grant_path.exists()
+    grant = None
+    caps = list(AGENT_CAPS)
+    if grant_exists:
+        try:
+            grant = json.loads(grant_path.read_text())
+            if isinstance(grant.get("caps"), list) and all(isinstance(cap, str) for cap in grant["caps"]):
+                caps = grant["caps"]
+        except (OSError, ValueError, AttributeError):
+            grant = None
+
+    problem = ""
+    if not key_exists and not grant_exists:
+        problem = "both the agent key and grant are missing"
+    elif not key_exists:
+        problem = "the agent key is missing while its grant remains"
+    elif not grant_exists:
+        problem = "the agent grant is missing while its key remains"
+    else:
+        try:
+            _, agent_pub = S.load_key(key_path)
+            if not isinstance(grant, dict):
+                raise ValueError("the grant is not valid JSON")
+            if grant.get("schema") != S.GRANT_SCHEMA:
+                raise ValueError("the grant schema is invalid")
+            if grant.get("subject") != agent:
+                raise ValueError("the grant names a different agent")
+            if grant.get("subject_pub") != agent_pub:
+                raise ValueError("the grant is bound to a different agent key")
+            if grant.get("node") not in ("*", node_pub):
+                raise ValueError("the grant is bound to a different node")
+            if not S._verify(grant, person_pub):  # noqa: SLF001 — structural validation, not time validity
+                raise ValueError("the grant signature does not verify against signer person.pub")
+        except (OSError, UnicodeError, ValueError, S.SignerError) as exc:
+            problem = str(exc)
+
+    if problem:
+        # Reusing a surviving key is safe only when the grant is the missing half. Other structural
+        # mismatches need an explicit human key rotation, which omits --reuse-key deliberately.
+        reuse_key = key_exists and not grant_exists
+        command = _delegate_command(state, person_path, agent, caps, reuse_key=reuse_key)
+        raise SystemExit(f"established node delegation for agent {agent!r} is incomplete or mismatched "
+                         f"({problem}); refusing to mint, rotate, or rename it and leaving all files untouched. "
+                         f"Human recovery must name the authority explicitly: {command}")
+
+    now = int(time.time())
+    expires = int(grant.get("expires_at", 0))
+    missing = sorted(set(AGENT_CAPS) - set(grant.get("caps") or []))
+    notices = []
+    if expires <= now:
+        notices.append("grant expired")
+    elif expires < now + 7 * 86400:
+        notices.append("grant expires in under 7 days")
+    if missing:
+        notices.append("grant intentionally remains narrower than join defaults "
+                       f"(missing {', '.join(missing)})")
+    agent_result = f"'{agent}' kept"
+    if notices:
+        command = "nak grant renew"
+        if missing:
+            widened = sorted(set(grant.get("caps") or []) | set(AGENT_CAPS))
+            command += " --caps " + ",".join(widened)
+        agent_result += f"; {'; '.join(notices)}; human renewal only: {command}"
+    return {
+        "node_key": "kept",
+        "person_key": ("kept" if person_path.exists() else "not on this box (human custody kept)"),
+        "signer": "kept",
+        "agent": agent_result,
+        "person": person_pub,
+        "node": node_pub,
+    }
+
+
 def ensure_identity(home: Path) -> dict:
     """Steps 1-4. Create the agent delegation once; later authority changes stay human-run."""
     from sthambha import signer as S
-    done = {}
+    # This is the authority boundary. Decide it before mkdir/chmod/key generation or any other write.
+    state = home / ".sthambha" / "signer"
+    net = home / ".nakshatra" / "net"
+    person_path = home / ".sthambha" / "person-TEST.key"
     node_key = home / ".nakshatra" / "keys" / "worker.ed25519"
+    first_initialisation = not any(((state / "person.pub").exists(),
+                                    (state / "node.pub").exists(),
+                                    (net / "agent").exists()))
+    if not first_initialisation:
+        return _established_identity(home, state, net, person_path, node_key)
+
+    done = {}
     if not node_key.exists():
         node_key.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         fd = os.open(str(node_key), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -234,8 +360,6 @@ def ensure_identity(home: Path) -> dict:
         done["node_key"] = "created"
     else:
         done["node_key"] = "kept"
-    state = home / ".sthambha" / "signer"
-    person_path = home / ".sthambha" / "person-TEST.key"
     person_priv = None
     if not person_path.exists() and (state / "person.pub").exists():
         person_pub = (state / "person.pub").read_text().strip()
@@ -259,10 +383,7 @@ def ensure_identity(home: Path) -> dict:
         if (state / "person.pub").read_text().strip() != person_pub or (state / "node.pub").read_text().strip() != node_pub:
             raise SystemExit("the signer here belongs to a different person or node key; refusing to mix them")
         done["signer"] = "kept"
-    net = home / ".nakshatra" / "net"
     agent = AGENT
-    if (net / "agent").exists():                    # an existing node already signs as some agent: keep it
-        agent = (net / "agent").read_text().strip() or AGENT
     key_path = state / "agents" / f"{agent}.key"
     grant_path = state / "agents" / f"{agent}.grant.json"
     if not key_path.exists() and not grant_path.exists():

@@ -67,6 +67,9 @@ def test_grant_renew_preserves_agent_key_caps_and_constraints_without_restart(tm
     assert renewed["constraints"] == current["constraints"]
     assert 89 * 86400 <= renewed["expires_at"] - int(time.time()) <= 90 * 86400
     assert live_signer.grant_status("agent")["grant_id"] == renewed["grant_id"]
+    envelope = live_signer.sign_envelope("agent", "msg", "cd" * 32, "ab" * 32)
+    assert signer_mod.verify_envelope(envelope, (state / "person.pub").read_text().strip())["grant_id"] == \
+        renewed["grant_id"]
     assert "signer reload is automatic" in capsys.readouterr().out
 
 

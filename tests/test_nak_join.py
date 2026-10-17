@@ -36,6 +36,14 @@ def _resign_invite(p, code, **changes):
     return "nki1." + joincode._b64u(json.dumps(body, sort_keys=True, separators=(",", ":")).encode())
 
 
+def _identity_snapshot(home: Path) -> dict[str, tuple[int, bytes | None]]:
+    return {
+        path.relative_to(home).as_posix(): (path.stat().st_mode & 0o777,
+                                            path.read_bytes() if path.is_file() else None)
+        for path in sorted(home.rglob("*"))
+    }
+
+
 def test_installer_verifies_invites_without_cryptography(net):
     a = net("inviter")
     code = _invite(a)
@@ -69,7 +77,7 @@ def test_installer_verifies_invites_without_cryptography(net):
         I.parse_invite("hello")
 
 
-def test_identity_setup_is_idempotent_and_grants_only_message_and_claim(tmp_path):
+def test_genuine_first_identity_setup_mints_once_and_is_idempotent(tmp_path):
     first = join_setup.ensure_identity(tmp_path)
     assert first["node_key"] == "created" and first["person_key"].startswith("created")
     assert oct((tmp_path / ".sthambha" / "signer").stat().st_mode & 0o777) == "0o700"
@@ -84,22 +92,21 @@ def test_identity_setup_is_idempotent_and_grants_only_message_and_claim(tmp_path
     assert again == dict(first, node_key="kept", person_key="kept", signer="kept", agent="'agent' kept")
 
 
-def test_existing_short_narrow_grant_and_agent_key_are_never_replaced(tmp_path):
+def test_existing_short_narrow_grant_is_preserved_byte_for_byte(tmp_path):
     first = join_setup.ensure_identity(tmp_path)
     state = tmp_path / ".sthambha" / "signer"
     key_path = state / "agents" / "agent.key"
     grant_path = state / "agents" / "agent.grant.json"
-    agent_key_before = key_path.read_bytes()
     person_priv, _ = signer_mod.load_key(tmp_path / ".sthambha" / "person-TEST.key")
     _, agent_pub = signer_mod.load_key(key_path)
     narrow = signer_mod.issue_grant(person_priv, "agent", agent_pub, ("nak.msg",), node=first["node"],
                                     ttl_s=6 * 86400)
     signer_mod.save_grant(grant_path, narrow)
+    before = _identity_snapshot(tmp_path)
 
     result = join_setup.ensure_identity(tmp_path)
 
-    assert key_path.read_bytes() == agent_key_before
-    assert json.loads(grant_path.read_text())["grant_id"] == narrow["grant_id"]
+    assert _identity_snapshot(tmp_path) == before
     assert "expires in under 7 days" in result["agent"]
     assert "remains narrower" in result["agent"]
     assert "nak grant renew --caps nak.msg,nak.task.claim" in result["agent"]
@@ -108,17 +115,96 @@ def test_existing_short_narrow_grant_and_agent_key_are_never_replaced(tmp_path):
     without_person_key = join_setup.ensure_identity(tmp_path)
     assert without_person_key["person_key"] == "not on this box (human custody kept)"
     assert not (tmp_path / ".sthambha" / "person-TEST.key").exists()
-    assert key_path.read_bytes() == agent_key_before
-    assert json.loads(grant_path.read_text())["grant_id"] == narrow["grant_id"]
+    assert key_path.read_bytes() == before[".sthambha/signer/agents/agent.key"][1]
+    assert grant_path.read_bytes() == before[".sthambha/signer/agents/agent.grant.json"][1]
 
 
-def test_existing_node_keeps_its_own_agent(tmp_path):
+def test_existing_expired_grant_is_preserved_separately(tmp_path):
+    first = join_setup.ensure_identity(tmp_path)
+    state = tmp_path / ".sthambha" / "signer"
+    key_path = state / "agents" / "agent.key"
+    grant_path = state / "agents" / "agent.grant.json"
+    person_priv, _ = signer_mod.load_key(tmp_path / ".sthambha" / "person-TEST.key")
+    _, agent_pub = signer_mod.load_key(key_path)
+    expired = signer_mod.issue_grant(person_priv, "agent", agent_pub, ("nak.msg",), node=first["node"],
+                                     ttl_s=1, now=int(time.time()) - 10)
+    signer_mod.save_grant(grant_path, expired)
+    before = _identity_snapshot(tmp_path)
+
+    result = join_setup.ensure_identity(tmp_path)
+
+    assert _identity_snapshot(tmp_path) == before
+    assert "grant expired" in result["agent"]
+    assert "nak grant renew --caps nak.msg,nak.task.claim" in result["agent"]
+
+
+def test_established_node_agent_rename_never_mints_or_renames(tmp_path):
     join_setup.ensure_identity(tmp_path)
     net_dir = tmp_path / ".nakshatra" / "net"
-    (net_dir / "agent").write_text("bro-agent\n")       # a node that already signs as another agent
-    r = join_setup.ensure_identity(tmp_path)
-    assert r["agent"].startswith("'bro-agent'")
-    assert (tmp_path / ".sthambha" / "signer" / "agents" / "bro-agent.grant.json").exists()
+    (net_dir / "agent").write_text("bro-agent\n")
+    before = _identity_snapshot(tmp_path)
+
+    with pytest.raises(SystemExit) as refused:
+        join_setup.ensure_identity(tmp_path)
+
+    message = str(refused.value)
+    assert "refusing to mint, rotate, or rename" in message
+    assert "--agent bro-agent --caps nak.msg,nak.task.claim --ttl 7776000" in message
+    assert "--reuse-key" not in message
+    assert _identity_snapshot(tmp_path) == before
+
+
+def test_established_node_with_key_and_grant_deleted_fails_closed(tmp_path):
+    join_setup.ensure_identity(tmp_path)
+    state = tmp_path / ".sthambha" / "signer"
+    (state / "agents" / "agent.key").unlink()
+    (state / "agents" / "agent.grant.json").unlink()
+    before = _identity_snapshot(tmp_path)
+
+    with pytest.raises(SystemExit) as refused:
+        join_setup.ensure_identity(tmp_path)
+
+    message = str(refused.value)
+    expected = (f"python -m sthambha.signer delegate --state {state} --person-key "
+                f"{tmp_path / '.sthambha' / 'person-TEST.key'} --agent agent "
+                "--caps nak.msg,nak.task.claim --ttl 7776000")
+    assert expected in message and "--reuse-key" not in message
+    assert _identity_snapshot(tmp_path) == before
+
+
+def test_established_node_with_only_agent_key_missing_names_caps_without_reuse(tmp_path):
+    join_setup.ensure_identity(tmp_path)
+    state = tmp_path / ".sthambha" / "signer"
+    grant_path = state / "agents" / "agent.grant.json"
+    grant = json.loads(grant_path.read_text())
+    grant["caps"] = ["nak.msg"]
+    grant_path.write_text(json.dumps(grant))
+    (state / "agents" / "agent.key").unlink()
+    before = _identity_snapshot(tmp_path)
+
+    with pytest.raises(SystemExit) as refused:
+        join_setup.ensure_identity(tmp_path)
+
+    message = str(refused.value)
+    assert "agent key is missing while its grant remains" in message
+    assert "--caps nak.msg --ttl 7776000" in message
+    assert "--reuse-key" not in message
+    assert _identity_snapshot(tmp_path) == before
+
+
+def test_established_node_with_only_grant_missing_reuses_surviving_key(tmp_path):
+    join_setup.ensure_identity(tmp_path)
+    state = tmp_path / ".sthambha" / "signer"
+    (state / "agents" / "agent.grant.json").unlink()
+    before = _identity_snapshot(tmp_path)
+
+    with pytest.raises(SystemExit) as refused:
+        join_setup.ensure_identity(tmp_path)
+
+    message = str(refused.value)
+    assert "agent grant is missing while its key remains" in message
+    assert "--caps nak.msg,nak.task.claim --ttl 7776000 --reuse-key" in message
+    assert _identity_snapshot(tmp_path) == before
 
 
 def test_join_end_to_end_request_reaches_the_inviter(net, tmp_path, monkeypatch, capsys):
