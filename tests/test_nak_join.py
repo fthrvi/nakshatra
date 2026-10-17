@@ -114,6 +114,52 @@ def test_first_identity_setup_accepts_an_empty_signer_directory(tmp_path):
     assert (tmp_path / ".sthambha" / "signer" / "agents" / "agent.key").is_file()
 
 
+def test_person_key_alone_is_established_authority_and_is_left_untouched(tmp_path):
+    person_key = tmp_path / ".sthambha" / "person-TEST.key"
+    person_key.parent.mkdir(parents=True)
+    person_key.write_bytes(b"person authority residue")
+    before = _identity_snapshot(tmp_path)
+
+    with pytest.raises(SystemExit) as refused:
+        join_setup.ensure_identity(tmp_path)
+
+    message = str(refused.value)
+    assert "python -m sthambha.signer delegate" in message
+    assert str(person_key) in message
+    assert _identity_snapshot(tmp_path) == before
+
+
+def test_unknown_sthambha_file_is_established_authority_and_is_left_untouched(tmp_path):
+    unknown = tmp_path / ".sthambha" / "future-authority.state"
+    unknown.parent.mkdir(parents=True)
+    unknown.write_bytes(b"future authority residue")
+    before = _identity_snapshot(tmp_path)
+
+    with pytest.raises(SystemExit) as refused:
+        join_setup.ensure_identity(tmp_path)
+
+    assert "python -m sthambha.signer delegate" in str(refused.value)
+    assert _identity_snapshot(tmp_path) == before
+
+
+def test_malformed_worker_key_fails_repeatably_before_any_first_init_write(tmp_path):
+    worker_key = tmp_path / ".nakshatra" / "keys" / "worker.ed25519"
+    worker_key.parent.mkdir(parents=True)
+    worker_key.write_bytes(b"short")
+    before = _identity_snapshot(tmp_path)
+
+    errors = []
+    for _ in range(2):
+        with pytest.raises(SystemExit) as refused:
+            join_setup.ensure_identity(tmp_path)
+        errors.append(str(refused.value))
+        assert _identity_snapshot(tmp_path) == before
+
+    assert errors[0] == errors[1]
+    assert "pre-existing worker key is invalid" in errors[0]
+    assert "established node identity" not in errors[0]
+
+
 @pytest.mark.parametrize("present", range(32), ids=lambda value: f"subset-{value:05b}")
 def test_established_authority_five_file_matrix_never_repairs_or_remints(tmp_path, present):
     join_setup.ensure_identity(tmp_path)

@@ -255,6 +255,20 @@ def _signer_state_present(state: Path) -> bool:
     return True
 
 
+def _sthambha_authority_present(root: Path, state: Path) -> bool:
+    """Whether ~/.sthambha contains anything except an empty signer directory."""
+    try:
+        info = root.lstat()
+    except FileNotFoundError:
+        return False
+    if root.is_symlink() or not stat.S_ISDIR(info.st_mode):
+        return True
+    for entry in root.iterdir():
+        if entry != state or _signer_state_present(entry):
+            return True
+    return False
+
+
 def _established_identity(home: Path, state: Path, net: Path, person_path: Path,
                           node_key: Path) -> dict:
     """Read and validate an established node without changing a single file."""
@@ -377,18 +391,33 @@ def ensure_identity(home: Path) -> dict:
     net = home / ".nakshatra" / "net"
     person_path = home / ".sthambha" / "person-TEST.key"
     node_key = home / ".nakshatra" / "keys" / "worker.ed25519"
-    first_initialisation = not (_signer_state_present(state) or
-                                _path_present(net / "agent") or
-                                _path_present(net / "net.sqlite"))
+    try:
+        # Snapshot every path used to classify this run before taking either branch. The only
+        # pre-existing key first-init may consume is worker.ed25519; validate it before any write.
+        sthambha_authority_present = _sthambha_authority_present(home / ".sthambha", state)
+        net_agent_present = _path_present(net / "agent")
+        net_store_present = _path_present(net / "net.sqlite")
+        node_key_present = _path_present(node_key)
+    except OSError as exc:
+        raise SystemExit(f"cannot inspect existing identity state; leaving all files untouched: {exc}") from exc
+    first_initialisation = not (sthambha_authority_present or net_agent_present or net_store_present)
     if not first_initialisation:
         return _established_identity(home, state, net, person_path, node_key)
 
+    node_pub = None
+    if node_key_present:
+        try:
+            node_pub = S._node_pub_from_key(node_key)  # noqa: SLF001 — validate before first-init writes
+        except (OSError, ValueError, S.SignerError) as exc:
+            raise SystemExit(f"pre-existing worker key is invalid; leaving all files untouched: {exc}") from exc
+
     done = {}
-    if not node_key.exists():
+    if not node_key_present:
         node_key.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         fd = os.open(str(node_key), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "wb") as f:
             f.write(os.urandom(32))                 # a raw Ed25519 seed, the format nakd/meshd read
+        node_pub = S._node_pub_from_key(node_key)  # noqa: SLF001 — the signer's own reader for this file
         done["node_key"] = "created"
     else:
         done["node_key"] = "kept"
@@ -410,7 +439,6 @@ def ensure_identity(home: Path) -> dict:
         raise SystemExit(f"cannot open confined signer agent state: {exc}") from exc
     with agent_files:
         os.chmod(state, 0o700)
-        node_pub = S._node_pub_from_key(node_key)  # noqa: SLF001 — the signer's own reader for this file
         if not (state / "person.pub").exists():
             (state / "node.pub").write_text(node_pub)
             (state / "person.pub").write_text(person_pub)
