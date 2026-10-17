@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import secrets
 import sqlite3
 import tempfile
@@ -352,11 +353,22 @@ class Store:
         return [self.contact(r[0]) for r in self._q("SELECT person FROM contacts ORDER BY added")]
 
     def resolve(self, who: str) -> Optional[dict]:
-        """A petname or a person key (or its prefix of at least 8 hex chars)."""
-        for c in self.contacts():
-            if who and (c["petname"] == who or c["person"] == who or (len(who) >= 8 and c["person"].startswith(who))):
+        """A petname or a person key (or its prefix of at least 8 hex chars).
+
+        An exact person key always wins. Anything else that matches more than one contact is
+        refused rather than silently picking the first, so a duplicate petname or a short shared
+        prefix can never address the wrong person."""
+        if not who:
+            return None
+        contacts = self.contacts()
+        for c in contacts:
+            if c["person"] == who:
                 return c
-        return None
+        hits = [c for c in contacts
+                if c["petname"] == who or (len(who) >= 8 and c["person"].startswith(who))]
+        if len(hits) > 1:
+            raise ValueError(f"{who!r} matches {len(hits)} contacts; use a longer person key prefix")
+        return hits[0] if hits else None
 
     def set_direct(self, person: str, on: bool) -> None:
         """Opt this contact in/out of direct paths. Turning it off also forgets their addresses."""
@@ -547,8 +559,8 @@ class Store:
         return sorted(grouped.values(), key=lambda row: (row["last_time"], row["thread"]), reverse=True)
 
     def agent_thread(self, prefix: str, peer: str | None = None) -> tuple[str, list]:
-        if not isinstance(prefix, str) or not prefix:
-            raise ValueError("thread id or prefix is required")
+        if not isinstance(prefix, str) or not re.fullmatch(r"[0-9a-f]{1,32}", prefix):
+            raise ValueError("thread id or prefix must be 1-32 lowercase hex characters")
         query = "SELECT DISTINCT peer,thread FROM agent_messages WHERE thread LIKE ?"
         args: tuple = (prefix + "%",)
         if peer is not None:

@@ -345,3 +345,28 @@ def test_wrong_node_signer_is_rejected_before_data_key_or_store_access(tmp_path)
         nakd.Node(tmp_path / "net", node_key, wrong_signer, agent="agent",
                   relay=("127.0.0.1", 1))
     assert calls == ["whoami"] and not (tmp_path / "net" / "net.sqlite").exists()
+
+
+def test_resolve_refuses_ambiguous_petname_and_prefix_but_exact_key_wins(tmp_path):
+    store = Store(tmp_path / "net", KEY)
+    a, b = "ab" * 32, "ab" * 4 + "cd" * 28
+    store.upsert_contact(a, "11" * 32, "active", petname="dup")
+    store.upsert_contact(b, "22" * 32, "active", petname="dup")
+    with pytest.raises(ValueError, match="matches 2 contacts"):
+        store.resolve("dup")
+    with pytest.raises(ValueError, match="matches 2 contacts"):
+        store.resolve("ab" * 4)
+    assert store.resolve(a)["person"] == a
+    assert store.resolve(b)["person"] == b
+    assert store.resolve("ab" * 5)["person"] == a
+    assert store.resolve("nobody") is None
+
+
+@pytest.mark.parametrize("bad", ["%", "_", "ab%", "AB", "zz", "a" * 33, ""])
+def test_agent_thread_prefix_must_be_lowercase_hex(tmp_path, bad):
+    store = Store(tmp_path / "net", KEY)
+    store.add_agent_message({"mid": "12" * 12, "thread": "34" * 16, "intent": "ask", "reply_to": "",
+                             "text": "hello"}, "ab" * 32, "in")
+    with pytest.raises(ValueError, match="lowercase hex"):
+        store.agent_thread(bad)
+    assert store.agent_thread("3434")[0] == "34" * 16
