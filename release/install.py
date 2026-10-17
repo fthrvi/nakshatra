@@ -21,6 +21,7 @@ What it guarantees:
 from __future__ import annotations
 
 import argparse
+import base64
 import errno
 import fcntl
 import functools
@@ -1028,7 +1029,10 @@ class Installer:
                 stream.flush()
                 line = stream.readline(65537)
             reply = json.loads(line) if line and len(line) <= 65536 else {}
-            return reply.get("ok") is True and isinstance(reply.get("data_key"), str)
+            encoded = reply.get("data_key")
+            if reply.get("ok") is not True or not isinstance(encoded, str):
+                return False
+            return len(base64.b64decode(encoded, validate=True)) == 32
         except (OSError, ValueError, TypeError):
             return False
         finally:

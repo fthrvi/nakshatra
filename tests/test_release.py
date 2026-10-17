@@ -1,6 +1,7 @@
 """Tests for the signed release + installer (release/)."""
 from __future__ import annotations
 
+import base64
 import importlib.util
 import fcntl
 import io
@@ -1240,7 +1241,8 @@ def test_signer_readiness_probe_requires_data_key_answer(tmp_path, monkeypatch):
         conn, _ = server.accept()
         with conn:
             assert conn.makefile("rb").readline() == b'{"op":"data_key"}\n'
-            conn.sendall(b'{"ok":true,"data_key":"test-value"}\n')
+            encoded = base64.b64encode(bytes(range(32))).decode()
+            conn.sendall(json.dumps({"ok": True, "data_key": encoded}).encode() + b"\n")
         server.close()
 
     thread = threading.Thread(target=signer, daemon=True)
@@ -1248,6 +1250,42 @@ def test_signer_readiness_probe_requires_data_key_answer(tmp_path, monkeypatch):
     assert ready.wait(1)
     monkeypatch.setenv("NAK_SIGNER_SOCK", str(path))
     assert I.Installer._signer_answers()
+    thread.join(timeout=1)
+    assert not thread.is_alive()
+
+
+@pytest.mark.parametrize("bad_value", ["test-value", base64.b64encode(b"short").decode()])
+def test_bad_signer_data_key_keeps_nak_net_running_old_code(tmp_path, monkeypatch, bad_value):
+    path = tmp_path / "signer.sock"
+    ready = threading.Event()
+
+    def signer():
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(str(path))
+        server.listen(1)
+        ready.set()
+        conn, _ = server.accept()
+        with conn:
+            assert conn.makefile("rb").readline() == b'{"op":"data_key"}\n'
+            conn.sendall(json.dumps({"ok": True, "data_key": bad_value}).encode() + b"\n")
+        server.close()
+
+    thread = threading.Thread(target=signer, daemon=True)
+    thread.start()
+    assert ready.wait(1)
+    monkeypatch.setenv("NAK_SIGNER_SOCK", str(path))
+    monkeypatch.setattr(I, "SIGNER_READY_TIMEOUT_S", 0)
+    calls = []
+    monkeypatch.setattr(I.subprocess, "run", lambda args, **kwargs: calls.append(args) or
+                        type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})())
+    inst = I.Installer(tmp_path / "node", systemd=True, make_venv=False, unit_dir=tmp_path / "units")
+    man = {"version": "1", "components": [], "profiles": {},
+           "services": {"nak-net": {"description": "net", "exec": ["net"]}}}
+
+    assert inst.restart(["nak-net"], man) == []
+    assert not any(call[:3] == ["systemctl", "--user", "restart"] for call in calls)
+    issue = json.loads(inst._service_state_path.read_text())["services"]["nak-net"]
+    assert issue["status"] == "pending" and "data_key" in issue["detail"]
     thread.join(timeout=1)
     assert not thread.is_alive()
 
