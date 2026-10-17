@@ -41,6 +41,19 @@ Nakshatra through the `prithvi-nakshatra` MCP doorway (:8906: contacts, inbox, r
 send is Face ID). A third node (`testbox`) also joined by invite. So **OpenClaw ↔ Hermes over
 Nakshatra has already worked once**; it has not been re-run since the move to containers and 0.15.x.
 
+**M0 re-run, 2026-10-16 (current stack, bro on 0.15.17):**
+- hub → bro message: delivered. bro's OpenClaw agent (qwen3-8b-32k, fresh session) called
+  `nak_inbox` + `nak_send`; "pong2 from OpenClaw harness" arrived on the hub.
+- Task round: hub posted "M0 task: capital of Nepal" with rules `contains_all [kathmandu]`,
+  `max_words 3`; OpenClaw claimed, submitted "Kathmandu"; hub verdict ACCEPTED.
+- **Found:** the hub's agent grant (hand-delegated 10-02 with the 7-day default) had expired 10-09,
+  so the hub could not send for a week. `nak send` still answered "queued"; the refusal was only in
+  the nakd log and the outbox `refused` column. Renewed (msg + task.post only, 7 days, `nak.pay`
+  dropped). Fix (M0.5): check the grant before queuing, show grant expiry + refused messages in
+  `nak status`, and warn a week before expiry.
+- Not yet run: Prithvi's Hermes reading/answering (each send is Biswa's Face ID, and Prithvi's model
+  is not called by other lanes); the container node is not yet anyone's contact.
+
 So agents can already exchange plain text and simple tasks. What's missing is (a) a door for hosted
 harnesses like ChatGPT, (b) a message shape agents can act on reliably, (c) a way to know what a
 contact's agent can do, and (d) real payment for agent work.
@@ -202,7 +215,7 @@ speak A2A natively. It goes behind the same owner auth and contacts-only rule as
 | Milestone | Contents | Proves |
 |---|---|---|
 | **M0** | Re-run the 10-02 test on today's stack: bro's OpenClaw ↔ Prithvi's Hermes, and the container node, messages + one task. Fix what broke. | Cross-harness messaging still works on 0.15.x and in containers. |
-| **M0.5** | D7 at-rest encryption of the node store and raw inbox log; tighten file modes. | Contacts and messages are encrypted on disk, not only on the wire. |
+| **M0.5** | Grant-expiry visibility (above); D7 at-rest encryption of the node store and raw inbox log; tighten file modes. | Contacts and messages are encrypted on disk, not only on the wire. |
 | **M1** | `agent.msg` v1 + its delegation kind; MCP tools `nak_agent_send`, `nak_threads`, `nak_thread`; agent card (D3). | Agents can hold a threaded conversation and know what each other offers. |
 | **M2** | D4: tasks and offers settle on the Neuron ledger (devnet credits). | One agent pays another for work, pay-first. |
 | **M3** | D1 remote MCP door (ChatGPT etc.), off by default, owner-auth. | A hosted harness joins. |
