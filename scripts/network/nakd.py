@@ -536,8 +536,10 @@ class Node:
                            ("harness", harness)):
             if value is not None:
                 body[key] = value
-        body = validate_agent_message(body, MAX_TEXT, outbound=True,
-                                      reply_known=self.store.agent_mid_known)
+        body = validate_agent_message(
+            body, MAX_TEXT, outbound=True,
+            reply_known=lambda known_thread, known_mid: self.store.agent_mid_known(
+                c["person"], known_thread, known_mid))
         for value in (body["text"], body.get("want", "")):
             why = outbound_problem(value)
             if why:
@@ -594,16 +596,30 @@ class Node:
     def threads(self) -> list:
         rows = self.store.agent_threads()
         for row in rows:
-            contact = self.store.contact(row["contact"])
-            row["contact"] = (contact or {}).get("petname") or row["contact"][:12]
+            contact = self.store.contact(row["peer"])
+            row["contact"] = (contact or {}).get("petname") or row["peer"][:12]
+            row["name_source"] = (contact or {}).get("name_src") or "self-chosen"
         return rows
 
-    def thread(self, prefix: str) -> tuple[str, list]:
-        thread, rows = self.store.agent_thread(prefix)
+    def thread(self, prefix: str, who: str = "") -> tuple[str, list]:
+        peer = None
+        if who:
+            contact = self.store.resolve(who)
+            if not contact:
+                raise ValueError("no such contact")
+            peer = contact["person"]
+        thread, rows = self.store.agent_thread(prefix, peer)
         for row in rows:
             contact = self.store.contact(row["peer"])
             name = (contact or {}).get("petname") or row["peer"][:12]
-            row["from"] = name if row["direction"] == "in" else "me"
+            row["from_me"] = row["direction"] == "out"
+            if row["from_me"]:
+                row["from"] = "me"
+            else:
+                row["from"] = name
+                row["name"] = name
+                row["from_key"] = row["peer"][:16]
+                row["name_source"] = (contact or {}).get("name_src") or "self-chosen"
         return thread, rows
 
     def _queue(self, person: str, kind: str, body: dict) -> str:
@@ -1248,8 +1264,8 @@ def handle(node: Node, req: dict) -> dict:
         if op == "threads":
             return {"ok": True, "threads": node.threads()}
         if op == "thread":
-            thread, messages = node.thread(req["thread"])
-            return {"ok": True, "thread": thread, "messages": messages}
+            thread, messages = node.thread(req["thread"], req.get("contact", ""))
+            return {"ok": True, "thread": thread, "peer": messages[0]["peer"], "messages": messages}
         if op == "card":
             return {"ok": True, **node.card(req.get("contact", ""))}
         if op == "card_set":

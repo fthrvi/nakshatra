@@ -70,8 +70,11 @@ def validate_agent_message(body: dict, max_text: int, *, outbound: bool = False,
         expires = out["expires"]
         if not _plain_int(expires) or expires < 0:
             raise ValueError("expires must be a non-negative unix timestamp")
+        latest = int(now if now is not None else time.time()) + MAX_EXPIRY_S
         if outbound:
-            out["expires"] = min(expires, int(now if now is not None else time.time()) + MAX_EXPIRY_S)
+            out["expires"] = min(expires, latest)
+        elif expires > latest:
+            raise ValueError("expires must be no more than 30 days in the future")
     if "budget" in out:
         budget = out["budget"]
         if not isinstance(budget, dict) or set(budget) != {"amount", "unit"}:

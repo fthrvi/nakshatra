@@ -59,6 +59,13 @@ def test_agent_message_accepts_all_optional_fields_and_caps_sender_expiry():
     assert out["expires"] == 100 + MAX_EXPIRY_S
 
 
+def test_receiver_rejects_expiry_beyond_its_own_thirty_day_window():
+    with pytest.raises(ValueError, match="30 days"):
+        validate_agent_message(message(expires=100 + MAX_EXPIRY_S + 1), MAX_TEXT, now=100)
+    assert validate_agent_message(message(expires=100 + MAX_EXPIRY_S), MAX_TEXT, now=100)[
+        "expires"] == 100 + MAX_EXPIRY_S
+
+
 def test_sender_refuses_paid_budget_with_m2_message_and_unknown_reply():
     with pytest.raises(ValueError, match="paid asks arrive in M2"):
         validate_agent_message(message(budget={"amount": 1, "unit": "credits"}), MAX_TEXT,

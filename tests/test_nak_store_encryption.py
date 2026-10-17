@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 import base64
+import importlib.util
 import json
 import os
-import re
 import sqlite3
 import stat
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -88,6 +89,47 @@ def test_ciphertext_cannot_move_between_columns_because_aad_binds_column(tmp_pat
     store._q("UPDATE inbox SET petname=?, author=? WHERE nonce='row'", (author, petname))
     with pytest.raises(InvalidTag):
         store.inbox()
+
+
+def test_agent_message_ciphertext_cannot_move_between_rows_or_columns(tmp_path):
+    store = Store(tmp_path / "net", KEY)
+    first = {"mid": "10" * 12, "thread": "30" * 16, "intent": "ask", "reply_to": "",
+             "text": "first text", "want": "first want"}
+    second = {"mid": "20" * 12, "thread": "30" * 16, "intent": "answer", "reply_to": "",
+              "text": "second text", "want": "second want"}
+    store.add_agent_message(first, PERSON, "in")
+    store.add_agent_message(second, PERSON, "in")
+    first_text, first_want = store._q(
+        "SELECT text,want FROM agent_messages WHERE mid=?", (first["mid"],))[0]
+    second_text = store._q("SELECT text FROM agent_messages WHERE mid=?", (second["mid"],))[0][0]
+
+    store._q("UPDATE agent_messages SET text=? WHERE mid=?", (second_text, first["mid"]))
+    with pytest.raises(InvalidTag):
+        store.agent_thread(first["thread"], PERSON)
+    store._q("UPDATE agent_messages SET text=?,want=? WHERE mid=?",
+             (first_want, first_text, first["mid"]))
+    with pytest.raises(InvalidTag):
+        store.agent_thread(first["thread"], PERSON)
+
+
+def test_agent_card_ciphertext_cannot_move_between_rows_or_columns(tmp_path):
+    store = Store(tmp_path / "net", KEY)
+    card = {"display_name": "Agent", "offers": "offers", "intents": ["ask"], "paid": False,
+            "price_hint": "none", "models": ["m"], "supports": ["agent.msg/1"], "updated_at": 1}
+    other = "12" * 32
+    store.set_agent_card(PERSON, card)
+    store.set_agent_card(other, dict(card, display_name="Other", offers="other offers"))
+    display_name, offers = store._q(
+        "SELECT display_name,offers FROM agent_cards WHERE person=?", (PERSON,))[0]
+    other_offers = store._q("SELECT offers FROM agent_cards WHERE person=?", (other,))[0][0]
+
+    store._q("UPDATE agent_cards SET offers=? WHERE person=?", (other_offers, PERSON))
+    with pytest.raises(InvalidTag):
+        store.agent_card(PERSON)
+    store._q("UPDATE agent_cards SET display_name=?,offers=? WHERE person=?",
+             (offers, display_name, PERSON))
+    with pytest.raises(InvalidTag):
+        store.agent_card(PERSON)
 
 
 def test_plaintext_that_starts_with_ciphertext_prefix_is_still_encrypted(tmp_path):
@@ -184,15 +226,19 @@ def test_plaintext_migration_scrubs_db_wal_and_raw_log_and_is_idempotent(tmp_pat
 
 def test_schema_migration_is_idempotent_on_a_forgejo_main_store(tmp_path):
     root = tmp_path / "net"
-    root.mkdir()
-    # This is the exact structural delta introduced by M1: remove the two new tables/index to model
-    # a database initialized by forgejo/main, then let Store open it twice.
-    parent_schema = re.sub(
-        r"CREATE TABLE IF NOT EXISTS agent_messages .*?CREATE TABLE IF NOT EXISTS agent_cards .*?;\n",
-        "", SCHEMA, flags=re.DOTALL)
+    module_path = tmp_path / "forgejo_main_store.py"
+    source = subprocess.run(
+        ["git", "show", "forgejo/main:scripts/network/store.py"], cwd=_REPO,
+        check=True, capture_output=True, text=True).stdout
+    module_path.write_text(source)
+    spec = importlib.util.spec_from_file_location("forgejo_main_store", module_path)
+    assert spec and spec.loader
+    parent_store = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(parent_store)
+    legacy = parent_store.Store(root, KEY)
+    legacy._db.close()
     db = sqlite3.connect(root / "net.sqlite")
-    db.executescript(parent_schema)
-    db.commit()
+    assert db.execute("SELECT name FROM sqlite_master WHERE name='agent_messages'").fetchone() is None
     db.close()
     first = Store(root, KEY)
     first.set_agent_card(PERSON, {"display_name": "A", "offers": "O", "intents": [], "paid": False,

@@ -31,6 +31,7 @@ from cryptography.hazmat.primitives.asymmetric import ed25519  # noqa: E402
 
 import joincode  # noqa: E402
 from network import nakd  # noqa: E402
+from network.agent import MAX_EXPIRY_S  # noqa: E402
 from transport.relay import RendezvousRelay  # noqa: E402
 
 
@@ -170,6 +171,102 @@ def test_expired_agent_message_is_logged_and_dropped(net):
     assert a.node._receive(b.person_pub, {"t": "env", "env": env, "body": body})["t"] == "ack"
     assert a.node.store.agent_threads() == []
     assert any("dropped expired agent.msg" in line for line in logs)
+
+
+def _stored_receive_state(party):
+    root = party.dir / "net"
+    raw = root / "inbox-raw.jsonl"
+    return {
+        "agent_messages": party.node.store._q("SELECT COUNT(*) FROM agent_messages")[0][0],
+        "agent_cards": party.node.store._q("SELECT COUNT(*) FROM agent_cards")[0][0],
+        "seen": tuple(party.node.store._q("SELECT nonce,ts FROM seen ORDER BY nonce")),
+        "raw": raw.read_bytes() if raw.exists() else None,
+    }
+
+
+def test_receive_dispatch_rejects_malicious_agent_and_card_matrix_without_storage(net):
+    a, b = _pair(net)
+    now = int(time.time())
+    base = {"v": 1, "mid": "1" * 24, "thread": "2" * 32, "reply_to": "", "intent": "ask",
+            "text": "hello"}
+    card = {"v": 1, "mid": "3" * 24, "display_name": "Agent", "offers": "answers",
+            "intents": ["ask"], "paid": False, "price_hint": "", "models": ["m"],
+            "supports": ["agent.msg/1"], "updated_at": now}
+    cases = [
+        ("agent.msg", dict(base, unknown=True)),
+        ("agent.msg", dict(base, mid="bad")),
+        ("agent.msg", dict(base, thread="bad")),
+        ("agent.msg", dict(base, reply_to="bad")),
+        ("agent.msg", dict(base, text="x" * (nakd.MAX_TEXT + 1))),
+        ("agent.msg", dict(base, text=7)),
+        ("agent.msg", dict(base, refs=[{"sha256": "a" * 64, "bytes": 1, "name": "x"}] * 9)),
+        ("agent.msg", dict(base, expires=now + MAX_EXPIRY_S + 60)),
+        ("contact.card", dict(card, paid=True)),
+    ]
+    for kind, body in cases:
+        before = _stored_receive_state(a)
+        env = b.node._sign(kind, a.person_pub, body)
+        reply = a.node._receive(b.person_pub, {"t": "env", "env": env, "body": body})
+        assert reply["t"] == "nack", (kind, body, reply)
+        assert _stored_receive_state(a) == before, (kind, body)
+
+
+def test_receive_dispatch_scopes_reused_thread_and_me_name_to_contact(net):
+    from network.client import render_agent_thread
+
+    a, b, c = net("a"), net("b"), net("c")
+
+    def connect(peer, nickname):
+        assert peer.node.redeem(a.invite(), nickname=nickname, petname="a", wait_s=15)["state"] == "request sent"
+        request = next(row for row in a.node.store.requests() if row["person"] == peer.person_pub)
+        a.node.accept(request["id"])
+        assert wait(lambda: (peer.node.store.contact(a.person_pub) or {}).get("state") == "active")
+
+    connect(b, "b")
+    connect(c, "me")
+    now = int(time.time())
+
+    def receive(sender, kind, body):
+        env = sender.node._sign(kind, a.person_pub, body)
+        return a.node._receive(sender.person_pub, {"t": "env", "env": env, "body": body})
+
+    def card(mid, name):
+        return {"v": 1, "mid": mid, "display_name": name, "offers": "answers", "intents": ["ask"],
+                "paid": False, "price_hint": "", "models": ["m"], "supports": ["agent.msg/1"],
+                "updated_at": now}
+
+    assert receive(b, "contact.card", card("4" * 24, "B"))["t"] == "ack"
+    assert receive(c, "contact.card", card("5" * 24, "C"))["t"] == "ack"
+    thread = "6" * 32
+    b_mid, c_mid = "7" * 24, "8" * 24
+    b_message = {"v": 1, "mid": b_mid, "thread": thread, "reply_to": "", "intent": "ask",
+                 "text": "from b"}
+    c_message = {"v": 1, "mid": c_mid, "thread": thread, "reply_to": "", "intent": "ask",
+                 "text": "from contact named me"}
+    assert receive(b, "agent.msg", b_message)["t"] == "ack"
+    assert receive(c, "agent.msg", c_message)["t"] == "ack"
+
+    with pytest.raises(ValueError, match="not a known message"):
+        a.node.agent_send("me", "cross-contact reply", thread=thread, reply_to=b_mid)
+    sent = a.node.agent_send("me", "scoped reply", intent="answer", thread=thread, reply_to=c_mid)
+
+    summaries = {(row["peer"], row["thread"]): row for row in a.node.threads()}
+    assert summaries[(b.person_pub, thread)]["count"] == 1
+    assert summaries[(c.person_pub, thread)]["count"] == 2
+    with pytest.raises(ValueError, match="specify the contact"):
+        a.node.thread(thread)
+    _, b_rows = a.node.thread(thread, b.person_pub[:12])
+    _, c_rows = a.node.thread(thread, "me")
+    assert [row["mid"] for row in b_rows] == [b_mid]
+    assert {row["mid"] for row in c_rows} == {c_mid, sent["queued"]}
+    inbound = next(row for row in c_rows if row["mid"] == c_mid)
+    outbound = next(row for row in c_rows if row["mid"] == sent["queued"])
+    assert inbound["from"] == "me" and inbound["name"] == "me" and inbound["from_me"] is False
+    assert inbound["from_key"] == c.person_pub[:16] and inbound["name_source"] == "self-chosen"
+    assert outbound["from"] == "me" and outbound["from_me"] is True
+    rendered = render_agent_thread({"thread": thread, "peer": c.person_pub, "messages": c_rows})
+    assert f'from_key="{c.person_pub[:16]}" name="me" name_source="self-chosen" from_me="false"' in rendered
+    assert rendered.count('from="me" from_me="true"') == 1
 
 
 def test_invite_is_single_use(net):

@@ -40,7 +40,7 @@ CREATE TABLE IF NOT EXISTS agent_messages (id INTEGER PRIMARY KEY AUTOINCREMENT,
     peer TEXT NOT NULL, direction TEXT NOT NULL, thread TEXT NOT NULL, intent TEXT NOT NULL,
     reply_to TEXT NOT NULL, expires INTEGER, text TEXT NOT NULL, want TEXT, refs TEXT, budget TEXT,
     harness TEXT, created INTEGER NOT NULL);
-CREATE INDEX IF NOT EXISTS agent_messages_thread_idx ON agent_messages(thread, created, id);
+CREATE INDEX IF NOT EXISTS agent_messages_peer_thread_idx ON agent_messages(peer, thread, created, id);
 CREATE TABLE IF NOT EXISTS agent_cards (person TEXT PRIMARY KEY, display_name TEXT NOT NULL,
     offers TEXT NOT NULL, intents TEXT NOT NULL, paid TEXT NOT NULL, price_hint TEXT NOT NULL,
     models TEXT NOT NULL, supports TEXT NOT NULL, updated_at TEXT NOT NULL);
@@ -519,8 +519,9 @@ class Store:
         except sqlite3.IntegrityError:
             return False
 
-    def agent_mid_known(self, thread: str, mid: str) -> bool:
-        return bool(self._q("SELECT 1 FROM agent_messages WHERE thread=? AND mid=?", (thread, mid)))
+    def agent_mid_known(self, peer: str, thread: str, mid: str) -> bool:
+        return bool(self._q("SELECT 1 FROM agent_messages WHERE peer=? AND thread=? AND mid=?",
+                            (peer, thread, mid)))
 
     def _agent_row(self, values) -> dict:
         row = dict(zip(self._AGENT_COLS, values))
@@ -538,25 +539,28 @@ class Store:
         grouped = {}
         for values in rows:
             row = self._agent_row(values)
-            summary = grouped.setdefault(row["thread"], {"thread": row["thread"], "contact": row["peer"],
-                                                          "count": 0})
-            summary.update(contact=row["peer"], last_intent=row["intent"], last_time=row["created"],
+            key = (row["peer"], row["thread"])
+            summary = grouped.setdefault(key, {"thread": row["thread"], "peer": row["peer"], "count": 0})
+            summary.update(last_intent=row["intent"], last_time=row["created"],
                            unread=row["direction"] == "in")
             summary["count"] += 1
         return sorted(grouped.values(), key=lambda row: (row["last_time"], row["thread"]), reverse=True)
 
-    def agent_thread(self, prefix: str) -> tuple[str, list]:
+    def agent_thread(self, prefix: str, peer: str | None = None) -> tuple[str, list]:
         if not isinstance(prefix, str) or not prefix:
             raise ValueError("thread id or prefix is required")
-        matches = [row[0] for row in self._q(
-            "SELECT DISTINCT thread FROM agent_messages WHERE thread LIKE ? ORDER BY thread", (prefix + "%",))]
+        query = "SELECT DISTINCT peer,thread FROM agent_messages WHERE thread LIKE ?"
+        args: tuple = (prefix + "%",)
+        if peer is not None:
+            query, args = query + " AND peer=?", args + (peer,)
+        matches = self._q(query + " ORDER BY peer,thread", args)
         if not matches:
             raise ValueError("no such thread")
         if len(matches) > 1:
-            raise ValueError("thread prefix is ambiguous")
-        thread = matches[0]
+            raise ValueError("thread prefix is ambiguous; specify the contact")
+        matched_peer, thread = matches[0]
         rows = self._q(f"SELECT {', '.join(self._AGENT_COLS)} FROM agent_messages "
-                       "WHERE thread=? ORDER BY created, id", (thread,))
+                       "WHERE peer=? AND thread=? ORDER BY created, id", (matched_peer, thread))
         return thread, [self._agent_row(row) for row in rows]
 
     # Contact cards are encrypted in their entirety. ``person`` is the row key: the local person's

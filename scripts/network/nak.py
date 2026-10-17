@@ -1872,6 +1872,7 @@ def main(argv=None, *, http_post=None) -> int:
     sub.add_parser("threads", help="list typed agent-message threads")
     p = sub.add_parser("thread", help="show one typed agent-message thread")
     p.add_argument("thread")
+    p.add_argument("--contact", default="", help="contact name or person-key prefix when ids collide")
     p = sub.add_parser("card", help="show or publish the person's outward-facing agent card")
     csub = p.add_subparsers(dest="card_cmd", required=True)
     q = csub.add_parser("show"); q.add_argument("contact", nargs="?", default="")
@@ -2117,15 +2118,18 @@ def main(argv=None, *, http_post=None) -> int:
     elif a.cmd == "threads":
         for row in call(s, {"op": "threads"})["threads"]:
             unread = " unread-ish" if row["unread"] else ""
-            print(f"{row['thread']}  {row['contact']}  {row['last_intent']}  "
+            print(f"{row['thread']}  {row['contact']} ({row['peer'][:16]}…, {row['name_source']})  "
+                  f"{row['last_intent']}  "
                   f"{_ago(row['last_time'])}  {row['count']} message(s){unread}")
     elif a.cmd == "thread":
-        result = call(s, {"op": "thread", "thread": a.thread})
-        print(f"thread {result['thread']}")
+        result = call(s, {"op": "thread", "thread": a.thread, "contact": a.contact})
+        print(f"thread {result['thread']} peer={result['peer'][:16]}…")
         for message in result["messages"]:
             reply = f" reply_to={message['reply_to']}" if message["reply_to"] else ""
             want = f"\n  want: {message['want']}" if message.get("want") is not None else ""
-            print(f"[{_ago(message['created'])}] {message['from']} {message['intent']} mid={message['mid']}{reply}\n"
+            sender = ("me" if message["from_me"] else
+                      f"{message['name']} [{message['from_key']}…, {message['name_source']}]")
+            print(f"[{_ago(message['created'])}] {sender} {message['intent']} mid={message['mid']}{reply}\n"
                   f"  {message['text']}{want}")
     elif a.cmd == "card":
         if a.card_cmd == "set":
