@@ -307,10 +307,11 @@ class Node:
         return ""
 
     def _renewal_command(self, grant: dict, required_cap: str = "") -> str:
-        caps = sorted(set(grant.get("caps") or []) | ({required_cap} if required_cap else set()))
-        return ("python -m sthambha.signer delegate --state <signer-state-dir> "
-                "--person-key <your-person-key> --agent " + shlex.quote(self.agent) +
-                " --caps " + shlex.quote(",".join(caps)) + " --ttl 604800")
+        caps = sorted(set(grant.get("caps") or []))
+        if required_cap and required_cap not in caps:
+            caps.append(required_cap)
+            return "nak grant renew --caps " + shlex.quote(",".join(sorted(caps)))
+        return "nak grant renew"
 
     def _require_grant(self, kind: str) -> dict:
         grant = self._grant_status(kind)
@@ -328,7 +329,7 @@ class Node:
             problem = f"not valid until {self._utc(grant.get('not_before', 0))}"
         else:
             problem = str(grant.get("problem") or "grant is not valid for this node")
-        raise ValueError(f"agent {self.agent!r} cannot sign {kind}: {problem}. Renew manually: "
+        raise ValueError(f"agent {self.agent!r} cannot sign {kind}: {problem}. Human renewal: "
                          f"{self._renewal_command(grant, cap)}")
 
     def _warn_grant(self, force: bool = False, now: Optional[int] = None) -> None:
@@ -343,7 +344,7 @@ class Node:
             warning = str(exc)
         self._last_grant_warning_day = day
         if warning:
-            self.log(f"WARNING: agent {self.agent!r} {warning}; renew manually: "
+            self.log(f"WARNING: agent {self.agent!r} {warning}; human renewal: "
                      f"{self._renewal_command(grant) if 'grant' in locals() else 'check the signer service'}")
 
     def _dial(self, rid: bytes, my_key: bytes, pin: str, initiator: bool, binding: bytes):
@@ -1051,7 +1052,8 @@ class Node:
         with self._lock:
             online = set(self._sessions)
         grant = self._grant_status()
-        grant["warning"] = self._grant_warning_text(grant)
+        warning = self._grant_warning_text(grant)
+        grant["warning"] = f"{warning}; run: nak grant renew" if warning else ""
         grant = {k: grant[k] for k in ("agent", "caps", "expires_at", "not_before", "revoked",
                                        "grant_id", "warning")}
         refused = self.store.refusal_summary()

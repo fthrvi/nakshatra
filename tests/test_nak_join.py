@@ -84,6 +84,34 @@ def test_identity_setup_is_idempotent_and_grants_only_message_and_claim(tmp_path
     assert again == dict(first, node_key="kept", person_key="kept", signer="kept", agent="'agent' kept")
 
 
+def test_existing_short_narrow_grant_and_agent_key_are_never_replaced(tmp_path):
+    first = join_setup.ensure_identity(tmp_path)
+    state = tmp_path / ".sthambha" / "signer"
+    key_path = state / "agents" / "agent.key"
+    grant_path = state / "agents" / "agent.grant.json"
+    agent_key_before = key_path.read_bytes()
+    person_priv, _ = signer_mod.load_key(tmp_path / ".sthambha" / "person-TEST.key")
+    _, agent_pub = signer_mod.load_key(key_path)
+    narrow = signer_mod.issue_grant(person_priv, "agent", agent_pub, ("nak.msg",), node=first["node"],
+                                    ttl_s=6 * 86400)
+    signer_mod.save_grant(grant_path, narrow)
+
+    result = join_setup.ensure_identity(tmp_path)
+
+    assert key_path.read_bytes() == agent_key_before
+    assert json.loads(grant_path.read_text())["grant_id"] == narrow["grant_id"]
+    assert "expires in under 7 days" in result["agent"]
+    assert "remains narrower" in result["agent"]
+    assert "nak grant renew --caps nak.msg,nak.task.claim" in result["agent"]
+
+    (tmp_path / ".sthambha" / "person-TEST.key").unlink()
+    without_person_key = join_setup.ensure_identity(tmp_path)
+    assert without_person_key["person_key"] == "not on this box (human custody kept)"
+    assert not (tmp_path / ".sthambha" / "person-TEST.key").exists()
+    assert key_path.read_bytes() == agent_key_before
+    assert json.loads(grant_path.read_text())["grant_id"] == narrow["grant_id"]
+
+
 def test_existing_node_keeps_its_own_agent(tmp_path):
     join_setup.ensure_identity(tmp_path)
     net_dir = tmp_path / ".nakshatra" / "net"

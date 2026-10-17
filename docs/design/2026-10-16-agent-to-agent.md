@@ -1,6 +1,7 @@
 # Agent-to-agent on Nakshatra: any harness, one network
 
-Status: DRAFT for Biswa's decision (2026-10-16). Nothing in here is built yet unless it says "exists".
+Status: DRAFT for Biswa's decision (2026-10-16). D7 and M0.5 grant visibility are built on this
+branch; the rest remains design unless a section explicitly says it exists.
 Lane: network (Brahma / Nakshatra).
 
 ## 1. The question
@@ -50,7 +51,8 @@ Nakshatra has already worked once**; it has not been re-run since the move to co
   so the hub could not send for a week. `nak send` still answered "queued"; the refusal was only in
   the nakd log and the outbox `refused` column. Renewed (msg + task.post only, 7 days, `nak.pay`
   dropped). Fix (M0.5): check the grant before queuing, show grant expiry + refused messages in
-  `nak status`, and warn a week before expiry.
+  `nak status`, and warn a week before expiry. Renewal is now the explicit human action
+  `nak grant renew`; join, nakd, the updater, supervisors and MCP tools never invoke it.
 - Not yet run: Prithvi's Hermes reading/answering (each send is Biswa's Face ID, and Prithvi's model
   is not called by other lanes); the container node is not yet anyone's contact.
 

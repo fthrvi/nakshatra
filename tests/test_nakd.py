@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import stat
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -158,6 +160,67 @@ def _pair(net):
     a.node.accept(a.node.store.requests()[0]["id"], petname="b")
     assert wait(lambda: (b.node.store.contact(a.person_pub) or {}).get("state") == "active")
     return a, b
+
+
+def _replace_with_parent_plaintext_store(party, peer, petname: str, marker: str) -> None:
+    """Materialize the pre-M0.5 Store schema/write shape without importing new Store code."""
+    from network.store import SCHEMA
+
+    party.node.stop()
+    assert wait(lambda: all(not thread.is_alive() for thread in party.node._threads.values()))
+    party.node.store._db.close()
+    root = party.dir / "net"
+    for name in ("net.sqlite", "net.sqlite-wal", "net.sqlite-shm", "inbox-raw.jsonl"):
+        (root / name).unlink(missing_ok=True)
+    old_schema = SCHEMA.replace(
+        "CREATE TABLE IF NOT EXISTS store_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);\n", "")
+    db = sqlite3.connect(root / "net.sqlite")
+    db.execute("PRAGMA journal_mode=WAL")
+    db.executescript(old_schema)
+    db.execute("ALTER TABLE contacts ADD COLUMN name_src TEXT")
+    db.execute("ALTER TABLE contacts ADD COLUMN direct INTEGER NOT NULL DEFAULT 0")
+    db.execute("ALTER TABLE contacts ADD COLUMN direct_hint TEXT")
+    db.execute("ALTER TABLE contacts ADD COLUMN p2p INTEGER NOT NULL DEFAULT 0")
+    db.execute("ALTER TABLE outbox ADD COLUMN refused TEXT")
+    now = int(time.time())
+    db.execute("INSERT INTO contacts (person,node,petname,nickname,state,added,name_src) VALUES (?,?,?,?,?,?,?)",
+               (peer.person_pub, peer.node.node, petname, "nick-" + marker, "active", now, "yours"))
+    db.execute("INSERT INTO inbox VALUES (?,?,?,?,?,?,?)",
+               ("legacy-in", peer.person_pub, petname, "agent:legacy", "whole", "inbox-" + marker, now))
+    task_hash = "77" * 32
+    db.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+               (task_hash, "worker", peer.person_pub, json.dumps({"title": marker}), "submitted",
+                None, None, 1, "output-" + marker, json.dumps({"reason": marker}), now, now))
+    db.commit()
+    db.close()
+    (root / "inbox-raw.jsonl").write_text(json.dumps({"received": now, "body": marker}) + "\n")
+
+
+def test_parent_plaintext_stores_upgrade_and_two_nodes_exchange_by_petname(net):
+    a, b = _pair(net)
+    marker = "PARENT_STORE_UPGRADE_MARKER_M05"
+    a_relay, b_relay = a.node.relay, b.node.relay
+    _replace_with_parent_plaintext_store(a, b, "b", marker)
+    _replace_with_parent_plaintext_store(b, a, "a", marker)
+
+    a.node = nakd.Node(a.dir / "net", a.node_key, a.signer.handle, agent="pa", relay=a_relay).start()
+    b.node = nakd.Node(b.dir / "net", b.node_key, b.signer.handle, agent="pa", relay=b_relay).start()
+
+    for party, peer, petname in ((a, b, "b"), (b, a, "a")):
+        assert party.node.store.contact(peer.person_pub)["petname"] == petname
+        assert party.node.store.contact(peer.person_pub)["nickname"] == "nick-" + marker
+        assert party.node.store.inbox()[0]["text"] == "inbox-" + marker
+        task = party.node.store.task_get("77" * 32, "worker", peer.person_pub)
+        assert task["spec"]["title"] == marker and task["output"] == "output-" + marker
+        assert party.node.store.raw_records()[0]["body"] == marker
+        for name in ("net.sqlite", "net.sqlite-wal", "net.sqlite-shm", "inbox-raw.jsonl"):
+            path = party.dir / "net" / name
+            if path.exists():
+                assert marker.encode() not in path.read_bytes(), (party.dir.name, name)
+
+    mid = a.node.send("b", "message after parent-store upgrade")["queued"]
+    assert wait(lambda: a.node.delivered(mid), timeout=40)
+    assert any(row["text"] == "message after parent-store upgrade" for row in b.node.store.inbox())
 
 
 def test_receive_refuses_tampered_and_misbound_envelopes(net):
@@ -351,7 +414,7 @@ def test_worker_without_claim_cap_cannot_claim(net):
     _connect(net, a, b)
     h = a.node.post_task("worker", "x", "Do it.", [{"max_words": 3}])["task_hash"]
     assert wait(lambda: _worker_row(b.node, h))
-    with pytest.raises(ValueError, match=r"cap nak\.task\.claim not granted.*sthambha\.signer delegate"):
+    with pytest.raises(ValueError, match=r"cap nak\.task\.claim not granted.*nak grant renew --caps"):
         b.node.claim_task(h)                          # refused before state change or queueing
     assert _worker_row(b.node, h)[0]["state"] == "offered"
     assert a.node.store.task_get(h, "poster")["state"] == "posted"
@@ -376,31 +439,72 @@ def test_expired_missing_and_valid_grants_refuse_synchronously_or_queue(net, tmp
     a, b = _pair(net)
     before = len(_outbox_mids(a.node))
     grant = _replace_grant(a, ("nak.msg",), int(time.time()) - 100, 10)
-    with pytest.raises(ValueError, match=r"agent 'pa'.*expired at .*Renew manually: python -m sthambha.signer delegate"):
+    with pytest.raises(ValueError, match=r"agent 'pa'.*expired at .*Human renewal: nak grant renew"):
         a.node.send("b", "not queued")
     assert len(_outbox_mids(a.node)) == before
     sock, stop = _serve(a.node, tmp_path)
     from network import nak
     from network.client import NakClient
     from network.nak_mcp import Server
-    with pytest.raises(SystemExit, match=r"expired at .*sthambha\.signer delegate"):
+    with pytest.raises(SystemExit, match=r"expired at .*nak grant renew"):
         nak.main(["--sock", str(sock), "send", "b", "still not queued"])
     mcp = Server(NakClient(sock)).handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                                           "params": {"name": "nak_send", "arguments": {
                                               "to": "b", "text": "mcp not queued"}}})["result"]
     assert mcp["isError"] and "expired at" in mcp["content"][0]["text"]
-    assert "sthambha.signer delegate" in mcp["content"][0]["text"]
-    stop.set()
+    assert "nak grant renew" in mcp["content"][0]["text"]
 
     _replace_grant(a, ("nak.msg",), int(time.time()), 3600)
-    with pytest.raises(ValueError, match=r"cap nak\.task\.post not granted.*--caps nak\.msg,nak\.task\.post"):
+    with pytest.raises(ValueError, match=r"cap nak\.task\.post not granted.*nak grant renew --caps nak\.msg,nak\.task\.post"):
         a.node.post_task("b", "no cap", "not queued", [{"max_words": 2}])
     assert len(_outbox_mids(a.node)) == before
+    cli_home = tmp_path / "cli-home"
+    cli_home.mkdir()
+    cli_env = dict(os.environ, HOME=str(cli_home),
+                   PYTHONPATH=str(_REPO / "scripts") + os.pathsep + os.environ.get("PYTHONPATH", ""))
+    cli = subprocess.run(
+        [sys.executable, "-m", "network.nak", "--sock", str(sock),
+         "task", "post", "b", "no cap", "CLI not queued"],
+        text=True, capture_output=True, env=cli_env, check=False)
+    assert cli.returncode == 1
+    assert "cap nak.task.post not granted" in cli.stderr and "nak grant renew --caps" in cli.stderr
+    task_mcp = Server(NakClient(sock)).handle({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": {"name": "nak_task_post", "arguments": {
+            "to": "b", "title": "no cap", "instructions": "MCP not queued",
+            "acceptance": [{"max_words": 2}]}}})["result"]
+    assert task_mcp["isError"] and "nak grant renew --caps" in task_mcp["content"][0]["text"]
+    assert len(_outbox_mids(a.node)) == before and a.node.store.tasks(role="poster") == []
 
     _replace_grant(a, ("nak.msg", "nak.task.post"), int(time.time()), 3600)
     mid = a.node.send("b", "valid grant queues")["queued"]
     assert mid in _outbox_mids(a.node)
     assert grant["grant_id"]
+    stop.set()
+
+
+def test_message_queued_while_valid_is_refused_if_grant_expires_before_signing(net, monkeypatch):
+    import threading
+
+    a, b = _pair(net)
+    entered = threading.Event()
+    release = threading.Event()
+    real_sign = a.node._sign
+
+    def delayed_sign(kind, person, body):
+        entered.set()
+        assert release.wait(10)
+        return real_sign(kind, person, body)
+
+    monkeypatch.setattr(a.node, "_sign", delayed_sign)
+    mid = a.node.send("b", "queued under a valid grant")["queued"]
+    assert entered.wait(10)
+    _replace_grant(a, ("nak.msg",), int(time.time()) - 100, 10)
+    release.set()
+
+    assert wait(lambda: bool(a.node.store.refused(mid)))
+    assert "grant expired" in a.node.store.refused(mid)
+    assert all(message["text"] != "queued under a valid grant" for message in b.node.store.inbox())
 
 
 def test_grant_warning_thresholds_and_daily_log(net, monkeypatch):
@@ -420,6 +524,7 @@ def test_grant_warning_thresholds_and_daily_log(net, monkeypatch):
     a.node._warn_grant()
     a.node._warn_grant()
     assert len(logs) == 1 and logs[0].startswith("WARNING:") and "expired" in logs[0]
+    assert "nak grant renew" in logs[0]
     a.node._warn_grant(now=now + 86400)
     assert len(logs) == 2
 

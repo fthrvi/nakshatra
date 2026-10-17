@@ -71,6 +71,15 @@ def test_ciphertext_cannot_move_between_rows_because_aad_binds_primary_key(tmp_p
         store.inbox()
 
 
+def test_ciphertext_cannot_move_between_columns_because_aad_binds_column(tmp_path):
+    store = Store(tmp_path / "net", KEY)
+    store.add_inbox("row", PERSON, "petname", "author", "whole", "text")
+    petname, author = store._q("SELECT petname, author FROM inbox WHERE nonce='row'")[0]
+    store._q("UPDATE inbox SET petname=?, author=? WHERE nonce='row'", (author, petname))
+    with pytest.raises(InvalidTag):
+        store.inbox()
+
+
 def test_plaintext_that_starts_with_ciphertext_prefix_is_still_encrypted(tmp_path):
     store = Store(tmp_path / "net", KEY)
     store.add_inbox("prefix", PERSON, "p", "a", "x", "enc1:not-actually-ciphertext")

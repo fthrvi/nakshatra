@@ -1709,6 +1709,97 @@ def _default_p2p_socket() -> Path:
     return default_p2p_socket_path()
 
 
+def _grant_paths() -> tuple[Path, Path, str, Path, Path]:
+    net_dir = Path(os.environ.get("NAK_NET_DIR", Path.home() / ".nakshatra" / "net"))
+    signer_dir = Path(os.environ.get("NAK_SIGNER_DIR", Path.home() / ".sthambha" / "signer"))
+    try:
+        agent = (net_dir / "agent").read_text().strip()
+    except OSError as exc:
+        raise SystemExit(f"cannot identify this node's delegated agent from {net_dir / 'agent'}: {exc}") from exc
+    if not agent or "/" in agent or agent.startswith("."):
+        raise SystemExit(f"refusing invalid delegated agent name {agent!r}")
+    return (signer_dir, net_dir, agent, signer_dir / "agents" / f"{agent}.key",
+            signer_dir / "agents" / f"{agent}.grant.json")
+
+
+def _delegate_reuse_command(state: Path, person_key: Path, agent: str, caps: list[str], ttl_days: int) -> str:
+    return ("python -m sthambha.signer delegate --state " + shlex.quote(str(state)) +
+            " --person-key " + shlex.quote(str(person_key)) + " --agent " + shlex.quote(agent) +
+            " --caps " + shlex.quote(",".join(caps)) + f" --ttl {ttl_days * 86400} --reuse-key")
+
+
+def _grant_renew(args) -> int:
+    """Human CLI boundary for re-signing one grant without rotating its agent key."""
+    if not args.yes and not sys.stdin.isatty():
+        raise SystemExit("nak grant renew is interactive-only; run it in a terminal or pass --yes explicitly")
+    if not 1 <= args.ttl <= 365:
+        raise SystemExit("--ttl must be between 1 and 365 days")
+    signer_dir, _net_dir, agent, key_path, grant_path = _grant_paths()
+    try:
+        current = json.loads(grant_path.read_text())
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"cannot read the current grant at {grant_path}: {exc}") from exc
+    current_caps = sorted({str(cap) for cap in current.get("caps") or [] if str(cap)})
+    if args.caps is None:
+        caps = current_caps
+    else:
+        caps = sorted({cap.strip() for cap in args.caps.split(",") if cap.strip()})
+        if not caps:
+            raise SystemExit("--caps must name at least one capability")
+    if not caps:
+        raise SystemExit("the current grant has no capabilities; name the intended set with --caps")
+    try:
+        from sthambha import signer as signer_mod
+        _, agent_pub = signer_mod.load_key(key_path)
+        signer_person = (signer_dir / "person.pub").read_text().strip()
+        node_pub = (signer_dir / "node.pub").read_text().strip()
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"cannot load signer identity for renewal: {exc}") from exc
+    if current.get("subject") != agent or current.get("subject_pub") != agent_pub:
+        raise SystemExit("the current grant is not bound to the existing agent key; refusing renewal")
+    if not signer_mod._verify(current, signer_person):  # noqa: SLF001 — authenticate stale/expired metadata
+        raise SystemExit("the current grant signature does not verify; refusing to copy its authority")
+    if current.get("node") not in ("*", node_pub):
+        raise SystemExit("the current grant is bound to a different node; refusing renewal")
+    constraints = current.get("constraints") or {}
+    if not isinstance(constraints, dict):
+        raise SystemExit("the current grant has malformed constraints; refusing renewal")
+    person_key = Path.home() / ".sthambha" / "person-TEST.key"
+    fallback = _delegate_reuse_command(signer_dir, person_key, agent, caps, args.ttl)
+    if not person_key.is_file():
+        print(f"person key is not available at {person_key}; the grant was not changed.\n"
+              "Run this human delegation command where the person key and signer state are available:\n"
+              f"  {fallback}", file=sys.stderr)
+        return 1
+    if not args.yes:
+        widening = sorted(set(caps) - set(current_caps))
+        detail = f"; explicitly adding {','.join(widening)}" if widening else ""
+        answer = input(f"Renew agent {agent!r} for {args.ttl} days with caps {','.join(caps)}{detail}? [y/N] ")
+        if answer.strip().lower() not in {"y", "yes"}:
+            print("grant unchanged")
+            return 1
+    try:
+        person_priv, person_pub = signer_mod.load_key(person_key)
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"cannot load the person key for renewal: {exc}") from exc
+    if person_pub != signer_person:
+        raise SystemExit(f"the person key at {person_key} does not match {signer_dir / 'person.pub'}")
+    renewed = signer_mod.issue_grant(person_priv, agent, agent_pub, caps, node=current["node"],
+                                     ttl_s=args.ttl * 86400, constraints=constraints)
+    signer_mod.save_grant(grant_path, renewed)
+    print(f"renewed agent {agent} with caps {','.join(renewed['caps'])} through "
+          f"{time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(renewed['expires_at']))} "
+          f"(grant {renewed['grant_id']}); signer reload is automatic")
+    return 0
+
+
+def _print_grant_status(grant: dict) -> None:
+    print(f"agent {grant['agent']}  caps {','.join(grant['caps']) or '-'}  grant expires "
+          f"{time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(grant['expires_at']))}")
+    if grant.get("warning"):
+        print(f"WARNING: {grant['warning']}")
+
+
 class _NoAbbrevArgumentParser(argparse.ArgumentParser):
     """Keep every parser level strict; argparse otherwise abbreviates long options."""
 
@@ -1725,6 +1816,13 @@ def main(argv=None, *, http_post=None) -> int:
     ap.add_argument("--sock", type=Path, default=default_sock)
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("status")
+    p = sub.add_parser("grant", help="inspect or explicitly renew this node's agent grant")
+    gsub = p.add_subparsers(dest="grant_cmd", required=True)
+    gsub.add_parser("status", help="show the delegated agent, caps, expiry, and warning")
+    q = gsub.add_parser("renew", help="human-only renewal that preserves the existing agent key")
+    q.add_argument("--ttl", type=int, default=90, metavar="DAYS", help="renewal lifetime in days (1-365)")
+    q.add_argument("--caps", help="explicit comma-separated cap set; omitted preserves current caps")
+    q.add_argument("--yes", action="store_true", help="confirm explicitly when stdin is not a terminal")
     p = sub.add_parser("invite"); p.add_argument("--person-key", type=Path,
                                                  default=Path.home() / ".sthambha" / "person-TEST.key")
     p.add_argument("--ttl", type=int, default=86400); p.add_argument("--note", default="")
@@ -1857,7 +1955,11 @@ def main(argv=None, *, http_post=None) -> int:
     a = ap.parse_args(argv)
     s = a.sock
 
-    if a.cmd == "wallet":
+    if a.cmd == "grant":
+        if a.grant_cmd == "renew":
+            return _grant_renew(a)
+        _print_grant_status(call(s, {"op": "status"})["grant"])
+    elif a.cmd == "wallet":
         _wallet_command(a)
     elif a.cmd == "gateway":
         import subprocess as _sp
@@ -1900,10 +2002,7 @@ def main(argv=None, *, http_post=None) -> int:
         print(f"direct listener {r.get('direct_port') or 'off'}  p2p "
               f"{(r.get('p2p') or {}).get('dial', 'off')}")
         g = r["grant"]
-        print(f"agent {g['agent']}  caps {','.join(g['caps']) or '-'}  grant expires "
-              f"{time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(g['expires_at']))}")
-        if g.get("warning"):
-            print(f"WARNING: {g['warning']}")
+        _print_grant_status(g)
         print(f"refused outbox items: {r['outbox_refused']}")
         if r.get("newest_refusal"):
             q = r["newest_refusal"]

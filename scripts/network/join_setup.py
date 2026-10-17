@@ -222,7 +222,7 @@ def retry_worker_redeem(home: Path, *, name: str = "", http_post=None) -> dict:
 
 
 def ensure_identity(home: Path) -> dict:
-    """Steps 1-4. Returns what was created vs kept."""
+    """Steps 1-4. Create the agent delegation once; later authority changes stay human-run."""
     from sthambha import signer as S
     done = {}
     node_key = home / ".nakshatra" / "keys" / "worker.ed25519"
@@ -234,15 +234,20 @@ def ensure_identity(home: Path) -> dict:
         done["node_key"] = "created"
     else:
         done["node_key"] = "kept"
+    state = home / ".sthambha" / "signer"
     person_path = home / ".sthambha" / "person-TEST.key"
-    if not person_path.exists():
+    person_priv = None
+    if not person_path.exists() and (state / "person.pub").exists():
+        person_pub = (state / "person.pub").read_text().strip()
+        done["person_key"] = "not on this box (human custody kept)"
+    elif not person_path.exists():
         priv, _ = S.new_key()
         S.save_key(person_path, priv)
         done["person_key"] = "created (TEST custody: a file on this machine)"
+        person_priv, person_pub = S.load_key(person_path)
     else:
         done["person_key"] = "kept"
-    person_priv, person_pub = S.load_key(person_path)
-    state = home / ".sthambha" / "signer"
+        person_priv, person_pub = S.load_key(person_path)
     (state / "agents").mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(state, 0o700)
     node_pub = S._node_pub_from_key(node_key)  # noqa: SLF001 — the signer's own reader for this file
@@ -258,19 +263,41 @@ def ensure_identity(home: Path) -> dict:
     agent = AGENT
     if (net / "agent").exists():                    # an existing node already signs as some agent: keep it
         agent = (net / "agent").read_text().strip() or AGENT
+    key_path = state / "agents" / f"{agent}.key"
     grant_path = state / "agents" / f"{agent}.grant.json"
-    fresh = False
-    if grant_path.exists():
-        g = json.loads(grant_path.read_text())
-        fresh = g.get("expires_at", 0) > time.time() + 7 * 86400 and set(AGENT_CAPS) <= set(g.get("caps", []))
-    if not fresh:
+    if not key_path.exists() and not grant_path.exists():
+        if person_priv is None:
+            raise SystemExit(f"agent {agent!r} has no delegation and the person key is not on this box; "
+                             "create it with an explicit human delegation")
         agent_priv, agent_pub = S.new_key()
-        S.save_key(state / "agents" / f"{agent}.key", agent_priv)
+        S.save_key(key_path, agent_priv)
         grant = S.issue_grant(person_priv, agent, agent_pub, AGENT_CAPS, node=node_pub, ttl_s=AGENT_TTL_S)
-        grant_path.write_text(json.dumps(grant, indent=1))
+        S.save_grant(grant_path, grant)
         done["agent"] = f"'{agent}' may {', '.join(AGENT_CAPS)} for 90 days"
+    elif key_path.exists() != grant_path.exists():
+        raise SystemExit(f"agent {agent!r} has only one of its key/grant files; refusing automatic repair. "
+                         "Restore the missing signer-state file or delegate a replacement explicitly.")
     else:
-        done["agent"] = f"'{agent}' kept"
+        grant = json.loads(grant_path.read_text())
+        now = int(time.time())
+        expires = int(grant.get("expires_at", 0))
+        missing = sorted(set(AGENT_CAPS) - set(grant.get("caps") or []))
+        notices = []
+        if expires <= now:
+            notices.append("grant expired")
+        elif expires < now + 7 * 86400:
+            notices.append("grant expires in under 7 days")
+        if missing:
+            notices.append("grant intentionally remains narrower than join defaults "
+                           f"(missing {', '.join(missing)})")
+        if notices:
+            command = "nak grant renew"
+            if missing:
+                widened = sorted(set(grant.get("caps") or []) | set(AGENT_CAPS))
+                command += " --caps " + ",".join(widened)
+            done["agent"] = f"'{agent}' kept; {'; '.join(notices)}; human renewal only: {command}"
+        else:
+            done["agent"] = f"'{agent}' kept"
     net.mkdir(parents=True, exist_ok=True, mode=0o700)
     agent_path = net / "agent"
     if not agent_path.exists():
@@ -357,8 +384,11 @@ def main(argv=None) -> int:
     print("  4. plug in your AI (optional):")
     print(f"       OpenClaw: openclaw mcp add nakshatra --command '{mcp_command}' && openclaw config set tools.toolSearch false")
     print(f"       Hermes:   add an mcp_servers entry with command {mcp_command}")
-    print(f"\nyou are {done['person'][:16]}… on node {done['node'][:16]}… — your person key is a TEST file at "
-          f"~/.sthambha/person-TEST.key: back it up, and never share it.")
+    if (a.home / ".sthambha" / "person-TEST.key").exists():
+        custody_note = "your person key is a TEST file at ~/.sthambha/person-TEST.key: back it up, and never share it"
+    else:
+        custody_note = "your person key remains in human custody off this box"
+    print(f"\nyou are {done['person'][:16]}… on node {done['node'][:16]}… — {custody_note}.")
     return 0
 
 
