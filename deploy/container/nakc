@@ -7,8 +7,14 @@ CONTAINER_NAME="${NAKC_NAME:-nakshatra-node}"
 VOLUME_NAME="${NAKC_VOLUME:-nakshatra-node-state}"
 CONFIG_DIR="${NAKC_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/nakshatra-container}"
 VARIANT="${NAKC_VARIANT:-cpu}"
-IMAGE="${NAKC_IMAGE:-nakshatra-node:$VARIANT}"
+DEFAULT_IMAGE="nakshatra-node:$VARIANT"
+IMAGE="${NAKC_IMAGE:-$DEFAULT_IMAGE}"
 DRY_RUN="${NAKC_DRY_RUN:-0}"
+IMAGE_INPUTS=(Containerfile supervisor.py systemctl.py bootstrap.py control.py dispatch.sh)
+IMAGE_ENSURED=0
+IMAGE_REFRESH_STATE=unknown
+IMAGE_REFRESH_OLD_ID=''
+IMAGE_REFRESH_NEW_ID=''
 
 die() { printf 'nakc: %s\n' "$*" >&2; exit 2; }
 
@@ -63,13 +69,125 @@ base_image() {
     esac
 }
 
+manage_image() {
+    [ "${NAKC_MANAGE_IMAGE:-0}" = 1 ] || [ "$IMAGE" = "$DEFAULT_IMAGE" ]
+}
+
+image_fingerprint() {
+    local base
+    base="$(base_image)" || return
+    python3 - "$SCRIPT_DIR" "$VARIANT" "$base" "${IMAGE_INPUTS[@]}" <<'PY'
+import hashlib
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+fields = [(name, (root / name).read_bytes()) for name in sys.argv[4:]]
+fields.extend((("VARIANT", sys.argv[2].encode()), ("BASE_IMAGE", sys.argv[3].encode())))
+digest = hashlib.sha256()
+for name, value in fields:
+    encoded_name = name.encode()
+    digest.update(len(encoded_name).to_bytes(8, "big"))
+    digest.update(encoded_name)
+    digest.update(len(value).to_bytes(8, "big"))
+    digest.update(value)
+print(digest.hexdigest())
+PY
+}
+
+image_id() {
+    "$1" image inspect -f '{{.Id}}' "$IMAGE" 2>/dev/null
+}
+
+container_image_id() {
+    "$1" inspect -f '{{.Image}}' "$CONTAINER_NAME" 2>/dev/null
+}
+
+build_image() {
+    local runtime="$1" fingerprint="$2"
+    run "$runtime" build --pull -t "$IMAGE" -f "$SCRIPT_DIR/Containerfile" \
+        --label "io.nakshatra.image-inputs=$fingerprint" \
+        --build-arg "NAK_VARIANT=$VARIANT" --build-arg "BASE_IMAGE=$(base_image)" "$SCRIPT_DIR"
+}
+
 ensure_image() {
-    local runtime="$1"
-    if [ "$DRY_RUN" = 1 ]; then return; fi
-    if ! "$runtime" image inspect "$IMAGE" >/dev/null 2>&1; then
-        "$runtime" build --pull -t "$IMAGE" -f "$SCRIPT_DIR/Containerfile" \
-            --build-arg "NAK_VARIANT=$VARIANT" --build-arg "BASE_IMAGE=$(base_image)" "$SCRIPT_DIR"
+    local runtime="$1" fingerprint current_label
+    [ "$IMAGE_ENSURED" = 0 ] || return 0
+    if ! manage_image; then
+        IMAGE_REFRESH_STATE=unmanaged
+        IMAGE_ENSURED=1
+        return 0
     fi
+    fingerprint="$(image_fingerprint)" || return
+    if [ "$DRY_RUN" = 1 ]; then
+        build_image "$runtime" "$fingerprint"
+        IMAGE_REFRESH_STATE=dry-run
+        IMAGE_ENSURED=1
+        return 0
+    fi
+    if "$runtime" image inspect "$IMAGE" >/dev/null 2>&1; then
+        IMAGE_REFRESH_OLD_ID="$(image_id "$runtime")" || return
+        current_label="$("$runtime" image inspect -f \
+            '{{index .Config.Labels "io.nakshatra.image-inputs"}}' "$IMAGE" 2>/dev/null || true)"
+        if [ "$current_label" = "$fingerprint" ]; then
+            IMAGE_REFRESH_STATE=current
+            IMAGE_REFRESH_NEW_ID="$IMAGE_REFRESH_OLD_ID"
+            IMAGE_ENSURED=1
+            return 0
+        fi
+        if ! run "$runtime" tag "$IMAGE" "${IMAGE}-prev"; then
+            printf 'nakc: cannot preserve current image as %s; rebuild aborted\n' "${IMAGE}-prev" >&2
+            return 1
+        fi
+    else
+        IMAGE_REFRESH_OLD_ID='<missing>'
+    fi
+    if ! build_image "$runtime" "$fingerprint"; then
+        printf '%s\n' \
+            'nakc: image build failed; existing image tag (if any) and running container unchanged' >&2
+        return 1
+    fi
+    IMAGE_REFRESH_NEW_ID="$(image_id "$runtime")" || {
+        printf 'nakc: image build completed but the new image ID could not be inspected\n' >&2
+        return 1
+    }
+    IMAGE_REFRESH_STATE=rebuilt
+    IMAGE_ENSURED=1
+}
+
+image_status_line() {
+    local runtime="$1" fingerprint label freshness current_id running_id use_status
+    if [ "$DRY_RUN" = 1 ]; then
+        printf 'image stale (fingerprint not inspected in dry run); running container image unknown\n'
+        return
+    fi
+    fingerprint="$(image_fingerprint)" || return
+    current_id=''
+    if "$runtime" image inspect "$IMAGE" >/dev/null 2>&1; then
+        current_id="$(image_id "$runtime")" || true
+        label="$("$runtime" image inspect -f \
+            '{{index .Config.Labels "io.nakshatra.image-inputs"}}' "$IMAGE" 2>/dev/null || true)"
+        if [ "$label" = "$fingerprint" ]; then
+            freshness='image current'
+        elif manage_image; then
+            freshness='image stale (fingerprint mismatch)'
+        else
+            freshness='image stale (fingerprint mismatch; unmanaged)'
+        fi
+    else
+        freshness='image stale (missing)'
+    fi
+    if container_running; then
+        running_id="$(container_image_id "$runtime")" || true
+        if [ -n "$current_id" ] && [ "$running_id" = "$current_id" ]; then
+            use_status='running container uses current image ID'
+        else
+            use_status='running container does not use current image ID'
+        fi
+    else
+        use_status='no running container'
+    fi
+    printf '%s; %s\n' "$freshness" "$use_status"
 }
 
 valid_port() {
@@ -202,6 +320,53 @@ ensure_running() {
     if ! container_running; then start_container "$runtime"; fi
 }
 
+recreate_with_rollback() {
+    local runtime="$1"
+    if start_container "$runtime"; then return 0; fi
+    printf 'nakc: container recreation failed; attempting image rollback\n' >&2
+    if "$runtime" image inspect "${IMAGE}-prev" >/dev/null 2>&1 && \
+       run "$runtime" tag "${IMAGE}-prev" "$IMAGE" && \
+       start_container "$runtime"; then
+        printf 'nakc: restored previous image generation after recreation failure\n' >&2
+    else
+        printf 'nakc: recreation failed and the previous image generation could not be restored\n' >&2
+    fi
+    return 1
+}
+
+update_container() {
+    local runtime="$1" current_id running_id recreated=0
+    ensure_image "$runtime" || return
+    if ! container_running; then
+        recreate_with_rollback "$runtime" || return
+        recreated=1
+    else
+        current_id="$(image_id "$runtime")" || {
+            printf 'nakc: cannot inspect current image ID for update\n' >&2
+            return 1
+        }
+        running_id="$(container_image_id "$runtime")" || {
+            printf 'nakc: cannot inspect running container image ID for update\n' >&2
+            return 1
+        }
+        if [ "$running_id" != "$current_id" ]; then
+            recreate_with_rollback "$runtime" || return
+            recreated=1
+        fi
+    fi
+    run "$runtime" exec "$CONTAINER_NAME" nak-container-control update || return
+    case "$IMAGE_REFRESH_STATE" in
+        rebuilt)
+            printf 'image rebuilt %s->%s' "$IMAGE_REFRESH_OLD_ID" "$IMAGE_REFRESH_NEW_ID"
+            ;;
+        unmanaged) printf 'image current (externally managed)' ;;
+        dry-run) printf 'image rebuild planned' ;;
+        *) printf 'image current' ;;
+    esac
+    if [ "$recreated" = 1 ]; then printf ', container recreated'; fi
+    printf '\n'
+}
+
 worker_port_from_args() {
     local port='' count=0 needs_value=0 item
     for item in "$@"; do
@@ -237,7 +402,8 @@ usage: nakc join '<invite line>'
        nakc mcp
 
 Environment: NAKC_ENGINE=docker|podman, NAKC_VARIANT=cpu|nvidia|rocm,
-NAKC_MEMORY=16g, NAKC_PIDS_LIMIT=512, NAKC_P2P_PORT=4001, NAKC_DRY_RUN=1.
+NAKC_MEMORY=16g, NAKC_PIDS_LIMIT=512, NAKC_P2P_PORT=4001, NAKC_DRY_RUN=1,
+NAKC_IMAGE=<prebuilt>, NAKC_MANAGE_IMAGE=1.
 EOF
 }
 
@@ -264,14 +430,14 @@ main() {
             [ "$#" -eq 0 ] || die "status takes no arguments"
             run "$runtime" ps -a --filter "name=^${CONTAINER_NAME}$"
             if container_running; then run "$runtime" exec "$CONTAINER_NAME" nak-container-control status; fi
+            image_status_line "$runtime"
             ;;
         logs)
             run "$runtime" logs "$@" "$CONTAINER_NAME"
             ;;
         update)
             [ "$#" -eq 0 ] || die "update takes no arguments"
-            ensure_running "$runtime"
-            run "$runtime" exec "$CONTAINER_NAME" nak-container-control update
+            update_container "$runtime"
             ;;
         join)
             [ "$#" -eq 1 ] || die "join needs the single complete invite line"

@@ -18,6 +18,9 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 CONTAINER = ROOT / "deploy" / "container"
 NAKC = CONTAINER / "nakc"
+FINGERPRINT_INPUTS = {
+    "Containerfile", "supervisor.py", "systemctl.py", "bootstrap.py", "control.py", "dispatch.sh",
+}
 
 
 def _load(name: str, path: Path):
@@ -162,6 +165,121 @@ def _dry_run_argv(output: str, occurrence: int = 0) -> list[str]:
     return shlex.split(lines[occurrence][2:])
 
 
+def _dry_build_argv(script: Path = NAKC, variant: str = "cpu") -> list[str]:
+    result = subprocess.run(
+        [str(script), "start"],
+        env=dict(
+            os.environ,
+            NAKC_DRY_RUN="1",
+            NAKC_ENGINE="true",
+            NAKC_VARIANT=variant,
+            NAKC_CONFIG_DIR=str(script.parent / ".test-config"),
+        ),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    line = next(line for line in result.stdout.splitlines() if line.startswith("+ true build "))
+    return shlex.split(line.removeprefix("+ "))
+
+
+def _image_fingerprint(script: Path = NAKC, variant: str = "cpu") -> str:
+    argv = _dry_build_argv(script, variant)
+    label = argv[argv.index("--label") + 1]
+    return label.removeprefix("io.nakshatra.image-inputs=")
+
+
+def _freshness_engine(
+        tmp_path: Path, *, image_id: str | None = "sha256:old", label: str | None = None,
+        container_id: str | None = None, next_id: str = "sha256:new",
+        fail_build: bool = False, fail_runs: int = 0) -> tuple[Path, Path, dict[str, str]]:
+    state = tmp_path / "engine-state"
+    state.mkdir()
+    if image_id is not None:
+        (state / "image_id").write_text(image_id + "\n")
+    if label is not None:
+        (state / "image_label").write_text(label + "\n")
+    if container_id is not None:
+        (state / "container_id").write_text(container_id + "\n")
+        (state / "running").touch()
+    (state / "next_id").write_text(next_id + "\n")
+    (state / "fail_build").write_text("1\n" if fail_build else "0\n")
+    (state / "fail_runs").write_text(f"{fail_runs}\n")
+    log = tmp_path / "engine.log"
+    engine = tmp_path / "fake-image-engine"
+    engine.write_text(
+        "#!/bin/sh\n"
+        "set -eu\n"
+        "s=$NAKC_TEST_STATE\n"
+        "printf '%s\\n' \"$*\" >>\"$NAKC_TEST_LOG\"\n"
+        "case \"$1 $2\" in\n"
+        "  'image inspect')\n"
+        "    if [ \"${3:-}\" = -f ]; then fmt=$4; ref=$5; else fmt=; ref=$3; fi\n"
+        "    suffix=\n"
+        "    case \"$ref\" in *-prev) suffix=_prev;; esac\n"
+        "    [ -f \"$s/image_id$suffix\" ] || exit 1\n"
+        "    case \"$fmt\" in\n"
+        "      *Labels*) [ -f \"$s/image_label$suffix\" ] && cat \"$s/image_label$suffix\" || true;;\n"
+        "      *Id*) cat \"$s/image_id$suffix\";;\n"
+        "    esac\n"
+        "    exit 0;;\n"
+        "  'container inspect') [ -f \"$s/running\" ]; exit $?;;\n"
+        "esac\n"
+        "case \"$1\" in\n"
+        "  inspect)\n"
+        "    case \"$3\" in\n"
+        "      *State.Running*) [ -f \"$s/running\" ] && printf 'true\\n' || printf 'false\\n';;\n"
+        "      *Image*) [ -f \"$s/container_id\" ] && cat \"$s/container_id\" || exit 1;;\n"
+        "    esac;;\n"
+        "  tag)\n"
+        "    case \"$2\" in\n"
+        "      *-prev) src=_prev;;\n"
+        "      *) src=;;\n"
+        "    esac\n"
+        "    case \"$3\" in\n"
+        "      *-prev) dst=_prev;;\n"
+        "      *) dst=;;\n"
+        "    esac\n"
+        "    cp \"$s/image_id$src\" \"$s/image_id$dst\"\n"
+        "    if [ -f \"$s/image_label$src\" ]; then\n"
+        "      cp \"$s/image_label$src\" \"$s/image_label$dst\"\n"
+        "    else\n"
+        "      rm -f \"$s/image_label$dst\"\n"
+        "    fi;;\n"
+        "  build)\n"
+        "    [ \"$(cat \"$s/fail_build\")\" = 0 ] || exit 41\n"
+        "    label=\n"
+        "    while [ \"$#\" -gt 0 ]; do\n"
+        "      if [ \"$1\" = --label ]; then label=$2; break; fi\n"
+        "      shift\n"
+        "    done\n"
+        "    cp \"$s/next_id\" \"$s/image_id\"\n"
+        "    printf '%s\\n' \"${label#io.nakshatra.image-inputs=}\" >\"$s/image_label\";;\n"
+        "  rm) rm -f \"$s/running\" \"$s/container_id\";;\n"
+        "  run)\n"
+        "    failures=$(cat \"$s/fail_runs\")\n"
+        "    if [ \"$failures\" -gt 0 ]; then\n"
+        "      printf '%s\\n' $((failures - 1)) >\"$s/fail_runs\"\n"
+        "      exit 42\n"
+        "    fi\n"
+        "    cp \"$s/image_id\" \"$s/container_id\"\n"
+        "    : >\"$s/running\";;\n"
+        "  exec|ps|stop) :;;\n"
+        "esac\n"
+    )
+    engine.chmod(0o755)
+    env = dict(
+        os.environ,
+        HOME=str(tmp_path / "home"),
+        NAKC_ENGINE=str(engine),
+        NAKC_CONFIG_DIR=str(tmp_path / "config"),
+        NAKC_TEST_STATE=str(state),
+        NAKC_TEST_LOG=str(log),
+    )
+    return state, log, env
+
+
 def _logged_run_argv(path: Path) -> list[str]:
     runs = [shlex.split(line) for line in path.read_text().splitlines()
             if line.startswith("run ")]
@@ -189,6 +307,222 @@ def test_containerfile_is_nonroot_pinned_and_does_not_copy_secrets():
     assert not re.search(r"COPY[^\n]*(?:\.env|\.key|id_rsa|credentials|\.nakshatra|\.sthambha)", body, re.I)
     assert "sudo" not in body
     assert 'ENTRYPOINT ["/usr/bin/tini"' in body
+
+
+def test_containerfile_copy_sources_are_all_fingerprint_inputs():
+    body = (CONTAINER / "Containerfile").read_text().replace("\\\n", " ")
+    copied = set()
+    for line in body.splitlines():
+        if not re.match(r"^\s*COPY\s", line, re.I):
+            continue
+        payload = line.split(None, 1)[1].strip()
+        while payload.startswith("--"):
+            _option, payload = payload.split(None, 1)
+        if payload.startswith("["):
+            operands = json.loads(payload)
+        else:
+            operands = shlex.split(payload)
+        copied.update(operands[:-1])
+    assert copied <= FINGERPRINT_INPUTS
+
+
+@pytest.mark.parametrize("name", sorted(FINGERPRINT_INPUTS))
+def test_image_fingerprint_changes_when_any_input_byte_changes(tmp_path, name):
+    copied = tmp_path / "container"
+    shutil.copytree(CONTAINER, copied)
+    baseline = _image_fingerprint(copied / "nakc")
+    path = copied / name
+    path.write_bytes(path.read_bytes() + b"\n# fingerprint mutation\n")
+    assert _image_fingerprint(copied / "nakc") != baseline
+
+
+def test_image_fingerprint_changes_with_variant_and_base_image(tmp_path):
+    assert _image_fingerprint(variant="nvidia") != _image_fingerprint(variant="cpu")
+    copied = tmp_path / "container"
+    shutil.copytree(CONTAINER, copied)
+    script = copied / "nakc"
+    baseline = _image_fingerprint(script)
+    script.write_text(script.read_text().replace(
+        "cpu) printf '%s\\n' 'debian:12.12-slim'",
+        "cpu) printf '%s\\n' 'debian:12.13-slim'",
+    ))
+    assert _image_fingerprint(script) != baseline
+
+
+def test_missing_image_builds_with_fingerprint_label(tmp_path):
+    state, log, env = _freshness_engine(tmp_path, image_id=None)
+    result = subprocess.run(
+        [str(NAKC), "start"], env=env, text=True, capture_output=True, check=False)
+    assert result.returncode == 0, result.stderr
+    lines = log.read_text().splitlines()
+    build = next(shlex.split(line) for line in lines if line.startswith("build "))
+    assert build[build.index("--label") + 1] == (
+        f"io.nakshatra.image-inputs={_image_fingerprint()}"
+    )
+    assert not any(line.startswith("tag ") for line in lines)
+    assert (state / "image_label").read_text().strip() == _image_fingerprint()
+
+
+def test_dry_run_prints_labeled_build_without_executing_engine(tmp_path):
+    engine_log = tmp_path / "engine-was-called"
+    engine = tmp_path / "must-not-run-engine"
+    engine.write_text(
+        "#!/bin/sh\n"
+        "printf called >\"$NAKC_TEST_LOG\"\n"
+        "exit 99\n"
+    )
+    engine.chmod(0o755)
+    result = subprocess.run(
+        [str(NAKC), "start"],
+        env=dict(
+            os.environ,
+            HOME=str(tmp_path / "home"),
+            NAKC_DRY_RUN="1",
+            NAKC_ENGINE=str(engine),
+            NAKC_CONFIG_DIR=str(tmp_path / "config"),
+            NAKC_TEST_LOG=str(engine_log),
+        ),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert not engine_log.exists()
+    build = shlex.split(result.stdout.splitlines()[0].removeprefix("+ "))
+    assert build[0:2] == [str(engine), "build"]
+    assert build[build.index("--label") + 1] == (
+        f"io.nakshatra.image-inputs={_image_fingerprint()}"
+    )
+
+
+def test_current_image_label_does_not_build(tmp_path):
+    _state, log, env = _freshness_engine(tmp_path, label=_image_fingerprint())
+    result = subprocess.run(
+        [str(NAKC), "start"], env=env, text=True, capture_output=True, check=False)
+    assert result.returncode == 0, result.stderr
+    lines = log.read_text().splitlines()
+    assert not any(line.startswith(("build ", "tag ")) for line in lines)
+
+
+def test_stale_image_is_preserved_as_prev_before_build(tmp_path):
+    state, log, env = _freshness_engine(tmp_path, label="stale")
+    result = subprocess.run(
+        [str(NAKC), "start"], env=env, text=True, capture_output=True, check=False)
+    assert result.returncode == 0, result.stderr
+    actions = [line.split()[0] for line in log.read_text().splitlines()]
+    assert actions.index("tag") < actions.index("build")
+    assert (state / "image_id_prev").read_text().strip() == "sha256:old"
+    assert (state / "image_id").read_text().strip() == "sha256:new"
+
+
+def test_failed_image_build_keeps_old_tag_and_running_container(tmp_path):
+    state, log, env = _freshness_engine(
+        tmp_path, label="stale", container_id="sha256:old", fail_build=True)
+    result = subprocess.run(
+        [str(NAKC), "start"], env=env, text=True, capture_output=True, check=False)
+    assert result.returncode != 0
+    assert "image build failed" in result.stderr
+    assert (state / "image_id").read_text().strip() == "sha256:old"
+    assert (state / "image_id_prev").read_text().strip() == "sha256:old"
+    assert (state / "container_id").read_text().strip() == "sha256:old"
+    lines = log.read_text().splitlines()
+    assert not any(line.startswith(("rm ", "run ")) for line in lines)
+
+
+def test_update_rebuilds_stale_image_recreates_with_stored_args_then_updates(tmp_path):
+    config = tmp_path / "config"
+    config.mkdir()
+    (config / "worker-port").write_text("50051\n")
+    (config / "p2p-port").write_text("24001\n")
+    _state, log, env = _freshness_engine(
+        tmp_path, label="stale", container_id="sha256:old")
+    result = subprocess.run(
+        [str(NAKC), "update"], env=env, text=True, capture_output=True, check=False)
+    assert result.returncode == 0, result.stderr
+    lines = log.read_text().splitlines()
+    build_index = next(i for i, line in enumerate(lines) if line.startswith("build "))
+    rm_index = next(i for i, line in enumerate(lines) if line.startswith("rm "))
+    run_index = next(i for i, line in enumerate(lines) if line.startswith("run "))
+    update_index = next(i for i, line in enumerate(lines) if line.endswith(
+        "exec nakshatra-node nak-container-control update"))
+    assert build_index < rm_index < run_index < update_index
+    update_run = shlex.split(lines[run_index])
+    assert "NAK_CONTAINER_WORKER=1" in update_run
+    assert "0.0.0.0:24001:24001/tcp" in update_run
+    assert "image rebuilt sha256:old->sha256:new, container recreated" in result.stdout
+
+    log.write_text("")
+    started = subprocess.run(
+        [str(NAKC), "start"], env=env, text=True, capture_output=True, check=False)
+    assert started.returncode == 0, started.stderr
+    start_run = next(shlex.split(line) for line in log.read_text().splitlines()
+                     if line.startswith("run "))
+    assert update_run == start_run
+
+
+def test_update_recreates_old_container_without_build(tmp_path):
+    _state, log, env = _freshness_engine(
+        tmp_path, image_id="sha256:new", label=_image_fingerprint(),
+        container_id="sha256:old")
+    result = subprocess.run(
+        [str(NAKC), "update"], env=env, text=True, capture_output=True, check=False)
+    assert result.returncode == 0, result.stderr
+    lines = log.read_text().splitlines()
+    assert not any(line.startswith("build ") for line in lines)
+    assert any(line.startswith("rm ") for line in lines)
+    assert any(line.startswith("run ") for line in lines)
+    assert result.stdout == "image current, container recreated\n"
+
+
+def test_update_with_current_image_and_container_only_runs_control_update(tmp_path):
+    _state, log, env = _freshness_engine(
+        tmp_path, image_id="sha256:new", label=_image_fingerprint(),
+        container_id="sha256:new")
+    result = subprocess.run(
+        [str(NAKC), "update"], env=env, text=True, capture_output=True, check=False)
+    assert result.returncode == 0, result.stderr
+    lines = log.read_text().splitlines()
+    assert not any(line.startswith(("build ", "rm ", "run ")) for line in lines)
+    assert lines[-1].endswith("exec nakshatra-node nak-container-control update")
+    assert result.stdout == "image current\n"
+
+
+def test_update_recreate_failure_restores_prev_and_restarts_then_fails(tmp_path):
+    state, log, env = _freshness_engine(
+        tmp_path, label="stale", container_id="sha256:old", fail_runs=1)
+    result = subprocess.run(
+        [str(NAKC), "update"], env=env, text=True, capture_output=True, check=False)
+    assert result.returncode != 0
+    assert "attempting image rollback" in result.stderr
+    assert "restored previous image generation" in result.stderr
+    assert (state / "image_id").read_text().strip() == "sha256:old"
+    assert (state / "container_id").read_text().strip() == "sha256:old"
+    lines = log.read_text().splitlines()
+    assert sum(line.startswith("run ") for line in lines) == 2
+    assert any(line == "tag nakshatra-node:cpu-prev nakshatra-node:cpu" for line in lines)
+    assert not any(line.endswith("nak-container-control update") for line in lines)
+
+
+def test_custom_image_without_manage_opt_in_is_never_rebuilt(tmp_path):
+    _state, log, env = _freshness_engine(tmp_path, label=None)
+    env["NAKC_IMAGE"] = "registry.example/nakshatra-node:official"
+    result = subprocess.run(
+        [str(NAKC), "start"], env=env, text=True, capture_output=True, check=False)
+    assert result.returncode == 0, result.stderr
+    assert not any(line.startswith(("build ", "tag "))
+                   for line in log.read_text().splitlines())
+
+
+def test_status_reports_freshness_and_running_image_generation(tmp_path):
+    _state, _log, env = _freshness_engine(
+        tmp_path, image_id="sha256:new", label=_image_fingerprint(),
+        container_id="sha256:old")
+    result = subprocess.run(
+        [str(NAKC), "status"], env=env, text=True, capture_output=True, check=False)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == (
+        "image current; running container does not use current image ID\n"
+    )
 
 
 def test_nakc_default_run_is_hardened_and_mounts_only_the_state_volume(tmp_path):
@@ -256,7 +590,15 @@ def test_worker_dry_run_golden_is_byte_identical(tmp_path):
         "nakc: deliberate public port: libp2p sidecar 0.0.0.0:4001 (tcp+udp); "
         "worker gRPC stays on container loopback\n"
     )
-    assert result.stdout == (
+    lines = result.stdout.splitlines(keepends=True)
+    build = shlex.split(lines[0].removeprefix("+ "))
+    assert build[:2] == ["docker", "build"]
+    assert build[build.index("--label") + 1] == (
+        f"io.nakshatra.image-inputs={_image_fingerprint()}"
+    )
+    assert "--pull" in build
+    assert "docker" not in build[1:]
+    assert "".join(lines[1:]) == (
         "+ docker run -d --name nakshatra-node --hostname nakshatra-node "
         "--label io.nakshatra.role=node --restart unless-stopped --user 11600:11600 "
         "--cap-drop ALL --security-opt no-new-privileges --read-only "
@@ -1479,6 +1821,8 @@ def test_daemon_reload_regenerates_the_installer_allowlist(tmp_path, monkeypatch
 
 
 def test_cpu_image_smoke_when_docker_is_usable_without_sudo(tmp_path):
+    if os.environ.get("NAKC_TEST_REAL_DOCKER") != "1":
+        pytest.skip("real Docker smoke test requires NAKC_TEST_REAL_DOCKER=1")
     if not shutil.which("docker"):
         pytest.skip("docker is not installed")
     available = subprocess.run(["docker", "info"], capture_output=True, text=True, check=False)

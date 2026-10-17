@@ -80,6 +80,21 @@ nakc update
 nakc stop
 ```
 
+### Updates and image freshness
+
+`nakc start` and `nakc update` fingerprint the `Containerfile` and the adjacent host-side
+supervisor/control files, together with the selected variant and base image. If the default
+`nakshatra-node:<variant>` image has a different fingerprint label, `nakc` preserves it as
+`<image>-prev`, builds the replacement before removing any container, and recreates a container
+that still uses the older image ID. `nakc update` does this host image step first and then runs the
+signed in-container release updater. Image rebuild and container recreation happen only on an
+explicit host `nakc start` or `nakc update`, never from the hourly in-container updater.
+
+`NAKC_IMAGE` remains an externally managed prebuilt-image override: it is not rebuilt merely
+because it has no Nakshatra fingerprint label. Set `NAKC_MANAGE_IMAGE=1` to opt a custom image into
+the same rebuild and `-prev` rollback behavior. `nakc status` reports both fingerprint freshness
+and whether the running container uses the current image ID.
+
 ## Optional share
 
 No host path is mounted by default. To expose one deliberate directory:
@@ -135,7 +150,8 @@ NAKC_VARIANT=rocm nakc start     # ROCm image; only /dev/kfd and /dev/dri
 
 The default build bases are pinned by version tag, not immutable digest, in `nakc` and
 `Containerfile`; image construction is outside Nakshatra release signing. Set `NAKC_IMAGE`
-to use a prebuilt official image instead of the locally built `nakshatra-node:<variant>`.
+to use a prebuilt official image instead of the locally built `nakshatra-node:<variant>`;
+custom images are externally managed unless `NAKC_MANAGE_IMAGE=1` is also set.
 NVIDIA requires the NVIDIA container runtime/CDI setup on the host; ROCm requires host
 device permissions. Neither mode mounts the host filesystem beyond the optional share.
 
