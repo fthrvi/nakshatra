@@ -106,7 +106,8 @@ def test_revoked_worker_cannot_deliver_and_the_task_refunds_at_deadline(net):
     h = _assigned(a, b, deadline_s=4)
     grant_id = json.loads((b.dir / "signer" / "agents" / "pa.grant.json").read_text())["grant_id"]
     (b.dir / "signer" / "revoked.txt").write_text(grant_id + "\n")     # the worker's person pulls the delegation
-    b.node.submit_task(h, "ok")                     # queued, but the signer will not sign it
+    with pytest.raises(ValueError, match="is revoked"):
+        b.node.submit_task(h, "ok")                  # synchronously refused before changing task state
     time.sleep(4.5)
     assert a.node.store.task_get(h, "poster")["state"] in ("assigned", "expired")
     a.node.sweep()

@@ -349,8 +349,9 @@ def test_worker_without_claim_cap_cannot_claim(net):
     _connect(net, a, b)
     h = a.node.post_task("worker", "x", "Do it.", [{"max_words": 3}])["task_hash"]
     assert wait(lambda: _worker_row(b.node, h))
-    b.node.claim_task(h)                              # queued; the signer refuses to sign it
-    assert wait(lambda: any(b.node.store.refused(m) for m in _outbox_mids(b.node)))
+    with pytest.raises(ValueError, match=r"cap nak\.task\.claim not granted.*sthambha\.signer delegate"):
+        b.node.claim_task(h)                          # refused before state change or queueing
+    assert _worker_row(b.node, h)[0]["state"] == "offered"
     assert a.node.store.task_get(h, "poster")["state"] == "posted"
     # and the session with that contact still carries ordinary messages
     mid = b.node.send(a.person_pub, "still here")["queued"]
@@ -359,6 +360,69 @@ def test_worker_without_claim_cap_cannot_claim(net):
 
 def _outbox_mids(node):
     return [r[0] for r in node.store._q("SELECT nonce FROM outbox")]
+
+
+def _replace_grant(party, caps, issued_at, ttl):
+    _, agent_pub = signer_mod.load_key(party.dir / "signer" / "agents" / "pa.key")
+    grant = signer_mod.issue_grant(party.person_priv, "pa", agent_pub, caps, node=party.node.node,
+                                   now=issued_at, ttl_s=ttl)
+    (party.dir / "signer" / "agents" / "pa.grant.json").write_text(json.dumps(grant))
+    return grant
+
+
+def test_expired_missing_and_valid_grants_refuse_synchronously_or_queue(net):
+    a, b = _pair(net)
+    before = len(_outbox_mids(a.node))
+    grant = _replace_grant(a, ("nak.msg",), int(time.time()) - 100, 10)
+    with pytest.raises(ValueError, match=r"agent 'pa'.*expired at .*Renew manually: python -m sthambha.signer delegate"):
+        a.node.send("b", "not queued")
+    assert len(_outbox_mids(a.node)) == before
+
+    _replace_grant(a, ("nak.msg",), int(time.time()), 3600)
+    with pytest.raises(ValueError, match=r"cap nak\.task\.post not granted.*--caps nak\.msg,nak\.task\.post"):
+        a.node.post_task("b", "no cap", "not queued", [{"max_words": 2}])
+    assert len(_outbox_mids(a.node)) == before
+
+    _replace_grant(a, ("nak.msg", "nak.task.post"), int(time.time()), 3600)
+    mid = a.node.send("b", "valid grant queues")["queued"]
+    assert mid in _outbox_mids(a.node)
+    assert grant["grant_id"]
+
+
+def test_grant_warning_thresholds_and_daily_log(net, monkeypatch):
+    now = 1_700_000_000
+    base = {"grant_id": "g", "not_before": now - 1, "expires_at": now + nakd.GRANT_WARN_S,
+            "revoked": False}
+    assert nakd.Node._grant_warning_text(base, now) == ""
+    assert "expires at" in nakd.Node._grant_warning_text(dict(base, expires_at=now + nakd.GRANT_WARN_S - 1), now)
+    assert "expired at" in nakd.Node._grant_warning_text(dict(base, expires_at=now), now)
+
+    a = net("warning")
+    logs = []
+    a.node.log = logs.append
+    _replace_grant(a, ("nak.msg",), now - 100, 10)
+    monkeypatch.setattr(nakd.time, "time", lambda: now)
+    a.node._last_grant_warning_day = None
+    a.node._warn_grant()
+    a.node._warn_grant()
+    assert len(logs) == 1 and logs[0].startswith("WARNING:") and "expired" in logs[0]
+    a.node._warn_grant(now=now + 86400)
+    assert len(logs) == 2
+
+
+def test_status_and_outbox_show_refusal_without_text_by_default(net):
+    a, b = _pair(net)
+    mid = a.node.send("b", "private marker")['queued']
+    a.node.store.refuse(mid, "grant expired locally")
+    rows = a.node.store.outbox()
+    row = next(r for r in rows if r["id"] == mid)
+    assert row["kind"] == "msg" and row["refused"] and "text" not in row
+    assert next(r for r in a.node.store.outbox(include_text=True) if r["id"] == mid)["text"] == "private marker"
+    assert next(r for r in a.node.store.outbox(refused_only=True) if r["id"] == mid)["reason"] == "grant expired locally"
+    status = a.node.status()
+    assert status["grant"]["agent"] == "pa" and status["grant"]["caps"] == ["nak.msg"]
+    assert status["outbox_refused"] == 1
+    assert status["newest_refusal"]["reason"] == "grant expired locally"
 
 
 def test_poster_cannot_post_secrets_or_to_strangers(net):

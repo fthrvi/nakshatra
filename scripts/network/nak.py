@@ -1750,6 +1750,10 @@ def main(argv=None, *, http_post=None) -> int:
     p = sub.add_parser("send"); p.add_argument("to"); p.add_argument("text")
     p.add_argument("--aspect", default="")
     p = sub.add_parser("inbox"); p.add_argument("--limit", type=int, default=20)
+    p = sub.add_parser("outbox", help="show recent queued, delivered, and refused outbound items")
+    p.add_argument("--refused", action="store_true", help="show only refused items")
+    p.add_argument("--text", action="store_true", help="also show message/result text")
+    p.add_argument("--limit", type=int, default=50)
     sub.add_parser("ledger", help="escrow journal: open / released / refunded")
     p = sub.add_parser("wallet", help="deposit and withdraw USDC-backed inference credits")
     walsub = p.add_subparsers(dest="wallet_cmd", required=True)
@@ -1895,6 +1899,15 @@ def main(argv=None, *, http_post=None) -> int:
         print(f"{len(r['contacts'])} contacts, {r['pending_requests']} pending requests, {r['open_invites']} open invites")
         print(f"direct listener {r.get('direct_port') or 'off'}  p2p "
               f"{(r.get('p2p') or {}).get('dial', 'off')}")
+        g = r["grant"]
+        print(f"agent {g['agent']}  caps {','.join(g['caps']) or '-'}  grant expires "
+              f"{time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(g['expires_at']))}")
+        if g.get("warning"):
+            print(f"WARNING: {g['warning']}")
+        print(f"refused outbox items: {r['outbox_refused']}")
+        if r.get("newest_refusal"):
+            q = r["newest_refusal"]
+            print(f"newest refusal [{_ago(q['time'])}] {q['id']} to {q['to'][:12]}: {q['reason']}")
     elif a.cmd == "invite":
         import joincode
         from cryptography.hazmat.primitives.asymmetric import ed25519
@@ -2032,6 +2045,14 @@ def main(argv=None, *, http_post=None) -> int:
     elif a.cmd == "inbox":
         for m in reversed(call(s, {"op": "inbox", "limit": a.limit})["messages"]):
             print(f"[{_ago(m['received'])}] {m['petname'] or m['from_person'][:12]}: {m['text']}")
+    elif a.cmd == "outbox":
+        for row in call(s, {"op": "outbox", "refused": a.refused, "text": a.text,
+                            "limit": a.limit})["items"]:
+            state = "refused" if row["refused"] else ("delivered" if row["delivered"] else "queued")
+            detail = f": {row['reason']}" if row.get("reason") else ""
+            print(f"[{_ago(row['created'])}] {row['id']} to {row['to'][:12]} {row['kind']} {state}{detail}")
+            if a.text and row.get("text"):
+                print(f"  {row['text']}")
     return 0
 
 

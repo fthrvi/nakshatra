@@ -5,6 +5,7 @@ On create add a row (status=active, owner). On merge flip to `merged→<sha>`.
 
 | branch | sector | description | base | status | owner |
 |---|---|---|---|---|---|
+| net/grant-visibility-at-rest | network | M0.5 synchronous grant-status checks, operator visibility, encrypted messaging store/raw log migration, and private state-file modes. | forgejo/main@4e738e2 | active | codex (network lane) |
 | deploy/image-freshness | deploy | nakc rebuilds a stale container image (input fingerprint label), keeps -prev for rollback, and nakc update recreates containers on an old image. | forgejo/main@e0fa53c | merged→3384d49 | codex (network lane) |
 | worker/paid-admission | worker | Bind paid Info to the worker Ed25519 identity; fix output metering, per-session serialization, deadline completion timestamps, and bounded receipt checkpoints. | main@f0d9e63 | merged→f507bf0 | codex/root |
 | network/relay-live-fix | network | Reproduce and fix relay-only dynamic FORWARD TLS stalls; cache relay path selection while direct upgrade continues; preserve gateway probe timeout configuration. | forgejo/main@f888fe6 | active | codex/root |

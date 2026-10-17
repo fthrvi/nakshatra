@@ -196,8 +196,16 @@ class Server:
         c = self.client
         if name == "nak_status":
             s = c.status()
+            g = s["grant"]
+            warning = f"; WARNING: {g['warning']}" if g.get("warning") else ""
+            refused = f"; {s['outbox_refused']} refused outbox item(s)"
+            if s.get("newest_refusal"):
+                q = s["newest_refusal"]
+                refused += f"; newest at {q['time']}: {q['reason']}"
             return (f"person {s['person'][:16]}… node {s['node'][:16]}… custody {s['custody']}; "
-                    f"{len(s['contacts'])} contacts, {s['pending_requests']} pending requests")
+                    f"{len(s['contacts'])} contacts, {s['pending_requests']} pending requests; "
+                    f"agent {g['agent']} caps {','.join(g['caps']) or '-'} expires {g['expires_at']}"
+                    f"{warning}{refused}")
         if name == "nak_contacts":
             rows = c.contacts()
             return "\n".join(f"{r['petname'] or r['person'][:12]} ({r['state']}, "

@@ -31,6 +31,7 @@ import json
 import os
 import random
 import secrets
+import shlex
 import socket
 import struct
 import sys
@@ -58,18 +59,19 @@ from transport.connect import (accept_direct, local_endpoints, open_channel, ope
 from transport.secure_channel import SecureChannelError  # noqa: E402
 
 try:
-    from sthambha.signer import SignerError, canonical, verify_envelope
+    from sthambha.signer import MAX_SKEW_S, SignerError, canonical, verify_envelope
 except ImportError:  # the release ships both; a dev checkout may point at a sthambha worktree
     _alt = os.environ.get("NAK_STHAMBHA_PATH")
     if not _alt:
         raise
     sys.path.insert(0, _alt)
-    from sthambha.signer import SignerError, canonical, verify_envelope  # noqa: E402
+    from sthambha.signer import MAX_SKEW_S, SignerError, canonical, verify_envelope  # noqa: E402
 
 MSG_DOMAIN = "nak-msg-v1"
 MAX_FRAME = 1 << 20
 MAX_TEXT = 8000
 SWEEP_S = 30.0          # how often expired tasks are swept (refund + notify)
+GRANT_WARN_S = 7 * 86400
 # Worst case is 5 advertised endpoints × 3 s, a 10 s handshake, then the sidecar's 15 s DCUtR wait
 # plus its pinned handshake. Fifty seconds covers that sequence; only both-sides direct opt-ins wait.
 DIRECT_WAIT_S = 50.0
@@ -201,6 +203,8 @@ class Node:
         self._sessions: dict[str, tuple] = {}                 # contact person -> (channel, send lock)
         self._wake: dict[str, threading.Event] = {}
         self._lock = threading.Lock()
+        self._last_grant_warning_day: Optional[str] = None
+        self._warn_grant(force=True)
 
     # lifecycle
     def start(self) -> "Node":
@@ -241,6 +245,74 @@ class Node:
         if not r.get("ok"):
             raise RuntimeError(f"signer refused: {r.get('error')}")
         return r["envelope"]
+
+    def _grant_status(self, kind: str = "") -> dict:
+        req = {"op": "grant_status", "agent": self.agent}
+        if kind:
+            req["kind"] = kind
+        r = self._signer(req)
+        if not r.get("ok"):
+            raise RuntimeError(f"cannot inspect grant for agent {self.agent!r}: {r.get('error')}")
+        return r
+
+    @staticmethod
+    def _utc(ts: int) -> str:
+        return time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(int(ts)))
+
+    @classmethod
+    def _grant_warning_text(cls, grant: dict, now: Optional[int] = None) -> str:
+        now = int(now if now is not None else time.time())
+        if grant.get("revoked"):
+            return f"grant {grant.get('grant_id') or '(unknown)'} is revoked"
+        if now + MAX_SKEW_S < int(grant.get("not_before", 0)):
+            return f"grant is not valid until {cls._utc(grant['not_before'])}"
+        expires = int(grant.get("expires_at", 0))
+        if now >= expires:
+            return f"grant expired at {cls._utc(expires)}"
+        left = expires - now
+        if left < GRANT_WARN_S:
+            return f"grant expires at {cls._utc(expires)} ({left // 86400}d {left % 86400 // 3600}h left)"
+        return ""
+
+    def _renewal_command(self, grant: dict, required_cap: str = "") -> str:
+        caps = sorted(set(grant.get("caps") or []) | ({required_cap} if required_cap else set()))
+        return ("python -m sthambha.signer delegate --state <signer-state-dir> "
+                "--person-key <your-person-key> --agent " + shlex.quote(self.agent) +
+                " --caps " + shlex.quote(",".join(caps)) + " --ttl 604800")
+
+    def _require_grant(self, kind: str) -> dict:
+        grant = self._grant_status(kind)
+        if grant.get("valid"):
+            return grant
+        cap = str(grant.get("required_cap") or "")
+        now = int(time.time())
+        if grant.get("revoked"):
+            problem = f"grant {grant.get('grant_id') or '(unknown)'} is revoked"
+        elif cap and cap not in grant.get("caps", []):
+            problem = f"cap {cap} not granted"
+        elif now >= int(grant.get("expires_at", 0)):
+            problem = f"expired at {self._utc(grant.get('expires_at', 0))}"
+        elif now + MAX_SKEW_S < int(grant.get("not_before", 0)):
+            problem = f"not valid until {self._utc(grant.get('not_before', 0))}"
+        else:
+            problem = str(grant.get("problem") or "grant is not valid for this node")
+        raise ValueError(f"agent {self.agent!r} cannot sign {kind}: {problem}. Renew manually: "
+                         f"{self._renewal_command(grant, cap)}")
+
+    def _warn_grant(self, force: bool = False, now: Optional[int] = None) -> None:
+        now = int(now if now is not None else time.time())
+        day = time.strftime("%Y-%m-%d", time.gmtime(now))
+        if not force and self._last_grant_warning_day == day:
+            return
+        try:
+            grant = self._grant_status()
+            warning = self._grant_warning_text(grant, now)
+        except RuntimeError as exc:
+            warning = str(exc)
+        if warning:
+            self.log(f"WARNING: agent {self.agent!r} {warning}; renew manually: "
+                     f"{self._renewal_command(grant) if 'grant' in locals() else 'check the signer service'}")
+            self._last_grant_warning_day = day
 
     def _dial(self, rid: bytes, my_key: bytes, pin: str, initiator: bool, binding: bytes):
         # THE one way to reach a peer (transport/connect.py) — the same path meshd's tunnels use.
@@ -319,6 +391,7 @@ class Node:
         existing = self.store.contact(inv["inviter"])
         if existing and existing["state"] == "active":
             return {"state": "already connected", "person": inv["inviter"]}
+        self._require_grant("contact.request")
         # The inviter appears under the name YOU give them, else the name they gave themselves. The note
         # is about whom the invite is for, never a name for the inviter.
         self.store.upsert_contact(inv["inviter"], inv["inviter_node"], "awaiting",
@@ -365,6 +438,7 @@ class Node:
 
     # ── deciding requests ────────────────────────────────────────────────────────────────────
     def accept(self, req_id: str, petname: str = "") -> dict:
+        self._require_grant("contact.accept")
         r = self.store.decide_request(req_id, True)
         if not r:
             raise ValueError("no pending request with that id")
@@ -403,10 +477,12 @@ class Node:
         if why:
             self.log(f"send to {c['person'][:12]} refused: {why}")
             raise ValueError(why)
+        self._require_grant("msg")
         mid = self._queue(c["person"], "msg", {"text": text, "aspect": str(aspect)[:32]})
         return {"queued": mid, "to": c["petname"] or c["person"][:12]}
 
     def _queue(self, person: str, kind: str, body: dict) -> str:
+        self._require_grant(kind)
         mid = secrets.token_hex(12)
         self.store.queue(mid, person, {"kind": kind, "body": dict(body, mid=mid)})
         ev = self._wake.get(person)
@@ -732,6 +808,7 @@ class Node:
         why = outbound_problem(f"{title}\n{instructions}")
         if why:
             raise ValueError(why)
+        self._require_grant("task.post")
         spec = T.make_spec(self.person, title, instructions, acceptance, reward=reward, deadline_s=deadline_s)
         h = T.task_hash(spec)
         escrow = None
@@ -769,6 +846,7 @@ class Node:
     def _sweep_loop(self) -> None:
         while not self._stop.wait(SWEEP_S):
             try:
+                self._warn_grant()
                 self.sweep()
             except Exception as e:  # noqa: BLE001 — a sweep bug must never kill the node
                 self.log(f"sweep failed: {e}")
@@ -823,6 +901,7 @@ class Node:
         t = self._worker_task(ref)
         if t["spec"]["deadline"] <= time.time():
             raise ValueError("that task's deadline has passed")
+        self._require_grant("task.claim")
         if not self.store.task_cas(t["task_hash"], "worker", t["peer"], ("offered",), state="claimed"):
             raise ValueError(f"cannot claim a task that is {t['state']}")
         self._queue(t["peer"], "task.claim", {"task_hash": t["task_hash"]})
@@ -837,6 +916,7 @@ class Node:
             raise ValueError(why)
         if t["spec"]["deadline"] <= time.time():
             raise ValueError("that task's deadline has passed; the poster will not take a result now")
+        self._require_grant("task.result")
         passed, reasons = T.evaluate(t["spec"], output)       # the worker can see it would fail first
         if not self.store.task_cas(t["task_hash"], "worker", t["peer"], ("assigned",),
                                    state="submitted", output=output):
@@ -931,6 +1011,11 @@ class Node:
     def status(self) -> dict:
         with self._lock:
             online = set(self._sessions)
+        grant = self._grant_status()
+        grant["warning"] = self._grant_warning_text(grant)
+        grant = {k: grant[k] for k in ("agent", "caps", "expires_at", "not_before", "revoked",
+                                       "grant_id", "warning")}
+        refused = self.store.refusal_summary()
         return {"person": self.person, "node": self.node, "custody": self.custody,
                 "relay": f"{self.relay[0]}:{self.relay[1]}",
                 "contacts": [dict(c, online=c["person"] in online, path=self._paths.get(c["person"], ""))
@@ -938,7 +1023,9 @@ class Node:
                 "direct_port": self.direct_port,
                 "p2p": self.p2p,
                 "pending_requests": len(self.store.requests()),
-                "open_invites": len(self.store.open_invites())}
+                "open_invites": len(self.store.open_invites()),
+                "grant": grant, "outbox_refused": refused["count"],
+                "newest_refusal": refused["latest"]}
 
 
 def _close(sock) -> None:
@@ -972,7 +1059,7 @@ def _hard_close(ch) -> None:
 # ── control socket (the CLI and, on Day 5, the MCP front door talk to this) ───────────────────
 
 OPS = {"status", "register_invite", "redeem", "requests", "accept", "decline", "contacts", "remove", "send",
-       "delivered", "inbox", "task_post", "tasks", "task_claim", "task_submit", "ledger", "direct"}
+       "delivered", "inbox", "outbox", "task_post", "tasks", "task_claim", "task_submit", "ledger", "direct"}
 
 
 def handle(node: Node, req: dict) -> dict:
@@ -1024,6 +1111,10 @@ def handle(node: Node, req: dict) -> dict:
             for m in msgs:
                 m["name_source"] = (node.store.contact(m["from_person"]) or {}).get("name_src") or "self-chosen"
             return {"ok": True, "messages": msgs}
+        if op == "outbox":
+            return {"ok": True, "items": node.store.outbox(bool(req.get("refused")),
+                                                               bool(req.get("text")),
+                                                               int(req.get("limit", 50)))}
     except (KeyError, ValueError, RuntimeError) as e:
         return {"ok": False, "error": str(e) if not isinstance(e, KeyError) else f"missing {e}"}
     return {"ok": False, "error": "unreachable"}

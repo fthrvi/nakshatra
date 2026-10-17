@@ -63,6 +63,9 @@ class NakClient:
     def delivered(self, mid: str) -> bool:
         return self.call("delivered", mid=mid)["delivered"]
 
+    def outbox(self, refused: bool = False, text: bool = False, limit: int = 50) -> list:
+        return self.call("outbox", refused=refused, text=text, limit=limit)["items"]
+
     def accept(self, req_id: str, petname: str = "") -> dict:
         return self.call("accept", id=req_id, petname=petname)
 

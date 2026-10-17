@@ -188,6 +188,30 @@ class Store:
         r = self._q("SELECT acked FROM outbox WHERE nonce=?", (nonce,))
         return bool(r and r[0][0])
 
+    def outbox(self, refused_only: bool = False, include_text: bool = False, limit: int = 50) -> list:
+        where = " WHERE refused IS NOT NULL" if refused_only else ""
+        rows = self._q("SELECT nonce, to_person, frame, created, acked, refused FROM outbox" + where +
+                       " ORDER BY created DESC LIMIT ?", (int(limit),))
+        out = []
+        for nonce, person, raw, created, acked, refused in rows:
+            frame = json.loads(raw)
+            row = {"id": nonce, "to": person, "kind": frame.get("kind", ""), "created": created,
+                   "delivered": bool(acked and not refused), "refused": bool(refused),
+                   "completed": acked, "reason": refused or ""}
+            if include_text:
+                body = frame.get("body") or {}
+                row["text"] = body.get("text") or body.get("output") or ""
+            out.append(row)
+        return out
+
+    def refusal_summary(self) -> dict:
+        count = self._q("SELECT COUNT(*) FROM outbox WHERE refused IS NOT NULL")[0][0]
+        latest = self._q("SELECT nonce, to_person, acked, refused FROM outbox "
+                         "WHERE refused IS NOT NULL ORDER BY acked DESC LIMIT 1")
+        return {"count": count, "latest": ({"id": latest[0][0], "to": latest[0][1],
+                                             "time": latest[0][2], "reason": latest[0][3]}
+                                            if latest else None)}
+
     # inbox (untrusted external content)
     def raw_log(self, record: dict) -> None:
         with self._lock, open(self._raw, "a") as f:
