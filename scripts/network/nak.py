@@ -1709,7 +1709,7 @@ def _default_p2p_socket() -> Path:
     return default_p2p_socket_path()
 
 
-def _grant_paths() -> tuple[Path, Path, str, Path, Path]:
+def _grant_paths() -> tuple[Path, Path, str]:
     net_dir = Path(os.environ.get("NAK_NET_DIR", Path.home() / ".nakshatra" / "net"))
     signer_dir = Path(os.environ.get("NAK_SIGNER_DIR", Path.home() / ".sthambha" / "signer"))
     try:
@@ -1722,10 +1722,9 @@ def _grant_paths() -> tuple[Path, Path, str, Path, Path]:
         raise SystemExit(f"cannot load the signer while resolving agent {agent!r}: {exc}") from exc
     try:
         signer_mod.validate_agent_name(agent)
-        key_path, grant_path = signer_mod.agent_paths(signer_dir, agent)
     except (OSError, ValueError, signer_mod.SignerError) as exc:
         raise SystemExit(f"refusing invalid delegated agent state for {agent!r}: {exc}") from exc
-    return signer_dir, net_dir, agent, key_path, grant_path
+    return signer_dir, net_dir, agent
 
 
 def _delegate_reuse_command(state: Path, person_key: Path, agent: str, caps: list[str], ttl_days: int) -> str:
@@ -1740,11 +1739,21 @@ def _grant_renew(args) -> int:
         raise SystemExit("nak grant renew is interactive-only; run it in a terminal or pass --yes explicitly")
     if not 1 <= args.ttl <= 365:
         raise SystemExit("--ttl must be between 1 and 365 days")
-    signer_dir, _net_dir, agent, key_path, grant_path = _grant_paths()
+    signer_dir, _net_dir, agent = _grant_paths()
+    from sthambha import signer as signer_mod
     try:
-        current = json.loads(grant_path.read_text())
-    except (OSError, ValueError) as exc:
-        raise SystemExit(f"cannot read the current grant at {grant_path}: {exc}") from exc
+        with signer_mod.open_agent_files(signer_dir, agent) as agent_files:
+            return _grant_renew_confined(args, signer_dir, agent, signer_mod, agent_files)
+    except (OSError, ValueError, signer_mod.SignerError) as exc:
+        raise SystemExit(f"cannot renew confined agent {agent!r}: {exc}") from exc
+
+
+def _grant_renew_confined(args, signer_dir: Path, agent: str, signer_mod, agent_files) -> int:
+    """Renew while holding the one no-follow agents-directory descriptor."""
+    try:
+        current = agent_files.load_grant()
+    except signer_mod.SignerError as exc:
+        raise SystemExit(f"cannot read the current grant at {agent_files.grant_path}: {exc}") from exc
     current_caps = sorted({str(cap) for cap in current.get("caps") or [] if str(cap)})
     if args.caps is None:
         caps = current_caps
@@ -1755,11 +1764,10 @@ def _grant_renew(args) -> int:
     if not caps:
         raise SystemExit("the current grant has no capabilities; name the intended set with --caps")
     try:
-        from sthambha import signer as signer_mod
-        _, agent_pub = signer_mod.load_key(key_path)
+        _, agent_pub = agent_files.load_key()
         signer_person = (signer_dir / "person.pub").read_text().strip()
         node_pub = (signer_dir / "node.pub").read_text().strip()
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, signer_mod.SignerError) as exc:
         raise SystemExit(f"cannot load signer identity for renewal: {exc}") from exc
     if current.get("subject") != agent or current.get("subject_pub") != agent_pub:
         raise SystemExit("the current grant is not bound to the existing agent key; refusing renewal")
@@ -1792,7 +1800,7 @@ def _grant_renew(args) -> int:
         raise SystemExit(f"the person key at {person_key} does not match {signer_dir / 'person.pub'}")
     renewed = signer_mod.issue_grant(person_priv, agent, agent_pub, caps, node=current["node"],
                                      ttl_s=args.ttl * 86400, constraints=constraints)
-    signer_mod.save_grant(grant_path, renewed)
+    agent_files.write_grant(renewed)
     print(f"renewed agent {agent} with caps {','.join(renewed['caps'])} through "
           f"{time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(renewed['expires_at']))} "
           f"(grant {renewed['grant_id']}); signer reload is automatic")

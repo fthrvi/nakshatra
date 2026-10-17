@@ -104,10 +104,14 @@ def test_grant_renew_without_person_key_prints_exact_same_key_command(tmp_path, 
     assert key_path.read_bytes() == before_key and grant_path.read_bytes() == before_grant
 
 
-def test_grant_renew_rejects_path_shaped_agent_without_mutation(tmp_path, monkeypatch):
+@pytest.mark.parametrize("bad_name", [
+    "agent.name", "agent name", "agent\tname", "agent\x1fname", "agént", "a" * 65,
+    "agent\x00name", "../agents/agent",
+])
+def test_grant_renew_rejects_noncanonical_agent_without_mutation(tmp_path, monkeypatch, bad_name):
     state, _key_path, _grant_path = _temporary_identity(tmp_path, monkeypatch)
     net_dir = tmp_path / ".nakshatra" / "net"
-    (net_dir / "agent").write_text("../agents/agent\n")
+    (net_dir / "agent").write_text(bad_name + "\n")
     before = {
         path.relative_to(tmp_path).as_posix():
             (path.lstat().st_mode, path.read_bytes() if path.is_file() else b"")
@@ -123,6 +127,27 @@ def test_grant_renew_rejects_path_shaped_agent_without_mutation(tmp_path, monkey
         for path in sorted(tmp_path.rglob("*"))
     }
     assert after == before
+
+
+def test_grant_renew_refuses_key_symlink_swapped_at_validation_open_boundary(
+        tmp_path, monkeypatch):
+    state, key_path, grant_path = _temporary_identity(tmp_path, monkeypatch)
+    outside = tmp_path / "outside-agent.key"
+    outside.write_bytes(key_path.read_bytes())
+    outside_before = outside.read_bytes()
+    grant_before = grant_path.read_bytes()
+
+    def swap_key(_state, name):
+        assert name == "agent"
+        key_path.unlink()
+        key_path.symlink_to(outside)
+
+    monkeypatch.setattr(signer_mod, "_agent_open_hook", swap_key)
+    with pytest.raises(SystemExit, match="non-regular agent state file"):
+        nak.main(["grant", "renew", "--yes"])
+
+    assert outside.read_bytes() == outside_before
+    assert grant_path.read_bytes() == grant_before
 
 
 def test_grant_renew_has_no_daemon_updater_supervisor_timer_or_mcp_entrypoint():

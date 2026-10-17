@@ -232,6 +232,59 @@ def test_established_node_rejects_path_shaped_agent_before_building_signer_paths
     assert _identity_snapshot(tmp_path) == before
 
 
+@pytest.mark.parametrize("bad_name", [
+    "agent.name", "agent name", "agent\tname", "agent\x1fname", "agént", "a" * 65,
+    "agent\x00name",
+])
+def test_join_rejects_noncanonical_established_agent_without_mutation(tmp_path, bad_name):
+    join_setup.ensure_identity(tmp_path)
+    agent_path = tmp_path / ".nakshatra" / "net" / "agent"
+    agent_path.write_text(bad_name + "\n")
+    before = _identity_snapshot(tmp_path)
+
+    with pytest.raises(SystemExit, match="bad agent name"):
+        join_setup.ensure_identity(tmp_path)
+
+    assert _identity_snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize("bad_name", [
+    "agent.name", "agent name", "agent\tname", "agent\x1fname", "agént", "a" * 65,
+    "agent\x00name",
+])
+def test_join_validates_configured_agent_before_first_filesystem_mutation(
+        tmp_path, monkeypatch, bad_name):
+    monkeypatch.setattr(join_setup, "AGENT", bad_name)
+
+    with pytest.raises(SystemExit, match="bad agent name"):
+        join_setup.ensure_identity(tmp_path)
+
+    assert _identity_snapshot(tmp_path) == {}
+
+
+def test_join_refuses_key_symlink_swapped_at_validation_open_boundary(tmp_path, monkeypatch):
+    join_setup.ensure_identity(tmp_path)
+    state = tmp_path / ".sthambha" / "signer"
+    key_path = state / "agents" / "agent.key"
+    grant_path = state / "agents" / "agent.grant.json"
+    outside = tmp_path / "outside-agent.key"
+    outside.write_bytes(key_path.read_bytes())
+    outside_before = outside.read_bytes()
+    grant_before = grant_path.read_bytes()
+
+    def swap_key(_state, name):
+        assert name == "agent"
+        key_path.unlink()
+        key_path.symlink_to(outside)
+
+    monkeypatch.setattr(signer_mod, "_agent_open_hook", swap_key)
+    with pytest.raises(SystemExit, match="non-regular agent state file"):
+        join_setup.ensure_identity(tmp_path)
+
+    assert outside.read_bytes() == outside_before
+    assert grant_path.read_bytes() == grant_before
+
+
 def test_established_node_with_key_and_grant_deleted_fails_closed(tmp_path):
     join_setup.ensure_identity(tmp_path)
     state = tmp_path / ".sthambha" / "signer"

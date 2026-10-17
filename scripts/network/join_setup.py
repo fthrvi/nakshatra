@@ -287,45 +287,46 @@ def _established_identity(home: Path, state: Path, net: Path, person_path: Path,
                          f"files untouched: {exc}") from exc
 
     try:
-        key_path, grant_path = S.agent_paths(state, agent)
-    except S.SignerError as exc:
+        agent_files = S.open_agent_files(state, agent)
+    except (OSError, S.SignerError) as exc:
         raise SystemExit("established node identity is inconsistent; refusing automatic repair and leaving all "
                          f"files untouched: {exc}") from exc
-    key_exists, grant_exists = key_path.exists(), grant_path.exists()
-    grant = None
-    caps = list(AGENT_CAPS)
-    if grant_exists:
-        try:
-            grant = json.loads(grant_path.read_text())
-            if isinstance(grant.get("caps"), list) and all(isinstance(cap, str) for cap in grant["caps"]):
-                caps = grant["caps"]
-        except (OSError, ValueError, AttributeError):
-            grant = None
+    with agent_files:
+        key_exists, grant_exists = agent_files.key_exists(), agent_files.grant_exists()
+        grant = None
+        caps = list(AGENT_CAPS)
+        if grant_exists:
+            try:
+                grant = agent_files.load_grant()
+                if isinstance(grant.get("caps"), list) and all(isinstance(cap, str) for cap in grant["caps"]):
+                    caps = grant["caps"]
+            except (OSError, ValueError, AttributeError, S.SignerError):
+                grant = None
 
-    problem = ""
-    if not key_exists and not grant_exists:
-        problem = "both the agent key and grant are missing"
-    elif not key_exists:
-        problem = "the agent key is missing while its grant remains"
-    elif not grant_exists:
-        problem = "the agent grant is missing while its key remains"
-    else:
-        try:
-            _, agent_pub = S.load_key(key_path)
-            if not isinstance(grant, dict):
-                raise ValueError("the grant is not valid JSON")
-            if grant.get("schema") != S.GRANT_SCHEMA:
-                raise ValueError("the grant schema is invalid")
-            if grant.get("subject") != agent:
-                raise ValueError("the grant names a different agent")
-            if grant.get("subject_pub") != agent_pub:
-                raise ValueError("the grant is bound to a different agent key")
-            if grant.get("node") not in ("*", node_pub):
-                raise ValueError("the grant is bound to a different node")
-            if not S._verify(grant, person_pub):  # noqa: SLF001 — structural validation, not time validity
-                raise ValueError("the grant signature does not verify against signer person.pub")
-        except (OSError, UnicodeError, ValueError, S.SignerError) as exc:
-            problem = str(exc)
+        problem = ""
+        if not key_exists and not grant_exists:
+            problem = "both the agent key and grant are missing"
+        elif not key_exists:
+            problem = "the agent key is missing while its grant remains"
+        elif not grant_exists:
+            problem = "the agent grant is missing while its key remains"
+        else:
+            try:
+                _, agent_pub = agent_files.load_key()
+                if not isinstance(grant, dict):
+                    raise ValueError("the grant is not valid JSON")
+                if grant.get("schema") != S.GRANT_SCHEMA:
+                    raise ValueError("the grant schema is invalid")
+                if grant.get("subject") != agent:
+                    raise ValueError("the grant names a different agent")
+                if grant.get("subject_pub") != agent_pub:
+                    raise ValueError("the grant is bound to a different agent key")
+                if grant.get("node") not in ("*", node_pub):
+                    raise ValueError("the grant is bound to a different node")
+                if not S._verify(grant, person_pub):  # noqa: SLF001 — structural validation, not time validity
+                    raise ValueError("the grant signature does not verify against signer person.pub")
+            except (OSError, UnicodeError, ValueError, S.SignerError) as exc:
+                problem = str(exc)
 
     if problem:
         # Reusing a surviving key is safe only when the grant is the missing half. Other structural
@@ -367,6 +368,10 @@ def _established_identity(home: Path, state: Path, net: Path, person_path: Path,
 def ensure_identity(home: Path) -> dict:
     """Steps 1-4. Create the agent delegation once; later authority changes stay human-run."""
     from sthambha import signer as S
+    try:
+        agent = S.validate_agent_name(AGENT)
+    except S.SignerError as exc:
+        raise SystemExit(f"refusing invalid join agent {AGENT!r}: {exc}") from exc
     # This is the authority boundary. Decide it before mkdir/chmod/key generation or any other write.
     state = home / ".sthambha" / "signer"
     net = home / ".nakshatra" / "net"
@@ -377,9 +382,6 @@ def ensure_identity(home: Path) -> dict:
                                 _path_present(net / "net.sqlite"))
     if not first_initialisation:
         return _established_identity(home, state, net, person_path, node_key)
-
-    agent = S.validate_agent_name(AGENT)
-    key_path, grant_path = S.agent_paths(state, agent)
 
     done = {}
     if not node_key.exists():
@@ -402,50 +404,56 @@ def ensure_identity(home: Path) -> dict:
     else:
         done["person_key"] = "kept"
         person_priv, person_pub = S.load_key(person_path)
-    (state / "agents").mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(state, 0o700)
-    node_pub = S._node_pub_from_key(node_key)  # noqa: SLF001 — the signer's own reader for this file
-    if not (state / "person.pub").exists():
-        (state / "node.pub").write_text(node_pub)
-        (state / "person.pub").write_text(person_pub)
-        done["signer"] = "set up"
-    else:
-        if (state / "person.pub").read_text().strip() != person_pub or (state / "node.pub").read_text().strip() != node_pub:
-            raise SystemExit("the signer here belongs to a different person or node key; refusing to mix them")
-        done["signer"] = "kept"
-    if not key_path.exists() and not grant_path.exists():
-        if person_priv is None:
-            raise SystemExit(f"agent {agent!r} has no delegation and the person key is not on this box; "
-                             "create it with an explicit human delegation")
-        agent_priv, agent_pub = S.new_key()
-        S.save_key(key_path, agent_priv)
-        grant = S.issue_grant(person_priv, agent, agent_pub, AGENT_CAPS, node=node_pub, ttl_s=AGENT_TTL_S)
-        S.save_grant(grant_path, grant)
-        done["agent"] = f"'{agent}' may {', '.join(AGENT_CAPS)} for 90 days"
-    elif key_path.exists() != grant_path.exists():
-        raise SystemExit(f"agent {agent!r} has only one of its key/grant files; refusing automatic repair. "
-                         "Restore the missing signer-state file or delegate a replacement explicitly.")
-    else:
-        grant = json.loads(grant_path.read_text())
-        now = int(time.time())
-        expires = int(grant.get("expires_at", 0))
-        missing = sorted(set(AGENT_CAPS) - set(grant.get("caps") or []))
-        notices = []
-        if expires <= now:
-            notices.append("grant expired")
-        elif expires < now + 7 * 86400:
-            notices.append("grant expires in under 7 days")
-        if missing:
-            notices.append("grant intentionally remains narrower than join defaults "
-                           f"(missing {', '.join(missing)})")
-        if notices:
-            command = "nak grant renew"
-            if missing:
-                widened = sorted(set(grant.get("caps") or []) | set(AGENT_CAPS))
-                command += " --caps " + ",".join(widened)
-            done["agent"] = f"'{agent}' kept; {'; '.join(notices)}; human renewal only: {command}"
+    try:
+        agent_files = S.open_agent_files(state, agent, create=True)
+    except (OSError, S.SignerError) as exc:
+        raise SystemExit(f"cannot open confined signer agent state: {exc}") from exc
+    with agent_files:
+        os.chmod(state, 0o700)
+        node_pub = S._node_pub_from_key(node_key)  # noqa: SLF001 — the signer's own reader for this file
+        if not (state / "person.pub").exists():
+            (state / "node.pub").write_text(node_pub)
+            (state / "person.pub").write_text(person_pub)
+            done["signer"] = "set up"
         else:
-            done["agent"] = f"'{agent}' kept"
+            if ((state / "person.pub").read_text().strip() != person_pub or
+                    (state / "node.pub").read_text().strip() != node_pub):
+                raise SystemExit("the signer here belongs to a different person or node key; refusing to mix them")
+            done["signer"] = "kept"
+        key_exists, grant_exists = agent_files.key_exists(), agent_files.grant_exists()
+        if not key_exists and not grant_exists:
+            if person_priv is None:
+                raise SystemExit(f"agent {agent!r} has no delegation and the person key is not on this box; "
+                                 "create it with an explicit human delegation")
+            agent_priv, agent_pub = S.new_key()
+            grant = S.issue_grant(
+                person_priv, agent, agent_pub, AGENT_CAPS, node=node_pub, ttl_s=AGENT_TTL_S)
+            agent_files.write_key_and_grant(agent_priv, grant)
+            done["agent"] = f"'{agent}' may {', '.join(AGENT_CAPS)} for 90 days"
+        elif key_exists != grant_exists:
+            raise SystemExit(f"agent {agent!r} has only one of its key/grant files; refusing automatic repair. "
+                             "Restore the missing signer-state file or delegate a replacement explicitly.")
+        else:
+            grant = agent_files.load_grant()
+            now = int(time.time())
+            expires = int(grant.get("expires_at", 0))
+            missing = sorted(set(AGENT_CAPS) - set(grant.get("caps") or []))
+            notices = []
+            if expires <= now:
+                notices.append("grant expired")
+            elif expires < now + 7 * 86400:
+                notices.append("grant expires in under 7 days")
+            if missing:
+                notices.append("grant intentionally remains narrower than join defaults "
+                               f"(missing {', '.join(missing)})")
+            if notices:
+                command = "nak grant renew"
+                if missing:
+                    widened = sorted(set(grant.get("caps") or []) | set(AGENT_CAPS))
+                    command += " --caps " + ",".join(widened)
+                done["agent"] = f"'{agent}' kept; {'; '.join(notices)}; human renewal only: {command}"
+            else:
+                done["agent"] = f"'{agent}' kept"
     net.mkdir(parents=True, exist_ok=True, mode=0o700)
     agent_path = net / "agent"
     if not agent_path.exists():
