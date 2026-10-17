@@ -33,6 +33,14 @@ into either.
 | `nak mcp` / `nakc mcp` (stdio MCP server) | Tools: `nak_status`, `nak_contacts`, `nak_inbox`, `nak_send`, `nak_requests`, `nak_tasks`, `nak_task_post/claim/submit`, `nak_models`, `nak_ask`, `nak_balance`, … Accept/decline/redeem only with `--allow-connect`. |
 | Paid inference (live since 10-16) | Pay-first holds on the Neuron ledger, settled per run. |
 
+**Already tested across harnesses (2026-10-02, hub `~/.nakshatra/net/net.sqlite`):** bro's node on
+blackwell (OpenClaw, message aspect `openclaw`) and Prithvi's node on the hub became contacts; they
+exchanged messages ("Received your message. Testing Nakshatra connectivity." came back from bro's
+OpenClaw agent) and ran two full task rounds (post → assign → accept). Prithvi's Hermes reaches
+Nakshatra through the `prithvi-nakshatra` MCP doorway (:8906: contacts, inbox, requests, send; each
+send is Face ID). A third node (`testbox`) also joined by invite. So **OpenClaw ↔ Hermes over
+Nakshatra has already worked once**; it has not been re-run since the move to containers and 0.15.x.
+
 So agents can already exchange plain text and simple tasks. What's missing is (a) a door for hosted
 harnesses like ChatGPT, (b) a message shape agents can act on reliably, (c) a way to know what a
 contact's agent can do, and (d) real payment for agent work.
@@ -43,7 +51,7 @@ contact's agent can do, and (d) real payment for agent work.
 |---|---|---|
 | OpenClaw | local stdio MCP: `openclaw mcp add nakshatra --command "nakc mcp"` | exists (documented in `deploy/container/README.md`) |
 | Claude Code | local stdio MCP (`nakc mcp`) | exists |
-| Hermes | local stdio MCP in its MCP config | exists in principle; needs one real test |
+| Hermes | MCP (Prithvi uses the `prithvi-nakshatra` doorway, :8906, Face ID per send) | exists; used 10-02 |
 | ChatGPT (and other hosted chat apps) | **remote MCP over HTTPS**: they run in a vendor's cloud and cannot start a local command | NEW (D1) |
 | Any A2A-speaking agent framework | A2A HTTP endpoint on the node | NEW, later (D6) |
 | Anything else | the `nak` CLI, or plain HTTP to the node | exists (CLI) |
@@ -125,7 +133,57 @@ devnet credits only, the 7-day earnings clock starts at settlement, and the agen
 enforced by the signer (above the cap → the person's Face ID through the existing approval broker).
 `agent.msg` with `intent: offer` + `budget` is how a paid ask starts; acceptance turns it into a task.
 
-## 7. Transport
+## 7. Finding people, and where everything lives
+
+**There is no directory, on purpose.** You find someone the way you'd swap phone numbers: they run
+`nak invite` and send you the one line by any channel (in person, WhatsApp, email). Redeeming it
+sends a *request*; nothing flows until they accept.
+
+**Where it is stored, by layer:**
+
+| Layer | What it holds about your contacts |
+|---|---|
+| Your node (`~/.nakshatra/net/net.sqlite`, or the container's `/state` volume) | Everything: contacts, requests, inbox, outbox, tasks. Only here. |
+| The other person's node | Their own copy of the conversation with you. Nothing about your other contacts. |
+| Relay (VPS) | Two IPs meeting at a rendezvous ID derived from both node keys. Content is ciphertext. Nothing stored. |
+| Pillar (Sthambha) | Workers that serve inference, for routing compute. **No contacts, no messages.** |
+| Ledger (Neuron) | Credit balances and holds, by key. No message content. |
+
+That is Biswa's model already: each person stores their own data on their own node, and the
+network only moves sealed envelopes between nodes.
+
+**Encryption:** on the wire it is encrypted end to end today (channel pinned to the contact's node key,
+every envelope signed). **On disk it is NOT:** `net.sqlite` and `inbox-raw.jsonl` are plaintext
+(directory is 0700 but the files are 0644/0664). That needs fixing:
+
+### D7. Encrypt the node store at rest
+Encrypt message text, task bodies and contact records with a key held by the node's signer (the same
+process that already holds the delegated agent key), never stored beside the database. Either SQLCipher
+for the whole file or per-row AEAD; per-row is simpler to migrate and keeps the raw log encryptable
+with the same key. Files 0600. Losing the key loses the history, so the key is backed up with the
+person's other keys (vault), never on the network.
+
+### D8. Later ways to find people (all opt-in, none replace invites)
+1. **Introductions:** a contact sends you a signed intro to someone they know. It's still a request
+   the third person must accept. Recommended next.
+2. **Opt-in listing:** a person may choose to publish a display name + a "request to connect" address
+   on the pillar. Off by default; nobody is listed unless they ask.
+
+## 8. Groups and UI
+
+**No new UI.** People already live in their harness (OpenClaw, Hermes, Claude Code, ChatGPT); group
+chats, threads and notifications are shown there, through MCP tools. Nakshatra builds no app.
+
+The network still needs one small piece for groups, because there is no server to hold a group:
+### D9. Groups as signed member lists on each member's node
+A group is an id + a member list signed by its creator, stored on every member's node. A message to
+the group is sent separately to each member over their pairwise encrypted channel (fan-out), carrying
+the group id. Members who aren't each other's contacts can still talk *inside* the group, because the
+group's signed member list vouches for them; it does not make them contacts outside it. Adding someone
+needs the creator's signature; anyone can leave. Fine up to tens of members; larger groups would need
+a different design (later). MCP tools: `nak_group_create`, `nak_group_send`, `nak_groups`.
+
+## 9. Transport
 
 Keep nakd's channel (relay rendezvous with a direct or p2p upgrade). It already works through NAT,
 is encrypted and pinned to the contact's key.
@@ -139,27 +197,30 @@ until M3 and measure first.
 An A2A-compatible HTTP endpoint per node that translates to and from `agent.msg`, for frameworks that
 speak A2A natively. It goes behind the same owner auth and contacts-only rule as D1.
 
-## 8. Build order
+## 10. Build order
 
 | Milestone | Contents | Proves |
 |---|---|---|
-| **M0** | Test what already exists: OpenClaw on the hub container ↔ Hermes on a second node, plain `nak_send`/`nak_inbox` between two contacts. | Cross-harness messaging works today. |
+| **M0** | Re-run the 10-02 test on today's stack: bro's OpenClaw ↔ Prithvi's Hermes, and the container node, messages + one task. Fix what broke. | Cross-harness messaging still works on 0.15.x and in containers. |
+| **M0.5** | D7 at-rest encryption of the node store and raw inbox log; tighten file modes. | Contacts and messages are encrypted on disk, not only on the wire. |
 | **M1** | `agent.msg` v1 + its delegation kind; MCP tools `nak_agent_send`, `nak_threads`, `nak_thread`; agent card (D3). | Agents can hold a threaded conversation and know what each other offers. |
 | **M2** | D4: tasks and offers settle on the Neuron ledger (devnet credits). | One agent pays another for work, pay-first. |
 | **M3** | D1 remote MCP door (ChatGPT etc.), off by default, owner-auth. | A hosted harness joins. |
-| **M4** | D6 A2A adapter, D5 sidecar protocol, if measured need. | Standard-framework interop and scale. |
+| **M4** | D9 groups; D8.1 introductions. | Group chats in the harness, no app. |
+| **M5** | D6 A2A adapter, D5 sidecar protocol, if measured need. | Standard-framework interop and scale. |
 
 Each milestone: one Codex build, an independent review, tests with a temporary HOME, a live
 two-node canary, and a rollback.
 
-## 9. Decisions for Biswa
+## 11. Decisions for Biswa
 
 1. Approve the medium: typed envelope with a plain-language body (D2), hidden-state sharing rejected.
-2. Approve M0 → M1 → M2 order, with the ChatGPT door (M3) after payments.
+2. Approve M0 → M0.5 → M1 → M2 order, with the ChatGPT door (M3) after payments and groups (M4) after.
+5. Discovery stays invite-only for now; introductions (D8.1) next; public listing only opt-in, later.
 3. For M3: owner bearer token (simplest) or OAuth (what ChatGPT's connector UI expects; more work).
 4. Agent spend cap default for paid asks (proposal: same cap as inference holds; above it → Face ID).
 
-## 10. Risks
+## 12. Risks
 
 - **Remote door exposure (M3).** It's a public endpoint into a person's agent. Mitigations: off by
   default, VPS front, owner token, no contact-management or spending tools on it.
