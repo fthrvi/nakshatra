@@ -48,7 +48,7 @@ def validate_agent_message(body: dict, max_text: int, *, outbound: bool = False,
     if missing:
         raise ValueError("missing agent.msg keys: " + ", ".join(sorted(missing)))
     out = dict(body)
-    if out["v"] != AGENT_MSG_VERSION:
+    if type(out["v"]) is not int or out["v"] != AGENT_MSG_VERSION:
         raise ValueError("agent.msg v must be 1")
     if not isinstance(out["mid"], str) or _MID_RE.fullmatch(out["mid"]) is None:
         raise ValueError("mid must be 24 lowercase hex characters")
@@ -106,7 +106,7 @@ def validate_card(body: dict) -> dict:
         raise ValueError("unknown contact.card keys: " + ", ".join(sorted(unknown)))
     if set(body) != allowed:
         raise ValueError("contact.card is missing required fields")
-    if body["v"] != CARD_VERSION:
+    if type(body["v"]) is not int or body["v"] != CARD_VERSION:
         raise ValueError("contact.card v must be 1")
     if not isinstance(body["mid"], str) or _MID_RE.fullmatch(body["mid"]) is None:
         raise ValueError("mid must be 24 lowercase hex characters")

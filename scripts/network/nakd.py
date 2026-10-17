@@ -561,10 +561,12 @@ class Node:
 
     def card_set(self, display_name: str, offers: str, *, intents=None, models=None,
                  price_hint: str = "") -> dict:
+        previous = self.store.agent_card(self.person)
+        updated_at = max(int(time.time()), int(previous["updated_at"]) + 1 if previous else 0)
         card = {"v": CARD_VERSION, "mid": "0" * 24, "display_name": display_name,
                 "offers": offers, "intents": list(intents if intents is not None else INTENTS),
                 "paid": False, "price_hint": price_hint, "models": list(models or []),
-                "supports": [CARD_SUPPORT], "updated_at": int(time.time())}
+                "supports": [CARD_SUPPORT], "updated_at": updated_at}
         validate_card(card)
         stored = {key: value for key, value in card.items() if key not in {"v", "mid"}}
         self.store.set_agent_card(self.person, stored)

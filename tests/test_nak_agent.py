@@ -31,7 +31,7 @@ def card(**changes):
 
 
 @pytest.mark.parametrize("change", [
-    {"extra": True}, {"v": 2}, {"mid": "A" * 24}, {"thread": "B" * 32}, {"reply_to": "x"},
+    {"extra": True}, {"v": 2}, {"v": True}, {"mid": "A" * 24}, {"thread": "B" * 32}, {"reply_to": "x"},
     {"intent": "command"}, {"text": ""}, {"text": "x" * (MAX_TEXT + 1)}, {"want": "x" * 501},
     {"harness": "x" * 33}, {"expires": True}, {"expires": -1},
     {"budget": {"amount": 0}}, {"budget": {"amount": True, "unit": "credits"}},
@@ -72,7 +72,7 @@ def test_sender_refuses_paid_budget_with_m2_message_and_unknown_reply():
 
 
 @pytest.mark.parametrize("change", [
-    {"extra": True}, {"v": 2}, {"mid": "bad"}, {"display_name": ""},
+    {"extra": True}, {"v": 2}, {"v": True}, {"mid": "bad"}, {"display_name": ""},
     {"display_name": "x" * 65}, {"offers": ""}, {"offers": "x" * 1001},
     {"intents": ["ask", "command"]}, {"intents": ["ask", "ask"]}, {"paid": True},
     {"price_hint": "x" * 201}, {"models": ["x"] * 33}, {"models": ["x" * 65]},
