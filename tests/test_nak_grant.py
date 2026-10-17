@@ -104,6 +104,27 @@ def test_grant_renew_without_person_key_prints_exact_same_key_command(tmp_path, 
     assert key_path.read_bytes() == before_key and grant_path.read_bytes() == before_grant
 
 
+def test_grant_renew_rejects_path_shaped_agent_without_mutation(tmp_path, monkeypatch):
+    state, _key_path, _grant_path = _temporary_identity(tmp_path, monkeypatch)
+    net_dir = tmp_path / ".nakshatra" / "net"
+    (net_dir / "agent").write_text("../agents/agent\n")
+    before = {
+        path.relative_to(tmp_path).as_posix():
+            (path.lstat().st_mode, path.read_bytes() if path.is_file() else b"")
+        for path in sorted(tmp_path.rglob("*"))
+    }
+
+    with pytest.raises(SystemExit, match="bad agent name"):
+        nak.main(["grant", "renew", "--yes"])
+
+    after = {
+        path.relative_to(tmp_path).as_posix():
+            (path.lstat().st_mode, path.read_bytes() if path.is_file() else b"")
+        for path in sorted(tmp_path.rglob("*"))
+    }
+    assert after == before
+
+
 def test_grant_renew_has_no_daemon_updater_supervisor_timer_or_mcp_entrypoint():
     production = []
     for root in (_REPO / "scripts", _REPO / "release", _REPO / "deploy"):

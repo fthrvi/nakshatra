@@ -231,6 +231,30 @@ def _delegate_command(state: Path, person_key: Path, agent: str, caps, *, reuse_
     return shlex.join(argv)
 
 
+def _path_present(path: Path) -> bool:
+    """Like lexists: even a dangling symlink is pre-existing state."""
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _signer_state_present(state: Path) -> bool:
+    """Whether the signer path contains any authority residue, without changing it."""
+    try:
+        info = state.lstat()
+    except FileNotFoundError:
+        return False
+    if state.is_symlink() or not stat.S_ISDIR(info.st_mode):
+        return True
+    try:
+        next(state.iterdir())
+    except StopIteration:
+        return False
+    return True
+
+
 def _established_identity(home: Path, state: Path, net: Path, person_path: Path,
                           node_key: Path) -> dict:
     """Read and validate an established node without changing a single file."""
@@ -241,13 +265,13 @@ def _established_identity(home: Path, state: Path, net: Path, person_path: Path,
     missing_identity = [str(path) for path in (person_pub_path, node_pub_path, agent_path)
                         if not path.exists()]
     if missing_identity:
+        command = _delegate_command(state, person_path, AGENT, AGENT_CAPS, reuse_key=False)
         raise SystemExit("established node identity is incomplete; refusing automatic repair and leaving all "
                          "files untouched. Restore the missing identity file(s): " +
-                         ", ".join(missing_identity))
+                         ", ".join(missing_identity) + ". Human recovery must name the authority explicitly: " +
+                         command)
     try:
-        agent = agent_path.read_text().strip()
-        if not agent or "/" in agent or agent.startswith("."):
-            raise ValueError("invalid agent name")
+        agent = S.validate_agent_name(agent_path.read_text().strip())
         person_pub = person_pub_path.read_text().strip()
         node_pub = node_pub_path.read_text().strip()
         if not node_key.exists():
@@ -262,8 +286,11 @@ def _established_identity(home: Path, state: Path, net: Path, person_path: Path,
         raise SystemExit(f"established node identity is inconsistent; refusing automatic repair and leaving all "
                          f"files untouched: {exc}") from exc
 
-    key_path = state / "agents" / f"{agent}.key"
-    grant_path = state / "agents" / f"{agent}.grant.json"
+    try:
+        key_path, grant_path = S.agent_paths(state, agent)
+    except S.SignerError as exc:
+        raise SystemExit("established node identity is inconsistent; refusing automatic repair and leaving all "
+                         f"files untouched: {exc}") from exc
     key_exists, grant_exists = key_path.exists(), grant_path.exists()
     grant = None
     caps = list(AGENT_CAPS)
@@ -345,11 +372,14 @@ def ensure_identity(home: Path) -> dict:
     net = home / ".nakshatra" / "net"
     person_path = home / ".sthambha" / "person-TEST.key"
     node_key = home / ".nakshatra" / "keys" / "worker.ed25519"
-    first_initialisation = not any(((state / "person.pub").exists(),
-                                    (state / "node.pub").exists(),
-                                    (net / "agent").exists()))
+    first_initialisation = not (_signer_state_present(state) or
+                                _path_present(net / "agent") or
+                                _path_present(net / "net.sqlite"))
     if not first_initialisation:
         return _established_identity(home, state, net, person_path, node_key)
+
+    agent = S.validate_agent_name(AGENT)
+    key_path, grant_path = S.agent_paths(state, agent)
 
     done = {}
     if not node_key.exists():
@@ -383,9 +413,6 @@ def ensure_identity(home: Path) -> dict:
         if (state / "person.pub").read_text().strip() != person_pub or (state / "node.pub").read_text().strip() != node_pub:
             raise SystemExit("the signer here belongs to a different person or node key; refusing to mix them")
         done["signer"] = "kept"
-    agent = AGENT
-    key_path = state / "agents" / f"{agent}.key"
-    grant_path = state / "agents" / f"{agent}.grant.json"
     if not key_path.exists() and not grant_path.exists():
         if person_priv is None:
             raise SystemExit(f"agent {agent!r} has no delegation and the person key is not on this box; "

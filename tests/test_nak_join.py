@@ -92,6 +92,72 @@ def test_genuine_first_identity_setup_mints_once_and_is_idempotent(tmp_path):
     assert again == dict(first, node_key="kept", person_key="kept", signer="kept", agent="'agent' kept")
 
 
+def test_first_identity_setup_keeps_a_preexisting_worker_key(tmp_path):
+    worker_key = tmp_path / ".nakshatra" / "keys" / "worker.ed25519"
+    worker_key.parent.mkdir(parents=True)
+    original = bytes(range(32))
+    worker_key.write_bytes(original)
+
+    result = join_setup.ensure_identity(tmp_path)
+
+    assert result["node_key"] == "kept"
+    assert worker_key.read_bytes() == original
+    assert (tmp_path / ".sthambha" / "signer" / "agents" / "agent.grant.json").is_file()
+
+
+def test_first_identity_setup_accepts_an_empty_signer_directory(tmp_path):
+    (tmp_path / ".sthambha" / "signer").mkdir(parents=True)
+
+    result = join_setup.ensure_identity(tmp_path)
+
+    assert result["signer"] == "set up"
+    assert (tmp_path / ".sthambha" / "signer" / "agents" / "agent.key").is_file()
+
+
+@pytest.mark.parametrize("present", range(32), ids=lambda value: f"subset-{value:05b}")
+def test_established_authority_five_file_matrix_never_repairs_or_remints(tmp_path, present):
+    join_setup.ensure_identity(tmp_path)
+    state = tmp_path / ".sthambha" / "signer"
+    markers = (
+        state / "person.pub",                                      # P
+        state / "node.pub",                                        # N
+        tmp_path / ".nakshatra" / "net" / "agent",                # A
+        state / "agents" / "agent.key",                            # K
+        state / "agents" / "agent.grant.json",                     # G
+    )
+    for bit, path in enumerate(markers):
+        if not present & (1 << bit):
+            path.unlink()
+    before = _identity_snapshot(tmp_path)
+
+    if present == 0b11111:
+        result = join_setup.ensure_identity(tmp_path)
+        assert result["signer"] == "kept" and result["agent"].startswith("'agent' kept")
+    else:
+        with pytest.raises(SystemExit) as refused:
+            join_setup.ensure_identity(tmp_path)
+        assert "python -m sthambha.signer delegate" in str(refused.value)
+
+    assert _identity_snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize("residue", ["spend.sqlite", "datakey", "net.sqlite"])
+def test_authority_residue_alone_fails_closed_without_writes(tmp_path, residue):
+    if residue == "net.sqlite":
+        path = tmp_path / ".nakshatra" / "net" / residue
+    else:
+        path = tmp_path / ".sthambha" / "signer" / residue
+    path.parent.mkdir(parents=True)
+    path.write_bytes(("residue:" + residue).encode())
+    before = _identity_snapshot(tmp_path)
+
+    with pytest.raises(SystemExit) as refused:
+        join_setup.ensure_identity(tmp_path)
+
+    assert "python -m sthambha.signer delegate" in str(refused.value)
+    assert _identity_snapshot(tmp_path) == before
+
+
 def test_existing_short_narrow_grant_is_preserved_byte_for_byte(tmp_path):
     first = join_setup.ensure_identity(tmp_path)
     state = tmp_path / ".sthambha" / "signer"
@@ -151,6 +217,18 @@ def test_established_node_agent_rename_never_mints_or_renames(tmp_path):
     assert "refusing to mint, rotate, or rename" in message
     assert "--agent bro-agent --caps nak.msg,nak.task.claim --ttl 7776000" in message
     assert "--reuse-key" not in message
+    assert _identity_snapshot(tmp_path) == before
+
+
+def test_established_node_rejects_path_shaped_agent_before_building_signer_paths(tmp_path):
+    join_setup.ensure_identity(tmp_path)
+    agent_path = tmp_path / ".nakshatra" / "net" / "agent"
+    agent_path.write_text("../agents/agent\n")
+    before = _identity_snapshot(tmp_path)
+
+    with pytest.raises(SystemExit, match="bad agent name"):
+        join_setup.ensure_identity(tmp_path)
+
     assert _identity_snapshot(tmp_path) == before
 
 

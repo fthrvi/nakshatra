@@ -1716,10 +1716,16 @@ def _grant_paths() -> tuple[Path, Path, str, Path, Path]:
         agent = (net_dir / "agent").read_text().strip()
     except OSError as exc:
         raise SystemExit(f"cannot identify this node's delegated agent from {net_dir / 'agent'}: {exc}") from exc
-    if not agent or "/" in agent or agent.startswith("."):
-        raise SystemExit(f"refusing invalid delegated agent name {agent!r}")
-    return (signer_dir, net_dir, agent, signer_dir / "agents" / f"{agent}.key",
-            signer_dir / "agents" / f"{agent}.grant.json")
+    try:
+        from sthambha import signer as signer_mod
+    except ImportError as exc:
+        raise SystemExit(f"cannot load the signer while resolving agent {agent!r}: {exc}") from exc
+    try:
+        signer_mod.validate_agent_name(agent)
+        key_path, grant_path = signer_mod.agent_paths(signer_dir, agent)
+    except (OSError, ValueError, signer_mod.SignerError) as exc:
+        raise SystemExit(f"refusing invalid delegated agent state for {agent!r}: {exc}") from exc
+    return signer_dir, net_dir, agent, key_path, grant_path
 
 
 def _delegate_reuse_command(state: Path, person_key: Path, agent: str, caps: list[str], ttl_days: int) -> str:
