@@ -272,8 +272,12 @@ def ensure_identity(home: Path) -> dict:
     else:
         done["agent"] = f"'{agent}' kept"
     net.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if not (net / "agent").exists():
-        (net / "agent").write_text(agent + "\n")
+    agent_path = net / "agent"
+    if not agent_path.exists():
+        fd = os.open(agent_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as out:
+            out.write(agent + "\n")
+    os.chmod(agent_path, 0o600)
     done["person"], done["node"] = person_pub, node_pub
     return done
 

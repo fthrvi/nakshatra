@@ -26,6 +26,7 @@ labelled source=nakshatra trust=external, and never triggers any action here.
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -169,22 +170,24 @@ class SignerClient:
         return json.loads(line) if line else {"ok": False, "error": "signer closed the connection"}
 
 
+class DataKeyError(RuntimeError):
+    """The signer answered but cannot supply the mandatory encrypted-store key."""
+
+
 # ── the node ────────────────────────────────────────────────────────────────────────────────────
 
 class Node:
     def __init__(self, state_dir: Path, node_key: bytes, signer: Callable[[dict], dict], *,
                  agent: str, relay: tuple = DEFAULT_RELAY, log: Callable[[str], None] = lambda m: None,
                  settlement=None, direct_port: Optional[int] = None, p2p: Optional[dict] = None):
-        self.store = Store(state_dir)
-        # Adapter #0 (local ledger, TEST units) unless a real one is passed; see network/settle.py.
-        # THE accounting front door (accounting.py, U5) picks the escrow backend; tests may pass one.
-        self.settle = settlement or _accounting.escrow(Path(state_dir))
         self._key = node_key
         self.node = ed25519.Ed25519PrivateKey.from_private_bytes(node_key).public_key().public_bytes_raw().hex()
         self._signer = signer
         self.agent = agent
         self.relay = relay
         self.log = log
+        # Authenticate the signer's public identity before its data key can touch legacy state. A
+        # valid but wrong signer must never get a chance to migrate this node's plaintext history.
         who = signer({"op": "whoami"})
         if not who.get("ok"):
             raise RuntimeError(f"signer: {who.get('error')}")
@@ -194,6 +197,20 @@ class Node:
             raise RuntimeError(f"the signer has no delegation for agent {agent!r}")
         self.person = who["person"]
         self.custody = who.get("custody", "")
+        key_reply = signer({"op": "data_key"})
+        if not key_reply.get("ok"):
+            raise DataKeyError(f"signer data key unavailable: {key_reply.get('error')}")
+        try:
+            data_key = base64.b64decode(key_reply["data_key"], validate=True)
+        except (KeyError, ValueError, TypeError) as exc:
+            raise DataKeyError("signer returned an invalid data key") from exc
+        if len(data_key) != 32:
+            raise DataKeyError("signer returned an invalid data key")
+        self.store = Store(state_dir, data_key)
+        # Adapter #0 (local ledger, TEST units) unless a real one is passed; see network/settle.py.
+        # THE accounting front door (accounting.py, U5) picks the escrow backend; tests may pass one.
+        self.settle = settlement or _accounting.escrow(Path(state_dir))
+        self._harden_state_files(Path(state_dir))
         self.direct_port = direct_port        # U3b: listen for direct connections (opt-in, per node)
         self.p2p = dict(p2p) if p2p else None  # {"dial": "/run/user/<uid>/nakshatra/p2p.sock"}
         self._paths: dict[str, str] = {}      # contact person -> "direct" | "p2p" | "relay"
@@ -205,6 +222,19 @@ class Node:
         self._lock = threading.Lock()
         self._last_grant_warning_day: Optional[str] = None
         self._warn_grant(force=True)
+
+    @staticmethod
+    def _harden_state_files(state_dir: Path) -> None:
+        state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(state_dir, 0o700)
+        names = ("net.sqlite", "net.sqlite-wal", "net.sqlite-shm", "inbox-raw.jsonl",
+                 "settle.sqlite", "settle.sqlite-wal", "settle.sqlite-shm",
+                 "agent", "name", "direct-port", "p2p-dial")
+        for name in names:
+            try:
+                os.chmod(state_dir / name, 0o600)
+            except FileNotFoundError:
+                pass
 
     # lifecycle
     def start(self) -> "Node":
@@ -269,6 +299,8 @@ class Node:
         expires = int(grant.get("expires_at", 0))
         if now >= expires:
             return f"grant expired at {cls._utc(expires)}"
+        if grant.get("valid") is False:
+            return f"grant invalid: {grant.get('problem') or 'signer rejected it'}"
         left = expires - now
         if left < GRANT_WARN_S:
             return f"grant expires at {cls._utc(expires)} ({left // 86400}d {left % 86400 // 3600}h left)"
@@ -309,10 +341,10 @@ class Node:
             warning = self._grant_warning_text(grant, now)
         except RuntimeError as exc:
             warning = str(exc)
+        self._last_grant_warning_day = day
         if warning:
             self.log(f"WARNING: agent {self.agent!r} {warning}; renew manually: "
                      f"{self._renewal_command(grant) if 'grant' in locals() else 'check the signer service'}")
-            self._last_grant_warning_day = day
 
     def _dial(self, rid: bytes, my_key: bytes, pin: str, initiator: bool, binding: bytes):
         # THE one way to reach a peer (transport/connect.py) — the same path meshd's tunnels use.
@@ -948,6 +980,10 @@ class Node:
                 raise ValueError("this task was not offered to you")
             if t["spec"]["deadline"] <= time.time():
                 raise ValueError("deadline passed")
+            # Both the winner response (assign) and loser response (reject) require nak.task.post.
+            # Check before changing assignment state so a local grant problem cannot produce a nack
+            # after the protocol step has already committed.
+            self._require_grant("task.assign")
             if self.store.task_cas(h, "poster", "", ("posted",), state="assigned", assignee=c["person"], epoch=1):
                 self._queue(c["person"], "task.assign", {"task_hash": h, "epoch": 1, "worker": c["person"]})
                 self.log(f"task {h[:12]} assigned to {who}")
@@ -969,6 +1005,9 @@ class Node:
             if t["spec"]["deadline"] <= time.time():
                 self.sweep()                                 # expire + refund now rather than at the next tick
                 raise ValueError("deadline passed; the task expired and its escrow was refunded")
+            # The verdict is nak.task.post-authorised. Validate it before task state or escrow moves;
+            # sender-loop signing still rechecks in case the grant expires while the reply waits.
+            self._require_grant("task.accept")
             output = body.get("output")
             passed, reasons = T.evaluate(t["spec"], output)
             verdict = {"passed": passed, "reasons": reasons,
@@ -1171,6 +1210,7 @@ def _load_node_key(path: Path) -> bytes:
 
 def main(argv=None) -> int:
     import argparse
+    os.umask(0o077)
     home = Path.home()
     ap = argparse.ArgumentParser(prog="nakd", description="Nakshatra messaging node")
     ap.add_argument("--state", type=Path, default=Path(os.environ.get("NAK_NET_DIR", home / ".nakshatra" / "net")))
@@ -1202,6 +1242,8 @@ def main(argv=None) -> int:
                         relay=(host, int(port)), log=lambda m: print(f"[nakd] {m}", flush=True),
                         direct_port=direct_port, p2p={"dial": p2p_dial} if p2p_dial else None).start()
             break
+        except DataKeyError as e:
+            raise SystemExit(f"nakd cannot start without the signer's data key: {e}") from e
         except (OSError, RuntimeError) as e:
             if time.time() > deadline:
                 raise

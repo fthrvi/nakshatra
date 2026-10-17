@@ -1920,7 +1920,7 @@ def main(argv=None, *, http_post=None) -> int:
         name_file = Path(os.environ.get("NAK_NET_DIR", Path.home() / ".nakshatra" / "net")) / "name"
         from_name = a.from_name or (name_file.read_text().strip() if name_file.exists() else "")
         if a.from_name:
-            name_file.write_text(a.from_name.strip()[:40] + "\n")
+            _write_private(name_file, (a.from_name.strip()[:40] + "\n").encode())
         if not from_name:
             print("tip: add --from <your name> so your friend sees who invited them (remembered after once)",
                   file=sys.stderr)
@@ -1991,7 +1991,7 @@ def main(argv=None, *, http_post=None) -> int:
         if a.port == "off":
             f.unlink(missing_ok=True)
         else:
-            f.write_text(str(int(a.port)) + "\n")
+            _write_private(f, (str(int(a.port)) + "\n").encode())
         _sp.run(["systemctl", "--user", "restart", "nak-net.service"], check=False)
         print(f"direct listener {'off' if a.port == 'off' else 'on port ' + a.port}; nak-net restarted")
     elif a.cmd == "p2p":
@@ -2014,7 +2014,7 @@ def main(argv=None, *, http_post=None) -> int:
                     raise SystemExit("--socket must be an absolute path")
                 if a.socket is None:          # the bundled sidecar listens on the default socket only
                     _enable_p2p_service_locked(_sp)
-                f.write_text(str(dial) + "\n")
+                _write_private(f, (str(dial) + "\n").encode())
                 _sp.run(["systemctl", "--user", "restart", "nak-net.service"], check=False)
             # The worker reads the P2P state only at startup. Keep the ownership check and restart in
             # this same transaction so gateway release cannot race it.

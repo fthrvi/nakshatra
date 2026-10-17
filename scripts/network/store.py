@@ -6,13 +6,19 @@ friend messages are untrusted external content — raw-log first, source=nakshat
 """
 from __future__ import annotations
 
+import base64
 import json
+import os
 import secrets
 import sqlite3
+import tempfile
 import threading
 import time
 from pathlib import Path
 from typing import Optional
+
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS contacts (person TEXT PRIMARY KEY, node TEXT NOT NULL, petname TEXT,
@@ -30,14 +36,30 @@ CREATE TABLE IF NOT EXISTS tasks (task_hash TEXT NOT NULL, role TEXT NOT NULL, p
     PRIMARY KEY (task_hash, role, peer));
 CREATE TABLE IF NOT EXISTS inbox (nonce TEXT PRIMARY KEY, from_person TEXT NOT NULL, petname TEXT,
     author TEXT, aspect TEXT, text TEXT, received INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS store_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 """
 
 
 class Store:
-    def __init__(self, state_dir: Path):
+    _ENCRYPTED = {
+        "inbox": (("nonce",), ("text", "petname", "author", "aspect")),
+        "contacts": (("person",), ("petname", "nickname")),
+        "requests": (("id",), ("nickname",)),
+        "invites": (("nonce",), ("note",)),
+        "outbox": (("nonce",), ("frame", "refused")),
+        "tasks": (("task_hash", "role", "peer"), ("spec", "output", "verdict")),
+    }
+
+    def __init__(self, state_dir: Path, data_key: bytes):
         self.dir = Path(state_dir)
         self.dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self._db = sqlite3.connect(str(self.dir / "net.sqlite"), isolation_level=None, check_same_thread=False)
+        os.chmod(self.dir, 0o700)
+        if not isinstance(data_key, bytes) or len(data_key) != 32:
+            raise ValueError("the Nakshatra store requires a 32-byte signer data key")
+        self._aead = ChaCha20Poly1305(data_key)
+        self._db_path = self.dir / "net.sqlite"
+        self._db = sqlite3.connect(str(self._db_path), isolation_level=None, check_same_thread=False)
+        os.chmod(self._db_path, 0o600)
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.executescript(SCHEMA)
         self._lock = threading.Lock()
@@ -56,6 +78,179 @@ class Store:
             self._db.execute("ALTER TABLE outbox ADD COLUMN refused TEXT")
         except sqlite3.OperationalError:
             pass
+        self._key_verified = self._verify_key_marker()
+        self._migrate()
+        self._fix_modes()
+
+    @staticmethod
+    def _pk(values) -> str:
+        return json.dumps(list(values), separators=(",", ":"), ensure_ascii=False)
+
+    @staticmethod
+    def _aad(table: str, column: str, primary_key: str) -> bytes:
+        return f"{table}\0{column}\0{primary_key}".encode("utf-8")
+
+    def _seal(self, value: str, aad: bytes) -> str:
+        nonce = secrets.token_bytes(12)
+        return "enc1:" + base64.b64encode(
+            nonce + self._aead.encrypt(nonce, str(value).encode("utf-8"), aad)).decode("ascii")
+
+    def _open(self, value, aad: bytes):
+        if value is None or not (isinstance(value, str) and value.startswith("enc1:")):
+            return value
+        raw = base64.b64decode(value[5:], validate=True)
+        if len(raw) < 28:  # 12-byte nonce + at least the 16-byte Poly1305 tag
+            raise ValueError("encrypted store value is truncated")
+        return self._aead.decrypt(raw[:12], raw[12:], aad).decode("utf-8")
+
+    def _enc(self, table: str, column: str, primary_key: str, value):
+        if value is None:
+            return value
+        return self._seal(str(value), self._aad(table, column, primary_key))
+
+    def _dec(self, table: str, column: str, primary_key: str, value):
+        return self._open(value, self._aad(table, column, primary_key))
+
+    def _is_encrypted(self, table: str, column: str, primary_key: str, value) -> bool:
+        if not (isinstance(value, str) and value.startswith("enc1:")):
+            return False
+        try:
+            raw = base64.b64decode(value[5:], validate=True)
+        except ValueError:
+            return False
+        if len(raw) < 28:
+            return False
+        try:
+            self._dec(table, column, primary_key, value)
+        except InvalidTag:
+            if self._key_verified:
+                raise  # after migration, this is corruption rather than ambiguous legacy text
+            return False
+        return True
+
+    def _verify_key_marker(self) -> bool:
+        row = self._db.execute("SELECT value FROM store_meta WHERE key='key_check'").fetchone()
+        if not row:
+            return False
+        if self._open(row[0], b"store-key-check") != "nak-store-key-v1":
+            raise ValueError("Nakshatra store data-key check failed")
+        return True
+
+    def _fix_modes(self) -> None:
+        os.chmod(self.dir, 0o700)
+        for path in (self._db_path, Path(str(self._db_path) + "-wal"),
+                     Path(str(self._db_path) + "-shm"), self._raw):
+            try:
+                os.chmod(path, 0o600)
+            except FileNotFoundError:
+                pass
+
+    def _migrate(self) -> None:
+        """Encrypt every legacy plaintext field in one transaction, then scrub SQLite free space."""
+        changed = False
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            for table, (pk_cols, columns) in self._ENCRYPTED.items():
+                selected = ", ".join((*pk_cols, *columns))
+                for row in self._db.execute(f"SELECT {selected} FROM {table}").fetchall():
+                    pk_values, values = row[:len(pk_cols)], row[len(pk_cols):]
+                    primary_key = self._pk(pk_values)
+                    updates = {column: self._enc(table, column, primary_key, value)
+                               for column, value in zip(columns, values)
+                               if value is not None and not self._is_encrypted(
+                                   table, column, primary_key, value)}
+                    if not updates:
+                        continue
+                    sets = ", ".join(f"{column}=?" for column in updates)
+                    where = " AND ".join(f"{column}=?" for column in pk_cols)
+                    self._db.execute(f"UPDATE {table} SET {sets} WHERE {where}",
+                                     (*updates.values(), *pk_values))
+                    changed = True
+            if not self._key_verified:
+                self._db.execute("INSERT INTO store_meta (key, value) VALUES ('key_check', ?)",
+                                 (self._seal("nak-store-key-v1", b"store-key-check"),))
+            if changed:
+                self._db.execute("INSERT INTO store_meta (key, value) VALUES ('cleanup_pending', '1') "
+                                 "ON CONFLICT(key) DO UPDATE SET value='1'")
+            self._db.execute("COMMIT")
+        except Exception:
+            self._db.execute("ROLLBACK")
+            raise
+        self._key_verified = True
+        raw_changed = self._migrate_raw_log()
+        if raw_changed:
+            self._db.execute("INSERT INTO store_meta (key, value) VALUES ('cleanup_pending', '1') "
+                             "ON CONFLICT(key) DO UPDATE SET value='1'")
+        pending = self._db.execute(
+            "SELECT value FROM store_meta WHERE key='cleanup_pending'").fetchone()
+        if pending and pending[0] == "1":
+            self._scrub_plaintext_pages()
+            self._db.execute("UPDATE store_meta SET value='0' WHERE key='cleanup_pending'")
+            self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+    def _scrub_plaintext_pages(self) -> None:
+        self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        self._db.execute("VACUUM")
+        self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+    def _read_raw_rows(self) -> tuple[list[dict], bool]:
+        if not self._raw.exists():
+            return [], False
+        lines = self._raw.read_bytes().splitlines(keepends=True)
+        rows, torn = [], False
+        for index, line in enumerate(lines):
+            body = line.rstrip(b"\r\n")
+            if not body:
+                continue
+            try:
+                rows.append(json.loads(body.decode("utf-8")))
+            except (UnicodeDecodeError, ValueError):
+                if index == len(lines) - 1 and not line.endswith((b"\n", b"\r")):
+                    torn = True
+                    break
+                raise
+        return rows, torn
+
+    def _migrate_raw_log(self) -> bool:
+        if not self._raw.exists():
+            return False
+        source_rows, changed = self._read_raw_rows()
+        rows = []
+        for row in source_rows:
+            if row.get("v") == "enc1" and isinstance(row.get("ct"), str):
+                # Authenticate existing encrypted lines now; a bad key must fail startup.
+                self._open(row["ct"], b"inbox-raw")
+                rows.append(row)
+                continue
+            encoded = json.dumps(row, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+            rows.append({"v": "enc1", "ts": int(row.get("ts", row.get("received", time.time()))),
+                         "ct": self._seal(encoded, b"inbox-raw")})
+            changed = True
+        if not changed:
+            return False
+        fd, tmp_name = tempfile.mkstemp(prefix=".inbox-raw.", dir=self.dir)
+        tmp = Path(tmp_name)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w") as out:
+                for row in rows:
+                    out.write(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n")
+                out.flush()
+                os.fsync(out.fileno())
+            os.replace(tmp, self._raw)
+            dfd = os.open(str(self.dir), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except Exception:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            tmp.unlink(missing_ok=True)
+            raise
+        return True
 
     def _q(self, sql, args=()):
         with self._lock:
@@ -74,6 +269,7 @@ class Store:
 
     # invites
     def add_invite(self, nonce: str, ik: str, expires_at: int, note: str = "") -> None:
+        note = self._enc("invites", "note", self._pk((nonce,)), note)
         self._q("INSERT INTO invites VALUES (?,?,?,?,?,NULL)", (nonce, ik, expires_at, int(time.time()), note))
 
     def open_invites(self, now: Optional[int] = None) -> list:
@@ -95,13 +291,18 @@ class Store:
     # requests (someone redeemed our invite and asks to connect)
     def add_request(self, person: str, node: str, nickname: str, invite_nonce: str) -> str:
         rid = secrets.token_hex(4)
+        nickname = self._enc("requests", "nickname", self._pk((rid,)), nickname[:40])
         self._q("INSERT INTO requests VALUES (?,?,?,?,?,?, 'pending')",
-                (rid, person, node, nickname[:40], invite_nonce, int(time.time())))
+                (rid, person, node, nickname, invite_nonce, int(time.time())))
         return rid
 
     def requests(self, state: str = "pending") -> list:
-        return [dict(zip(("id", "person", "node", "nickname", "received"), r)) for r in
-                self._q("SELECT id, person, node, nickname, received FROM requests WHERE state=?", (state,))]
+        out = []
+        for r in self._q("SELECT id, person, node, nickname, received FROM requests WHERE state=?", (state,)):
+            row = dict(zip(("id", "person", "node", "nickname", "received"), r))
+            row["nickname"] = self._dec("requests", "nickname", self._pk((row["id"],)), row["nickname"])
+            out.append(row)
+        return out
 
     def decide_request(self, rid: str, accept: bool) -> Optional[dict]:
         def fn(db):
@@ -109,28 +310,35 @@ class Store:
             if not r:
                 return None
             db.execute("UPDATE requests SET state=? WHERE id=?", ("accepted" if accept else "declined", rid))
-            return {"person": r[0], "node": r[1], "nickname": r[2]}
+            return {"person": r[0], "node": r[1],
+                    "nickname": self._dec("requests", "nickname", self._pk((rid,)), r[2])}
         return self._tx(fn)
 
     # contacts
     def upsert_contact(self, person: str, node: str, state: str, petname: str = "", nickname: str = "",
                        name_src: str = "self-chosen") -> None:
+        primary_key = self._pk((person,))
+        values = (person, node, self._enc("contacts", "petname", primary_key, petname),
+                  self._enc("contacts", "nickname", primary_key, nickname), state, int(time.time()), name_src)
+        update_names = (", name_src=excluded.name_src, petname=excluded.petname" if petname else "")
         self._q("INSERT INTO contacts (person, node, petname, nickname, state, added, name_src) VALUES (?,?,?,?,?,?,?) "
-                "ON CONFLICT(person) DO UPDATE SET node=excluded.node, state=excluded.state, "
-                "name_src=CASE WHEN excluded.petname<>'' THEN excluded.name_src ELSE contacts.name_src END, "
-                "petname=COALESCE(NULLIF(excluded.petname,''), contacts.petname)",
-                (person, node, petname, nickname, state, int(time.time()), name_src))
+                "ON CONFLICT(person) DO UPDATE SET node=excluded.node, state=excluded.state" + update_names, values)
 
     def set_contact_state(self, person: str, state: str) -> None:
         self._q("UPDATE contacts SET state=? WHERE person=?", (state, person))
 
     def contact(self, person: str) -> Optional[dict]:
         r = self._q("SELECT person, node, petname, nickname, state, name_src, direct, direct_hint, p2p FROM contacts WHERE person=?", (person,))
-        return dict(zip(("person", "node", "petname", "nickname", "state", "name_src", "direct", "direct_hint", "p2p"), r[0])) if r else None
+        if not r:
+            return None
+        row = dict(zip(("person", "node", "petname", "nickname", "state", "name_src", "direct", "direct_hint", "p2p"), r[0]))
+        primary_key = self._pk((person,))
+        for column in ("petname", "nickname"):
+            row[column] = self._dec("contacts", column, primary_key, row[column])
+        return row
 
     def contacts(self) -> list:
-        return [dict(zip(("person", "node", "petname", "nickname", "state", "name_src", "direct", "direct_hint", "p2p"), r)) for r in
-                self._q("SELECT person, node, petname, nickname, state, name_src, direct, direct_hint, p2p FROM contacts ORDER BY added")]
+        return [self.contact(r[0]) for r in self._q("SELECT person FROM contacts ORDER BY added")]
 
     def resolve(self, who: str) -> Optional[dict]:
         """A petname or a person key (or its prefix of at least 8 hex chars)."""
@@ -159,12 +367,13 @@ class Store:
 
     # outbox
     def queue(self, nonce: str, to_person: str, frame: dict) -> None:
+        raw = self._enc("outbox", "frame", self._pk((nonce,)), json.dumps(frame))
         self._q("INSERT INTO outbox (nonce, to_person, frame, created) VALUES (?,?,?,?)",
-                (nonce, to_person, json.dumps(frame), int(time.time())))
+                (nonce, to_person, raw, int(time.time())))
 
     def pending_for(self, person: str) -> list:
-        return [json.loads(r[0]) for r in
-                self._q("SELECT frame FROM outbox WHERE to_person=? AND acked IS NULL ORDER BY created", (person,))]
+        return [json.loads(self._dec("outbox", "frame", self._pk((r[0],)), r[1])) for r in
+                self._q("SELECT nonce, frame FROM outbox WHERE to_person=? AND acked IS NULL ORDER BY created", (person,))]
 
     def ack(self, nonce: str, to_person: str) -> None:
         """Only the contact a message was FOR can acknowledge it."""
@@ -173,16 +382,17 @@ class Store:
     def refuse(self, nonce: str, why: str, to_person: Optional[str] = None) -> None:
         """The peer received it and said no (terminal): stop retrying, keep the reason. A peer can
         only refuse what was sent TO it; a local refusal (signer said no) passes no person."""
+        encrypted = self._enc("outbox", "refused", self._pk((nonce,)), str(why)[:300])
         if to_person is None:
             self._q("UPDATE outbox SET acked=?, refused=? WHERE nonce=? AND acked IS NULL",
-                    (int(time.time()), str(why)[:300], nonce))
+                    (int(time.time()), encrypted, nonce))
         else:
             self._q("UPDATE outbox SET acked=?, refused=? WHERE nonce=? AND to_person=? AND acked IS NULL",
-                    (int(time.time()), str(why)[:300], nonce, to_person))
+                    (int(time.time()), encrypted, nonce, to_person))
 
     def refused(self, nonce: str) -> Optional[str]:
         r = self._q("SELECT refused FROM outbox WHERE nonce=?", (nonce,))
-        return r[0][0] if r else None
+        return self._dec("outbox", "refused", self._pk((nonce,)), r[0][0]) if r else None
 
     def delivered(self, nonce: str) -> bool:
         r = self._q("SELECT acked FROM outbox WHERE nonce=?", (nonce,))
@@ -194,7 +404,9 @@ class Store:
                        " ORDER BY created DESC LIMIT ?", (int(limit),))
         out = []
         for nonce, person, raw, created, acked, refused in rows:
-            frame = json.loads(raw)
+            primary_key = self._pk((nonce,))
+            frame = json.loads(self._dec("outbox", "frame", primary_key, raw))
+            refused = self._dec("outbox", "refused", primary_key, refused)
             row = {"id": nonce, "to": person, "kind": frame.get("kind", ""), "created": created,
                    "delivered": bool(acked and not refused), "refused": bool(refused),
                    "completed": acked, "reason": refused or ""}
@@ -209,13 +421,35 @@ class Store:
         latest = self._q("SELECT nonce, to_person, acked, refused FROM outbox "
                          "WHERE refused IS NOT NULL ORDER BY acked DESC LIMIT 1")
         return {"count": count, "latest": ({"id": latest[0][0], "to": latest[0][1],
-                                             "time": latest[0][2], "reason": latest[0][3]}
+                                             "time": latest[0][2], "reason": self._dec(
+                                                 "outbox", "refused", self._pk((latest[0][0],)), latest[0][3])}
                                             if latest else None)}
 
     # inbox (untrusted external content)
     def raw_log(self, record: dict) -> None:
-        with self._lock, open(self._raw, "a") as f:
-            f.write(json.dumps(record, sort_keys=True) + "\n")
+        encoded = json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        row = {"v": "enc1", "ts": int(record.get("ts", record.get("received", time.time()))),
+               "ct": self._seal(encoded, b"inbox-raw")}
+        with self._lock:
+            fd = os.open(str(self._raw), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            try:
+                data = (json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n").encode()
+                view = memoryview(data)
+                while view:
+                    view = view[os.write(fd, view):]
+                os.fsync(fd)
+                os.fchmod(fd, 0o600)
+            finally:
+                os.close(fd)
+
+    def raw_records(self) -> list:
+        out = []
+        rows, _torn = self._read_raw_rows()
+        for row in rows:
+            if row.get("v") == "enc1":
+                row = json.loads(self._open(row["ct"], b"inbox-raw"))
+            out.append(row)
+        return out
 
     def is_seen(self, nonce: str) -> bool:
         return bool(self._q("SELECT 1 FROM seen WHERE nonce=?", (nonce,)))
@@ -228,14 +462,24 @@ class Store:
             return False
 
     def add_inbox(self, nonce: str, from_person: str, petname: str, author: str, aspect: str, text: str) -> None:
+        primary_key = self._pk((nonce,))
         self._q("INSERT OR IGNORE INTO inbox VALUES (?,?,?,?,?,?,?)",
-                (nonce, from_person, petname, author, aspect, text, int(time.time())))
+                (nonce, from_person, self._enc("inbox", "petname", primary_key, petname),
+                 self._enc("inbox", "author", primary_key, author),
+                 self._enc("inbox", "aspect", primary_key, aspect),
+                 self._enc("inbox", "text", primary_key, text), int(time.time())))
 
     def inbox(self, since: int = 0, limit: int = 50) -> list:
-        return [dict(zip(("nonce", "from_person", "petname", "author", "aspect", "text", "received"), r)) | {
-                "source": "nakshatra", "trust": "external"} for r in
-                self._q("SELECT nonce, from_person, petname, author, aspect, text, received FROM inbox "
-                        "WHERE received >= ? ORDER BY received DESC LIMIT ?", (since, limit))]
+        out = []
+        for r in self._q("SELECT nonce, from_person, petname, author, aspect, text, received FROM inbox "
+                         "WHERE received >= ? ORDER BY received DESC LIMIT ?", (since, limit)):
+            row = dict(zip(("nonce", "from_person", "petname", "author", "aspect", "text", "received"), r))
+            primary_key = self._pk((row["nonce"],))
+            for column in ("petname", "author", "aspect", "text"):
+                row[column] = self._dec("inbox", column, primary_key, row[column])
+            row.update(source="nakshatra", trust="external")
+            out.append(row)
+        return out
 
     # tasks: one row per (task, my role, counterparty). Poster rows use peer "" (the assignee is a
     # column); worker rows use the poster's person key as peer. Every transition is compare-and-set.
@@ -245,9 +489,10 @@ class Store:
     def task_insert(self, task_hash: str, role: str, peer: str, spec: dict, state: str,
                     targets: Optional[list] = None) -> bool:
         now = int(time.time())
+        primary_key = self._pk((task_hash, role, peer))
         try:
             self._q("INSERT INTO tasks VALUES (?,?,?,?,?,?,NULL,0,NULL,NULL,?,?)",
-                    (task_hash, role, peer, json.dumps(spec), state,
+                    (task_hash, role, peer, self._enc("tasks", "spec", primary_key, json.dumps(spec)), state,
                      json.dumps(targets) if targets is not None else None, now, now))
             return True
         except sqlite3.IntegrityError:
@@ -261,6 +506,10 @@ class Store:
             raise ValueError(f"bad task fields {set(fields) - allowed}")
         sets = ", ".join(f"{k}=?" for k in fields) + ", updated=?"
         marks = ",".join("?" * len(from_states))
+        primary_key = self._pk((task_hash, role, peer))
+        fields = {key: (self._enc("tasks", key, primary_key, value)
+                        if key in ("output", "verdict") and value is not None else value)
+                  for key, value in fields.items()}
 
         def fn(db):
             cur = db.execute(f"UPDATE tasks SET {sets} WHERE task_hash=? AND role=? AND peer=? AND state IN ({marks})",
@@ -298,6 +547,9 @@ class Store:
 
     def _task_row(self, r) -> dict:
         d = dict(zip(self._TASK_COLS, r))
+        primary_key = self._pk((d["task_hash"], d["role"], d["peer"]))
+        for column in ("spec", "output", "verdict"):
+            d[column] = self._dec("tasks", column, primary_key, d[column])
         d["spec"] = json.loads(d["spec"])
         d["targets"] = json.loads(d["targets"]) if d["targets"] else None
         d["verdict"] = json.loads(d["verdict"]) if d["verdict"] else None

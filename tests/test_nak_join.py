@@ -73,6 +73,7 @@ def test_identity_setup_is_idempotent_and_grants_only_message_and_claim(tmp_path
     first = join_setup.ensure_identity(tmp_path)
     assert first["node_key"] == "created" and first["person_key"].startswith("created")
     assert oct((tmp_path / ".sthambha" / "signer").stat().st_mode & 0o777) == "0o700"
+    assert oct((tmp_path / ".nakshatra" / "net" / "agent").stat().st_mode & 0o777) == "0o600"
     grant = json.loads((tmp_path / ".sthambha" / "signer" / "agents" / "agent.grant.json").read_text())
     signer_mod.verify_grant(grant, first["person"], cap="nak.msg", node=first["node"])
     signer_mod.verify_grant(grant, first["person"], cap="nak.task.claim", node=first["node"])
@@ -191,6 +192,7 @@ def test_nak_worker_invite_stages_code_with_injected_http(tmp_path, monkeypatch,
     monkeypatch.setattr(nak, "call", fake_call)
     monkeypatch.setattr(nak.time, "time", lambda: 1000)
     assert nak.main(["invite", "--person-key", str(person_path), "--kind", "worker", "--tier", "known",
+                     "--from", "Alice",
                      "--redeem", "https://onboard.example/base", "--code-only"], http_post=fake_post) == 0
     output = capsys.readouterr()
     code = output.out.strip()
@@ -200,6 +202,7 @@ def test_nak_worker_invite_stages_code_with_injected_http(tmp_path, monkeypatch,
     assert inv["worker"] == {"redeem": "https://onboard.example/base", "code": "staged-once", "tier": "known"}
     assert inv["expires_at"] == 1600 and "Unix 1600" in output.err
     assert registered == [code]
+    assert oct((tmp_path / "net" / "name").stat().st_mode & 0o777) == "0o600"
 
 
 def test_nak_consumer_invite_stages_signed_starter_request(tmp_path, monkeypatch, capsys):

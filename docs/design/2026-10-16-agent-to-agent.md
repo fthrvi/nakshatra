@@ -170,11 +170,22 @@ every envelope signed). **On disk it is NOT:** `net.sqlite` and `inbox-raw.jsonl
 (directory is 0700 but the files are 0644/0664). That needs fixing:
 
 ### D7. Encrypt the node store at rest
-Encrypt message text, task bodies and contact records with a key held by the node's signer (the same
-process that already holds the delegated agent key), never stored beside the database. Either SQLCipher
-for the whole file or per-row AEAD; per-row is simpler to migrate and keeps the raw log encryptable
-with the same key. Files 0600. Losing the key loses the history, so the key is backed up with the
-person's other keys (vault), never on the network.
+Message text, task bodies and contact names are encrypted per field with ChaCha20-Poly1305. Each
+ciphertext's associated data binds its table, column and primary key, so copying ciphertext between
+rows or columns fails authentication. The raw inbox log uses the same AEAD with a distinct
+`inbox-raw` context. Lookup keys, state and timestamps remain plaintext. The 32-byte `datakey` lives
+only in the signer's state directory (0600), never in `~/.nakshatra/net`; nakd obtains it through the
+same uid-admitted local signer socket used for signing. Legacy plaintext rows and raw-log lines are
+migrated on startup, then SQLite's WAL is truncated and the database vacuumed so freed pages do not
+retain the old text. The net directory is 0700 and its database, WAL/SHM, raw log and small config
+files are 0600.
+
+**Threat boundary:** this protects a net directory or container-volume subdirectory copied, synced
+or backed up *without* the signer directory (including memory-sync, Syncthing and ordinary backup
+copies). It does **not** protect against malware running as the same OS user: that process passes the
+Unix-socket uid check and can ask the signer for the data key. Losing `datakey` loses the encrypted
+message history. Back it up by backing up the complete signer state directory with the person's
+other keys in the vault; do not make a second copy beside the network database.
 
 ### D8. Later ways to find people (all opt-in, none replace invites)
 1. **Introductions:** a contact sends you a signed intro to someone they know. It's still a request

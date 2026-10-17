@@ -6,7 +6,7 @@ import time
 
 import pytest
 
-from test_nakd import _connect, _worker_row, net, wait  # noqa: F401  (net is a fixture)
+from test_nakd import _connect, _replace_grant, _worker_row, net, wait  # noqa: F401  (net is a fixture)
 
 PAY = {"per_tx_cap": 10, "day_cap": 50}
 
@@ -54,6 +54,30 @@ def test_reject_refunds_the_poster(net):
     assert wait(lambda: _worker_row(b.node, h)[0]["state"] == "rejected")
     assert a.node.settle.status(h)["state"] == "refunded"
     assert events(a, h) == ["open", "refunded"]
+
+
+def test_expired_poster_grant_refuses_result_before_state_or_escrow_changes(net):
+    a, b = _pair(net)
+    h = _assigned(a, b)
+    body = {"task_hash": h, "epoch": 1, "output": "ok", "mid": "expired-poster-result"}
+    env = b.node._sign("task.result", a.person_pub, body)
+    _replace_grant(a, ("nak.msg", "nak.task.post", "nak.pay"), int(time.time()) - 100, 10)
+    reply = a.node._receive(b.person_pub, {"t": "env", "env": env, "body": body})
+    assert reply["t"] == "nack" and "expired at" in reply["why"]
+    assert a.node.store.task_get(h, "poster")["state"] == "assigned"
+    assert a.node.settle.status(h)["state"] == "open" and events(a, h) == ["open"]
+
+
+def test_expired_poster_grant_refuses_claim_before_assignment_changes(net):
+    a, b = _pair(net)
+    h = a.node.post_task("worker", "drill", "Say ok.", [{"contains_all": ["ok"]}])["task_hash"]
+    assert wait(lambda: _worker_row(b.node, h))
+    body = {"task_hash": h, "mid": "expired-poster-claim"}
+    env = b.node._sign("task.claim", a.person_pub, body)
+    _replace_grant(a, ("nak.msg", "nak.task.post", "nak.pay"), int(time.time()) - 100, 10)
+    reply = a.node._receive(b.person_pub, {"t": "env", "env": env, "body": body})
+    assert reply["t"] == "nack" and "expired at" in reply["why"]
+    assert a.node.store.task_get(h, "poster")["state"] == "posted"
 
 
 def test_reward_over_the_agents_cap_needs_the_person_and_posts_nothing(net):
