@@ -51,6 +51,8 @@ from cryptography.hazmat.primitives.asymmetric import ed25519  # noqa: E402
 
 import joincode  # noqa: E402
 from mesh.pairing import pair_role  # noqa: E402
+from network.agent import (AGENT_MSG_VERSION, CARD_SUPPORT, CARD_VERSION, INTENTS,
+                           validate_agent_message, validate_card)  # noqa: E402
 from network.store import Store  # noqa: E402
 from network import tasks as T  # noqa: E402
 from network.settle import SettlementError  # noqa: E402
@@ -478,6 +480,7 @@ class Node:
         self.store.upsert_contact(r["person"], r["node"], "active", petname or r["nickname"], r["nickname"],
                                   name_src="yours" if petname else "self-chosen")
         self._queue(r["person"], "contact.accept", {"person": self.person, "node": self.node})
+        self._send_card_if_set(r["person"])
         self._ensure_session(r["person"])
         return {"person": r["person"], "petname": petname or r["nickname"]}
 
@@ -513,6 +516,93 @@ class Node:
         self._require_grant("msg")
         mid = self._queue(c["person"], "msg", {"text": text, "aspect": str(aspect)[:32]})
         return {"queued": mid, "to": c["petname"] or c["person"][:12]}
+
+    def agent_send(self, who: str, text: str, *, intent: str = "ask", thread: str = "",
+                   reply_to: str = "", want=None, expires=None, budget=None, refs=None,
+                   harness=None) -> dict:
+        c = self.store.resolve(who)
+        if not c:
+            raise ValueError("not a contact: only people who accepted a connection can be messaged")
+        if c["state"] != "active":
+            raise ValueError("that connection has not been accepted yet")
+        name = c["petname"] or c["person"][:12]
+        if self.store.agent_card(c["person"]) is None:
+            raise ValueError(f"{name} runs an older node (no agent card yet); use nak_send")
+        self._require_grant("agent.msg")
+        body = {"v": AGENT_MSG_VERSION, "mid": secrets.token_hex(12),
+                "thread": thread or secrets.token_hex(16), "reply_to": reply_to or "",
+                "intent": intent, "text": text}
+        for key, value in (("want", want), ("expires", expires), ("budget", budget), ("refs", refs),
+                           ("harness", harness)):
+            if value is not None:
+                body[key] = value
+        body = validate_agent_message(body, MAX_TEXT, outbound=True,
+                                      reply_known=self.store.agent_mid_known)
+        for value in (body["text"], body.get("want", "")):
+            why = outbound_problem(value)
+            if why:
+                self.log(f"agent send to {c['person'][:12]} refused: {why}")
+                raise ValueError(why)
+        self.store.add_agent_message(body, c["person"], "out")
+        self.store.queue(body["mid"], c["person"], {"kind": "agent.msg", "body": body})
+        ev = self._wake.get(c["person"])
+        if ev:
+            ev.set()
+        return {"queued": body["mid"], "to": name, "thread": body["thread"],
+                "expires": body.get("expires")}
+
+    def _card_body(self) -> Optional[dict]:
+        card = self.store.agent_card(self.person)
+        return dict(card, v=CARD_VERSION) if card else None
+
+    def _send_card_if_set(self, person: str) -> Optional[str]:
+        body = self._card_body()
+        return self._queue(person, "contact.card", body) if body else None
+
+    def card_set(self, display_name: str, offers: str, *, intents=None, models=None,
+                 price_hint: str = "") -> dict:
+        card = {"v": CARD_VERSION, "mid": "0" * 24, "display_name": display_name,
+                "offers": offers, "intents": list(intents if intents is not None else INTENTS),
+                "paid": False, "price_hint": price_hint, "models": list(models or []),
+                "supports": [CARD_SUPPORT], "updated_at": int(time.time())}
+        validate_card(card)
+        stored = {key: value for key, value in card.items() if key not in {"v", "mid"}}
+        self.store.set_agent_card(self.person, stored)
+        sent = []
+        for contact in self.store.contacts():
+            if contact["state"] == "active":
+                sent.append(self._send_card_if_set(contact["person"]))
+        return {"card": stored, "sent": len(sent)}
+
+    def card(self, who: str = "") -> dict:
+        if not who:
+            card = self.store.agent_card(self.person)
+            if not card:
+                raise ValueError("no agent card is set; use: nak card set ...")
+            return {"card": card, "person": self.person, "mine": True}
+        c = self.store.resolve(who)
+        if not c:
+            raise ValueError("no such contact")
+        card = self.store.agent_card(c["person"])
+        if not card:
+            raise ValueError(f"{c['petname'] or c['person'][:12]} has no agent card yet")
+        return {"card": card, "person": c["person"], "mine": False,
+                "contact": c["petname"] or c["person"][:12]}
+
+    def threads(self) -> list:
+        rows = self.store.agent_threads()
+        for row in rows:
+            contact = self.store.contact(row["contact"])
+            row["contact"] = (contact or {}).get("petname") or row["contact"][:12]
+        return rows
+
+    def thread(self, prefix: str) -> tuple[str, list]:
+        thread, rows = self.store.agent_thread(prefix)
+        for row in rows:
+            contact = self.store.contact(row["peer"])
+            name = (contact or {}).get("petname") or row["peer"][:12]
+            row["from"] = name if row["direction"] == "in" else "me"
+        return thread, rows
 
     def _queue(self, person: str, kind: str, body: dict) -> str:
         self._require_grant(kind)
@@ -730,9 +820,29 @@ class Node:
             if c["state"] == "awaiting":
                 self.store.set_contact_state(person, "active")
                 self.log(f"{c['petname'] or person[:12]} accepted the connection")
+                self._send_card_if_set(person)
             return {"t": "ack", "mid": mid}
         if c["state"] != "active":
             return {"t": "nack", "mid": mid, "why": "connection not accepted yet"}
+        if kind == "contact.card":
+            card_body = validate_card(body)
+            if self.store.first_time(mid):
+                self.store.raw_log({"received": int(time.time()), "source": "nakshatra", "trust": "external",
+                                    "from_person": person, "envelope": env, "body": body})
+                card = {key: value for key, value in card_body.items() if key not in {"v", "mid"}}
+                self.store.set_agent_card(person, card)
+            return {"t": "ack", "mid": mid}
+        if kind == "agent.msg":
+            message = validate_agent_message(body, MAX_TEXT)
+            if message.get("expires") is not None and message["expires"] <= int(time.time()):
+                if self.store.first_time(mid):
+                    self.log(f"dropped expired agent.msg {mid[:8]} from {person[:12]}")
+                return {"t": "ack", "mid": mid}
+            if self.store.first_time(mid):
+                self.store.raw_log({"received": int(time.time()), "source": "nakshatra", "trust": "external",
+                                    "from_person": person, "envelope": env, "body": body})
+                self.store.add_agent_message(message, person, "in")
+            return {"t": "ack", "mid": mid}
         if isinstance(kind, str) and kind.startswith("task."):
             if self.store.is_seen(mid):
                 return {"t": "ack", "mid": mid}
@@ -1100,7 +1210,8 @@ def _hard_close(ch) -> None:
 # ── control socket (the CLI and, on Day 5, the MCP front door talk to this) ───────────────────
 
 OPS = {"status", "register_invite", "redeem", "requests", "accept", "decline", "contacts", "remove", "send",
-       "delivered", "inbox", "outbox", "task_post", "tasks", "task_claim", "task_submit", "ledger", "direct"}
+       "agent_send", "threads", "thread", "card", "card_set", "delivered", "inbox", "outbox",
+       "task_post", "tasks", "task_claim", "task_submit", "ledger", "direct"}
 
 
 def handle(node: Node, req: dict) -> dict:
@@ -1127,6 +1238,21 @@ def handle(node: Node, req: dict) -> dict:
             return {"ok": True, **node.remove(req["who"])}
         if op == "send":
             return {"ok": True, **node.send(req["to"], req["text"], req.get("aspect", ""))}
+        if op == "agent_send":
+            optional = {key: req[key] for key in ("want", "expires", "budget", "refs", "harness") if key in req}
+            return {"ok": True, **node.agent_send(req["to"], req["text"], intent=req.get("intent", "ask"),
+                                                  thread=req.get("thread", ""),
+                                                  reply_to=req.get("reply_to", ""), **optional)}
+        if op == "threads":
+            return {"ok": True, "threads": node.threads()}
+        if op == "thread":
+            thread, messages = node.thread(req["thread"])
+            return {"ok": True, "thread": thread, "messages": messages}
+        if op == "card":
+            return {"ok": True, **node.card(req.get("contact", ""))}
+        if op == "card_set":
+            return {"ok": True, **node.card_set(req["name"], req["offers"], intents=req.get("intents"),
+                                                models=req.get("models"), price_hint=req.get("price_hint", ""))}
         if op == "delivered":
             return {"ok": True, "delivered": node.delivered(req["mid"])}
         if op == "task_post":

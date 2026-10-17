@@ -115,6 +115,63 @@ def test_connect_only_after_accept_then_message_both_ways(net):
     assert b.node.store.inbox()[0]["text"] == "got it" and b.node.store.inbox()[0]["aspect"] == "whole"
 
 
+def test_agent_cards_and_threaded_ask_answer_are_exchanged_and_encrypted(net):
+    a, b = net("alice"), net("bob")
+    offers_marker = "CARD_OFFERS_MARKER_M1"
+    text_marker = "AGENT_TEXT_MARKER_M1"
+    want_marker = "AGENT_WANT_MARKER_M1"
+    a.node.card_set("Alice agent", offers_marker, intents=["ask", "answer"], models=["qwen3"])
+    b.node.card_set("Bob agent", "answers questions", intents=["ask", "answer"], models=["hermes"])
+
+    b.node.redeem(a.invite(), petname="alice", wait_s=15)
+    a.node.accept(a.node.store.requests()[0]["id"], petname="bob")
+    assert wait(lambda: (b.node.store.contact(a.person_pub) or {}).get("state") == "active")
+    assert wait(lambda: (b.node.store.agent_card(a.person_pub) or {}).get("offers") == offers_marker)
+    assert wait(lambda: a.node.store.agent_card(b.person_pub) is not None)
+    ask = a.node.agent_send("bob", text_marker, intent="ask", want=want_marker, harness="openclaw")
+    assert wait(lambda: a.node.delivered(ask["queued"]))
+    assert wait(lambda: len(b.node.store.agent_thread(ask["thread"])[1]) == 1)
+    answer = b.node.agent_send("alice", "the answer", intent="answer", thread=ask["thread"],
+                               reply_to=ask["queued"], harness="hermes")
+    assert wait(lambda: b.node.delivered(answer["queued"]))
+    assert wait(lambda: len(a.node.store.agent_thread(ask["thread"])[1]) == 2)
+
+    for party in (a, b):
+        thread, messages = party.node.thread(ask["thread"][:10])
+        assert thread == ask["thread"]
+        assert [row["intent"] for row in messages] == ["ask", "answer"]
+        assert messages[1]["reply_to"] == ask["queued"]
+        assert party.node.threads()[0]["count"] == 2
+    assert a.node.thread(ask["thread"])[1][1]["trust"] == "external"
+    assert b.node.thread(ask["thread"])[1][0]["trust"] == "external"
+
+    markers = [offers_marker.encode(), text_marker.encode(), want_marker.encode()]
+    for party in (a, b):
+        for name in ("net.sqlite", "net.sqlite-wal", "net.sqlite-shm", "inbox-raw.jsonl"):
+            path = party.dir / "net" / name
+            if path.exists():
+                raw = path.read_bytes()
+                assert all(marker not in raw for marker in markers), (party.dir.name, name)
+
+
+def test_agent_send_refuses_cardless_contact_with_exact_compatibility_message(net):
+    a, _b = _pair(net)
+    with pytest.raises(ValueError, match=r"^b runs an older node \(no agent card yet\); use nak_send$"):
+        a.node.agent_send("b", "typed hello")
+
+
+def test_expired_agent_message_is_logged_and_dropped(net):
+    a, b = _pair(net)
+    logs = []
+    a.node.log = logs.append
+    body = {"v": 1, "mid": "a" * 24, "thread": "b" * 32, "reply_to": "", "intent": "inform",
+            "text": "already stale", "expires": int(time.time()) - 1}
+    env = b.node._sign("agent.msg", a.person_pub, body)
+    assert a.node._receive(b.person_pub, {"t": "env", "env": env, "body": body})["t"] == "ack"
+    assert a.node.store.agent_threads() == []
+    assert any("dropped expired agent.msg" in line for line in logs)
+
+
 def test_invite_is_single_use(net):
     a, b, c = net("a"), net("b"), net("c")
     code = a.invite()
@@ -308,6 +365,7 @@ def test_mcp_front_door(net, tmp_path):
     assert init["result"]["serverInfo"]["name"] == "nakshatra"
     names = {t["name"] for t in srv.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})["result"]["tools"]}
     assert names == {"nak_status", "nak_contacts", "nak_inbox", "nak_requests", "nak_send",
+                     "nak_agent_send", "nak_threads", "nak_thread", "nak_card",
                      "nak_tasks", "nak_task_post", "nak_task_claim", "nak_task_submit",
                      "nak_models", "nak_ask", "nak_balance", "nak_wallet",
                      "nak_worker_status"}   # no connect tools

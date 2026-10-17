@@ -1861,6 +1861,25 @@ def main(argv=None, *, http_post=None) -> int:
     p = sub.add_parser("remove"); p.add_argument("who")
     p = sub.add_parser("send"); p.add_argument("to"); p.add_argument("text")
     p.add_argument("--aspect", default="")
+    p = sub.add_parser("agent", help="typed agent-to-agent messages")
+    asub = p.add_subparsers(dest="agent_cmd", required=True)
+    q = asub.add_parser("send")
+    q.add_argument("to"); q.add_argument("text")
+    q.add_argument("--intent", default="ask")
+    q.add_argument("--thread", default="")
+    q.add_argument("--reply-to", default="")
+    q.add_argument("--want", default=None)
+    sub.add_parser("threads", help="list typed agent-message threads")
+    p = sub.add_parser("thread", help="show one typed agent-message thread")
+    p.add_argument("thread")
+    p = sub.add_parser("card", help="show or publish the person's outward-facing agent card")
+    csub = p.add_subparsers(dest="card_cmd", required=True)
+    q = csub.add_parser("show"); q.add_argument("contact", nargs="?", default="")
+    q = csub.add_parser("set")
+    q.add_argument("--name", required=True); q.add_argument("--offers", required=True)
+    q.add_argument("--intents", default="", help="comma-separated agent.msg intents (default: all)")
+    q.add_argument("--models", default="", help="comma-separated model names")
+    q.add_argument("--price-hint", default="")
     p = sub.add_parser("inbox"); p.add_argument("--limit", type=int, default=20)
     p = sub.add_parser("outbox", help="show recent queued, delivered, and refused outbound items")
     p.add_argument("--refused", action="store_true", help="show only refused items")
@@ -2090,6 +2109,38 @@ def main(argv=None, *, http_post=None) -> int:
     elif a.cmd == "send":
         r = call(s, {"op": "send", "to": a.to, "text": a.text, "aspect": a.aspect})
         print(f"queued {r['queued']} to {r['to']}")
+    elif a.cmd == "agent":
+        r = call(s, {"op": "agent_send", "to": a.to, "text": a.text, "intent": a.intent,
+                     "thread": a.thread, "reply_to": a.reply_to,
+                     **({"want": a.want} if a.want is not None else {})})
+        print(f"queued {r['queued']} to {r['to']} in thread {r['thread']}")
+    elif a.cmd == "threads":
+        for row in call(s, {"op": "threads"})["threads"]:
+            unread = " unread-ish" if row["unread"] else ""
+            print(f"{row['thread']}  {row['contact']}  {row['last_intent']}  "
+                  f"{_ago(row['last_time'])}  {row['count']} message(s){unread}")
+    elif a.cmd == "thread":
+        result = call(s, {"op": "thread", "thread": a.thread})
+        print(f"thread {result['thread']}")
+        for message in result["messages"]:
+            reply = f" reply_to={message['reply_to']}" if message["reply_to"] else ""
+            want = f"\n  want: {message['want']}" if message.get("want") is not None else ""
+            print(f"[{_ago(message['created'])}] {message['from']} {message['intent']} mid={message['mid']}{reply}\n"
+                  f"  {message['text']}{want}")
+    elif a.cmd == "card":
+        if a.card_cmd == "set":
+            intents = [value.strip() for value in a.intents.split(",") if value.strip()] or None
+            models = [value.strip() for value in a.models.split(",") if value.strip()]
+            result = call(s, {"op": "card_set", "name": a.name, "offers": a.offers,
+                              "intents": intents, "models": models, "price_hint": a.price_hint})
+            print(f"agent card saved and sent to {result['sent']} contact(s)")
+        else:
+            result = call(s, {"op": "card", "contact": a.contact})
+            card = result["card"]
+            print(f"{result.get('contact') or 'my card'}: {card['display_name']}\n"
+                  f"offers: {card['offers']}\nintents: {', '.join(card['intents'])}\n"
+                  f"models: {', '.join(card['models']) or '-'}\npaid: no\n"
+                  f"price hint: {card['price_hint'] or '-'}\nsupports: {', '.join(card['supports'])}")
     elif a.cmd == "direct":
         r = call(s, {"op": "direct", "who": a.who, "on": a.onoff == "on"})
         if a.onoff == "on":

@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import sqlite3
 import stat
 import sys
@@ -35,6 +36,13 @@ def test_every_encrypted_column_round_trips_and_is_ciphertext_in_sqlite(tmp_path
     store.queue("out-1", PERSON, {"kind": "msg", "body": {"text": "outbox-text"}})
     store.refuse("out-1", "outbox-refusal")
     store.add_inbox("in-1", PERSON, "inbox-pet", "agent:alice", "whole", "inbox-text")
+    store.add_agent_message({"mid": "12" * 12, "thread": "34" * 16, "intent": "ask", "reply_to": "",
+                             "text": "agent-text", "want": "agent-want", "refs": [],
+                             "budget": {"amount": 0, "unit": "credits"}, "harness": "test"},
+                            PERSON, "in")
+    store.set_agent_card(PERSON, {"display_name": "Agent", "offers": "card-offers", "intents": ["ask"],
+                                  "paid": False, "price_hint": "none", "models": ["m"],
+                                  "supports": ["agent.msg/1"], "updated_at": 1})
     assert store.task_insert(TASK, "worker", PERSON, {"title": "task-spec"}, "assigned")
     assert store.task_cas(TASK, "worker", PERSON, ("assigned",), state="submitted",
                           output="task-output", verdict=json.dumps({"reason": "task-verdict"}))
@@ -49,6 +57,8 @@ def test_every_encrypted_column_round_trips_and_is_ciphertext_in_sqlite(tmp_path
     assert task["spec"]["title"] == "task-spec" and task["output"] == "task-output"
     assert task["verdict"]["reason"] == "task-verdict"
     assert store.raw_records()[0]["body"] == MARKER
+    assert store.agent_thread("34")[1][0]["want"] == "agent-want"
+    assert store.agent_card(PERSON)["offers"] == "card-offers"
 
     for table, (pk_cols, columns) in Store._ENCRYPTED.items():
         rows = store._q(f"SELECT {', '.join((*pk_cols, *columns))} FROM {table}")
@@ -170,6 +180,27 @@ def test_plaintext_migration_scrubs_db_wal_and_raw_log_and_is_idempotent(tmp_pat
     reopened = Store(root, KEY)
     assert reopened._q("SELECT text FROM inbox WHERE nonce='in'")[0][0] == before
     _assert_marker_absent(root)
+
+
+def test_schema_migration_is_idempotent_on_a_forgejo_main_store(tmp_path):
+    root = tmp_path / "net"
+    root.mkdir()
+    # This is the exact structural delta introduced by M1: remove the two new tables/index to model
+    # a database initialized by forgejo/main, then let Store open it twice.
+    parent_schema = re.sub(
+        r"CREATE TABLE IF NOT EXISTS agent_messages .*?CREATE TABLE IF NOT EXISTS agent_cards .*?;\n",
+        "", SCHEMA, flags=re.DOTALL)
+    db = sqlite3.connect(root / "net.sqlite")
+    db.executescript(parent_schema)
+    db.commit()
+    db.close()
+    first = Store(root, KEY)
+    first.set_agent_card(PERSON, {"display_name": "A", "offers": "O", "intents": [], "paid": False,
+                                  "price_hint": "", "models": [], "supports": ["agent.msg/1"],
+                                  "updated_at": 1})
+    first._db.close()
+    second = Store(root, KEY)
+    assert second.agent_card(PERSON)["display_name"] == "A"
 
 
 def test_mixed_store_recovery_finishes_plaintext_rows_and_raw_lines(tmp_path):

@@ -60,6 +60,30 @@ class NakClient:
     def send(self, to: str, text: str, aspect: str = "") -> dict:
         return self.call("send", to=to, text=text, aspect=aspect)
 
+    def agent_send(self, to: str, text: str, *, intent: str = "ask", thread: str = "",
+                   reply_to: str = "", want: str | None = None, expires: int | None = None,
+                   budget: dict | None = None, refs: list | None = None,
+                   harness: str | None = None) -> dict:
+        args = {"to": to, "text": text, "intent": intent, "thread": thread, "reply_to": reply_to}
+        for key, value in (("want", want), ("expires", expires), ("budget", budget), ("refs", refs),
+                           ("harness", harness)):
+            if value is not None:
+                args[key] = value
+        return self.call("agent_send", **args)
+
+    def threads(self) -> list:
+        return self.call("threads")["threads"]
+
+    def thread(self, thread: str) -> dict:
+        return self.call("thread", thread=thread)
+
+    def card(self, contact: str = "") -> dict:
+        return self.call("card", contact=contact)
+
+    def card_set(self, name: str, offers: str, *, intents=None, models=None, price_hint: str = "") -> dict:
+        return self.call("card_set", name=name, offers=offers, intents=intents, models=models,
+                         price_hint=price_hint)
+
     def delivered(self, mid: str) -> bool:
         return self.call("delivered", mid=mid)["delivered"]
 

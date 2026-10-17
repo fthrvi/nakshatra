@@ -36,6 +36,14 @@ CREATE TABLE IF NOT EXISTS tasks (task_hash TEXT NOT NULL, role TEXT NOT NULL, p
     PRIMARY KEY (task_hash, role, peer));
 CREATE TABLE IF NOT EXISTS inbox (nonce TEXT PRIMARY KEY, from_person TEXT NOT NULL, petname TEXT,
     author TEXT, aspect TEXT, text TEXT, received INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS agent_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, mid TEXT NOT NULL UNIQUE,
+    peer TEXT NOT NULL, direction TEXT NOT NULL, thread TEXT NOT NULL, intent TEXT NOT NULL,
+    reply_to TEXT NOT NULL, expires INTEGER, text TEXT NOT NULL, want TEXT, refs TEXT, budget TEXT,
+    harness TEXT, created INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS agent_messages_thread_idx ON agent_messages(thread, created, id);
+CREATE TABLE IF NOT EXISTS agent_cards (person TEXT PRIMARY KEY, display_name TEXT NOT NULL,
+    offers TEXT NOT NULL, intents TEXT NOT NULL, paid TEXT NOT NULL, price_hint TEXT NOT NULL,
+    models TEXT NOT NULL, supports TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS store_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 """
 
@@ -48,6 +56,9 @@ class Store:
         "invites": (("nonce",), ("note",)),
         "outbox": (("nonce",), ("frame", "refused")),
         "tasks": (("task_hash", "role", "peer"), ("spec", "output", "verdict")),
+        "agent_messages": (("mid",), ("text", "want", "refs", "budget", "harness")),
+        "agent_cards": (("person",), ("display_name", "offers", "intents", "paid", "price_hint",
+                                          "models", "supports", "updated_at")),
     }
 
     def __init__(self, state_dir: Path, data_key: bytes):
@@ -480,6 +491,106 @@ class Store:
             row.update(source="nakshatra", trust="external")
             out.append(row)
         return out
+
+    # M1 agent conversations. Peer-controlled received rows are returned with trust=external; sent
+    # rows are the local node's own record of what it queued.
+    _AGENT_COLS = ("id", "mid", "peer", "direction", "thread", "intent", "reply_to", "expires",
+                   "text", "want", "refs", "budget", "harness", "created")
+
+    def add_agent_message(self, body: dict, peer: str, direction: str, *, created: Optional[int] = None) -> bool:
+        if direction not in {"in", "out"}:
+            raise ValueError("agent message direction must be in or out")
+        mid = body["mid"]
+        primary_key = self._pk((mid,))
+        values = {
+            "text": body["text"], "want": body.get("want"),
+            "refs": json.dumps(body["refs"], separators=(",", ":")) if "refs" in body else None,
+            "budget": json.dumps(body["budget"], separators=(",", ":")) if "budget" in body else None,
+            "harness": body.get("harness"),
+        }
+        try:
+            self._q("INSERT INTO agent_messages (mid,peer,direction,thread,intent,reply_to,expires,text,want,refs,"
+                    "budget,harness,created) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (mid, peer, direction, body["thread"], body["intent"], body["reply_to"],
+                     body.get("expires"), *(self._enc("agent_messages", key, primary_key, value)
+                                            for key, value in values.items()),
+                     int(created if created is not None else time.time())))
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+    def agent_mid_known(self, thread: str, mid: str) -> bool:
+        return bool(self._q("SELECT 1 FROM agent_messages WHERE thread=? AND mid=?", (thread, mid)))
+
+    def _agent_row(self, values) -> dict:
+        row = dict(zip(self._AGENT_COLS, values))
+        primary_key = self._pk((row["mid"],))
+        for column in ("text", "want", "refs", "budget", "harness"):
+            row[column] = self._dec("agent_messages", column, primary_key, row[column])
+        for column in ("refs", "budget"):
+            row[column] = json.loads(row[column]) if row[column] is not None else None
+        row.pop("id", None)
+        row["trust"] = "external" if row["direction"] == "in" else "local"
+        return row
+
+    def agent_threads(self) -> list:
+        rows = self._q(f"SELECT {', '.join(self._AGENT_COLS)} FROM agent_messages ORDER BY created, id")
+        grouped = {}
+        for values in rows:
+            row = self._agent_row(values)
+            summary = grouped.setdefault(row["thread"], {"thread": row["thread"], "contact": row["peer"],
+                                                          "count": 0})
+            summary.update(contact=row["peer"], last_intent=row["intent"], last_time=row["created"],
+                           unread=row["direction"] == "in")
+            summary["count"] += 1
+        return sorted(grouped.values(), key=lambda row: (row["last_time"], row["thread"]), reverse=True)
+
+    def agent_thread(self, prefix: str) -> tuple[str, list]:
+        if not isinstance(prefix, str) or not prefix:
+            raise ValueError("thread id or prefix is required")
+        matches = [row[0] for row in self._q(
+            "SELECT DISTINCT thread FROM agent_messages WHERE thread LIKE ? ORDER BY thread", (prefix + "%",))]
+        if not matches:
+            raise ValueError("no such thread")
+        if len(matches) > 1:
+            raise ValueError("thread prefix is ambiguous")
+        thread = matches[0]
+        rows = self._q(f"SELECT {', '.join(self._AGENT_COLS)} FROM agent_messages "
+                       "WHERE thread=? ORDER BY created, id", (thread,))
+        return thread, [self._agent_row(row) for row in rows]
+
+    # Contact cards are encrypted in their entirety. ``person`` is the row key: the local person's
+    # key denotes their own card, while contact person keys denote received cards.
+    _CARD_FIELDS = ("display_name", "offers", "intents", "paid", "price_hint", "models", "supports",
+                    "updated_at")
+
+    def set_agent_card(self, person: str, card: dict) -> bool:
+        existing = self.agent_card(person)
+        if existing and existing["updated_at"] >= card["updated_at"]:
+            return False
+        primary_key = self._pk((person,))
+        encoded = {
+            key: json.dumps(card[key], separators=(",", ":")) if key in {"intents", "paid", "models", "supports",
+                                                                            "updated_at"} else card[key]
+            for key in self._CARD_FIELDS
+        }
+        values = [self._enc("agent_cards", key, primary_key, encoded[key]) for key in self._CARD_FIELDS]
+        self._q("INSERT INTO agent_cards (person,display_name,offers,intents,paid,price_hint,models,supports,updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(person) DO UPDATE SET " +
+                ",".join(f"{key}=excluded.{key}" for key in self._CARD_FIELDS), (person, *values))
+        return True
+
+    def agent_card(self, person: str) -> Optional[dict]:
+        rows = self._q("SELECT display_name,offers,intents,paid,price_hint,models,supports,updated_at "
+                       "FROM agent_cards WHERE person=?", (person,))
+        if not rows:
+            return None
+        primary_key = self._pk((person,))
+        row = {key: self._dec("agent_cards", key, primary_key, value)
+               for key, value in zip(self._CARD_FIELDS, rows[0])}
+        for key in ("intents", "paid", "models", "supports", "updated_at"):
+            row[key] = json.loads(row[key])
+        return row
 
     # tasks: one row per (task, my role, counterparty). Poster rows use peer "" (the assignee is a
     # column); worker rows use the poster's person key as peer. Every transition is compare-and-set.
