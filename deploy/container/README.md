@@ -88,7 +88,8 @@ supervisor/control files, together with the selected variant and base image. If 
 `<image>-prev`, builds the replacement before removing any container, and recreates a container
 that still uses the older image ID. `nakc update` does this host image step first and then runs the
 signed in-container release updater. Image rebuild and container recreation happen only on an
-explicit host `nakc start` or `nakc update`, never from the hourly in-container updater.
+explicit host `nakc` command that starts the container (`start`, `update`, `join`, `share`,
+`gateway on/off`, `worker on/off`), never from the hourly in-container updater.
 
 `NAKC_IMAGE` remains an externally managed prebuilt-image override: it is not rebuilt merely
 because it has no Nakshatra fingerprint label. Set `NAKC_MANAGE_IMAGE=1` to opt a custom image into
