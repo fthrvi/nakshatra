@@ -167,3 +167,41 @@ def test_grant_renew_has_no_daemon_updater_supervisor_timer_or_mcp_entrypoint():
     assert nak_source.count("_grant_renew(") == 2       # definition + explicit CLI dispatch
     mcp_source = (_REPO / "scripts" / "network" / "nak_mcp.py").read_text()
     assert "nak_grant_renew" not in mcp_source
+
+
+def test_grant_renew_sets_spend_caps_only_when_named(tmp_path, monkeypatch, capsys):
+    _state, key_path, grant_path = _temporary_identity(tmp_path, monkeypatch)
+    before_key = key_path.read_bytes()
+    before = json.loads(grant_path.read_text())
+    assert nak.main(["grant", "renew", "--yes"]) == 0
+    assert json.loads(grant_path.read_text()).get("constraints") == before.get("constraints")
+
+    assert nak.main(["grant", "renew", "--yes", "--caps", "nak.msg,nak.pay,nak.task.claim",
+                     "--per-tx-cap", "500", "--day-cap", "2000"]) == 0
+    after = json.loads(grant_path.read_text())
+    assert key_path.read_bytes() == before_key
+    assert after["constraints"]["per_tx_cap"] == 500 and after["constraints"]["day_cap"] == 2000
+    assert "nak.pay" in after["caps"]
+    assert "500 per payment, 2000 per day" in capsys.readouterr().out
+
+    assert nak.main(["grant", "renew", "--yes", "--day-cap", "3000"]) == 0
+    again = json.loads(grant_path.read_text())
+    assert again["constraints"]["per_tx_cap"] == 500 and again["constraints"]["day_cap"] == 3000
+
+
+@pytest.mark.parametrize("flag,value", [("--per-tx-cap", "-1"), ("--day-cap", str(10**14 + 1))])
+def test_grant_renew_refuses_out_of_range_caps_without_change(tmp_path, monkeypatch, flag, value):
+    _state, _key_path, grant_path = _temporary_identity(tmp_path, monkeypatch)
+    before = grant_path.read_bytes()
+    with pytest.raises(SystemExit, match="between 0 and"):
+        nak.main(["grant", "renew", "--yes", flag, value])
+    assert grant_path.read_bytes() == before
+
+
+def test_grant_renew_cap_change_without_person_key_changes_nothing(tmp_path, monkeypatch, capsys):
+    state, _key_path, grant_path = _temporary_identity(tmp_path, monkeypatch)
+    before = grant_path.read_bytes()
+    (Path.home() / ".sthambha" / "person-TEST.key").unlink()
+    assert nak.main(["grant", "renew", "--yes", "--per-tx-cap", "5"]) == 1
+    assert grant_path.read_bytes() == before
+    assert "Spend caps can only be changed" in capsys.readouterr().err

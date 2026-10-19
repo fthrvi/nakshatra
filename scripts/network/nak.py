@@ -1733,12 +1733,18 @@ def _delegate_reuse_command(state: Path, person_key: Path, agent: str, caps: lis
             " --caps " + shlex.quote(",".join(caps)) + f" --ttl {ttl_days * 86400} --reuse-key")
 
 
+MAX_SPEND_CAP = 10**14   # base units; 10^6 USDC-equivalent in credits, far above any devnet need
+
+
 def _grant_renew(args) -> int:
     """Human CLI boundary for re-signing one grant without rotating its agent key."""
     if not args.yes and not sys.stdin.isatty():
         raise SystemExit("nak grant renew is interactive-only; run it in a terminal or pass --yes explicitly")
     if not 1 <= args.ttl <= 365:
         raise SystemExit("--ttl must be between 1 and 365 days")
+    for flag, value in (("--per-tx-cap", args.per_tx_cap), ("--day-cap", args.day_cap)):
+        if value is not None and not 0 <= value <= MAX_SPEND_CAP:
+            raise SystemExit(f"{flag} must be between 0 and {MAX_SPEND_CAP} base units")
     signer_dir, _net_dir, agent = _grant_paths()
     from sthambha import signer as signer_mod
     try:
@@ -1778,9 +1784,19 @@ def _grant_renew_confined(args, signer_dir: Path, agent: str, signer_mod, agent_
     constraints = current.get("constraints") or {}
     if not isinstance(constraints, dict):
         raise SystemExit("the current grant has malformed constraints; refusing renewal")
+    constraints = dict(constraints)
+    cap_changes = []
+    for name, value in (("per_tx_cap", args.per_tx_cap), ("day_cap", args.day_cap)):
+        if value is not None and constraints.get(name) != value:
+            cap_changes.append(f"{name} {constraints.get(name, 0)} -> {value}")
+            constraints[name] = value
     person_key = Path.home() / ".sthambha" / "person-TEST.key"
     fallback = _delegate_reuse_command(signer_dir, person_key, agent, caps, args.ttl)
     if not person_key.is_file():
+        if cap_changes:
+            print(f"person key is not available at {person_key}; the grant was not changed.\n"
+                  "Spend caps can only be changed where the person key is available.", file=sys.stderr)
+            return 1
         print(f"person key is not available at {person_key}; the grant was not changed.\n"
               "Run this human delegation command where the person key and signer state are available:\n"
               f"  {fallback}", file=sys.stderr)
@@ -1788,6 +1804,8 @@ def _grant_renew_confined(args, signer_dir: Path, agent: str, signer_mod, agent_
     if not args.yes:
         widening = sorted(set(caps) - set(current_caps))
         detail = f"; explicitly adding {','.join(widening)}" if widening else ""
+        if cap_changes:
+            detail += f"; spend caps {', '.join(cap_changes)}"
         answer = input(f"Renew agent {agent!r} for {args.ttl} days with caps {','.join(caps)}{detail}? [y/N] ")
         if answer.strip().lower() not in {"y", "yes"}:
             print("grant unchanged")
@@ -1801,6 +1819,9 @@ def _grant_renew_confined(args, signer_dir: Path, agent: str, signer_mod, agent_
     renewed = signer_mod.issue_grant(person_priv, agent, agent_pub, caps, node=current["node"],
                                      ttl_s=args.ttl * 86400, constraints=constraints)
     agent_files.write_grant(renewed)
+    if cap_changes:
+        print(f"spend caps now {renewed['constraints'].get('per_tx_cap', 0)} per payment, "
+              f"{renewed['constraints'].get('day_cap', 0)} per day (base units)")
     print(f"renewed agent {agent} with caps {','.join(renewed['caps'])} through "
           f"{time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(renewed['expires_at']))} "
           f"(grant {renewed['grant_id']}); signer reload is automatic")
@@ -1836,6 +1857,10 @@ def main(argv=None, *, http_post=None) -> int:
     q = gsub.add_parser("renew", help="human-only renewal that preserves the existing agent key")
     q.add_argument("--ttl", type=int, default=90, metavar="DAYS", help="renewal lifetime in days (1-365)")
     q.add_argument("--caps", help="explicit comma-separated cap set; omitted preserves current caps")
+    q.add_argument("--per-tx-cap", type=int, default=None, metavar="N",
+                   help="set the agent's nak.pay limit per payment (base units); omitted preserves it")
+    q.add_argument("--day-cap", type=int, default=None, metavar="N",
+                   help="set the agent's nak.pay limit per day (base units); omitted preserves it")
     q.add_argument("--yes", action="store_true", help="confirm explicitly when stdin is not a terminal")
     p = sub.add_parser("invite"); p.add_argument("--person-key", type=Path,
                                                  default=Path.home() / ".sthambha" / "person-TEST.key")
