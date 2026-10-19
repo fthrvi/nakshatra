@@ -2,14 +2,21 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import io
 import json
+import re
+import threading
 import time
+import urllib.error
 import urllib.parse
 
 import pytest
 
-from network.settle import NeuronEscrowAdapter, SettlementError
+import nakshatra_auth
+from network import settle as settle_mod
+from network.settle import (HoldConflict, HoldNotFound, InsufficientFunds, NeuronEscrowAdapter,
+                            SettlementError)
 from test_nakd import _connect, _worker_row, net, wait  # noqa: F401 - net is a fixture
 
 
@@ -26,6 +33,7 @@ class FakeTaskLedger:
         self.initial = 0
         self.transitions = []
         self.fail_pay = False
+        self.fail_authorize = False
         self.status_override = None
 
     def fund(self, keyid, amount):
@@ -38,6 +46,8 @@ class FakeTaskLedger:
         assert sum(self.balances.values()) + held == self.initial
 
     def authorize(self, payer, task_hash, worker, amount, deadline):
+        if self.fail_authorize:
+            raise SettlementError("ledger down")
         terms = (task_hash, worker, amount, deadline)
         prior = self.nonces.get((payer, task_hash))
         if prior:
@@ -134,13 +144,83 @@ class FakeNeuronAdapter:
         return []
 
 
-def _pair(net, *, paid_card=True, suffix=""):
+class _Response(io.BytesIO):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        self.close()
+
+
+class ReplayLedgerHTTP:
+    """HTTP face of FakeTaskLedger that behaves like the real ledger_auth: it verifies the Ed25519
+    signature and rejects a signature it has seen before (sha256(signature) is the nonce) with 401."""
+
+    def __init__(self, ledger):
+        self.ledger = ledger
+        self.seen = set()
+        self.timestamps = []
+        self.lock = threading.Lock()
+
+    def _fail(self, request, code):
+        return urllib.error.HTTPError(request.full_url, code, "refused", {}, io.BytesIO(b"{}"))
+
+    def __call__(self, request, timeout=None, expected_spki_hash=None):
+        match = re.fullmatch(r'\S+ keyid="([0-9a-f]{64})",sig="([^"]+)",ts="(\d+)"',
+                             request.headers["Authorization"])
+        parts = urllib.parse.urlsplit(request.full_url)
+        path = parts.path + ("?" + parts.query if parts.query else "")
+        body = request.data or b""
+        keyid, sig, ts = match.group(1), match.group(2), int(match.group(3))
+        if not nakshatra_auth.verify_request(keyid, request.method, path, body, ts, sig):
+            raise self._fail(request, 401)
+        nonce = hashlib.sha256(sig.encode()).hexdigest()
+        with self.lock:
+            if nonce in self.seen:
+                raise self._fail(request, 401)
+            self.seen.add(nonce)
+            self.timestamps.append(ts)
+        ledger = self.ledger
+        try:
+            if parts.path == "/spend/task/authorize":
+                b = json.loads(body)
+                row = ledger.authorize(keyid, b["task_hash"], b["worker_keyid"], b["amount"], b["deadline"])
+            elif parts.path == "/spend/task/pay":
+                row = ledger.pay(keyid, json.loads(body)["hold_id"])
+            elif parts.path == "/spend/task/refund":
+                b = json.loads(body)
+                row = ledger.refund(keyid, b["hold_id"], b["reason"])
+            else:
+                hold_id = urllib.parse.parse_qs(parts.query)["hold_id"][0]
+                return _Response(json.dumps(ledger.status(keyid, hold_id)).encode())
+        except SettlementError as e:
+            text = str(e)
+            raise self._fail(request, 402 if "insufficient" in text else 404 if "not found" in text
+                             else 409)
+        row = {k: row[k] for k in ("v", "hold_id", "task_hash", "worker_keyid", "amount",
+                                   "deadline", "state")}
+        return _Response(json.dumps(row).encode())
+
+
+def _real_adapter(party, http):
+    return NeuronEscrowAdapter("https://ledger.test", "ab" * 32, party.node_key, party.node.node,
+                               opener=http)
+
+
+def _pair(net, *, paid_card=True, suffix="", real=False):
     poster = net("poster" + suffix, caps=("nak.msg", "nak.task.post", "nak.pay"), constraints=PAY)
     worker = net("worker" + suffix, caps=("nak.msg", "nak.task.claim"))
     ledger = FakeTaskLedger()
+    poster.ledger = ledger
     ledger.fund(poster.node.node, 100)
-    poster.node.settle = FakeNeuronAdapter(ledger, poster.node.node)
-    worker.node.settle = FakeNeuronAdapter(ledger, worker.node.node)
+    if real:
+        http = ReplayLedgerHTTP(ledger)
+        ledger.http = http
+        poster.node.settle = _real_adapter(poster, http)
+        worker.node.settle = _real_adapter(worker, http)
+    else:
+        poster.node.settle = FakeNeuronAdapter(ledger, poster.node.node)
+        worker.node.settle = FakeNeuronAdapter(ledger, worker.node.node)
     _connect(net, poster, worker)
     if paid_card:
         worker.node.card_set("Worker", "paid tasks", paid=True)
@@ -154,10 +234,13 @@ def _assign(poster, worker, reward=5, deadline_s=600):
         worker.dir.name, "drill", "Say ok.", [{"contains_all": ["ok"]}],
         reward=reward, deadline_s=deadline_s)
     task_hash = result["task_hash"]
-    assert result["escrow"] is None and not poster.node.settle.ledger.holds
+    assert result["escrow"] is None and not poster.ledger.holds
     assert wait(lambda: _worker_row(worker.node, task_hash))
     worker.node.claim_task(task_hash)
     assert wait(lambda: _worker_row(worker.node, task_hash)[0]["state"] == "assigned")
+    # the worker verifies the hold right after it records the assignment; wait for that verdict
+    assert wait(lambda: (_worker_row(worker.node, task_hash)[0]["funding_state"] == "funded"
+                         or _worker_row(worker.node, task_hash)[0]["funding_reason"]))
     return task_hash
 
 
@@ -244,14 +327,6 @@ def test_unpaid_contact_cannot_be_assigned_and_over_cap_opens_no_hold(net):
     assert ledger.holds == {}
 
 
-class _Response(io.BytesIO):
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_args):
-        self.close()
-
-
 def test_real_neuron_adapter_uses_contract_routes_and_signed_query_path():
     task_hash, worker = "12" * 32, "34" * 32
     hold = {"v": 1, "hold_id": "h-1", "task_hash": task_hash, "worker_keyid": worker,
@@ -290,3 +365,191 @@ def test_real_neuron_adapter_refuses_non_https_unpinned_or_fail_open():
     with pytest.raises(SettlementError, match="enforce"):
         NeuronEscrowAdapter("https://ledger.test", "ab" * 32, b"k" * 32, "56" * 32,
                             mode="fail-open")
+
+
+def _paid_forgery(poster, worker, keyid, *, paid=True):
+    """Store a card for `worker` on the poster directly (as if it had been accepted)."""
+    previous = poster.node.store.agent_card(worker.person_pub) or {}
+    card = {"display_name": "Worker", "offers": "paid tasks", "intents": [], "paid": paid,
+            "price_hint": "", "models": [], "supports": [], "ledger_keyid": keyid,
+            "updated_at": int(previous.get("updated_at", 0)) + 100}
+    assert poster.node.store.set_agent_card(worker.person_pub, card)
+
+
+def _post_and_claim(poster, worker, reward=5):
+    task_hash = poster.node.post_task(
+        worker.dir.name, "drill", "Say ok.", [{"contains_all": ["ok"]}], reward=reward)["task_hash"]
+    assert wait(lambda: _worker_row(worker.node, task_hash))
+    worker.node.claim_task(task_hash)
+    return task_hash
+
+
+def test_adapter_never_signs_the_same_second_twice():
+    ledger = FakeTaskLedger()
+    http = ReplayLedgerHTTP(ledger)
+    # the fake ledger verifies signatures, so sign with a real key
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+    key = ed25519.Ed25519PrivateKey.generate()
+    keyid = key.public_key().public_bytes_raw().hex()
+    ledger.fund(keyid, 100)
+    adapter = NeuronEscrowAdapter("https://ledger.test", "ab" * 32, key.private_bytes_raw(), keyid,
+                                  opener=http)
+    th, worker = "12" * 32, "34" * 32
+    auth = {"task_hash": th, "amount": 7, "mint": "credits"}
+    adapter.open(th, "p", 7, "credits", int(time.time()) + 600, auth, worker_keyid=worker)
+    for _ in range(6):                                   # rapid identical status calls
+        assert adapter.status(th)["state"] == "open"
+    assert adapter.release(th, "w")["event"] == "released"
+    assert adapter.status(th)["state"] == "released"
+    assert http.timestamps == sorted(set(http.timestamps)) and len(http.timestamps) == 9
+
+
+def test_two_adapters_same_key_same_second_retry_once_on_401(monkeypatch):
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+    monkeypatch.setattr(settle_mod.time, "time", lambda: 1_800_000_000.0)
+    ledger = FakeTaskLedger()
+    key = ed25519.Ed25519PrivateKey.generate()
+    keyid = key.public_key().public_bytes_raw().hex()
+    ledger.fund(keyid, 100)
+    http = ReplayLedgerHTTP(ledger)
+    th = "12" * 32
+    auth = {"task_hash": th, "amount": 7, "mint": "credits"}
+    first = NeuronEscrowAdapter("https://ledger.test", "ab" * 32, key.private_bytes_raw(), keyid, opener=http)
+    first.open(th, "p", 7, "credits", 1_800_000_900, auth, worker_keyid="34" * 32)
+    other = NeuronEscrowAdapter("https://ledger.test", "ab" * 32, key.private_bytes_raw(), keyid, opener=http)
+    hold = next(iter(ledger.holds))
+    assert first.status(th)["state"] == "open"           # first adapter: ts 1_800_000_001
+    assert other.status(th, hold_id=hold)["state"] == "open"   # same ts as the first's first call -> 401 -> retry
+    assert len(http.timestamps) == 3
+
+
+def test_adapter_gives_up_after_one_401_retry():
+    def always_401(request, **_kwargs):
+        raise urllib.error.HTTPError(request.full_url, 401, "no", {}, io.BytesIO(b"{}"))
+    calls = []
+    adapter = NeuronEscrowAdapter("https://ledger.test", "ab" * 32, b"k" * 32, "56" * 32,
+                                  opener=lambda r, **k: (calls.append(1), always_401(r))[1])
+    with pytest.raises(SettlementError, match="HTTP 401"):
+        adapter.status("12" * 32, hold_id="h")
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("code,exc", [(402, InsufficientFunds), (404, HoldNotFound), (409, HoldConflict)])
+def test_adapter_maps_ledger_statuses_to_distinct_errors(code, exc):
+    def refuse(request, **_kwargs):
+        raise urllib.error.HTTPError(request.full_url, code, "no", {}, io.BytesIO(b"{}"))
+    adapter = NeuronEscrowAdapter("https://ledger.test", "ab" * 32, b"k" * 32, "56" * 32, opener=refuse)
+    with pytest.raises(exc) as caught:
+        adapter.refund("12" * 32, "why", hold_id="h")
+    assert caught.value.status == code and isinstance(caught.value, SettlementError)
+
+
+def test_verify_at_assign_then_immediate_submit_and_status_against_replay_ledger(net):
+    poster, worker, ledger = _pair(net, real=True)
+    task_hash = _assign(poster, worker)
+    assert wait(lambda: _worker_row(worker.node, task_hash)[0]["funding_state"] == "funded")
+    worker.node.submit_task(task_hash, "ok")             # immediately: its own status call, same second
+    assert wait(lambda: _worker_row(worker.node, task_hash)[0]["funding_state"] == "paid")
+    assert poster.node.reconcile_escrow() == 0
+    assert poster.node.escrow_status(task_hash)["funding"] == "paid"
+    assert poster.node.escrow_status(task_hash)["funding"] == "paid"
+    assert [event for _hold, event in ledger.transitions] == ["open", "paid"]
+    assert ledger.http.timestamps
+
+
+def test_forged_ledger_keyid_card_is_refused_and_stores_nothing(net):
+    poster, worker, ledger = _pair(net, paid_card=False)
+    worker.node.card_set("Worker", "paid tasks", paid=True)
+    assert wait(lambda: poster.node.store.agent_card(worker.person_pub) is not None)
+    honest = poster.node.store.agent_card(worker.person_pub)
+    assert honest["ledger_keyid"] == worker.node.node
+    # now the worker's agent publishes a newer card naming a different ledger key
+    forged = dict(worker.node.store.agent_card(worker.node.person), ledger_keyid="ee" * 32)
+    forged["updated_at"] += 50
+    worker.node.store.set_agent_card(worker.node.person, forged)
+    worker.node._send_card_if_set(poster.person_pub)
+    assert wait(lambda: any(row["refused"] for row in worker.node.store.outbox()))
+    assert poster.node.store.agent_card(worker.person_pub)["ledger_keyid"] == worker.node.node
+
+
+def test_assign_refuses_a_card_keyid_that_is_not_the_contacts_node_and_opens_no_hold(net):
+    poster, worker, ledger = _pair(net)
+    _paid_forgery(poster, worker, "ee" * 32)
+    task_hash = _post_and_claim(poster, worker)
+    assert wait(lambda: any(row["refused"] for row in worker.node.store.outbox()))
+    assert poster.node.store.task_get(task_hash, "poster")["state"] == "posted"
+    assert ledger.holds == {}
+
+
+def test_assign_requires_the_card_to_say_paid_even_with_a_ledger_key(net):
+    poster, worker, ledger = _pair(net)
+    _paid_forgery(poster, worker, worker.node.node, paid=False)
+    task_hash = _post_and_claim(poster, worker)
+    assert wait(lambda: any(row["refused"] for row in worker.node.store.outbox()))
+    assert poster.node.store.task_get(task_hash, "poster")["state"] == "posted"
+    assert ledger.holds == {}
+
+
+def test_loser_of_a_claim_race_gets_the_clean_reject_and_no_hold(net):
+    poster = net("poster", caps=("nak.msg", "nak.task.post", "nak.pay"), constraints=PAY)
+    w1 = net("w1", caps=("nak.msg", "nak.task.claim"))
+    w2 = net("w2", caps=("nak.msg", "nak.task.claim"))
+    ledger = FakeTaskLedger()
+    ledger.fund(poster.node.node, 100)
+    for party in (poster, w1, w2):
+        party.node.settle = FakeNeuronAdapter(ledger, party.node.node)
+    for worker in (w1, w2):
+        _connect(net, poster, worker)
+        worker.node.card_set("W", "paid tasks", paid=True)
+        assert wait(lambda w=worker: (poster.node.store.agent_card(w.person_pub) or {}).get("paid") is True)
+    task_hash = poster.node.post_task(["w1", "w2"], "drill", "Say ok.", [{"contains_all": ["ok"]}],
+                                      reward=5)["task_hash"]
+    assert wait(lambda: _worker_row(w1.node, task_hash) and _worker_row(w2.node, task_hash))
+    w1.node.claim_task(task_hash)
+    assert wait(lambda: _worker_row(w1.node, task_hash)[0]["state"] == "assigned")
+    w2.node.claim_task(task_hash)
+    assert wait(lambda: _worker_row(w2.node, task_hash)[0]["state"] != "claimed")
+    assert not any(row["refused"] for row in w2.node.store.outbox())     # a reject, not a nack
+    assert len(ledger.holds) == 1 and next(iter(ledger.holds.values()))["worker_keyid"] == w1.node.node
+    assert poster.node.store.task_get(task_hash, "poster")["assignee"] == w1.person_pub
+
+
+def test_failed_authorize_after_the_cas_puts_the_task_back_for_a_retry(net):
+    poster, worker, ledger = _pair(net)
+    ledger.fail_authorize = True
+    task_hash = _post_and_claim(poster, worker)
+    assert wait(lambda: any(row["refused"] for row in worker.node.store.outbox()))
+    row = poster.node.store.task_get(task_hash, "poster")
+    assert row["state"] == "posted" and not row["assignee"] and not row["hold_id"]
+    assert ledger.holds == {}
+    ledger.fail_authorize = False                       # the same worker claims again: clean assignment
+    worker.node.store.task_cas(task_hash, "worker", poster.person_pub, ("claimed",), state="offered")
+    worker.node.claim_task(task_hash)
+    assert wait(lambda: _worker_row(worker.node, task_hash)[0]["state"] == "assigned")
+    row = poster.node.store.task_get(task_hash, "poster")
+    assert row["hold_id"] and row["funding_state"] == "funded" and len(ledger.holds) == 1
+
+
+def test_worker_refuses_a_hold_that_expires_before_the_task_deadline(net):
+    poster, worker, ledger = _pair(net)
+    ledger.status_override = {"deadline": int(time.time()) + 30}
+    task_hash = _assign(poster, worker)
+    row = _worker_row(worker.node, task_hash)[0]
+    assert row["funding_state"] == "unfunded" and "deadline" in row["funding_reason"]
+
+
+def test_reconcile_adopts_the_ledgers_terminal_state_on_409(net):
+    poster, worker, ledger = _pair(net)
+    task_hash = _assign(poster, worker)
+    hold = next(iter(ledger.holds.values()))
+    worker.node.submit_task(task_hash, "ok")
+    assert wait(lambda: _worker_row(worker.node, task_hash)[0]["funding_state"] == "paid")
+    # strand it: the ledger swept the hold to refunded behind the poster's back, poster still pending
+    poster.node.store.task_cas(task_hash, "poster", "", ("accepted",), funding_state="pending",
+                               funding_reason="x")
+    hold["state"] = "refunded"
+    ledger.balances[poster.node.node] += hold["amount"]
+    ledger.balances[worker.node.node] -= hold["amount"]
+    assert poster.node.reconcile_escrow() == 1
+    assert poster.node.store.task_get(task_hash, "poster")["funding_state"] == "refunded"
+    assert poster.node.reconcile_escrow() == 0

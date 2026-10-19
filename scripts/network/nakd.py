@@ -849,6 +849,9 @@ class Node:
             return {"t": "nack", "mid": mid, "why": "connection not accepted yet"}
         if kind == "contact.card":
             card_body = validate_card(body)
+            if card_body.get("ledger_keyid") and card_body["ledger_keyid"] != c["node"]:
+                self.log(f"refused card from {c['petname'] or person[:12]}: ledger_keyid is not its node key")
+                return {"t": "nack", "mid": mid, "why": "card ledger_keyid is not this contact's node key"}
             if self.store.first_time(mid):
                 self.store.raw_log({"received": int(time.time()), "source": "nakshatra", "trust": "external",
                                     "from_person": person, "envelope": env, "body": body})
@@ -1068,6 +1071,10 @@ class Node:
                     t["task_hash"], t["spec"], "release" if desired == "released" else "refund",
                     party=t["assignee"] or "", reason=t["state"], hold_id=t["hold_id"] or "")
                 if receipt and receipt.get("error"):
+                    if not self._adopt_terminal(t):
+                        continue
+                    receipt = None
+                    fixed += 1
                     continue
             elif st and st["state"] == desired and self.settle.open_on_assign:
                 self._set_funding(t["task_hash"], "poster", "",
@@ -1077,6 +1084,8 @@ class Node:
                            "task_hash": t["task_hash"], "hold_id": t["hold_id"],
                            "amount": st["amount"], "unit": st.get("unit", "credits")}
             else:
+                if st and st["state"] in ("released", "refunded") and self._adopt_terminal(t):
+                    fixed += 1
                 continue
             fixed += 1
             if self.settle.open_on_assign and t["assignee"] and receipt:
@@ -1088,6 +1097,23 @@ class Node:
                             {"task_hash": t["task_hash"], "epoch": t["epoch"], **verdict})
             self.log(f"reconciled stranded escrow for {t['task_hash'][:12]} ({t['state']})")
         return fixed
+
+    def _adopt_terminal(self, t: dict) -> bool:
+        """The ledger refused our release/refund with 409 (the hold already reached the other terminal
+        state, e.g. its own expiry sweep refunded it). Re-read it and record what the ledger says."""
+        if not self.settle.open_on_assign:
+            return False
+        try:
+            st = self.settle.status(t["task_hash"], hold_id=t["hold_id"] or "")
+        except SettlementError as e:
+            self.log(f"escrow status for {t['task_hash'][:12]} unavailable: {e}")
+            return False
+        if not st or st.get("state") not in ("released", "refunded"):
+            return False
+        self._set_funding(t["task_hash"], "poster", "",
+                          "paid" if st["state"] == "released" else "refunded")
+        self.log(f"adopted ledger state {st['state']} for {t['task_hash'][:12]} ({t['state']})")
+        return True
 
     def sweep(self, now: Optional[float] = None) -> int:
         """Expire tasks whose deadline passed without an accepted result: refund the poster's escrow and
@@ -1163,6 +1189,8 @@ class Node:
                     reason = "task hold amount does not match the reward"
                 elif status.get("task_hash") != task["task_hash"]:
                     reason = "task hold is bound to another task"
+                elif status.get("deadline", 0) < task["spec"]["deadline"]:
+                    reason = "task hold expires before the task deadline"
         self._set_funding(task["task_hash"], "worker", task["peer"],
                           "unfunded" if reason else "funded", reason)
         return not reason
@@ -1227,27 +1255,58 @@ class Node:
             # Check before changing assignment state so a local grant problem cannot produce a nack
             # after the protocol step has already committed.
             self._require_grant("task.assign")
-            hold_id = ""
-            if t["spec"]["reward"]["amount"] > 0 and self.settle.open_on_assign:
-                card = self.store.agent_card(c["person"])
-                if not card or card.get("paid") is not True or not card.get("ledger_keyid"):
-                    raise ValueError("paid task assignment requires the contact's paid card and ledger key")
-                receipt = self._open_escrow(
-                    h, t["spec"], authorisation=t["escrow_auth"],
-                    worker_keyid=card["ledger_keyid"])
-                hold_id = receipt["hold_id"]
-            fields = {"state": "assigned", "assignee": c["person"], "epoch": 1}
-            if hold_id:
-                fields.update(hold_id=hold_id, funding_state="funded", funding_reason="")
-            if self.store.task_cas(h, "poster", "", ("posted",), **fields):
-                assign = {"task_hash": h, "epoch": 1, "worker": c["person"]}
-                if hold_id:
-                    assign["hold_id"] = hold_id
-                self._queue(c["person"], "task.assign", assign)
-                self.log(f"task {h[:12]} assigned to {who}")
-            elif t["assignee"] != c["person"]:
-                self._queue(c["person"], "task.reject", {"task_hash": h, "epoch": 0,
-                                                         "reasons": ["already assigned to someone else"]})
+            paid = t["spec"]["reward"]["amount"] > 0 and self.settle.open_on_assign
+            if not paid:
+                if self.store.task_cas(h, "poster", "", ("posted",), state="assigned",
+                                       assignee=c["person"], epoch=1):
+                    self._queue(c["person"], "task.assign", {"task_hash": h, "epoch": 1, "worker": c["person"]})
+                    self.log(f"task {h[:12]} assigned to {who}")
+                elif t["assignee"] != c["person"]:
+                    self._queue(c["person"], "task.reject", {"task_hash": h, "epoch": 0,
+                                                             "reasons": ["already assigned to someone else"]})
+                return
+            card = self.store.agent_card(c["person"])
+            if not card or card.get("paid") is not True or not card.get("ledger_keyid"):
+                raise ValueError("paid task assignment requires the contact's paid card and ledger key")
+            if card["ledger_keyid"] != c["node"]:
+                raise ValueError("the contact's card ledger key is not its node key")
+            # Winner selection FIRST (CAS posted -> assigned, funding pending, no hold yet): a losing
+            # claimant gets the clean reject and no hold is ever authorized for it. A claim replayed
+            # by the same assignee after a crash finds the task still assigned with no hold_id and
+            # re-runs the (idempotent) authorize, which returns the same hold.
+            won = self.store.task_cas(h, "poster", "", ("posted",), state="assigned",
+                                      assignee=c["person"], epoch=1,
+                                      funding_state="pending", funding_reason="opening task hold")
+            if not won:
+                cur = self.store.task_get(h, "poster", "")
+                if not (cur and cur["state"] == "assigned" and cur["assignee"] == c["person"]
+                        and not cur["hold_id"]):
+                    if not cur or cur["assignee"] != c["person"]:
+                        self._queue(c["person"], "task.reject", {"task_hash": h, "epoch": 0,
+                                                                 "reasons": ["already assigned to someone else"]})
+                    return
+            try:
+                receipt = self._open_escrow(h, t["spec"], authorisation=t["escrow_auth"],
+                                            worker_keyid=card["ledger_keyid"])
+            except ValueError:
+                # No hold exists, so put the task back where the poster (or another claimant) can
+                # retry it, or refund/expire it cleanly. Only while it is still our unfunded claim.
+                self.store.task_cas(h, "poster", "", ("assigned",), state="posted",
+                                    assignee=None, epoch=0, funding_state="unfunded", funding_reason="")
+                raise
+            hold_id = receipt["hold_id"]
+            # Record the hold durably BEFORE the assignment is sent or observed as funded.
+            if not self.store.task_cas(h, "poster", "", ("assigned",), hold_id=hold_id,
+                                       funding_state="funded", funding_reason=""):
+                # the task left `assigned` (expired) while the hold was opening: refund it now
+                try:
+                    self.settle.refund(h, "task no longer assigned", hold_id=hold_id)
+                except SettlementError as e:
+                    self.log(f"could not refund orphan hold for {h[:12]}: {e}")
+                return
+            self._queue(c["person"], "task.assign", {"task_hash": h, "epoch": 1, "worker": c["person"],
+                                                     "hold_id": hold_id})
+            self.log(f"task {h[:12]} assigned to {who}")
             return
         if kind == "task.assign":
             if body.get("worker") != self.person or not isinstance(body.get("epoch"), int):
