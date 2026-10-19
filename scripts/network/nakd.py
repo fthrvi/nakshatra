@@ -55,7 +55,7 @@ from network.agent import (AGENT_MSG_VERSION, CARD_SUPPORT, CARD_VERSION, INTENT
                            validate_agent_message, validate_card)  # noqa: E402
 from network.store import Store  # noqa: E402
 from network import tasks as T  # noqa: E402
-from network.settle import DEFINITIVE_STATUSES, SettlementError  # noqa: E402
+from network.settle import DEFINITIVE_STATUSES, HoldNotOpen, SettlementError  # noqa: E402
 import accounting as _accounting  # noqa: E402
 from transport.connect import (accept_direct, local_endpoints, open_channel, open_direct,  # noqa: E402
                                open_via_sidecar)
@@ -182,9 +182,11 @@ class EscrowRefused(ValueError):
     """Opening the escrow failed. `definitive` = the ledger answered with a refusal (no hold can
     exist); otherwise the outcome is unknown (timeout, 5xx, backlog) and a hold may exist."""
 
-    def __init__(self, message: str, definitive: bool = False):
+    def __init__(self, message: str, definitive: bool = False, hold: Optional[dict] = None,
+                 hold_state: str = ""):
         super().__init__(message)
         self.definitive = definitive
+        self.hold, self.hold_state = hold or {}, hold_state
 
 
 REOPENED = "task reopened: "     # nack prefix: the claim was refused AND the task is claimable again
@@ -1028,6 +1030,8 @@ class Node:
             return self.settle.open(h, self.person, amount, unit, spec["deadline"], authorisation,
                                     worker_keyid=worker_keyid)
         except SettlementError as e:
+            if isinstance(e, HoldNotOpen):      # a replayed authorize found the hold already terminal
+                raise EscrowRefused(f"escrow: {e}", definitive=True, hold=e.hold, hold_state=e.state)
             raise EscrowRefused(f"escrow: {e}", definitive=e.status in DEFINITIVE_STATUSES)
 
     def _set_funding(self, h: str, role: str, peer: str, state: str, reason: str = "") -> bool:
@@ -1092,6 +1096,13 @@ class Node:
                 self.store.task_cas(h, "poster", "", ("assigned",), funding_state="pending",
                                     funding_reason=str(e)[:200])
                 raise ValueError(f"escrow pending: {e}")
+            hold = e.hold
+            if (e.hold_state == "paid" and hold.get("task_hash") == h
+                    and hold.get("worker_keyid") == card["ledger_keyid"]
+                    and self.store.task_cas(h, "poster", "", ("assigned",), hold_id=hold["hold_id"],
+                                            funding_state="paid", funding_reason="")):
+                self.log(f"adopted ledger-paid hold for {h[:12]}")
+                raise ValueError(f"escrow already paid by the ledger: {e}")
             self.store.task_cas(h, "poster", "", ("assigned",), state="posted", assignee=None,
                                 epoch=0, funding_state="unfunded", funding_reason="")
             raise ValueError(REOPENED + str(e))

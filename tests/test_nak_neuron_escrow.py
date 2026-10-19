@@ -37,6 +37,8 @@ class FakeTaskLedger:
         self.refuse_authorize = 0        # HTTP status of a definitive refusal
         self.drop_response = False       # commit the hold, then lose the answer
         self.after_commit = None         # hook run after the hold commits (before the answer)
+        self.authorize_calls = 0
+        self.loose_replay = False        # replay returns the stored hold even if the terms differ
         self.lie_open_once = False       # one stale status read that still says open
         self.sweep_on_pay = False        # the ledger's own sweep refunds the hold as pay arrives
         self.status_override = None
@@ -51,6 +53,7 @@ class FakeTaskLedger:
         assert sum(self.balances.values()) + held == self.initial
 
     def authorize(self, payer, task_hash, worker, amount, deadline):
+        self.authorize_calls += 1
         if self.fail_authorize:
             raise SettlementError("ledger down")
         if self.refuse_authorize:
@@ -62,7 +65,10 @@ class FakeTaskLedger:
         if prior:
             hold = self.holds[prior]
             if (hold["task_hash"], hold["worker_keyid"], hold["amount"], hold["deadline"]) != terms:
-                raise SettlementError("idempotency conflict")
+                if not self.loose_replay:
+                    error = SettlementError("idempotency conflict")
+                    error.status = 409
+                    raise error
             return copy.deepcopy(hold)
         if self.balances.get(payer, 0) < amount:
             raise SettlementError("insufficient credits")
@@ -143,8 +149,11 @@ class FakeNeuronAdapter:
     def open(self, task_hash, _poster, amount, unit, deadline, authorisation, *, worker_keyid=""):
         assert unit == "credits"
         assert authorisation["task_hash"] == task_hash and authorisation["amount"] == amount
-        return self._receipt(
-            self.ledger.authorize(self.keyid, task_hash, worker_keyid, amount, deadline), "open")
+        row = self.ledger.authorize(self.keyid, task_hash, worker_keyid, amount, deadline)
+        if row["state"] != "open":                       # what the real adapter's _hold() raises
+            raise settle_mod.HoldNotOpen(f"Neuron task hold is {row['state']}, not open",
+                                         state=row["state"], hold=row)
+        return self._receipt(row, "open")
 
     def status(self, task_hash, *, hold_id=""):
         row = self.ledger.status(self.keyid, hold_id)
@@ -682,6 +691,72 @@ def test_a_401_is_not_retried_when_the_timestamp_is_already_ahead_of_the_clock(m
     with pytest.raises(SettlementError, match="HTTP 401"):
         adapter.status(th)
     assert len(sent) == 1
+
+
+def test_unrecorded_hold_refunded_by_the_ledger_reaches_posted_then_expired(net):
+    poster, worker, ledger = _pair(net)
+    ledger.drop_response = True
+    task_hash = poster.node.post_task(worker.dir.name, "drill", "Say ok.", [{"contains_all": ["ok"]}],
+                                      reward=5, deadline_s=2)["task_hash"]
+    assert wait(lambda: _worker_row(worker.node, task_hash))
+    worker.node.claim_task(task_hash)
+    assert wait(lambda: len(ledger.holds) == 1)
+    assert wait(lambda: poster.node.store.task_get(task_hash, "poster")["funding_reason"].startswith("escrow:"))
+    hold = next(iter(ledger.holds.values()))
+    ledger.refund(poster.node.node, hold["hold_id"], "ledger sweep")     # behind the poster's back
+    time.sleep(2.2)
+    poster.node.sweep()                                   # reconcile sees "refunded": definitive, revert
+    poster.node.sweep()                                   # now plain posted: expires
+    row = poster.node.store.task_get(task_hash, "poster")
+    assert row["state"] == "expired" and not row["hold_id"] and not row["assignee"]
+    worker.node.sweep()                                   # the worker side expires its own stale claim
+    assert _worker_row(worker.node, task_hash)[0]["state"] == "expired"
+    calls = ledger.authorize_calls
+    poster.node.sweep()
+    poster.node.reconcile_escrow()
+    assert ledger.authorize_calls == calls               # nothing left to retry
+    assert ledger.balances[poster.node.node] == 100
+
+
+def test_ledger_paid_hold_is_adopted_only_for_this_tasks_worker(net):
+    poster, worker, ledger = _pair(net)
+    ledger.drop_response = True
+    task_hash = _post_and_claim(poster, worker)
+    assert wait(lambda: len(ledger.holds) == 1)
+    assert wait(lambda: poster.node.store.task_get(task_hash, "poster")["funding_reason"].startswith("escrow:"))
+    hold = next(iter(ledger.holds.values()))
+    ledger.pay(poster.node.node, hold["hold_id"])
+    poster.node.reconcile_escrow()
+    row = poster.node.store.task_get(task_hash, "poster")
+    assert row["hold_id"] == hold["hold_id"] and row["funding_state"] == "paid"
+    # a paid hold naming someone else is never adopted: the task is put back instead
+    poster2, worker2, ledger2 = _pair(net, suffix="-x")
+    ledger2.drop_response = True
+    task2 = _post_and_claim(poster2, worker2)
+    assert wait(lambda: len(ledger2.holds) == 1)
+    assert wait(lambda: poster2.node.store.task_get(task2, "poster")["funding_reason"].startswith("escrow:"))
+    hold2 = next(iter(ledger2.holds.values()))
+    ledger2.pay(poster2.node.node, hold2["hold_id"])
+    hold2["worker_keyid"] = "ee" * 32
+    ledger2.loose_replay = True
+    poster2.node.reconcile_escrow()
+    row2 = poster2.node.store.task_get(task2, "poster")
+    assert row2["state"] == "posted" and not row2["hold_id"]
+
+
+def test_sweep_does_not_expire_an_assigned_paid_task_whose_hold_is_unrecorded(net):
+    poster, worker, ledger = _pair(net)
+    ledger.drop_response = True
+    task_hash = poster.node.post_task(worker.dir.name, "drill", "Say ok.", [{"contains_all": ["ok"]}],
+                                      reward=5, deadline_s=2)["task_hash"]
+    assert wait(lambda: _worker_row(worker.node, task_hash))
+    worker.node.claim_task(task_hash)
+    assert wait(lambda: len(ledger.holds) == 1)
+    assert wait(lambda: poster.node.store.task_get(task_hash, "poster")["funding_reason"].startswith("escrow:"))
+    time.sleep(2.2)
+    ledger.fail_authorize = True                          # recovery cannot run: the hold stays unknown
+    assert poster.node.sweep() == 0
+    assert poster.node.store.task_get(task_hash, "poster")["state"] == "assigned"
 
 
 def test_worker_refuses_a_hold_that_expires_before_the_task_deadline(net):

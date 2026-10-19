@@ -53,3 +53,14 @@ Review: rv2-m2.md. Suite (same command as round 1): round 1 302 passed / 10 fail
 | 4b `_adopt_terminal` in refused-release | New test: the ledger sweeps the hold as pay arrives and a stale status read still says open; reconcile's release is refused (409) and must adopt `refunded`. | `test_reconcile_adopts_the_ledgers_state_when_release_is_refused` (fails with the adopt call removed). |
 
 Side effect to note: a pending (unknown-outcome) claim is nacked to the worker as "escrow pending"; the worker row stays `claimed` and receives `task.assign` once reconcile records the hold.
+
+## Fix round 3
+
+Review: rv3-m2.md. Suite (same command): round 2 309 passed / 10 failed; round 3 312 passed / 10 failed (same 10 pre-existing failures).
+
+| Finding | Change | Proving test |
+|---|---|---|
+| 1 Unrecorded hold refunded/paid by the ledger stays pending forever | `settle.py` raises typed `HoldNotOpen(state, hold)` (a `SettlementError`) when a response carries a terminal state where `open` was expected. `_open_escrow` maps it to a definitive `EscrowRefused` carrying the hold. In `_open_assignment`: `refunded` reverts the task to `posted` (with the `task reopened:` nack on the claim path; the sweep then expires it normally, no hold means no further ledger calls); `paid` is adopted (`hold_id` recorded, funding `paid`) only if the hold's `task_hash` and `worker_keyid` match this task and its assignee's card key, otherwise the task is reverted. | `test_unrecorded_hold_refunded_by_the_ledger_reaches_posted_then_expired` (commit-then-drop, ledger refunds, sweep + reconcile: posted then expired, worker row expires on its own sweep, authorize call count unchanged by further sweeps), `test_ledger_paid_hold_is_adopted_only_for_this_tasks_worker` (adopt, and mismatched worker reverts). Forcing `definitive=False` or dropping the worker match fails them. |
+| Sweep-skip mutation | Direct test: with the recovery authorize failing, `sweep()` past the deadline expires nothing and the task stays `assigned`. | `test_sweep_does_not_expire_an_assigned_paid_task_whose_hold_is_unrecorded` (fails with the skip removed). |
+
+Note: on the reconcile/sweep path (no live claim to nack) the worker is not told the task reopened; its row expires on its own sweep. Not changed (nits in rv3): roster change mid-recovery orphan, one-slot-per-second throughput after a burst.

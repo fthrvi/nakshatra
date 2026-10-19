@@ -47,6 +47,15 @@ class HoldConflict(SettlementError):
     status = 409
 
 
+class HoldNotOpen(SettlementError):
+    """The ledger answered, and the hold is in a terminal state (`state`: paid|refunded). Definitive."""
+
+    def __init__(self, message: str, state: str = "", hold: Optional[dict] = None):
+        super().__init__(message)
+        self.state = state
+        self.hold = hold or {}
+
+
 class LedgerBusy(SettlementError):
     """Local, retryable: signing timestamps ran too far ahead of the clock; nothing was sent."""
 
@@ -263,7 +272,8 @@ class NeuronEscrowAdapter(SettlementAdapter):
         if expected_hold and value["hold_id"] != expected_hold:
             raise SettlementError("Neuron ledger returned a different task hold")
         if expected_state and value["state"] != expected_state:
-            raise SettlementError(f"Neuron task hold is {value['state']}, not {expected_state}")
+            raise HoldNotOpen(f"Neuron task hold is {value['state']}, not {expected_state}",
+                              state=value["state"], hold=value)
         return value
 
     @staticmethod
