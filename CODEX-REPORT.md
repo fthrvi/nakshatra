@@ -42,7 +42,7 @@ Test hygiene: `_assign` now waits for the worker's hold verdict (it previously r
 
 ## Fix round 2
 
-Review: rv2-m2.md. Suite (same command as round 1): round 1 302 passed / 10 failed; round 2 see below (same 10 pre-existing failures).
+Review: rv2-m2.md. Suite (same command as round 1): round 1 302 passed / 10 failed; round 2 309 passed / 10 failed (same 10 pre-existing failures).
 
 | Finding | Change | Proving test |
 |---|---|---|
