@@ -1869,6 +1869,7 @@ def main(argv=None, *, http_post=None) -> int:
     q.add_argument("--thread", default="")
     q.add_argument("--reply-to", default="")
     q.add_argument("--want", default=None)
+    q.add_argument("--budget", type=int, help="proposed credits (intent must be offer or ask)")
     sub.add_parser("threads", help="list typed agent-message threads")
     p = sub.add_parser("thread", help="show one typed agent-message thread")
     p.add_argument("thread")
@@ -1881,12 +1882,17 @@ def main(argv=None, *, http_post=None) -> int:
     q.add_argument("--intents", default="", help="comma-separated agent.msg intents (default: all)")
     q.add_argument("--models", default="", help="comma-separated model names")
     q.add_argument("--price-hint", default="")
+    q.add_argument("--paid", action="store_true",
+                   help="advertise paid work using this node's ledger key (Neuron escrow only)")
     p = sub.add_parser("inbox"); p.add_argument("--limit", type=int, default=20)
     p = sub.add_parser("outbox", help="show recent queued, delivered, and refused outbound items")
     p.add_argument("--refused", action="store_true", help="show only refused items")
     p.add_argument("--text", action="store_true", help="also show message/result text")
     p.add_argument("--limit", type=int, default=50)
     sub.add_parser("ledger", help="escrow journal: open / released / refunded")
+    p = sub.add_parser("escrow", help="inspect task escrow")
+    esub = p.add_subparsers(dest="escrow_cmd", required=True)
+    q = esub.add_parser("status"); q.add_argument("task")
     p = sub.add_parser("wallet", help="deposit and withdraw USDC-backed inference credits")
     walsub = p.add_subparsers(dest="wallet_cmd", required=True)
     walsub.add_parser("address", help="show or queue this operator's deposit token account")
@@ -1986,6 +1992,8 @@ def main(argv=None, *, http_post=None) -> int:
     q = tsub.add_parser("list"); q.add_argument("--role", default="")
     q = tsub.add_parser("claim"); q.add_argument("task")
     q = tsub.add_parser("submit"); q.add_argument("task"); q.add_argument("output")
+    q = sub.add_parser("tasks", help="list tasks (alias for `nak task list`)")
+    q.add_argument("--role", default="")
     a = ap.parse_args(argv)
     s = a.sock
 
@@ -2113,7 +2121,9 @@ def main(argv=None, *, http_post=None) -> int:
     elif a.cmd == "agent":
         r = call(s, {"op": "agent_send", "to": a.to, "text": a.text, "intent": a.intent,
                      "thread": a.thread, "reply_to": a.reply_to,
-                     **({"want": a.want} if a.want is not None else {})})
+                     **({"want": a.want} if a.want is not None else {}),
+                     **({"budget": {"amount": a.budget, "unit": "credits"}}
+                        if a.budget is not None else {})})
         print(f"queued {r['queued']} to {r['to']} in thread {r['thread']}")
     elif a.cmd == "threads":
         for row in call(s, {"op": "threads"})["threads"]:
@@ -2127,23 +2137,27 @@ def main(argv=None, *, http_post=None) -> int:
         for message in result["messages"]:
             reply = f" reply_to={message['reply_to']}" if message["reply_to"] else ""
             want = f"\n  want: {message['want']}" if message.get("want") is not None else ""
+            budget = message.get("budget")
+            proposed = (f"\n  proposed budget: {budget['amount']} credits"
+                        if isinstance(budget, dict) else "")
             sender = ("me" if message["from_me"] else
                       f"{message['name']} [{message['from_key']}…, {message['name_source']}]")
             print(f"[{_ago(message['created'])}] {sender} {message['intent']} mid={message['mid']}{reply}\n"
-                  f"  {message['text']}{want}")
+                  f"  {message['text']}{want}{proposed}")
     elif a.cmd == "card":
         if a.card_cmd == "set":
             intents = [value.strip() for value in a.intents.split(",") if value.strip()] or None
             models = [value.strip() for value in a.models.split(",") if value.strip()]
             result = call(s, {"op": "card_set", "name": a.name, "offers": a.offers,
-                              "intents": intents, "models": models, "price_hint": a.price_hint})
+                              "intents": intents, "models": models, "price_hint": a.price_hint,
+                              "paid": a.paid})
             print(f"agent card saved and sent to {result['sent']} contact(s)")
         else:
             result = call(s, {"op": "card", "contact": a.contact})
             card = result["card"]
             print(f"{result.get('contact') or 'my card'}: {card['display_name']}\n"
                   f"offers: {card['offers']}\nintents: {', '.join(card['intents'])}\n"
-                  f"models: {', '.join(card['models']) or '-'}\npaid: no\n"
+                  f"models: {', '.join(card['models']) or '-'}\npaid: {'yes' if card['paid'] else 'no'}\n"
                   f"price hint: {card['price_hint'] or '-'}\nsupports: {', '.join(card['supports'])}")
     elif a.cmd == "direct":
         r = call(s, {"op": "direct", "who": a.who, "on": a.onoff == "on"})
@@ -2196,6 +2210,11 @@ def main(argv=None, *, http_post=None) -> int:
         for j in r["journal"]:
             print(f"[{_ago(j['ts'])}] {j['task_hash'][:12]} {j['event']:9} {j['amount']} {j['unit']}"
                   f"  {('→ ' + j['party'][:12]) if j['party'] else ''}")
+    elif a.cmd == "escrow":
+        print(json.dumps(call(s, {"op": "escrow_status", "task": a.task}), sort_keys=True))
+    elif a.cmd == "tasks":
+        from network.client import render_tasks
+        print(render_tasks(call(s, {"op": "tasks", "role": a.role})["tasks"]))
     elif a.cmd == "task":
         if a.tcmd == "post":
             rules = [json.loads(r) for r in a.rule] or [{"max_words": 200}]

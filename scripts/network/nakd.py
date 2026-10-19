@@ -211,7 +211,8 @@ class Node:
         self.store = Store(state_dir, data_key)
         # Adapter #0 (local ledger, TEST units) unless a real one is passed; see network/settle.py.
         # THE accounting front door (accounting.py, U5) picks the escrow backend; tests may pass one.
-        self.settle = settlement or _accounting.escrow(Path(state_dir))
+        self.settle = settlement or _accounting.escrow(
+            Path(state_dir), private_key=self._key, keyid=self.node)
         self._harden_state_files(Path(state_dir))
         self.direct_port = direct_port        # U3b: listen for direct connections (opt-in, per node)
         self.p2p = dict(p2p) if p2p else None  # {"dial": "/run/user/<uid>/nakshatra/p2p.sock"}
@@ -562,13 +563,17 @@ class Node:
         return self._queue(person, "contact.card", body) if body else None
 
     def card_set(self, display_name: str, offers: str, *, intents=None, models=None,
-                 price_hint: str = "") -> dict:
+                 price_hint: str = "", paid: bool = False) -> dict:
+        if paid and self.settle.name != "neuron":
+            raise ValueError("paid cards require NAKSHATRA_ESCROW=neuron")
         previous = self.store.agent_card(self.person)
         updated_at = max(int(time.time()), int(previous["updated_at"]) + 1 if previous else 0)
         card = {"v": CARD_VERSION, "mid": "0" * 24, "display_name": display_name,
                 "offers": offers, "intents": list(intents if intents is not None else INTENTS),
-                "paid": False, "price_hint": price_hint, "models": list(models or []),
+                "paid": bool(paid), "price_hint": price_hint, "models": list(models or []),
                 "supports": [CARD_SUPPORT], "updated_at": updated_at}
+        if paid:
+            card["ledger_keyid"] = self.node
         validate_card(card)
         stored = {key: value for key, value in card.items() if key not in {"v", "mid"}}
         self.store.set_agent_card(self.person, stored)
@@ -970,18 +975,26 @@ class Node:
         if why:
             raise ValueError(why)
         self._require_grant("task.post")
-        spec = T.make_spec(self.person, title, instructions, acceptance, reward=reward, deadline_s=deadline_s)
+        spec = T.make_spec(self.person, title, instructions, acceptance, reward=reward,
+                           deadline_s=deadline_s,
+                           unit="credits" if self.settle.open_on_assign else "TEST")
         h = T.task_hash(spec)
         escrow = None
+        authorisation = None
         if spec["reward"]["amount"] > 0:
-            escrow = self._open_escrow(h, spec)            # raises if the signer or the ledger says no
-        self.store.task_insert(h, "poster", "", spec, "posted", [c["person"] for c in targets])
+            authorisation = self._approve_reward(h, spec)  # cap check always happens before anything is sent
+            if not self.settle.open_on_assign:
+                escrow = self._open_escrow(h, spec, authorisation=authorisation)
+        funding = "unfunded" if self.settle.open_on_assign and spec["reward"]["amount"] > 0 else ""
+        self.store.task_insert(h, "poster", "", spec, "posted", [c["person"] for c in targets],
+                               escrow_auth=authorisation if self.settle.open_on_assign else None,
+                               funding_state=funding)
         for c in targets:
             self._queue(c["person"], "task.post", {"task_hash": h, "spec": spec})
         self.log(f"posted task {h[:12]} '{title}' to {len(targets)} contact(s)")
         return {"task_hash": h, "posted_to": [c["petname"] or c["person"][:12] for c in targets], "escrow": escrow}
 
-    def _open_escrow(self, h: str, spec: dict) -> dict:
+    def _approve_reward(self, h: str, spec: dict) -> dict:
         amount, unit = spec["reward"]["amount"], spec["reward"]["unit"]
         r = self._signer({"op": "approve_spend", "agent": self.agent, "task_hash": h, "epoch": 0,
                           "amount": amount, "mint": unit, "to": "escrow"})
@@ -989,19 +1002,39 @@ class Node:
             raise ValueError(f"the signer refused the reward: {r.get('error')}")
         if r.get("status") == "needs_human":
             raise ValueError(f"this reward needs your person's approval (over the agent's cap): {r.get('description')}")
+        return r["authorisation"]
+
+    def _open_escrow(self, h: str, spec: dict, *, authorisation: dict,
+                     worker_keyid: str = "") -> dict:
+        amount, unit = spec["reward"]["amount"], spec["reward"]["unit"]
         try:
-            return self.settle.open(h, self.person, amount, unit, spec["deadline"], r["authorisation"])
+            return self.settle.open(h, self.person, amount, unit, spec["deadline"], authorisation,
+                                    worker_keyid=worker_keyid)
         except SettlementError as e:
             raise ValueError(f"escrow: {e}")
 
-    def _settle(self, h: str, spec: dict, how: str, party: str = "", reason: str = "") -> Optional[dict]:
+    def _set_funding(self, h: str, role: str, peer: str, state: str, reason: str = "") -> bool:
+        task = self.store.task_get(h, role, peer)
+        return bool(task and self.store.task_cas(
+            h, role, peer, (task["state"],), funding_state=state, funding_reason=reason))
+
+    def _settle(self, h: str, spec: dict, how: str, party: str = "", reason: str = "",
+                hold_id: str = "") -> Optional[dict]:
         """release|refund the task's escrow, if it has one. Exactly-once is the adapter's job."""
         if spec["reward"]["amount"] <= 0:
             return None
+        if self.settle.open_on_assign and not hold_id:
+            return None                         # a Neuron task expired before anyone was assigned
         try:
-            return self.settle.release(h, party) if how == "release" else self.settle.refund(h, reason)
+            receipt = (self.settle.release(h, party, hold_id=hold_id) if how == "release"
+                       else self.settle.refund(h, reason, hold_id=hold_id))
+            if self.settle.open_on_assign:
+                self._set_funding(h, "poster", "", "paid" if how == "release" else "refunded")
+            return receipt
         except SettlementError as e:
             self.log(f"settlement {how} for {h[:12]} refused: {e}")
+            if self.settle.open_on_assign:
+                self._set_funding(h, "poster", "", "pending", str(e))
             return {"error": str(e)}
 
     def _sweep_loop(self) -> None:
@@ -1019,14 +1052,40 @@ class Node:
         for t in self.store.tasks_in_states(("accepted", "rejected", "expired"), role="poster"):
             if t["spec"]["reward"]["amount"] <= 0:
                 continue
-            st = self.settle.status(t["task_hash"])
-            if not st or st["state"] != "open":
+            if self.settle.open_on_assign and t["funding_state"] in {"paid", "refunded"}:
                 continue
-            if t["state"] == "accepted" and t["assignee"]:
-                self._settle(t["task_hash"], t["spec"], "release", party=t["assignee"])
+            if self.settle.open_on_assign and not t["hold_id"]:
+                continue
+            try:
+                st = self.settle.status(t["task_hash"], hold_id=t["hold_id"] or "")
+            except SettlementError as e:
+                self.log(f"escrow status for {t['task_hash'][:12]} unavailable: {e}")
+                continue
+            desired = "released" if t["state"] == "accepted" else "refunded"
+            receipt = None
+            if st and st["state"] == "open":
+                receipt = self._settle(
+                    t["task_hash"], t["spec"], "release" if desired == "released" else "refund",
+                    party=t["assignee"] or "", reason=t["state"], hold_id=t["hold_id"] or "")
+                if receipt and receipt.get("error"):
+                    continue
+            elif st and st["state"] == desired and self.settle.open_on_assign:
+                self._set_funding(t["task_hash"], "poster", "",
+                                  "paid" if desired == "released" else "refunded")
+                event = "released" if desired == "released" else "refunded"
+                receipt = {"adapter": self.settle.name, "event": event,
+                           "task_hash": t["task_hash"], "hold_id": t["hold_id"],
+                           "amount": st["amount"], "unit": st.get("unit", "credits")}
             else:
-                self._settle(t["task_hash"], t["spec"], "refund", reason=t["state"])
+                continue
             fixed += 1
+            if self.settle.open_on_assign and t["assignee"] and receipt:
+                verdict = dict(t["verdict"] or {})
+                verdict["settlement"] = receipt
+                self.store.task_cas(t["task_hash"], "poster", "", (t["state"],),
+                                    verdict=json.dumps(verdict))
+                self._queue(t["assignee"], "task.accept" if t["state"] == "accepted" else "task.reject",
+                            {"task_hash": t["task_hash"], "epoch": t["epoch"], **verdict})
             self.log(f"reconciled stranded escrow for {t['task_hash'][:12]} ({t['state']})")
         return fixed
 
@@ -1042,10 +1101,14 @@ class Node:
             if t["role"] == "poster" and t["state"] in ("posted", "assigned"):
                 if self.store.task_cas(t["task_hash"], "poster", "", ("posted", "assigned"), state="expired",
                                        verdict=json.dumps({"passed": False, "reasons": ["deadline passed"]})):
-                    self._settle(t["task_hash"], t["spec"], "refund", reason="expired")
+                    receipt = self._settle(t["task_hash"], t["spec"], "refund", reason="expired",
+                                           hold_id=t["hold_id"] or "")
                     if t["assignee"]:
-                        self._queue(t["assignee"], "task.reject", {"task_hash": t["task_hash"], "epoch": t["epoch"],
-                                                                   "reasons": ["deadline passed"]})
+                        body = {"task_hash": t["task_hash"], "epoch": t["epoch"],
+                                "reasons": ["deadline passed"]}
+                        if self.settle.open_on_assign and receipt and not receipt.get("error"):
+                            body["settlement"] = receipt
+                        self._queue(t["assignee"], "task.reject", body)
                     n += 1
             elif t["role"] == "worker" and t["state"] in ("offered", "claimed", "assigned"):
                 n += self.store.task_cas(t["task_hash"], "worker", t["peer"], ("offered", "claimed", "assigned"),
@@ -1057,6 +1120,52 @@ class Node:
         if len(rows) != 1:
             raise ValueError("no single offered task matches that id")
         return rows[0]
+
+    def escrow_status(self, ref: str) -> dict:
+        rows = self.store.task_find(str(ref))
+        if len(rows) != 1:
+            raise ValueError("no single task matches that id")
+        task = rows[0]
+        amount = task["spec"]["reward"]["amount"]
+        if amount <= 0:
+            return {"task_hash": task["task_hash"], "funding": "free", "settlement": None}
+        if self.settle.open_on_assign and not task["hold_id"]:
+            return {"task_hash": task["task_hash"], "funding": "unfunded", "settlement": None}
+        try:
+            status = self.settle.status(task["task_hash"], hold_id=task["hold_id"] or "")
+        except SettlementError as e:
+            raise ValueError(f"escrow: {e}") from e
+        funding = {"open": "funded", "released": "paid", "refunded": "refunded"}.get(
+            (status or {}).get("state"), "unfunded")
+        return {"task_hash": task["task_hash"], "funding": funding,
+                "hold_id": task["hold_id"], "settlement": status}
+
+    def _verify_worker_hold(self, task: dict) -> bool:
+        """Pay-first: only an exact open Neuron hold makes a rewarded assignment workable."""
+        if task["spec"]["reward"]["amount"] <= 0 or not self.settle.open_on_assign:
+            return True
+        reason = ""
+        if not task["hold_id"]:
+            reason = "assignment did not include a task hold"
+        else:
+            try:
+                status = self.settle.status(task["task_hash"], hold_id=task["hold_id"])
+            except SettlementError as e:
+                status = None
+                reason = str(e)
+            if status is not None:
+                expected_amount = task["spec"]["reward"]["amount"]
+                if status.get("state") != "open":
+                    reason = f"task hold is {status.get('ledger_state') or status.get('state')}"
+                elif status.get("worker_keyid") != self.node:
+                    reason = "task hold names another worker"
+                elif status.get("amount") != expected_amount:
+                    reason = "task hold amount does not match the reward"
+                elif status.get("task_hash") != task["task_hash"]:
+                    reason = "task hold is bound to another task"
+        self._set_funding(task["task_hash"], "worker", task["peer"],
+                          "unfunded" if reason else "funded", reason)
+        return not reason
 
     def claim_task(self, ref: str) -> dict:
         t = self._worker_task(ref)
@@ -1077,6 +1186,9 @@ class Node:
             raise ValueError(why)
         if t["spec"]["deadline"] <= time.time():
             raise ValueError("that task's deadline has passed; the poster will not take a result now")
+        if not self._verify_worker_hold(t):
+            current = self.store.task_get(t["task_hash"], "worker", t["peer"])
+            raise ValueError(f"unfunded: {current['funding_reason'] or 'the task hold is not valid'}")
         self._require_grant("task.result")
         passed, reasons = T.evaluate(t["spec"], output)       # the worker can see it would fail first
         if not self.store.task_cas(t["task_hash"], "worker", t["peer"], ("assigned",),
@@ -1096,7 +1208,9 @@ class Node:
             T.validate_spec(spec)
             if T.task_hash(spec) != h or spec["poster"] != c["person"]:
                 raise ValueError("task spec is not bound to its hash and poster")
-            if self.store.task_insert(h, "worker", c["person"], spec, "offered"):
+            funding = "unfunded" if spec["reward"]["amount"] > 0 and self.settle.open_on_assign else ""
+            if self.store.task_insert(h, "worker", c["person"], spec, "offered",
+                                      funding_state=funding):
                 self.store.raw_log({"received": int(time.time()), "source": "nakshatra", "trust": "external",
                                     "from_person": c["person"], "envelope": env, "body": body})
                 self.log(f"task offer {h[:12]} '{spec['title']}' from {who}")
@@ -1113,8 +1227,23 @@ class Node:
             # Check before changing assignment state so a local grant problem cannot produce a nack
             # after the protocol step has already committed.
             self._require_grant("task.assign")
-            if self.store.task_cas(h, "poster", "", ("posted",), state="assigned", assignee=c["person"], epoch=1):
-                self._queue(c["person"], "task.assign", {"task_hash": h, "epoch": 1, "worker": c["person"]})
+            hold_id = ""
+            if t["spec"]["reward"]["amount"] > 0 and self.settle.open_on_assign:
+                card = self.store.agent_card(c["person"])
+                if not card or card.get("paid") is not True or not card.get("ledger_keyid"):
+                    raise ValueError("paid task assignment requires the contact's paid card and ledger key")
+                receipt = self._open_escrow(
+                    h, t["spec"], authorisation=t["escrow_auth"],
+                    worker_keyid=card["ledger_keyid"])
+                hold_id = receipt["hold_id"]
+            fields = {"state": "assigned", "assignee": c["person"], "epoch": 1}
+            if hold_id:
+                fields.update(hold_id=hold_id, funding_state="funded", funding_reason="")
+            if self.store.task_cas(h, "poster", "", ("posted",), **fields):
+                assign = {"task_hash": h, "epoch": 1, "worker": c["person"]}
+                if hold_id:
+                    assign["hold_id"] = hold_id
+                self._queue(c["person"], "task.assign", assign)
                 self.log(f"task {h[:12]} assigned to {who}")
             elif t["assignee"] != c["person"]:
                 self._queue(c["person"], "task.reject", {"task_hash": h, "epoch": 0,
@@ -1123,8 +1252,17 @@ class Node:
         if kind == "task.assign":
             if body.get("worker") != self.person or not isinstance(body.get("epoch"), int):
                 raise ValueError("assignment is not for this node's person")
-            if not self.store.task_cas(h, "worker", c["person"], ("claimed",), state="assigned", epoch=body["epoch"]):
+            hold_id = body.get("hold_id", "")
+            if hold_id and not isinstance(hold_id, str):
+                raise ValueError("assignment task hold is invalid")
+            if not self.store.task_cas(h, "worker", c["person"], ("claimed",), state="assigned",
+                                       epoch=body["epoch"], hold_id=hold_id or None):
                 raise ValueError("assignment for a task this node did not claim")
+            assigned = self.store.task_get(h, "worker", c["person"])
+            if not self._verify_worker_hold(assigned):
+                reason = self.store.task_get(h, "worker", c["person"])["funding_reason"]
+                self.log(f"task {h[:12]} assigned but unfunded: {reason}")
+                return
             self.log(f"task {h[:12]} assigned to us by {who}")
             return
         if kind == "task.result":
@@ -1145,8 +1283,8 @@ class Node:
                                        output=output, verdict=json.dumps(verdict)):
                 raise ValueError("task is not awaiting a result")
             receipt = self._settle(h, t["spec"], "release" if passed else "refund", party=c["person"],
-                                   reason="accepted" if passed else "rejected")
-            if receipt is not None:
+                                   reason="accepted" if passed else "rejected", hold_id=t["hold_id"] or "")
+            if receipt is not None and not receipt.get("error"):
                 verdict["settlement"] = receipt
                 self.store.task_cas(h, "poster", "", ("accepted", "rejected"), verdict=json.dumps(verdict))
             self.store.raw_log({"received": int(time.time()), "source": "nakshatra", "trust": "external",
@@ -1161,17 +1299,26 @@ class Node:
                 raise ValueError("no such task here")
             reasons = body.get("reasons") if isinstance(body.get("reasons"), list) else []
             v = {"passed": kind == "task.accept", "reasons": [str(r)[:300] for r in reasons][:12]}
-            if isinstance(body.get("settlement"), dict):       # the poster's receipt (verifiable on-chain later)
+            settlement = body.get("settlement")
+            if isinstance(settlement, dict):       # the poster's receipt (verifiable on-chain later)
                 v["settlement"] = {k: body["settlement"].get(k) for k in ("adapter", "event", "amount", "unit")}
             verdict = json.dumps(v)
             if body.get("epoch") == 0:
                 self.store.task_cas(h, "worker", c["person"], ("claimed",), state="lost", verdict=verdict)
             elif kind == "task.reject" and v["reasons"] == ["deadline passed"]:
                 self.store.task_cas(h, "worker", c["person"], ("assigned", "submitted", "expired"),
-                                    state="expired", verdict=verdict)
+                                    state="expired", verdict=verdict,
+                                    **({"funding_state": "refunded"} if isinstance(settlement, dict) else {}))
             else:
-                self.store.task_cas(h, "worker", c["person"], ("submitted",),
-                                    state="accepted" if kind == "task.accept" else "rejected", verdict=verdict)
+                final_state = "accepted" if kind == "task.accept" else "rejected"
+                funding = ""
+                if t["spec"]["reward"]["amount"] > 0 and self.settle.open_on_assign:
+                    funding = ("paid" if kind == "task.accept" and isinstance(settlement, dict)
+                               else "refunded" if kind == "task.reject" and isinstance(settlement, dict)
+                               else "funded")
+                self.store.task_cas(h, "worker", c["person"], ("submitted", "accepted", "rejected"),
+                                    state=final_state, verdict=verdict,
+                                    **({"funding_state": funding} if funding else {}))
             return
         raise ValueError(f"unknown task step {kind}")
 
@@ -1229,7 +1376,7 @@ def _hard_close(ch) -> None:
 
 OPS = {"status", "register_invite", "redeem", "requests", "accept", "decline", "contacts", "remove", "send",
        "agent_send", "threads", "thread", "card", "card_set", "delivered", "inbox", "outbox",
-       "task_post", "tasks", "task_claim", "task_submit", "ledger", "direct"}
+       "task_post", "tasks", "task_claim", "task_submit", "ledger", "escrow_status", "direct"}
 
 
 def handle(node: Node, req: dict) -> dict:
@@ -1270,7 +1417,8 @@ def handle(node: Node, req: dict) -> dict:
             return {"ok": True, **node.card(req.get("contact", ""))}
         if op == "card_set":
             return {"ok": True, **node.card_set(req["name"], req["offers"], intents=req.get("intents"),
-                                                models=req.get("models"), price_hint=req.get("price_hint", ""))}
+                                                models=req.get("models"), price_hint=req.get("price_hint", ""),
+                                                paid=bool(req.get("paid", False)))}
         if op == "delivered":
             return {"ok": True, "delivered": node.delivered(req["mid"])}
         if op == "task_post":
@@ -1279,6 +1427,10 @@ def handle(node: Node, req: dict) -> dict:
         if op == "tasks":
             rows = node.store.tasks(req.get("role") or None, int(req.get("limit", 50)))
             for r in rows:
+                r.pop("escrow_auth", None)
+                for internal in ("hold_id", "funding_state", "funding_reason"):
+                    if not r.get(internal):
+                        r.pop(internal, None)
                 c = node.store.contact(r["peer"] or (r["assignee"] or ""))
                 r["peer_name"] = (c or {}).get("petname", "")
                 r["name_source"] = (c or {}).get("name_src") or "self-chosen"
@@ -1287,6 +1439,8 @@ def handle(node: Node, req: dict) -> dict:
             return {"ok": True, **node.set_direct(req["who"], bool(req.get("on")))}
         if op == "ledger":
             return {"ok": True, "adapter": node.settle.name, "journal": node.settle.journal(req.get("task") or None)}
+        if op == "escrow_status":
+            return {"ok": True, **node.escrow_status(req["task"])}
         if op == "task_claim":
             return {"ok": True, **node.claim_task(req["task"])}
         if op == "task_submit":

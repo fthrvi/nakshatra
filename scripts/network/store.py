@@ -56,10 +56,10 @@ class Store:
         "requests": (("id",), ("nickname",)),
         "invites": (("nonce",), ("note",)),
         "outbox": (("nonce",), ("frame", "refused")),
-        "tasks": (("task_hash", "role", "peer"), ("spec", "output", "verdict")),
+        "tasks": (("task_hash", "role", "peer"), ("spec", "output", "verdict", "escrow_auth")),
         "agent_messages": (("mid",), ("text", "want", "refs", "budget", "harness")),
         "agent_cards": (("person",), ("display_name", "offers", "intents", "paid", "price_hint",
-                                          "models", "supports", "updated_at")),
+                                          "models", "supports", "updated_at", "ledger_keyid")),
     }
 
     def __init__(self, state_dir: Path, data_key: bytes):
@@ -88,6 +88,15 @@ class Store:
                 pass
         try:   # outbox.refused: a peer's terminal nack (added with tasks; older stores lack it)
             self._db.execute("ALTER TABLE outbox ADD COLUMN refused TEXT")
+        except sqlite3.OperationalError:
+            pass
+        for col in ("escrow_auth TEXT", "hold_id TEXT", "funding_state TEXT", "funding_reason TEXT"):
+            try:
+                self._db.execute(f"ALTER TABLE tasks ADD COLUMN {col}")
+            except sqlite3.OperationalError:
+                pass
+        try:
+            self._db.execute("ALTER TABLE agent_cards ADD COLUMN ledger_keyid TEXT")
         except sqlite3.OperationalError:
             pass
         self._key_verified = self._verify_key_marker()
@@ -578,7 +587,7 @@ class Store:
     # Contact cards are encrypted in their entirety. ``person`` is the row key: the local person's
     # key denotes their own card, while contact person keys denote received cards.
     _CARD_FIELDS = ("display_name", "offers", "intents", "paid", "price_hint", "models", "supports",
-                    "updated_at")
+                    "updated_at", "ledger_keyid")
 
     def set_agent_card(self, person: str, card: dict) -> bool:
         existing = self.agent_card(person)
@@ -587,17 +596,17 @@ class Store:
         primary_key = self._pk((person,))
         encoded = {
             key: json.dumps(card[key], separators=(",", ":")) if key in {"intents", "paid", "models", "supports",
-                                                                            "updated_at"} else card[key]
+                                                                            "updated_at"} else card.get(key)
             for key in self._CARD_FIELDS
         }
         values = [self._enc("agent_cards", key, primary_key, encoded[key]) for key in self._CARD_FIELDS]
-        self._q("INSERT INTO agent_cards (person,display_name,offers,intents,paid,price_hint,models,supports,updated_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(person) DO UPDATE SET " +
+        self._q("INSERT INTO agent_cards (person,display_name,offers,intents,paid,price_hint,models,supports,updated_at,ledger_keyid) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(person) DO UPDATE SET " +
                 ",".join(f"{key}=excluded.{key}" for key in self._CARD_FIELDS), (person, *values))
         return True
 
     def agent_card(self, person: str) -> Optional[dict]:
-        rows = self._q("SELECT display_name,offers,intents,paid,price_hint,models,supports,updated_at "
+        rows = self._q("SELECT display_name,offers,intents,paid,price_hint,models,supports,updated_at,ledger_keyid "
                        "FROM agent_cards WHERE person=?", (person,))
         if not rows:
             return None
@@ -606,21 +615,29 @@ class Store:
                for key, value in zip(self._CARD_FIELDS, rows[0])}
         for key in ("intents", "paid", "models", "supports", "updated_at"):
             row[key] = json.loads(row[key])
+        if row["ledger_keyid"] is None:
+            row.pop("ledger_keyid")
         return row
 
     # tasks: one row per (task, my role, counterparty). Poster rows use peer "" (the assignee is a
     # column); worker rows use the poster's person key as peer. Every transition is compare-and-set.
     _TASK_COLS = ("task_hash", "role", "peer", "spec", "state", "targets", "assignee", "epoch", "output",
-                  "verdict", "created", "updated")
+                  "verdict", "escrow_auth", "hold_id", "funding_state", "funding_reason", "created", "updated")
 
     def task_insert(self, task_hash: str, role: str, peer: str, spec: dict, state: str,
-                    targets: Optional[list] = None) -> bool:
+                    targets: Optional[list] = None, *, escrow_auth: Optional[dict] = None,
+                    hold_id: str = "", funding_state: str = "", funding_reason: str = "") -> bool:
         now = int(time.time())
         primary_key = self._pk((task_hash, role, peer))
         try:
-            self._q("INSERT INTO tasks VALUES (?,?,?,?,?,?,NULL,0,NULL,NULL,?,?)",
+            self._q("INSERT INTO tasks (task_hash,role,peer,spec,state,targets,assignee,epoch,output,verdict,"
+                    "escrow_auth,hold_id,funding_state,funding_reason,created,updated) "
+                    "VALUES (?,?,?,?,?,?,NULL,0,NULL,NULL,?,?,?,?,?,?)",
                     (task_hash, role, peer, self._enc("tasks", "spec", primary_key, json.dumps(spec)), state,
-                     json.dumps(targets) if targets is not None else None, now, now))
+                     json.dumps(targets) if targets is not None else None,
+                     self._enc("tasks", "escrow_auth", primary_key, json.dumps(escrow_auth))
+                     if escrow_auth is not None else None,
+                     hold_id or None, funding_state or None, funding_reason or None, now, now))
             return True
         except sqlite3.IntegrityError:
             return False
@@ -628,7 +645,8 @@ class Store:
     def task_cas(self, task_hash: str, role: str, peer: str, from_states: tuple, **fields) -> bool:
         """Move a task out of one of `from_states`, setting `fields`, atomically. False if it was not
         in one of those states (someone else won, or the step is out of order)."""
-        allowed = {"state", "assignee", "epoch", "output", "verdict"}
+        allowed = {"state", "assignee", "epoch", "output", "verdict", "hold_id", "funding_state",
+                   "funding_reason"}
         if set(fields) - allowed:
             raise ValueError(f"bad task fields {set(fields) - allowed}")
         sets = ", ".join(f"{k}=?" for k in fields) + ", updated=?"
@@ -675,9 +693,10 @@ class Store:
     def _task_row(self, r) -> dict:
         d = dict(zip(self._TASK_COLS, r))
         primary_key = self._pk((d["task_hash"], d["role"], d["peer"]))
-        for column in ("spec", "output", "verdict"):
+        for column in ("spec", "output", "verdict", "escrow_auth"):
             d[column] = self._dec("tasks", column, primary_key, d[column])
         d["spec"] = json.loads(d["spec"])
+        d["escrow_auth"] = json.loads(d["escrow_auth"]) if d["escrow_auth"] else None
         d["targets"] = json.loads(d["targets"]) if d["targets"] else None
         d["verdict"] = json.loads(d["verdict"]) if d["verdict"] else None
         return d

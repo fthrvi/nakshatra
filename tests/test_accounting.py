@@ -87,6 +87,21 @@ def test_escrow_backend_is_chosen_once_and_unknown_is_refused(tmp_path, monkeypa
         accounting.escrow(tmp_path)
 
 
+def test_neuron_escrow_uses_pinned_gateway_config_and_requires_enforce(tmp_path, monkeypatch):
+    state = tmp_path / ".nakshatra" / "net"
+    state.mkdir(parents=True)
+    (state.parent / "gateway.env").write_text(
+        "NAKSHATRA_LEDGER_URL=https://ledger.test\n"
+        f"NAKSHATRA_LEDGER_SPKI_SHA256={'ab' * 32}\n"
+        "NAKSHATRA_LEDGER_MODE=enforce\n")
+    monkeypatch.setenv("NAKSHATRA_ESCROW", "neuron")
+    adapter = accounting.escrow(state, private_key=b"k" * 32, keyid="cd" * 32)
+    assert adapter.name == "neuron" and adapter.url == "https://ledger.test"
+    monkeypatch.setenv("NAKSHATRA_LEDGER_MODE", "fail-open")
+    with pytest.raises(RuntimeError, match="requires NAKSHATRA_LEDGER_MODE=enforce"):
+        accounting.escrow(state, private_key=b"k" * 32, keyid="cd" * 32)
+
+
 def test_wallet_backend_is_named_and_fail_closed(monkeypatch):
     monkeypatch.setattr(
         nakshatra_auth, "load_worker_key", lambda: (b"private", "ab" * 32)

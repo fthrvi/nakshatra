@@ -62,10 +62,10 @@ def _check_rules(rules) -> None:
 
 
 def make_spec(poster: str, title: str, instructions: str, acceptance: list, *, reward: int = 0,
-              deadline_s: int = 3600, now: Optional[int] = None) -> dict:
+              deadline_s: int = 3600, now: Optional[int] = None, unit: str = "TEST") -> dict:
     now = int(now if now is not None else time.time())
     spec = {"v": 1, "poster": poster, "title": str(title), "instructions": str(instructions),
-            "acceptance": acceptance, "reward": {"amount": int(reward), "unit": "TEST"},
+            "acceptance": acceptance, "reward": {"amount": int(reward), "unit": unit},
             "deadline": now + int(deadline_s), "privacy": "open", "nonce": secrets.token_hex(8)}
     validate_spec(spec, now=now)
     return spec
@@ -83,9 +83,9 @@ def validate_spec(spec: dict, now: Optional[int] = None) -> None:
         raise ValueError(f"instructions must be 1-{MAX_INSTRUCTIONS} characters")
     _check_rules(spec["acceptance"])
     rw = spec["reward"]
-    if not isinstance(rw, dict) or set(rw) != {"amount", "unit"} or rw["unit"] != "TEST" or \
+    if not isinstance(rw, dict) or set(rw) != {"amount", "unit"} or rw["unit"] not in {"TEST", "credits"} or \
             not isinstance(rw["amount"], int) or rw["amount"] < 0:
-        raise ValueError("reward must be {amount: int >= 0, unit: TEST} (devnet settlement comes later)")
+        raise ValueError("reward must be {amount: int >= 0, unit: TEST|credits}")
     if spec["privacy"] not in PRIVACY:
         raise ValueError(f"privacy must be one of {sorted(PRIVACY)} until the sandbox lands")
     if not isinstance(spec["deadline"], int) or spec["deadline"] <= now:

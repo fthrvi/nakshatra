@@ -14,6 +14,7 @@ MAX_HARNESS = 32
 MAX_REFS = 8
 MAX_REF_BYTES = 10 * 1024 * 1024
 MAX_EXPIRY_S = 30 * 24 * 60 * 60
+MAX_BUDGET = 10**12
 CARD_SUPPORT = "agent.msg/1"
 
 _THREAD_RE = re.compile(r"[0-9a-f]{32}\Z")
@@ -79,10 +80,11 @@ def validate_agent_message(body: dict, max_text: int, *, outbound: bool = False,
         budget = out["budget"]
         if not isinstance(budget, dict) or set(budget) != {"amount", "unit"}:
             raise ValueError("budget must contain exactly amount and unit")
-        if not _plain_int(budget["amount"]) or budget["unit"] != "credits":
-            raise ValueError("budget must be {amount: int, unit: credits}")
-        if outbound and budget["amount"] != 0:
-            raise ValueError("paid asks arrive in M2")
+        if (not _plain_int(budget["amount"]) or not 0 < budget["amount"] <= MAX_BUDGET
+                or budget["unit"] != "credits"):
+            raise ValueError(f"budget must be {{amount: int 1-{MAX_BUDGET}, unit: credits}}")
+        if out["intent"] not in {"offer", "ask"}:
+            raise ValueError("budget is allowed only with intent=offer or ask")
     if "refs" in out:
         refs = out["refs"]
         if not isinstance(refs, list) or len(refs) > MAX_REFS:
@@ -103,11 +105,12 @@ def validate_card(body: dict) -> dict:
     if not isinstance(body, dict):
         raise ValueError("contact.card payload must be an object")
     allowed = {"v", "mid", "display_name", "offers", "intents", "paid", "price_hint",
-               "models", "supports", "updated_at"}
+               "models", "supports", "updated_at", "ledger_keyid"}
     unknown = set(body) - allowed
     if unknown:
         raise ValueError("unknown contact.card keys: " + ", ".join(sorted(unknown)))
-    if set(body) != allowed:
+    required = allowed - {"ledger_keyid"}
+    if not required.issubset(body):
         raise ValueError("contact.card is missing required fields")
     if type(body["v"]) is not int or body["v"] != CARD_VERSION:
         raise ValueError("contact.card v must be 1")
@@ -120,8 +123,14 @@ def validate_card(body: dict) -> dict:
         raise ValueError("intents must be a list containing only agent.msg intents")
     if len(set(intents)) != len(intents):
         raise ValueError("intents must not contain duplicates")
-    if body["paid"] is not False:
-        raise ValueError("paid must be false in M1")
+    if not isinstance(body["paid"], bool):
+        raise ValueError("paid must be a boolean")
+    ledger_keyid = body.get("ledger_keyid")
+    if ledger_keyid is not None and (
+            not isinstance(ledger_keyid, str) or _SHA256_RE.fullmatch(ledger_keyid) is None):
+        raise ValueError("ledger_keyid must be 64 lowercase hex characters")
+    if body["paid"] and ledger_keyid is None:
+        raise ValueError("paid=true requires ledger_keyid")
     _bounded_string(body["price_hint"], "price_hint", 200)
     models = body["models"]
     if (not isinstance(models, list) or len(models) > 32 or

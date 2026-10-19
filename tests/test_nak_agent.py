@@ -10,7 +10,7 @@ import pytest
 _REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO / "scripts"))
 
-from network.agent import (MAX_EXPIRY_S, MAX_REF_BYTES, validate_agent_message,  # noqa: E402
+from network.agent import (MAX_BUDGET, MAX_EXPIRY_S, MAX_REF_BYTES, validate_agent_message,  # noqa: E402
                            validate_card)
 from network.nakd import MAX_TEXT  # noqa: E402
 
@@ -51,7 +51,7 @@ def test_agent_message_rejects_every_bad_field_and_unknown_key(change):
 
 
 def test_agent_message_accepts_all_optional_fields_and_caps_sender_expiry():
-    value = message(want="please answer", expires=9999999999, budget={"amount": 0, "unit": "credits"},
+    value = message(want="please answer", expires=9999999999, budget={"amount": 1, "unit": "credits"},
                     refs=[{"sha256": "c" * 64, "bytes": MAX_REF_BYTES, "name": "report.md"}],
                     harness="hermes")
     out = validate_agent_message(value, MAX_TEXT, outbound=True, now=100,
@@ -66,16 +66,32 @@ def test_receiver_rejects_expiry_beyond_its_own_thirty_day_window():
         "expires"] == 100 + MAX_EXPIRY_S
 
 
-def test_sender_refuses_paid_budget_with_m2_message_and_unknown_reply():
-    with pytest.raises(ValueError, match="paid asks arrive in M2"):
-        validate_agent_message(message(budget={"amount": 1, "unit": "credits"}), MAX_TEXT,
-                               outbound=True)
+def test_sender_allows_m2_budget_proposals_and_refuses_unknown_reply():
+    assert validate_agent_message(
+        message(budget={"amount": 1, "unit": "credits"}), MAX_TEXT, outbound=True)[
+            "budget"] == {"amount": 1, "unit": "credits"}
     with pytest.raises(ValueError, match="not a known message"):
         validate_agent_message(message(reply_to="c" * 24), MAX_TEXT, outbound=True,
                                reply_known=lambda _thread, _mid: False)
     # Receivers carry paid metadata without acting on it, ready for the M2 settlement layer.
     assert validate_agent_message(message(budget={"amount": 7, "unit": "credits"}), MAX_TEXT)[
         "budget"]["amount"] == 7
+
+
+@pytest.mark.parametrize("intent,amount,unit,ok", [
+    ("ask", 1, "credits", True), ("offer", MAX_BUDGET, "credits", True),
+    ("inform", 1, "credits", False), ("answer", 1, "credits", False),
+    ("ask", 0, "credits", False), ("offer", -1, "credits", False),
+    ("ask", MAX_BUDGET + 1, "credits", False), ("ask", True, "credits", False),
+    ("ask", 1, "TEST", False),
+])
+def test_budget_validation_matrix(intent, amount, unit, ok):
+    value = message(intent=intent, budget={"amount": amount, "unit": unit})
+    if ok:
+        assert validate_agent_message(value, MAX_TEXT, outbound=True)["budget"]["amount"] == amount
+    else:
+        with pytest.raises(ValueError):
+            validate_agent_message(value, MAX_TEXT, outbound=True)
 
 
 @pytest.mark.parametrize("change", [
@@ -94,3 +110,10 @@ def test_card_rejects_every_bad_field_and_unknown_key(change):
 
 def test_card_accepts_declared_m1_shape():
     assert validate_card(card())["supports"] == ["agent.msg/1"]
+
+
+def test_card_accepts_paid_only_with_a_ledger_keyid():
+    value = card(paid=True, ledger_keyid="d" * 64)
+    assert validate_card(value)["ledger_keyid"] == "d" * 64
+    with pytest.raises(ValueError, match="ledger_keyid"):
+        validate_card(card(paid=True))

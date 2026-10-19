@@ -15,14 +15,15 @@ ledger) is added HERE, once, and every caller gets it.
 
     ESCROW — pay for a task posted to another person
         open(...) / release(...) / refund(...) / status(...)   exactly once per task
-        backend today: `network.settle.LedgerAdapter` (local ledger, TEST units)
-        next: Solana devnet escrow (an adapter with the same four calls)
+        backends: `network.settle.LedgerAdapter` (default local TEST units), or explicit
+        `network.settle.NeuronEscrowAdapter` (pinned HTTPS devnet credits)
 
     WALLET — deposit address, balance, payout binding, and withdrawal requests
         backend: `neuron-ledger`; Solana keys remain outside Nakshatra and the ledger server
 
 Choose backends with env, not code: NAKSHATRA_CREDITS (metering on/off, see ledger_client) and
-NAKSHATRA_ESCROW=ledger (the only escrow backend today; anything else is refused, not guessed).
+NAKSHATRA_ESCROW=ledger|neuron. The default remains the local TEST ledger; Neuron is explicit,
+fail-closed, and uses the gateway's pinned ledger configuration.
 """
 from __future__ import annotations
 
@@ -34,7 +35,7 @@ _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
-ESCROW_BACKENDS = ("ledger",)
+ESCROW_BACKENDS = ("ledger", "neuron")
 METERING_BACKEND = "neuron-ledger"
 WALLET_BACKEND = "neuron-ledger"
 
@@ -61,13 +62,47 @@ def metering():
                                gate=lambda est: (True, ""), settle=lambda p: None)
 
 
-def escrow(state_dir: Path):
+def _environment_file(path: Path) -> dict[str, str]:
+    """Read the scalar subset emitted by ``nak gateway on`` without evaluating shell syntax."""
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return {}
+    values = {}
+    for line in lines:
+        if not line or line.lstrip().startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        values[key.strip()] = value
+    return values
+
+
+def escrow(state_dir: Path, *, private_key: bytes | None = None, keyid: str | None = None):
     """The escrow half for a node's state dir. Refuses an unknown backend rather than guessing."""
     name = os.environ.get("NAKSHATRA_ESCROW", "ledger").strip() or "ledger"
     if name not in ESCROW_BACKENDS:
         raise ValueError(f"NAKSHATRA_ESCROW={name!r} is not a known escrow backend {ESCROW_BACKENDS}")
     from network.settle import LedgerAdapter
-    return LedgerAdapter(Path(state_dir) / "settle.sqlite")
+    state_dir = Path(state_dir)
+    if name == "ledger":
+        return LedgerAdapter(state_dir / "settle.sqlite")
+    from network.settle import NeuronEscrowAdapter
+    configured = _environment_file(state_dir.parent / "gateway.env")
+    url = (os.environ.get("NAKSHATRA_LEDGER_URL", "").strip()
+           or configured.get("NAKSHATRA_LEDGER_URL", "").strip())
+    pin = (os.environ.get("NAKSHATRA_LEDGER_SPKI_SHA256", "").strip()
+           or configured.get("NAKSHATRA_LEDGER_SPKI_SHA256", "").strip())
+    mode = (os.environ.get("NAKSHATRA_LEDGER_MODE", "").strip()
+            or configured.get("NAKSHATRA_LEDGER_MODE", "").strip())
+    try:
+        timeout = float(os.environ.get("NAKSHATRA_LEDGER_TIMEOUT", "5") or 5)
+    except ValueError:
+        timeout = 5.0
+    return NeuronEscrowAdapter(url, pin, private_key or b"", keyid or "",
+                               mode=mode, timeout=timeout)
 
 
 def wallet(**kwargs):

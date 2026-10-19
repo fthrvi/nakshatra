@@ -42,8 +42,9 @@ def test_every_encrypted_column_round_trips_and_is_ciphertext_in_sqlite(tmp_path
                              "budget": {"amount": 0, "unit": "credits"}, "harness": "test"},
                             PERSON, "in")
     store.set_agent_card(PERSON, {"display_name": "Agent", "offers": "card-offers", "intents": ["ask"],
-                                  "paid": False, "price_hint": "none", "models": ["m"],
-                                  "supports": ["agent.msg/1"], "updated_at": 1})
+                                  "paid": True, "price_hint": "none", "models": ["m"],
+                                  "supports": ["agent.msg/1"], "updated_at": 1,
+                                  "ledger_keyid": "77" * 32})
     assert store.task_insert(TASK, "worker", PERSON, {"title": "task-spec"}, "assigned")
     assert store.task_cas(TASK, "worker", PERSON, ("assigned",), state="submitted",
                           output="task-output", verdict=json.dumps({"reason": "task-verdict"}))
@@ -60,6 +61,7 @@ def test_every_encrypted_column_round_trips_and_is_ciphertext_in_sqlite(tmp_path
     assert store.raw_records()[0]["body"] == MARKER
     assert store.agent_thread("34")[1][0]["want"] == "agent-want"
     assert store.agent_card(PERSON)["offers"] == "card-offers"
+    assert store.agent_card(PERSON)["ledger_keyid"] == "77" * 32
 
     for table, (pk_cols, columns) in Store._ENCRYPTED.items():
         rows = store._q(f"SELECT {', '.join((*pk_cols, *columns))} FROM {table}")

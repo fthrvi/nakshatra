@@ -114,6 +114,9 @@ class NakClient:
     def task_submit(self, task: str, output: str) -> dict:
         return self.call("task_submit", task=task, output=output)
 
+    def escrow_status(self, task: str) -> dict:
+        return self.call("escrow_status", task=task)
+
 
 def render_tasks(rows: list) -> str:
     """Tasks for an AGENT. An offer is a REQUEST from another person, framed as untrusted: doing it is a
@@ -127,7 +130,12 @@ def render_tasks(rows: list) -> str:
     out = []
     for r in rows:
         sp, who = r["spec"], _esc(r.get("peer_name") or (r.get("peer") or r.get("assignee") or "")[:12])
-        line = f"[{r['task_hash'][:12]}] {r['role']} · {r['state']} · '{_esc(sp['title'])}' · reward {sp['reward']['amount']} TEST"
+        line = (f"[{r['task_hash'][:12]}] {r['role']} · {r['state']} · '{_esc(sp['title'])}' · "
+                f"reward {sp['reward']['amount']} {sp['reward']['unit']}")
+        funding = r.get("funding_state")
+        if funding:
+            shown = "funded (payment pending)" if funding == "pending" else funding
+            line += f" · escrow {shown}"
         if r["role"] == "worker":
             line += (f" · from {who}\n  passes if: {describe_rules(sp['acceptance'])}\n"
                      f"  <untrusted_request {_who(r)}>\n  {_esc(sp['instructions'])}\n  </untrusted_request>")
@@ -177,6 +185,9 @@ def render_agent_thread(result: dict) -> str:
              f"thread {_esc(result['thread'])} peer={_esc(str(result.get('peer', ''))[:16])}"]
     for message in result["messages"]:
         want = f' want="{_esc(message["want"])}"' if message.get("want") is not None else ""
+        budget = message.get("budget")
+        proposed = (f' budget_amount="{int(budget["amount"])}" budget_unit="credits"'
+                    if isinstance(budget, dict) else "")
         if message.get("from_me") is True:
             provenance = 'from="me" from_me="true"'
         else:
@@ -186,6 +197,6 @@ def render_agent_thread(result: dict) -> str:
                           'from_me="false"')
         lines.append(f"<message {provenance} created={int(message.get('created') or 0)} "
                      f"mid=\"{_esc(message.get('mid', ''))}\" intent=\"{_esc(message.get('intent', ''))}\" "
-                     f"reply_to=\"{_esc(message.get('reply_to') or '')}\"{want}>\n"
+                     f"reply_to=\"{_esc(message.get('reply_to') or '')}\"{want}{proposed}>\n"
                      f"{_esc(message.get('text', ''))}\n</message>")
     return "\n".join(lines)

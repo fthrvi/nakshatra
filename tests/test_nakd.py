@@ -129,7 +129,8 @@ def test_agent_cards_and_threaded_ask_answer_are_exchanged_and_encrypted(net):
     assert wait(lambda: (b.node.store.contact(a.person_pub) or {}).get("state") == "active")
     assert wait(lambda: (b.node.store.agent_card(a.person_pub) or {}).get("offers") == offers_marker)
     assert wait(lambda: a.node.store.agent_card(b.person_pub) is not None)
-    ask = a.node.agent_send("bob", text_marker, intent="ask", want=want_marker, harness="openclaw")
+    ask = a.node.agent_send("bob", text_marker, intent="ask", want=want_marker,
+                            budget={"amount": 7, "unit": "credits"}, harness="openclaw")
     assert wait(lambda: a.node.delivered(ask["queued"]))
     assert wait(lambda: len(b.node.store.agent_thread(ask["thread"])[1]) == 1)
     answer = b.node.agent_send("alice", "the answer", intent="answer", thread=ask["thread"],
@@ -145,6 +146,7 @@ def test_agent_cards_and_threaded_ask_answer_are_exchanged_and_encrypted(net):
         assert party.node.threads()[0]["count"] == 2
     assert a.node.thread(ask["thread"])[1][1]["trust"] == "external"
     assert b.node.thread(ask["thread"])[1][0]["trust"] == "external"
+    assert b.node.thread(ask["thread"])[1][0]["budget"] == {"amount": 7, "unit": "credits"}
 
     markers = [offers_marker.encode(), text_marker.encode(), want_marker.encode()]
     for party in (a, b):
