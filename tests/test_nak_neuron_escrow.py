@@ -34,6 +34,11 @@ class FakeTaskLedger:
         self.transitions = []
         self.fail_pay = False
         self.fail_authorize = False
+        self.refuse_authorize = 0        # HTTP status of a definitive refusal
+        self.drop_response = False       # commit the hold, then lose the answer
+        self.after_commit = None         # hook run after the hold commits (before the answer)
+        self.lie_open_once = False       # one stale status read that still says open
+        self.sweep_on_pay = False        # the ledger's own sweep refunds the hold as pay arrives
         self.status_override = None
 
     def fund(self, keyid, amount):
@@ -48,6 +53,10 @@ class FakeTaskLedger:
     def authorize(self, payer, task_hash, worker, amount, deadline):
         if self.fail_authorize:
             raise SettlementError("ledger down")
+        if self.refuse_authorize:
+            error = SettlementError("refused")
+            error.status = self.refuse_authorize
+            raise error
         terms = (task_hash, worker, amount, deadline)
         prior = self.nonces.get((payer, task_hash))
         if prior:
@@ -66,12 +75,20 @@ class FakeTaskLedger:
         self.nonces[(payer, task_hash)] = hold_id
         self.transitions.append((hold_id, "open"))
         self.check()
+        if self.after_commit:
+            self.after_commit()
+        if self.drop_response:
+            self.drop_response = False
+            raise SettlementError("Neuron ledger /spend/task/authorize unavailable (TimeoutError)")
         return copy.deepcopy(row)
 
     def status(self, caller, hold_id):
         row = copy.deepcopy(self.holds[hold_id])
         if caller not in {row["payer_account"], row["worker_keyid"]}:
             raise SettlementError("task hold not found")
+        if self.lie_open_once and caller == row["payer_account"]:
+            self.lie_open_once = False
+            row["state"] = "open"
         if self.status_override and caller == row["worker_keyid"]:
             row.update(self.status_override)
         return row
@@ -82,8 +99,14 @@ class FakeTaskLedger:
         row = self.holds[hold_id]
         if row["payer_account"] != payer:
             raise SettlementError("task hold not found")
+        if self.sweep_on_pay and row["state"] == "open":
+            row["state"] = "refunded"
+            self.balances[payer] += row["amount"]
+            self.transitions.append((hold_id, "refunded"))
         if row["state"] == "refunded":
-            raise SettlementError("task hold is refunded")
+            error = SettlementError("task hold is refunded")
+            error.status = 409
+            raise error
         if row["state"] == "open":
             row["state"] = "paid"
             self.balances[row["worker_keyid"]] = self.balances.get(row["worker_keyid"], 0) + row["amount"]
@@ -173,6 +196,8 @@ class ReplayLedgerHTTP:
         body = request.data or b""
         keyid, sig, ts = match.group(1), match.group(2), int(match.group(3))
         if not nakshatra_auth.verify_request(keyid, request.method, path, body, ts, sig):
+            raise self._fail(request, 401)
+        if abs(time.time() - ts) > 60:                       # the ledger's +/-60 s window
             raise self._fail(request, 401)
         nonce = hashlib.sha256(sig.encode()).hexdigest()
         with self.lock:
@@ -514,20 +539,149 @@ def test_loser_of_a_claim_race_gets_the_clean_reject_and_no_hold(net):
     assert poster.node.store.task_get(task_hash, "poster")["assignee"] == w1.person_pub
 
 
-def test_failed_authorize_after_the_cas_puts_the_task_back_for_a_retry(net):
+def test_definitive_refusal_puts_the_task_back_and_the_worker_can_claim_again(net):
     poster, worker, ledger = _pair(net)
-    ledger.fail_authorize = True
+    ledger.refuse_authorize = 402
     task_hash = _post_and_claim(poster, worker)
     assert wait(lambda: any(row["refused"] for row in worker.node.store.outbox()))
     row = poster.node.store.task_get(task_hash, "poster")
     assert row["state"] == "posted" and not row["assignee"] and not row["hold_id"]
     assert ledger.holds == {}
-    ledger.fail_authorize = False                       # the same worker claims again: clean assignment
-    worker.node.store.task_cas(task_hash, "worker", poster.person_pub, ("claimed",), state="offered")
+    # the nack carried the reopen marker: the worker's row went back to `offered` by itself
+    assert wait(lambda: _worker_row(worker.node, task_hash)[0]["state"] == "offered")
+    ledger.refuse_authorize = 0
     worker.node.claim_task(task_hash)
     assert wait(lambda: _worker_row(worker.node, task_hash)[0]["state"] == "assigned")
     row = poster.node.store.task_get(task_hash, "poster")
     assert row["hold_id"] and row["funding_state"] == "funded" and len(ledger.holds) == 1
+
+
+def test_ambiguous_authorize_leaves_the_task_pending_and_reconcile_adopts_the_same_hold(net):
+    poster, worker, ledger = _pair(net)
+    ledger.drop_response = True                          # hold commits, the answer is lost
+    task_hash = _post_and_claim(poster, worker)
+    assert wait(lambda: len(ledger.holds) == 1)
+    assert wait(lambda: poster.node.store.task_get(task_hash, "poster")["funding_reason"].startswith("escrow:"))
+    row = poster.node.store.task_get(task_hash, "poster")
+    assert row["state"] == "assigned" and row["funding_state"] == "pending" and not row["hold_id"]
+    poster.node.reconcile_escrow()                       # re-runs the idempotent authorize
+    row = poster.node.store.task_get(task_hash, "poster")
+    assert row["hold_id"] == next(iter(ledger.holds)) and row["funding_state"] == "funded"
+    assert len(ledger.holds) == 1
+    assert wait(lambda: _worker_row(worker.node, task_hash)[0]["state"] == "assigned")
+    assert wait(lambda: _worker_row(worker.node, task_hash)[0]["funding_state"] == "funded")
+
+
+def test_ambiguous_authorize_then_expiry_refunds_the_unrecorded_hold(net):
+    poster, worker, ledger = _pair(net)
+    ledger.drop_response = True
+    task_hash = poster.node.post_task(worker.dir.name, "drill", "Say ok.", [{"contains_all": ["ok"]}],
+                                      reward=5, deadline_s=2)["task_hash"]
+    assert wait(lambda: _worker_row(worker.node, task_hash))
+    worker.node.claim_task(task_hash)
+    assert wait(lambda: len(ledger.holds) == 1)
+    time.sleep(2.2)
+    poster.node.sweep()
+    poster.node.sweep()
+    assert poster.node.store.task_get(task_hash, "poster")["state"] == "expired"
+    assert [event for _hold, event in ledger.transitions] == ["open", "refunded"]
+    assert ledger.balances[poster.node.node] == 100
+
+
+def test_hold_opened_for_a_task_that_expired_meanwhile_is_refunded(net):
+    poster, worker, ledger = _pair(net)
+
+    def expire_now():
+        poster.node.store.task_cas(task_hash, "poster", "", ("assigned",), state="expired")
+    task_hash = poster.node.post_task(worker.dir.name, "drill", "Say ok.", [{"contains_all": ["ok"]}],
+                                      reward=5)["task_hash"]
+    assert wait(lambda: _worker_row(worker.node, task_hash))
+    ledger.after_commit = expire_now
+    worker.node.claim_task(task_hash)
+    assert wait(lambda: [e for _h, e in ledger.transitions] == ["open", "refunded"])
+    assert poster.node.store.task_get(task_hash, "poster")["hold_id"] is None
+    assert ledger.balances[poster.node.node] == 100
+
+
+def test_reconcile_adopts_the_ledgers_state_when_release_is_refused(net):
+    poster, worker, ledger = _pair(net)
+    task_hash = _assign(poster, worker)
+    ledger.sweep_on_pay = True                           # the ledger's sweep refunds it as pay arrives
+    worker.node.submit_task(task_hash, "ok")
+    assert wait(lambda: poster.node.store.task_get(task_hash, "poster")["state"] == "accepted")
+    assert wait(lambda: poster.node.store.task_get(task_hash, "poster")["funding_state"] == "pending")
+    ledger.lie_open_once = True       # reconcile reads a stale `open`, tries release, gets 409
+    assert poster.node.reconcile_escrow() == 1
+    assert poster.node.store.task_get(task_hash, "poster")["funding_state"] == "refunded"
+    assert [e for _h, e in ledger.transitions] == ["open", "refunded"]
+    assert poster.node.reconcile_escrow() == 0
+
+
+def _window_adapter(monkeypatch, now=1_800_000_000.0):
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+    clock = [now]
+    monkeypatch.setattr(settle_mod.time, "time", lambda: clock[0])
+    key = ed25519.Ed25519PrivateKey.generate()
+    keyid = key.public_key().public_bytes_raw().hex()
+    ledger = FakeTaskLedger()
+    ledger.fund(keyid, 100)
+    http = ReplayLedgerHTTP(ledger)
+    adapter = NeuronEscrowAdapter("https://ledger.test", "ab" * 32, key.private_bytes_raw(), keyid,
+                                  opener=http)
+    th = "12" * 32
+    adapter.open(th, "p", 7, "credits", int(now) + 600,
+                 {"task_hash": th, "amount": 7, "mint": "credits"}, worker_keyid="34" * 32)
+    return adapter, http, clock, th
+
+
+def test_signing_backlog_is_refused_locally_and_never_locks_the_ledger_out(monkeypatch):
+    adapter, http, clock, th = _window_adapter(monkeypatch)
+    sent_before = len(http.timestamps)
+    ok = busy = 0
+    for _ in range(150):                                 # 150 calls inside one second
+        try:
+            adapter.status(th)
+            ok += 1
+        except settle_mod.LedgerBusy:
+            busy += 1
+    assert ok == settle_mod.MAX_TS_LEAD_S and busy == 150 - ok   # open() took the first slot
+    assert len(http.timestamps) - sent_before == ok                      # busy calls sent nothing
+    assert max(http.timestamps) <= clock[0] + settle_mod.MAX_TS_LEAD_S   # never ran ahead of the window
+    started = time.perf_counter()
+    with pytest.raises(settle_mod.LedgerBusy):
+        adapter.status(th)
+    assert time.perf_counter() - started < 0.05
+    clock[0] += 40                                       # the clock catches up: calls work again
+    assert adapter.status(th)["state"] == "open"
+    assert adapter.release(th, "w")["event"] == "released"
+
+
+def test_recovery_loop_over_many_stranded_tasks_defers_instead_of_locking_out(monkeypatch):
+    adapter, http, clock, th = _window_adapter(monkeypatch)
+    served = deferred = 0
+    for _ in range(40):                                  # reconcile: status (+ settle) per task
+        for _call in range(3):
+            try:
+                adapter.status(th)
+                served += 1
+            except settle_mod.LedgerBusy:
+                deferred += 1
+    assert served > 0 and deferred > 0
+    clock[0] += 61                                       # next sweep: everything works, no 401 residue
+    for _ in range(10):
+        assert adapter.status(th)["state"] == "open"
+
+
+def test_a_401_is_not_retried_when_the_timestamp_is_already_ahead_of_the_clock(monkeypatch):
+    adapter, http, clock, th = _window_adapter(monkeypatch)
+    for _ in range(10):
+        adapter.status(th)                               # push _last_ts ahead of the clock
+    sent = []
+    adapter._opener = lambda request, **k: (sent.append(1), (_ for _ in ()).throw(
+        urllib.error.HTTPError(request.full_url, 401, "no", {}, io.BytesIO(b"{}"))))[1]
+    with pytest.raises(SettlementError, match="HTTP 401"):
+        adapter.status(th)
+    assert len(sent) == 1
 
 
 def test_worker_refuses_a_hold_that_expires_before_the_task_deadline(net):

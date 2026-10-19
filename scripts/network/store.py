@@ -426,6 +426,11 @@ class Store:
         r = self._q("SELECT refused FROM outbox WHERE nonce=?", (nonce,))
         return self._dec("outbox", "refused", self._pk((nonce,)), r[0][0]) if r else None
 
+    def outbox_frame(self, nonce: str, to_person: str) -> Optional[dict]:
+        """The frame we queued under `nonce` to `to_person` (None if it is not ours to that person)."""
+        r = self._q("SELECT frame FROM outbox WHERE nonce=? AND to_person=?", (nonce, to_person))
+        return json.loads(self._dec("outbox", "frame", self._pk((nonce,)), r[0][0])) if r else None
+
     def delivered(self, nonce: str) -> bool:
         r = self._q("SELECT acked FROM outbox WHERE nonce=?", (nonce,))
         return bool(r and r[0][0])

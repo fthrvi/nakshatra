@@ -47,6 +47,15 @@ class HoldConflict(SettlementError):
     status = 409
 
 
+class LedgerBusy(SettlementError):
+    """Local, retryable: signing timestamps ran too far ahead of the clock; nothing was sent."""
+
+
+# Largest lead of a request timestamp over the wall clock. The ledger accepts +/-60 s, so a
+# backlog beyond this is refused locally instead of being sent into a 401 lockout.
+MAX_TS_LEAD_S = 30
+DEFINITIVE_STATUSES = frozenset({402, 403, 404, 409, 422})
+
 _STATUS_ERRORS = {402: InsufficientFunds, 404: HoldNotFound, 409: HoldConflict}
 
 
@@ -199,8 +208,12 @@ class NeuronEscrowAdapter(SettlementAdapter):
         """Whole-second timestamp, strictly increasing per adapter: Ed25519 is deterministic and
         the ledger rejects a replayed signature, so two requests must never share (signature)."""
         with self._ts_lock:
-            self._last_ts = max(int(time.time()), self._last_ts + 1)
-            return self._last_ts
+            now = int(time.time())
+            ts = max(now, self._last_ts + 1)
+            if ts > now + MAX_TS_LEAD_S:
+                raise LedgerBusy("Neuron ledger signing backlog; retry shortly")
+            self._last_ts = ts
+            return ts
 
     def _request(self, method: str, path: str, body: Optional[dict] = None) -> dict:
         raw = b"" if body is None else json.dumps(
@@ -209,7 +222,7 @@ class NeuronEscrowAdapter(SettlementAdapter):
         value = None
         # one retry on 401: another process (nak CLI vs nakd) may have used the same second
         for attempt in (0, 1):
-            authorization, _timestamp = nakshatra_auth.build_signed_envelope(
+            authorization, sent_ts = nakshatra_auth.build_signed_envelope(
                 self.private_key, self.keyid, method, path, raw, self._next_ts())
             request = urllib.request.Request(
                 self.url + path, data=raw if method == "POST" else None,
@@ -221,10 +234,12 @@ class NeuronEscrowAdapter(SettlementAdapter):
                     value = json.loads(response.read())
                 break
             except urllib.error.HTTPError as exc:
-                if exc.code == 401 and attempt == 0:
+                # only a same-second collision (ts not ahead of the clock) is worth a retry
+                if exc.code == 401 and attempt == 0 and sent_ts <= int(time.time()):
                     continue
                 error = _STATUS_ERRORS.get(exc.code, SettlementError)(
                     f"Neuron ledger {label} refused HTTP {exc.code}")
+                error.status = exc.code
                 raise error from exc
             except Exception as exc:  # noqa: BLE001 - enforce mode fails every dependency error closed
                 raise SettlementError(

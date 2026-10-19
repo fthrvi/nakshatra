@@ -55,7 +55,7 @@ from network.agent import (AGENT_MSG_VERSION, CARD_SUPPORT, CARD_VERSION, INTENT
                            validate_agent_message, validate_card)  # noqa: E402
 from network.store import Store  # noqa: E402
 from network import tasks as T  # noqa: E402
-from network.settle import SettlementError  # noqa: E402
+from network.settle import DEFINITIVE_STATUSES, SettlementError  # noqa: E402
 import accounting as _accounting  # noqa: E402
 from transport.connect import (accept_direct, local_endpoints, open_channel, open_direct,  # noqa: E402
                                open_via_sidecar)
@@ -177,6 +177,18 @@ class DataKeyError(RuntimeError):
 
 
 # ── the node ────────────────────────────────────────────────────────────────────────────────────
+
+class EscrowRefused(ValueError):
+    """Opening the escrow failed. `definitive` = the ledger answered with a refusal (no hold can
+    exist); otherwise the outcome is unknown (timeout, 5xx, backlog) and a hold may exist."""
+
+    def __init__(self, message: str, definitive: bool = False):
+        super().__init__(message)
+        self.definitive = definitive
+
+
+REOPENED = "task reopened: "     # nack prefix: the claim was refused AND the task is claimable again
+
 
 class Node:
     def __init__(self, state_dir: Path, node_key: bytes, signer: Callable[[dict], dict], *,
@@ -774,6 +786,8 @@ class Node:
                             advertise_endpoints_once()
                     elif t == "nack":   # received and refused: terminal, stop retrying, keep why
                         self.store.refuse(str(frame.get("mid", "")), str(frame.get("why", "")), person)
+                        if str(frame.get("why", "")).startswith(REOPENED):
+                            self._claim_reopened(str(frame.get("mid", "")), person)
                         self.log(f"{person[:12]} refused {str(frame.get('mid', ''))[:8]}: {frame.get('why')}")
             except (OSError, SecureChannelError, ValueError) as e:
                 self.log(f"session {person[:12]}: {e}")
@@ -1014,7 +1028,7 @@ class Node:
             return self.settle.open(h, self.person, amount, unit, spec["deadline"], authorisation,
                                     worker_keyid=worker_keyid)
         except SettlementError as e:
-            raise ValueError(f"escrow: {e}")
+            raise EscrowRefused(f"escrow: {e}", definitive=e.status in DEFINITIVE_STATUSES)
 
     def _set_funding(self, h: str, role: str, peer: str, state: str, reason: str = "") -> bool:
         task = self.store.task_get(h, role, peer)
@@ -1048,10 +1062,73 @@ class Node:
             except Exception as e:  # noqa: BLE001 — a sweep bug must never kill the node
                 self.log(f"sweep failed: {e}")
 
+    def _claim_reopened(self, mid: str, person: str) -> None:
+        """The poster refused our claim and put the task back up: make it claimable again here.
+        Only for a task.claim WE sent to that poster, and only while it is still `claimed`."""
+        frame = self.store.outbox_frame(mid, person) or {}
+        h = (frame.get("body") or {}).get("task_hash")
+        if frame.get("kind") == "task.claim" and isinstance(h, str):
+            self.store.task_cas(h, "worker", person, ("claimed",), state="offered")
+
+    def _open_assignment(self, h: str, person: str) -> None:
+        """Open (or, idempotently, re-open) the task hold for an `assigned` task that has none yet,
+        record it, and only then tell the worker. client_nonce is the task hash, so a repeat after an
+        ambiguous failure returns the SAME hold. Definitive ledger refusal: put the task back to
+        `posted` (no hold can exist) and raise with the REOPENED marker. Unknown outcome (timeout,
+        5xx, backlog): leave it assigned/pending so the next claim replay or sweep retries it."""
+        t = self.store.task_get(h, "poster", "")
+        card = self.store.agent_card(person) or {}
+        if not t or t["state"] != "assigned" or t["assignee"] != person or t["hold_id"]:
+            return
+        if card.get("ledger_keyid") != (self.store.contact(person) or {}).get("node"):
+            self.store.task_cas(h, "poster", "", ("assigned",), state="posted", assignee=None,
+                                epoch=0, funding_state="unfunded", funding_reason="")
+            raise ValueError(REOPENED + "the contact's card ledger key is not its node key")
+        try:
+            receipt = self._open_escrow(h, t["spec"], authorisation=t["escrow_auth"],
+                                        worker_keyid=card["ledger_keyid"])
+        except EscrowRefused as e:
+            if not e.definitive:
+                self.store.task_cas(h, "poster", "", ("assigned",), funding_state="pending",
+                                    funding_reason=str(e)[:200])
+                raise ValueError(f"escrow pending: {e}")
+            self.store.task_cas(h, "poster", "", ("assigned",), state="posted", assignee=None,
+                                epoch=0, funding_state="unfunded", funding_reason="")
+            raise ValueError(REOPENED + str(e))
+        hold_id = receipt["hold_id"]
+        # Record the hold durably BEFORE the assignment is sent or observed as funded.
+        if not self.store.task_cas(h, "poster", "", ("assigned",), hold_id=hold_id,
+                                   funding_state="funded", funding_reason=""):
+            # the task left `assigned` (expired) while the hold was opening: refund it now
+            try:
+                self.settle.refund(h, "task no longer assigned", hold_id=hold_id)
+            except SettlementError as e:
+                self.log(f"could not refund orphan hold for {h[:12]}: {e}")
+            return
+        if t["spec"]["deadline"] <= time.time():
+            return          # hold recorded; the next sweep expires the task and refunds it
+        self._queue(person, "task.assign", {"task_hash": h, "epoch": 1, "worker": person,
+                                            "hold_id": hold_id})
+        self.log(f"task {h[:12]} assigned to {person[:12]}")
+
+    def _finish_pending_assignments(self) -> None:
+        """Retry assignments left `assigned` with no hold (the ledger was unreachable or its answer
+        was lost): the idempotent authorize either returns the hold we already opened or refuses."""
+        if not self.settle.open_on_assign:
+            return
+        for t in self.store.tasks_in_states(("assigned",), role="poster"):
+            if t["hold_id"] or t["spec"]["reward"]["amount"] <= 0 or not t["assignee"]:
+                continue
+            try:
+                self._open_assignment(t["task_hash"], t["assignee"])
+            except ValueError as e:
+                self.log(f"assignment of {t['task_hash'][:12]} still not funded: {e}")
+
     def reconcile_escrow(self) -> int:
         """Settle escrow left OPEN for a task already in a final state (a crash between the state
         change and the settlement). The ledger's own CAS keeps this exactly-once. Returns how many."""
         fixed = 0
+        self._finish_pending_assignments()
         for t in self.store.tasks_in_states(("accepted", "rejected", "expired"), role="poster"):
             if t["spec"]["reward"]["amount"] <= 0:
                 continue
@@ -1125,6 +1202,9 @@ class Node:
             if t["spec"]["deadline"] > now:
                 continue
             if t["role"] == "poster" and t["state"] in ("posted", "assigned"):
+                if (self.settle.open_on_assign and t["state"] == "assigned" and not t["hold_id"]
+                        and t["spec"]["reward"]["amount"] > 0):
+                    continue    # a hold may exist unrecorded; reconcile re-runs the idempotent authorize
                 if self.store.task_cas(t["task_hash"], "poster", "", ("posted", "assigned"), state="expired",
                                        verdict=json.dumps({"passed": False, "reasons": ["deadline passed"]})):
                     receipt = self._settle(t["task_hash"], t["spec"], "refund", reason="expired",
@@ -1271,9 +1351,7 @@ class Node:
             if card["ledger_keyid"] != c["node"]:
                 raise ValueError("the contact's card ledger key is not its node key")
             # Winner selection FIRST (CAS posted -> assigned, funding pending, no hold yet): a losing
-            # claimant gets the clean reject and no hold is ever authorized for it. A claim replayed
-            # by the same assignee after a crash finds the task still assigned with no hold_id and
-            # re-runs the (idempotent) authorize, which returns the same hold.
+            # claimant gets the clean reject and no hold is ever authorized for it.
             won = self.store.task_cas(h, "poster", "", ("posted",), state="assigned",
                                       assignee=c["person"], epoch=1,
                                       funding_state="pending", funding_reason="opening task hold")
@@ -1285,28 +1363,7 @@ class Node:
                         self._queue(c["person"], "task.reject", {"task_hash": h, "epoch": 0,
                                                                  "reasons": ["already assigned to someone else"]})
                     return
-            try:
-                receipt = self._open_escrow(h, t["spec"], authorisation=t["escrow_auth"],
-                                            worker_keyid=card["ledger_keyid"])
-            except ValueError:
-                # No hold exists, so put the task back where the poster (or another claimant) can
-                # retry it, or refund/expire it cleanly. Only while it is still our unfunded claim.
-                self.store.task_cas(h, "poster", "", ("assigned",), state="posted",
-                                    assignee=None, epoch=0, funding_state="unfunded", funding_reason="")
-                raise
-            hold_id = receipt["hold_id"]
-            # Record the hold durably BEFORE the assignment is sent or observed as funded.
-            if not self.store.task_cas(h, "poster", "", ("assigned",), hold_id=hold_id,
-                                       funding_state="funded", funding_reason=""):
-                # the task left `assigned` (expired) while the hold was opening: refund it now
-                try:
-                    self.settle.refund(h, "task no longer assigned", hold_id=hold_id)
-                except SettlementError as e:
-                    self.log(f"could not refund orphan hold for {h[:12]}: {e}")
-                return
-            self._queue(c["person"], "task.assign", {"task_hash": h, "epoch": 1, "worker": c["person"],
-                                                     "hold_id": hold_id})
-            self.log(f"task {h[:12]} assigned to {who}")
+            self._open_assignment(h, c["person"])
             return
         if kind == "task.assign":
             if body.get("worker") != self.person or not isinstance(body.get("epoch"), int):
