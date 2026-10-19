@@ -6,7 +6,7 @@ On create add a row (status=active, owner). On merge flip to `merged→<sha>`.
 | branch | sector | description | base | status | owner |
 |---|---|---|---|---|---|
 | net/agent-msg-v1 | network | M1: typed threaded `agent.msg` v1 and contact-only agent cards (encrypted at rest, per-contact threads, CLI + MCP); installer restarts signer and checks its data key before nak-net; release-url 0600. | forgejo/main@4c77d79 | merged→0f247f2 | codex (network lane) |
-| net/grant-renew-caps | network | `nak grant renew --per-tx-cap/--day-cap`: human-only way to set the agent's nak.pay limits (renew otherwise preserves them; there was no way to raise them from 0). | forgejo/main@4c8a816 | active | claude (network lane) |
+| net/grant-renew-caps | network | `nak grant renew --per-tx-cap/--day-cap`: human-only way to set the agent's nak.pay limits (renew otherwise preserves them; there was no way to raise them from 0). | forgejo/main@4c8a816 | merged→61318b2 | claude (network lane) |
 | net/task-escrow-neuron | network | M2: task rewards escrow on the Neuron ledger (devnet credits) via a fixed-price task hold; contact card advertises the payee ledger key; offers may carry a budget. | forgejo/main@4eedd50 | merged→d5dead6 | codex (network lane) |
 | net/grant-visibility-at-rest | network | M0.5 synchronous grant-status checks, operator visibility, encrypted messaging store/raw log migration, and private state-file modes. | forgejo/main@4e738e2 | merged→2a971dd | codex (network lane) |
 | deploy/image-freshness | deploy | nakc rebuilds a stale container image (input fingerprint label), keeps -prev for rollback, and nakc update recreates containers on an old image. | forgejo/main@e0fa53c | merged→3384d49 | codex (network lane) |
