@@ -32,7 +32,22 @@ import nakshatra_auth
 
 
 class SettlementError(RuntimeError):
-    pass
+    status = 0  # HTTP status when the ledger refused the call, else 0
+
+
+class InsufficientFunds(SettlementError):
+    status = 402
+
+
+class HoldNotFound(SettlementError):
+    status = 404
+
+
+class HoldConflict(SettlementError):
+    status = 409
+
+
+_STATUS_ERRORS = {402: InsufficientFunds, 404: HoldNotFound, 409: HoldConflict}
 
 
 class SettlementAdapter:
@@ -162,6 +177,8 @@ class NeuronEscrowAdapter(SettlementAdapter):
         self.timeout = float(timeout)
         self._opener = opener
         self._holds: dict[str, str] = {}
+        self._ts_lock = threading.Lock()
+        self._last_ts = 0
         if self.mode != "enforce":
             raise SettlementError("Neuron task escrow requires NAKSHATRA_LEDGER_MODE=enforce")
         if not self.url.startswith("https://"):
@@ -178,24 +195,40 @@ class NeuronEscrowAdapter(SettlementAdapter):
         return nakshatra_auth.open_pillar_url(
             request, timeout=self.timeout, expected_spki_hash=self.spki_sha256)
 
+    def _next_ts(self) -> int:
+        """Whole-second timestamp, strictly increasing per adapter: Ed25519 is deterministic and
+        the ledger rejects a replayed signature, so two requests must never share (signature)."""
+        with self._ts_lock:
+            self._last_ts = max(int(time.time()), self._last_ts + 1)
+            return self._last_ts
+
     def _request(self, method: str, path: str, body: Optional[dict] = None) -> dict:
         raw = b"" if body is None else json.dumps(
             body, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
-        authorization, _timestamp = nakshatra_auth.build_signed_envelope(
-            self.private_key, self.keyid, method, path, raw)
-        request = urllib.request.Request(
-            self.url + path, data=raw if method == "POST" else None,
-            headers={"Authorization": authorization,
-                     **({"Content-Type": "application/json"} if method == "POST" else {})},
-            method=method)
-        try:
-            with self._open(request) as response:
-                value = json.loads(response.read())
-        except urllib.error.HTTPError as exc:
-            raise SettlementError(f"Neuron ledger {path.split('?')[0]} refused HTTP {exc.code}") from exc
-        except Exception as exc:  # noqa: BLE001 - enforce mode fails every dependency error closed
-            raise SettlementError(
-                f"Neuron ledger {path.split('?')[0]} unavailable ({type(exc).__name__})") from exc
+        label = path.split("?")[0]
+        value = None
+        # one retry on 401: another process (nak CLI vs nakd) may have used the same second
+        for attempt in (0, 1):
+            authorization, _timestamp = nakshatra_auth.build_signed_envelope(
+                self.private_key, self.keyid, method, path, raw, self._next_ts())
+            request = urllib.request.Request(
+                self.url + path, data=raw if method == "POST" else None,
+                headers={"Authorization": authorization,
+                         **({"Content-Type": "application/json"} if method == "POST" else {})},
+                method=method)
+            try:
+                with self._open(request) as response:
+                    value = json.loads(response.read())
+                break
+            except urllib.error.HTTPError as exc:
+                if exc.code == 401 and attempt == 0:
+                    continue
+                error = _STATUS_ERRORS.get(exc.code, SettlementError)(
+                    f"Neuron ledger {label} refused HTTP {exc.code}")
+                raise error from exc
+            except Exception as exc:  # noqa: BLE001 - enforce mode fails every dependency error closed
+                raise SettlementError(
+                    f"Neuron ledger {label} unavailable ({type(exc).__name__})") from exc
         if not isinstance(value, dict):
             raise SettlementError("Neuron ledger returned a non-object task response")
         return value
