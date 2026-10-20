@@ -1751,7 +1751,8 @@ def _grant_renew(args) -> int:
         raise SystemExit("--idle-days must be between 1 and 90 days")
     if not 1 <= args.lease_days <= 7:
         raise SystemExit("--lease-days must be between 1 and 7 days")
-    for flag, value in (("--per-tx-cap", args.per_tx_cap), ("--day-cap", args.day_cap)):
+    for flag, value in (("--per-tx-cap", args.per_tx_cap), ("--day-cap", args.day_cap),
+                        ("--verdict-auto-max", args.verdict_auto_max)):
         if value is not None and not 0 <= value <= MAX_SPEND_CAP:
             raise SystemExit(f"{flag} must be between 0 and {MAX_SPEND_CAP} base units")
     signer_dir, _net_dir, agent = _grant_paths()
@@ -1801,14 +1802,33 @@ def _grant_renew_confined(args, signer_dir: Path, agent: str, signer_mod, agent_
         if value is not None and constraints.get(name) != value:
             cap_changes.append(f"{name} {constraints.get(name, 0)} -> {value}")
             constraints[name] = value
+    from network import verdict as verdict_policy
+    policy_changes = []
+    requested_policy = (
+        ("verdict_mode", args.verdict),
+        ("verdict_auto_max", args.verdict_auto_max),
+        ("verdict_ask_strangers", None if args.verdict_ask_strangers is None
+         else args.verdict_ask_strangers == "yes"),
+    )
+    for name, value in requested_policy:
+        if value is not None and constraints.get(name, {
+                "verdict_mode": verdict_policy.DEFAULT_MODE,
+                "verdict_auto_max": verdict_policy.DEFAULT_AUTO_MAX,
+                "verdict_ask_strangers": verdict_policy.DEFAULT_ASK_STRANGERS,
+        }[name]) != value:
+            policy_changes.append(f"{name} -> {str(value).lower()}")
+            constraints[name] = value
+    effective_policy = verdict_policy.policy(constraints)
     person_key = Path.home() / ".sthambha" / "person-TEST.key"
     fallback = _delegate_reuse_command(
         signer_dir, person_key, agent, caps, args.ttl,
         args.idle_days, args.lease_days, args.no_lease)
     if not person_key.is_file():
-        if cap_changes:
+        if cap_changes or policy_changes:
             print(f"person key is not available at {person_key}; the grant was not changed.\n"
-                  "Spend caps can only be changed where the person key is available.", file=sys.stderr)
+                  "Spend caps can only be changed where the person key is available; verdict policy "
+                  "has the same human-only boundary.",
+                  file=sys.stderr)
             return 1
         print(f"person key is not available at {person_key}; the grant was not changed.\n"
               "Run this human delegation command where the person key and signer state are available:\n"
@@ -1819,6 +1839,9 @@ def _grant_renew_confined(args, signer_dir: Path, agent: str, signer_mod, agent_
         detail = f"; explicitly adding {','.join(widening)}" if widening else ""
         if cap_changes:
             detail += f"; spend caps {', '.join(cap_changes)}"
+        if policy_changes:
+            detail += f"; verdict policy {', '.join(policy_changes)}"
+        detail += f"; answers: {verdict_policy.describe(effective_policy)}"
         behaviour = ("as a fixed-expiry legacy grant"
                      if args.no_lease else
                      f"as a charter active while used (a {args.lease_days}-day wire lease; "
@@ -1847,6 +1870,7 @@ def _grant_renew_confined(args, signer_dir: Path, agent: str, signer_mod, agent_
     if cap_changes:
         print(f"spend caps now {renewed['constraints'].get('per_tx_cap', 0)} per payment, "
               f"{renewed['constraints'].get('day_cap', 0)} per day (base units)")
+    print("verdict policy: " + verdict_policy.describe(verdict_policy.policy(renewed.get("constraints"))))
     authority = ("fixed-expiry legacy grant"
                  if args.no_lease else
                  f"charter active while used; {args.lease_days}-day wire leases; "
@@ -1864,6 +1888,9 @@ def _print_grant_status(grant: dict) -> None:
            time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(grant['expires_at']))))
     if grant.get("warning"):
         print(f"WARNING: {grant['warning']}")
+    if grant.get("verdict_policy"):
+        from network.verdict import describe
+        print("paid-task verdicts: " + describe(grant["verdict_policy"]))
 
 
 class _NoAbbrevArgumentParser(argparse.ArgumentParser):
@@ -1898,6 +1925,12 @@ def main(argv=None, *, http_post=None) -> int:
                    help="set the agent's nak.pay limit per payment (base units); omitted preserves it")
     q.add_argument("--day-cap", type=int, default=None, metavar="N",
                    help="set the agent's nak.pay limit per day (base units); omitted preserves it")
+    q.add_argument("--verdict", choices=["auto", "ask", "threshold"], default=None,
+                   help="paid answer policy; omitted preserves it")
+    q.add_argument("--verdict-auto-max", type=int, default=None, metavar="N",
+                   help="threshold auto-accept maximum in credit base units; omitted preserves it")
+    q.add_argument("--verdict-ask-strangers", choices=["yes", "no"], default=None,
+                   help="always ask for unrostered/stranger workers; omitted preserves it")
     q.add_argument("--yes", action="store_true", help="confirm explicitly when stdin is not a terminal")
     p = sub.add_parser("invite"); p.add_argument("--person-key", type=Path,
                                                  default=Path.home() / ".sthambha" / "person-TEST.key")
@@ -2046,7 +2079,7 @@ def main(argv=None, *, http_post=None) -> int:
     q.add_argument("--resume-s", type=float, default=30.0)
     lsub.add_parser("off", help="remove the lease configuration")
     lsub.add_parser("status", help="show lease configuration without revealing its token")
-    p = sub.add_parser("task", help="post / list / claim / submit tasks")
+    p = sub.add_parser("task", help="post / list / claim / submit / decide tasks")
     tsub = p.add_subparsers(dest="tcmd", required=True)
     q = tsub.add_parser("post"); q.add_argument("to"); q.add_argument("title"); q.add_argument("instructions")
     q.add_argument("--rule", action="append", default=[], help='JSON rule, e.g. \'{"max_words": 60}\' (repeatable)')
@@ -2054,6 +2087,9 @@ def main(argv=None, *, http_post=None) -> int:
     q = tsub.add_parser("list"); q.add_argument("--role", default="")
     q = tsub.add_parser("claim"); q.add_argument("task")
     q = tsub.add_parser("submit"); q.add_argument("task"); q.add_argument("output")
+    q = tsub.add_parser("decide", help="human decision for a paid answer awaiting approval")
+    q.add_argument("task"); q.add_argument("decision", choices=["accept", "reject"])
+    q.add_argument("--reason", default=""); q.add_argument("--yes", action="store_true")
     q = sub.add_parser("tasks", help="list tasks (alias for `nak task list`)")
     q.add_argument("--role", default="")
     a = ap.parse_args(argv)
@@ -2103,6 +2139,10 @@ def main(argv=None, *, http_post=None) -> int:
         r = call(s, {"op": "status"})
         print(f"person {r['person'][:16]}…  node {r['node'][:16]}…  custody {r['custody']}  relay {r['relay']}")
         print(f"{len(r['contacts'])} contacts, {r['pending_requests']} pending requests, {r['open_invites']} open invites")
+        waiting = int(r.get("awaiting_approval") or 0)
+        if waiting:
+            noun = "answer" if waiting == 1 else "answers"
+            print(f"{waiting} paid {noun} waiting for your decision")
         print(f"direct listener {r.get('direct_port') or 'off'}  p2p "
               f"{(r.get('p2p') or {}).get('dial', 'off')}")
         g = r["grant"]
@@ -2291,6 +2331,16 @@ def main(argv=None, *, http_post=None) -> int:
             print(json.dumps(call(s, {"op": "task_claim", "task": a.task})))
         elif a.tcmd == "submit":
             print(json.dumps(call(s, {"op": "task_submit", "task": a.task, "output": a.output})))
+        elif a.tcmd == "decide":
+            if not a.yes and not sys.stdin.isatty():
+                raise SystemExit("nak task decide is interactive-only; run it in a terminal or pass --yes explicitly")
+            if not a.yes:
+                answer = input(f"{a.decision.upper()} paid task {a.task}? [y/N] ")
+                if answer.strip().lower() not in {"y", "yes"}:
+                    print("task unchanged")
+                    return 1
+            print(json.dumps(call(s, {"op": "task_decide", "task": a.task,
+                                      "decision": a.decision, "reason": a.reason})))
     elif a.cmd == "inbox":
         for m in reversed(call(s, {"op": "inbox", "limit": a.limit})["messages"]):
             print(f"[{_ago(m['received'])}] {m['petname'] or m['from_person'][:12]}: {m['text']}")

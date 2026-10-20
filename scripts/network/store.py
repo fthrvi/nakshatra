@@ -90,7 +90,8 @@ class Store:
             self._db.execute("ALTER TABLE outbox ADD COLUMN refused TEXT")
         except sqlite3.OperationalError:
             pass
-        for col in ("escrow_auth TEXT", "hold_id TEXT", "funding_state TEXT", "funding_reason TEXT"):
+        for col in ("escrow_auth TEXT", "hold_id TEXT", "funding_state TEXT", "funding_reason TEXT",
+                    "result_hash TEXT", "submit_state TEXT", "submit_reason TEXT"):
             try:
                 self._db.execute(f"ALTER TABLE tasks ADD COLUMN {col}")
             except sqlite3.OperationalError:
@@ -627,7 +628,8 @@ class Store:
     # tasks: one row per (task, my role, counterparty). Poster rows use peer "" (the assignee is a
     # column); worker rows use the poster's person key as peer. Every transition is compare-and-set.
     _TASK_COLS = ("task_hash", "role", "peer", "spec", "state", "targets", "assignee", "epoch", "output",
-                  "verdict", "escrow_auth", "hold_id", "funding_state", "funding_reason", "created", "updated")
+                  "verdict", "escrow_auth", "hold_id", "funding_state", "funding_reason", "result_hash",
+                  "submit_state", "submit_reason", "created", "updated")
 
     def task_insert(self, task_hash: str, role: str, peer: str, spec: dict, state: str,
                     targets: Optional[list] = None, *, escrow_auth: Optional[dict] = None,
@@ -636,8 +638,8 @@ class Store:
         primary_key = self._pk((task_hash, role, peer))
         try:
             self._q("INSERT INTO tasks (task_hash,role,peer,spec,state,targets,assignee,epoch,output,verdict,"
-                    "escrow_auth,hold_id,funding_state,funding_reason,created,updated) "
-                    "VALUES (?,?,?,?,?,?,NULL,0,NULL,NULL,?,?,?,?,?,?)",
+                    "escrow_auth,hold_id,funding_state,funding_reason,result_hash,submit_state,submit_reason,"
+                    "created,updated) VALUES (?,?,?,?,?,?,NULL,0,NULL,NULL,?,?,?,?,NULL,NULL,NULL,?,?)",
                     (task_hash, role, peer, self._enc("tasks", "spec", primary_key, json.dumps(spec)), state,
                      json.dumps(targets) if targets is not None else None,
                      self._enc("tasks", "escrow_auth", primary_key, json.dumps(escrow_auth))
@@ -651,7 +653,7 @@ class Store:
         """Move a task out of one of `from_states`, setting `fields`, atomically. False if it was not
         in one of those states (someone else won, or the step is out of order)."""
         allowed = {"state", "assignee", "epoch", "output", "verdict", "hold_id", "funding_state",
-                   "funding_reason"}
+                   "funding_reason", "result_hash", "submit_state", "submit_reason"}
         if set(fields) - allowed:
             raise ValueError(f"bad task fields {set(fields) - allowed}")
         sets = ", ".join(f"{k}=?" for k in fields) + ", updated=?"

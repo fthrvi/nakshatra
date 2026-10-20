@@ -35,6 +35,7 @@ import secrets
 import shlex
 import socket
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -55,6 +56,7 @@ from network.agent import (AGENT_MSG_VERSION, CARD_SUPPORT, CARD_VERSION, INTENT
                            validate_agent_message, validate_card)  # noqa: E402
 from network.store import Store  # noqa: E402
 from network import tasks as T  # noqa: E402
+from network import verdict as V  # noqa: E402
 from network.settle import DEFINITIVE_STATUSES, HoldNotOpen, SettlementError  # noqa: E402
 import accounting as _accounting  # noqa: E402
 from transport.connect import (accept_direct, local_endpoints, open_channel, open_direct,  # noqa: E402
@@ -74,6 +76,10 @@ MSG_DOMAIN = "nak-msg-v1"
 MAX_FRAME = 1 << 20
 MAX_TEXT = 8000
 SWEEP_S = 30.0          # how often expired tasks are swept (refund + notify)
+APPROVAL_TIMEOUT_S = 700.0
+APPROVAL_REPEAT_S = 6 * 3600
+APPROVAL_FINAL_S = 2 * 3600
+APPROVAL_MAX_PROMPTS = 8
 GRANT_WARN_S = 7 * 86400
 # Worst case is 5 advertised endpoints × 3 s, a 10 s handshake, then the sidecar's 15 s DCUtR wait
 # plus its pinned handshake. Fifty seconds covers that sequence; only both-sides direct opt-ins wait.
@@ -195,7 +201,8 @@ REOPENED = "task reopened: "     # nack prefix: the claim was refused AND the ta
 class Node:
     def __init__(self, state_dir: Path, node_key: bytes, signer: Callable[[dict], dict], *,
                  agent: str, relay: tuple = DEFAULT_RELAY, log: Callable[[str], None] = lambda m: None,
-                 settlement=None, direct_port: Optional[int] = None, p2p: Optional[dict] = None):
+                 settlement=None, direct_port: Optional[int] = None, p2p: Optional[dict] = None,
+                 roster_loader: Optional[Callable[[], dict]] = None):
         self._key = node_key
         self.node = ed25519.Ed25519PrivateKey.from_private_bytes(node_key).public_key().public_bytes_raw().hex()
         self._signer = signer
@@ -237,6 +244,9 @@ class Node:
         self._sessions: dict[str, tuple] = {}                 # contact person -> (channel, send lock)
         self._wake: dict[str, threading.Event] = {}
         self._lock = threading.Lock()
+        self._approval_lock = threading.Lock()
+        self._approval_running: set[str] = set()
+        self._roster_loader = roster_loader
         self._last_grant_warning_day: Optional[str] = None
         self._warn_grant(force=True)
 
@@ -260,6 +270,7 @@ class Node:
         for c in self.store.contacts():
             self._ensure_session(c["person"])
         self._spawn("sweeper", self._sweep_loop)
+        self._rearm_approvals()
         if self.direct_port:
             self._spawn("direct-listener", self._listen_loop)
         return self
@@ -307,7 +318,23 @@ class Node:
         r = self._signer(req)
         if not r.get("ok"):
             raise RuntimeError(f"cannot inspect grant for agent {self.agent!r}: {r.get('error')}")
+        constraints = r.get("constraints")
+        if not isinstance(constraints, dict):
+            constraints = self._local_grant_constraints()
+        r["verdict_policy"] = V.policy(constraints)
         return r
+
+    def _local_grant_constraints(self) -> dict:
+        """Best-effort status view of the signed local grant; enforcement uses the signed spend auth."""
+        signer_dir = Path(os.environ.get("NAK_SIGNER_DIR", Path.home() / ".sthambha" / "signer"))
+        try:
+            grant = json.loads((signer_dir / "agents" / f"{self.agent}.grant.json").read_text())
+            from sthambha.signer import _verify  # noqa: PLC0415, SLF001 - authenticate public metadata
+            if grant.get("subject") == self.agent and _verify(grant, self.person):
+                return grant.get("constraints") if isinstance(grant.get("constraints"), dict) else {}
+        except (ImportError, OSError, ValueError, TypeError):
+            pass
+        return {}
 
     @staticmethod
     def _utc(ts: int) -> str:
@@ -1096,6 +1123,193 @@ class Node:
             except Exception as e:  # noqa: BLE001 — a sweep bug must never kill the node
                 self.log(f"sweep failed: {e}")
 
+    @staticmethod
+    def _task_constraints(task: dict) -> dict:
+        auth = task.get("escrow_auth") or {}
+        grant = auth.get("grant") if isinstance(auth, dict) else {}
+        return grant.get("constraints") if isinstance(grant, dict) and \
+            isinstance(grant.get("constraints"), dict) else {}
+
+    def _worker_is_stranger(self, contact: dict) -> bool:
+        try:
+            if self._roster_loader is not None:
+                peers = self._roster_loader() or {}
+            else:
+                from fabric import worker_join  # noqa: PLC0415
+                peers = worker_join._load_admission().load_peers() or {}  # noqa: SLF001
+            row = peers.get(contact.get("node")) or {}
+            return row.get("tier") not in {"known", "trusted", "self"}
+        except Exception:  # noqa: BLE001 - absent/unreadable roster is deliberately stranger
+            return True
+
+    @staticmethod
+    def _credits_text(amount: int) -> str:
+        whole, fraction = divmod(int(amount), 100_000_000)
+        digits = f"{fraction:08d}".rstrip("0")
+        if len(digits) < 2:
+            digits = digits.ljust(2, "0")
+        return f"{whole}.{digits}"
+
+    def _approval_description(self, task: dict) -> str:
+        contact = self.store.contact(task["assignee"]) or {}
+        worker = " ".join(str(contact.get("petname") or task["assignee"][:12]).split())[:40]
+        title = " ".join(str(task["spec"]["title"]).split())[:60]
+        reward = self._credits_text(task["spec"]["reward"]["amount"])
+        return (f"Pay {worker} {reward} USDC for task '{title}' ({task['task_hash'][:12]})? "
+                "The answer passed the task's rules.")
+
+    @staticmethod
+    def _approval_due(task: dict, now: float) -> bool:
+        approval = (task.get("verdict") or {}).get("approval") or {}
+        count = int(approval.get("prompt_count") or 0)
+        last = int(approval.get("last_prompted_at") or 0)
+        if now >= int(task["spec"]["deadline"]):
+            return False
+        if count >= APPROVAL_MAX_PROMPTS:
+            return False
+        if count == 0:
+            return True
+        final_at = int(task["spec"]["deadline"]) - APPROVAL_FINAL_S
+        if now >= final_at and last < final_at:
+            return True
+        return now < final_at and now - last >= APPROVAL_REPEAT_S
+
+    def _arm_approval(self, task_hash: str) -> None:
+        command = os.environ.get("NAK_APPROVAL_CMD", "")
+        if not command:
+            return
+        if not Path(command).is_absolute():
+            self.log("NAK_APPROVAL_CMD must be an absolute path; approval remains unanswered")
+            return
+        with self._approval_lock:
+            if task_hash in self._approval_running:
+                return
+            task = self.store.task_get(task_hash, "poster", "")
+            if not task or task["state"] != "awaiting_approval" or not self._approval_due(task, time.time()):
+                return
+            self._approval_running.add(task_hash)
+        threading.Thread(target=self._run_approval_hook, args=(task_hash, command), daemon=True,
+                         name=f"approval:{task_hash}").start()
+
+    def _run_approval_hook(self, task_hash: str, command: str) -> None:
+        try:
+            task = self.store.task_get(task_hash, "poster", "")
+            if not task or task["state"] != "awaiting_approval":
+                return
+            verdict = dict(task.get("verdict") or {})
+            approval = dict(verdict.get("approval") or {})
+            now = int(time.time())
+            approval["last_prompted_at"] = now
+            approval["prompt_count"] = int(approval.get("prompt_count") or 0) + 1
+            verdict["approval"] = approval
+            if not self.store.task_cas(task_hash, "poster", "", ("awaiting_approval",),
+                                       verdict=json.dumps(verdict)):
+                return
+            try:
+                result = subprocess.run([command, self._approval_description(task)], check=False,
+                                        timeout=APPROVAL_TIMEOUT_S,
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                code = result.returncode
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                self.log(f"approval hook for {task_hash[:12]} unanswered ({type(exc).__name__})")
+                return
+            if code == 0:
+                try:
+                    self._apply_task_decision(task_hash, True, "", source="approval hook", touch=True)
+                except ValueError as exc:
+                    self.log(f"approval hook for {task_hash[:12]} was superseded: {exc}")
+            elif code == 10:
+                try:
+                    self._apply_task_decision(task_hash, False, "approval hook rejected",
+                                              source="approval hook", touch=True)
+                except ValueError as exc:
+                    self.log(f"approval hook for {task_hash[:12]} was superseded: {exc}")
+            else:
+                self.log(f"approval hook for {task_hash[:12]} unanswered (exit {code})")
+        finally:
+            with self._approval_lock:
+                self._approval_running.discard(task_hash)
+
+    def _rearm_approvals(self) -> None:
+        for task in self.store.tasks_in_states(("awaiting_approval",), role="poster"):
+            self._arm_approval(task["task_hash"])
+
+    def _apply_task_decision(self, task_hash: str, accept: bool, reason: str, *, source: str,
+                             touch: bool, output: Optional[str] = None,
+                             verdict: Optional[dict] = None, from_states: tuple = ("awaiting_approval",)) -> dict:
+        task = self.store.task_get(task_hash, "poster", "")
+        if not task:
+            raise ValueError("no such posted task")
+        desired = "accepted" if accept else "rejected"
+        if task["state"] in {"accepted", "rejected"}:
+            if task["state"] != desired:
+                raise ValueError(f"task was already {task['state']}")
+            self.reconcile_escrow()     # adopt/retry a ledger transition lost around a crash
+            return {"task_hash": task_hash, "state": task["state"], "idempotent": True}
+        if task["state"] not in from_states:
+            raise ValueError(f"task is {task['state']}, not awaiting a decision")
+        self._require_grant("task.accept")
+        final = dict(verdict if verdict is not None else (task.get("verdict") or {}))
+        rules_passed = bool(final.get("rules_passed", final.get("passed")))
+        final["rules_passed"] = rules_passed
+        final["passed"] = accept
+        final["reasons"] = [] if accept else [str(reason or "rejected by person")[:300]]
+        final["decision"] = source
+        fields = {"state": desired, "verdict": json.dumps(final)}
+        if output is not None:
+            fields["output"] = output
+        if not self.store.task_cas(task_hash, "poster", "", from_states, **fields):
+            return self._apply_task_decision(task_hash, accept, reason, source=source, touch=touch)
+        receipt = self._settle(task_hash, task["spec"], "release" if accept else "refund",
+                               party=task["assignee"] or "", reason=reason or desired,
+                               hold_id=task["hold_id"] or "")
+        if receipt is not None and not receipt.get("error"):
+            final["settlement"] = receipt
+            self.store.task_cas(task_hash, "poster", "", (desired,), verdict=json.dumps(final))
+        self._queue(task["assignee"], "task.accept" if accept else "task.reject",
+                    {"task_hash": task_hash, "epoch": task["epoch"], **final}, touch=touch)
+        label = "paid by silence" if source == "silence" else source
+        self.log(f"task {task_hash[:12]} {'ACCEPTED' if accept else 'REJECTED'} ({label})")
+        return {"task_hash": task_hash, "state": desired, "idempotent": False}
+
+    def decide_task(self, ref: str, decision: str, reason: str = "") -> dict:
+        rows = [r for r in self.store.task_find(str(ref)) if r["role"] == "poster"]
+        if len(rows) != 1:
+            raise ValueError("no single posted task matches that id")
+        if decision not in {"accept", "reject"}:
+            raise ValueError("decision must be accept or reject")
+        if not isinstance(reason, str) or len(reason) > 300:
+            raise ValueError("decision reason must be text of at most 300 characters")
+        why = outbound_problem(reason)
+        if why:
+            raise ValueError(why)
+        task = rows[0]
+        if task["state"] == "awaiting_approval" and task["spec"]["deadline"] <= time.time():
+            self._apply_task_decision(task["task_hash"], True, "", source="silence", touch=False)
+            task = self.store.task_get(task["task_hash"], "poster", "")
+        return self._apply_task_decision(task["task_hash"], decision == "accept", reason,
+                                         source="human", touch=True)
+
+    def _mark_worker_submit(self, task: dict) -> bool:
+        if (not self.settle.open_on_assign or task["spec"]["reward"]["amount"] <= 0
+                or not task.get("hold_id") or not task.get("result_hash")):
+            return True
+        try:
+            self.settle.submit(task["task_hash"], task["result_hash"], hold_id=task["hold_id"])
+        except SettlementError as exc:
+            self.store.task_cas(task["task_hash"], "worker", task["peer"], ("submitted",),
+                                submit_state="pending", submit_reason=str(exc)[:200])
+            self.log(f"ledger submit mark for {task['task_hash'][:12]} pending: {exc}")
+            return False
+        self.store.task_cas(task["task_hash"], "worker", task["peer"], ("submitted",),
+                            submit_state="marked", submit_reason="")
+        return True
+
+    def _retry_worker_submits(self) -> None:
+        for task in self.store.tasks_in_states(("submitted",), role="worker"):
+            if task.get("submit_state") != "marked":
+                self._mark_worker_submit(task)
+
     def _claim_reopened(self, mid: str, person: str) -> None:
         """The poster refused our claim and put the task back up: make it claimable again here.
         Only for a task.claim WE sent to that poster, and only while it is still `claimed`."""
@@ -1169,6 +1383,8 @@ class Node:
         """Settle escrow left OPEN for a task already in a final state (a crash between the state
         change and the settlement). The ledger's own CAS keeps this exactly-once. Returns how many."""
         fixed = 0
+        self._retry_worker_submits()
+        self._rearm_approvals()
         self._finish_pending_assignments()
         for t in self.store.tasks_in_states(("accepted", "rejected", "expired"), role="poster"):
             if t["spec"]["reward"]["amount"] <= 0:
@@ -1239,10 +1455,13 @@ class Node:
         now = time.time() if now is None else now
         n = 0
         self.reconcile_escrow()
-        for t in self.store.tasks_in_states(("posted", "assigned", "offered", "claimed")):
+        for t in self.store.tasks_in_states(("posted", "assigned", "awaiting_approval", "offered", "claimed")):
             if t["spec"]["deadline"] > now:
                 continue
-            if t["role"] == "poster" and t["state"] in ("posted", "assigned"):
+            if t["role"] == "poster" and t["state"] == "awaiting_approval":
+                self._apply_task_decision(t["task_hash"], True, "", source="silence", touch=False)
+                n += 1
+            elif t["role"] == "poster" and t["state"] in ("posted", "assigned"):
                 if (self.settle.open_on_assign and t["state"] == "assigned" and not t["hold_id"]
                         and t["spec"]["reward"]["amount"] > 0):
                     continue    # a hold may exist unrecorded; reconcile re-runs the idempotent authorize
@@ -1340,9 +1559,15 @@ class Node:
             raise ValueError(f"unfunded: {current['funding_reason'] or 'the task hold is not valid'}")
         self._require_grant("task.result")
         passed, reasons = T.evaluate(t["spec"], output)       # the worker can see it would fail first
+        result_hash = hashlib.sha256(output.encode("utf-8")).hexdigest()
+        funded = self.settle.open_on_assign and t["spec"]["reward"]["amount"] > 0
         if not self.store.task_cas(t["task_hash"], "worker", t["peer"], ("assigned",),
-                                   state="submitted", output=output):
+                                   state="submitted", output=output, result_hash=result_hash,
+                                   submit_state="pending" if funded else ""):
             raise ValueError(f"cannot submit a task that is {t['state']} (it must be assigned to you)")
+        submitted = self.store.task_get(t["task_hash"], "worker", t["peer"])
+        if funded:
+            self._mark_worker_submit(submitted)       # failure is durable/retried and never blocks delivery
         self._queue(t["peer"], "task.result", {"task_hash": t["task_hash"], "epoch": t["epoch"], "output": output})
         return {"task_hash": t["task_hash"], "state": "submitted", "precheck_passed": passed, "precheck": reasons}
 
@@ -1429,6 +1654,8 @@ class Node:
             t = self.store.task_get(h, "poster", "")
             if not t or t["assignee"] != c["person"] or body.get("epoch") != t["epoch"]:
                 raise ValueError("result for a task not assigned to you")
+            if t["state"] != "assigned":
+                raise ValueError("task is not awaiting a result")
             if t["spec"]["deadline"] <= time.time():
                 self.sweep()                                 # expire + refund now rather than at the next tick
                 raise ValueError("deadline passed; the task expired and its escrow was refunded")
@@ -1439,19 +1666,29 @@ class Node:
             passed, reasons = T.evaluate(t["spec"], output)
             verdict = {"passed": passed, "reasons": reasons,
                        "output_sha256": hashlib.sha256(str(output).encode("utf-8")).hexdigest()}
-            if not self.store.task_cas(h, "poster", "", ("assigned",), state="accepted" if passed else "rejected",
-                                       output=output, verdict=json.dumps(verdict)):
-                raise ValueError("task is not awaiting a result")
-            receipt = self._settle(h, t["spec"], "release" if passed else "refund", party=c["person"],
-                                   reason="accepted" if passed else "rejected", hold_id=t["hold_id"] or "")
-            if receipt is not None and not receipt.get("error"):
-                verdict["settlement"] = receipt
-                self.store.task_cas(h, "poster", "", ("accepted", "rejected"), verdict=json.dumps(verdict))
             self.store.raw_log({"received": int(time.time()), "source": "nakshatra", "trust": "external",
                                 "from_person": c["person"], "envelope": env, "body": body})
-            self._queue(c["person"], "task.accept" if passed else "task.reject",
-                        {"task_hash": h, "epoch": t["epoch"], **verdict}, touch=False)
-            self.log(f"task {h[:12]} result from {who}: {'ACCEPTED' if passed else 'REJECTED ' + str(reasons)}")
+            paid = t["spec"]["reward"]["amount"] > 0 and self.settle.open_on_assign
+            action = V.decide_policy(
+                self._task_constraints(t), reward=t["spec"]["reward"]["amount"],
+                stranger=self._worker_is_stranger(c), rules_passed=passed, escrowed=paid)
+            if action == V.ASK:
+                now = int(time.time())
+                verdict["rules_passed"] = passed
+                verdict["approval"] = {"worker": c["person"],
+                                       "reward": t["spec"]["reward"]["amount"],
+                                       "result_preview_hash": verdict["output_sha256"],
+                                       "asked_at": now, "last_prompted_at": 0, "prompt_count": 0}
+                if not self.store.task_cas(h, "poster", "", ("assigned",), state="awaiting_approval",
+                                           output=output, verdict=json.dumps(verdict)):
+                    raise ValueError("task is not awaiting a result")
+                self.log(f"task {h[:12]} result from {who}: awaiting approval")
+                self._arm_approval(h)
+                return
+            self._apply_task_decision(
+                h, action == V.ACCEPT, "" if passed else "; ".join(reasons),
+                source="automatic", touch=False, output=output, verdict=verdict,
+                from_states=("assigned",))
             return
         if kind in ("task.accept", "task.reject"):
             t = self.store.task_get(h, "worker", c["person"])
@@ -1492,9 +1729,11 @@ class Node:
         lapsed = grant["status"].startswith("LAPSED:")
         grant["warning"] = "" if lapsed else (f"{warning}; run: nak grant renew" if warning else "")
         grant = {k: grant[k] for k in ("agent", "caps", "expires_at", "not_before", "revoked",
-                                       "grant_id", "valid", "problem", "lease", "status", "warning")
+                                       "grant_id", "valid", "problem", "lease", "status", "warning",
+                                       "verdict_policy")
                  if k in grant}
         refused = self.store.refusal_summary()
+        waiting = len(self.store.tasks_in_states(("awaiting_approval",), role="poster"))
         return {"person": self.person, "node": self.node, "custody": self.custody,
                 "relay": f"{self.relay[0]}:{self.relay[1]}",
                 "contacts": [dict(c, online=c["person"] in online, path=self._paths.get(c["person"], ""))
@@ -1503,7 +1742,8 @@ class Node:
                 "p2p": self.p2p,
                 "pending_requests": len(self.store.requests()),
                 "open_invites": len(self.store.open_invites()),
-                "grant": grant, "outbox_refused": refused["count"],
+                "grant": grant, "awaiting_approval": waiting,
+                "outbox_refused": refused["count"],
                 "newest_refusal": refused["latest"]}
 
 
@@ -1539,7 +1779,7 @@ def _hard_close(ch) -> None:
 
 OPS = {"status", "register_invite", "redeem", "requests", "accept", "decline", "contacts", "remove", "send",
        "agent_send", "threads", "thread", "card", "card_set", "delivered", "inbox", "outbox",
-       "task_post", "tasks", "task_claim", "task_submit", "ledger", "escrow_status", "direct"}
+       "task_post", "tasks", "task_claim", "task_submit", "task_decide", "ledger", "escrow_status", "direct"}
 
 
 def handle(node: Node, req: dict) -> dict:
@@ -1608,6 +1848,8 @@ def handle(node: Node, req: dict) -> dict:
             return {"ok": True, **node.claim_task(req["task"])}
         if op == "task_submit":
             return {"ok": True, **node.submit_task(req["task"], req["output"])}
+        if op == "task_decide":
+            return {"ok": True, **node.decide_task(req["task"], req["decision"], req.get("reason", ""))}
         if op == "inbox":
             msgs = node.store.inbox(int(req.get("since", 0)), int(req.get("limit", 50)))
             for m in msgs:

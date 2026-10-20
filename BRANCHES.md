@@ -5,6 +5,7 @@ On create add a row (status=active, owner). On merge flip to `merged→<sha>`.
 
 | branch | sector | description | base | status | owner |
 |---|---|---|---|---|---|
+| net/task-verdict-policy | network | M2.1 person-signed paid-task verdict policy, durable ASK/decision flow, silence-pay, and worker ledger submit marks. | forgejo/main@6b3827a | active | codex/root |
 | net/agent-msg-v1 | network | M1: typed threaded `agent.msg` v1 and contact-only agent cards (encrypted at rest, per-contact threads, CLI + MCP); installer restarts signer and checks its data key before nak-net; release-url 0600. | forgejo/main@4c77d79 | merged→0f247f2 | codex (network lane) |
 | net/grant-renew-caps | network | `nak grant renew --per-tx-cap/--day-cap`: human-only way to set the agent's nak.pay limits (renew otherwise preserves them; there was no way to raise them from 0). | forgejo/main@4c8a816 | merged→61318b2 | claude (network lane) |
 | net/task-escrow-neuron | network | M2: task rewards escrow on the Neuron ledger (devnet credits) via a fixed-price task hold; contact card advertises the payee ledger key; offers may carry a budget. | forgejo/main@4eedd50 | merged→d5dead6 | codex (network lane) |

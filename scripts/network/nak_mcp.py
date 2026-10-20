@@ -218,6 +218,9 @@ class Server:
             g = s["grant"]
             warning = f"; WARNING: {g['warning']}" if g.get("warning") else ""
             refused = f"; {s['outbox_refused']} refused outbox item(s)"
+            waiting = int(s.get("awaiting_approval") or 0)
+            approvals = (f"; {waiting} paid answer{'s' if waiting != 1 else ''} waiting for your decision"
+                         if waiting else "")
             if s.get("newest_refusal"):
                 q = s["newest_refusal"]
                 refused += (f"; newest at {q['time']}: <untrusted_refusal source=nakshatra "
@@ -227,7 +230,7 @@ class Server:
                     f"{len(s['contacts'])} contacts, {s['pending_requests']} pending requests; "
                     f"agent {g['agent']} caps {','.join(g['caps']) or '-'} "
                     f"{g.get('status') or 'expires ' + str(g['expires_at'])}"
-                    f"{warning}{refused}")
+                    f"{warning}{approvals}{refused}")
         if name == "nak_contacts":
             rows = c.contacts()
             return "\n".join(f"{r['petname'] or r['person'][:12]} ({r['state']}, "

@@ -46,8 +46,10 @@ def wait(pred, timeout=20.0):
 
 class Party:
     def __init__(self, root: Path, name: str, relay_port: int, caps=("nak.msg",), constraints=None,
-                 direct_port=None, p2p=None, lease=False, grant_now=None):
+                 direct_port=None, p2p=None, lease=False, grant_now=None, tier="known",
+                 roster_loader=None):
         self.dir = root / name
+        self.tier = tier
         self.node_key = ed25519.Ed25519PrivateKey.generate().private_bytes_raw()
         node_pub = ed25519.Ed25519PrivateKey.from_private_bytes(self.node_key).public_key().public_bytes_raw().hex()
         self.person_priv, self.person_pub = signer_mod.new_key()
@@ -73,7 +75,8 @@ class Party:
             return self.signer.handle(req)
 
         self.node = nakd.Node(self.dir / "net", self.node_key, signer_call, agent="pa",
-                              relay=("127.0.0.1", relay_port), direct_port=direct_port, p2p=p2p).start()
+                              relay=("127.0.0.1", relay_port), direct_port=direct_port, p2p=p2p,
+                              roster_loader=roster_loader).start()
 
     def invite(self, ttl=600, note=""):
         code = joincode.encode_invite(self.person_priv, self.node.node,
@@ -88,8 +91,11 @@ def net(tmp_path):
     port = relay.start()
     parties = []
 
+    def roster():
+        return {p.node.node: {"tier": p.tier} for p in parties}
+
     def make(name, **kw):
-        p = Party(tmp_path, name, port, **kw)
+        p = Party(tmp_path, name, port, roster_loader=roster, **kw)
         parties.append(p)
         return p
     make.relay = relay

@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import re
+import shlex
 import threading
 import time
 import urllib.error
@@ -33,6 +34,8 @@ class FakeTaskLedger:
         self.initial = 0
         self.transitions = []
         self.fail_pay = False
+        self.fail_submit = False
+        self.submit_calls = 0
         self.fail_authorize = False
         self.refuse_authorize = 0        # HTTP status of a definitive refusal
         self.drop_response = False       # commit the hold, then lose the answer
@@ -76,7 +79,8 @@ class FakeTaskLedger:
         self.balances[payer] -= amount
         row = {"v": 1, "hold_id": hold_id, "task_hash": task_hash,
                "payer_account": payer, "worker_keyid": worker, "amount": amount,
-               "deadline": deadline, "state": "open", "server_time": int(time.time())}
+               "deadline": deadline, "state": "open", "server_time": int(time.time()),
+               "submitted_at": 0, "result_hash": ""}
         self.holds[hold_id] = row
         self.nonces[(payer, task_hash)] = hold_id
         self.transitions.append((hold_id, "open"))
@@ -118,6 +122,26 @@ class FakeTaskLedger:
             self.balances[row["worker_keyid"]] = self.balances.get(row["worker_keyid"], 0) + row["amount"]
             self.transitions.append((hold_id, "paid"))
         self.check()
+        return copy.deepcopy(row)
+
+    def submit(self, worker, hold_id, result_hash):
+        self.submit_calls += 1
+        if self.fail_submit:
+            raise SettlementError("ledger down")
+        row = self.holds[hold_id]
+        if row["worker_keyid"] != worker:
+            raise SettlementError("task hold not found")
+        if row["state"] != "open":
+            error = SettlementError(f"task hold is {row['state']}")
+            error.status = 409
+            raise error
+        if row["result_hash"] and row["result_hash"] != result_hash:
+            error = SettlementError("different task result")
+            error.status = 409
+            raise error
+        if not row["result_hash"]:
+            row["submitted_at"] = int(time.time()) or 1
+            row["result_hash"] = result_hash
         return copy.deepcopy(row)
 
     def refund(self, payer, hold_id, _reason):
@@ -172,6 +196,13 @@ class FakeNeuronAdapter:
         assert row["task_hash"] == task_hash
         return self._receipt(row, "refunded")
 
+    def submit(self, task_hash, result_hash, *, hold_id=""):
+        row = self.ledger.submit(self.keyid, hold_id, result_hash)
+        assert row["task_hash"] == task_hash
+        receipt = self._receipt(row, "submitted")
+        receipt.update(result_hash=result_hash, submitted_at=row["submitted_at"])
+        return receipt
+
     def journal(self, _task_hash=None):
         return []
 
@@ -224,6 +255,9 @@ class ReplayLedgerHTTP:
             elif parts.path == "/spend/task/refund":
                 b = json.loads(body)
                 row = ledger.refund(keyid, b["hold_id"], b["reason"])
+            elif parts.path == "/spend/task/submit":
+                b = json.loads(body)
+                row = ledger.submit(keyid, b["hold_id"], b["result_hash"])
             else:
                 hold_id = urllib.parse.parse_qs(parts.query)["hold_id"][0]
                 return _Response(json.dumps(ledger.status(keyid, hold_id)).encode())
@@ -231,8 +265,10 @@ class ReplayLedgerHTTP:
             text = str(e)
             raise self._fail(request, 402 if "insufficient" in text else 404 if "not found" in text
                              else 409)
-        row = {k: row[k] for k in ("v", "hold_id", "task_hash", "worker_keyid", "amount",
-                                   "deadline", "state")}
+        keys = ("v", "hold_id", "task_hash", "worker_keyid", "amount", "deadline", "state")
+        if parts.path == "/spend/task/submit":
+            keys += ("submitted_at", "result_hash")
+        row = {k: row[k] for k in keys}
         return _Response(json.dumps(row).encode())
 
 
@@ -241,9 +277,10 @@ def _real_adapter(party, http):
                                opener=http)
 
 
-def _pair(net, *, paid_card=True, suffix="", real=False):
-    poster = net("poster" + suffix, caps=("nak.msg", "nak.task.post", "nak.pay"), constraints=PAY)
-    worker = net("worker" + suffix, caps=("nak.msg", "nak.task.claim"))
+def _pair(net, *, paid_card=True, suffix="", real=False, constraints=None, worker_tier="known"):
+    poster = net("poster" + suffix, caps=("nak.msg", "nak.task.post", "nak.pay"),
+                 constraints=PAY if constraints is None else constraints)
+    worker = net("worker" + suffix, caps=("nak.msg", "nak.task.claim"), tier=worker_tier)
     ledger = FakeTaskLedger()
     poster.ledger = ledger
     ledger.fund(poster.node.node, 100)
@@ -276,6 +313,166 @@ def _assign(poster, worker, reward=5, deadline_s=600):
     assert wait(lambda: (_worker_row(worker.node, task_hash)[0]["funding_state"] == "funded"
                          or _worker_row(worker.node, task_hash)[0]["funding_reason"]))
     return task_hash
+
+
+def _approval_script(tmp_path, code=1, *, capture=None, sleep=0):
+    path = tmp_path / f"approval-{code}-{sleep}.sh"
+    lines = ["#!/bin/sh"]
+    if capture is not None:
+        lines.append(f"printf '%s' \"$1\" > {shlex.quote(str(capture))}")
+    if sleep:
+        lines.append(f"sleep {sleep}")
+    lines.append(f"exit {code}")
+    path.write_text("\n".join(lines) + "\n")
+    path.chmod(0o700)
+    return path
+
+
+def _ask_policy(*, mode="threshold", auto_max=4, strangers=False):
+    return {**PAY, "verdict_mode": mode, "verdict_auto_max": auto_max,
+            "verdict_ask_strangers": strangers}
+
+
+def _submit_waiting(poster, worker, *, reward=5, output="ok"):
+    task_hash = _assign(poster, worker, reward=reward)
+    worker.node.submit_task(task_hash, output)
+    assert wait(lambda: poster.node.store.task_get(task_hash, "poster")["state"] == "awaiting_approval")
+    return task_hash
+
+
+def test_threshold_auto_pays_at_or_below_the_limit(net):
+    poster, worker, ledger = _pair(net, constraints=_ask_policy(auto_max=5))
+    task_hash = _assign(poster, worker, reward=5)
+    worker.node.submit_task(task_hash, "ok")
+    assert wait(lambda: poster.node.store.task_get(task_hash, "poster")["state"] == "accepted")
+    assert next(iter(ledger.holds.values()))["state"] == "paid"
+
+
+def test_over_threshold_hook_accepts_with_fixed_text_and_human_touch(net, tmp_path, monkeypatch):
+    capture = tmp_path / "description.txt"
+    monkeypatch.setenv("NAK_APPROVAL_CMD", str(_approval_script(tmp_path, 0, capture=capture)))
+    poster, worker, ledger = _pair(net, constraints=_ask_policy())
+    poster.signer_requests.clear()
+    task_hash = _assign(poster, worker)
+    worker.node.submit_task(task_hash, "ok")
+    assert wait(lambda: poster.node.store.task_get(task_hash, "poster")["state"] == "accepted")
+    assert capture.read_text() == (
+        f"Pay worker 0.00000005 USDC for task 'drill' ({task_hash[:12]})? "
+        "The answer passed the task's rules.")
+    assert next(iter(ledger.holds.values()))["state"] == "paid"
+    touches = [r for r in poster.signer_requests if r.get("kind") == "task.accept"]
+    assert any(r.get("touch") is True for r in touches)
+
+
+def test_hook_reject_refunds_and_unanswered_or_timeout_keeps_waiting(net, tmp_path, monkeypatch):
+    monkeypatch.setenv("NAK_APPROVAL_CMD", str(_approval_script(tmp_path, 10)))
+    poster, worker, ledger = _pair(net, suffix="-reject", constraints=_ask_policy())
+    task_hash = _assign(poster, worker)
+    worker.node.submit_task(task_hash, "ok")
+    assert wait(lambda: poster.node.store.task_get(task_hash, "poster")["state"] == "rejected")
+    assert next(iter(ledger.holds.values()))["state"] == "refunded"
+
+    monkeypatch.setenv("NAK_APPROVAL_CMD", str(_approval_script(tmp_path, 1)))
+    poster2, worker2, ledger2 = _pair(net, suffix="-unanswered", constraints=_ask_policy())
+    task2 = _submit_waiting(poster2, worker2)
+    assert wait(lambda: poster2.node.store.task_get(task2, "poster")["verdict"]["approval"]["prompt_count"] == 1)
+    assert next(iter(ledger2.holds.values()))["state"] == "open"
+
+    monkeypatch.setattr("network.nakd.APPROVAL_TIMEOUT_S", 0.05)
+    monkeypatch.setenv("NAK_APPROVAL_CMD", str(_approval_script(tmp_path, 0, sleep=1)))
+    poster3, worker3, ledger3 = _pair(net, suffix="-timeout", constraints=_ask_policy())
+    task3 = _submit_waiting(poster3, worker3)
+    assert wait(lambda: poster3.node.store.task_get(task3, "poster")["verdict"]["approval"]["prompt_count"] == 1)
+    time.sleep(0.1)
+    assert poster3.node.store.task_get(task3, "poster")["state"] == "awaiting_approval"
+    assert next(iter(ledger3.holds.values()))["state"] == "open"
+
+
+def test_deadline_silence_pays_and_stranger_always_asks(net, tmp_path, monkeypatch):
+    monkeypatch.setenv("NAK_APPROVAL_CMD", str(_approval_script(tmp_path, 1)))
+    poster, worker, ledger = _pair(net, suffix="-silence", constraints=_ask_policy())
+    task_hash = _submit_waiting(poster, worker)
+    deadline = poster.node.store.task_get(task_hash, "poster")["spec"]["deadline"]
+    assert poster.node.sweep(now=deadline + 1) == 1
+    row = poster.node.store.task_get(task_hash, "poster")
+    assert row["state"] == "accepted" and row["verdict"]["decision"] == "silence"
+    assert next(iter(ledger.holds.values()))["state"] == "paid"
+
+    poster2, worker2, ledger2 = _pair(
+        net, suffix="-stranger", worker_tier="stranger",
+        constraints=_ask_policy(mode="auto", auto_max=0, strangers=True))
+    task2 = _submit_waiting(poster2, worker2)
+    assert poster2.node.store.task_get(task2, "poster")["state"] == "awaiting_approval"
+    assert next(iter(ledger2.holds.values()))["state"] == "open"
+
+
+def test_rule_failure_auto_rejects_without_prompt_and_automatic_signing_is_no_touch(
+        net, tmp_path, monkeypatch):
+    capture = tmp_path / "must-not-run"
+    monkeypatch.setenv("NAK_APPROVAL_CMD", str(_approval_script(tmp_path, 0, capture=capture)))
+    poster, worker, ledger = _pair(net, constraints=_ask_policy(mode="ask"))
+    poster.signer_requests.clear()
+    task_hash = _assign(poster, worker)
+    worker.node.submit_task(task_hash, "nope")
+    assert wait(lambda: poster.node.store.task_get(task_hash, "poster")["state"] == "rejected")
+    assert not capture.exists() and next(iter(ledger.holds.values()))["state"] == "refunded"
+    calls = [r for r in poster.signer_requests
+             if r.get("op") == "sign_envelope" and r.get("kind") == "task.reject"]
+    assert calls and all(r.get("touch") is False for r in calls)
+
+
+def test_human_decide_is_idempotent_and_restart_rearms_due_hook(net, tmp_path, monkeypatch):
+    monkeypatch.setenv("NAK_APPROVAL_CMD", str(_approval_script(tmp_path, 1)))
+    poster, worker, ledger = _pair(net, suffix="-human", constraints=_ask_policy())
+    task_hash = _submit_waiting(poster, worker)
+    poster.signer_requests.clear()
+    first = poster.node.decide_task(task_hash, "accept")
+    second = poster.node.decide_task(task_hash, "accept")
+    assert not first["idempotent"] and second["idempotent"]
+    assert [event for _hold, event in ledger.transitions].count("paid") == 1
+    assert any(r.get("kind") == "task.accept" and r.get("touch") is True
+               for r in poster.signer_requests)
+
+    monkeypatch.setenv("NAK_APPROVAL_CMD", str(_approval_script(tmp_path, 1)))
+    poster2, worker2, ledger2 = _pair(net, suffix="-restart", constraints=_ask_policy())
+    task2 = _submit_waiting(poster2, worker2)
+    assert wait(lambda: poster2.node.store.task_get(task2, "poster")["verdict"]["approval"]["prompt_count"] == 1)
+    row = poster2.node.store.task_get(task2, "poster")
+    verdict_data = dict(row["verdict"])
+    verdict_data["approval"] = dict(verdict_data["approval"],
+                                     last_prompted_at=int(time.time()) - settle_mod.MAX_TS_LEAD_S - 22_000)
+    poster2.node.store.task_cas(task2, "poster", "", ("awaiting_approval",),
+                                verdict=json.dumps(verdict_data))
+    relay, roster_loader = poster2.node.relay, poster2.node._roster_loader
+    poster2.node.stop()
+    monkeypatch.setenv("NAK_APPROVAL_CMD", str(_approval_script(tmp_path, 0)))
+
+    def signer_call(req):
+        poster2.signer_requests.append(dict(req))
+        return poster2.signer.handle(req)
+
+    from network import nakd
+    poster2.node = nakd.Node(poster2.dir / "net", poster2.node_key, signer_call, agent="pa",
+                             relay=relay, settlement=FakeNeuronAdapter(ledger2, poster2.node.node),
+                             roster_loader=roster_loader).start()
+    assert wait(lambda: poster2.node.store.task_get(task2, "poster")["state"] == "accepted")
+    assert next(iter(ledger2.holds.values()))["state"] == "paid"
+
+
+def test_worker_submit_mark_failure_never_blocks_delivery_and_reconcile_retries(
+        net, tmp_path, monkeypatch):
+    monkeypatch.setenv("NAK_APPROVAL_CMD", str(_approval_script(tmp_path, 1)))
+    poster, worker, ledger = _pair(net, constraints=_ask_policy())
+    task_hash = _assign(poster, worker)
+    ledger.fail_submit = True
+    worker.node.submit_task(task_hash, "ok")
+    assert wait(lambda: poster.node.store.task_get(task_hash, "poster")["state"] == "awaiting_approval")
+    local = worker.node.store.task_get(task_hash, "worker", poster.person_pub)
+    assert local["state"] == "submitted" and local["submit_state"] == "pending"
+    ledger.fail_submit = False
+    worker.node.reconcile_escrow()
+    local = worker.node.store.task_get(task_hash, "worker", poster.person_pub)
+    assert local["submit_state"] == "marked" and ledger.submit_calls >= 2
 
 
 def test_paid_card_requires_neuron_and_uses_the_nodes_own_key(net):
@@ -373,7 +570,7 @@ def test_real_neuron_adapter_uses_contract_routes_and_signed_query_path():
             value = dict(hold, state="paid")
         elif request.method == "GET":
             assert urllib.parse.parse_qs(urllib.parse.urlsplit(request.full_url).query) == {"hold_id": ["h-1"]}
-            value = dict(hold, payer_account="payer", server_time=1)
+            value = dict(hold, payer_account="payer", server_time=1, submitted_at=0, result_hash="")
         else:
             value = hold
         return _Response(json.dumps(value).encode())
