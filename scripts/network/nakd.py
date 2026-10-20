@@ -84,6 +84,7 @@ APPROVAL_REPEAT_S = 6 * 3600
 APPROVAL_FINAL_S = 2 * 3600
 APPROVAL_MAX_PROMPTS = 8
 WORKER_SUBMIT_MAX_ATTEMPTS = 8
+POSTER_RECEIVE_MAX_ATTEMPTS = 8
 GRANT_WARN_S = 7 * 86400
 # Worst case is 5 advertised endpoints × 3 s, a 10 s handshake, then the sidecar's 15 s DCUtR wait
 # plus its pinned handshake. Fifty seconds covers that sequence; only both-sides direct opt-ins wait.
@@ -254,6 +255,7 @@ class Node:
         self._decision_lock = threading.Lock()
         self._decision_proofs: set[str] = set()
         self._submit_lock = threading.Lock()
+        self._receipt_lock = threading.Lock()
         self._roster_loader = roster_loader
         self._roster_path = Path(roster_path) if roster_path is not None else None
         self._last_grant_warning_day: Optional[str] = None
@@ -1319,7 +1321,8 @@ class Node:
             except SettlementError as exc:
                 raise ValueError(f"cannot verify the paid task result against its ledger mark: {exc}") from exc
             expected = hashlib.sha256(actual.encode("utf-8")).hexdigest()
-            if not hold or hold.get("result_hash") != expected:
+            if (not hold or hold.get("result_hash") != expected
+                    or hold.get("received_hash") != expected):
                 accept = False
                 reason = "result does not match the ledger mark"
                 source = "ledger result check"
@@ -1330,6 +1333,7 @@ class Node:
         final["passed"] = accept
         final["reasons"] = [] if accept else [str(reason or "rejected by person")[:300]]
         final["decision"] = source
+        final.pop("pending_action", None)
         fields = {"state": desired, "verdict": json.dumps(final)}
         if output is not None:
             fields["output"] = output
@@ -1431,6 +1435,66 @@ class Node:
             if task.get("submit_state") not in {"marked", "terminal", "exhausted"}:
                 self._mark_worker_submit(task)
 
+    def _mark_poster_received(self, task: dict) -> bool:
+        with self._receipt_lock:
+            current = self.store.task_get(task["task_hash"], "poster", "")
+            if not current:
+                return False
+            if current.get("receive_state") in {"marked", "terminal", "exhausted"}:
+                return current.get("receive_state") == "marked"
+            if (not self.settle.open_on_assign or current["spec"]["reward"]["amount"] <= 0
+                    or not current.get("hold_id") or not current.get("result_hash")):
+                return True
+            attempts = int(current.get("receive_attempts") or 0) + 1
+            if attempts > POSTER_RECEIVE_MAX_ATTEMPTS:
+                self.store.task_cas(current["task_hash"], "poster", "", (current["state"],),
+                                    receive_state="exhausted",
+                                    receive_reason="ledger receive retry limit reached")
+                return False
+            self.store.task_cas(current["task_hash"], "poster", "", (current["state"],),
+                                receive_attempts=attempts)
+            try:
+                self.settle.received(current["task_hash"], current["result_hash"],
+                                     hold_id=current["hold_id"])
+            except SettlementError as exc:
+                terminal = getattr(exc, "state", "") in {"paid", "refunded", "released"}
+                if exc.status == 409 and not terminal:
+                    try:
+                        status = self.settle.status(current["task_hash"], hold_id=current["hold_id"])
+                        terminal = (status or {}).get("state") in {"paid", "released", "refunded"}
+                    except SettlementError:
+                        pass
+                state = "terminal" if terminal else (
+                    "exhausted" if attempts >= POSTER_RECEIVE_MAX_ATTEMPTS else "pending")
+                latest = self.store.task_get(current["task_hash"], "poster", "") or current
+                self.store.task_cas(current["task_hash"], "poster", "", (latest["state"],),
+                                    receive_state=state, receive_reason=str(exc)[:200],
+                                    receive_attempts=attempts)
+                self.log(f"ledger received mark for {current['task_hash'][:12]} {state}: {exc}")
+                return False
+            latest = self.store.task_get(current["task_hash"], "poster", "") or current
+            self.store.task_cas(current["task_hash"], "poster", "", (latest["state"],),
+                                receive_state="marked", receive_reason="",
+                                receive_attempts=attempts)
+            return True
+
+    def _retry_poster_receipts(self) -> None:
+        states = ("assigned", "awaiting_approval", "accepted", "rejected", "expired")
+        for task in self.store.tasks_in_states(states, role="poster"):
+            if task.get("receive_state") in {None, "", "marked", "terminal", "exhausted"}:
+                continue
+            marked = self._mark_poster_received(task)
+            current = self.store.task_get(task["task_hash"], "poster", "")
+            pending = (current or {}).get("verdict") or {}
+            if marked and current and current["state"] == "assigned" \
+                    and pending.get("pending_action") == "accept":
+                try:
+                    self._apply_task_decision(
+                        current["task_hash"], True, "", source="automatic", touch=False,
+                        output=current.get("output"), verdict=pending, from_states=("assigned",))
+                except ValueError as exc:
+                    self.log(f"task {current['task_hash'][:12]} acceptance still deferred: {exc}")
+
     def _claim_reopened(self, mid: str, person: str) -> None:
         """The poster refused our claim and put the task back up: make it claimable again here.
         Only for a task.claim WE sent to that poster, and only while it is still `claimed`."""
@@ -1505,6 +1569,7 @@ class Node:
         change and the settlement). The ledger's own CAS keeps this exactly-once. Returns how many."""
         fixed = 0
         self._retry_worker_submits()
+        self._retry_poster_receipts()
         self._rearm_approvals()
         self._finish_pending_assignments()
         for t in self.store.tasks_in_states(("accepted", "rejected", "expired"), role="poster"):
@@ -1780,19 +1845,31 @@ class Node:
                 raise ValueError("result for a task not assigned to you")
             if t["state"] != "assigned":
                 raise ValueError("task is not awaiting a result")
+            output = body.get("output")
+            if not isinstance(output, str) or len(output) > T.MAX_OUTPUT:
+                raise ValueError(f"output must be text of at most {T.MAX_OUTPUT} characters")
+            paid = t["spec"]["reward"]["amount"] > 0 and self.settle.open_on_assign
+            result_hash = hashlib.sha256(output.encode("utf-8")).hexdigest()
+            receipt_marked = True
+            if paid:
+                # Persist the exact delivered bytes before the external call. Receipt failure is
+                # advisory to local handling and is retried by reconciliation.
+                self.store.task_cas(h, "poster", "", ("assigned",), output=output,
+                                    result_hash=result_hash, receive_state="pending",
+                                    receive_reason="")
+                t = self.store.task_get(h, "poster", "")
+                receipt_marked = self._mark_poster_received(t)
             if t["spec"]["deadline"] <= time.time():
                 self.sweep()                                 # expire + refund now rather than at the next tick
                 raise ValueError("deadline passed; the task expired and its escrow was refunded")
             # The verdict is nak.task.post-authorised. Validate it before task state or escrow moves;
             # sender-loop signing still rechecks in case the grant expires while the reply waits.
             self._require_grant("task.accept")
-            output = body.get("output")
             passed, reasons = T.evaluate(t["spec"], output)
             verdict = {"passed": passed, "reasons": reasons,
-                       "output_sha256": hashlib.sha256(str(output).encode("utf-8")).hexdigest()}
+                       "output_sha256": result_hash}
             self.store.raw_log({"received": int(time.time()), "source": "nakshatra", "trust": "external",
                                 "from_person": c["person"], "envelope": env, "body": body})
-            paid = t["spec"]["reward"]["amount"] > 0 and self.settle.open_on_assign
             action = V.decide_policy(
                 self._task_constraints(t), reward=t["spec"]["reward"]["amount"],
                 stranger=self._worker_is_stranger(c), rules_passed=passed, escrowed=paid)
@@ -1808,6 +1885,13 @@ class Node:
                     raise ValueError("task is not awaiting a result")
                 self.log(f"task {h[:12]} result from {who}: awaiting approval")
                 self._arm_approval(h)
+                return
+            if action == V.ACCEPT and paid and not receipt_marked:
+                verdict["pending_action"] = "accept"
+                if not self.store.task_cas(h, "poster", "", ("assigned",), output=output,
+                                           verdict=json.dumps(verdict)):
+                    raise ValueError("task is not awaiting a result")
+                self.log(f"task {h[:12]} result from {who}: acceptance awaits ledger receipt")
                 return
             self._apply_task_decision(
                 h, action == V.ACCEPT, "" if passed else "; ".join(reasons),

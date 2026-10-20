@@ -266,3 +266,48 @@ touched.
   (`None.returncode`) and the moving-main
   `test_schema_migration_is_idempotent_on_a_forgejo_main_store` assertion.
 - `py_compile` for all changed Python files and `git diff --check` passed.
+
+---
+
+# Fix round 2 — delivery receipt (node) — 2026-10-20
+
+## What changed
+
+- `NeuronEscrowAdapter.received()` now signs `POST /spend/task/received` as the payer and validates
+  the contract response. Task status parsing requires and validates `received_at` and
+  `received_hash` alongside the worker's submit mark.
+- When a funded `task.result` arrives, the poster validates that the output is bounded text,
+  computes the same SHA-256 over its exact UTF-8 bytes that the worker used, persists the delivered
+  output/hash, and attempts the ledger receipt before rule evaluation or policy selection. This is
+  node-key ledger traffic and does not touch the sliding agent grant; any automatic verdict envelope
+  remains `touch=false`.
+- Receipt failures do not nack or discard the delivered result. The durable poster row records
+  pending/marked/terminal/exhausted receipt state and an attempt count; reconciliation retries up to
+  eight times, stops on a terminal hold (including a terminal 409 discovered through status), and
+  resumes a deferred automatic acceptance after the receipt succeeds.
+- Every funded ACCEPT now enforces the N3 equality: worker `result_hash` == payer `received_hash` ==
+  the SHA-256 of the locally delivered output. A mismatch becomes the existing automatic reject and
+  refund. ASK and rule-reject handling continue locally even when the receipt endpoint is down.
+- The contract-faithful fake ledger now implements payer-only, idempotent `/received` semantics and
+  the deadline+24h sweep rule: pay only for an on-time submit with a matching payer receipt;
+  otherwise refund.
+
+## Verification
+
+All commands used a fresh temporary `HOME` and
+`PYTHONPATH=/home/prithvi/sthambha:/home/prithvi/.local/lib/python3.12/site-packages`. Two-node tests
+used only the loopback in-process relay. No live node state, signer socket, Neuron ledger, approval
+service, systemd unit, deploy, pull, or push was touched.
+
+- Full Neuron escrow suite: **56 passed** in 27.15s.
+- Established 13-file network matrix: **353 passed / 10 failed**. This is the prior round's
+  **348 passed / 10 failed** plus five receipt regressions and no new failure.
+- The same ten baseline failures remain: nine `test_nak_direct` subprocess stubs returning `None`,
+  plus `test_schema_migration_is_idempotent_on_a_forgejo_main_store` against the moving
+  `forgejo/main` schema.
+- Matrix plus the exhaustive 203-case verdict-policy suite: **556 passed / 10 failed** in 81.61s.
+- Coverage includes the exact canonical receipt hash and automatic `touch=false`, ledger-down
+  receipt retry, bounded retry plus terminal-409 stop, silence-pay while the poster is offline,
+  refund when the worker marks submit but never delivers, mismatch refund, and the real signed HTTP
+  adapter path.
+- `py_compile` for all changed Python files and `git diff --check` passed.

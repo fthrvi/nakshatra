@@ -90,6 +90,9 @@ class SettlementAdapter:
     def submit(self, task_hash: str, result_hash: str, *, hold_id: str = "") -> dict:
         raise NotImplementedError
 
+    def received(self, task_hash: str, result_hash: str, *, hold_id: str = "") -> dict:
+        raise NotImplementedError
+
 
 class LedgerAdapter(SettlementAdapter):
     """Adapter #0: escrow as rows in a local ledger. No money moves; the transitions are real."""
@@ -171,6 +174,10 @@ class LedgerAdapter(SettlementAdapter):
 
     def submit(self, task_hash, result_hash, *, hold_id=""):
         return {"adapter": self.name, "event": "submitted", "task_hash": task_hash,
+                "result_hash": result_hash}
+
+    def received(self, task_hash, result_hash, *, hold_id=""):
+        return {"adapter": self.name, "event": "received", "task_hash": task_hash,
                 "result_hash": result_hash}
 
     def journal(self, task_hash: Optional[str] = None) -> list:
@@ -350,12 +357,32 @@ class NeuronEscrowAdapter(SettlementAdapter):
         receipt.update(result_hash=result_hash, submitted_at=value["submitted_at"])
         return receipt
 
+    def received(self, task_hash, result_hash, *, hold_id=""):
+        if _HEX64.fullmatch(result_hash or "") is None:
+            raise SettlementError("task result hash must be 64 lowercase hex characters")
+        resolved = self._hold_id(task_hash, hold_id)
+        value = self._hold(self._request("POST", "/spend/task/received", {
+            "hold_id": resolved, "result_hash": result_hash,
+        }), expected_hold=resolved, expected_state="open")
+        expected = {"v", "hold_id", "task_hash", "worker_keyid", "amount", "deadline", "state",
+                    "submitted_at", "result_hash", "received_at", "received_hash"}
+        if (set(value) != expected or value["task_hash"] != task_hash
+                or isinstance(value["submitted_at"], bool) or not isinstance(value["submitted_at"], int)
+                or value["submitted_at"] <= 0 or _HEX64.fullmatch(value["result_hash"] or "") is None
+                or isinstance(value["received_at"], bool) or not isinstance(value["received_at"], int)
+                or value["received_at"] <= 0 or value["received_hash"] != result_hash):
+            raise SettlementError("Neuron ledger returned an invalid task received response")
+        receipt = self._receipt(value, "received")
+        receipt.update(result_hash=result_hash, received_at=value["received_at"])
+        return receipt
+
     def status(self, task_hash, *, hold_id=""):
         resolved = self._hold_id(task_hash, hold_id)
         path = "/spend/task/status?" + urllib.parse.urlencode({"hold_id": resolved})
         value = self._hold(self._request("GET", path), expected_hold=resolved)
         expected = {"v", "hold_id", "task_hash", "payer_account", "worker_keyid", "amount",
-                    "deadline", "state", "server_time", "submitted_at", "result_hash"}
+                    "deadline", "state", "server_time", "submitted_at", "result_hash",
+                    "received_at", "received_hash"}
         if (set(value) != expected or value["task_hash"] != task_hash
                 or not isinstance(value["payer_account"], str)
                 or isinstance(value["server_time"], bool) or not isinstance(value["server_time"], int)
@@ -363,7 +390,11 @@ class NeuronEscrowAdapter(SettlementAdapter):
                 or value["submitted_at"] < 0
                 or not isinstance(value["result_hash"], str)
                 or (value["result_hash"] and _HEX64.fullmatch(value["result_hash"]) is None)
-                or bool(value["submitted_at"]) != bool(value["result_hash"])):
+                or bool(value["submitted_at"]) != bool(value["result_hash"])
+                or isinstance(value["received_at"], bool) or not isinstance(value["received_at"], int)
+                or value["received_at"] < 0 or not isinstance(value["received_hash"], str)
+                or (value["received_hash"] and _HEX64.fullmatch(value["received_hash"]) is None)
+                or bool(value["received_at"]) != bool(value["received_hash"])):
             raise SettlementError("Neuron ledger returned an invalid task status")
         out = dict(value)
         out["ledger_state"] = value["state"]

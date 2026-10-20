@@ -38,6 +38,8 @@ class FakeTaskLedger:
         self.fail_pay = False
         self.fail_submit = False
         self.submit_calls = 0
+        self.fail_receive = False
+        self.receive_calls = 0
         self.fail_authorize = False
         self.refuse_authorize = 0        # HTTP status of a definitive refusal
         self.drop_response = False       # commit the hold, then lose the answer
@@ -83,7 +85,7 @@ class FakeTaskLedger:
         row = {"v": 1, "hold_id": hold_id, "task_hash": task_hash,
                "payer_account": payer, "worker_keyid": worker, "amount": amount,
                "deadline": deadline, "state": "open", "server_time": int(time.time()),
-               "submitted_at": 0, "result_hash": ""}
+               "submitted_at": 0, "result_hash": "", "received_at": 0, "received_hash": ""}
         self.holds[hold_id] = row
         self.nonces[(payer, task_hash)] = hold_id
         self.transitions.append((hold_id, "open"))
@@ -147,6 +149,45 @@ class FakeTaskLedger:
             row["result_hash"] = self.submit_hash_override or result_hash
         return copy.deepcopy(row)
 
+    def received(self, payer, hold_id, result_hash):
+        self.receive_calls += 1
+        if self.fail_receive:
+            raise SettlementError("ledger down")
+        row = self.holds[hold_id]
+        if row["payer_account"] != payer:
+            raise SettlementError("task hold not found")
+        if row["state"] != "open":
+            error = SettlementError(f"task hold is {row['state']}")
+            error.status = 409
+            raise error
+        if not row["result_hash"] or row["submitted_at"] > row["deadline"]:
+            error = SettlementError("task result was not submitted on time")
+            error.status = 409
+            raise error
+        if row["received_hash"] and row["received_hash"] != result_hash:
+            error = SettlementError("different received task result")
+            error.status = 409
+            raise error
+        if not row["received_hash"]:
+            row["received_at"] = int(time.time()) or 1
+            row["received_hash"] = result_hash
+        return copy.deepcopy(row)
+
+    def sweep(self, now):
+        for hold_id, row in self.holds.items():
+            if row["state"] != "open" or now < row["deadline"] + 24 * 3600:
+                continue
+            if (row["submitted_at"] and row["submitted_at"] <= row["deadline"]
+                    and row["received_at"] and row["result_hash"] == row["received_hash"]):
+                row["state"] = "paid"
+                self.balances[row["worker_keyid"]] = self.balances.get(row["worker_keyid"], 0) + row["amount"]
+                self.transitions.append((hold_id, "paid"))
+            else:
+                row["state"] = "refunded"
+                self.balances[row["payer_account"]] = self.balances.get(row["payer_account"], 0) + row["amount"]
+                self.transitions.append((hold_id, "refunded"))
+        self.check()
+
     def refund(self, payer, hold_id, _reason):
         row = self.holds[hold_id]
         if row["payer_account"] != payer:
@@ -206,6 +247,13 @@ class FakeNeuronAdapter:
         receipt.update(result_hash=result_hash, submitted_at=row["submitted_at"])
         return receipt
 
+    def received(self, task_hash, result_hash, *, hold_id=""):
+        row = self.ledger.received(self.keyid, hold_id, result_hash)
+        assert row["task_hash"] == task_hash
+        receipt = self._receipt(row, "received")
+        receipt.update(result_hash=result_hash, received_at=row["received_at"])
+        return receipt
+
     def journal(self, _task_hash=None):
         return []
 
@@ -261,6 +309,9 @@ class ReplayLedgerHTTP:
             elif parts.path == "/spend/task/submit":
                 b = json.loads(body)
                 row = ledger.submit(keyid, b["hold_id"], b["result_hash"])
+            elif parts.path == "/spend/task/received":
+                b = json.loads(body)
+                row = ledger.received(keyid, b["hold_id"], b["result_hash"])
             else:
                 hold_id = urllib.parse.parse_qs(parts.query)["hold_id"][0]
                 return _Response(json.dumps(ledger.status(keyid, hold_id)).encode())
@@ -271,6 +322,8 @@ class ReplayLedgerHTTP:
         keys = ("v", "hold_id", "task_hash", "worker_keyid", "amount", "deadline", "state")
         if parts.path == "/spend/task/submit":
             keys += ("submitted_at", "result_hash")
+        elif parts.path == "/spend/task/received":
+            keys += ("submitted_at", "result_hash", "received_at", "received_hash")
         row = {k: row[k] for k in keys}
         return _Response(json.dumps(row).encode())
 
@@ -371,8 +424,8 @@ def test_over_threshold_hook_accepts_with_fixed_text_and_human_touch(net, tmp_pa
         f"Pay worker ({worker.person_pub[:8]}) 0.00000005 USDC for task 'drill' ({task_hash[:12]})? "
         "The answer passed the task's rules.")
     assert next(iter(ledger.holds.values()))["state"] == "paid"
-    touches = [r for r in poster.signer_requests if r.get("kind") == "task.accept"]
-    assert any(r.get("touch") is True for r in touches)
+    assert wait(lambda: any(r.get("kind") == "task.accept" and r.get("touch") is True
+                            for r in poster.signer_requests))
 
 
 def test_hook_reject_refunds_and_unanswered_or_timeout_keeps_waiting(net, tmp_path, monkeypatch):
@@ -571,6 +624,97 @@ def test_worker_submit_mark_failure_never_blocks_delivery_and_reconcile_retries(
     assert local["submit_state"] == "marked" and ledger.submit_calls >= 2
 
 
+def test_two_node_funded_delivery_records_payer_receipt_with_canonical_hash_and_no_touch(net):
+    poster, worker, ledger = _pair(net, constraints=_ask_policy(auto_max=10))
+    poster.signer_requests.clear()
+    task_hash = _assign(poster, worker)
+    worker.node.submit_task(task_hash, "ok")
+    assert wait(lambda: poster.node.store.task_get(task_hash, "poster")["state"] == "accepted")
+    hold = next(iter(ledger.holds.values()))
+    expected = hashlib.sha256(b"ok").hexdigest()
+    assert hold["result_hash"] == hold["received_hash"] == expected
+    assert hold["received_at"] > 0 and ledger.receive_calls == 1
+    calls = [r for r in poster.signer_requests
+             if r.get("op") == "sign_envelope" and r.get("kind") == "task.accept"]
+    assert calls and all(r.get("touch") is False for r in calls)
+
+
+def test_poster_receive_failure_never_blocks_handling_and_reconcile_retries(net):
+    poster, worker, ledger = _pair(net, constraints=_ask_policy(auto_max=10))
+    task_hash = _assign(poster, worker)
+    ledger.fail_receive = True
+    worker.node.submit_task(task_hash, "ok")
+    assert wait(lambda: poster.node.store.task_get(task_hash, "poster")["receive_state"] == "pending")
+    local = poster.node.store.task_get(task_hash, "poster")
+    assert local["state"] == "assigned" and local["verdict"]["pending_action"] == "accept"
+    assert local["output"] == "ok"
+    ledger.fail_receive = False
+    poster.node.reconcile_escrow()
+    assert poster.node.store.task_get(task_hash, "poster")["state"] == "accepted"
+    hold = next(iter(ledger.holds.values()))
+    assert hold["received_hash"] == hashlib.sha256(b"ok").hexdigest()
+    assert ledger.receive_calls >= 2
+
+
+def test_ledger_sweep_pays_on_time_delivery_while_poster_stays_offline(net):
+    poster, worker, ledger = _pair(net, constraints=_ask_policy(mode="ask"))
+    task_hash = _assign(poster, worker)
+    worker.node.submit_task(task_hash, "ok")
+    assert wait(lambda: poster.node.store.task_get(task_hash, "poster")["state"] == "awaiting_approval")
+    hold = next(iter(ledger.holds.values()))
+    assert hold["submitted_at"] <= hold["deadline"] and hold["received_at"] > 0
+    poster.node.stop()
+    ledger.sweep(hold["deadline"] + 24 * 3600)
+    assert hold["state"] == "paid"
+    assert ledger.balances[worker.node.node] == hold["amount"]
+
+
+def test_ledger_sweep_refunds_worker_mark_that_was_never_delivered(net):
+    poster, worker, ledger = _pair(net, constraints=_ask_policy(mode="ask"))
+    task_hash = _assign(poster, worker)
+    poster.node.stop()
+    worker.node.submit_task(task_hash, "ok")
+    hold = next(iter(ledger.holds.values()))
+    assert hold["result_hash"] == hashlib.sha256(b"ok").hexdigest()
+    assert hold["received_at"] == 0 and not hold["received_hash"]
+    ledger.sweep(hold["deadline"] + 24 * 3600)
+    assert hold["state"] == "refunded"
+    assert ledger.balances[poster.node.node] == 100
+
+
+def test_poster_receive_retries_stop_on_terminal_hold_and_are_bounded(net):
+    poster, worker, ledger = _pair(net, suffix="-receive-terminal",
+                                   constraints=_ask_policy(mode="ask"))
+    task_hash = _assign(poster, worker)
+    ledger.fail_receive = True
+    worker.node.submit_task(task_hash, "ok")
+    assert wait(lambda: poster.node.store.task_get(task_hash, "poster")["receive_state"] == "pending")
+    hold = next(iter(ledger.holds.values()))
+    ledger.fail_receive = False
+    hold["state"] = "refunded"
+    ledger.balances[hold["payer_account"]] += hold["amount"]
+    before = ledger.receive_calls
+    poster.node.reconcile_escrow()
+    terminal = poster.node.store.task_get(task_hash, "poster")
+    assert terminal["receive_state"] == "terminal"
+    poster.node.reconcile_escrow()
+    assert ledger.receive_calls == before + 1
+
+    poster2, worker2, ledger2 = _pair(net, suffix="-receive-bounded",
+                                      constraints=_ask_policy(mode="ask"))
+    task2 = _assign(poster2, worker2)
+    ledger2.fail_receive = True
+    worker2.node.submit_task(task2, "ok")
+    assert wait(lambda: poster2.node.store.task_get(task2, "poster")["receive_state"] == "pending")
+    for _ in range(nakd.POSTER_RECEIVE_MAX_ATTEMPTS + 3):
+        poster2.node.reconcile_escrow()
+    exhausted = poster2.node.store.task_get(task2, "poster")
+    assert exhausted["receive_state"] == "exhausted"
+    calls = ledger2.receive_calls
+    poster2.node.reconcile_escrow()
+    assert ledger2.receive_calls == calls == nakd.POSTER_RECEIVE_MAX_ATTEMPTS
+
+
 def test_result_hash_mismatch_rejects_and_refunds_before_accept(net):
     poster, worker, ledger = _pair(net, constraints=_ask_policy(auto_max=10))
     ledger.submit_hash_override = "f" * 64
@@ -742,7 +886,8 @@ def test_real_neuron_adapter_uses_contract_routes_and_signed_query_path():
             value = dict(hold, state="paid")
         elif request.method == "GET":
             assert urllib.parse.parse_qs(urllib.parse.urlsplit(request.full_url).query) == {"hold_id": ["h-1"]}
-            value = dict(hold, payer_account="payer", server_time=1, submitted_at=0, result_hash="")
+            value = dict(hold, payer_account="payer", server_time=1, submitted_at=0, result_hash="",
+                         received_at=0, received_hash="")
         else:
             value = hold
         return _Response(json.dumps(value).encode())
