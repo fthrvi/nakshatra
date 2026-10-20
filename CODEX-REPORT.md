@@ -90,7 +90,7 @@ Note: on the reconcile/sweep path (no live claim to nack) the worker is not told
 | `_run_session` via `_sign` | `sign_envelope` | background delivery and every resend of an already queued item; the initiating boundary already touched once | `false` |
 | `_approve_reward` | `approve_spend` | agent/human task-post payment authorization | `true` |
 
-Daemon-created queued task traffic is also classified at its queue boundary: pending-assignment recovery queues `task.assign` with `touch=false`; escrow reconciliation queues terminal verdicts with `touch=false`; expiry sweep queues `task.reject` with `touch=false`. Direct inbound task decisions and explicit human/agent operations keep the `_queue` default `touch=true`. Acks are transport frames and do not call the signer.
+Daemon-created queued task traffic is also classified at its queue boundary: pending-assignment recovery queues `task.assign` with `touch=false`; escrow reconciliation queues terminal verdicts with `touch=false`; expiry sweep queues `task.reject` with `touch=false`. Every reply forced by an inbound envelope now also uses `touch=false`; only explicit local human/agent entry points retain `touch=true`. Acks are transport frames and do not call the signer.
 
 ## Verification
 
@@ -103,3 +103,53 @@ All Python/pytest commands used a fresh `HOME=$(mktemp -d)` and `PYTHONPATH=/hom
 - `py_compile` passed for every changed Python module/test; `git diff --check` passed.
 
 The node side was verified against Sthambha signer commit `93ab1b9` (`signer: add sliding charter leases`).
+
+## Fix round 1
+
+Review: `/home/prithvi/wt/rv-lease.md`, findings B1 and N8.
+
+- B1: all envelopes queued as a consequence of inbound processing now use `touch=false`. This includes the automatic first assignment, both already-assigned rejection paths, paid assignment through `_open_assignment`, automatic accept/reject verdicts, and the card published when an inbound `contact.accept` activates a connection. Automatic assignment is a protocol decision, not a human/agent decision. The `_open_assignment` default is therefore also `false`. Local accept, send, card set, post, claim, submit, and agent-message entry points continue to touch.
+- N8: charter renewal detects a signer without `load_or_create_lease_key` before opening mutable agent state, and genuine join first-init detects it before creating any identity or authority file. Both exit cleanly with `signer too old for sliding grants; update the node or use --no-lease`. Renewal with `--no-lease` remains compatible and omits the new `lease` argument entirely.
+
+### Complete `nakd` signer-call inventory
+
+Every queued item is signed for delivery in `_run_session` with `touch=false`; a local initiating queue boundary first calls `_touch_signing_activity` with `touch=true`. The table lists every direct signer call and every `_sign`, `_touch_signing_activity`, `_queue`, `_send_card_if_set`, and `_open_assignment` call site that determines that classification.
+
+| Call site | Envelope/action | Classification | `touch` |
+|---|---|---|---|
+| `Node.__init__` | `whoami` | startup identity read | n/a |
+| `Node.__init__` | `data_key` | startup encrypted-store key retrieval | n/a |
+| `_grant_status` | `grant_status` | startup/daily/local read-only preflight; signer does not mint or write | n/a |
+| `_redeem_loop` → `_sign` | `contact.request` | local redeem on the first successful signing attempt; later daemon retries | first `true`, then `false` |
+| `accept` → `_queue` | `contact.accept` | explicit local accept | `true` |
+| `accept` → `_send_card_if_set` → `_queue` | `contact.card` | card accompanying explicit local accept | `true` |
+| `send` → `_queue` | `msg` | explicit local send | `true` |
+| `agent_send` → `_touch_signing_activity` | `agent.msg` | explicit local agent send before durable queueing | `true` |
+| `card_set` → `_send_card_if_set` → `_queue` | `contact.card` per active contact | explicit local card update | `true` |
+| `_receive_checked(contact.accept)` → `_send_card_if_set` → `_queue` | `contact.card` | reply forced by inbound accept | `false` |
+| `post_task` → `_approve_reward` | `approve_spend` | explicit local paid-task post | `true` |
+| `post_task` → `_queue` | `task.post` per target | explicit local task post | `true` |
+| `_finish_pending_assignments` → `_open_assignment` → `_queue` | `task.assign` | daemon recovery/reconciliation | `false` |
+| `reconcile_escrow` → `_queue` | `task.accept` / `task.reject` | daemon settlement reconciliation | `false` |
+| `sweep` → `_queue` | `task.reject` | daemon expiry response | `false` |
+| `claim_task` → `_queue` | `task.claim` | explicit local claim | `true` |
+| `submit_task` → `_queue` | `task.result` | explicit local submit | `true` |
+| `_task_receive(task.claim)` → `_queue` | first free `task.assign` | automatic reply to inbound claim | `false` |
+| `_task_receive(task.claim)` → `_queue` | free-task `task.reject` for another assignee | automatic reply to inbound claim | `false` |
+| `_task_receive(task.claim)` → `_queue` | paid-task `task.reject` for another assignee | automatic reply to inbound claim | `false` |
+| `_task_receive(task.claim)` → `_open_assignment` → `_queue` | paid `task.assign` | automatic reply to inbound claim | `false` |
+| `_task_receive(task.result)` → `_queue` | `task.accept` / `task.reject` verdict | automatic reply to inbound result | `false` |
+| `_queue` → `_touch_signing_activity` | pre-queue signer check for the local rows above | records the initiating local activity once | `true` iff the call-site row is `true` |
+| `_run_session` → `_sign` | delivery and every resend of every queued item | daemon background work | `false` |
+
+Acks/nacks, pings, and direct-address frames are transport frames and never call the signer.
+
+### Verification
+
+All pytest runs used a newly created temporary `HOME`, the Sthambha signer branch on `PYTHONPATH`, and only loopback in-process relays. No real node home, signer socket, service, deploy, pull, or push was touched.
+
+- Required focused files (`test_nak_grant`, `test_nak_join`, `test_nakd`, `test_nak_neuron_escrow`): **182 passed** in 38.26s (round-0 branch: 178 passed; +4 regressions).
+- Final four new regressions after the last hardening edit: **4 passed** in 3.89s.
+- Established 13-file matrix: branch **332 passed / 10 failed** versus clean Git-backed `forgejo/main@29ccaf0` **316 passed / 10 failed**. Net: **+16 passed, no new failure**.
+- The same ten baseline failures occur on both revisions: nine `test_nak_direct` subprocess-stub failures (`None.returncode`) and `test_schema_migration_is_idempotent_on_a_forgejo_main_store` against the moving `forgejo/main` schema.
+- `py_compile` for all changed Python runtime/test files and `git diff --check` passed.

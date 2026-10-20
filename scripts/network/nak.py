@@ -1738,6 +1738,7 @@ def _delegate_reuse_command(state: Path, person_key: Path, agent: str, caps: lis
 
 
 MAX_SPEND_CAP = 10**14   # base units; 10^6 USDC-equivalent in credits, far above any devnet need
+OLD_SIGNER_MESSAGE = "signer too old for sliding grants; update the node or use --no-lease"
 
 
 def _grant_renew(args) -> int:
@@ -1755,6 +1756,8 @@ def _grant_renew(args) -> int:
             raise SystemExit(f"{flag} must be between 0 and {MAX_SPEND_CAP} base units")
     signer_dir, _net_dir, agent = _grant_paths()
     from sthambha import signer as signer_mod
+    if not args.no_lease and not callable(getattr(signer_mod, "load_or_create_lease_key", None)):
+        raise SystemExit(OLD_SIGNER_MESSAGE)
     try:
         with signer_mod.open_agent_files(signer_dir, agent) as agent_files:
             return _grant_renew_confined(args, signer_dir, agent, signer_mod, agent_files)
@@ -1836,8 +1839,10 @@ def _grant_renew_confined(args, signer_dir: Path, agent: str, signer_mod, agent_
         _lease_priv, lease_pub = signer_mod.load_or_create_lease_key(signer_dir)
         lease = {"issuer_pub": lease_pub, "max_s": args.lease_days * 86400,
                  "idle_s": args.idle_days * 86400}
-    renewed = signer_mod.issue_grant(person_priv, agent, agent_pub, caps, node=current["node"],
-                                     ttl_s=args.ttl * 86400, constraints=constraints, lease=lease)
+    grant_args = {"node": current["node"], "ttl_s": args.ttl * 86400, "constraints": constraints}
+    if lease is not None:
+        grant_args["lease"] = lease
+    renewed = signer_mod.issue_grant(person_priv, agent, agent_pub, caps, **grant_args)
     agent_files.write_grant(renewed)
     if cap_changes:
         print(f"spend caps now {renewed['constraints'].get('per_tx_cap', 0)} per payment, "

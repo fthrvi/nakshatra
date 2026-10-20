@@ -36,6 +36,7 @@ AGENT_CAPS = ("nak.msg", "nak.task.claim")
 AGENT_TTL_S = 365 * 86400
 AGENT_LEASE_S = 7 * 86400
 AGENT_IDLE_S = 30 * 86400
+OLD_SIGNER_MESSAGE = "signer too old for sliding grants; update the node or use --no-lease"
 WORKER_RETRY_FILE = Path(".nakshatra") / "worker-invite.json"
 CONSUMER_STANDING_FILE = Path(".nakshatra") / "consumer-standing.json"
 
@@ -405,6 +406,9 @@ def ensure_identity(home: Path) -> dict:
     first_initialisation = not (sthambha_authority_present or net_agent_present or net_store_present)
     if not first_initialisation:
         return _established_identity(home, state, net, person_path, node_key)
+    if not callable(getattr(S, "load_or_create_lease_key", None)):
+        # Compatibility must be decided before first-init creates any identity or authority state.
+        raise SystemExit(OLD_SIGNER_MESSAGE)
 
     node_pub = None
     if node_key_present:

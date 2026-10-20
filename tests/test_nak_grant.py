@@ -32,6 +32,14 @@ def _temporary_identity(tmp_path: Path, monkeypatch):
     return state, state / "agents" / "agent.key", state / "agents" / "agent.grant.json"
 
 
+def _state_snapshot(root: Path):
+    return {
+        path.relative_to(root).as_posix():
+            (path.lstat().st_mode, path.read_bytes() if path.is_file() else b"")
+        for path in sorted(root.rglob("*"))
+    }
+
+
 def test_grant_status_prints_public_authority_and_renewal_warning(monkeypatch, capsys):
     status = {"agent": "agent", "caps": ["nak.msg"], "expires_at": 1_800_000_000,
               "not_before": 1, "revoked": False, "grant_id": "g",
@@ -119,6 +127,22 @@ def test_grant_renew_no_lease_keeps_the_legacy_fixed_expiry_path(tmp_path, monke
     renewed = json.loads(grant_path.read_text())
     assert "lease" not in renewed
     assert 29 * 86400 <= renewed["expires_at"] - int(time.time()) <= 30 * 86400
+    assert "fixed-expiry legacy grant" in capsys.readouterr().out
+
+
+def test_grant_renew_old_signer_fails_cleanly_without_mutation_and_no_lease_still_works(
+        tmp_path, monkeypatch, capsys):
+    _state, _key_path, grant_path = _temporary_identity(tmp_path, monkeypatch)
+    before = _state_snapshot(tmp_path)
+    monkeypatch.delattr(signer_mod, "load_or_create_lease_key")
+
+    with pytest.raises(SystemExit) as refused:
+        nak.main(["grant", "renew", "--yes"])
+
+    assert str(refused.value) == "signer too old for sliding grants; update the node or use --no-lease"
+    assert _state_snapshot(tmp_path) == before
+    assert nak.main(["grant", "renew", "--yes", "--no-lease"]) == 0
+    assert "lease" not in json.loads(grant_path.read_text())
     assert "fixed-expiry legacy grant" in capsys.readouterr().out
 
 

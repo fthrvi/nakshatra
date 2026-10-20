@@ -596,9 +596,9 @@ class Node:
         card = self.store.agent_card(self.person)
         return dict(card, v=CARD_VERSION) if card else None
 
-    def _send_card_if_set(self, person: str) -> Optional[str]:
+    def _send_card_if_set(self, person: str, *, touch: bool = True) -> Optional[str]:
         body = self._card_body()
-        return self._queue(person, "contact.card", body) if body else None
+        return self._queue(person, "contact.card", body, touch=touch) if body else None
 
     def card_set(self, display_name: str, offers: str, *, intents=None, models=None,
                  price_hint: str = "", paid: bool = False) -> dict:
@@ -888,7 +888,8 @@ class Node:
             if c["state"] == "awaiting":
                 self.store.set_contact_state(person, "active")
                 self.log(f"{c['petname'] or person[:12]} accepted the connection")
-                self._send_card_if_set(person)
+                # This publication is forced by the peer's accept, not initiated locally.
+                self._send_card_if_set(person, touch=False)
             return {"t": "ack", "mid": mid}
         if c["state"] != "active":
             return {"t": "nack", "mid": mid, "why": "connection not accepted yet"}
@@ -1103,7 +1104,7 @@ class Node:
         if frame.get("kind") == "task.claim" and isinstance(h, str):
             self.store.task_cas(h, "worker", person, ("claimed",), state="offered")
 
-    def _open_assignment(self, h: str, person: str, *, touch: bool = True) -> None:
+    def _open_assignment(self, h: str, person: str, *, touch: bool = False) -> None:
         """Open (or, idempotently, re-open) the task hold for an `assigned` task that has none yet,
         record it, and only then tell the worker. client_nonce is the task hash, so a repeat after an
         ambiguous failure returns the SAME hold. Definitive ledger refusal: put the task back to
@@ -1379,11 +1380,13 @@ class Node:
             if not paid:
                 if self.store.task_cas(h, "poster", "", ("posted",), state="assigned",
                                        assignee=c["person"], epoch=1):
-                    self._queue(c["person"], "task.assign", {"task_hash": h, "epoch": 1, "worker": c["person"]})
+                    self._queue(c["person"], "task.assign",
+                                {"task_hash": h, "epoch": 1, "worker": c["person"]}, touch=False)
                     self.log(f"task {h[:12]} assigned to {who}")
                 elif t["assignee"] != c["person"]:
                     self._queue(c["person"], "task.reject", {"task_hash": h, "epoch": 0,
-                                                             "reasons": ["already assigned to someone else"]})
+                                                             "reasons": ["already assigned to someone else"]},
+                                touch=False)
                 return
             card = self.store.agent_card(c["person"])
             if not card or card.get("paid") is not True or not card.get("ledger_keyid"):
@@ -1401,9 +1404,10 @@ class Node:
                         and not cur["hold_id"]):
                     if not cur or cur["assignee"] != c["person"]:
                         self._queue(c["person"], "task.reject", {"task_hash": h, "epoch": 0,
-                                                                 "reasons": ["already assigned to someone else"]})
+                                                                 "reasons": ["already assigned to someone else"]},
+                                    touch=False)
                     return
-            self._open_assignment(h, c["person"])
+            self._open_assignment(h, c["person"], touch=False)
             return
         if kind == "task.assign":
             if body.get("worker") != self.person or not isinstance(body.get("epoch"), int):
@@ -1446,7 +1450,7 @@ class Node:
             self.store.raw_log({"received": int(time.time()), "source": "nakshatra", "trust": "external",
                                 "from_person": c["person"], "envelope": env, "body": body})
             self._queue(c["person"], "task.accept" if passed else "task.reject",
-                        {"task_hash": h, "epoch": t["epoch"], **verdict})
+                        {"task_hash": h, "epoch": t["epoch"], **verdict}, touch=False)
             self.log(f"task {h[:12]} result from {who}: {'ACCEPTED' if passed else 'REJECTED ' + str(reasons)}")
             return
         if kind in ("task.accept", "task.reject"):

@@ -98,6 +98,17 @@ def test_genuine_first_identity_setup_mints_once_and_is_idempotent(tmp_path):
     assert again == dict(first, node_key="kept", person_key="kept", signer="kept", agent="'agent' kept")
 
 
+def test_first_identity_setup_old_signer_fails_cleanly_before_any_state_change(tmp_path, monkeypatch):
+    before = _identity_snapshot(tmp_path)
+    monkeypatch.delattr(signer_mod, "load_or_create_lease_key")
+
+    with pytest.raises(SystemExit) as refused:
+        join_setup.ensure_identity(tmp_path)
+
+    assert str(refused.value) == "signer too old for sliding grants; update the node or use --no-lease"
+    assert _identity_snapshot(tmp_path) == before
+
+
 def test_first_identity_setup_keeps_a_preexisting_worker_key(tmp_path):
     worker_key = tmp_path / ".nakshatra" / "keys" / "worker.ed25519"
     worker_key.parent.mkdir(parents=True)

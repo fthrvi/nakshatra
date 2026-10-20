@@ -190,6 +190,33 @@ def test_daemon_resend_signatures_do_not_extend_charter_idle_activity(net, monke
     a.node.store.ack(mid, b.person_pub)
 
 
+def test_inbound_accept_card_does_not_touch_while_local_accept_and_send_do(net):
+    acceptor = net("acceptor", lease=True)
+    requester = net("requester", lease=True)
+    requester.node.card_set("Requester", "answers")
+    requester.node.redeem(acceptor.invite(), petname="acceptor", wait_s=15)
+    assert wait(lambda: len(acceptor.node.store.requests()) == 1)
+    acceptor_before = acceptor.signer.grant_status("pa")["lease"]["last_used"]
+    requester_before = requester.signer.grant_status("pa")["lease"]["last_used"]
+
+    time.sleep(1.05)
+    acceptor.node.accept(acceptor.node.store.requests()[0]["id"], petname="requester")
+    assert wait(lambda: (requester.node.store.contact(acceptor.person_pub) or {}).get("state") == "active")
+    assert wait(lambda: acceptor.node.store.agent_card(requester.person_pub) is not None)
+
+    assert acceptor.signer.grant_status("pa")["lease"]["last_used"] > acceptor_before
+    assert requester.signer.grant_status("pa")["lease"]["last_used"] == requester_before
+    card_calls = [r for r in requester.signer_requests
+                  if r.get("op") == "sign_envelope" and r.get("kind") == "contact.card"]
+    assert card_calls and all(r["touch"] is False for r in card_calls)
+
+    send_before = acceptor.signer.grant_status("pa")["lease"]["last_used"]
+    time.sleep(1.05)
+    mid = acceptor.node.send("requester", "locally initiated")['queued']
+    assert wait(lambda: acceptor.node.delivered(mid))
+    assert acceptor.signer.grant_status("pa")["lease"]["last_used"] > send_before
+
+
 def test_agent_cards_and_threaded_ask_answer_are_exchanged_and_encrypted(net):
     a, b = net("alice"), net("bob")
     offers_marker = "CARD_OFFERS_MARKER_M1"
@@ -637,6 +664,38 @@ def test_first_claim_wins_second_is_told_lost(net):
     c.node.claim_task(h)
     assert wait(lambda: _worker_row(c.node, h)[0]["state"] == "lost")
     assert a.node.store.task_get(h, "poster")["assignee"] == b.person_pub
+
+
+def test_peer_driven_task_replies_never_extend_the_posters_charter(net):
+    poster = net("lease-poster", caps=("nak.msg", "nak.task.post"), lease=True)
+    winner = net("lease-winner", caps=("nak.msg", "nak.task.claim"), lease=True)
+    loser = net("lease-loser", caps=("nak.msg", "nak.task.claim"), lease=True)
+    _connect(net, poster, winner)
+    _connect(net, poster, loser)
+    h = poster.node.post_task("*", "one job", "Say ok.", [{"contains_all": ["ok"]}])["task_hash"]
+    assert wait(lambda: _worker_row(winner.node, h) and _worker_row(loser.node, h))
+
+    poster.signer_requests.clear()
+    winner.node.claim_task(h)
+    assert wait(lambda: _worker_row(winner.node, h)[0]["state"] == "assigned")
+    assign_calls = [r for r in poster.signer_requests
+                    if r.get("op") == "sign_envelope" and r.get("kind") == "task.assign"]
+    assert assign_calls and all(r["touch"] is False for r in assign_calls)
+
+    before = poster.signer.grant_status("pa")["lease"]["last_used"]
+    time.sleep(1.05)
+    loser.node.claim_task(h)
+    assert wait(lambda: _worker_row(loser.node, h)[0]["state"] == "lost")
+    assert poster.signer.grant_status("pa")["lease"]["last_used"] == before
+    reject_calls = [r for r in poster.signer_requests
+                    if r.get("op") == "sign_envelope" and r.get("kind") == "task.reject"]
+    assert reject_calls and all(r["touch"] is False for r in reject_calls)
+
+    winner.node.submit_task(h, "ok")
+    assert wait(lambda: _worker_row(winner.node, h)[0]["state"] == "accepted")
+    verdict_calls = [r for r in poster.signer_requests
+                     if r.get("op") == "sign_envelope" and r.get("kind") == "task.accept"]
+    assert verdict_calls and all(r["touch"] is False for r in verdict_calls)
 
 
 def test_worker_without_claim_cap_cannot_claim(net):
