@@ -153,3 +153,73 @@ All pytest runs used a newly created temporary `HOME`, the Sthambha signer branc
 - Established 13-file matrix: branch **332 passed / 10 failed** versus clean Git-backed `forgejo/main@29ccaf0` **316 passed / 10 failed**. Net: **+16 passed, no new failure**.
 - The same ten baseline failures occur on both revisions: nine `test_nak_direct` subprocess-stub failures (`None.returncode`) and `test_schema_migration_is_idempotent_on_a_forgejo_main_store` against the moving `forgejo/main` schema.
 - `py_compile` for all changed Python runtime/test files and `git diff --check` passed.
+
+---
+
+# Paid-task verdict policy (M2.1 node) — 2026-10-20
+
+## What changed
+
+- Grant constraints now carry the optional `verdict_mode`, `verdict_auto_max`, and
+  `verdict_ask_strangers` policy. `nak grant renew` is the only mutation surface; omitted flags
+  preserve the signed values, the confirmation names the effective policy, and both grant/status
+  views render it. The defaults are threshold/10,000,000 credits/ask strangers.
+- `network.verdict` is a pure policy function. Rule failure always rejects; free or non-Neuron work
+  retains the old deterministic verdict; paid Neuron work selects automatic accept, automatic
+  reject, or ASK from the signed spend authorization's grant and the worker's roster tier. A missing
+  or unreadable roster row is deliberately a stranger.
+- ASK results enter durable `awaiting_approval` with worker/reward/rule result/result hash,
+  `asked_at`, `last_prompted_at`, and prompt count. CLI/status/task rendering and `nak_tasks` expose
+  the wait; MCP has no decide tool. `nak task decide ... accept|reject` is human-only (TTY or
+  explicit `--yes`) and idempotent.
+- `NAK_APPROVAL_CMD` is absolute-path, argv-only, fixed-text, 700-second bounded, and single-flight
+  per task. Exit 0 accepts, 10 rejects, and every other result/timeout is unanswered. Prompts run at
+  submit, no more than every six hours, once in the final two-hour window, and at most eight times.
+  Restart scans durable waits and re-arms due prompts. A passed answer still waiting at its deadline
+  is accepted and logged as paid by silence.
+- Worker submit now SHA-256 marks a funded result through `NeuronEscrowAdapter.submit` without
+  delaying `task.result`. Pending marks are durable and retried by reconciliation. Status parsing
+  includes the contract's `submitted_at` and `result_hash` fields.
+
+## M2.1 signer-call inventory update
+
+The prior complete inventory remains unchanged except for the result-decision paths below. Every
+delivery/resend still signs in `_run_session` with `touch=false`; the listed queue-boundary touch is
+the one classification that records initiating activity.
+
+| Call site | Envelope/action | Classification | `touch` |
+|---|---|---|---|
+| `_task_receive(task.result)` → `_apply_task_decision` → `_queue` | below-threshold/rules-passed `task.accept` | automatic daemon decision | `false` |
+| `_task_receive(task.result)` → `_apply_task_decision` → `_queue` | rules-failed `task.reject` (never ASK) | automatic daemon decision | `false` |
+| `sweep` → `_apply_task_decision` → `_queue` | deadline `task.accept` (`paid by silence`) | automatic daemon decision | `false` |
+| `decide_task` → `_apply_task_decision` → `_queue` | explicit human `task.accept` / `task.reject` | human decision | `true` |
+| `_run_approval_hook` → `_apply_task_decision` → `_queue` | hook exit 0/10 `task.accept` / `task.reject` | configured approval decision | `true` |
+| `reconcile_escrow` → `_queue` | recovered terminal `task.accept` / `task.reject` receipt | daemon crash recovery | `false` |
+| `submit_task` / `_retry_worker_submits` → `NeuronEscrowAdapter.submit` | ledger submitted mark | node-key ledger signature, not a Sthambha agent signature | n/a |
+
+Grant status reads, policy rendering, approval scheduling, unanswered hooks, and ledger submit retry
+bookkeeping do not sign and do not touch the sliding grant. Acks/nacks/pings remain transport frames.
+
+## Verification
+
+Every pytest invocation used a fresh `HOME=$(mktemp -d)` and
+`PYTHONPATH=/home/prithvi/sthambha:/home/prithvi/.local/lib/python3.12/site-packages`. Approval tests
+used only executable scripts under pytest's temporary directory (exit 0/10/1 and a bounded timeout);
+two-node tests used loopback relays and a contract-faithful fake ledger. No real node, port 8902,
+Buzz, signer home, Neuron store, service, deploy, pull, or push was touched.
+
+- Established 13-file matrix on this branch: **339 passed / 10 failed** in 76.83s.
+- Clean exported `forgejo/main@6b3827a`: **332 passed / 10 failed** in 71.48s. Net: **+7 passing
+  matrix tests, no new failure**.
+- The identical ten baseline failures are nine `test_nak_direct` subprocess-stub failures
+  (`None.returncode`) and the moving-main
+  `test_schema_migration_is_idempotent_on_a_forgejo_main_store` assertion (confirmed separately in
+  the Git-backed export).
+- Exhaustive pure policy/CLI/status/MCP suite (`test_nak_verdict_policy`): **201 passed**.
+- Final focused runtime suite (`test_nak_neuron_escrow`, `test_nak_grant`, `test_nakd`,
+  `test_nak_mcp_consumer`): **115 passed** in 42.24s.
+- `py_compile` passed for every changed Python module/test; `git diff --check` passed.
+
+The Neuron server implementation was built in parallel. This branch verifies the frozen submit/status
+contract through the real signed HTTP adapter against the injected fake ledger; a live two-node
+ledger canary remains the integration/cutover check.
