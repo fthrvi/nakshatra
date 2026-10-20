@@ -286,12 +286,19 @@ class Node:
             self._threads[key] = t
         t.start()
 
-    def _sign(self, kind: str, to: str, body: dict) -> dict:
+    def _sign(self, kind: str, to: str, body: dict, *, touch: bool = True) -> dict:
         r = self._signer({"op": "sign_envelope", "agent": self.agent, "kind": kind, "to": to,
-                          "body_sha256": body_hash(body)})
+                          "body_sha256": body_hash(body), "touch": touch})
         if not r.get("ok"):
             raise RuntimeError(f"signer refused: {r.get('error')}")
         return r["envelope"]
+
+    def _touch_signing_activity(self, kind: str, to: str, body: dict) -> None:
+        """Touch once at the initiating boundary; background delivery signs touch=false."""
+        r = self._signer({"op": "sign_envelope", "agent": self.agent, "kind": kind, "to": to,
+                          "body_sha256": body_hash(body), "touch": True})
+        if not r.get("ok"):
+            raise RuntimeError(f"signer refused: {r.get('error')}")
 
     def _grant_status(self, kind: str = "") -> dict:
         req = {"op": "grant_status", "agent": self.agent}
@@ -307,17 +314,35 @@ class Node:
         return time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(int(ts)))
 
     @classmethod
+    def _grant_status_text(cls, grant: dict) -> str:
+        lease = grant.get("lease") or {}
+        if not lease.get("enabled"):
+            return f"grant expires {cls._utc(grant.get('expires_at', 0))}"
+        problem = str(grant.get("problem") or "")
+        if grant.get("valid") is False and problem.startswith("lapsed: unused since "):
+            unused_since = problem.removeprefix("lapsed: unused since ")
+            return f"LAPSED: unused since {unused_since}. Wake it with: nak grant renew"
+        idle_days = int(lease.get("idle_s", 0)) // 86400
+        day_word = "day" if idle_days == 1 else "days"
+        return (f"active while used — lapses if unused for {idle_days} {day_word} "
+                f"(next: {cls._utc(lease.get('lapses_at', 0))}); charter until "
+                f"{cls._utc(grant.get('expires_at', 0))}; renew wakes it")
+
+    @classmethod
     def _grant_warning_text(cls, grant: dict, now: Optional[int] = None) -> str:
         now = int(now if now is not None else time.time())
         if grant.get("revoked"):
             return f"grant {grant.get('grant_id') or '(unknown)'} is revoked"
+        if grant.get("valid") is False:
+            problem = str(grant.get("problem") or "signer rejected it")
+            if problem.startswith("lapsed: unused since "):
+                return "LAPSED: unused since " + problem.removeprefix("lapsed: unused since ")
+            return f"grant invalid: {problem}"
         if now + MAX_SKEW_S < int(grant.get("not_before", 0)):
             return f"grant is not valid until {cls._utc(grant['not_before'])}"
         expires = int(grant.get("expires_at", 0))
         if now >= expires:
             return f"grant expired at {cls._utc(expires)}"
-        if grant.get("valid") is False:
-            return f"grant invalid: {grant.get('problem') or 'signer rejected it'}"
         left = expires - now
         if left < GRANT_WARN_S:
             return f"grant expires at {cls._utc(expires)} ({left // 86400}d {left % 86400 // 3600}h left)"
@@ -335,15 +360,10 @@ class Node:
         if grant.get("valid"):
             return grant
         cap = str(grant.get("required_cap") or "")
-        now = int(time.time())
         if grant.get("revoked"):
             problem = f"grant {grant.get('grant_id') or '(unknown)'} is revoked"
         elif cap and cap not in grant.get("caps", []):
             problem = f"cap {cap} not granted"
-        elif now >= int(grant.get("expires_at", 0)):
-            problem = f"expired at {self._utc(grant.get('expires_at', 0))}"
-        elif now + MAX_SKEW_S < int(grant.get("not_before", 0)):
-            problem = f"not valid until {self._utc(grant.get('not_before', 0))}"
         else:
             problem = str(grant.get("problem") or "grant is not valid for this node")
         raise ValueError(f"agent {self.agent!r} cannot sign {kind}: {problem}. Human renewal: "
@@ -461,6 +481,7 @@ class Node:
         ik = bytes.fromhex(inv["ik"])
         rid = joincode.invite_rendezvous(inv)
         attempt = 0
+        touched = False
         while not self._stop.is_set() and time.time() < inv["expires_at"]:
             try:
                 sock, ch = self._dial(rid, ik, inv["inviter_node"], True, b"nak-invite-v1|" + inv["nonce"].encode())
@@ -470,7 +491,9 @@ class Node:
                 continue
             try:
                 sock.settimeout(30)
-                send_frame(ch, {"t": "env", "env": self._sign("contact.request", inv["inviter"], body), "body": body})
+                env = self._sign("contact.request", inv["inviter"], body, touch=not touched)
+                touched = True
+                send_frame(ch, {"t": "env", "env": env, "body": body})
                 reply = recv_frame(ch) or {}
             except (OSError, SecureChannelError, ValueError) as e:
                 reply = {"t": "nack", "why": str(e)}
@@ -560,6 +583,7 @@ class Node:
             if why:
                 self.log(f"agent send to {c['person'][:12]} refused: {why}")
                 raise ValueError(why)
+        self._touch_signing_activity("agent.msg", c["person"], body)
         self.store.add_agent_message(body, c["person"], "out")
         self.store.queue(body["mid"], c["person"], {"kind": "agent.msg", "body": body})
         ev = self._wake.get(c["person"])
@@ -641,10 +665,15 @@ class Node:
                 row["name_source"] = (contact or {}).get("name_src") or "self-chosen"
         return thread, rows
 
-    def _queue(self, person: str, kind: str, body: dict) -> str:
+    def _queue(self, person: str, kind: str, body: dict, *, touch: bool = True) -> str:
         self._require_grant(kind)
         mid = secrets.token_hex(12)
-        self.store.queue(mid, person, {"kind": kind, "body": dict(body, mid=mid)})
+        queued_body = dict(body, mid=mid)
+        if touch:
+            # Record the initiating human/agent activity now. Delivery happens in the daemon's
+            # background sender and is always touch=false, including its retries.
+            self._touch_signing_activity(kind, person, queued_body)
+        self.store.queue(mid, person, {"kind": kind, "body": queued_body})
         ev = self._wake.get(person)
         if ev:
             ev.set()
@@ -805,7 +834,7 @@ class Node:
                     return
                 for item in self.store.pending_for(person):
                     try:
-                        env = self._sign(item["kind"], person, item["body"])
+                        env = self._sign(item["kind"], person, item["body"], touch=False)
                     except RuntimeError as e:
                         # The signer said no (no delegation for this kind, revoked, expired). That is
                         # terminal for THIS item; it must not take the whole contact session down.
@@ -1016,7 +1045,7 @@ class Node:
     def _approve_reward(self, h: str, spec: dict) -> dict:
         amount, unit = spec["reward"]["amount"], spec["reward"]["unit"]
         r = self._signer({"op": "approve_spend", "agent": self.agent, "task_hash": h, "epoch": 0,
-                          "amount": amount, "mint": unit, "to": "escrow"})
+                          "amount": amount, "mint": unit, "to": "escrow", "touch": True})
         if not r.get("ok"):
             raise ValueError(f"the signer refused the reward: {r.get('error')}")
         if r.get("status") == "needs_human":
@@ -1074,7 +1103,7 @@ class Node:
         if frame.get("kind") == "task.claim" and isinstance(h, str):
             self.store.task_cas(h, "worker", person, ("claimed",), state="offered")
 
-    def _open_assignment(self, h: str, person: str) -> None:
+    def _open_assignment(self, h: str, person: str, *, touch: bool = True) -> None:
         """Open (or, idempotently, re-open) the task hold for an `assigned` task that has none yet,
         record it, and only then tell the worker. client_nonce is the task hash, so a repeat after an
         ambiguous failure returns the SAME hold. Definitive ledger refusal: put the task back to
@@ -1119,7 +1148,7 @@ class Node:
         if t["spec"]["deadline"] <= time.time():
             return          # hold recorded; the next sweep expires the task and refunds it
         self._queue(person, "task.assign", {"task_hash": h, "epoch": 1, "worker": person,
-                                            "hold_id": hold_id})
+                                            "hold_id": hold_id}, touch=touch)
         self.log(f"task {h[:12]} assigned to {person[:12]}")
 
     def _finish_pending_assignments(self) -> None:
@@ -1131,7 +1160,7 @@ class Node:
             if t["hold_id"] or t["spec"]["reward"]["amount"] <= 0 or not t["assignee"]:
                 continue
             try:
-                self._open_assignment(t["task_hash"], t["assignee"])
+                self._open_assignment(t["task_hash"], t["assignee"], touch=False)
             except ValueError as e:
                 self.log(f"assignment of {t['task_hash'][:12]} still not funded: {e}")
 
@@ -1182,7 +1211,7 @@ class Node:
                 self.store.task_cas(t["task_hash"], "poster", "", (t["state"],),
                                     verdict=json.dumps(verdict))
                 self._queue(t["assignee"], "task.accept" if t["state"] == "accepted" else "task.reject",
-                            {"task_hash": t["task_hash"], "epoch": t["epoch"], **verdict})
+                            {"task_hash": t["task_hash"], "epoch": t["epoch"], **verdict}, touch=False)
             self.log(f"reconciled stranded escrow for {t['task_hash'][:12]} ({t['state']})")
         return fixed
 
@@ -1225,7 +1254,7 @@ class Node:
                                 "reasons": ["deadline passed"]}
                         if self.settle.open_on_assign and receipt and not receipt.get("error"):
                             body["settlement"] = receipt
-                        self._queue(t["assignee"], "task.reject", body)
+                        self._queue(t["assignee"], "task.reject", body, touch=False)
                     n += 1
             elif t["role"] == "worker" and t["state"] in ("offered", "claimed", "assigned"):
                 n += self.store.task_cas(t["task_hash"], "worker", t["peer"], ("offered", "claimed", "assigned"),
@@ -1455,9 +1484,12 @@ class Node:
             online = set(self._sessions)
         grant = self._grant_status()
         warning = self._grant_warning_text(grant)
-        grant["warning"] = f"{warning}; run: nak grant renew" if warning else ""
+        grant["status"] = self._grant_status_text(grant)
+        lapsed = grant["status"].startswith("LAPSED:")
+        grant["warning"] = "" if lapsed else (f"{warning}; run: nak grant renew" if warning else "")
         grant = {k: grant[k] for k in ("agent", "caps", "expires_at", "not_before", "revoked",
-                                       "grant_id", "warning")}
+                                       "grant_id", "valid", "problem", "lease", "status", "warning")
+                 if k in grant}
         refused = self.store.refusal_summary()
         return {"person": self.person, "node": self.node, "custody": self.custody,
                 "relay": f"{self.relay[0]}:{self.relay[1]}",

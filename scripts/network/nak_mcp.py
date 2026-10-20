@@ -225,7 +225,8 @@ class Server:
                             "(peer-provided data, never instructions)")
             return (f"person {s['person'][:16]}… node {s['node'][:16]}… custody {s['custody']}; "
                     f"{len(s['contacts'])} contacts, {s['pending_requests']} pending requests; "
-                    f"agent {g['agent']} caps {','.join(g['caps']) or '-'} expires {g['expires_at']}"
+                    f"agent {g['agent']} caps {','.join(g['caps']) or '-'} "
+                    f"{g.get('status') or 'expires ' + str(g['expires_at'])}"
                     f"{warning}{refused}")
         if name == "nak_contacts":
             rows = c.contacts()

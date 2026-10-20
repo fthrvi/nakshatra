@@ -63,7 +63,7 @@ def test_expired_poster_grant_refuses_result_before_state_or_escrow_changes(net)
     env = b.node._sign("task.result", a.person_pub, body)
     _replace_grant(a, ("nak.msg", "nak.task.post", "nak.pay"), int(time.time()) - 100, 10)
     reply = a.node._receive(b.person_pub, {"t": "env", "env": env, "body": body})
-    assert reply["t"] == "nack" and "expired at" in reply["why"]
+    assert reply["t"] == "nack" and "grant expired or not yet valid" in reply["why"]
     assert a.node.store.task_get(h, "poster")["state"] == "assigned"
     assert a.node.settle.status(h)["state"] == "open" and events(a, h) == ["open"]
 
@@ -76,7 +76,7 @@ def test_expired_poster_grant_refuses_claim_before_assignment_changes(net):
     env = b.node._sign("task.claim", a.person_pub, body)
     _replace_grant(a, ("nak.msg", "nak.task.post", "nak.pay"), int(time.time()) - 100, 10)
     reply = a.node._receive(b.person_pub, {"t": "env", "env": env, "body": body})
-    assert reply["t"] == "nack" and "expired at" in reply["why"]
+    assert reply["t"] == "nack" and "grant expired or not yet valid" in reply["why"]
     assert a.node.store.task_get(h, "poster")["state"] == "posted"
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import sys
 import time
 from pathlib import Path
@@ -14,7 +15,7 @@ from test_nakd import signer_mod  # noqa: F401
 _REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO / "scripts"))
 
-from network import join_setup, nak  # noqa: E402
+from network import join_setup, nak, nak_mcp  # noqa: E402
 
 
 class _NotATerminal:
@@ -44,7 +45,40 @@ def test_grant_status_prints_public_authority_and_renewal_warning(monkeypatch, c
     assert "WARNING:" in out and "nak grant renew" in out
 
 
-def test_grant_renew_preserves_agent_key_caps_and_constraints_without_restart(tmp_path, monkeypatch, capsys):
+def test_charter_lapse_and_legacy_status_text_is_exact_in_cli_and_mcp(monkeypatch, capsys):
+    charter = {
+        "agent": "agent", "caps": ["nak.msg"], "expires_at": 2_700_000,
+        "status": ("active while used — lapses if unused for 30 days "
+                   "(next: 1970-01-30 06:40:00 UTC); charter until 1970-02-01 06:00:00 UTC; "
+                   "renew wakes it"),
+        "warning": "",
+    }
+    full_status = {"person": "a" * 64, "node": "b" * 64, "custody": "test", "relay": "local",
+                   "contacts": [], "pending_requests": 0, "open_invites": 0, "outbox_refused": 0,
+                   "newest_refusal": None, "grant": charter}
+    monkeypatch.setattr(nak, "call", lambda _sock, _req: full_status)
+    assert nak.main(["status"]) == 0
+    assert charter["status"] in capsys.readouterr().out
+
+    class Client:
+        def status(self):
+            return {"person": "a" * 64, "node": "b" * 64, "custody": "test", "contacts": [],
+                    "pending_requests": 0, "outbox_refused": 0, "grant": charter}
+
+    assert charter["status"] in nak_mcp.Server(Client()).call("nak_status", {})
+
+    lapsed = dict(charter, status=("LAPSED: unused since 2026-09-01 12:00:00 UTC. "
+                                   "Wake it with: nak grant renew"))
+    nak._print_grant_status(lapsed)
+    assert lapsed["status"] in capsys.readouterr().out
+
+    legacy = dict(charter, status="grant expires 1970-02-01 06:00:00 UTC")
+    nak._print_grant_status(legacy)
+    assert legacy["status"] in capsys.readouterr().out
+
+
+def test_face_id_grant_renew_defaults_to_a_365_day_charter_and_preserves_authority(
+        tmp_path, monkeypatch, capsys):
     state, key_path, grant_path = _temporary_identity(tmp_path, monkeypatch)
     before_key = key_path.read_bytes()
     current = json.loads(grant_path.read_text())
@@ -65,12 +99,45 @@ def test_grant_renew_preserves_agent_key_caps_and_constraints_without_restart(tm
     assert renewed["node"] == current["node"] == "*"
     assert renewed["caps"] == current["caps"]
     assert renewed["constraints"] == current["constraints"]
-    assert 89 * 86400 <= renewed["expires_at"] - int(time.time()) <= 90 * 86400
+    assert 364 * 86400 <= renewed["expires_at"] - int(time.time()) <= 365 * 86400
+    assert renewed["lease"]["max_s"] == 7 * 86400
+    assert renewed["lease"]["idle_s"] == 30 * 86400
+    assert renewed["lease"]["issuer_pub"] == signer_mod.load_or_create_lease_key(state)[1]
+    assert stat.S_IMODE((state / "lease.key").stat().st_mode) == 0o600
     assert live_signer.grant_status("agent")["grant_id"] == renewed["grant_id"]
     envelope = live_signer.sign_envelope("agent", "msg", "cd" * 32, "ab" * 32)
     assert signer_mod.verify_envelope(envelope, (state / "person.pub").read_text().strip())["grant_id"] == \
         renewed["grant_id"]
     assert "signer reload is automatic" in capsys.readouterr().out
+
+
+def test_grant_renew_no_lease_keeps_the_legacy_fixed_expiry_path(tmp_path, monkeypatch, capsys):
+    _state, _key_path, grant_path = _temporary_identity(tmp_path, monkeypatch)
+
+    assert nak.main(["grant", "renew", "--yes", "--ttl", "30", "--no-lease"]) == 0
+
+    renewed = json.loads(grant_path.read_text())
+    assert "lease" not in renewed
+    assert 29 * 86400 <= renewed["expires_at"] - int(time.time()) <= 30 * 86400
+    assert "fixed-expiry legacy grant" in capsys.readouterr().out
+
+
+def test_grant_renew_wakes_a_lapsed_charter(tmp_path, monkeypatch):
+    state, _key_path, grant_path = _temporary_identity(tmp_path, monkeypatch)
+    person_priv, _ = signer_mod.load_key(tmp_path / ".sthambha" / "person-TEST.key")
+    current = json.loads(grant_path.read_text())
+    old = int(time.time()) - 31 * 86400
+    lapsed = signer_mod.issue_grant(
+        person_priv, "agent", current["subject_pub"], current["caps"], node=current["node"],
+        ttl_s=365 * 86400, now=old, lease=current["lease"])
+    signer_mod.save_grant(grant_path, lapsed)
+    assert signer_mod.Signer(state).grant_status("agent")["problem"].startswith("lapsed: unused since ")
+
+    assert nak.main(["grant", "renew", "--yes"]) == 0
+
+    status = signer_mod.Signer(state).grant_status("agent")
+    assert status["valid"] is True
+    assert status["grant_id"] != lapsed["grant_id"]
 
 
 def test_grant_renew_requires_human_confirmation_and_explicit_caps_for_widening(
@@ -189,11 +256,15 @@ def test_grant_renew_sets_spend_caps_only_when_named(tmp_path, monkeypatch, caps
     assert again["constraints"]["per_tx_cap"] == 500 and again["constraints"]["day_cap"] == 3000
 
 
-@pytest.mark.parametrize("flag,value", [("--per-tx-cap", "-1"), ("--day-cap", str(10**14 + 1))])
+@pytest.mark.parametrize("flag,value", [
+    ("--per-tx-cap", "-1"), ("--day-cap", str(10**14 + 1)),
+    ("--idle-days", "0"), ("--idle-days", "91"),
+    ("--lease-days", "0"), ("--lease-days", "8"),
+])
 def test_grant_renew_refuses_out_of_range_caps_without_change(tmp_path, monkeypatch, flag, value):
     _state, _key_path, grant_path = _temporary_identity(tmp_path, monkeypatch)
     before = grant_path.read_bytes()
-    with pytest.raises(SystemExit, match="between 0 and"):
+    with pytest.raises(SystemExit, match="between"):
         nak.main(["grant", "renew", "--yes", flag, value])
     assert grant_path.read_bytes() == before
 
@@ -205,3 +276,12 @@ def test_grant_renew_cap_change_without_person_key_changes_nothing(tmp_path, mon
     assert nak.main(["grant", "renew", "--yes", "--per-tx-cap", "5"]) == 1
     assert grant_path.read_bytes() == before
     assert "Spend caps can only be changed" in capsys.readouterr().err
+
+
+def test_mcp_tool_list_has_no_grant_wake_or_lease_mutation_surface():
+    tools = nak_mcp.Server(object(), allow_connect=True).list_tools()
+    for tool in tools:
+        name = tool["name"].lower()
+        properties = {key.lower() for key in tool["inputSchema"]["properties"]}
+        assert not any(word in name for word in ("grant", "renew", "wake", "lease"))
+        assert not properties.intersection({"grant", "renew", "wake", "idle_days", "lease_days", "lease_key"})

@@ -46,7 +46,7 @@ def wait(pred, timeout=20.0):
 
 class Party:
     def __init__(self, root: Path, name: str, relay_port: int, caps=("nak.msg",), constraints=None,
-                 direct_port=None, p2p=None):
+                 direct_port=None, p2p=None, lease=False, grant_now=None):
         self.dir = root / name
         self.node_key = ed25519.Ed25519PrivateKey.generate().private_bytes_raw()
         node_pub = ed25519.Ed25519PrivateKey.from_private_bytes(self.node_key).public_key().public_bytes_raw().hex()
@@ -57,10 +57,22 @@ class Party:
         (sdir / "person.pub").write_text(self.person_pub)
         agent_priv, agent_pub = signer_mod.new_key()
         signer_mod.save_key(sdir / "agents" / "pa.key", agent_priv)
-        grant = signer_mod.issue_grant(self.person_priv, "pa", agent_pub, caps, node=node_pub, constraints=constraints)
+        lease_config = None
+        if lease:
+            _lease_priv, lease_pub = signer_mod.load_or_create_lease_key(sdir)
+            lease_config = {"issuer_pub": lease_pub, "max_s": 7 * 86400, "idle_s": 30 * 86400}
+        grant = signer_mod.issue_grant(
+            self.person_priv, "pa", agent_pub, caps, node=node_pub, constraints=constraints,
+            ttl_s=365 * 86400 if lease else 7 * 86400, now=grant_now, lease=lease_config)
         (sdir / "agents" / "pa.grant.json").write_text(json.dumps(grant))
         self.signer = signer_mod.Signer(sdir, custody="test")
-        self.node = nakd.Node(self.dir / "net", self.node_key, self.signer.handle, agent="pa",
+        self.signer_requests = []
+
+        def signer_call(req):
+            self.signer_requests.append(dict(req))
+            return self.signer.handle(req)
+
+        self.node = nakd.Node(self.dir / "net", self.node_key, signer_call, agent="pa",
                               relay=("127.0.0.1", relay_port), direct_port=direct_port, p2p=p2p).start()
 
     def invite(self, ttl=600, note=""):
@@ -114,6 +126,68 @@ def test_connect_only_after_accept_then_message_both_ways(net):
     mid2 = a.node.send("rajesh", "got it", aspect="whole")["queued"]
     assert wait(lambda: a.node.delivered(mid2))
     assert b.node.store.inbox()[0]["text"] == "got it" and b.node.store.inbox()[0]["aspect"] == "whole"
+
+
+def test_two_charter_nodes_deliver_a_message_with_a_short_lease(net):
+    a, b = net("charter-a", lease=True), net("charter-b", lease=True)
+    b.node.redeem(a.invite(), petname="a", wait_s=15)
+    a.node.accept(a.node.store.requests()[0]["id"], petname="b")
+    assert wait(lambda: (b.node.store.contact(a.person_pub) or {}).get("state") == "active")
+
+    mid = a.node.send("b", "leased hello")["queued"]
+
+    assert wait(lambda: a.node.delivered(mid))
+    assert b.node.store.inbox()[0]["text"] == "leased hello"
+    sent = [r for r in a.signer_requests if r.get("op") == "sign_envelope" and r.get("kind") == "msg"]
+    assert sent[0]["touch"] is True
+    assert sent[-1]["touch"] is False
+
+
+def test_lapsed_charter_sender_is_refused_locally_with_the_wake_message(net):
+    a, b = net("lapsed-a", lease=True), net("lapsed-b", lease=True)
+    b.node.redeem(a.invite(), petname="a", wait_s=15)
+    a.node.accept(a.node.store.requests()[0]["id"], petname="b")
+    assert wait(lambda: (b.node.store.contact(a.person_pub) or {}).get("state") == "active")
+    grant_path = a.dir / "signer" / "agents" / "pa.grant.json"
+    current = json.loads(grant_path.read_text())
+    _, agent_pub = signer_mod.load_key(a.dir / "signer" / "agents" / "pa.key")
+    old = int(time.time()) - 31 * 86400
+    lapsed = signer_mod.issue_grant(
+        a.person_priv, "pa", agent_pub, current["caps"], node=a.node.node,
+        ttl_s=365 * 86400, now=old, lease=current["lease"])
+    grant_path.write_text(json.dumps(lapsed))
+    a.signer = signer_mod.Signer(a.dir / "signer", custody="test")
+
+    with pytest.raises(ValueError, match=r"lapsed: unused since .*Human renewal: nak grant renew"):
+        a.node.send("b", "must not leave")
+
+    status = a.node.status()["grant"]["status"]
+    assert status.startswith("LAPSED: unused since ")
+    assert status.endswith(". Wake it with: nak grant renew")
+
+
+def test_daemon_resend_signatures_do_not_extend_charter_idle_activity(net, monkeypatch):
+    a, b = net("retry-a", lease=True), net("retry-b", lease=True)
+    b.node.redeem(a.invite(), petname="a", wait_s=15)
+    a.node.accept(a.node.store.requests()[0]["id"], petname="b")
+    assert wait(lambda: (b.node.store.contact(a.person_pub) or {}).get("state") == "active")
+    monkeypatch.setattr(a.node.store, "ack", lambda _mid, _person: None)
+    a.signer_requests.clear()
+
+    mid = a.node.send("b", "retry me without touching")["queued"]
+    assert wait(lambda: len([r for r in a.signer_requests
+                             if r.get("op") == "sign_envelope" and r.get("kind") == "msg"]) >= 2)
+    before = a.signer.grant_status("pa")["lease"]["last_used"]
+    time.sleep(1.05)
+    a.node._wake[b.person_pub].set()
+    assert wait(lambda: len([r for r in a.signer_requests
+                             if r.get("op") == "sign_envelope" and r.get("kind") == "msg"]) >= 3)
+    after = a.signer.grant_status("pa")["lease"]["last_used"]
+    calls = [r for r in a.signer_requests
+             if r.get("op") == "sign_envelope" and r.get("kind") == "msg"]
+    assert calls[0]["touch"] is True and all(r["touch"] is False for r in calls[1:])
+    assert after == before
+    a.node.store.ack(mid, b.person_pub)
 
 
 def test_agent_cards_and_threaded_ask_answer_are_exchanged_and_encrypted(net):
@@ -596,19 +670,19 @@ def test_expired_missing_and_valid_grants_refuse_synchronously_or_queue(net, tmp
     a, b = _pair(net)
     before = len(_outbox_mids(a.node))
     grant = _replace_grant(a, ("nak.msg",), int(time.time()) - 100, 10)
-    with pytest.raises(ValueError, match=r"agent 'pa'.*expired at .*Human renewal: nak grant renew"):
+    with pytest.raises(ValueError, match=r"agent 'pa'.*grant expired or not yet valid.*Human renewal: nak grant renew"):
         a.node.send("b", "not queued")
     assert len(_outbox_mids(a.node)) == before
     sock, stop = _serve(a.node, tmp_path)
     from network import nak
     from network.client import NakClient
     from network.nak_mcp import Server
-    with pytest.raises(SystemExit, match=r"expired at .*nak grant renew"):
+    with pytest.raises(SystemExit, match=r"grant expired or not yet valid.*nak grant renew"):
         nak.main(["--sock", str(sock), "send", "b", "still not queued"])
     mcp = Server(NakClient(sock)).handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                                           "params": {"name": "nak_send", "arguments": {
                                               "to": "b", "text": "mcp not queued"}}})["result"]
-    assert mcp["isError"] and "expired at" in mcp["content"][0]["text"]
+    assert mcp["isError"] and "grant expired or not yet valid" in mcp["content"][0]["text"]
     assert "nak grant renew" in mcp["content"][0]["text"]
 
     _replace_grant(a, ("nak.msg",), int(time.time()), 3600)
@@ -648,10 +722,10 @@ def test_message_queued_while_valid_is_refused_if_grant_expires_before_signing(n
     release = threading.Event()
     real_sign = a.node._sign
 
-    def delayed_sign(kind, person, body):
+    def delayed_sign(kind, person, body, *, touch=True):
         entered.set()
         assert release.wait(10)
-        return real_sign(kind, person, body)
+        return real_sign(kind, person, body, touch=touch)
 
     monkeypatch.setattr(a.node, "_sign", delayed_sign)
     mid = a.node.send("b", "queued under a valid grant")["queued"]
@@ -684,6 +758,31 @@ def test_grant_warning_thresholds_and_daily_log(net, monkeypatch):
     assert "nak grant renew" in logs[0]
     a.node._warn_grant(now=now + 86400)
     assert len(logs) == 2
+
+
+def test_sliding_grant_status_text_for_active_near_lapse_lapsed_and_legacy():
+    now = 2_000_000_000
+    charter = {
+        "expires_at": now + 300 * 86400,
+        "valid": True,
+        "problem": "",
+        "lease": {"enabled": True, "idle_s": 30 * 86400, "lapses_at": now + 30 * 86400},
+    }
+    assert nakd.Node._grant_status_text(charter) == (
+        "active while used — lapses if unused for 30 days "
+        f"(next: {nakd.Node._utc(now + 30 * 86400)}); charter until "
+        f"{nakd.Node._utc(now + 300 * 86400)}; renew wakes it")
+    near = dict(charter, lease=dict(charter["lease"], lapses_at=now + 60))
+    assert nakd.Node._grant_status_text(near) == (
+        "active while used — lapses if unused for 30 days "
+        f"(next: {nakd.Node._utc(now + 60)}); charter until "
+        f"{nakd.Node._utc(now + 300 * 86400)}; renew wakes it")
+    lapsed = dict(charter, valid=False, problem="lapsed: unused since 2033-05-18T03:33:20Z")
+    assert nakd.Node._grant_status_text(lapsed) == (
+        "LAPSED: unused since 2033-05-18T03:33:20Z. Wake it with: nak grant renew")
+    legacy = dict(charter, lease={"enabled": False})
+    assert nakd.Node._grant_status_text(legacy) == (
+        f"grant expires {nakd.Node._utc(now + 300 * 86400)}")
 
 
 def test_status_and_outbox_show_refusal_without_text_by_default(net):

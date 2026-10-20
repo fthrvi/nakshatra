@@ -64,3 +64,42 @@ Review: rv3-m2.md. Suite (same command): round 2 309 passed / 10 failed; round 3
 | Sweep-skip mutation | Direct test: with the recovery authorize failing, `sweep()` past the deadline expires nothing and the task stays `assigned`. | `test_sweep_does_not_expire_an_assigned_paid_task_whose_hold_is_unrecorded` (fails with the skip removed). |
 
 Note: on the reconcile/sweep path (no live claim to nack) the worker is not told the task reopened; its row expires on its own sweep. Not changed (nits in rv3): roster change mid-recovery orphan, one-slot-per-second throughput after a burst.
+
+---
+
+# Sliding grant node-side report — 2026-10-20
+
+## What changed
+
+- `nak grant renew` now issues a 365-day charter by default, backed by the signer's private lease key and carrying the contract defaults of a 7-day wire lease and a 30-day idle lapse. `--idle-days` (1–90), `--lease-days` (1–7), and `--no-lease` are human-only CLI controls; invalid values are rejected before signer state changes. Existing agent key, caps, node binding, and constraints remain unchanged unless the existing explicit cap flags say otherwise. Renewal creates a new grant id, so it wakes a lapsed charter.
+- The confirmation prompt and completion output explain whether the operator is creating an active-while-used charter or a legacy fixed-expiry grant. The no-person-key recovery command carries the same lease choice.
+- Genuine first initialization in `join_setup` now creates the same 365-day/7-day/30-day charter. Every established-authority and partial-residue path remains read-only and refuses to mint or repair, including the full M0.5 residue matrix.
+- `nakd` now trusts the signer's `valid`/`problem` result instead of reimplementing expiry precedence. It renders the contract charter/lapse text into daemon status; both `nak status`/`nak grant status` and the MCP status line consume that one rendered value. Legacy grants keep the fixed-expiry text.
+- MCP gained no grant, renewal, wake, lease-setting, or lease-key mutation surface. A runtime tool-list regression test checks names and input properties.
+- Added two-real-node coverage for leased-envelope delivery, local lapsed-sender refusal, and a forced resend whose daemon signatures do not advance `last_used`.
+
+## Every `nakd` signer call
+
+| Call site | Operation | Classification | `touch` |
+|---|---|---|---|
+| `Node.__init__` | `whoami` | startup identity read; not a signing operation | n/a |
+| `Node.__init__` | `data_key` | startup encrypted-store key retrieval; not an agent signing operation | n/a |
+| `_grant_status` | `grant_status` | read-only preflight/status/warning check; signer guarantees no mint or write | n/a |
+| `_touch_signing_activity` | `sign_envelope` | one signature at an agent/human initiating boundary (`send`, typed send, card/contact/task queue actions) before durable queueing | `true` |
+| `_redeem_loop` via `_sign` | `sign_envelope` | first successful invite-request signing is human initiated; later loop attempts are daemon retries | first `true`, then `false` |
+| `_run_session` via `_sign` | `sign_envelope` | background delivery and every resend of an already queued item; the initiating boundary already touched once | `false` |
+| `_approve_reward` | `approve_spend` | agent/human task-post payment authorization | `true` |
+
+Daemon-created queued task traffic is also classified at its queue boundary: pending-assignment recovery queues `task.assign` with `touch=false`; escrow reconciliation queues terminal verdicts with `touch=false`; expiry sweep queues `task.reject` with `touch=false`. Direct inbound task decisions and explicit human/agent operations keep the `_queue` default `touch=true`. Acks are transport frames and do not call the signer.
+
+## Verification
+
+All Python/pytest commands used a fresh `HOME=$(mktemp -d)` and `PYTHONPATH=/home/prithvi/wt/sth-lease:/home/prithvi/.local/lib/python3.12/site-packages`; loopback-only suites ran with sandbox socket permission. Nothing touched the real signer/node homes, systemd, or running sockets.
+
+- Required focused files (`test_nak_grant`, `test_nak_join`, `test_nakd`, `test_nak_neuron_escrow`): **178 passed** in 34.20s.
+- Established full network matrix (the 13 dependency-clean files recorded by the prior reports): branch **328 passed / 10 failed** versus exported `forgejo/main` **316 passed / 10 failed**. Net: **+12 passed, no new failure**.
+- The identical 10 failures are the known baseline: nine `test_nak_direct` p2p tests whose subprocess stubs return `None`, plus `test_schema_migration_is_idempotent_on_a_forgejo_main_store` against the moving `forgejo/main` schema.
+- Literal repository-wide `pytest -q` cannot collect in this checkout and stopped with 39 environment/dependency errors: missing Petals/Hivemind/grpc/pytest-asyncio, protobuf runtime mismatch, the local `scripts/packaging` shadow, and the required `INITIAL_PEERS` variable. This is separate from the dependency-clean project matrix and occurred before executing tests.
+- `py_compile` passed for every changed Python module/test; `git diff --check` passed.
+
+The node side was verified against Sthambha signer commit `93ab1b9` (`signer: add sliding charter leases`).

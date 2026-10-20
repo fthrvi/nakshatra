@@ -33,7 +33,9 @@ if str(_SCRIPTS) not in sys.path:
 
 AGENT = "agent"
 AGENT_CAPS = ("nak.msg", "nak.task.claim")
-AGENT_TTL_S = 90 * 86400
+AGENT_TTL_S = 365 * 86400
+AGENT_LEASE_S = 7 * 86400
+AGENT_IDLE_S = 30 * 86400
 WORKER_RETRY_FILE = Path(".nakshatra") / "worker-invite.json"
 CONSUMER_STANDING_FILE = Path(".nakshatra") / "consumer-standing.json"
 
@@ -454,10 +456,13 @@ def ensure_identity(home: Path) -> dict:
                 raise SystemExit(f"agent {agent!r} has no delegation and the person key is not on this box; "
                                  "create it with an explicit human delegation")
             agent_priv, agent_pub = S.new_key()
+            _lease_priv, lease_pub = S.load_or_create_lease_key(state)
             grant = S.issue_grant(
-                person_priv, agent, agent_pub, AGENT_CAPS, node=node_pub, ttl_s=AGENT_TTL_S)
+                person_priv, agent, agent_pub, AGENT_CAPS, node=node_pub, ttl_s=AGENT_TTL_S,
+                lease={"issuer_pub": lease_pub, "max_s": AGENT_LEASE_S, "idle_s": AGENT_IDLE_S})
             agent_files.write_key_and_grant(agent_priv, grant)
-            done["agent"] = f"'{agent}' may {', '.join(AGENT_CAPS)} for 90 days"
+            done["agent"] = (f"'{agent}' may {', '.join(AGENT_CAPS)} under a 365-day charter; "
+                             "active while used and lapses after 30 idle days")
         elif key_exists != grant_exists:
             raise SystemExit(f"agent {agent!r} has only one of its key/grant files; refusing automatic repair. "
                              "Restore the missing signer-state file or delegate a replacement explicitly.")

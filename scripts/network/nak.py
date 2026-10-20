@@ -1727,10 +1727,14 @@ def _grant_paths() -> tuple[Path, Path, str]:
     return signer_dir, net_dir, agent
 
 
-def _delegate_reuse_command(state: Path, person_key: Path, agent: str, caps: list[str], ttl_days: int) -> str:
-    return ("python -m sthambha.signer delegate --state " + shlex.quote(str(state)) +
+def _delegate_reuse_command(state: Path, person_key: Path, agent: str, caps: list[str], ttl_days: int,
+                            idle_days: int, lease_days: int, no_lease: bool) -> str:
+    command = ("python -m sthambha.signer delegate --state " + shlex.quote(str(state)) +
             " --person-key " + shlex.quote(str(person_key)) + " --agent " + shlex.quote(agent) +
             " --caps " + shlex.quote(",".join(caps)) + f" --ttl {ttl_days * 86400} --reuse-key")
+    if no_lease:
+        return command + " --no-lease"
+    return command + f" --idle-days {idle_days} --lease-days {lease_days}"
 
 
 MAX_SPEND_CAP = 10**14   # base units; 10^6 USDC-equivalent in credits, far above any devnet need
@@ -1742,6 +1746,10 @@ def _grant_renew(args) -> int:
         raise SystemExit("nak grant renew is interactive-only; run it in a terminal or pass --yes explicitly")
     if not 1 <= args.ttl <= 365:
         raise SystemExit("--ttl must be between 1 and 365 days")
+    if not 1 <= args.idle_days <= 90:
+        raise SystemExit("--idle-days must be between 1 and 90 days")
+    if not 1 <= args.lease_days <= 7:
+        raise SystemExit("--lease-days must be between 1 and 7 days")
     for flag, value in (("--per-tx-cap", args.per_tx_cap), ("--day-cap", args.day_cap)):
         if value is not None and not 0 <= value <= MAX_SPEND_CAP:
             raise SystemExit(f"{flag} must be between 0 and {MAX_SPEND_CAP} base units")
@@ -1791,7 +1799,9 @@ def _grant_renew_confined(args, signer_dir: Path, agent: str, signer_mod, agent_
             cap_changes.append(f"{name} {constraints.get(name, 0)} -> {value}")
             constraints[name] = value
     person_key = Path.home() / ".sthambha" / "person-TEST.key"
-    fallback = _delegate_reuse_command(signer_dir, person_key, agent, caps, args.ttl)
+    fallback = _delegate_reuse_command(
+        signer_dir, person_key, agent, caps, args.ttl,
+        args.idle_days, args.lease_days, args.no_lease)
     if not person_key.is_file():
         if cap_changes:
             print(f"person key is not available at {person_key}; the grant was not changed.\n"
@@ -1806,7 +1816,12 @@ def _grant_renew_confined(args, signer_dir: Path, agent: str, signer_mod, agent_
         detail = f"; explicitly adding {','.join(widening)}" if widening else ""
         if cap_changes:
             detail += f"; spend caps {', '.join(cap_changes)}"
-        answer = input(f"Renew agent {agent!r} for {args.ttl} days with caps {','.join(caps)}{detail}? [y/N] ")
+        behaviour = ("as a fixed-expiry legacy grant"
+                     if args.no_lease else
+                     f"as a charter active while used (a {args.lease_days}-day wire lease; "
+                     f"lapses after {args.idle_days} idle days)")
+        answer = input(f"Renew agent {agent!r} for {args.ttl} days with caps {','.join(caps)} "
+                       f"{behaviour}{detail}? [y/N] ")
         if answer.strip().lower() not in {"y", "yes"}:
             print("grant unchanged")
             return 1
@@ -1816,21 +1831,32 @@ def _grant_renew_confined(args, signer_dir: Path, agent: str, signer_mod, agent_
         raise SystemExit(f"cannot load the person key for renewal: {exc}") from exc
     if person_pub != signer_person:
         raise SystemExit(f"the person key at {person_key} does not match {signer_dir / 'person.pub'}")
+    lease = None
+    if not args.no_lease:
+        _lease_priv, lease_pub = signer_mod.load_or_create_lease_key(signer_dir)
+        lease = {"issuer_pub": lease_pub, "max_s": args.lease_days * 86400,
+                 "idle_s": args.idle_days * 86400}
     renewed = signer_mod.issue_grant(person_priv, agent, agent_pub, caps, node=current["node"],
-                                     ttl_s=args.ttl * 86400, constraints=constraints)
+                                     ttl_s=args.ttl * 86400, constraints=constraints, lease=lease)
     agent_files.write_grant(renewed)
     if cap_changes:
         print(f"spend caps now {renewed['constraints'].get('per_tx_cap', 0)} per payment, "
               f"{renewed['constraints'].get('day_cap', 0)} per day (base units)")
-    print(f"renewed agent {agent} with caps {','.join(renewed['caps'])} through "
+    authority = ("fixed-expiry legacy grant"
+                 if args.no_lease else
+                 f"charter active while used; {args.lease_days}-day wire leases; "
+                 f"lapses after {args.idle_days} idle days")
+    expiry_name = "grant" if args.no_lease else "charter"
+    print(f"renewed agent {agent} with caps {','.join(renewed['caps'])}: {authority}; {expiry_name} through "
           f"{time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(renewed['expires_at']))} "
           f"(grant {renewed['grant_id']}); signer reload is automatic")
     return 0
 
 
 def _print_grant_status(grant: dict) -> None:
-    print(f"agent {grant['agent']}  caps {','.join(grant['caps']) or '-'}  grant expires "
-          f"{time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(grant['expires_at']))}")
+    print(f"agent {grant['agent']}  caps {','.join(grant['caps']) or '-'}  " +
+          (grant.get("status") or "grant expires " +
+           time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(grant['expires_at']))))
     if grant.get("warning"):
         print(f"WARNING: {grant['warning']}")
 
@@ -1855,7 +1881,13 @@ def main(argv=None, *, http_post=None) -> int:
     gsub = p.add_subparsers(dest="grant_cmd", required=True)
     gsub.add_parser("status", help="show the delegated agent, caps, expiry, and warning")
     q = gsub.add_parser("renew", help="human-only renewal that preserves the existing agent key")
-    q.add_argument("--ttl", type=int, default=90, metavar="DAYS", help="renewal lifetime in days (1-365)")
+    q.add_argument("--ttl", type=int, default=365, metavar="DAYS", help="charter lifetime in days (1-365)")
+    q.add_argument("--idle-days", type=int, default=30, metavar="DAYS",
+                   help="lapse after this many unused days (1-90; default 30)")
+    q.add_argument("--lease-days", type=int, default=7, metavar="DAYS",
+                   help="wire credential lifetime in days (1-7; default 7)")
+    q.add_argument("--no-lease", action="store_true",
+                   help="issue a legacy fixed-expiry grant instead of a sliding charter")
     q.add_argument("--caps", help="explicit comma-separated cap set; omitted preserves current caps")
     q.add_argument("--per-tx-cap", type=int, default=None, metavar="N",
                    help="set the agent's nak.pay limit per payment (base units); omitted preserves it")

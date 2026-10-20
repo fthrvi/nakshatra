@@ -83,6 +83,12 @@ def test_genuine_first_identity_setup_mints_once_and_is_idempotent(tmp_path):
     assert oct((tmp_path / ".sthambha" / "signer").stat().st_mode & 0o777) == "0o700"
     assert oct((tmp_path / ".nakshatra" / "net" / "agent").stat().st_mode & 0o777) == "0o600"
     grant = json.loads((tmp_path / ".sthambha" / "signer" / "agents" / "agent.grant.json").read_text())
+    assert grant["lease"] == {
+        "issuer_pub": signer_mod.load_or_create_lease_key(tmp_path / ".sthambha" / "signer")[1],
+        "max_s": 7 * 86400,
+        "idle_s": 30 * 86400,
+    }
+    assert 364 * 86400 <= grant["expires_at"] - int(time.time()) <= 365 * 86400
     signer_mod.verify_grant(grant, first["person"], cap="nak.msg", node=first["node"])
     signer_mod.verify_grant(grant, first["person"], cap="nak.task.claim", node=first["node"])
     for cap in ("nak.task.post", "nak.pay"):
@@ -261,7 +267,7 @@ def test_established_node_agent_rename_never_mints_or_renames(tmp_path):
 
     message = str(refused.value)
     assert "refusing to mint, rotate, or rename" in message
-    assert "--agent bro-agent --caps nak.msg,nak.task.claim --ttl 7776000" in message
+    assert "--agent bro-agent --caps nak.msg,nak.task.claim --ttl 31536000" in message
     assert "--reuse-key" not in message
     assert _identity_snapshot(tmp_path) == before
 
@@ -344,7 +350,7 @@ def test_established_node_with_key_and_grant_deleted_fails_closed(tmp_path):
     message = str(refused.value)
     expected = (f"python -m sthambha.signer delegate --state {state} --person-key "
                 f"{tmp_path / '.sthambha' / 'person-TEST.key'} --agent agent "
-                "--caps nak.msg,nak.task.claim --ttl 7776000")
+                "--caps nak.msg,nak.task.claim --ttl 31536000")
     assert expected in message and "--reuse-key" not in message
     assert _identity_snapshot(tmp_path) == before
 
@@ -364,7 +370,7 @@ def test_established_node_with_only_agent_key_missing_names_caps_without_reuse(t
 
     message = str(refused.value)
     assert "agent key is missing while its grant remains" in message
-    assert "--caps nak.msg --ttl 7776000" in message
+    assert "--caps nak.msg --ttl 31536000" in message
     assert "--reuse-key" not in message
     assert _identity_snapshot(tmp_path) == before
 
@@ -380,7 +386,7 @@ def test_established_node_with_only_grant_missing_reuses_surviving_key(tmp_path)
 
     message = str(refused.value)
     assert "agent grant is missing while its key remains" in message
-    assert "--caps nak.msg,nak.task.claim --ttl 7776000 --reuse-key" in message
+    assert "--caps nak.msg,nak.task.claim --ttl 31536000 --reuse-key" in message
     assert _identity_snapshot(tmp_path) == before
 
 
