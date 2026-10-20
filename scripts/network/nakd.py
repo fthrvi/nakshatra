@@ -34,11 +34,13 @@ import random
 import secrets
 import shlex
 import socket
+import stat
 import struct
 import subprocess
 import sys
 import threading
 import time
+import unicodedata
 from pathlib import Path
 
 from typing import Callable, Optional
@@ -49,6 +51,7 @@ if str(_SCRIPTS) not in sys.path:
 
 from nakshatra_auth import WORKER_KEY_PATH  # noqa: E402
 from cryptography.hazmat.primitives.asymmetric import ed25519  # noqa: E402
+from cryptography.exceptions import InvalidSignature  # noqa: E402
 
 import joincode  # noqa: E402
 from mesh.pairing import pair_role  # noqa: E402
@@ -80,6 +83,7 @@ APPROVAL_TIMEOUT_S = 700.0
 APPROVAL_REPEAT_S = 6 * 3600
 APPROVAL_FINAL_S = 2 * 3600
 APPROVAL_MAX_PROMPTS = 8
+WORKER_SUBMIT_MAX_ATTEMPTS = 8
 GRANT_WARN_S = 7 * 86400
 # Worst case is 5 advertised endpoints × 3 s, a 10 s handshake, then the sidecar's 15 s DCUtR wait
 # plus its pinned handshake. Fifty seconds covers that sequence; only both-sides direct opt-ins wait.
@@ -202,7 +206,8 @@ class Node:
     def __init__(self, state_dir: Path, node_key: bytes, signer: Callable[[dict], dict], *,
                  agent: str, relay: tuple = DEFAULT_RELAY, log: Callable[[str], None] = lambda m: None,
                  settlement=None, direct_port: Optional[int] = None, p2p: Optional[dict] = None,
-                 roster_loader: Optional[Callable[[], dict]] = None):
+                 roster_loader: Optional[Callable[[], dict]] = None,
+                 roster_path: Optional[Path] = None):
         self._key = node_key
         self.node = ed25519.Ed25519PrivateKey.from_private_bytes(node_key).public_key().public_bytes_raw().hex()
         self._signer = signer
@@ -246,7 +251,11 @@ class Node:
         self._lock = threading.Lock()
         self._approval_lock = threading.Lock()
         self._approval_running: set[str] = set()
+        self._decision_lock = threading.Lock()
+        self._decision_proofs: set[str] = set()
+        self._submit_lock = threading.Lock()
         self._roster_loader = roster_loader
+        self._roster_path = Path(roster_path) if roster_path is not None else None
         self._last_grant_warning_day: Optional[str] = None
         self._warn_grant(force=True)
 
@@ -1135,12 +1144,32 @@ class Node:
             if self._roster_loader is not None:
                 peers = self._roster_loader() or {}
             else:
-                from fabric import worker_join  # noqa: PLC0415
-                peers = worker_join._load_admission().load_peers() or {}  # noqa: SLF001
+                peers = self._load_roster_tsv()
             row = peers.get(contact.get("node")) or {}
             return row.get("tier") not in {"known", "trusted", "self"}
         except Exception:  # noqa: BLE001 - absent/unreadable roster is deliberately stranger
             return True
+
+    def _load_roster_tsv(self) -> dict:
+        """Read the startup-pinned admission TSV without importing code from another checkout."""
+        if self._roster_path is None:
+            return {}
+        peers = {}
+        for line in self._roster_path.read_text().splitlines():
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            fields = line.split("\t") if "\t" in line else line.split()
+            if len(fields) < 5 or len(fields[0]) != 64:
+                continue
+            try:
+                bytes.fromhex(fields[0])
+            except ValueError:
+                continue
+            tier = fields[3] if fields[3] in {"stranger", "known", "trusted", "self"} else "stranger"
+            if fields[0] in peers and peers[fields[0]]["tier"] != tier:
+                tier = "stranger"
+            peers[fields[0]] = {"tier": tier}
+        return peers
 
     @staticmethod
     def _credits_text(amount: int) -> str:
@@ -1150,12 +1179,22 @@ class Node:
             digits = digits.ljust(2, "0")
         return f"{whole}.{digits}"
 
+    @staticmethod
+    def _prompt_text(value: object, limit: int) -> str:
+        dropped = {"Cc", "Cf", "Co", "Cs", "Zl", "Zp"}
+        clean = "".join(ch for ch in str(value) if unicodedata.category(ch) not in dropped)
+        return " ".join(clean.split())[:limit]
+
     def _approval_description(self, task: dict) -> str:
         contact = self.store.contact(task["assignee"]) or {}
-        worker = " ".join(str(contact.get("petname") or task["assignee"][:12]).split())[:40]
-        title = " ".join(str(task["spec"]["title"]).split())[:60]
-        reward = self._credits_text(task["spec"]["reward"]["amount"])
-        return (f"Pay {worker} {reward} USDC for task '{title}' ({task['task_hash'][:12]})? "
+        person_key = self._prompt_text(task["assignee"][:8], 8)
+        local_name = contact.get("petname") if contact.get("name_src") == "yours" else ""
+        worker = self._prompt_text(local_name or "", 40)
+        worker_label = f"{worker} ({person_key})" if worker else person_key
+        title = self._prompt_text(task["spec"]["title"], 60)
+        reward = self._prompt_text(self._credits_text(task["spec"]["reward"]["amount"]), 32)
+        task_id = self._prompt_text(task["task_hash"][:12], 12)
+        return (f"Pay {worker_label} {reward} USDC for task '{title}' ({task_id})? "
                 "The answer passed the task's rules.")
 
     @staticmethod
@@ -1178,8 +1217,16 @@ class Node:
         command = os.environ.get("NAK_APPROVAL_CMD", "")
         if not command:
             return
-        if not Path(command).is_absolute():
-            self.log("NAK_APPROVAL_CMD must be an absolute path; approval remains unanswered")
+        path = Path(command)
+        try:
+            info = path.lstat()
+        except Exception as exc:  # noqa: BLE001 - malformed paths leave the approval unanswered
+            self.log(f"NAK_APPROVAL_CMD is unavailable ({type(exc).__name__}); approval remains unanswered")
+            return
+        if (not path.is_absolute() or not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or info.st_mode & 0o022):
+            self.log("NAK_APPROVAL_CMD must be an absolute, uid-owned regular file that is not "
+                     "group/world-writable; approval remains unanswered")
             return
         with self._approval_lock:
             if task_hash in self._approval_running:
@@ -1188,30 +1235,41 @@ class Node:
             if not task or task["state"] != "awaiting_approval" or not self._approval_due(task, time.time()):
                 return
             self._approval_running.add(task_hash)
-        threading.Thread(target=self._run_approval_hook, args=(task_hash, command), daemon=True,
-                         name=f"approval:{task_hash}").start()
+        try:
+            threading.Thread(target=self._run_approval_hook, args=(task_hash, command), daemon=True,
+                             name=f"approval:{task_hash}").start()
+        except Exception as exc:  # noqa: BLE001 - a thread launch failure did not show a prompt
+            with self._approval_lock:
+                self._approval_running.discard(task_hash)
+            self.log(f"approval hook for {task_hash[:12]} was not shown ({type(exc).__name__}); will retry")
 
     def _run_approval_hook(self, task_hash: str, command: str) -> None:
         try:
             task = self.store.task_get(task_hash, "poster", "")
             if not task or task["state"] != "awaiting_approval":
                 return
-            verdict = dict(task.get("verdict") or {})
+            try:
+                description = self._approval_description(task)
+                result = subprocess.run([command, description], check=False,
+                                        timeout=APPROVAL_TIMEOUT_S,
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                code = result.returncode
+            except subprocess.TimeoutExpired:
+                code = None                 # the process launched, so this prompt consumes a slot
+            except Exception as exc:  # noqa: BLE001 - a malformed field/spawn must never kill this thread
+                self.log(f"approval hook for {task_hash[:12]} was not shown ({type(exc).__name__}); "
+                         "will retry")
+                return
+            current = self.store.task_get(task_hash, "poster", "")
+            if not current or current["state"] != "awaiting_approval":
+                return
+            verdict = dict(current.get("verdict") or {})
             approval = dict(verdict.get("approval") or {})
-            now = int(time.time())
-            approval["last_prompted_at"] = now
+            approval["last_prompted_at"] = int(time.time())
             approval["prompt_count"] = int(approval.get("prompt_count") or 0) + 1
             verdict["approval"] = approval
             if not self.store.task_cas(task_hash, "poster", "", ("awaiting_approval",),
                                        verdict=json.dumps(verdict)):
-                return
-            try:
-                result = subprocess.run([command, self._approval_description(task)], check=False,
-                                        timeout=APPROVAL_TIMEOUT_S,
-                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                code = result.returncode
-            except (OSError, subprocess.TimeoutExpired) as exc:
-                self.log(f"approval hook for {task_hash[:12]} unanswered ({type(exc).__name__})")
                 return
             if code == 0:
                 try:
@@ -1224,6 +1282,8 @@ class Node:
                                               source="approval hook", touch=True)
                 except ValueError as exc:
                     self.log(f"approval hook for {task_hash[:12]} was superseded: {exc}")
+            elif code is None:
+                self.log(f"approval hook for {task_hash[:12]} unanswered (timeout)")
             else:
                 self.log(f"approval hook for {task_hash[:12]} unanswered (exit {code})")
         finally:
@@ -1250,6 +1310,21 @@ class Node:
             raise ValueError(f"task is {task['state']}, not awaiting a decision")
         self._require_grant("task.accept")
         final = dict(verdict if verdict is not None else (task.get("verdict") or {}))
+        if accept and self.settle.open_on_assign and task["spec"]["reward"]["amount"] > 0:
+            actual = output if output is not None else task.get("output")
+            if not isinstance(actual, str):
+                raise ValueError("paid task result is unavailable; refusing acceptance")
+            try:
+                hold = self.settle.status(task_hash, hold_id=task.get("hold_id") or "")
+            except SettlementError as exc:
+                raise ValueError(f"cannot verify the paid task result against its ledger mark: {exc}") from exc
+            expected = hashlib.sha256(actual.encode("utf-8")).hexdigest()
+            if not hold or hold.get("result_hash") != expected:
+                accept = False
+                reason = "result does not match the ledger mark"
+                source = "ledger result check"
+                touch = False
+        desired = "accepted" if accept else "rejected"
         rules_passed = bool(final.get("rules_passed", final.get("passed")))
         final["rules_passed"] = rules_passed
         final["passed"] = accept
@@ -1259,7 +1334,8 @@ class Node:
         if output is not None:
             fields["output"] = output
         if not self.store.task_cas(task_hash, "poster", "", from_states, **fields):
-            return self._apply_task_decision(task_hash, accept, reason, source=source, touch=touch)
+            return self._apply_task_decision(task_hash, accept, reason, source=source, touch=touch,
+                                             output=output, verdict=final, from_states=from_states)
         receipt = self._settle(task_hash, task["spec"], "release" if accept else "refund",
                                party=task["assignee"] or "", reason=reason or desired,
                                hold_id=task["hold_id"] or "")
@@ -1272,7 +1348,7 @@ class Node:
         self.log(f"task {task_hash[:12]} {'ACCEPTED' if accept else 'REJECTED'} ({label})")
         return {"task_hash": task_hash, "state": desired, "idempotent": False}
 
-    def decide_task(self, ref: str, decision: str, reason: str = "") -> dict:
+    def decide_task(self, ref: str, decision: str, reason: str = "", *, ts=None, signature: str = "") -> dict:
         rows = [r for r in self.store.task_find(str(ref)) if r["role"] == "poster"]
         if len(rows) != 1:
             raise ValueError("no single posted task matches that id")
@@ -1284,30 +1360,75 @@ class Node:
         if why:
             raise ValueError(why)
         task = rows[0]
+        if isinstance(ts, bool) or not isinstance(ts, int) or abs(int(time.time()) - ts) > V.DECISION_MAX_SKEW_S:
+            raise ValueError("task decision proof timestamp is stale")
+        if not isinstance(signature, str) or len(signature) != 128:
+            raise ValueError("task decision needs a person signature")
+        try:
+            proof = bytes.fromhex(signature)
+            ed25519.Ed25519PublicKey.from_public_bytes(bytes.fromhex(self.person)).verify(
+                proof, V.decision_statement(task["task_hash"], decision, reason, ts))
+        except (ValueError, TypeError, InvalidSignature) as exc:
+            raise ValueError("task decision person signature is invalid") from exc
+        prior = (task.get("verdict") or {}).get("decision_proof") or {}
+        with self._decision_lock:
+            if signature in self._decision_proofs or prior.get("signature") == signature:
+                raise ValueError("task decision proof was already used")
+            self._decision_proofs.add(signature)
         if task["state"] == "awaiting_approval" and task["spec"]["deadline"] <= time.time():
             self._apply_task_decision(task["task_hash"], True, "", source="silence", touch=False)
             task = self.store.task_get(task["task_hash"], "poster", "")
+        final = dict(task.get("verdict") or {})
+        final["decision_proof"] = {"signature": signature, "ts": ts,
+                                   "reason_sha256": hashlib.sha256(reason.encode("utf-8")).hexdigest()}
         return self._apply_task_decision(task["task_hash"], decision == "accept", reason,
-                                         source="human", touch=True)
+                                         source="human", touch=True, verdict=final)
 
     def _mark_worker_submit(self, task: dict) -> bool:
+        with self._submit_lock:
+            current = self.store.task_get(task["task_hash"], "worker", task["peer"])
+            if not current or current["state"] != "submitted":
+                return True
+            if current.get("submit_state") in {"marked", "terminal", "exhausted"}:
+                return current.get("submit_state") == "marked"
+            return self._mark_worker_submit_locked(current)
+
+    def _mark_worker_submit_locked(self, task: dict) -> bool:
         if (not self.settle.open_on_assign or task["spec"]["reward"]["amount"] <= 0
                 or not task.get("hold_id") or not task.get("result_hash")):
             return True
+        attempts = int(task.get("submit_attempts") or 0) + 1
+        if attempts > WORKER_SUBMIT_MAX_ATTEMPTS:
+            self.store.task_cas(task["task_hash"], "worker", task["peer"], ("submitted",),
+                                submit_state="exhausted",
+                                submit_reason="ledger submit retry limit reached")
+            return False
+        self.store.task_cas(task["task_hash"], "worker", task["peer"], ("submitted",),
+                            submit_attempts=attempts)
         try:
             self.settle.submit(task["task_hash"], task["result_hash"], hold_id=task["hold_id"])
         except SettlementError as exc:
+            terminal = getattr(exc, "state", "") in {"paid", "refunded", "released"}
+            if exc.status == 409 and not terminal:
+                try:
+                    status = self.settle.status(task["task_hash"], hold_id=task["hold_id"])
+                    terminal = (status or {}).get("state") in {"paid", "released", "refunded"}
+                except SettlementError:
+                    pass
+            state = "terminal" if terminal else (
+                "exhausted" if attempts >= WORKER_SUBMIT_MAX_ATTEMPTS else "pending")
             self.store.task_cas(task["task_hash"], "worker", task["peer"], ("submitted",),
-                                submit_state="pending", submit_reason=str(exc)[:200])
-            self.log(f"ledger submit mark for {task['task_hash'][:12]} pending: {exc}")
+                                submit_state=state, submit_reason=str(exc)[:200],
+                                submit_attempts=attempts)
+            self.log(f"ledger submit mark for {task['task_hash'][:12]} {state}: {exc}")
             return False
         self.store.task_cas(task["task_hash"], "worker", task["peer"], ("submitted",),
-                            submit_state="marked", submit_reason="")
+                            submit_state="marked", submit_reason="", submit_attempts=attempts)
         return True
 
     def _retry_worker_submits(self) -> None:
         for task in self.store.tasks_in_states(("submitted",), role="worker"):
-            if task.get("submit_state") != "marked":
+            if task.get("submit_state") not in {"marked", "terminal", "exhausted"}:
                 self._mark_worker_submit(task)
 
     def _claim_reopened(self, mid: str, person: str) -> None:
@@ -1458,27 +1579,30 @@ class Node:
         for t in self.store.tasks_in_states(("posted", "assigned", "awaiting_approval", "offered", "claimed")):
             if t["spec"]["deadline"] > now:
                 continue
-            if t["role"] == "poster" and t["state"] == "awaiting_approval":
-                self._apply_task_decision(t["task_hash"], True, "", source="silence", touch=False)
-                n += 1
-            elif t["role"] == "poster" and t["state"] in ("posted", "assigned"):
-                if (self.settle.open_on_assign and t["state"] == "assigned" and not t["hold_id"]
-                        and t["spec"]["reward"]["amount"] > 0):
-                    continue    # a hold may exist unrecorded; reconcile re-runs the idempotent authorize
-                if self.store.task_cas(t["task_hash"], "poster", "", ("posted", "assigned"), state="expired",
-                                       verdict=json.dumps({"passed": False, "reasons": ["deadline passed"]})):
-                    receipt = self._settle(t["task_hash"], t["spec"], "refund", reason="expired",
-                                           hold_id=t["hold_id"] or "")
-                    if t["assignee"]:
-                        body = {"task_hash": t["task_hash"], "epoch": t["epoch"],
-                                "reasons": ["deadline passed"]}
-                        if self.settle.open_on_assign and receipt and not receipt.get("error"):
-                            body["settlement"] = receipt
-                        self._queue(t["assignee"], "task.reject", body, touch=False)
+            try:
+                if t["role"] == "poster" and t["state"] == "awaiting_approval":
+                    self._apply_task_decision(t["task_hash"], True, "", source="silence", touch=False)
                     n += 1
-            elif t["role"] == "worker" and t["state"] in ("offered", "claimed", "assigned"):
-                n += self.store.task_cas(t["task_hash"], "worker", t["peer"], ("offered", "claimed", "assigned"),
-                                         state="expired")
+                elif t["role"] == "poster" and t["state"] in ("posted", "assigned"):
+                    if (self.settle.open_on_assign and t["state"] == "assigned" and not t["hold_id"]
+                            and t["spec"]["reward"]["amount"] > 0):
+                        continue    # a hold may exist unrecorded; reconcile re-runs the idempotent authorize
+                    if self.store.task_cas(t["task_hash"], "poster", "", ("posted", "assigned"), state="expired",
+                                           verdict=json.dumps({"passed": False, "reasons": ["deadline passed"]})):
+                        receipt = self._settle(t["task_hash"], t["spec"], "refund", reason="expired",
+                                               hold_id=t["hold_id"] or "")
+                        if t["assignee"]:
+                            body = {"task_hash": t["task_hash"], "epoch": t["epoch"],
+                                    "reasons": ["deadline passed"]}
+                            if self.settle.open_on_assign and receipt and not receipt.get("error"):
+                                body["settlement"] = receipt
+                            self._queue(t["assignee"], "task.reject", body, touch=False)
+                        n += 1
+                elif t["role"] == "worker" and t["state"] in ("offered", "claimed", "assigned"):
+                    n += self.store.task_cas(t["task_hash"], "worker", t["peer"],
+                                             ("offered", "claimed", "assigned"), state="expired")
+            except Exception as exc:  # noqa: BLE001 - one task must never starve later expiries
+                self.log(f"task sweep for {t['task_hash'][:12]} failed: {exc}")
         return n
 
     def _worker_task(self, ref: str) -> dict:
@@ -1849,7 +1973,9 @@ def handle(node: Node, req: dict) -> dict:
         if op == "task_submit":
             return {"ok": True, **node.submit_task(req["task"], req["output"])}
         if op == "task_decide":
-            return {"ok": True, **node.decide_task(req["task"], req["decision"], req.get("reason", ""))}
+            return {"ok": True, **node.decide_task(
+                req["task"], req["decision"], req.get("reason", ""),
+                ts=req.get("ts"), signature=req.get("signature", ""))}
         if op == "inbox":
             msgs = node.store.inbox(int(req.get("since", 0)), int(req.get("limit", 50)))
             for m in msgs:
@@ -1913,6 +2039,17 @@ def _load_node_key(path: Path) -> bytes:
     return raw
 
 
+def _resolve_roster_path(home: Path) -> Path:
+    """Pin the roster source once at daemon start; later env/filesystem changes cannot redirect it."""
+    configured = os.environ.get("MESH_PEERS", "").strip()
+    if configured:
+        return Path(configured).expanduser().resolve()
+    pulled = home / ".nakshatra" / "admission-peers.tsv"
+    if pulled.exists():
+        return pulled
+    return home / "trisul" / "infra" / "control-plane" / "peers.tsv"
+
+
 def main(argv=None) -> int:
     import argparse
     os.umask(0o077)
@@ -1927,6 +2064,7 @@ def main(argv=None) -> int:
     ap.add_argument("--direct-port", type=int, help="direct listener port (overrides <state>/direct-port)")
     ap.add_argument("--p2p-dial", help="local sidecar UNIX socket path (overrides <state>/p2p-dial)")
     a = ap.parse_args(argv)
+    roster_path = _resolve_roster_path(home)
     if not a.agent and (a.state / "agent").exists():
         a.agent = (a.state / "agent").read_text().strip()      # set once per node: `echo prithvi > …/net/agent`
     if not a.agent:
@@ -1945,7 +2083,8 @@ def main(argv=None) -> int:
             p2p_dial = a.p2p_dial or (p2p_file.read_text().strip() if p2p_file.exists() else "")
             node = Node(a.state, _load_node_key(a.node_key), SignerClient(a.signer), agent=a.agent,
                         relay=(host, int(port)), log=lambda m: print(f"[nakd] {m}", flush=True),
-                        direct_port=direct_port, p2p={"dial": p2p_dial} if p2p_dial else None).start()
+                        direct_port=direct_port, p2p={"dial": p2p_dial} if p2p_dial else None,
+                        roster_path=roster_path).start()
             break
         except DataKeyError as e:
             raise SystemExit(f"nakd cannot start without the signer's data key: {e}") from e

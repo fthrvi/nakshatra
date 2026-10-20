@@ -5,12 +5,27 @@ provide the rule result, reward, escrow kind, and roster classification, and rec
 """
 from __future__ import annotations
 
+import hashlib
+import json
+
 DEFAULT_MODE = "threshold"
 DEFAULT_AUTO_MAX = 10_000_000
 DEFAULT_ASK_STRANGERS = True
 MAX_AUTO_MAX = 10**14
 MODES = frozenset({"auto", "ask", "threshold"})
 ACCEPT, REJECT, ASK = "accept", "reject", "ask"
+DECISION_MAX_SKEW_S = 120
+
+
+def decision_statement(task_hash: str, decision: str, reason: str, ts: int) -> bytes:
+    """Canonical person-signature payload for one explicit paid-task decision."""
+    body = {
+        "task_hash": task_hash,
+        "decision": decision,
+        "reason_sha256": hashlib.sha256(reason.encode("utf-8")).hexdigest(),
+        "ts": ts,
+    }
+    return json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
 
 
 def policy(constraints: object) -> dict:

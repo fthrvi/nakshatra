@@ -109,7 +109,7 @@ def test_grant_refuses_bad_verdict_threshold_without_mutation(tmp_path, monkeypa
     assert grant_path.read_bytes() == before
 
 
-def test_task_decide_is_cli_only_and_noninteractive_requires_yes(monkeypatch):
+def test_task_decide_is_cli_only_and_requires_a_terminal(monkeypatch):
     class NotTerminal:
         def isatty(self):
             return False
@@ -118,6 +118,8 @@ def test_task_decide_is_cli_only_and_noninteractive_requires_yes(monkeypatch):
     monkeypatch.setattr(nak, "call", lambda *_a, **_k: pytest.fail("daemon must not be called"))
     with pytest.raises(SystemExit, match="interactive-only"):
         nak.main(["task", "decide", "12345678", "accept"])
+    with pytest.raises(SystemExit):
+        nak.main(["task", "decide", "12345678", "accept", "--yes"])
     names = {tool["name"] for tool in nak_mcp.Server(object(), allow_connect=True).list_tools()}
     assert "nak_task_decide" not in names
 
@@ -152,10 +154,60 @@ def test_waiting_answer_is_visible_in_cli_status_tasks_and_mcp(monkeypatch, caps
     assert "1 paid answer waiting for your decision" in nak_mcp.Server(Client()).call("nak_status", {})
 
 
-def test_task_decide_yes_calls_only_the_daemon_control_op(monkeypatch, capsys):
+def test_task_decide_loads_matching_person_key_and_sends_signed_proof(
+        tmp_path, monkeypatch, capsys):
+    state, _key, _grant = _temporary_identity(tmp_path, monkeypatch)
+    task_hash = "1" * 64
+
+    class Terminal:
+        def isatty(self):
+            return True
+
     calls = []
-    monkeypatch.setattr(nak, "call", lambda _sock, req: calls.append(req) or {
-        "task_hash": "1" * 64, "state": "accepted", "idempotent": False})
-    assert nak.main(["task", "decide", "12345678", "accept", "--yes"]) == 0
-    assert calls == [{"op": "task_decide", "task": "12345678", "decision": "accept", "reason": ""}]
+    def fake_call(_sock, req):
+        calls.append(req)
+        if req["op"] == "tasks":
+            return {"tasks": [{"task_hash": task_hash}]}
+        return {"task_hash": task_hash, "state": "accepted", "idempotent": False}
+
+    monkeypatch.setattr(nak.sys, "stdin", Terminal())
+    monkeypatch.setattr("builtins.input", lambda _prompt: "yes")
+    monkeypatch.setattr(nak, "call", fake_call)
+    assert nak.main(["task", "decide", "11111111", "accept"]) == 0
+    decision = calls[1]
+    assert decision["op"] == "task_decide" and decision["task"] == task_hash
+    assert decision["decision"] == "accept" and decision["reason"] == ""
+    from sthambha import signer as signer_mod
+    _priv, person_pub = signer_mod.load_key(tmp_path / ".sthambha" / "person-TEST.key")
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+    ed25519.Ed25519PublicKey.from_public_bytes(bytes.fromhex(person_pub)).verify(
+        bytes.fromhex(decision["signature"]),
+        verdict.decision_statement(task_hash, "accept", "", decision["ts"]))
+    assert (state / "person.pub").read_text().strip() == person_pub
     assert '"state": "accepted"' in capsys.readouterr().out
+
+
+def test_task_decide_help_says_posting_policy_is_frozen(capsys):
+    with pytest.raises(SystemExit) as exc:
+        nak.main(["task", "decide", "--help"])
+    assert exc.value.code == 0
+    help_text = " ".join(capsys.readouterr().out.split())
+    assert "verdict policy" in help_text and "posted under" in help_text
+
+
+def test_task_decide_refuses_a_person_key_that_does_not_match_the_signer(
+        tmp_path, monkeypatch):
+    _temporary_identity(tmp_path, monkeypatch)
+    from sthambha import signer as signer_mod
+    wrong_private, _wrong_public = signer_mod.new_key()
+    signer_mod.save_key(tmp_path / ".sthambha" / "person-TEST.key", wrong_private)
+
+    class Terminal:
+        def isatty(self):
+            return True
+
+    monkeypatch.setattr(nak.sys, "stdin", Terminal())
+    monkeypatch.setattr(nak, "call", lambda _sock, req: {
+        "tasks": [{"task_hash": "1" * 64}]} if req["op"] == "tasks" else {})
+    with pytest.raises(SystemExit, match="does not match"):
+        nak.main(["task", "decide", "11111111", "accept"])

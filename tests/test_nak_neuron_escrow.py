@@ -7,6 +7,7 @@ import io
 import json
 import re
 import shlex
+import subprocess
 import threading
 import time
 import urllib.error
@@ -15,7 +16,8 @@ import urllib.parse
 import pytest
 
 import nakshatra_auth
-from network import settle as settle_mod
+from cryptography.hazmat.primitives.asymmetric import ed25519
+from network import nakd, settle as settle_mod, tasks as task_mod, verdict as verdict_mod
 from network.settle import (HoldConflict, HoldNotFound, InsufficientFunds, NeuronEscrowAdapter,
                             SettlementError)
 from test_nakd import _connect, _worker_row, net, wait  # noqa: F401 - net is a fixture
@@ -45,6 +47,7 @@ class FakeTaskLedger:
         self.lie_open_once = False       # one stale status read that still says open
         self.sweep_on_pay = False        # the ledger's own sweep refunds the hold as pay arrives
         self.status_override = None
+        self.submit_hash_override = ""
 
     def fund(self, keyid, amount):
         self.balances[keyid] = self.balances.get(keyid, 0) + amount
@@ -141,7 +144,7 @@ class FakeTaskLedger:
             raise error
         if not row["result_hash"]:
             row["submitted_at"] = int(time.time()) or 1
-            row["result_hash"] = result_hash
+            row["result_hash"] = self.submit_hash_override or result_hash
         return copy.deepcopy(row)
 
     def refund(self, payer, hold_id, _reason):
@@ -340,6 +343,14 @@ def _submit_waiting(poster, worker, *, reward=5, output="ok"):
     return task_hash
 
 
+def _person_decide(poster, task_hash, decision, reason="", *, ts=None, private=None):
+    ts = int(time.time()) if ts is None else ts
+    private = private or poster.person_priv
+    signature = private.sign(
+        verdict_mod.decision_statement(task_hash, decision, reason, ts)).hex()
+    return poster.node.decide_task(task_hash, decision, reason, ts=ts, signature=signature)
+
+
 def test_threshold_auto_pays_at_or_below_the_limit(net):
     poster, worker, ledger = _pair(net, constraints=_ask_policy(auto_max=5))
     task_hash = _assign(poster, worker, reward=5)
@@ -357,7 +368,7 @@ def test_over_threshold_hook_accepts_with_fixed_text_and_human_touch(net, tmp_pa
     worker.node.submit_task(task_hash, "ok")
     assert wait(lambda: poster.node.store.task_get(task_hash, "poster")["state"] == "accepted")
     assert capture.read_text() == (
-        f"Pay worker 0.00000005 USDC for task 'drill' ({task_hash[:12]})? "
+        f"Pay worker ({worker.person_pub[:8]}) 0.00000005 USDC for task 'drill' ({task_hash[:12]})? "
         "The answer passed the task's rules.")
     assert next(iter(ledger.holds.values()))["state"] == "paid"
     touches = [r for r in poster.signer_requests if r.get("kind") == "task.accept"]
@@ -426,9 +437,10 @@ def test_human_decide_is_idempotent_and_restart_rearms_due_hook(net, tmp_path, m
     poster, worker, ledger = _pair(net, suffix="-human", constraints=_ask_policy())
     task_hash = _submit_waiting(poster, worker)
     poster.signer_requests.clear()
-    first = poster.node.decide_task(task_hash, "accept")
-    second = poster.node.decide_task(task_hash, "accept")
-    assert not first["idempotent"] and second["idempotent"]
+    first = _person_decide(poster, task_hash, "accept")
+    assert not first["idempotent"]
+    with pytest.raises(ValueError, match="already used"):
+        _person_decide(poster, task_hash, "accept")
     assert [event for _hold, event in ledger.transitions].count("paid") == 1
     assert any(r.get("kind") == "task.accept" and r.get("touch") is True
                for r in poster.signer_requests)
@@ -459,6 +471,90 @@ def test_human_decide_is_idempotent_and_restart_rearms_due_hook(net, tmp_path, m
     assert next(iter(ledger2.holds.values()))["state"] == "paid"
 
 
+def test_socket_decide_requires_fresh_matching_person_signature_and_refuses_replay(
+        net, tmp_path, monkeypatch):
+    monkeypatch.setenv("NAK_APPROVAL_CMD", str(_approval_script(tmp_path, 1)))
+    poster, worker, _ledger = _pair(net, constraints=_ask_policy())
+    task_hash = _submit_waiting(poster, worker)
+    base = {"op": "task_decide", "task": task_hash, "decision": "accept", "reason": ""}
+    assert nakd.handle(poster.node, base)["ok"] is False
+
+    old_ts = int(time.time()) - verdict_mod.DECISION_MAX_SKEW_S - 1
+    old = dict(base, ts=old_ts, signature=poster.person_priv.sign(
+        verdict_mod.decision_statement(task_hash, "accept", "", old_ts)).hex())
+    assert "stale" in nakd.handle(poster.node, old)["error"]
+
+    wrong = ed25519.Ed25519PrivateKey.generate()
+    ts = int(time.time())
+    bad = dict(base, ts=ts, signature=wrong.sign(
+        verdict_mod.decision_statement(task_hash, "accept", "", ts)).hex())
+    assert "invalid" in nakd.handle(poster.node, bad)["error"]
+
+    good = dict(base, ts=ts, signature=poster.person_priv.sign(
+        verdict_mod.decision_statement(task_hash, "accept", "", ts)).hex())
+    assert nakd.handle(poster.node, good)["state"] == "accepted"
+    assert "already used" in nakd.handle(poster.node, good)["error"]
+
+
+def test_hook_sanitizes_hostile_local_petname_and_title_without_consuming_failed_spawn(
+        net, tmp_path, monkeypatch):
+    capture = tmp_path / "description.txt"
+    script = _approval_script(tmp_path, 0, capture=capture)
+    monkeypatch.setenv("NAK_APPROVAL_CMD", str(script))
+    poster, worker, _ledger = _pair(net, constraints=_ask_policy())
+    hostile_name = "local\x00\x1b\u202ename\n" + "z" * 5000
+    poster.node.store.upsert_contact(worker.person_pub, worker.node.node, "active", hostile_name,
+                                     name_src="yours")
+    hostile_title = "ti\x00\x1b\u2066tle\n" + "q" * 100
+    task_hash = poster.node.post_task(
+        worker.person_pub, hostile_title, "Say ok.", [{"contains_all": ["ok"]}],
+        reward=5, deadline_s=600)["task_hash"]
+    assert wait(lambda: _worker_row(worker.node, task_hash))
+    worker.node.claim_task(task_hash)
+    assert wait(lambda: _worker_row(worker.node, task_hash)[0]["state"] == "assigned")
+    worker.node.submit_task(task_hash, "ok")
+    assert wait(capture.exists)
+    shown = capture.read_text()
+    assert "\x00" not in shown and "\x1b" not in shown and "\u202e" not in shown
+    assert "\u2066" not in shown and "\n" not in shown
+    assert worker.person_pub[:8] in shown and len(shown) < 220
+
+    huge = poster.node.store.task_get(task_hash, "poster")
+    huge["spec"] = dict(huge["spec"], title="x\x00\x1b\u202e\n" + "q" * 5000)
+    huge_description = poster.node._approval_description(huge)
+    subprocess.run([str(script), huge_description], check=True)
+    assert capture.read_text() == huge_description and len(huge_description) < 220
+    poster.node.store.upsert_contact(worker.person_pub, worker.node.node, "active",
+                                     "worker-chosen-name", name_src="self-chosen")
+    no_self_chosen_name = poster.node._approval_description(huge)
+    assert "worker-chosen-name" not in no_self_chosen_name
+    assert no_self_chosen_name.startswith(f"Pay {worker.person_pub[:8]} ")
+
+    poster2, worker2, _ledger2 = _pair(net, suffix="-spawn", constraints=_ask_policy())
+    monkeypatch.setattr("network.nakd.subprocess.run", lambda *_a, **_k: (_ for _ in ()).throw(ValueError("bad")))
+    task2 = _submit_waiting(poster2, worker2)
+    time.sleep(0.1)
+    row = poster2.node.store.task_get(task2, "poster")
+    assert row["verdict"]["approval"]["prompt_count"] == 0
+
+
+@pytest.mark.parametrize("mode", ["world_writable", "wrong_owner", "not_regular"])
+def test_approval_hook_refuses_unsafe_command_file(net, tmp_path, monkeypatch, mode):
+    script = _approval_script(tmp_path, 0)
+    if mode == "world_writable":
+        script.chmod(0o722)
+    elif mode == "wrong_owner":
+        monkeypatch.setattr("network.nakd.os.getuid", lambda: script.lstat().st_uid + 1)
+    else:
+        script.unlink()
+        script.mkdir()
+    monkeypatch.setenv("NAK_APPROVAL_CMD", str(script))
+    poster, worker, _ledger = _pair(net, suffix="-" + mode, constraints=_ask_policy())
+    task_hash = _submit_waiting(poster, worker)
+    time.sleep(0.1)
+    assert poster.node.store.task_get(task_hash, "poster")["verdict"]["approval"]["prompt_count"] == 0
+
+
 def test_worker_submit_mark_failure_never_blocks_delivery_and_reconcile_retries(
         net, tmp_path, monkeypatch):
     monkeypatch.setenv("NAK_APPROVAL_CMD", str(_approval_script(tmp_path, 1)))
@@ -473,6 +569,82 @@ def test_worker_submit_mark_failure_never_blocks_delivery_and_reconcile_retries(
     worker.node.reconcile_escrow()
     local = worker.node.store.task_get(task_hash, "worker", poster.person_pub)
     assert local["submit_state"] == "marked" and ledger.submit_calls >= 2
+
+
+def test_result_hash_mismatch_rejects_and_refunds_before_accept(net):
+    poster, worker, ledger = _pair(net, constraints=_ask_policy(auto_max=10))
+    ledger.submit_hash_override = "f" * 64
+    task_hash = _assign(poster, worker)
+    worker.node.submit_task(task_hash, "ok")
+    assert wait(lambda: poster.node.store.task_get(task_hash, "poster")["state"] == "rejected")
+    row = poster.node.store.task_get(task_hash, "poster")
+    assert row["verdict"]["reasons"] == ["result does not match the ledger mark"]
+    assert next(iter(ledger.holds.values()))["state"] == "refunded"
+
+
+def test_worker_submit_retries_stop_on_terminal_hold_and_are_bounded(net):
+    poster, worker, ledger = _pair(net, suffix="-terminal", constraints=_ask_policy())
+    task_hash = _assign(poster, worker)
+    ledger.fail_submit = True
+    worker.node.submit_task(task_hash, "ok")
+    hold = next(iter(ledger.holds.values()))
+    ledger.fail_submit = False
+    hold["state"] = "refunded"
+    ledger.balances[hold["payer_account"]] += hold["amount"]
+    before = ledger.submit_calls
+    worker.node.reconcile_escrow()
+    terminal = worker.node.store.task_get(task_hash, "worker", poster.person_pub)
+    assert terminal["submit_state"] == "terminal"
+    worker.node.reconcile_escrow()
+    assert ledger.submit_calls == before + 1
+
+    poster2, worker2, ledger2 = _pair(net, suffix="-bounded", constraints=_ask_policy())
+    task2 = _assign(poster2, worker2)
+    ledger2.fail_submit = True
+    worker2.node.submit_task(task2, "ok")
+    for _ in range(nakd.WORKER_SUBMIT_MAX_ATTEMPTS + 3):
+        worker2.node.reconcile_escrow()
+    exhausted = worker2.node.store.task_get(task2, "worker", poster2.person_pub)
+    assert exhausted["submit_state"] == "exhausted"
+    calls = ledger2.submit_calls
+    worker2.node.reconcile_escrow()
+    assert ledger2.submit_calls == calls == nakd.WORKER_SUBMIT_MAX_ATTEMPTS
+
+
+def test_sweep_isolates_one_failed_task_from_later_expiry(net, monkeypatch):
+    poster, worker, _ledger = _pair(net)
+    first = task_mod.make_spec(poster.person_pub, "first", "x", [{"max_words": 1}], deadline_s=1)
+    second = task_mod.make_spec(poster.person_pub, "second", "x", [{"max_words": 1}], deadline_s=1)
+    first_hash, second_hash = task_mod.task_hash(first), task_mod.task_hash(second)
+    poster.node.store.task_insert(first_hash, "poster", "", first, "awaiting_approval",
+                                  targets=[worker.person_pub])
+    poster.node.store.task_insert(second_hash, "poster", "", second, "posted",
+                                  targets=[worker.person_pub])
+    original = poster.node._apply_task_decision
+
+    def fail_first(task_hash, *args, **kwargs):
+        if task_hash == first_hash:
+            raise RuntimeError("signer down")
+        return original(task_hash, *args, **kwargs)
+
+    monkeypatch.setattr(poster.node, "_apply_task_decision", fail_first)
+    assert poster.node.sweep(now=max(first["deadline"], second["deadline"]) + 1) == 1
+    assert poster.node.store.task_get(first_hash, "poster")["state"] == "awaiting_approval"
+    assert poster.node.store.task_get(second_hash, "poster")["state"] == "expired"
+
+
+def test_stranger_roster_reads_pinned_tsv_directly(net, tmp_path):
+    poster, worker = net("roster-poster"), net("roster-worker")
+    roster = tmp_path / "peers.tsv"
+    roster.write_text(f"{worker.node.node}\tworker\top\ttrusted\ttenant\n")
+    poster.node._roster_loader = None
+    poster.node._roster_path = roster
+    contact = {"node": worker.node.node}
+    assert poster.node._worker_is_stranger(contact) is False
+    roster.write_text(f"{worker.node.node}\tworker\top\tKnown\ttenant\n")
+    assert poster.node._worker_is_stranger(contact) is True
+    poster.node._roster_path = tmp_path / "missing.tsv"
+    assert poster.node._worker_is_stranger(contact) is True
 
 
 def test_paid_card_requires_neuron_and_uses_the_nodes_own_key(net):

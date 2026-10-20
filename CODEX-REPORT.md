@@ -223,3 +223,46 @@ Buzz, signer home, Neuron store, service, deploy, pull, or push was touched.
 The Neuron server implementation was built in parallel. This branch verifies the frozen submit/status
 contract through the real signed HTTP adapter against the injected fake ledger; a live two-node
 ledger canary remains the integration/cutover check.
+
+---
+
+# Fix round 1 — paid-task verdict policy (node) — 2026-10-20
+
+## Review fixes
+
+- Approval descriptions now use only the poster-assigned local petname (never a worker's
+  self-chosen name), the worker person-key prefix, node-rendered reward, task id, and title. Every
+  dynamic field drops Unicode Cc/Cf/Co/Cs/Zl/Zp characters, collapses whitespace, and is bounded.
+  Hook build/spawn failures are logged without consuming a prompt slot. `NAK_APPROVAL_CMD` must be
+  an absolute, uid-owned regular file with no group/world write bit.
+- `nak task decide` is terminal-only and has no `--yes`. It loads and matches the same person key as
+  grant renewal, then signs the exact task hash, decision, reason SHA-256, and timestamp. nakd
+  verifies the signature against its person identity, enforces a +/-120-second window, and rejects
+  replay. Only this verified path and a hook-approved verdict use `touch=true`.
+- Each expired task is isolated inside `sweep()` so one signer/settlement failure cannot starve
+  later expiries. Stranger classification reads a startup-pinned roster TSV directly; it no longer
+  imports code from `~/trisul`, and absent/malformed/ambiguous rows remain strangers.
+- Before any paid ACCEPT, nakd compares the hold's `result_hash` with SHA-256 of the exact delivered
+  UTF-8 result. A mismatch becomes REJECT + refund with `result does not match the ledger mark` and
+  is classified as automatic (`touch=false`).
+- Task help, status, and rendering say that an in-flight task keeps its posting-time verdict policy.
+  Worker submit marks stop after a paid/refunded 409 and otherwise stop after eight attempts; the
+  attempt count is durable.
+
+## Verification
+
+All runs used a fresh temporary `HOME` and
+`PYTHONPATH=/home/prithvi/sthambha:/home/prithvi/.local/lib/python3.12/site-packages`. Hook tests used
+only uid-owned scripts inside pytest temporary directories; all relays were loopback/in-process. No
+real approval service, port 8902, Buzz, live node state, ledger, service, deploy, pull, or push was
+touched.
+
+- `tests/test_nak_verdict_policy.py`: **203 passed**.
+- Focused verdict + Neuron escrow suites: **254 passed**.
+- Established 13-file matrix on this branch: **348 passed / 10 failed** in 78.70s.
+- Clean exported `forgejo/main@6b3827a`: **332 passed / 10 failed** in 71.70s. Net: **+16 passing
+  matrix tests, no new failure**.
+- The identical ten baseline failures are nine `test_nak_direct` subprocess-stub failures
+  (`None.returncode`) and the moving-main
+  `test_schema_migration_is_idempotent_on_a_forgejo_main_store` assertion.
+- `py_compile` for all changed Python files and `git diff --check` passed.

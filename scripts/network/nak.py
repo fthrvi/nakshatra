@@ -1893,6 +1893,29 @@ def _print_grant_status(grant: dict) -> None:
         print("paid-task verdicts: " + describe(grant["verdict_policy"]))
 
 
+def _load_matching_person_key():
+    """Load the TEST-custody person key and bind it to the active signer's person.pub."""
+    signer_dir, _net_dir, _agent = _grant_paths()
+    from sthambha import signer as signer_mod
+    person_key = Path.home() / ".sthambha" / "person-TEST.key"
+    try:
+        signer_person = (signer_dir / "person.pub").read_text().strip()
+        person_priv, person_pub = signer_mod.load_key(person_key)
+    except (OSError, ValueError, signer_mod.SignerError) as exc:
+        raise SystemExit(f"cannot load the person key for task decision: {exc}") from exc
+    if person_pub != signer_person:
+        raise SystemExit(f"the person key at {person_key} does not match {signer_dir / 'person.pub'}")
+    return person_priv
+
+
+def _resolve_posted_task(sock: Path, ref: str) -> str:
+    rows = [row for row in call(sock, {"op": "tasks", "role": "poster"})["tasks"]
+            if row.get("task_hash", "").startswith(str(ref))]
+    if len(rows) != 1:
+        raise SystemExit("refused: no single posted task matches that id")
+    return rows[0]["task_hash"]
+
+
 class _NoAbbrevArgumentParser(argparse.ArgumentParser):
     """Keep every parser level strict; argparse otherwise abbreviates long options."""
 
@@ -2087,9 +2110,11 @@ def main(argv=None, *, http_post=None) -> int:
     q = tsub.add_parser("list"); q.add_argument("--role", default="")
     q = tsub.add_parser("claim"); q.add_argument("task")
     q = tsub.add_parser("submit"); q.add_argument("task"); q.add_argument("output")
-    q = tsub.add_parser("decide", help="human decision for a paid answer awaiting approval")
+    q = tsub.add_parser(
+        "decide", help="human decision for a paid answer awaiting approval",
+        description="Human-only paid-answer decision. A task keeps the verdict policy it was posted under.")
     q.add_argument("task"); q.add_argument("decision", choices=["accept", "reject"])
-    q.add_argument("--reason", default=""); q.add_argument("--yes", action="store_true")
+    q.add_argument("--reason", default="")
     q = sub.add_parser("tasks", help="list tasks (alias for `nak task list`)")
     q.add_argument("--role", default="")
     a = ap.parse_args(argv)
@@ -2142,7 +2167,7 @@ def main(argv=None, *, http_post=None) -> int:
         waiting = int(r.get("awaiting_approval") or 0)
         if waiting:
             noun = "answer" if waiting == 1 else "answers"
-            print(f"{waiting} paid {noun} waiting for your decision")
+            print(f"{waiting} paid {noun} waiting for your decision (each keeps its posting-time policy)")
         print(f"direct listener {r.get('direct_port') or 'off'}  p2p "
               f"{(r.get('p2p') or {}).get('dial', 'off')}")
         g = r["grant"]
@@ -2332,15 +2357,21 @@ def main(argv=None, *, http_post=None) -> int:
         elif a.tcmd == "submit":
             print(json.dumps(call(s, {"op": "task_submit", "task": a.task, "output": a.output})))
         elif a.tcmd == "decide":
-            if not a.yes and not sys.stdin.isatty():
-                raise SystemExit("nak task decide is interactive-only; run it in a terminal or pass --yes explicitly")
-            if not a.yes:
-                answer = input(f"{a.decision.upper()} paid task {a.task}? [y/N] ")
-                if answer.strip().lower() not in {"y", "yes"}:
-                    print("task unchanged")
-                    return 1
-            print(json.dumps(call(s, {"op": "task_decide", "task": a.task,
-                                      "decision": a.decision, "reason": a.reason})))
+            if not sys.stdin.isatty():
+                raise SystemExit("nak task decide is interactive-only; run it in a terminal")
+            task_hash = _resolve_posted_task(s, a.task)
+            person_priv = _load_matching_person_key()
+            answer = input(f"{a.decision.upper()} paid task {task_hash[:12]}? [y/N] ")
+            if answer.strip().lower() not in {"y", "yes"}:
+                print("task unchanged")
+                return 1
+            from network import verdict as verdict_policy
+            ts = int(time.time())
+            signature = person_priv.sign(
+                verdict_policy.decision_statement(task_hash, a.decision, a.reason, ts)).hex()
+            print(json.dumps(call(s, {"op": "task_decide", "task": task_hash,
+                                      "decision": a.decision, "reason": a.reason,
+                                      "ts": ts, "signature": signature})))
     elif a.cmd == "inbox":
         for m in reversed(call(s, {"op": "inbox", "limit": a.limit})["messages"]):
             print(f"[{_ago(m['received'])}] {m['petname'] or m['from_person'][:12]}: {m['text']}")

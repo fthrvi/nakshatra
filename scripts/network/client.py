@@ -142,7 +142,8 @@ def render_tasks(rows: list) -> str:
         else:
             line += f" · assignee {who or '-'}"
             if r["state"] == "awaiting_approval":
-                line += " · HUMAN DECISION REQUIRED (CLI: nak task decide <id> accept|reject)"
+                line += (" · HUMAN DECISION REQUIRED (CLI: nak task decide <id> accept|reject; "
+                         "posting-time policy remains in force)")
         if r.get("verdict"):
             if r["state"] == "awaiting_approval":
                 line += "\n  rules: PASSED; paid answer is awaiting approval"
