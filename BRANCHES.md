@@ -5,7 +5,7 @@ On create add a row (status=active, owner). On merge flip to `merged→<sha>`.
 
 | branch | sector | description | base | status | owner |
 |---|---|---|---|---|---|
-| net/starter-credit | network | Wire starter credits: inviter node pays the person-signed starter amount on accept via a new ledger /spend/starter route (spend-only, one per recipient, capped). | forgejo/main@8143916 | active | claude/network + codex |
+| net/starter-credit | network | Wire starter credits: inviter node pays the person-signed starter amount on accept via a new ledger /spend/starter route (spend-only, one per recipient, capped). | forgejo/main@8143916 | merged→b41a9ea | claude/network + codex |
 | join/cleanbox-rerun | join | Rerun the clean-box outsider join against public release 0.15.22 and reconcile outsider documentation with the observed result. | forgejo/main@3f62d96 | merged→0f14eed | codex/friends-onboarding |
 | net/ledger-reply-shapes | network | Accept the real neuron ledger's task reply shapes (submit/received `replayed`, status `refund_after_submit`); fixture captured from the real ledger. | forgejo/main@dc54d66 | merged→3ceca37 | claude/network |
 | join/outsider-refresh | join | Refresh JOIN/HARNESSES from a public outsider clean-box test; fix the first-install systemd-unit blocker (write identity-gated units after join) and verified current CLI boundaries. | forgejo/main@98cadad | merged→c2cc2e9 | codex/friends-onboarding |
