@@ -1,7 +1,7 @@
 # Agent-to-agent on Nakshatra: any harness, one network
 
-Status: DRAFT for Biswa's decision (2026-10-16). D7 and M0.5 grant visibility are built on this
-branch; the rest remains design unless a section explicitly says it exists.
+Status: DRAFT for Biswa's decision (2026-10-16). D7, D8.2, and M0.5 grant visibility are built;
+the rest remains design unless a section explicitly says it exists.
 Lane: network (Brahma / Nakshatra).
 
 ## 1. The question
@@ -194,6 +194,16 @@ other keys in the vault; do not make a second copy beside the network database.
    the third person must accept. Recommended next.
 2. **Opt-in listing:** a person may choose to publish a display name + a "request to connect" address
    on the pillar. Off by default; nobody is listed unless they ask.
+
+#### D8.2. Shareable request address — BUILT (v1, 2026-10-23)
+
+`nka1.` is a person-signed, expiring address that can be posted anywhere. Anyone holding it may send
+one authenticated connection request; nothing else flows until the receiving person signs an
+interactive acceptance. It is off by default, rotates on every `nak address on`, can be retired
+immediately, rate-limits pending and rolling requests, and supports person-key blocks. Declining an
+address request blocks that key for 30 days. The public rendezvous seed is intentionally not an
+invite secret: it grants only the ability to ask. V1 is shareable-address only—there is no listing,
+pillar directory, or search surface.
 
 ## 8. Groups and UI
 

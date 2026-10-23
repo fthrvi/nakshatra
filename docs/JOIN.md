@@ -16,8 +16,38 @@ and send you the **one line** it prints. Treat it like a key: it works once, exp
 by default, and is meant only for you.
 
 An invitation is not authority over you. Anyone who has your ID can ask to connect. Nothing flows
-until **you** accept, and every person makes that decision for themselves. How a stranger who knows
-no member gets their first invitation is not solved yet.
+until **you** accept, and every person makes that decision for themselves.
+
+## No one to invite you?
+
+A person may opt in to a public request address and put its one-line installer on a profile, web
+page, or message:
+
+    nak address on --days 90 --name "Biswa"   # 1-365 days; 90 is the default
+    nak address show                           # print the address and exact install line again
+    nak address off                            # the current address dies immediately
+
+Every `on` mints a new address, so running it again rotates the old one out immediately. Addresses
+are off by default. A stranger pastes the printed line just like an invite. It installs the exact
+signed release named by the address, creates the stranger's identity locally, and sends only a
+connection request. The stranger sees, plainly, that nothing is shared until the named person
+accepts.
+
+An address request always requires a person-signed interactive `nak accept <id>`; an MCP tool,
+socket caller, or non-interactive CLI cannot accept it. `nak requests` labels it `address` rather
+than `invite`. The receiver admits at most one pending address request per person key, 20 pending
+address requests total, and 50 new address requests in a rolling 24 hours. Declining one blocks
+that person key for 30 days. Blocks can also be managed directly:
+
+    nak block <person-key-or-request-id> --days 30
+    nak blocked
+    nak unblock <person-key>
+
+The address's rendezvous key (`ik`) is public by design: the address gives its holder only a way to
+**ask**, never a way to message, receive starter credit, or become a contact. The v1 listener handles
+one pairing at a time, so a flood can slow it down; relay limits and the local caps bound the damage
+but do not make it unavailable-proof. Trust the address only as much as the place where you found
+it—the signature proves it is intact and names a key, not who owns that key, exactly like an invite.
 
 ## 2. You paste the line into a terminal
 
@@ -174,5 +204,6 @@ that credential expires, at most 7 days. Shared revocation is still on the list.
 **Today's limits.** Releases are public at `http://45.63.109.137:8960`; each channel has a signed
 `latest.json`. An inviter names that host in `~/.nakshatra/net/release-url`, or overrides it for one
 invite with `nak invite --release-url http://45.63.109.137:8960`. A clean outsider join through that
-host was verified end to end on `0.15.22` on 2026-10-23. A stranger who knows no member still has no
-public way to request an invitation, and person keys are TEST files, not a vault.
+host was verified end to end on `0.15.22` on 2026-10-23. Shareable request addresses now let a
+stranger ask without an invitation, but there is still no public directory or listing. Person keys
+are TEST files, not a vault.
