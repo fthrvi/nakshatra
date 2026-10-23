@@ -72,12 +72,31 @@ def test_grant_renew_changes_only_named_verdict_fields_and_prints_policy(
         tmp_path, monkeypatch, capsys):
     _state, _key, grant_path = _temporary_identity(tmp_path, monkeypatch)
     before = json.loads(grant_path.read_text())
+    real_person_key = nak.PersonKey
+    approvals = []
+
+    class CapturingPersonKey:
+        def __init__(self, kind, summary, **kwargs):
+            approvals.append((kind, summary))
+            self._key = real_person_key(kind, summary, **kwargs)
+
+        def sign(self, statement):
+            return self._key.sign(statement)
+
+        def public_key(self):
+            return self._key.public_key()
+
+    monkeypatch.setattr(nak, "PersonKey", CapturingPersonKey)
     assert nak.main(["grant", "renew", "--yes", "--verdict", "auto",
                      "--verdict-auto-max", "123", "--verdict-ask-strangers", "no"]) == 0
     changed = json.loads(grant_path.read_text())
     assert changed["constraints"] == {"verdict_mode": "auto", "verdict_auto_max": 123,
                                       "verdict_ask_strangers": False}
     assert "verdict policy: automatic; strangers follow the same rule" in capsys.readouterr().out
+    assert approvals[0][0] == "grant-renew"
+    assert "ttl 365 days" in approvals[0][1]
+    assert ("verdict policy verdict_mode -> auto, verdict_auto_max -> 123, "
+            "verdict_ask_strangers -> false") in approvals[0][1]
 
     assert nak.main(["grant", "renew", "--yes", "--verdict-auto-max", "456"]) == 0
     preserved = json.loads(grant_path.read_text())["constraints"]
@@ -109,11 +128,13 @@ def test_grant_refuses_bad_verdict_threshold_without_mutation(tmp_path, monkeypa
     assert grant_path.read_bytes() == before
 
 
-def test_task_decide_is_cli_only_and_requires_a_terminal(monkeypatch):
+def test_task_decide_is_cli_only_and_requires_a_terminal(monkeypatch, tmp_path):
     class NotTerminal:
         def isatty(self):
             return False
 
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("NAK_NET_DIR", raising=False)
     monkeypatch.setattr(nak.sys, "stdin", NotTerminal())
     monkeypatch.setattr(nak, "call", lambda *_a, **_k: pytest.fail("daemon must not be called"))
     with pytest.raises(SystemExit, match="interactive-only"):

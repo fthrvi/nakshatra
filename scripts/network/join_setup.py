@@ -32,7 +32,7 @@ if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
 from network.person_custody import (  # noqa: E402
-    PersonKey, _person_key_path, _signing_home, custody_mode)
+    PersonKey, _person_key_path, _raw_file_key, _signing_home, broker_preflight)
 
 AGENT = "agent"
 AGENT_CAPS = ("nak.msg", "nak.task.claim")
@@ -299,7 +299,7 @@ def _established_identity(home: Path, state: Path, net: Path, person_path: Path,
         if S._node_pub_from_key(node_key) != node_pub:  # noqa: SLF001 — signer owns this format
             raise ValueError("the node key does not match signer node.pub")
         if person_path.exists():
-            _, stored_person_pub = S.load_key(person_path)
+            _, stored_person_pub = _raw_file_key(person_path)
             if stored_person_pub != person_pub:
                 raise ValueError("the TEST custody person key does not match signer person.pub")
     except (OSError, UnicodeError, ValueError, S.SignerError) as exc:
@@ -410,8 +410,7 @@ def ensure_identity(home: Path) -> dict:
     if not first_initialisation:
         return _established_identity(home, state, net, person_path, node_key)
     with _signing_home(home):
-        if custody_mode() == "broker":
-            PersonKey("grant-issue", f"Create initial grant for agent {agent}")
+        broker_preflight("grant-issue", f"Create initial grant for agent {agent}")
     if not callable(getattr(S, "load_or_create_lease_key", None)):
         # Compatibility must be decided before first-init creates any identity or authority state.
         raise SystemExit(OLD_SIGNER_MESSAGE)
@@ -441,11 +440,11 @@ def ensure_identity(home: Path) -> dict:
         priv, _ = S.new_key()
         S.save_key(person_path, priv)
         done["person_key"] = "created (TEST custody: a file on this machine)"
-        _person_priv, person_pub = S.load_key(person_path)
+        _person_priv, person_pub = _raw_file_key(person_path)
         person_key_available = True
     else:
         done["person_key"] = "kept"
-        _person_priv, person_pub = S.load_key(person_path)
+        _person_priv, person_pub = _raw_file_key(person_path)
         person_key_available = True
     try:
         agent_files = S.open_agent_files(state, agent, create=True)

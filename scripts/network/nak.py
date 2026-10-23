@@ -41,7 +41,8 @@ if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
 from release_trust import ReleaseTrustError, load_release_package_signers  # noqa: E402
-from network.person_custody import PersonKey, _person_key_path, custody_mode  # noqa: E402
+from network.person_custody import (  # noqa: E402
+    PersonKey, _person_key_path, approval, broker_preflight, custody_mode, plain)
 
 
 def call(sock_path: Path, req: dict) -> dict:
@@ -1745,6 +1746,9 @@ OLD_SIGNER_MESSAGE = "signer too old for sliding grants; update the node or use 
 
 def _grant_renew(args) -> int:
     """Human CLI boundary for re-signing one grant without rotating its agent key."""
+    # The accurate statement summary is built after reading the current grant. This early, generic
+    # preflight keeps broker custody ahead of the historical TTY check without moving file-mode work.
+    broker_preflight("grant-renew", "Renew the delegated agent grant")
     if not args.yes and not sys.stdin.isatty():
         raise SystemExit("nak grant renew is interactive-only; run it in a terminal or pass --yes explicitly")
     if not 1 <= args.ttl <= 365:
@@ -1821,6 +1825,23 @@ def _grant_renew_confined(args, signer_dir: Path, agent: str, signer_mod, agent_
             policy_changes.append(f"{name} -> {str(value).lower()}")
             constraints[name] = value
     effective_policy = verdict_policy.policy(constraints)
+    widening = sorted(set(caps) - set(current_caps))
+    if cap_changes:
+        person_kind = "spend-cap"
+    else:
+        person_kind = "grant-renew"
+    summary_parts = [
+        f"Renew agent {plain(agent, 64)}",
+        f"ttl {args.ttl} days",
+        f"caps {','.join(caps)}",
+    ]
+    if widening:
+        summary_parts.append(f"widened caps {','.join(widening)}")
+    if cap_changes:
+        summary_parts.append(f"spend caps {', '.join(cap_changes)}")
+    if policy_changes:
+        summary_parts.append(f"verdict policy {', '.join(policy_changes)}")
+    summary = "; ".join(summary_parts)
     person_key = _person_key_path()
     fallback = _delegate_reuse_command(
         signer_dir, person_key, agent, caps, args.ttl,
@@ -1837,7 +1858,6 @@ def _grant_renew_confined(args, signer_dir: Path, agent: str, signer_mod, agent_
               f"  {fallback}", file=sys.stderr)
         return 1
     if not args.yes:
-        widening = sorted(set(caps) - set(current_caps))
         detail = f"; explicitly adding {','.join(widening)}" if widening else ""
         if cap_changes:
             detail += f"; spend caps {', '.join(cap_changes)}"
@@ -1853,12 +1873,6 @@ def _grant_renew_confined(args, signer_dir: Path, agent: str, signer_mod, agent_
         if answer.strip().lower() not in {"y", "yes"}:
             print("grant unchanged")
             return 1
-    if cap_changes:
-        person_kind = "spend-cap"
-        summary = f"Change spend caps for agent {agent}: {', '.join(cap_changes)}"
-    else:
-        person_kind = "grant-renew"
-        summary = f"Renew agent {agent} for {args.ttl} days with {','.join(caps)}"
     person_priv = PersonKey(person_kind, summary)
     lease = None
     if not args.no_lease:
@@ -1945,7 +1959,7 @@ def main(argv=None, *, http_post=None) -> int:
     q.add_argument("--yes", action="store_true", help="confirm explicitly when stdin is not a terminal")
     p = sub.add_parser("invite"); p.add_argument(
         "--person-key", type=Path, default=None,
-        help="explicit file-key override (default: configured person custody)")
+        help="explicit file key in file custody only (default: ~/.sthambha/person-TEST.key)")
     p.add_argument("--ttl", type=int, default=86400); p.add_argument("--note", default="")
     p.add_argument("--release-url", default="", help="where newcomers download Nakshatra (default: this node's source)")
     p.add_argument("--code-only", action="store_true", help="print just the invite code")
@@ -2189,13 +2203,23 @@ def main(argv=None, *, http_post=None) -> int:
         import joincode
         if a.kind != "consumer" and a.starter:
             raise SystemExit("--starter is only valid with --kind consumer")
-        http_post = http_post or _http_post_json
-        st = call(s, {"op": "status"})
-        invite_for = a.note.strip() or a.from_name.strip() or a.kind
-        priv = PersonKey("invite", f"Create {a.kind} invite for {invite_for}", key_path=a.person_key)
-        release, line = _release_for_invite(a.release_url)
+        if a.person_key is not None and custody_mode() == "broker":
+            raise SystemExit("person custody is broker; --person-key is not allowed")
         name_file = Path(os.environ.get("NAK_NET_DIR", Path.home() / ".nakshatra" / "net")) / "name"
         from_name = a.from_name or (name_file.read_text().strip() if name_file.exists() else "")
+        summary_parts = [f"Create {a.kind} invite"]
+        if a.note:
+            summary_parts.append(f"with your note {json.dumps(plain(a.note, 80), ensure_ascii=False)}")
+        if from_name:
+            name_source = "the name you supplied" if a.from_name else "your saved name"
+            summary_parts.append(
+                f"using {name_source} {json.dumps(plain(from_name[:40], 40), ensure_ascii=False)}")
+        invite_summary = "; ".join(summary_parts)
+        broker_preflight("invite", invite_summary)
+        http_post = http_post or _http_post_json
+        st = call(s, {"op": "status"})
+        priv = PersonKey("invite", invite_summary, key_path=a.person_key or _person_key_path())
+        release, line = _release_for_invite(a.release_url)
         if a.from_name:
             _write_private(name_file, (a.from_name.strip()[:40] + "\n").encode())
         if not from_name:
@@ -2237,10 +2261,12 @@ def main(argv=None, *, http_post=None) -> int:
             if not row.get("enabled"):
                 print("request address is already off")
                 return 0
+            address_summary = f"Turn request address off {row['aid'][:8]}…"
+            broker_preflight("address-control", address_summary)
             from network.nakd import address_control_statement
             ts = int(time.time())
             signature = PersonKey(
-                "address-control", f"Turn request address off {row['aid'][:8]}…").sign(
+                "address-control", address_summary).sign(
                 address_control_statement("address_off", row["aid"], ts)).hex()
             call(s, {"op": "address_off", "aid": row["aid"],
                      "ts": ts, "signature": signature})
@@ -2259,27 +2285,31 @@ def main(argv=None, *, http_post=None) -> int:
             if not 1 <= a.days <= 365:
                 raise SystemExit("--days must be between 1 and 365")
             import joincode
+            name_file = Path(os.environ.get("NAK_NET_DIR", Path.home() / ".nakshatra" / "net")) / "name"
+            from_name = a.name.strip()[:40] or (name_file.read_text().strip() if name_file.exists() else "")
+            address_summary = (
+                "Turn on (or rotate) your public request address for "
+                f"{plain(from_name, 40) or 'strangers'}"
+            )
+            broker_preflight("address-control", address_summary)
             st = call(s, {"op": "status"})
             release, line = _release_for_invite()
             if not release or not line:
                 raise SystemExit("cannot publish an address until this node has a sha-pinned public release line")
-            name_file = Path(os.environ.get("NAK_NET_DIR", Path.home() / ".nakshatra" / "net")) / "name"
-            from_name = a.name.strip()[:40] or (name_file.read_text().strip() if name_file.exists() else "")
             if a.name:
                 _write_private(name_file, (from_name + "\n").encode())
-            person_priv = PersonKey(
-                "address-control", f"Create public request address for {from_name or 'strangers'}")
-            code = joincode.encode_address(
-                person_priv, st["node"],
-                [{"node": st["node"], "addrs": [st["relay"]]}], days=a.days,
-                from_name=from_name, release=release)
-            install_line = line.replace("{CODE}", code)
-            from network.nakd import address_control_statement
-            aid = joincode.decode_address(code)["aid"]
-            ts = int(time.time())
-            signature = PersonKey(
-                "address-control", f"Turn request address on {aid[:8]}…").sign(
-                address_control_statement("register_address", aid, ts)).hex()
+            with approval("address-control", address_summary):
+                person_priv = PersonKey("address-control", address_summary)
+                code = joincode.encode_address(
+                    person_priv, st["node"],
+                    [{"node": st["node"], "addrs": [st["relay"]]}], days=a.days,
+                    from_name=from_name, release=release)
+                install_line = line.replace("{CODE}", code)
+                from network.nakd import address_control_statement
+                aid = joincode.decode_address(code)["aid"]
+                ts = int(time.time())
+                signature = PersonKey("address-control", address_summary).sign(
+                    address_control_statement("register_address", aid, ts)).hex()
             call(s, {"op": "register_address", "code": code, "install_line": install_line,
                      "ts": ts, "signature": signature})
             print(code)
@@ -2305,6 +2335,14 @@ def main(argv=None, *, http_post=None) -> int:
             pending = [row for row in call(s, {"op": "requests"})["requests"]
                        if row.get("id") == a.id]
             if pending and pending[0].get("requires_person"):
+                stranger = pending[0].get("person", "unknown")
+                nickname = plain(pending[0].get("nickname") or "", 40)
+                accept_summary = f"Accept stranger {plain(stranger, 64)[:16]}…"
+                if nickname:
+                    accept_summary += f" (calls themselves {json.dumps(nickname, ensure_ascii=False)})"
+                if a.petname:
+                    accept_summary += f" as {plain(a.petname, 40)}"
+                broker_preflight("contact-accept", accept_summary)
                 if not sys.stdin.isatty():
                     raise SystemExit(f"a person must accept this one: nak accept {a.id}")
                 answer = input(f"ACCEPT person-gated request {a.id}? [y/N] ")
@@ -2313,10 +2351,8 @@ def main(argv=None, *, http_post=None) -> int:
                     return 1
                 from network.nakd import accept_statement
                 ts = int(time.time())
-                stranger = pending[0].get("person", "unknown")
-                accepted_as = a.petname or pending[0].get("nickname") or "their chosen name"
                 signature = PersonKey(
-                    "contact-accept", f"Accept stranger {stranger[:8]}… as {accepted_as}").sign(
+                    "contact-accept", accept_summary).sign(
                     accept_statement(a.id, a.petname, ts)).hex()
                 proof = {"ts": ts, "signature": signature}
         r = call(s, {"op": a.cmd, "id": a.id,
@@ -2453,11 +2489,13 @@ def main(argv=None, *, http_post=None) -> int:
         elif a.tcmd == "submit":
             print(json.dumps(call(s, {"op": "task_submit", "task": a.task, "output": a.output})))
         elif a.tcmd == "decide":
+            broker_preflight(
+                "task-verdict", f"{a.decision.title()} paid task {plain(a.task, 12)}")
             if not sys.stdin.isatty():
                 raise SystemExit("nak task decide is interactive-only; run it in a terminal")
             task_hash = _resolve_posted_task(s, a.task)
-            person_priv = PersonKey(
-                "task-verdict", f"{a.decision.title()} paid task {task_hash[:12]}…")
+            task_summary = f"{a.decision.title()} paid task {task_hash[:12]}…"
+            person_priv = PersonKey("task-verdict", task_summary)
             answer = input(f"{a.decision.upper()} paid task {task_hash[:12]}? [y/N] ")
             if answer.strip().lower() not in {"y", "yes"}:
                 print("task unchanged")

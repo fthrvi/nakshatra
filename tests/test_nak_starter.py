@@ -300,10 +300,20 @@ def test_mcp_cannot_accept_starter_request_but_can_accept_zero_starter(net, tmp_
     stop.set()
 
 
-def test_cli_accept_builds_tty_and_person_signature_for_starter(monkeypatch):
+def test_cli_accept_builds_tty_and_person_signature_for_starter(monkeypatch, tmp_path):
     person = ed25519.Ed25519PrivateKey.generate()
     request_id = "abcd1234"
     calls = []
+    approvals = []
+    statements = []
+
+    class CapturingPersonKey:
+        def __init__(self, kind, summary, **_kwargs):
+            approvals.append((kind, summary))
+
+        def sign(self, statement):
+            statements.append(statement)
+            return person.sign(statement)
 
     class Terminal:
         def isatty(self):
@@ -312,15 +322,21 @@ def test_cli_accept_builds_tty_and_person_signature_for_starter(monkeypatch):
     def fake_call(_sock, req):
         calls.append(req)
         if req["op"] == "requests":
-            return {"requests": [{"id": request_id, "requires_person": True}]}
+            return {"requests": [{"id": request_id, "person": "2" * 64,
+                                   "nickname": "their-name", "requires_person": True}]}
         return {"person": "1" * 64, "petname": "friend"}
 
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("NAK_NET_DIR", raising=False)
     monkeypatch.setattr(nak.sys, "stdin", Terminal())
     monkeypatch.setattr("builtins.input", lambda _prompt: "yes")
     monkeypatch.setattr(nak, "call", fake_call)
-    monkeypatch.setattr(nak, "PersonKey", lambda *_a, **_k: person)
+    monkeypatch.setattr(nak, "PersonKey", CapturingPersonKey)
     assert nak.main(["accept", request_id, "--as", "friend"]) == 0
     proof = calls[1]
+    assert approvals == [("contact-accept",
+                          'Accept stranger 2222222222222222… (calls themselves "their-name") as friend')]
+    assert statements == [nakd.accept_statement(request_id, "friend", proof["ts"])]
     person.public_key().verify(bytes.fromhex(proof["signature"]),
                                nakd.accept_statement(request_id, "friend", proof["ts"]))
 

@@ -403,6 +403,19 @@ def test_cli_address_on_show_off_rotates(monkeypatch, tmp_path, capsys):
     key = ed25519.Ed25519PrivateKey.generate()
     state = {"row": {"enabled": False}}
     calls = []
+    approvals = []
+    signed = []
+
+    class CapturingPersonKey:
+        def __init__(self, kind, summary, **_kwargs):
+            approvals.append((kind, summary))
+
+        def public_key(self):
+            return key.public_key()
+
+        def sign(self, statement):
+            signed.append(statement)
+            return key.sign(statement)
 
     def fake_call(_sock, req):
         calls.append(req)
@@ -421,7 +434,7 @@ def test_cli_address_on_show_off_rotates(monkeypatch, tmp_path, capsys):
         raise AssertionError(req)
 
     monkeypatch.setattr(nak, "call", fake_call)
-    monkeypatch.setattr(nak, "PersonKey", lambda *_a, **_k: key)
+    monkeypatch.setattr(nak, "PersonKey", CapturingPersonKey)
     monkeypatch.setattr(nak, "_release_for_invite", lambda *_a: (RELEASE, "install {CODE}"))
     monkeypatch.setenv("NAK_NET_DIR", str(tmp_path / "net"))
     assert nak.main(["address", "on", "--days", "30", "--name", "Biswa"]) == 0
@@ -435,6 +448,18 @@ def test_cli_address_on_show_off_rotates(monkeypatch, tmp_path, capsys):
     assert state["row"]["code"] in shown and state["row"]["install_line"] in shown
     assert nak.main(["address", "off"]) == 0
     assert not state["row"]["enabled"]
+    assert approvals and {kind for kind, _summary in approvals} == {"address-control"}
+    assert len(signed) == 5
+    first_code = next(req["code"] for req in calls if req["op"] == "register_address")
+    first_body = joincode.decode_address(first_code)
+    first_unsigned = dict(first_body)
+    first_unsigned.pop("sig")
+    assert signed[0] == joincode._canon(first_unsigned)
+    first_register = next(req for req in calls if req["op"] == "register_address")
+    assert signed[1] == nakd.address_control_statement(
+        "register_address", first_body["aid"], first_register["ts"])
+    off = next(req for req in reversed(calls) if req["op"] == "address_off")
+    assert signed[-1] == nakd.address_control_statement("address_off", off["aid"], off["ts"])
 
 
 def test_join_docs_state_address_expiry_person_control_and_source_trust():

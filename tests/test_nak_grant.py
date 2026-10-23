@@ -264,6 +264,21 @@ def test_grant_renew_sets_spend_caps_only_when_named(tmp_path, monkeypatch, caps
     _state, key_path, grant_path = _temporary_identity(tmp_path, monkeypatch)
     before_key = key_path.read_bytes()
     before = json.loads(grant_path.read_text())
+    real_person_key = nak.PersonKey
+    approvals = []
+
+    class CapturingPersonKey:
+        def __init__(self, kind, summary, **kwargs):
+            approvals.append((kind, summary))
+            self._key = real_person_key(kind, summary, **kwargs)
+
+        def public_key(self):
+            return self._key.public_key()
+
+        def sign(self, statement):
+            return self._key.sign(statement)
+
+    monkeypatch.setattr(nak, "PersonKey", CapturingPersonKey)
     assert nak.main(["grant", "renew", "--yes"]) == 0
     assert json.loads(grant_path.read_text()).get("constraints") == before.get("constraints")
 
@@ -274,10 +289,23 @@ def test_grant_renew_sets_spend_caps_only_when_named(tmp_path, monkeypatch, caps
     assert after["constraints"]["per_tx_cap"] == 500 and after["constraints"]["day_cap"] == 2000
     assert "nak.pay" in after["caps"]
     assert "500 per payment, 2000 per day" in capsys.readouterr().out
+    kind, summary = approvals[1]
+    assert kind == "spend-cap"
+    assert "ttl 365 days" in summary
+    assert "caps nak.msg,nak.pay,nak.task.claim" in summary
+    assert "widened caps nak.pay" in summary
+    assert "spend caps per_tx_cap 0 -> 500, day_cap 0 -> 2000" in summary
 
     assert nak.main(["grant", "renew", "--yes", "--day-cap", "3000"]) == 0
     again = json.loads(grant_path.read_text())
     assert again["constraints"]["per_tx_cap"] == 500 and again["constraints"]["day_cap"] == 3000
+
+
+def test_grant_renew_keeps_renewal_key_error_text(tmp_path, monkeypatch):
+    _state, _key_path, _grant_path = _temporary_identity(tmp_path, monkeypatch)
+    (tmp_path / ".sthambha" / "person-TEST.key").write_text("not-hex")
+    with pytest.raises(SystemExit, match="cannot load the person key for renewal:"):
+        nak.main(["grant", "renew", "--yes"])
 
 
 @pytest.mark.parametrize("flag,value", [
