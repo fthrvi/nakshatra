@@ -40,6 +40,9 @@ socket caller, or non-interactive CLI cannot accept it. `nak requests` labels it
 than `invite`. The receiver admits at most one pending address request per person key, 20 pending
 address requests total, and 50 new address requests in a rolling 24 hours. A pending address request
 expires after 7 days and no longer occupies a slot. Declining one blocks that person key for 30 days.
+"Person-signed" means signed with your person key. While that key is a TEST file, any program
+running as your user that can read it (an AI agent included) could sign too; the guarantee becomes
+real once the person key moves off-box.
 Blocks can also be managed directly:
 
     nak block <person-key-or-request-id> --days 30

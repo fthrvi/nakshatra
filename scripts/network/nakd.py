@@ -577,7 +577,13 @@ class Node:
         rid = joincode.address_rendezvous(address)
         attempt = 0
         while not self._stop.is_set() and self._clock() < address["expires_at"]:
-            current = self.store.address(active_only=True, now=int(self._clock()))
+            try:
+                current = self.store.address(active_only=True, now=int(self._clock()))
+            except Exception as exc:  # noqa: BLE001 - a transient store error must not end the listener
+                self.log(f"address {aid[:8]} state: {exc}")
+                attempt += 1
+                self._backoff(attempt)
+                continue
             if not current or current["aid"] != aid:
                 return
             try:
