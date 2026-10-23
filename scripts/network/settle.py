@@ -348,8 +348,9 @@ class NeuronEscrowAdapter(SettlementAdapter):
             "hold_id": resolved, "result_hash": result_hash,
         }), expected_hold=resolved, expected_state="open")
         expected = {"v", "hold_id", "task_hash", "worker_keyid", "amount", "deadline", "state",
-                    "submitted_at", "result_hash"}
-        if (set(value) != expected or value["task_hash"] != task_hash
+                    "submitted_at", "result_hash", "replayed"}
+        if (set(value) != expected or not isinstance(value["replayed"], bool)
+                or value["task_hash"] != task_hash
                 or isinstance(value["submitted_at"], bool) or not isinstance(value["submitted_at"], int)
                 or value["submitted_at"] <= 0 or value["result_hash"] != result_hash):
             raise SettlementError("Neuron ledger returned an invalid task submit response")
@@ -365,10 +366,9 @@ class NeuronEscrowAdapter(SettlementAdapter):
             "hold_id": resolved, "result_hash": result_hash,
         }), expected_hold=resolved, expected_state="open")
         expected = {"v", "hold_id", "task_hash", "worker_keyid", "amount", "deadline", "state",
-                    "submitted_at", "result_hash", "received_at", "received_hash"}
-        if (set(value) != expected or value["task_hash"] != task_hash
-                or isinstance(value["submitted_at"], bool) or not isinstance(value["submitted_at"], int)
-                or value["submitted_at"] <= 0 or _HEX64.fullmatch(value["result_hash"] or "") is None
+                    "received_at", "received_hash", "replayed"}
+        if (set(value) != expected or not isinstance(value["replayed"], bool)
+                or value["task_hash"] != task_hash
                 or isinstance(value["received_at"], bool) or not isinstance(value["received_at"], int)
                 or value["received_at"] <= 0 or value["received_hash"] != result_hash):
             raise SettlementError("Neuron ledger returned an invalid task received response")
@@ -382,8 +382,9 @@ class NeuronEscrowAdapter(SettlementAdapter):
         value = self._hold(self._request("GET", path), expected_hold=resolved)
         expected = {"v", "hold_id", "task_hash", "payer_account", "worker_keyid", "amount",
                     "deadline", "state", "server_time", "submitted_at", "result_hash",
-                    "received_at", "received_hash"}
+                    "received_at", "received_hash", "refund_after_submit"}
         if (set(value) != expected or value["task_hash"] != task_hash
+                or not isinstance(value["refund_after_submit"], bool)
                 or not isinstance(value["payer_account"], str)
                 or isinstance(value["server_time"], bool) or not isinstance(value["server_time"], int)
                 or isinstance(value["submitted_at"], bool) or not isinstance(value["submitted_at"], int)

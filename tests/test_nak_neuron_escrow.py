@@ -314,18 +314,30 @@ class ReplayLedgerHTTP:
                 row = ledger.received(keyid, b["hold_id"], b["result_hash"])
             else:
                 hold_id = urllib.parse.parse_qs(parts.query)["hold_id"][0]
-                return _Response(json.dumps(ledger.status(keyid, hold_id)).encode())
+                row = ledger.status(keyid, hold_id)
+                # The exact key set neuron 0f16873 sends (tests/fixtures/neuron_task_replies.json).
+                keys = ("v", "hold_id", "task_hash", "payer_account", "worker_keyid", "amount",
+                        "deadline", "state", "submitted_at", "result_hash", "received_at",
+                        "received_hash")
+                out = {k: row[k] for k in keys}
+                out["refund_after_submit"] = row["state"] == "refunded" and row["submitted_at"] > 0
+                out["server_time"] = row.get("server_time", int(time.time()))
+                return _Response(json.dumps(out).encode())
         except SettlementError as e:
             text = str(e)
             raise self._fail(request, 402 if "insufficient" in text else 404 if "not found" in text
                              else 409)
+        # Reply shapes match neuron 0f16873 exactly: authorize has no `replayed`; every other
+        # write carries it; received carries only its own fields, not the submit mark.
         keys = ("v", "hold_id", "task_hash", "worker_keyid", "amount", "deadline", "state")
         if parts.path == "/spend/task/submit":
             keys += ("submitted_at", "result_hash")
         elif parts.path == "/spend/task/received":
-            keys += ("submitted_at", "result_hash", "received_at", "received_hash")
-        row = {k: row[k] for k in keys}
-        return _Response(json.dumps(row).encode())
+            keys += ("received_at", "received_hash")
+        out = {k: row[k] for k in keys}
+        if parts.path != "/spend/task/authorize":
+            out["replayed"] = False
+        return _Response(json.dumps(out).encode())
 
 
 def _real_adapter(party, http):
@@ -887,7 +899,7 @@ def test_real_neuron_adapter_uses_contract_routes_and_signed_query_path():
         elif request.method == "GET":
             assert urllib.parse.parse_qs(urllib.parse.urlsplit(request.full_url).query) == {"hold_id": ["h-1"]}
             value = dict(hold, payer_account="payer", server_time=1, submitted_at=0, result_hash="",
-                         received_at=0, received_hash="")
+                         received_at=0, received_hash="", refund_after_submit=False)
         else:
             value = hold
         return _Response(json.dumps(value).encode())
@@ -902,6 +914,48 @@ def test_real_neuron_adapter_uses_contract_routes_and_signed_query_path():
     assert [call[0] for call in calls] == ["POST", "GET", "POST"]
     assert all(call[3]["Authorization"].startswith("Sthambha-Ed25519 ") for call in calls)
     assert all(call[4]["expected_spki_hash"] == "ab" * 32 for call in calls)
+
+
+def test_real_adapter_accepts_every_reply_the_real_neuron_ledger_sends():
+    """Replies captured from neuron 0f16873 over HTTP. 0.15.21 shipped against hand-written
+    fakes that disagreed with the real ledger on submit/received/status and refused them all."""
+    from pathlib import Path
+    real = json.loads((Path(__file__).parent / "fixtures" / "neuron_task_replies.json").read_text())
+    queue = []
+
+    def opener(request, **kwargs):
+        return _Response(json.dumps(queue.pop(0)).encode())
+
+    def adapter_for(reply_names):
+        queue[:] = [real[n] for n in reply_names]
+        return NeuronEscrowAdapter("https://ledger.test", "ab" * 32, b"k" * 32, "56" * 32,
+                                   opener=opener)
+
+    a = real["authorize"]
+    task, worker, hold = a["task_hash"], a["worker_keyid"], a["hold_id"]
+    auth = {"task_hash": task, "amount": a["amount"], "mint": "credits"}
+    adapter = adapter_for(["authorize", "status_open", "submit", "submit_replay", "received",
+                           "received_replay", "status_received", "pay", "status_paid"])
+    assert adapter.open(task, "poster", a["amount"], "credits", a["deadline"], auth,
+                        worker_keyid=worker)["hold_id"] == hold
+    assert adapter.status(task)["state"] == "open"
+    for _ in range(2):
+        assert adapter.submit(task, "b" * 64)["result_hash"] == "b" * 64
+    for _ in range(2):
+        assert adapter.received(task, "b" * 64)["event"] == "received"
+    seen = adapter.status(task)
+    assert (seen["result_hash"], seen["received_hash"]) == ("b" * 64, "b" * 64)
+    assert adapter.release(task, "worker")["event"] == "released"
+    assert adapter.status(task)["state"] == "released"
+
+    a2 = real["authorize2"]
+    task2 = a2["task_hash"]
+    adapter = adapter_for(["submit2", "refund_after_submit", "status_refunded_after_submit"])
+    assert adapter.submit(task2, "d" * 64, hold_id=a2["hold_id"])["event"] == "submitted"
+    assert adapter.refund(task2, "rejected", hold_id=a2["hold_id"])["event"] == "refunded"
+    final = adapter.status(task2, hold_id=a2["hold_id"])
+    assert final["state"] == "refunded" and final["refund_after_submit"] is True
+    assert queue == []
 
 
 def test_real_neuron_adapter_refuses_non_https_unpinned_or_fail_open():
