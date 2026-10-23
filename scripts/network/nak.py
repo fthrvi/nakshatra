@@ -2,7 +2,7 @@
 
     nak status
     nak invite --person-key ~/.sthambha/person-TEST.key [--ttl 86400] [--note "for Rajesh"]
-    nak redeem <nki1.…> [--nickname "B"] [--as rajesh]     ask to connect (they must accept)
+    nak redeem <nki1.… | nka1.…> [--nickname "B"] [--as rajesh]  ask to connect (they must accept)
     nak requests                                           people asking to connect to you
     nak accept <id> [--as rajesh]  |  nak decline <id>
     nak contacts  |  nak remove <name>
@@ -1969,6 +1969,13 @@ def main(argv=None, *, http_post=None) -> int:
                    help="consumer starter credits, 0..100000000 base units (default: 0)")
     p.add_argument("--redeem", default=DEFAULT_ONBOARD_BASE,
                    help="onboard server base URL for a worker or consumer invite")
+    p = sub.add_parser("address", help="manage your opt-in public request address")
+    adsub = p.add_subparsers(dest="address_cmd", required=True)
+    q = adsub.add_parser("on", help="mint/rotate a shareable request address")
+    q.add_argument("--days", type=int, default=90)
+    q.add_argument("--name", default="", help="your name as strangers will see it")
+    adsub.add_parser("show", help="show the current address and pinned install command")
+    adsub.add_parser("off", help="retire the current address immediately")
     p = sub.add_parser("redeem"); p.add_argument("code"); p.add_argument("--nickname", default="")
     p.add_argument("--as", dest="petname", default="")
     p = sub.add_parser("worker-redeem", help="retry the stored worker admission while its code is valid")
@@ -1976,6 +1983,10 @@ def main(argv=None, *, http_post=None) -> int:
     sub.add_parser("requests")
     p = sub.add_parser("accept"); p.add_argument("id"); p.add_argument("--as", dest="petname", default="")
     p = sub.add_parser("decline"); p.add_argument("id")
+    p = sub.add_parser("block"); p.add_argument("person")
+    p.add_argument("--days", type=int, default=30)
+    p = sub.add_parser("unblock"); p.add_argument("person")
+    sub.add_parser("blocked")
     sub.add_parser("contacts")
     p = sub.add_parser("remove"); p.add_argument("who")
     p = sub.add_parser("send"); p.add_argument("to"); p.add_argument("text")
@@ -2232,15 +2243,55 @@ def main(argv=None, *, http_post=None) -> int:
             print(line.replace("{CODE}", code))
             print("\nThey paste it in a terminal (Linux or WSL with systemd). When their request arrives:"
                   "  nak requests  →  nak accept <id> --as <name>", file=sys.stderr)
+    elif a.cmd == "address":
+        if a.address_cmd == "off":
+            call(s, {"op": "address_off"})
+            print("request address off; the old address is dead immediately")
+        elif a.address_cmd == "show":
+            row = call(s, {"op": "address_status"})
+            if not row.get("enabled"):
+                print("request address is off")
+            else:
+                print(row["code"])
+                if row.get("install_line"):
+                    print(row["install_line"])
+                print(f"expires at {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(row['expires_at']))}",
+                      file=sys.stderr)
+        else:
+            if not 1 <= a.days <= 365:
+                raise SystemExit("--days must be between 1 and 365")
+            import joincode
+            st = call(s, {"op": "status"})
+            release, line = _release_for_invite()
+            if not release or not line:
+                raise SystemExit("cannot publish an address until this node has a sha-pinned public release line")
+            name_file = Path(os.environ.get("NAK_NET_DIR", Path.home() / ".nakshatra" / "net")) / "name"
+            from_name = a.name.strip()[:40] or (name_file.read_text().strip() if name_file.exists() else "")
+            if a.name:
+                _write_private(name_file, (from_name + "\n").encode())
+            code = joincode.encode_address(
+                _load_matching_person_key(), st["node"],
+                [{"node": st["node"], "addrs": [st["relay"]]}], days=a.days,
+                from_name=from_name, release=release)
+            install_line = line.replace("{CODE}", code)
+            call(s, {"op": "register_address", "code": code, "install_line": install_line})
+            print(code)
+            print(install_line)
+            print("request address on (rotated): anyone with this line may ask; nothing is shared until you accept",
+                  file=sys.stderr)
     elif a.cmd == "redeem":
         r = call(s, {"op": "redeem", "code": a.code, "nickname": a.nickname, "petname": a.petname, "wait_s": 20})
-        print(f"{r['state']}. They have to accept before either of you can message.")
+        if r["state"] == "request refused":
+            print(f"request refused: {r.get('why') or 'not accepted'}")
+        else:
+            print(f"your request was sent; nothing is shared until {r.get('name') or 'they'} accept")
     elif a.cmd == "worker-redeem":
         from network import join_setup
         join_setup.retry_worker_redeem(Path.home(), name=a.name, http_post=http_post)
     elif a.cmd == "requests":
         for q in call(s, {"op": "requests"})["requests"] or []:
-            print(f"{q['id']}  {q['nickname'] or '(no nickname)'}  person {q['person'][:16]}…  {_ago(q['received'])}")
+            print(f"{q['id']}  {q.get('source') or 'invite':7}  {q['nickname'] or '(no nickname)'}  "
+                  f"person {q['person'][:16]}…  {_ago(q['received'])}")
     elif a.cmd in ("accept", "decline"):
         proof = {}
         if a.cmd == "accept":
@@ -2249,7 +2300,7 @@ def main(argv=None, *, http_post=None) -> int:
             if pending and pending[0].get("requires_person"):
                 if not sys.stdin.isatty():
                     raise SystemExit(f"a person must accept this one: nak accept {a.id}")
-                answer = input(f"ACCEPT starter-bearing request {a.id}? [y/N] ")
+                answer = input(f"ACCEPT person-gated request {a.id}? [y/N] ")
                 if answer.strip().lower() not in {"y", "yes"}:
                     print("request unchanged")
                     return 1
@@ -2261,6 +2312,14 @@ def main(argv=None, *, http_post=None) -> int:
         r = call(s, {"op": a.cmd, "id": a.id,
                      **({"petname": a.petname, **proof} if a.cmd == "accept" else {})})
         print(json.dumps(r))
+    elif a.cmd == "block":
+        print(json.dumps(call(s, {"op": "block", "person": a.person, "days": a.days})))
+    elif a.cmd == "unblock":
+        print(json.dumps(call(s, {"op": "unblock", "person": a.person})))
+    elif a.cmd == "blocked":
+        for row in call(s, {"op": "blocked"})["blocked"]:
+            print(f"{row['person']}  until {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(row['until']))}  "
+                  f"{row['reason']}")
     elif a.cmd == "contacts":
         for c in call(s, {"op": "contacts"})["contacts"]:
             via = f" via {c['path']}" if c.get("path") else ""

@@ -55,6 +55,14 @@ CREATE TABLE IF NOT EXISTS starter_obligations (invite_id TEXT PRIMARY KEY, pers
     reason TEXT, created INTEGER NOT NULL, updated INTEGER NOT NULL, next_attempt INTEGER NOT NULL,
     attempts INTEGER NOT NULL DEFAULT 0, approved INTEGER NOT NULL DEFAULT 0, paid_at INTEGER,
     receipt TEXT);
+CREATE TABLE IF NOT EXISTS address_state (slot INTEGER PRIMARY KEY CHECK(slot=1), code TEXT NOT NULL,
+    aid TEXT NOT NULL, ik TEXT NOT NULL, expires_at INTEGER NOT NULL, created INTEGER NOT NULL,
+    enabled INTEGER NOT NULL, install_line TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS request_sources (request_id TEXT PRIMARY KEY, source TEXT NOT NULL,
+    source_id TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS request_sources_source_idx ON request_sources(source, source_id);
+CREATE TABLE IF NOT EXISTS blocks (person TEXT PRIMARY KEY, until INTEGER NOT NULL, reason TEXT NOT NULL,
+    created INTEGER NOT NULL);
 """
 
 
@@ -365,54 +373,105 @@ class Store:
         row["code"] = self._dec("invite_codes", "code", primary_key, row["code"])
         return row
 
+    # public request address (additive side table; legacy request/invite shapes stay untouched)
+    def set_address(self, code: str, aid: str, ik: str, expires_at: int, install_line: str = "",
+                    now: Optional[int] = None) -> None:
+        self._q(
+            "INSERT INTO address_state(slot,code,aid,ik,expires_at,created,enabled,install_line) "
+            "VALUES(1,?,?,?,?,?,1,?) "
+            "ON CONFLICT(slot) DO UPDATE SET code=excluded.code,aid=excluded.aid,ik=excluded.ik,"
+            "expires_at=excluded.expires_at,created=excluded.created,enabled=1,"
+            "install_line=excluded.install_line",
+            (code, aid, ik, int(expires_at), int(time.time() if now is None else now), install_line))
+
+    def address(self, *, active_only: bool = False, now: Optional[int] = None) -> Optional[dict]:
+        rows = self._q(
+            "SELECT code,aid,ik,expires_at,created,enabled,install_line FROM address_state WHERE slot=1")
+        if not rows:
+            return None
+        row = dict(zip(("code", "aid", "ik", "expires_at", "created", "enabled", "install_line"), rows[0]))
+        row["enabled"] = bool(row["enabled"])
+        if active_only and (not row["enabled"] or row["expires_at"] <= int(
+                time.time() if now is None else now)):
+            return None
+        return row
+
+    def retire_address(self) -> bool:
+        with self._lock:
+            cur = self._db.execute("UPDATE address_state SET enabled=0 WHERE slot=1 AND enabled=1")
+            return cur.rowcount == 1
+
     # requests (someone redeemed our invite and asks to connect)
     def add_request(self, person: str, node: str, nickname: str, invite_nonce: str,
-                    ledger_key: str = "") -> str:
+                    ledger_key: str = "", *, source: str = "invite", source_id: str = "",
+                    received: Optional[int] = None) -> str:
         rid = secrets.token_hex(4)
         nickname = self._enc("requests", "nickname", self._pk((rid,)), nickname[:40])
+        received = int(time.time() if received is None else received)
 
         def fn(db):
             db.execute("INSERT INTO requests (id,person,node,nickname,invite_nonce,received,state) "
                        "VALUES (?,?,?,?,?,?,'pending')",
-                       (rid, person, node, nickname, invite_nonce, int(time.time())))
+                       (rid, person, node, nickname, invite_nonce, received))
             if ledger_key:
                 db.execute("INSERT INTO request_ledger_keys(request_id,ledger_key) VALUES (?,?)",
                            (rid, ledger_key))
+            if source != "invite":
+                db.execute("INSERT INTO request_sources(request_id,source,source_id) VALUES (?,?,?)",
+                           (rid, source, source_id))
         self._tx(fn)
         return rid
 
     def requests(self, state: str = "pending") -> list:
         out = []
         for r in self._q(
-                "SELECT r.id,r.person,r.node,r.nickname,r.received,k.ledger_key FROM requests r "
-                "LEFT JOIN request_ledger_keys k ON k.request_id=r.id WHERE r.state=?", (state,)):
-            row = dict(zip(("id", "person", "node", "nickname", "received", "ledger_key"), r))
+                "SELECT r.id,r.person,r.node,r.nickname,r.received,k.ledger_key,s.source,s.source_id "
+                "FROM requests r LEFT JOIN request_ledger_keys k ON k.request_id=r.id "
+                "LEFT JOIN request_sources s ON s.request_id=r.id WHERE r.state=?", (state,)):
+            row = dict(zip(("id", "person", "node", "nickname", "received", "ledger_key",
+                            "source", "source_id"), r))
             row["nickname"] = self._dec("requests", "nickname", self._pk((row["id"],)), row["nickname"])
+            row["ledger_key"] = row["ledger_key"] or ""
+            row["source"] = row["source"] or "invite"
+            row["source_id"] = row["source_id"] or ""
             out.append(row)
         return out
 
     def request(self, rid: str, state: str = "pending") -> Optional[dict]:
         rows = self._q(
-            "SELECT r.id,r.person,r.node,r.nickname,r.invite_nonce,r.received,r.state,k.ledger_key "
+            "SELECT r.id,r.person,r.node,r.nickname,r.invite_nonce,r.received,r.state,k.ledger_key,"
+            "s.source,s.source_id "
             "FROM requests r LEFT JOIN request_ledger_keys k ON k.request_id=r.id "
+            "LEFT JOIN request_sources s ON s.request_id=r.id "
             "WHERE r.id=? AND r.state=?", (rid, state))
         if not rows:
             return None
         row = dict(zip(("id", "person", "node", "nickname", "invite_nonce", "received", "state",
-                        "ledger_key"), rows[0]))
+                        "ledger_key", "source", "source_id"), rows[0]))
         row["nickname"] = self._dec("requests", "nickname", self._pk((rid,)), row["nickname"])
         row["ledger_key"] = row["ledger_key"] or ""
+        row["source"] = row["source"] or "invite"
+        row["source_id"] = row["source_id"] or ""
         return row
 
-    def decide_request(self, rid: str, accept: bool, starter: Optional[dict] = None) -> Optional[dict]:
+    def decide_request(self, rid: str, accept: bool, starter: Optional[dict] = None,
+                       *, block_until: int = 0, block_reason: str = "") -> Optional[dict]:
         def fn(db):
             r = db.execute(
-                "SELECT r.person,r.node,r.nickname,r.invite_nonce,k.ledger_key FROM requests r "
+                "SELECT r.person,r.node,r.nickname,r.invite_nonce,k.ledger_key,s.source,s.source_id "
+                "FROM requests r "
                 "LEFT JOIN request_ledger_keys k ON k.request_id=r.id "
+                "LEFT JOIN request_sources s ON s.request_id=r.id "
                 "WHERE r.id=? AND r.state='pending'", (rid,)).fetchone()
             if not r:
                 return None
             db.execute("UPDATE requests SET state=? WHERE id=?", ("accepted" if accept else "declined", rid))
+            if not accept and block_until:
+                db.execute(
+                    "INSERT INTO blocks(person,until,reason,created) VALUES(?,?,?,?) "
+                    "ON CONFLICT(person) DO UPDATE SET until=excluded.until,reason=excluded.reason,"
+                    "created=excluded.created",
+                    (r[0], int(block_until), str(block_reason)[:200], int(time.time())))
             if accept and starter is not None:
                 invite_id = starter["invite_id"]
                 pk = self._pk((invite_id,))
@@ -426,8 +485,46 @@ class Store:
                      int(starter["created"]), int(starter["created"]), int(starter["created"])))
             return {"person": r[0], "node": r[1],
                     "nickname": self._dec("requests", "nickname", self._pk((rid,)), r[2]),
-                    "invite_nonce": r[3], "ledger_key": r[4] or ""}
+                    "invite_nonce": r[3], "ledger_key": r[4] or "",
+                    "source": r[5] or "invite", "source_id": r[6] or ""}
         return self._tx(fn)
+
+    def pending_address_counts(self, person: str) -> tuple[int, int]:
+        rows = self._q(
+            "SELECT SUM(CASE WHEN r.person=? THEN 1 ELSE 0 END),COUNT(*) FROM requests r "
+            "JOIN request_sources s ON s.request_id=r.id "
+            "WHERE r.state='pending' AND s.source='address'", (person,))
+        mine, total = rows[0] if rows else (0, 0)
+        return int(mine or 0), int(total or 0)
+
+    def recent_address_request_count(self, since: int) -> int:
+        rows = self._q(
+            "SELECT COUNT(*) FROM requests r JOIN request_sources s ON s.request_id=r.id "
+            "WHERE s.source='address' AND r.received>=?", (int(since),))
+        return int(rows[0][0])
+
+    # address-request block list
+    def block(self, person: str, until: int, reason: str = "manual block",
+              now: Optional[int] = None) -> None:
+        self._q(
+            "INSERT INTO blocks(person,until,reason,created) VALUES(?,?,?,?) "
+            "ON CONFLICT(person) DO UPDATE SET until=excluded.until,reason=excluded.reason,"
+            "created=excluded.created",
+            (person, int(until), str(reason)[:200], int(time.time() if now is None else now)))
+
+    def unblock(self, person: str) -> bool:
+        with self._lock:
+            cur = self._db.execute("DELETE FROM blocks WHERE person=?", (person,))
+            return cur.rowcount == 1
+
+    def is_blocked(self, person: str, now: Optional[int] = None) -> bool:
+        rows = self._q("SELECT until FROM blocks WHERE person=?", (person,))
+        return bool(rows and int(rows[0][0]) > int(time.time() if now is None else now))
+
+    def blocks(self, now: Optional[int] = None) -> list[dict]:
+        now = int(time.time() if now is None else now)
+        return [dict(zip(("person", "until", "reason", "created"), row)) for row in self._q(
+            "SELECT person,until,reason,created FROM blocks WHERE until>? ORDER BY until,person", (now,))]
 
     def mark_contact_authenticated(self, person: str, node: str, now: Optional[int] = None) -> None:
         self._q(

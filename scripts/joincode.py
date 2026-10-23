@@ -97,9 +97,14 @@ import time as _time
 from urllib.parse import urlsplit
 
 INVITE_PREFIX = "nki1."
+ADDRESS_PREFIX = "nka1."
 _INVITE_KEYS = {"v", "inviter", "inviter_node", "peers", "nonce", "expires_at", "scope", "note", "ik", "release",
                 "from_name", "kind", "worker", "consumer", "sig"}
+_ADDRESS_KEYS = {"v", "kind", "inviter", "inviter_node", "peers", "aid", "ik", "expires_at",
+                 "from_name", "release", "sig"}
 _MAX_INVITE_LEN = 8192
+_MAX_ADDRESS_LEN = 8192
+_MAX_ADDRESS_TTL_S = 365 * 86400
 _WORKER_TIERS = {"stranger", "known", "trusted"}
 _MAX_STARTER = 100_000_000
 
@@ -252,6 +257,133 @@ def decode_invite(code: str, *, now: int | None = None, trusted_inviters: set | 
     if trusted_inviters is not None and inv["inviter"] not in trusted_inviters:
         raise ValueError("invite is from an inviter this node does not trust")
     return inv
+
+
+def _validate_address_release(value: object) -> None:
+    if not isinstance(value, dict) or set(value) != {"url", "channel", "pubkey", "version"}:
+        raise ValueError("address release entry is malformed")
+    if not all(isinstance(v, str) and v for v in value.values()):
+        raise ValueError("address release entry is malformed")
+    if not value["url"].startswith(("http://", "https://")):
+        raise ValueError("address release URL must be http(s)")
+    if len(value["pubkey"]) != 64 or any(c not in "0123456789abcdef" for c in value["pubkey"]):
+        raise ValueError("address release key is malformed")
+
+
+def _validate_address_peers(peers: object) -> None:
+    if not isinstance(peers, list) or not peers or len(peers) > 16:
+        raise ValueError("address must list 1-16 peers")
+    for peer in peers:
+        if not isinstance(peer, dict) or set(peer) != {"node", "addrs"}:
+            raise ValueError("address peer entry is malformed")
+        node, addrs = peer.get("node"), peer.get("addrs")
+        if not isinstance(node, str) or len(node) != 64 or any(c not in "0123456789abcdef" for c in node):
+            raise ValueError("address peer node is malformed")
+        if not isinstance(addrs, list) or len(addrs) > 16 or not all(
+                isinstance(addr, str) and 0 < len(addr) <= 512 for addr in addrs):
+            raise ValueError("address peer dial hints are malformed")
+
+
+def encode_address(person_priv, inviter_node: str, peers: list, *, days: int = 90,
+                   now: int | None = None, from_name: str = "", release: dict) -> str:
+    """Mint a public, reusable request address signed by the person's key.
+
+    ``ik`` is deliberately published. It authenticates only the rendezvous endpoint; the signed
+    contact.request envelope authenticates each stranger. Possession therefore permits an ASK,
+    never messaging or contact access.
+    """
+    from cryptography.hazmat.primitives.asymmetric import ed25519 as _ed
+    if isinstance(days, bool) or not isinstance(days, int) or not 1 <= days <= 365:
+        raise ValueError("address lifetime must be 1-365 days")
+    if not isinstance(inviter_node, str) or len(inviter_node) != 64 or \
+            any(c not in "0123456789abcdef" for c in inviter_node):
+        raise ValueError("address inviter_node is malformed")
+    _validate_address_peers(peers)
+    _validate_address_release(release)
+    if not isinstance(from_name, str) or len(from_name) > 40:
+        raise ValueError("address from_name is malformed")
+    now = int(now if now is not None else _time.time())
+    inviter = person_priv.public_key().public_bytes_raw().hex()
+    address = {
+        "v": 1, "kind": "address", "inviter": inviter, "inviter_node": inviter_node,
+        "peers": peers, "aid": secrets.token_hex(16),
+        # Public seed by design: it pins the listener but conveys no contact authority.
+        "ik": _ed.Ed25519PrivateKey.generate().private_bytes_raw().hex(),
+        "expires_at": now + days * 86400, "release": dict(release),
+    }
+    if from_name:
+        address["from_name"] = from_name
+    address["sig"] = {"alg": "Ed25519", "keyid": inviter[:16],
+                      "value": base64.b64encode(person_priv.sign(_canon(address))).decode("ascii")}
+    raw = json.dumps(address, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return ADDRESS_PREFIX + _b64u(raw)
+
+
+def decode_address(code: str, *, now: int | None = None,
+                   trusted_inviters: set | None = None) -> dict:
+    """Verify a public request address and return its signed fields."""
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+    now = int(now if now is not None else _time.time())
+    if not isinstance(code, str) or not code.startswith(ADDRESS_PREFIX):
+        raise ValueError("not a Nakshatra request address")
+    if len(code) > _MAX_ADDRESS_LEN:
+        raise ValueError("address too long")
+    encoded = code[len(ADDRESS_PREFIX):]
+    if not encoded or any(c not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-" for c in encoded):
+        raise ValueError("address is not valid base64url JSON")
+    try:
+        raw = _unb64u(encoded)
+        address = json.loads(raw.decode("utf-8"))
+    except Exception:
+        raise ValueError("address is not valid base64url JSON")
+    if not isinstance(address, dict) or set(address) != _ADDRESS_KEYS - {"from_name"} and \
+            set(address) != _ADDRESS_KEYS:
+        raise ValueError("address fields are missing or unknown")
+    canonical = json.dumps(address, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    if raw != canonical:
+        raise ValueError("address encoding is not canonical")
+    if address.get("v") != 1:
+        raise ValueError("unsupported address version")
+    if address.get("kind") != "address":
+        raise ValueError("address kind is not address")
+    for key, length in (("inviter", 64), ("inviter_node", 64), ("aid", 32), ("ik", 64)):
+        value = address.get(key)
+        if not isinstance(value, str) or len(value) != length or any(c not in "0123456789abcdef" for c in value):
+            raise ValueError(f"address field {key} is malformed")
+    _validate_address_peers(address.get("peers"))
+    _validate_address_release(address.get("release"))
+    if "from_name" in address and (not isinstance(address["from_name"], str) or
+                                    len(address["from_name"]) > 40):
+        raise ValueError("address from_name is malformed")
+    sig = address.get("sig") or {}
+    try:
+        if set(sig) != {"alg", "keyid", "value"} or sig.get("alg") != "Ed25519" or \
+                sig.get("keyid") != address["inviter"][:16]:
+            raise InvalidSignature
+        ed25519.Ed25519PublicKey.from_public_bytes(bytes.fromhex(address["inviter"])).verify(
+            base64.b64decode(sig["value"], validate=True), _canon(address))
+    except (InvalidSignature, KeyError, ValueError, TypeError):
+        raise ValueError("address signature does not verify")
+    expires_at = address.get("expires_at")
+    if isinstance(expires_at, bool) or not isinstance(expires_at, int) or now >= expires_at:
+        raise ValueError("address expired")
+    if expires_at > now + _MAX_ADDRESS_TTL_S:
+        raise ValueError("address expiry is more than 365 days away")
+    if trusted_inviters is not None and address["inviter"] not in trusted_inviters:
+        raise ValueError("address is from a person this node does not trust")
+    return address
+
+
+def address_pub(address: dict) -> str:
+    """Public half of the intentionally-public address rendezvous key."""
+    from cryptography.hazmat.primitives.asymmetric import ed25519 as _ed
+    return _ed.Ed25519PrivateKey.from_private_bytes(
+        bytes.fromhex(address["ik"])).public_key().public_bytes_raw().hex()
+
+
+def address_rendezvous(address: dict) -> bytes:
+    return hashlib.sha256(b"nak-address-v1|" + address["aid"].encode()).digest()[:16]
 
 
 class InviteBook:

@@ -96,6 +96,15 @@ class NakClient:
     def decline(self, req_id: str) -> dict:
         return self.call("decline", id=req_id)
 
+    def block(self, person_or_request: str, days: int = 30) -> dict:
+        return self.call("block", person=person_or_request, days=days)
+
+    def unblock(self, person: str) -> dict:
+        return self.call("unblock", person=person)
+
+    def blocked(self) -> list:
+        return self.call("blocked")["blocked"]
+
     def starter_status(self) -> dict:
         return self.call("starter_status")
 

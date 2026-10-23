@@ -229,6 +229,8 @@ import threading as _th
 from cryptography.hazmat.primitives.asymmetric import ed25519 as _ed
 
 from joincode import _canon, encode_invite, decode_invite, InviteBook, INVITE_PREFIX  # noqa: E402
+from joincode import (ADDRESS_PREFIX, address_pub, address_rendezvous, decode_address,
+                      encode_address)  # noqa: E402
 
 _NODE = "ab" * 32
 _PEERS = [{"node": "cd" * 32, "addrs": ["203.0.113.5:4433"]}]
@@ -359,3 +361,51 @@ class TestSignedInvite:
         assert len(a["ik"]) == 64 and a["ik"] != b["ik"]
         assert len(invite_pub(a)) == 64 and len(invite_rendezvous(a)) == 16
         assert invite_rendezvous(a) != invite_rendezvous(b)
+
+
+class TestRequestAddress:
+    release = {"url": "https://releases.example", "channel": "canary",
+               "pubkey": "ef" * 32, "version": "1.2.3"}
+
+    def test_round_trip_is_signed_canonical_and_publicly_dialable(self):
+        key, pub = _person()
+        code = encode_address(key, _NODE, _PEERS, days=90, now=1000,
+                              from_name="Biswa", release=self.release)
+        address = decode_address(code, now=1001)
+        assert code.startswith(ADDRESS_PREFIX)
+        assert address["kind"] == "address" and address["inviter"] == pub
+        assert address["from_name"] == "Biswa" and address["release"] == self.release
+        assert len(address["aid"]) == 32 and len(address["ik"]) == 64
+        assert len(address_pub(address)) == 64 and len(address_rendezvous(address)) == 16
+
+    def test_tamper_expiry_and_lifetime_limit(self):
+        key, _ = _person()
+        code = encode_address(key, _NODE, _PEERS, days=90, now=1000, release=self.release)
+        address = decode_address(code, now=1001)
+        address["aid"] = "ab" * 16
+        forged = ADDRESS_PREFIX + _b64.urlsafe_b64encode(
+            _json.dumps(address, sort_keys=True, separators=(",", ":")).encode()).decode().rstrip("=")
+        with pytest.raises(ValueError, match="signature"):
+            decode_address(forged, now=1001)
+        with pytest.raises(ValueError, match="expired"):
+            decode_address(code, now=1000 + 90 * 86400)
+        with pytest.raises(ValueError, match="1-365"):
+            encode_address(key, _NODE, _PEERS, days=366, now=1000, release=self.release)
+
+    def test_invite_and_address_kinds_never_cross_decode(self):
+        key, _ = _person()
+        invite = encode_invite(key, _NODE, _PEERS, now=1000)
+        address = encode_address(key, _NODE, _PEERS, now=1000, release=self.release)
+        with pytest.raises(ValueError, match="not a network invite"):
+            decode_invite(address, now=1001)
+        with pytest.raises(ValueError, match="not a Nakshatra request address"):
+            decode_address(invite, now=1001)
+
+    def test_noncanonical_json_is_refused_even_with_a_valid_signature(self):
+        key, _ = _person()
+        address = decode_address(
+            encode_address(key, _NODE, _PEERS, now=1000, release=self.release), now=1001)
+        raw = _json.dumps(address, indent=1).encode()
+        code = ADDRESS_PREFIX + _b64.urlsafe_b64encode(raw).decode().rstrip("=")
+        with pytest.raises(ValueError, match="canonical"):
+            decode_address(code, now=1001)

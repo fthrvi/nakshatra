@@ -79,6 +79,20 @@ def test_installer_verifies_invites_without_cryptography(net):
         I.parse_invite("hello")
 
 
+def test_installer_accepts_nka_address_and_rejects_prefix_kind_confusion(net):
+    a = net("inviter")
+    code = joincode.encode_address(
+        a.person_priv, a.node.node, [{"node": a.node.node, "addrs": []}],
+        days=90, from_name="Biswa", release=REL)
+    parsed = I.parse_invite(code)
+    assert parsed["kind"] == "address" and parsed["release"] == REL
+    with pytest.raises(I.InstallError, match="must use the nka1"):
+        I.parse_invite("nki1." + code.removeprefix("nka1."))
+    invite = _invite(a)
+    with pytest.raises(I.InstallError, match="request address fields"):
+        I.parse_invite("nka1." + invite.removeprefix("nki1."))
+
+
 def test_genuine_first_identity_setup_mints_once_and_is_idempotent(tmp_path):
     first = join_setup.ensure_identity(tmp_path)
     assert first["node_key"] == "created" and first["person_key"].startswith("created")
@@ -428,6 +442,35 @@ def test_join_end_to_end_request_reaches_the_inviter(net, tmp_path, monkeypatch,
     a.node.accept(reqs[0]["id"], petname="rajesh")
     assert wait(lambda: (node.store.contact(a.person_pub) or {}).get("state") == "active")
     stop.set(); node.stop()
+
+
+def test_join_setup_address_path_sends_request_and_prints_person_boundary(net, tmp_path, monkeypatch, capsys):
+    a = net("inviter")
+    code = joincode.encode_address(
+        a.person_priv, a.node.node, [{"node": a.node.node, "addrs": []}],
+        days=90, from_name="Biswa", release=REL)
+    a.node.register_address(code)
+    home = tmp_path / "stranger"
+    join_setup.ensure_identity(home)
+    sg = signer_mod.Signer(home / ".sthambha" / "signer", custody="test")
+    node_key = (home / ".nakshatra" / "keys" / "worker.ed25519").read_bytes()
+    node = nakd.Node(home / ".nakshatra" / "net", node_key, sg.handle, agent="agent",
+                     relay=a.node.relay).start()
+    stop = threading.Event()
+    sock = home / ".nakshatra" / "net" / "nakd.sock"
+    threading.Thread(target=nakd.serve_control, args=(node, sock, stop), daemon=True).start()
+    assert wait(sock.exists)
+    monkeypatch.setenv("NAK_JOIN_NO_SYSTEMD", "1")
+    try:
+        assert join_setup.main(["--invite", code, "--name", "Unknown", "--home", str(home)]) == 0
+        out = capsys.readouterr().out
+        assert "your request was sent; nothing is shared until Biswa accepts" in out
+        assert wait(lambda: len(a.node.store.requests()) == 1)
+        request = a.node.store.requests()[0]
+        assert request["nickname"] == "Unknown" and request["source"] == "address"
+    finally:
+        stop.set()
+        node.stop()
 
 
 @pytest.mark.parametrize("container", [False, True], ids=["host", "container"])

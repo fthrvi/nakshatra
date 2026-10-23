@@ -239,7 +239,8 @@ class Server:
             return render_inbox(c.inbox(limit=int(args.get("limit") or 20)))
         if name == "nak_requests":
             rows = c.requests()
-            return "\n".join(f"id {r['id']}: {r['nickname'] or '(no nickname)'} person {r['person'][:12]}…"
+            return "\n".join(f"id {r['id']} ({r.get('source') or 'invite'}): "
+                             f"{r['nickname'] or '(no nickname)'} person {r['person'][:12]}…"
                              for r in rows) or "No pending requests."
         if name == "nak_send":
             r = c.send(str(args["to"]), str(args["text"]), self.aspect)

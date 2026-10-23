@@ -90,6 +90,9 @@ STARTER_RETRY_S = (60, 300, 1800)
 STARTER_RETRY_MAX_S = 3600
 STARTER_RETRY_WINDOW_S = 7 * 86400
 ACCEPT_PROOF_MAX_SKEW_S = 120
+ADDRESS_DECLINE_BLOCK_S = 30 * 86400
+ADDRESS_PENDING_TOTAL_MAX = 20
+ADDRESS_DAILY_MAX = 50
 # Worst case is 5 advertised endpoints × 3 s, a 10 s handshake, then the sidecar's 15 s DCUtR wait
 # plus its pinned handshake. Fifty seconds covers that sequence; only both-sides direct opt-ins wait.
 DIRECT_WAIT_S = 50.0
@@ -166,7 +169,7 @@ def body_hash(body: dict) -> str:
 
 
 def accept_statement(request_id: str, petname: str, ts: int) -> bytes:
-    """Canonical person-signature payload for accepting a starter-bearing request."""
+    """Canonical person-signature payload for accepting a person-gated request."""
     return canonical({"kind": "nak.contact.accept.v1", "request_id": request_id,
                       "petname": petname, "ts": ts})
 
@@ -289,6 +292,9 @@ class Node:
     def start(self) -> "Node":
         for inv in self.store.open_invites():
             self._spawn(f"invite:{inv['nonce']}", self._invite_loop, inv)
+        address = self.store.address(active_only=True)
+        if address:
+            self._spawn(f"address:{address['aid']}", self._address_loop, address)
         for c in self.store.contacts():
             self._ensure_session(c["person"])
         self._spawn("sweeper", self._sweep_loop)
@@ -480,6 +486,52 @@ class Node:
             finally:
                 _close(sock)
 
+    # ── public request address (person side) ────────────────────────────────────────────────
+    def register_address(self, code: str, install_line: str = "") -> dict:
+        address = joincode.decode_address(code)
+        if address["inviter"] != self.person or address["inviter_node"] != self.node:
+            raise ValueError("that address was not made for this person and node")
+        self.store.set_address(code, address["aid"], address["ik"], address["expires_at"], install_line)
+        self._spawn(f"address:{address['aid']}", self._address_loop, self.store.address(active_only=True))
+        return {"aid": address["aid"], "expires_at": address["expires_at"]}
+
+    def address_status(self) -> dict:
+        row = self.store.address()
+        if not row:
+            return {"enabled": False}
+        return {"enabled": bool(row["enabled"] and row["expires_at"] > int(time.time())),
+                "code": row["code"], "aid": row["aid"], "expires_at": row["expires_at"],
+                "install_line": row.get("install_line", "")}
+
+    def address_off(self) -> dict:
+        self.store.retire_address()
+        return {"enabled": False}
+
+    def _address_loop(self, address: dict) -> None:
+        aid = address["aid"]
+        pin = joincode.address_pub(address)
+        rid = joincode.address_rendezvous(address)
+        attempt = 0
+        while not self._stop.is_set() and time.time() < address["expires_at"]:
+            current = self.store.address(active_only=True)
+            if not current or current["aid"] != aid:
+                return
+            try:
+                sock, ch = self._dial(rid, self._key, pin, False, b"nak-address-v1|" + aid.encode())
+            except (OSError, SecureChannelError):
+                attempt += 1
+                self._backoff(attempt)
+                continue
+            attempt = 0
+            try:
+                sock.settimeout(30)
+                reply = self._take_request(recv_frame(ch), "")
+                send_frame(ch, reply)
+            except (OSError, SecureChannelError, ValueError) as exc:
+                self.log(f"address {aid[:8]}: {exc}")
+            finally:
+                _close(sock)
+
     def _take_request(self, frame: Optional[dict], nonce: str) -> dict:
         if not frame or frame.get("t") != "env":
             return {"t": "nack", "why": "expected a signed request"}
@@ -491,27 +543,65 @@ class Node:
             verify_envelope(env, person)
         except (KeyError, SignerError) as e:
             return {"t": "nack", "why": f"request does not verify: {e}"}
-        if env.get("from_node") != node or env.get("to") != self.person or env.get("body_sha256") != body_hash(body) \
-                or body.get("invite") != nonce:
-            return {"t": "nack", "why": "request is not bound to this invite"}
+        if env.get("from_node") != node or env.get("to") != self.person or \
+                env.get("body_sha256") != body_hash(body):
+            return {"t": "nack", "why": "request identity or contents do not match its signed envelope"}
+        has_invite, has_address = "invite" in body, "address" in body
+        if has_invite and has_address:
+            return {"t": "nack", "why": "request cannot carry both an invite and an address"}
+        if has_invite:
+            if body.get("invite") != nonce:
+                return {"t": "nack", "why": "request is not bound to this invite"}
+        elif has_address:
+            address = self.store.address(active_only=True)
+            if not address or body.get("address") != address["aid"]:
+                return {"t": "nack", "why": "request address is off, expired, or no longer current"}
+        else:
+            return {"t": "nack", "why": "request has neither an invite nor an address"}
         if person == self.person:
             return {"t": "nack", "why": "cannot connect to yourself"}
         ledger_key = body.get("ledger_key", "")
-        if "ledger_key" in body and (not isinstance(ledger_key, str) or len(ledger_key) != 64
-                                     or any(ch not in "0123456789abcdef" for ch in ledger_key)
-                                     or ledger_key != node):
-            return {"t": "nack", "why": "request ledger key is not its node key"}
-        if not self.store.consume_invite(nonce, person):
-            return {"t": "nack", "why": "invite already used or expired"}
-        rid = self.store.add_request(person, node, str(body.get("nickname", ""))[:40], nonce,
-                                     ledger_key if isinstance(ledger_key, str) else "")
+        if has_address:
+            if self.store.is_blocked(person):
+                return {"t": "nack", "why": "not accepting requests from you"}
+            if self.store.contact(person) is not None:
+                return {"t": "nack", "why": "you are already a contact"}
+            per_person, total = self.store.pending_address_counts(person)
+            if per_person >= 1:
+                return {"t": "nack", "why": "you already have a pending address request"}
+            if total >= ADDRESS_PENDING_TOTAL_MAX:
+                return {"t": "nack", "why": "busy, try later"}
+            if self.store.recent_address_request_count(int(time.time()) - 86400) >= ADDRESS_DAILY_MAX:
+                return {"t": "nack", "why": "daily request limit reached, try later"}
+            if "ledger_key" in body and (not isinstance(ledger_key, str) or len(ledger_key) != 64
+                                         or any(ch not in "0123456789abcdef" for ch in ledger_key)
+                                         or ledger_key != node):
+                return {"t": "nack", "why": "request ledger key is not its node key"}
+            rid = self.store.add_request(
+                person, node, str(body.get("nickname", ""))[:40], "",
+                ledger_key if isinstance(ledger_key, str) else "", source="address",
+                source_id=body["address"])
+        else:
+            if "ledger_key" in body and (not isinstance(ledger_key, str) or len(ledger_key) != 64
+                                         or any(ch not in "0123456789abcdef" for ch in ledger_key)
+                                         or ledger_key != node):
+                return {"t": "nack", "why": "request ledger key is not its node key"}
+            if not self.store.consume_invite(nonce, person):
+                return {"t": "nack", "why": "invite already used or expired"}
+            rid = self.store.add_request(person, node, str(body.get("nickname", ""))[:40], nonce,
+                                         ledger_key if isinstance(ledger_key, str) else "")
         self.log(f"connection request {rid} from {person[:12]} ({body.get('nickname', '')!r})")
         return {"t": "ack", "mid": body.get("mid", "")}
 
     # ── redeeming someone else's invite ──────────────────────────────────────────────────────
     def redeem(self, code: str, nickname: str = "", petname: str = "", wait_s: float = 0.0) -> dict:
         """Ask the inviter to connect. Returns at once; delivery retries until the invite expires."""
-        inv = joincode.decode_invite(code)
+        if isinstance(code, str) and code.startswith(joincode.ADDRESS_PREFIX):
+            inv = joincode.decode_address(code)
+            redeem_id = inv["aid"]
+        else:
+            inv = joincode.decode_invite(code)
+            redeem_id = inv["nonce"]
         if inv["inviter"] == self.person:
             raise ValueError("that is your own invite")
         existing = self.store.contact(inv["inviter"])
@@ -524,23 +614,35 @@ class Node:
                                   petname or inv.get("from_name", "") or inv["inviter"][:12],
                                   name_src="yours" if petname else "self-chosen")
         done = threading.Event()
-        self._spawn(f"redeem:{inv['nonce']}", self._redeem_loop, inv, nickname[:40], done)
+        outcome = {}
+        self._spawn(f"redeem:{redeem_id}", self._redeem_loop, inv, nickname[:40], done, outcome)
         if wait_s:
             done.wait(wait_s)
         c = self.store.contact(inv["inviter"]) or {}
-        return {"state": "request sent" if done.is_set() else "request queued", "person": inv["inviter"],
-                "name": c.get("petname", "")}
+        if outcome.get("why"):
+            return {"state": "request refused", "why": outcome["why"], "person": inv["inviter"],
+                    "name": c.get("petname", "")}
+        return {"state": "request sent" if outcome.get("ack") else "request queued",
+                "person": inv["inviter"], "name": c.get("petname", "")}
 
-    def _redeem_loop(self, inv: dict, nickname: str, done: threading.Event) -> None:
-        body = {"person": self.person, "node": self.node, "ledger_key": self.node,
-                "nickname": nickname, "invite": inv["nonce"], "mid": secrets.token_hex(12)}
+    def _redeem_loop(self, inv: dict, nickname: str, done: threading.Event,
+                     outcome: Optional[dict] = None) -> None:
+        outcome = outcome if outcome is not None else {}
+        is_address = inv.get("kind") == "address"
+        identity_field, identity = (("address", inv["aid"]) if is_address else ("invite", inv["nonce"]))
+        body = {"person": self.person, "node": self.node, "nickname": nickname,
+                identity_field: identity, "mid": secrets.token_hex(12)}
+        if not is_address:
+            body["ledger_key"] = self.node
         ik = bytes.fromhex(inv["ik"])
-        rid = joincode.invite_rendezvous(inv)
+        rid = joincode.address_rendezvous(inv) if is_address else joincode.invite_rendezvous(inv)
+        domain = b"nak-address-v1|" if is_address else b"nak-invite-v1|"
         attempt = 0
         touched = False
         while not self._stop.is_set() and time.time() < inv["expires_at"]:
+            local_error = ""
             try:
-                sock, ch = self._dial(rid, ik, inv["inviter_node"], True, b"nak-invite-v1|" + inv["nonce"].encode())
+                sock, ch = self._dial(rid, ik, inv["inviter_node"], True, domain + identity.encode())
             except (OSError, SecureChannelError):
                 attempt += 1
                 self._backoff(attempt)
@@ -552,21 +654,32 @@ class Node:
                 send_frame(ch, {"t": "env", "env": env, "body": body})
                 reply = recv_frame(ch) or {}
             except (OSError, SecureChannelError, ValueError) as e:
-                reply = {"t": "nack", "why": str(e)}
+                local_error = str(e)
+                reply = {}
             finally:
                 _close(sock)
             if reply.get("t") == "ack":
+                outcome["ack"] = True
                 done.set()
                 self._ensure_session(inv["inviter"])     # be there to hear the accept
                 return
-            self.log(f"redeem {inv['nonce'][:8]}: {reply.get('why')}")
-            if "already used" in str(reply.get("why", "")):
+            why = str(reply.get("why") or local_error or "no reply")
+            self.log(f"redeem {identity[:8]}: {why}")
+            if is_address and reply.get("t") == "nack":
+                outcome["why"] = why
+                done.set()
+                return
+            if reply.get("t") == "nack" and "already used" in why:
                 return
             attempt += 1
             self._backoff(attempt)
 
     # ── deciding requests ────────────────────────────────────────────────────────────────────
     def _starter_for_request(self, request: dict) -> Optional[dict]:
+        # A public address can carry a syntactically valid ledger_key, but it never conveys the
+        # person's signed consent to fund a stranger. Only signed consumer invites can do that.
+        if request.get("source") == "address":
+            return None
         invite_row = self.store.invite(request["invite_nonce"])
         if not invite_row or not invite_row.get("code"):
             return None
@@ -598,7 +711,7 @@ class Node:
         if not request:
             raise ValueError("no pending request with that id")
         starter = self._starter_for_request(request)
-        if starter is not None:
+        if starter is not None or request.get("source") == "address":
             self._verify_accept_proof(req_id, petname, ts, signature)
         r = self.store.decide_request(req_id, True, starter=starter)
         if not r:
@@ -613,9 +726,49 @@ class Node:
         return {"person": r["person"], "petname": petname or r["nickname"]}
 
     def decline(self, req_id: str) -> dict:
-        if not self.store.decide_request(req_id, False):
+        request = self.store.request(req_id)
+        if not request:
             raise ValueError("no pending request with that id")
-        return {"declined": req_id}
+        address_request = request.get("source") == "address"
+        until = int(time.time()) + ADDRESS_DECLINE_BLOCK_S if address_request else 0
+        if not self.store.decide_request(
+                req_id, False, block_until=until,
+                block_reason="declined address request" if address_request else ""):
+            raise ValueError("no pending request with that id")
+        return {"declined": req_id, **({"blocked_until": until} if address_request else {})}
+
+    @staticmethod
+    def _valid_person_key(value: str) -> bool:
+        return isinstance(value, str) and len(value) == 64 and \
+            all(ch in "0123456789abcdef" for ch in value)
+
+    def block(self, person_or_request: str, days: int = 30) -> dict:
+        if isinstance(days, bool) or not isinstance(days, int) or not 1 <= days <= 3650:
+            raise ValueError("block days must be between 1 and 3650")
+        person = person_or_request
+        if not self._valid_person_key(person):
+            request = self.store.request(person_or_request)
+            if request is None:
+                # A decided request remains a valid reference for a later explicit block.
+                rows = [row for state in ("accepted", "declined")
+                        if (row := self.store.request(person_or_request, state)) is not None]
+                request = rows[0] if rows else None
+            if request is None:
+                raise ValueError("not a person key or request id")
+            person = request["person"]
+        until = int(time.time()) + days * 86400
+        self.store.block(person, until, "manual block")
+        return {"person": person, "until": until}
+
+    def unblock(self, person: str) -> dict:
+        if not self._valid_person_key(person):
+            raise ValueError("person key must be 64 lowercase hex characters")
+        if not self.store.unblock(person):
+            raise ValueError("that person is not blocked")
+        return {"person": person}
+
+    def blocked(self) -> list[dict]:
+        return self.store.blocks()
 
     def _verified_starter_invite(self, code: str) -> dict:
         """Verify signed consent without re-applying the redemption-expiry gate.
@@ -2169,6 +2322,7 @@ class Node:
                 "p2p": self.p2p,
                 "pending_requests": len(self.store.requests()),
                 "open_invites": len(self.store.open_invites()),
+                "address": self.address_status(),
                 "grant": grant, "awaiting_approval": waiting,
                 "starters": starters["starters"], "starter_paid_count": starters["paid_count"],
                 "outbox_refused": refused["count"],
@@ -2205,7 +2359,8 @@ def _hard_close(ch) -> None:
 
 # ── control socket (the CLI and, on Day 5, the MCP front door talk to this) ───────────────────
 
-OPS = {"status", "register_invite", "redeem", "requests", "accept", "decline", "contacts", "remove", "send",
+OPS = {"status", "register_invite", "register_address", "address_status", "address_off",
+       "redeem", "requests", "accept", "decline", "block", "unblock", "blocked", "contacts", "remove", "send",
        "agent_send", "threads", "thread", "card", "card_set", "delivered", "inbox", "outbox",
        "task_post", "tasks", "task_claim", "task_submit", "task_decide", "ledger", "escrow_status", "direct",
        "starter_status"}
@@ -2222,6 +2377,12 @@ def handle(node: Node, req: dict) -> dict:
             return {"ok": True, **node.starter_status()}
         if op == "register_invite":
             return {"ok": True, **node.register_invite(req["code"])}
+        if op == "register_address":
+            return {"ok": True, **node.register_address(req["code"], req.get("install_line", ""))}
+        if op == "address_status":
+            return {"ok": True, **node.address_status()}
+        if op == "address_off":
+            return {"ok": True, **node.address_off()}
         if op == "redeem":
             return {"ok": True, **node.redeem(req["code"], req.get("nickname", ""), req.get("petname", ""),
                                               float(req.get("wait_s", 0)))}
@@ -2229,13 +2390,20 @@ def handle(node: Node, req: dict) -> dict:
             requests = node.store.requests()
             for request in requests:
                 full = node.store.request(request["id"])
-                request["requires_person"] = bool(full and node._starter_for_request(full))
+                request["requires_person"] = bool(
+                    full and (full.get("source") == "address" or node._starter_for_request(full)))
             return {"ok": True, "requests": requests}
         if op == "accept":
             return {"ok": True, **node.accept(req["id"], req.get("petname", ""),
                                                ts=req.get("ts"), signature=req.get("signature", ""))}
         if op == "decline":
             return {"ok": True, **node.decline(req["id"])}
+        if op == "block":
+            return {"ok": True, **node.block(req["person"], int(req.get("days", 30)))}
+        if op == "unblock":
+            return {"ok": True, **node.unblock(req["person"])}
+        if op == "blocked":
+            return {"ok": True, "blocked": node.blocked()}
         if op == "contacts":
             return {"ok": True, "contacts": node.status()["contacts"]}
         if op == "remove":

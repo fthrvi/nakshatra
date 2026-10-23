@@ -568,12 +568,20 @@ def main(argv=None) -> int:
         r = NakClient(sock).redeem(a.invite, nickname=a.name[:40], wait_s=30)
     except NakError as e:
         raise SystemExit(f"could not send the connection request: {e}")
-    print(f"\nconnection request: {r['state']}. Your friend appears here as '{r.get('name') or '?'}'.")
+    if r.get("state") == "request refused":
+        print(f"\nrequest refused: {r.get('why') or 'the person is not accepting this request'}")
+        return 1
     import joincode
     try:
-        inv = joincode.decode_invite(a.invite)
+        inv = (joincode.decode_address(a.invite) if a.invite.startswith(joincode.ADDRESS_PREFIX)
+               else joincode.decode_invite(a.invite))
     except ValueError as e:
-        raise SystemExit(f"invite became invalid during setup: {e}")
+        raise SystemExit(f"join code became invalid during setup: {e}")
+    inviter_name = inv.get("from_name") or r.get("name") or inv["inviter"][:12]
+    if inv.get("kind") == "address":
+        print(f"\nyour request was sent; nothing is shared until {inviter_name} accepts")
+    else:
+        print(f"\nconnection request: {r['state']}. Your friend appears here as '{r.get('name') or '?'}'.")
     if inv.get("kind", "contact") == "worker":
         retry_path = _store_worker_invite(a.home, a.invite, a.name)
         try:
@@ -598,7 +606,7 @@ def main(argv=None) -> int:
             suffix = f"; starter credit {starter} arrives after {inviter_name} accepts you" if starter else ""
             print(f"consumer standing: tier {standing['tier']}, operator {standing['operator']}{suffix}")
     print("\nnext:")
-    print("  1. ask your friend to accept you (they run: nak requests, then nak accept <id>)")
+    print(f"  1. ask {inviter_name} to accept you (they run: nak requests, then nak accept <id>)")
     print("  2. check:  nak contacts      (shows them as active once they accept)")
     print(f"  3. talk:   nak send '{r.get('name') or '<their name>'}' \"hello\"     ·   nak inbox")
     mcp_command = _mcp_command()

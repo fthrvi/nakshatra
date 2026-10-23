@@ -1313,7 +1313,7 @@ class Installer:
 
 # ── join: the one command a newcomer pastes ─────────────────────────────────────────────────────
 #
-#   python3 install.py join '<nki1… invite>' [--name "what your friend sees"]
+#   python3 install.py join '<nki1… invite | nka1… address>' [--name "what they see"]
 #
 # 1. checks the invite is signed by the friend who made it and has not expired
 # 2. installs the node from the release the invite names, pinning the release key the invite names
@@ -1321,6 +1321,7 @@ class Installer:
 # 4. asks the friend to connect (they still have to accept)
 
 INVITE_PREFIX = "nki1."
+ADDRESS_PREFIX = "nka1."
 
 
 def parse_invite(code: str, now=None) -> dict:
@@ -1329,11 +1330,14 @@ def parse_invite(code: str, now=None) -> dict:
     from urllib.parse import urlsplit
     now = int(now if now is not None else time.time())
     code = (code or "").strip()
-    if not code.startswith(INVITE_PREFIX) or len(code) > 8192:
-        raise InstallError("that is not a Nakshatra invite (it should start with nki1.)")
+    prefix = ADDRESS_PREFIX if code.startswith(ADDRESS_PREFIX) else \
+        INVITE_PREFIX if code.startswith(INVITE_PREFIX) else ""
+    if not prefix or len(code) > 8192:
+        raise InstallError("that is not a Nakshatra invite or request address (expected nki1. or nka1.)")
     try:
-        body = code[len(INVITE_PREFIX):]
-        inv = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)).decode("utf-8"))
+        body = code[len(prefix):]
+        raw = base64.urlsafe_b64decode(body + "=" * (-len(body) % 4))
+        inv = json.loads(raw.decode("utf-8"))
     except (ValueError, UnicodeDecodeError):
         raise InstallError("the invite is damaged (copy the whole line again)")
     if not isinstance(inv, dict) or not isinstance(inv.get("inviter"), str) or len(inv["inviter"]) != 64:
@@ -1342,16 +1346,49 @@ def parse_invite(code: str, now=None) -> dict:
         raise InstallError("the invite's signature does not verify: it was changed or is not genuine")
     if not isinstance(inv.get("expires_at"), int) or now >= inv["expires_at"]:
         raise InstallError("the invite has expired: ask your friend for a new one")
+    is_address = prefix == ADDRESS_PREFIX
+    if is_address:
+        canonical_address = json.dumps(
+            inv, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        if raw != canonical_address:
+            raise InstallError("the request address encoding is not canonical")
+        expected = {"v", "kind", "inviter", "inviter_node", "peers", "aid", "ik", "expires_at",
+                    "release", "sig"}
+        if "from_name" in inv:
+            expected.add("from_name")
+        if set(inv) != expected or inv.get("v") != 1 or inv.get("kind") != "address":
+            raise InstallError("the request address fields are malformed")
+        for key, length in (("inviter", 64), ("inviter_node", 64), ("aid", 32), ("ik", 64)):
+            value = inv.get(key)
+            if not isinstance(value, str) or len(value) != length or \
+                    any(ch not in "0123456789abcdef" for ch in value):
+                raise InstallError(f"the request address {key} is malformed")
+        peers = inv.get("peers")
+        if not isinstance(peers, list) or not 1 <= len(peers) <= 16:
+            raise InstallError("the request address peer hints are malformed")
+        for peer in peers:
+            if not isinstance(peer, dict) or set(peer) != {"node", "addrs"} or \
+                    not isinstance(peer.get("node"), str) or len(peer["node"]) != 64 or \
+                    any(ch not in "0123456789abcdef" for ch in peer["node"]) or \
+                    not isinstance(peer.get("addrs"), list) or len(peer["addrs"]) > 16 or \
+                    not all(isinstance(addr, str) and 0 < len(addr) <= 512 for addr in peer["addrs"]):
+                raise InstallError("the request address peer hints are malformed")
+        if "from_name" in inv and (not isinstance(inv["from_name"], str) or len(inv["from_name"]) > 40):
+            raise InstallError("the request address name is malformed")
+        if inv["expires_at"] > now + 365 * 86400:
+            raise InstallError("the request address expiry is more than 365 days away")
+    elif inv.get("kind") == "address":
+        raise InstallError("an address payload must use the nka1. prefix")
     kind = inv.get("kind", "contact")
     worker = inv.get("worker")
     consumer = inv.get("consumer")
-    if kind not in {"contact", "worker", "consumer"}:
+    if not is_address and kind not in {"contact", "worker", "consumer"}:
         raise InstallError("the invite kind is not supported by this installer")
-    if kind == "contact" and "worker" in inv:
+    if not is_address and kind == "contact" and "worker" in inv:
         raise InstallError("the contact invite contains unexpected worker details")
-    if kind == "contact" and "consumer" in inv:
+    if not is_address and kind == "contact" and "consumer" in inv:
         raise InstallError("the contact invite contains unexpected consumer details")
-    if kind in {"worker", "consumer"}:
+    if not is_address and kind in {"worker", "consumer"}:
         details = worker if kind == "worker" else consumer
         expected = {"redeem", "code", "tier"} | ({"starter"} if kind == "consumer" else set())
         if not isinstance(details, dict) or set(details) != expected or \
@@ -1373,6 +1410,12 @@ def parse_invite(code: str, now=None) -> dict:
     rel = inv.get("release")
     if not isinstance(rel, dict) or not all(isinstance(rel.get(k), str) for k in ("url", "channel", "pubkey")):
         raise InstallError("the invite does not say where to get Nakshatra (your friend's node is too old)")
+    if is_address and (set(rel) != {"url", "channel", "pubkey", "version"} or
+                       not all(isinstance(value, str) and value for value in rel.values()) or
+                       not rel["url"].startswith(("http://", "https://")) or
+                       len(rel["pubkey"]) != 64 or
+                       any(ch not in "0123456789abcdef" for ch in rel["pubkey"])):
+        raise InstallError("the request address release entry is malformed")
     return inv
 
 
@@ -1389,8 +1432,9 @@ def join(prefix: Path, code: str, name: str) -> int:
     rel = inv["release"]
     # The signature proves the invite is intact and was made with the key it names — NOT who that is.
     # Trust comes from the person who sent you the line (and the installer fingerprint inside it).
-    print(f"invite is intact and signed by key {inv['inviter'][:16]}… (check with your friend that "
-          f"this is theirs); installing Nakshatra from {rel['url']} ({rel['channel']})", flush=True)
+    artifact = "request address" if inv.get("kind") == "address" else "invite"
+    print(f"{artifact} is intact and signed by key {inv['inviter'][:16]}… (check where you found it "
+          f"that this is theirs); installing Nakshatra from {rel['url']} ({rel['channel']})", flush=True)
     if not _systemd_user_ok():
         raise InstallError("this machine has no systemd user session. On WSL put [boot] systemd=true in "
                            "/etc/wsl.conf and restart WSL, then paste the line again.")
@@ -1429,7 +1473,7 @@ def main(argv=None) -> int:
     p.add_argument("service")
     p = sub.add_parser("restart", help="rewrite and restart one enabled current-release opt-in service")
     p.add_argument("service")
-    p = sub.add_parser("join", help="join Nakshatra with an invite a friend sent you")
+    p = sub.add_parser("join", help="join Nakshatra with an nki1 invite or nka1 request address")
     p.add_argument("invite")
     p.add_argument("--name", default="", help="what your friend will see you as")
     a = ap.parse_args(argv)
