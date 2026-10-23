@@ -5,7 +5,7 @@ On create add a row (status=active, owner). On merge flip to `merged→<sha>`.
 
 | branch | sector | description | base | status | owner |
 |---|---|---|---|---|---|
-| join/cleanbox-rerun | join | Rerun the clean-box outsider join against public release 0.15.22 and reconcile outsider documentation with the observed result. | forgejo/main@3f62d96 | active | codex/friends-onboarding |
+| join/cleanbox-rerun | join | Rerun the clean-box outsider join against public release 0.15.22 and reconcile outsider documentation with the observed result. | forgejo/main@3f62d96 | merged→0f14eed | codex/friends-onboarding |
 | net/ledger-reply-shapes | network | Accept the real neuron ledger's task reply shapes (submit/received `replayed`, status `refund_after_submit`); fixture captured from the real ledger. | forgejo/main@dc54d66 | merged→3ceca37 | claude/network |
 | join/outsider-refresh | join | Refresh JOIN/HARNESSES from a public outsider clean-box test; fix the first-install systemd-unit blocker (write identity-gated units after join) and verified current CLI boundaries. | forgejo/main@98cadad | merged→c2cc2e9 | codex/friends-onboarding |
 | net/task-verdict-policy | network | M2.1 person-signed paid-task verdict policy, durable ASK/decision flow, silence-pay, and worker ledger submit marks. | forgejo/main@6b3827a | active | codex/root |
