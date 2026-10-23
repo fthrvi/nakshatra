@@ -247,3 +247,169 @@ absent /tmp/nak-cleanbox-20261022.invite.stderr
 
 No hub configuration, service, grant, or existing contact was changed or restarted.
 The disposable `nak-cleanbox-systemd:ubuntu24.04` image was also removed.
+
+## Rerun 2026-10-23 on 0.15.22
+
+### Result
+
+The same clean-box outsider procedure passed end to end against public canary release `0.15.22`.
+The first-join fix did what the failed `0.15.20` run required: after creating the identity, the
+installer wrote, enabled, and started `nak-signer.service` and `nak-net.service`. The request reached
+the hub, both sides became contacts and exchanged messages, `nak-mcp` answered by hand over stdio,
+the documented grant renewal worked interactively, and both services plus messaging survived a
+container restart.
+
+The disposable systemd container was `nak-cleanbox-20261023`. It used the same `ubuntu:24.04`
+prerequisites and unreachable routes as the first run. The local date was 2026-10-23
+(`America/Denver`); the container displayed UTC.
+
+### Step results and timings
+
+| Step | Result | Timing |
+|---|---|---|
+| 1. Fresh isolated systemd container; private mesh fails; public canary answers | **Pass** | image build 14.336 s; final boot 680 ms; mesh refusal 46 ms; public 200 in 153 ms |
+| 2. Hub invite names public host and `0.15.22` | **Pass** | 70 ms |
+| 3. Join, accept, contacts, sends, and inboxes both ways | **Pass** | join 7.372 s; requests 45 ms; accept 53 ms; sends 62/132 ms; both inboxes had the messages within 2 s |
+| 4. Manual `nak-mcp` initialize + tools/list over stdio | **Pass** | 76 ms |
+| 5. Initial caps and documented interactive grant renewal | **Pass** | about 1.3 s including confirmation |
+| 6. Restart, service recovery, contact persistence, new message | **Pass** | services ready in 1.541 s; post-restart delivery 689 ms |
+| 7. Mandatory cleanup | **Pass** | 402 ms |
+
+The first container launch exited before the test because this Docker host also requires
+`--cgroupns=host` with the systemd cgroup mount. It created no invite or Nakshatra state. I removed
+that stopped instance and recreated the same named container with the required cgroup namespace;
+PID 1 was then `systemd`, the system state was `running`, and the `joiner` user manager was live.
+
+### 1. Isolation proof
+
+The effective routes retained Docker's more-specific connected gateway route while rejecting the
+three private aggregates:
+
+```text
+default via 172.17.0.1 dev eth0
+unreachable 10.0.0.0/8
+unreachable 172.16.0.0/12
+172.17.0.0/16 dev eth0 proto kernel scope link src 172.17.0.6
+unreachable 192.168.0.0/16
+```
+
+The required probes behaved differently:
+
+```text
+http://10.42.0.1:8960/                         HTTP=000  rc=7  elapsed_ms=46
+http://45.63.109.137:8960/canary/latest.json  HTTP=200  rc=0  elapsed_ms=153
+```
+
+### 2. Public invite and first install
+
+The hub still had `http://45.63.109.137:8960` in `~/.nakshatra/net/release-url`. The exact command
+was:
+
+```sh
+nak invite --note "clean-box rerun 2026-10-23"
+```
+
+It returned one line in 70 ms. The line named the public host and
+`/canary/0.15.22/{install.py,releasekit.py}`. The invite, signatures, and fingerprints are redacted:
+
+```sh
+mkdir -p ~/nak-join && cd ~/nak-join && \
+curl -fsSO http://45.63.109.137:8960/canary/0.15.22/install.py \
+  -O http://45.63.109.137:8960/canary/0.15.22/releasekit.py && \
+printf '%s  install.py\n%s  releasekit.py\n' <sha256> <sha256> | \
+sha256sum -c --quiet && python3 install.py join 'nki1.<redacted>'
+```
+
+The real line stayed in a mode-`0600` file, was passed to the container on standard input, and was
+unlinked during cleanup. Pasting it as the unprivileged `joiner` user took 7.372 seconds and exited
+zero. Trimmed output:
+
+```text
+invite is intact and signed by key <redacted>…; installing Nakshatra from
+http://45.63.109.137:8960 (canary)
+installed 0.15.22 (canary)
+setting up this node:
+  · node key: created
+  · person key: created (TEST custody: a file on this machine)
+  · signer: set up
+  · agent: 'agent' may nak.msg, nak.task.claim under a 365-day charter;
+    active while used and lapses after 30 idle days
+  · services: nak-signer + nak-net running (they start again after a reboot)
+connection request: request sent. Your friend appears here as 'Biswa'.
+```
+
+Both unit files existed, both were `enabled`, and both were `active`. This closes the original
+first-install blocker.
+
+### 3. Contact and two-way message proof
+
+`nak requests` showed the new request in 45 ms beside the unrelated old request named `friend`. I
+identified the new request by the fresh person's ID, accepted only it with
+`nak accept <id> --as cleanbox`, and left the old request untouched. The hub showed `cleanbox`
+active; the container showed `Biswa` active and online via the relay.
+
+Each side then sent one message and read it from the other side's inbox:
+
+```text
+hub:       queued <message-id> to cleanbox
+cleanbox:  queued <message-id> to Biswa
+hub inbox:       cleanbox: hello from cleanbox on rerun 2026-10-23
+cleanbox inbox:  Biswa: hello from hub on clean-box rerun 2026-10-23
+```
+
+### 4. MCP proof
+
+I piped raw JSON-RPC `initialize`, `notifications/initialized`, and `tools/list` messages to the
+container's `~/.local/bin/nak-mcp`. It exited zero in 76 ms with no standard error:
+
+```text
+initialize: protocolVersion 2024-11-05; server nakshatra 0.3
+tools/list: 18 default tools
+nak_status, nak_contacts, nak_inbox, nak_requests, nak_send, nak_agent_send,
+nak_threads, nak_thread, nak_card, nak_tasks, nak_task_claim, nak_task_submit,
+nak_task_post, nak_models, nak_ask, nak_balance, nak_wallet, nak_worker_status
+```
+
+### 5. Initial grant and renewal
+
+Before renewal, `nak status` reported exactly `nak.msg,nak.task.claim`. I then ran the documented
+payment-widening command verbatim in an interactive terminal and answered its confirmation prompt:
+
+```sh
+nak grant renew --caps nak.msg,nak.pay,nak.task.claim,nak.task.post --per-tx-cap 500 --day-cap 2000
+```
+
+It exited zero and reported the four requested caps, per-payment/day limits `500/2000`, a 7-day
+wire lease, a 30-day idle lapse, and a 365-day charter. A subsequent `nak status` showed all four
+caps.
+
+### 6. Restart persistence
+
+After `docker restart nak-cleanbox-20261023`, the system reached `running`, the `joiner` user manager
+was active, and both `nak-signer` and `nak-net` were active in 1.541 seconds. The private-route cuts
+were still present. `nak contacts` still showed `Biswa` active and online via relay. A fresh
+post-restart message from the container appeared in the hub inbox in 689 ms.
+
+### Remaining documentation divergence
+
+`JOIN.md`, `HARNESSES.md`, and `READY-FOR-OUTSIDERS.md` now describe the verified `0.15.22` result.
+One non-blocking runtime hint remains stale: the successful join's final text recommends the old
+`openclaw mcp add` form at `scripts/network/join_setup.py:605` (also repeated in the module example
+at `scripts/network/nak_mcp.py:6`), while the installed OpenClaw `2026.4.5` and `HARNESSES.md`
+correctly use `openclaw mcp set`. It did not affect the manual MCP proof and was not changed in this
+doc-only rerun.
+
+### Cleanup proof
+
+The hub contact was removed first. The final hub contact list contained only:
+
+```text
+bro              active    online via direct ...
+testbox          active    offline ...
+```
+
+`docker rm -f nak-cleanbox-20261023` removed the disposable container, and the temporary
+`nak-cleanbox-systemd:ubuntu24.04` image tag was deleted. Container and image lookups returned no
+rows. The mode-`0600` invite file, invite stderr, captured join/MCP logs, result file, system-state
+file, and temporary image build context were all absent after cleanup. No invite, key, token, or
+signature is present in the repository.

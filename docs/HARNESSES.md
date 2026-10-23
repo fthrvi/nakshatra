@@ -11,8 +11,9 @@ Prithvi, his gateway, or any mesh MCP doorway.
 Both stay on the invited node. The gateway reaches compute and accounting only through public,
 TLS-SPKI-pinned VPS fronts and signs requests with the node key made during join.
 
-The live `0.15.20` release has a first-join blocker described in [JOIN.md](JOIN.md). The harness
-syntax below is current, but a clean outsider could not reach harness setup on 2026-10-22.
+On 2026-10-23 a clean outsider joined through the public host on release `0.15.22` and completed a
+raw stdio `initialize` plus `tools/list` exchange with `nak-mcp`; it returned server version `0.3`
+and all 18 default tools. See [the clean-box finding](findings/2026-10-22-clean-box-join.md).
 
 ## Turn on the local gateway
 
