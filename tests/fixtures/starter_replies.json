@@ -1,0 +1,31 @@
+{
+  "grant": {
+    "v": 1,
+    "invite_id": "fixture_invite",
+    "from_account": "inviter",
+    "to_account": "recipient",
+    "to_keyid": "8dd1dba171f495fe7093507551cf9dd7e0b0951b9ac506d44b46b6bc275602e8",
+    "amount": 12345,
+    "ts": 1700000000,
+    "replayed": false
+  },
+  "replay": {
+    "v": 1,
+    "invite_id": "fixture_invite",
+    "from_account": "inviter",
+    "to_account": "recipient",
+    "to_keyid": "8dd1dba171f495fe7093507551cf9dd7e0b0951b9ac506d44b46b6bc275602e8",
+    "amount": 12345,
+    "ts": 1700000000,
+    "replayed": true
+  },
+  "status": {
+    "v": 1,
+    "invite_id": "fixture_invite",
+    "from_account": "inviter",
+    "to_account": "recipient",
+    "to_keyid": "8dd1dba171f495fe7093507551cf9dd7e0b0951b9ac506d44b46b6bc275602e8",
+    "amount": 12345,
+    "ts": 1700000000
+  }
+}

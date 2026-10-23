@@ -46,6 +46,11 @@ CREATE TABLE IF NOT EXISTS agent_cards (person TEXT PRIMARY KEY, display_name TE
     offers TEXT NOT NULL, intents TEXT NOT NULL, paid TEXT NOT NULL, price_hint TEXT NOT NULL,
     models TEXT NOT NULL, supports TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS store_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS starter_obligations (invite_id TEXT PRIMARY KEY, person TEXT NOT NULL,
+    to_keyid TEXT, amount INTEGER NOT NULL, signed_invite TEXT NOT NULL, state TEXT NOT NULL,
+    reason TEXT, created INTEGER NOT NULL, updated INTEGER NOT NULL, next_attempt INTEGER NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0, approved INTEGER NOT NULL DEFAULT 0, paid_at INTEGER,
+    receipt TEXT);
 """
 
 
@@ -54,12 +59,13 @@ class Store:
         "inbox": (("nonce",), ("text", "petname", "author", "aspect")),
         "contacts": (("person",), ("petname", "nickname")),
         "requests": (("id",), ("nickname",)),
-        "invites": (("nonce",), ("note",)),
+        "invites": (("nonce",), ("note", "code")),
         "outbox": (("nonce",), ("frame", "refused")),
         "tasks": (("task_hash", "role", "peer"), ("spec", "output", "verdict", "escrow_auth")),
         "agent_messages": (("mid",), ("text", "want", "refs", "budget", "harness")),
         "agent_cards": (("person",), ("display_name", "offers", "intents", "paid", "price_hint",
                                           "models", "supports", "updated_at", "ledger_keyid")),
+        "starter_obligations": (("invite_id",), ("signed_invite", "reason", "receipt")),
     }
 
     def __init__(self, state_dir: Path, data_key: bytes):
@@ -90,6 +96,11 @@ class Store:
             self._db.execute("ALTER TABLE outbox ADD COLUMN refused TEXT")
         except sqlite3.OperationalError:
             pass
+        for table, col in (("requests", "ledger_key TEXT"), ("invites", "code TEXT")):
+            try:
+                self._db.execute(f"ALTER TABLE {table} ADD COLUMN {col}")
+            except sqlite3.OperationalError:
+                pass
         for col in ("escrow_auth TEXT", "hold_id TEXT", "funding_state TEXT", "funding_reason TEXT",
                     "result_hash TEXT", "submit_state TEXT", "submit_reason TEXT",
                     "submit_attempts INTEGER NOT NULL DEFAULT 0", "receive_state TEXT",
@@ -292,9 +303,11 @@ class Store:
                 raise
 
     # invites
-    def add_invite(self, nonce: str, ik: str, expires_at: int, note: str = "") -> None:
+    def add_invite(self, nonce: str, ik: str, expires_at: int, note: str = "", code: str = "") -> None:
         note = self._enc("invites", "note", self._pk((nonce,)), note)
-        self._q("INSERT INTO invites VALUES (?,?,?,?,?,NULL)", (nonce, ik, expires_at, int(time.time()), note))
+        code = self._enc("invites", "code", self._pk((nonce,)), code)
+        self._q("INSERT INTO invites (nonce,ik,expires_at,created,note,consumed_by,code) "
+                "VALUES (?,?,?,?,?,NULL,?)", (nonce, ik, expires_at, int(time.time()), note, code))
 
     def open_invites(self, now: Optional[int] = None) -> list:
         now = int(now if now is not None else time.time())
@@ -312,31 +325,106 @@ class Store:
             return True
         return self._tx(fn)
 
+    def invite(self, nonce: str) -> Optional[dict]:
+        rows = self._q("SELECT nonce,ik,expires_at,created,note,consumed_by,code FROM invites WHERE nonce=?",
+                       (nonce,))
+        if not rows:
+            return None
+        row = dict(zip(("nonce", "ik", "expires_at", "created", "note", "consumed_by", "code"), rows[0]))
+        primary_key = self._pk((nonce,))
+        for column in ("note", "code"):
+            row[column] = self._dec("invites", column, primary_key, row[column])
+        return row
+
     # requests (someone redeemed our invite and asks to connect)
-    def add_request(self, person: str, node: str, nickname: str, invite_nonce: str) -> str:
+    def add_request(self, person: str, node: str, nickname: str, invite_nonce: str,
+                    ledger_key: str = "") -> str:
         rid = secrets.token_hex(4)
         nickname = self._enc("requests", "nickname", self._pk((rid,)), nickname[:40])
-        self._q("INSERT INTO requests VALUES (?,?,?,?,?,?, 'pending')",
-                (rid, person, node, nickname, invite_nonce, int(time.time())))
+        self._q("INSERT INTO requests (id,person,node,nickname,invite_nonce,received,state,ledger_key) "
+                "VALUES (?,?,?,?,?,?,'pending',?)",
+                (rid, person, node, nickname, invite_nonce, int(time.time()), ledger_key or None))
         return rid
 
     def requests(self, state: str = "pending") -> list:
         out = []
-        for r in self._q("SELECT id, person, node, nickname, received FROM requests WHERE state=?", (state,)):
-            row = dict(zip(("id", "person", "node", "nickname", "received"), r))
+        for r in self._q("SELECT id, person, node, nickname, received, ledger_key FROM requests WHERE state=?",
+                         (state,)):
+            row = dict(zip(("id", "person", "node", "nickname", "received", "ledger_key"), r))
             row["nickname"] = self._dec("requests", "nickname", self._pk((row["id"],)), row["nickname"])
             out.append(row)
         return out
 
-    def decide_request(self, rid: str, accept: bool) -> Optional[dict]:
+    def request(self, rid: str, state: str = "pending") -> Optional[dict]:
+        rows = self._q("SELECT id,person,node,nickname,invite_nonce,received,state,ledger_key FROM requests "
+                       "WHERE id=? AND state=?", (rid, state))
+        if not rows:
+            return None
+        row = dict(zip(("id", "person", "node", "nickname", "invite_nonce", "received", "state",
+                        "ledger_key"), rows[0]))
+        row["nickname"] = self._dec("requests", "nickname", self._pk((rid,)), row["nickname"])
+        row["ledger_key"] = row["ledger_key"] or ""
+        return row
+
+    def decide_request(self, rid: str, accept: bool, starter: Optional[dict] = None) -> Optional[dict]:
         def fn(db):
-            r = db.execute("SELECT person, node, nickname FROM requests WHERE id=? AND state='pending'", (rid,)).fetchone()
+            r = db.execute("SELECT person,node,nickname,invite_nonce,ledger_key FROM requests "
+                           "WHERE id=? AND state='pending'", (rid,)).fetchone()
             if not r:
                 return None
             db.execute("UPDATE requests SET state=? WHERE id=?", ("accepted" if accept else "declined", rid))
+            if accept and starter is not None:
+                invite_id = starter["invite_id"]
+                pk = self._pk((invite_id,))
+                db.execute(
+                    "INSERT INTO starter_obligations "
+                    "(invite_id,person,to_keyid,amount,signed_invite,state,reason,created,updated,next_attempt) "
+                    "VALUES (?,?,?,?,?,'pending',?,?,?,?)",
+                    (invite_id, r[0], starter.get("to_keyid") or None, int(starter["amount"]),
+                     self._enc("starter_obligations", "signed_invite", pk, starter["signed_invite"]),
+                     self._enc("starter_obligations", "reason", pk, starter.get("reason", "")),
+                     int(starter["created"]), int(starter["created"]), int(starter["created"])))
             return {"person": r[0], "node": r[1],
-                    "nickname": self._dec("requests", "nickname", self._pk((rid,)), r[2])}
+                    "nickname": self._dec("requests", "nickname", self._pk((rid,)), r[2]),
+                    "invite_nonce": r[3], "ledger_key": r[4] or ""}
         return self._tx(fn)
+
+    # starter credits
+    def starter_rows(self, states: Optional[tuple[str, ...]] = None) -> list[dict]:
+        columns = ("invite_id", "person", "to_keyid", "amount", "signed_invite", "state", "reason",
+                   "created", "updated", "next_attempt", "attempts", "approved", "paid_at", "receipt")
+        sql, args = "SELECT " + ",".join(columns) + " FROM starter_obligations", ()
+        if states:
+            sql += " WHERE state IN (" + ",".join("?" for _ in states) + ")"
+            args = tuple(states)
+        rows = []
+        for values in self._q(sql + " ORDER BY created,invite_id", args):
+            row = dict(zip(columns, values))
+            pk = self._pk((row["invite_id"],))
+            for column in ("signed_invite", "reason", "receipt"):
+                row[column] = self._dec("starter_obligations", column, pk, row[column])
+            if row["receipt"]:
+                row["receipt"] = json.loads(row["receipt"])
+            row["approved"] = int(row["approved"] or 0)
+            rows.append(row)
+        return rows
+
+    def starter_update(self, invite_id: str, **changes) -> bool:
+        allowed = {"state", "reason", "updated", "next_attempt", "attempts", "approved", "paid_at", "receipt"}
+        if not changes or set(changes) - allowed:
+            raise ValueError("invalid starter obligation update")
+        pk = self._pk((invite_id,))
+        values = dict(changes)
+        for column in ("reason", "receipt"):
+            if column in values:
+                value = values[column]
+                if column == "receipt" and value is not None:
+                    value = json.dumps(value, sort_keys=True, separators=(",", ":"))
+                values[column] = self._enc("starter_obligations", column, pk, value)
+        sets = ",".join(f"{column}=?" for column in values)
+        self._q(f"UPDATE starter_obligations SET {sets} WHERE invite_id=?",
+                (*values.values(), invite_id))
+        return True
 
     # contacts
     def upsert_contact(self, person: str, node: str, state: str, petname: str = "", nickname: str = "",

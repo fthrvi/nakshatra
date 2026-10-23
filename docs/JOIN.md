@@ -130,12 +130,19 @@ never advertised, planned, or summoned as an inference worker:
 
 `known` is the default tier; `self` cannot be granted by an invite. `--starter N` is optional and
 defaults to zero. A nonzero starter is a spend-only trial credit: it may be spent on the network but
-can never be withdrawn. Only money the person deposits can cash out. The transfer is **not wired
-yet**: onboarding records only a pending starter request today.
+can never be withdrawn. Only money the person deposits can cash out. On the devnet, accepting the
+consumer's contact request automatically pays the exact amount in the person-signed invite through
+the inviter's own `nak.pay` cap. A missing/lapsed grant or a not-yet-rostered consumer leaves the
+payment visibly pending and retrying; it is never paid around the signer.
 
 The consumer proves possession of its node key during redeem, reports no GPU capabilities, and
 opens no worker port. Its roster row is `consumer`, so worker planning and activation exclude it.
 It can run the loopback gateway and harnesses without serving model layers.
+
+The ledger identity rostered by `/consumer-redeem` is that same node Ed25519 key. New contact
+requests therefore carry it explicitly as the optional `ledger_key` field (equal to `node`); old
+nodes ignore the additive field and still connect. A request from an old node without the field is
+accepted normally, but its starter obligation remains `pending: recipient ledger key unknown`.
 
 ## What each side can see
 

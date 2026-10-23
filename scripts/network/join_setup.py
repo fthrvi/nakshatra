@@ -594,7 +594,8 @@ def main(argv=None) -> int:
                   file=sys.stderr)
         else:
             starter = int(inv["consumer"].get("starter", 0))
-            suffix = f"; starter request {starter} pending hub transfer" if starter else ""
+            inviter_name = inv.get("from_name") or inv["inviter"][:12]
+            suffix = f"; starter credit {starter} arrives after {inviter_name} accepts you" if starter else ""
             print(f"consumer standing: tier {standing['tier']}, operator {standing['operator']}{suffix}")
     print("\nnext:")
     print("  1. ask your friend to accept you (they run: nak requests, then nak accept <id>)")

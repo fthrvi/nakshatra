@@ -43,7 +43,7 @@ State as of 2026-10-23 (release 0.15.22 on the public canary; clean outsider joi
 | Item | Exists | Missing | Size |
 |---|---|---|---|
 | Consumer node | `nak invite --kind consumer`, `nak gateway on` (enforce), OpenAI-compatible local endpoint, paid run settled end to end | A stranger has no credits except the overdraft (stranger tier $0.01 ≈ a few requests) | (see §5) |
-| Starter credits | `--starter N` records a pending request | The signed hub transfer that pays it is not wired | S |
+| Starter credits | `--starter N` is paid once on accept from the person-signed invite, through the inviter's `nak.pay` caps; it stays spend-only and devnet-only | Production funding/policy beyond devnet | D |
 | Availability | Workers: hub + bro (bro sleeps when WSL idles) | Enough always-on capacity that a stranger's first request is not "no worker" | **D** / ops |
 
 ## 5. Credits (devnet only)
@@ -69,6 +69,6 @@ State as of 2026-10-23 (release 0.15.22 on the public canary; clean outsider joi
 ## Shortest path to "a stranger can do it alone"
 
 1. **D:** admission policy for strangers + who may accept (unblocks §1, §3, §4).
-2. **M:** S7 devnet drill → deposits on (with Biswa) → wire starter credits.
+2. **M:** S7 devnet drill → deposits on (with Biswa); starter credits are wired for devnet.
 3. **M:** non-TEST release key + person key off-box.
 4. **M + D:** refund-after-submit rule; shared revocation.

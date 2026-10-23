@@ -190,6 +190,7 @@ class LedgerAdapter(SettlementAdapter):
 
 
 _HEX64 = re.compile(r"[0-9a-f]{64}\Z")
+_INVITE_ID = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
 _TASK_STATES = {"open", "paid", "refunded"}
 
 
@@ -263,6 +264,11 @@ class NeuronEscrowAdapter(SettlementAdapter):
                 error = _STATUS_ERRORS.get(exc.code, SettlementError)(
                     f"Neuron ledger {label} refused HTTP {exc.code}")
                 error.status = exc.code
+                try:
+                    detail = json.loads(exc.read()).get("error", "")
+                except Exception:  # noqa: BLE001 - an error body is optional and untrusted
+                    detail = ""
+                error.ledger_error = str(detail)[:200] if isinstance(detail, str) else ""
                 raise error from exc
             except Exception as exc:  # noqa: BLE001 - enforce mode fails every dependency error closed
                 raise SettlementError(
@@ -403,6 +409,45 @@ class NeuronEscrowAdapter(SettlementAdapter):
         out["unit"] = "credits"
         out["adapter"] = self.name
         return out
+
+    def starter(self, invite_id: str, to_keyid: str, amount: int) -> dict:
+        """Pay one signed consumer-invite grant through Neuron's idempotent starter route."""
+        if _INVITE_ID.fullmatch(invite_id or "") is None:
+            raise SettlementError("starter invite id must be 1-64 URL-safe characters")
+        if _HEX64.fullmatch(to_keyid or "") is None:
+            raise SettlementError("starter recipient key must be 64 lowercase hex characters")
+        if isinstance(amount, bool) or not isinstance(amount, int) or not 1 <= amount <= 100_000_000:
+            raise SettlementError("starter amount must be between 1 and 100000000")
+        value = self._request("POST", "/spend/starter", {
+            "invite_id": invite_id, "to_keyid": to_keyid, "amount": amount,
+        })
+        expected = {"v", "invite_id", "from_account", "to_account", "to_keyid", "amount", "ts",
+                    "replayed"}
+        if (set(value) != expected or type(value.get("v")) is not int or value["v"] != 1
+                or value.get("invite_id") != invite_id or value.get("to_keyid") != to_keyid
+                or type(value.get("amount")) is not int or value["amount"] != amount
+                or not isinstance(value.get("from_account"), str) or not value["from_account"]
+                or not isinstance(value.get("to_account"), str) or not value["to_account"]
+                or type(value.get("ts")) is not int or value["ts"] <= 0
+                or not isinstance(value.get("replayed"), bool)):
+            raise SettlementError("Neuron ledger returned an invalid starter response")
+        return dict(value)
+
+    def starter_grant_status(self, invite_id: str) -> dict:
+        if _INVITE_ID.fullmatch(invite_id or "") is None:
+            raise SettlementError("starter invite id must be 1-64 URL-safe characters")
+        path = "/spend/starter/status?" + urllib.parse.urlencode({"invite_id": invite_id})
+        value = self._request("GET", path)
+        expected = {"v", "invite_id", "from_account", "to_account", "to_keyid", "amount", "ts"}
+        if (set(value) != expected or type(value.get("v")) is not int or value["v"] != 1
+                or value.get("invite_id") != invite_id
+                or _HEX64.fullmatch(str(value.get("to_keyid", ""))) is None
+                or type(value.get("amount")) is not int or not 1 <= value["amount"] <= 100_000_000
+                or not isinstance(value.get("from_account"), str) or not value["from_account"]
+                or not isinstance(value.get("to_account"), str) or not value["to_account"]
+                or type(value.get("ts")) is not int or value["ts"] <= 0):
+            raise SettlementError("Neuron ledger returned an invalid starter status")
+        return dict(value)
 
     def journal(self, task_hash: Optional[str] = None) -> list:
         """Neuron owns its journal; task status is available through ``nak escrow status``."""

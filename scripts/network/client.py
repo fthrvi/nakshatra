@@ -96,6 +96,9 @@ class NakClient:
     def decline(self, req_id: str) -> dict:
         return self.call("decline", id=req_id)
 
+    def starter_status(self) -> dict:
+        return self.call("starter_status")
+
     def redeem(self, code: str, nickname: str = "", petname: str = "", wait_s: float = 20) -> dict:
         return self.call("redeem", code=code, nickname=nickname, petname=petname, wait_s=wait_s)
 

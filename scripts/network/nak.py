@@ -165,14 +165,15 @@ def _stage_consumer(redeem: str, tier: str, starter: int, inviter_pubkey: str,
     if parsed is None or parsed.scheme not in {"http", "https"} or not host or authority.endswith(":") or \
             (port is not None and not 1 <= port <= 65535):
         raise SystemExit("consumer redeem URL must be an http(s) base URL")
-    if type(starter) is not int or not 0 <= starter <= 10**12:
-        raise SystemExit("--starter must be an integer between 0 and 1000000000000")
+    if type(starter) is not int or not 0 <= starter <= 100_000_000:
+        raise SystemExit("--starter must be an integer between 0 and 100000000")
     result = http_post(redeem.rstrip("/") + "/consumer-stage", {
         "token": _onboard_token(), "tier": tier, "starter": starter,
         "inviter_pubkey": inviter_pubkey,
     })
     code = result.get("code") if isinstance(result, dict) else None
-    if not isinstance(code, str) or not code.strip() or len(code) > 64:
+    if (not isinstance(code, str) or not 1 <= len(code) <= 64
+            or any(ch not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-" for ch in code)):
         raise SystemExit("onboard server returned an invalid consumer code")
     expires_at = result.get("expires_at", staged_at + 3600)
     if isinstance(expires_at, bool) or not isinstance(expires_at, int) or expires_at <= staged_at:
@@ -1965,7 +1966,7 @@ def main(argv=None, *, http_post=None) -> int:
     p.add_argument("--tier", choices=["stranger", "known", "trusted"], default="known",
                    help="worker/consumer trust tier (self is never granted by an invite)")
     p.add_argument("--starter", type=int, default=0,
-                   help="consumer starter credits requested from the inviter (default: 0)")
+                   help="consumer starter credits, 0..100000000 base units (default: 0)")
     p.add_argument("--redeem", default=DEFAULT_ONBOARD_BASE,
                    help="onboard server base URL for a worker or consumer invite")
     p = sub.add_parser("redeem"); p.add_argument("code"); p.add_argument("--nickname", default="")
@@ -2168,6 +2169,15 @@ def main(argv=None, *, http_post=None) -> int:
         if waiting:
             noun = "answer" if waiting == 1 else "answers"
             print(f"{waiting} paid {noun} waiting for your decision (each keeps its posting-time policy)")
+        paid_starters = int(r.get("starter_paid_count") or 0)
+        if paid_starters:
+            print(f"starter credits: {paid_starters} paid")
+        for starter in r.get("starters") or []:
+            if starter.get("state") == "paid":
+                continue
+            reason = f": {starter.get('reason')}" if starter.get("reason") else ""
+            print(f"starter {starter.get('invite_id')} to {starter.get('petname')}: "
+                  f"{starter.get('state')}{reason}")
         print(f"direct listener {r.get('direct_port') or 'off'}  p2p "
               f"{(r.get('p2p') or {}).get('dial', 'off')}")
         g = r["grant"]

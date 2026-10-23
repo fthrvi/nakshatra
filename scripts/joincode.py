@@ -101,7 +101,7 @@ _INVITE_KEYS = {"v", "inviter", "inviter_node", "peers", "nonce", "expires_at", 
                 "from_name", "kind", "worker", "consumer", "sig"}
 _MAX_INVITE_LEN = 8192
 _WORKER_TIERS = {"stranger", "known", "trusted"}
-_MAX_STARTER = 10**12
+_MAX_STARTER = 100_000_000
 
 
 def _canon(obj: dict) -> bytes:
@@ -154,7 +154,8 @@ def _validate_invite_kind(inv: dict) -> None:
     redeem, code, tier = details.get("redeem"), details.get("code"), details.get("tier")
     if not _valid_worker_redeem_url(redeem):
         raise ValueError(f"{kind} redeem URL must be http(s)")
-    if not isinstance(code, str) or not code.strip() or len(code) > 64:
+    if (not isinstance(code, str) or not 1 <= len(code) <= 64
+            or any(ch not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-" for ch in code)):
         raise ValueError(f"{kind} invite code is malformed")
     if tier not in _WORKER_TIERS:
         raise ValueError(f"{kind} invite tier is malformed")

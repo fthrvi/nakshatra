@@ -86,6 +86,9 @@ APPROVAL_MAX_PROMPTS = 8
 WORKER_SUBMIT_MAX_ATTEMPTS = 8
 POSTER_RECEIVE_MAX_ATTEMPTS = 8
 GRANT_WARN_S = 7 * 86400
+STARTER_RETRY_S = (60, 300, 1800)
+STARTER_RETRY_MAX_S = 3600
+STARTER_RETRY_WINDOW_S = 7 * 86400
 # Worst case is 5 advertised endpoints × 3 s, a 10 s handshake, then the sidecar's 15 s DCUtR wait
 # plus its pinned handshake. Fifty seconds covers that sequence; only both-sides direct opt-ins wait.
 DIRECT_WAIT_S = 50.0
@@ -256,6 +259,7 @@ class Node:
         self._decision_proofs: set[str] = set()
         self._submit_lock = threading.Lock()
         self._receipt_lock = threading.Lock()
+        self._starter_lock = threading.Lock()
         self._roster_loader = roster_loader
         self._roster_path = Path(roster_path) if roster_path is not None else None
         self._last_grant_warning_day: Optional[str] = None
@@ -281,6 +285,7 @@ class Node:
         for c in self.store.contacts():
             self._ensure_session(c["person"])
         self._spawn("sweeper", self._sweep_loop)
+        self._spawn("starter-reconcile", self.reconcile_starters)
         self._rearm_approvals()
         if self.direct_port:
             self._spawn("direct-listener", self._listen_loop)
@@ -436,7 +441,7 @@ class Node:
         inv = joincode.decode_invite(code)
         if inv["inviter"] != self.person or inv["inviter_node"] != self.node:
             raise ValueError("that invite was not made for this person and node")
-        self.store.add_invite(inv["nonce"], inv["ik"], inv["expires_at"], inv.get("note", ""))
+        self.store.add_invite(inv["nonce"], inv["ik"], inv["expires_at"], inv.get("note", ""), code)
         row = {"nonce": inv["nonce"], "ik": inv["ik"], "expires_at": inv["expires_at"]}
         self._spawn(f"invite:{inv['nonce']}", self._invite_loop, row)
         return {"nonce": inv["nonce"], "expires_at": inv["expires_at"]}
@@ -484,9 +489,15 @@ class Node:
             return {"t": "nack", "why": "request is not bound to this invite"}
         if person == self.person:
             return {"t": "nack", "why": "cannot connect to yourself"}
+        ledger_key = body.get("ledger_key", "")
+        if "ledger_key" in body and (not isinstance(ledger_key, str) or len(ledger_key) != 64
+                                     or any(ch not in "0123456789abcdef" for ch in ledger_key)
+                                     or ledger_key != node):
+            return {"t": "nack", "why": "request ledger key is not its node key"}
         if not self.store.consume_invite(nonce, person):
             return {"t": "nack", "why": "invite already used or expired"}
-        rid = self.store.add_request(person, node, str(body.get("nickname", ""))[:40], nonce)
+        rid = self.store.add_request(person, node, str(body.get("nickname", ""))[:40], nonce,
+                                     ledger_key if isinstance(ledger_key, str) else "")
         self.log(f"connection request {rid} from {person[:12]} ({body.get('nickname', '')!r})")
         return {"t": "ack", "mid": body.get("mid", "")}
 
@@ -514,8 +525,8 @@ class Node:
                 "name": c.get("petname", "")}
 
     def _redeem_loop(self, inv: dict, nickname: str, done: threading.Event) -> None:
-        body = {"person": self.person, "node": self.node, "nickname": nickname, "invite": inv["nonce"],
-                "mid": secrets.token_hex(12)}
+        body = {"person": self.person, "node": self.node, "ledger_key": self.node,
+                "nickname": nickname, "invite": inv["nonce"], "mid": secrets.token_hex(12)}
         ik = bytes.fromhex(inv["ik"])
         rid = joincode.invite_rendezvous(inv)
         attempt = 0
@@ -550,7 +561,22 @@ class Node:
     # ── deciding requests ────────────────────────────────────────────────────────────────────
     def accept(self, req_id: str, petname: str = "") -> dict:
         self._require_grant("contact.accept")
-        r = self.store.decide_request(req_id, True)
+        request = self.store.request(req_id)
+        if not request:
+            raise ValueError("no pending request with that id")
+        starter = None
+        invite_row = self.store.invite(request["invite_nonce"])
+        if invite_row and invite_row.get("code"):
+            inv = self._verified_starter_invite(invite_row["code"])
+            details = inv.get("consumer") if inv.get("kind") == "consumer" else None
+            if details and details["starter"] > 0:
+                starter = {
+                    "invite_id": details["code"], "to_keyid": request.get("ledger_key", ""),
+                    "amount": details["starter"], "signed_invite": invite_row["code"],
+                    "created": int(time.time()),
+                    "reason": "" if request.get("ledger_key") else "recipient ledger key unknown",
+                }
+        r = self.store.decide_request(req_id, True, starter=starter)
         if not r:
             raise ValueError("no pending request with that id")
         self.store.upsert_contact(r["person"], r["node"], "active", petname or r["nickname"], r["nickname"],
@@ -558,12 +584,158 @@ class Node:
         self._queue(r["person"], "contact.accept", {"person": self.person, "node": self.node})
         self._send_card_if_set(r["person"])
         self._ensure_session(r["person"])
+        if starter is not None:
+            self._spawn(f"starter:{starter['invite_id']}", self._attempt_starter, starter["invite_id"])
         return {"person": r["person"], "petname": petname or r["nickname"]}
 
     def decline(self, req_id: str) -> dict:
         if not self.store.decide_request(req_id, False):
             raise ValueError("no pending request with that id")
         return {"declined": req_id}
+
+    def _verified_starter_invite(self, code: str) -> dict:
+        """Verify signed consent without re-applying the redemption-expiry gate.
+
+        The request had to redeem before expiry.  Payment reconciliation may legitimately continue
+        for seven days after that, so ``now=0`` asks ``decode_invite`` to check the complete schema
+        and person signature while preserving the already-recorded acceptance decision.
+        """
+        inv = joincode.decode_invite(code, now=0)
+        if inv.get("inviter") != self.person or inv.get("inviter_node") != self.node:
+            raise ValueError("starter invite is not signed for this person and node")
+        return inv
+
+    @staticmethod
+    def _starter_spend_hash(row: dict) -> str:
+        material = {"kind": "starter", "invite_id": row["invite_id"],
+                    "to_keyid": row["to_keyid"], "amount": row["amount"]}
+        return hashlib.sha256(canonical(material)).hexdigest()
+
+    def _starter_pending(self, row: dict, reason: str, now: int, *, attempted: bool = True) -> None:
+        attempts = int(row.get("attempts") or 0) + (1 if attempted else 0)
+        deadline = int(row["created"]) + STARTER_RETRY_WINDOW_S
+        if now >= deadline:
+            self.store.starter_update(row["invite_id"], state="failed", reason=str(reason)[:200],
+                                      updated=now, next_attempt=deadline, attempts=attempts)
+            return
+        delay = (STARTER_RETRY_S[attempts - 1] if 0 < attempts <= len(STARTER_RETRY_S)
+                 else STARTER_RETRY_MAX_S)
+        self.store.starter_update(row["invite_id"], state="pending", reason=str(reason)[:200],
+                                  updated=now, next_attempt=min(deadline, now + delay), attempts=attempts)
+
+    def _attempt_starter(self, invite_id: str, now: Optional[int] = None) -> bool:
+        now = int(time.time() if now is None else now)
+        with self._starter_lock:
+            rows = [r for r in self.store.starter_rows(("pending",)) if r["invite_id"] == invite_id]
+            if not rows:
+                return False
+            row = rows[0]
+            if now < int(row["next_attempt"]):
+                return False
+            deadline = int(row["created"]) + STARTER_RETRY_WINDOW_S
+            if now >= deadline:
+                reason = row.get("reason") or "starter retry window expired"
+                self.store.starter_update(invite_id, state="failed", reason=str(reason)[:200],
+                                          updated=now, next_attempt=deadline)
+                return False
+            if os.environ.get("NAKSHATRA_ESCROW", "").strip().lower() != "neuron" \
+                    or not callable(getattr(self.settle, "starter", None)):
+                self._starter_pending(row, "starter payment disabled (NAKSHATRA_ESCROW is not neuron)",
+                                      now, attempted=False)
+                return False
+            if not row.get("to_keyid"):
+                self._starter_pending(row, "recipient ledger key unknown", now)
+                return False
+            try:
+                inv = self._verified_starter_invite(row["signed_invite"])
+                details = inv.get("consumer") if inv.get("kind") == "consumer" else None
+                if (not details or details.get("code") != row["invite_id"]
+                        or details.get("starter") != row["amount"]):
+                    raise ValueError("signed consumer starter terms do not match the obligation")
+            except ValueError as exc:
+                self.store.starter_update(invite_id, state="failed",
+                                          reason=f"invite signature/terms refused: {exc}"[:200],
+                                          updated=now, next_attempt=now)
+                return False
+
+            # A prior approval can be reused for the idempotent ledger retry, but the current grant
+            # must still be live and carry nak.pay.  This prevents a daemon retry from paying around
+            # a revoked, expired, or lapsed signer grant.  Status checks never refresh the lease.
+            try:
+                grant = self._grant_status()
+            except RuntimeError as exc:
+                self._starter_pending(row, str(exc), now)
+                return False
+            if not grant.get("valid") or "nak.pay" not in grant.get("caps", []):
+                reason = str(grant.get("problem") or "nak.pay is not granted")
+                self._starter_pending(row, f"spend grant refused: {reason}", now)
+                return False
+            if row["approved"] != 1:
+                if row["approved"] == 0:
+                    # Durable intent closes the crash window around the signer's own spend-book
+                    # write.  On restart, an `already authorised` answer can only adopt this exact
+                    # deterministic starter reference; a first call that never happened still works.
+                    self.store.starter_update(invite_id, approved=2, updated=now)
+                    row["approved"] = 2
+                approval = self._signer({
+                    "op": "approve_spend", "agent": self.agent,
+                    "task_hash": self._starter_spend_hash(row), "epoch": 0,
+                    "amount": row["amount"], "mint": "credits",
+                    "to": f"starter:{row['to_keyid']}", "touch": False,
+                })
+                if not approval.get("ok"):
+                    if (row["approved"] == 2
+                            and approval.get("error") == "this spend reference was already authorised"):
+                        self.store.starter_update(invite_id, approved=1, updated=now)
+                        row["approved"] = 1
+                    else:
+                        self._starter_pending(row, f"spend approval refused: {approval.get('error')}", now)
+                        return False
+                elif approval.get("status") != "ok":
+                    self._starter_pending(row, f"spend approval required: {approval.get('description', '')}", now)
+                    return False
+                else:
+                    self.store.starter_update(invite_id, approved=1, updated=now)
+                    row["approved"] = 1
+            try:
+                receipt = self.settle.starter(invite_id, row["to_keyid"], row["amount"])
+            except SettlementError as exc:
+                reason = getattr(exc, "ledger_error", "") or str(exc)
+                if exc.status == 409:
+                    self.store.starter_update(invite_id, state="failed", reason=reason[:200],
+                                              updated=now, next_attempt=now,
+                                              attempts=int(row.get("attempts") or 0) + 1)
+                else:
+                    self._starter_pending(row, reason, now)
+                return False
+            except Exception as exc:  # noqa: BLE001 - transport adapters fail closed and retry
+                self._starter_pending(row, f"starter ledger unavailable ({type(exc).__name__})", now)
+                return False
+            self.store.starter_update(invite_id, state="paid", reason="", updated=now,
+                                      next_attempt=now, paid_at=int(receipt["ts"]), receipt=receipt,
+                                      attempts=int(row.get("attempts") or 0) + 1)
+            contact = self.store.contact(row["person"]) or {}
+            name = contact.get("petname") or row["person"][:12]
+            self.log(f"starter: paid {row['amount']} credits to {name}")
+            return True
+
+    def reconcile_starters(self, now: Optional[int] = None) -> int:
+        now = int(time.time() if now is None else now)
+        paid = 0
+        for row in self.store.starter_rows(("pending",)):
+            if now >= int(row["next_attempt"]) and self._attempt_starter(row["invite_id"], now=now):
+                paid += 1
+        return paid
+
+    def starter_status(self) -> dict:
+        items = []
+        for row in self.store.starter_rows():
+            contact = self.store.contact(row["person"]) or {}
+            items.append({key: row[key] for key in (
+                "invite_id", "person", "to_keyid", "amount", "state", "reason", "created", "updated",
+                "next_attempt", "attempts", "paid_at")})
+            items[-1]["petname"] = contact.get("petname") or row["person"][:12]
+        return {"starters": items, "paid_count": sum(row["state"] == "paid" for row in items)}
 
     def remove(self, who: str) -> dict:
         c = self.store.resolve(who)
@@ -1640,6 +1812,7 @@ class Node:
         tell the assignee; mark this node's own offers/claims expired. Returns how many expired."""
         now = time.time() if now is None else now
         n = 0
+        self.reconcile_starters(now=int(now))
         self.reconcile_escrow()
         for t in self.store.tasks_in_states(("posted", "assigned", "awaiting_approval", "offered", "claimed")):
             if t["spec"]["deadline"] > now:
@@ -1942,6 +2115,7 @@ class Node:
                  if k in grant}
         refused = self.store.refusal_summary()
         waiting = len(self.store.tasks_in_states(("awaiting_approval",), role="poster"))
+        starters = self.starter_status()
         return {"person": self.person, "node": self.node, "custody": self.custody,
                 "relay": f"{self.relay[0]}:{self.relay[1]}",
                 "contacts": [dict(c, online=c["person"] in online, path=self._paths.get(c["person"], ""))
@@ -1951,6 +2125,7 @@ class Node:
                 "pending_requests": len(self.store.requests()),
                 "open_invites": len(self.store.open_invites()),
                 "grant": grant, "awaiting_approval": waiting,
+                "starters": starters["starters"], "starter_paid_count": starters["paid_count"],
                 "outbox_refused": refused["count"],
                 "newest_refusal": refused["latest"]}
 
@@ -1987,7 +2162,8 @@ def _hard_close(ch) -> None:
 
 OPS = {"status", "register_invite", "redeem", "requests", "accept", "decline", "contacts", "remove", "send",
        "agent_send", "threads", "thread", "card", "card_set", "delivered", "inbox", "outbox",
-       "task_post", "tasks", "task_claim", "task_submit", "task_decide", "ledger", "escrow_status", "direct"}
+       "task_post", "tasks", "task_claim", "task_submit", "task_decide", "ledger", "escrow_status", "direct",
+       "starter_status"}
 
 
 def handle(node: Node, req: dict) -> dict:
@@ -1997,6 +2173,8 @@ def handle(node: Node, req: dict) -> dict:
             raise ValueError(f"unknown op {op!r}")
         if op == "status":
             return {"ok": True, **node.status()}
+        if op == "starter_status":
+            return {"ok": True, **node.starter_status()}
         if op == "register_invite":
             return {"ok": True, **node.register_invite(req["code"])}
         if op == "redeem":

@@ -33,7 +33,14 @@ def test_every_encrypted_column_round_trips_and_is_ciphertext_in_sqlite(tmp_path
     store = Store(tmp_path / "net", KEY)
     store.upsert_contact(PERSON, NODE, "active", "pet-name", "nick-name")
     rid = store.add_request(PERSON, NODE, "request-nick", "invite-1")
+    starter_rid = store.add_request(PERSON, NODE, "starter-nick", "invite-1", NODE)
     store.add_invite("invite-1", "11" * 32, int(time.time()) + 1000, "invite-note")
+    now = int(time.time())
+    assert store.decide_request(starter_rid, True, starter={
+        "invite_id": "starter-1", "to_keyid": NODE, "amount": 7,
+        "signed_invite": "signed-starter-invite", "reason": "starter-reason", "created": now,
+    })
+    store.starter_update("starter-1", receipt={"v": 1, "replayed": False})
     store.queue("out-1", PERSON, {"kind": "msg", "body": {"text": "outbox-text"}})
     store.refuse("out-1", "outbox-refusal")
     store.add_inbox("in-1", PERSON, "inbox-pet", "agent:alice", "whole", "inbox-text")
@@ -62,6 +69,8 @@ def test_every_encrypted_column_round_trips_and_is_ciphertext_in_sqlite(tmp_path
     assert store.agent_thread("34")[1][0]["want"] == "agent-want"
     assert store.agent_card(PERSON)["offers"] == "card-offers"
     assert store.agent_card(PERSON)["ledger_keyid"] == "77" * 32
+    assert store.starter_rows()[0]["signed_invite"] == "signed-starter-invite"
+    assert store.starter_rows()[0]["receipt"] == {"v": 1, "replayed": False}
 
     for table, (pk_cols, columns) in Store._ENCRYPTED.items():
         rows = store._q(f"SELECT {', '.join((*pk_cols, *columns))} FROM {table}")
