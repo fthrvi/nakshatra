@@ -602,7 +602,9 @@ def main(argv=None) -> int:
     print(f"  3. talk:   nak send '{r.get('name') or '<their name>'}' \"hello\"     ·   nak inbox")
     mcp_command = _mcp_command()
     print("  4. plug in your AI (optional):")
-    print(f"       OpenClaw: openclaw mcp add nakshatra --command '{mcp_command}' && openclaw config set tools.toolSearch false")
+    argv = [os.path.expanduser(part) for part in shlex.split(mcp_command)]
+    openclaw_entry = json.dumps({"command": argv[0], "args": argv[1:]}, separators=(",", ":"))
+    print(f"       OpenClaw: openclaw mcp set nakshatra {shlex.quote(openclaw_entry)} && openclaw config set tools.toolSearch false")
     print(f"       Hermes:   add an mcp_servers entry with command {mcp_command}")
     if (a.home / ".sthambha" / "person-TEST.key").exists():
         custody_note = "your person key is a TEST file at ~/.sthambha/person-TEST.key: back it up, and never share it"

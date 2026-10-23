@@ -3,7 +3,7 @@
     python -m network.nak_mcp                    # read + send only (the default)
     python -m network.nak_mcp --allow-connect    # also accept/decline/redeem (a person's decision)
 
-OpenClaw:  openclaw mcp add nakshatra -- <venv>/bin/python -m network.nak_mcp
+OpenClaw:  openclaw mcp set nakshatra '{"command":"<venv>/bin/python","args":["-m","network.nak_mcp"]}'
 Hermes:    an mcp_servers entry with the same command.
 
 What an agent can do through it: see its node's status and contacts, read the inbox (always framed
