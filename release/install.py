@@ -750,10 +750,10 @@ class Installer:
         ctx, names = self._ctx(man), []
         self.unit_dir.mkdir(parents=True, exist_ok=True)
         for name, svc in man.get("services", {}).items():
+            unit_path = self.unit_dir / f"{name}.service"
             # A node that has NOT opted into a service gets no unit file for it at all: writing one
             # anyway would overwrite whatever (possibly hand-written, possibly live) unit carries that name.
             if svc.get("requires") and not Path(_render(svc["requires"], ctx)).exists():
-                unit_path = self.unit_dir / f"{name}.service"
                 if unit_path.exists() and self._managed_unit(unit_path):
                     if self.systemd:
                         stopped = subprocess.run(
@@ -765,7 +765,9 @@ class Installer:
                     unit_path.unlink()
                     self._clear_service_issue(name)
                 continue
-            (self.unit_dir / f"{name}.service").write_text(self._unit_text(svc, ctx, man))
+            if unit_path.exists() and not self._managed_unit(unit_path):
+                raise InstallError(f"refusing to replace operator-owned unit {unit_path}")
+            unit_path.write_text(self._unit_text(svc, ctx, man))
             names.append(name)
         bin_dir = self.prefix / "bin"
         bin_dir.mkdir(exist_ok=True)
@@ -1401,7 +1403,7 @@ def join(prefix: Path, code: str, name: str) -> int:
     else:
         print(inst.install(rel["url"], rel["channel"], rel["pubkey"], min_version=rel.get("version", "")), flush=True)
     man = json.loads((prefix / "current" / "manifest.json").read_text())
-    env = dict(os.environ, PYTHONPATH=inst._pythonpath(man))
+    env = dict(os.environ, PYTHONPATH=inst._pythonpath(man), NAK_NODE_PREFIX=str(prefix))
     py = str(prefix / "current" / "venv" / "bin" / "python")
     return subprocess.run([py, "-m", "network.join_setup", "--invite", code, "--name", name], env=env).returncode
 

@@ -1082,7 +1082,7 @@ def test_container_join_keeps_state_volume_home_through_the_shared_identity_gate
     assert 'VOLUME ["/state"]' in containerfile
     assert "env = dict(os.environ)" in bootstrap_source
     assert '"install.py"), "--prefix", prefix, "join", invite' in bootstrap_source
-    assert "env = dict(os.environ, PYTHONPATH=inst._pythonpath(man))" in installer_source
+    assert "env = dict(os.environ, PYTHONPATH=inst._pythonpath(man), NAK_NODE_PREFIX=str(prefix))" in installer_source
     assert '"-m", "network.join_setup", "--invite", code' in installer_source
 
 

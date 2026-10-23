@@ -502,6 +502,32 @@ def ensure_identity(home: Path) -> dict:
     return done
 
 
+def write_identity_gated_units(home: Path) -> None:
+    """Re-run the current signed release's unit writer after join creates its opt-in files."""
+    prefix = Path(os.environ.get("NAK_NODE_PREFIX", home / ".nakshatra-node"))
+    manifest_path = prefix / "current" / "manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text())
+        shipped = manifest["installer"]
+        if not isinstance(shipped, str) or not shipped:
+            raise ValueError("missing installer path")
+    except (OSError, KeyError, ValueError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"could not find the current signed-release installer: {exc}") from exc
+    installer = prefix / "current" / shipped
+    if not installer.is_file():
+        raise SystemExit(f"the current signed-release installer is missing: {installer}")
+    try:
+        result = subprocess.run(
+            [sys.executable, str(installer), "--prefix", str(prefix), "write-units"],
+            capture_output=True, text=True, timeout=120, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise SystemExit(f"could not write services after identity setup: {exc}") from exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()[-500:] or f"exit status {result.returncode}"
+        raise SystemExit(f"could not write services after identity setup: {detail}")
+
+
 def start_services(sock: Path, timeout_s: float = 90) -> None:
     subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
     subprocess.run(["systemctl", "--user", "enable", "--now", "nak-signer.service", "nak-net.service"], check=False)
@@ -534,6 +560,7 @@ def main(argv=None) -> int:
         _say(f"{k.replace('_', ' ')}: {done[k]}")
     sock = a.home / ".nakshatra" / "net" / "nakd.sock"
     if os.environ.get("NAK_JOIN_NO_SYSTEMD") != "1":
+        write_identity_gated_units(a.home)
         start_services(sock)
         _say("services: nak-signer + nak-net running (they start again after a reboot)")
     from network.client import NakClient, NakError

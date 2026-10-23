@@ -2,8 +2,10 @@
 
 The join is meant to take four steps. A clean-box test on 2026-10-22 found a blocker in the live
 `0.15.20` release: a first install makes the keys, but does not write the `nak-signer` or `nak-net`
-systemd units. It therefore cannot start the node or send the connection request. Do not tell a
-stranger that the current release completes these steps. See
+systemd units. The bug is fixed on branch `join/outsider-refresh`: after identity creation, join now
+reruns the current signed release's unit writer before enabling and starting those services. The fix
+reaches outsiders with the next signed release; the clean-box test must be rerun after that release
+is published. Until then, do not tell a stranger that the live release completes these steps. See
 [the clean-box finding](findings/2026-10-22-clean-box-join.md).
 
 Once a release with that fix is published, this is the shortest path.
@@ -40,7 +42,9 @@ The line:
 5. creates one agent with only `nak.msg,nak.task.claim`;
 6. starts `nak-signer` and `nak-net`, enables them after reboot, and asks your friend to connect.
 
-Step 6 is where release `0.15.20` currently stops because of the blocker above.
+Step 6 is where release `0.15.20` currently stops. The branch fix covers both systemd-user installs
+and the `nakc` container supervisor path, but is not available to outsiders until a signed release
+containing it is published and the clean-box join is rerun.
 
 ## 3. Your friend accepts
 
@@ -169,5 +173,6 @@ that credential expires, at most 7 days. Shared revocation is still on the list.
 **Today's limits.** Releases are public at `http://45.63.109.137:8960`; each channel has a signed
 `latest.json`. An inviter names that host in `~/.nakshatra/net/release-url`, or overrides it for one
 invite with `nak invite --release-url http://45.63.109.137:8960`. The `0.15.20` clean-box systemd
-unit blocker above still prevents a fresh host from finishing its first join. Person keys are TEST
+unit blocker above still prevents a fresh host from finishing its first join; its branch fix reaches
+outsiders with the next signed release and still requires a clean-box rerun. Person keys are TEST
 files, not a vault.

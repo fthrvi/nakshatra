@@ -14,8 +14,8 @@ import pytest
 
 _REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO / "scripts"))
-for cand in (os.environ.get("NAK_STHAMBHA_PATH", ""), str(Path.home() / "sthambha-signer"),
-             str(_REPO.parent / "sthambha")):
+for cand in (os.environ.get("NAK_STHAMBHA_PATH", ""), str(Path.home() / "sthambha"),
+             str(Path.home() / "sthambha-signer"), str(_REPO.parent / "sthambha")):
     if cand and (Path(cand) / "sthambha" / "signer.py").exists():
         sys.path.insert(0, cand)
         # Another test (bench_partition) may already have imported `sthambha` from a checkout that has

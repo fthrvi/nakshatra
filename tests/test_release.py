@@ -1107,6 +1107,26 @@ def test_units_are_written_only_for_services_the_node_opted_into(tmp_path):
     assert (tmp_path / "units" / "svc-off.service").read_text() == "HAND-WRITTEN, LIVE"   # untouched
 
 
+def test_write_units_refuses_eligible_operator_owned_unit(tmp_path):
+    units = tmp_path / "units"
+    units.mkdir()
+    opted = tmp_path / "identity"
+    opted.write_text("ready\n")
+    operator_unit = units / "svc.service"
+    operator_unit.write_text("[Service]\nExecStart=/operator/owned\n")
+    inst = I.Installer(tmp_path / "node", systemd=False, make_venv=False, unit_dir=units)
+    man = {
+        "version": "0.1.0", "components": [],
+        "services": {"svc": {"description": "managed", "requires": str(opted),
+                              "exec": ["{python}"]}},
+    }
+
+    with pytest.raises(I.InstallError, match="refusing to replace operator-owned unit"):
+        inst.write_units(man)
+
+    assert operator_unit.read_text() == "[Service]\nExecStart=/operator/owned\n"
+
+
 def test_removed_opt_in_stops_disables_and_removes_only_managed_unit(tmp_path, monkeypatch):
     units = tmp_path / "units"
     units.mkdir()

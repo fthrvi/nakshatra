@@ -4,6 +4,8 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -426,6 +428,81 @@ def test_join_end_to_end_request_reaches_the_inviter(net, tmp_path, monkeypatch,
     a.node.accept(reqs[0]["id"], petname="rajesh")
     assert wait(lambda: (node.store.contact(a.person_pub) or {}).get("state") == "active")
     stop.set(); node.stop()
+
+
+@pytest.mark.parametrize("container", [False, True], ids=["host", "container"])
+def test_fresh_join_writes_and_enables_identity_gated_units(tmp_path, monkeypatch, container):
+    """First join must revisit units skipped before the identity opt-ins existed."""
+    from network import client as network_client
+
+    home = tmp_path / "home"
+    prefix = tmp_path / "node"
+    units = home / ".config" / "systemd" / "user"
+    release = prefix / "releases" / "0.1.0"
+    installer = release / "nakshatra" / "release" / "install.py"
+    installer.parent.mkdir(parents=True)
+    shutil.copy2(_REPO / "release" / "install.py", installer)
+    shutil.copy2(_REPO / "release" / "releasekit.py", installer.parent / "releasekit.py")
+    (prefix / "current").symlink_to("releases/0.1.0")
+    spec = json.loads((_REPO / "release" / "spec.json").read_text())
+    manifest = {
+        "version": "0.1.0",
+        "installer": "nakshatra/release/install.py",
+        "components": spec["components"],
+        "services": {name: spec["services"][name] for name in ("nak-signer", "nak-net")},
+    }
+    (release / "manifest.json").write_text(json.dumps(manifest))
+    (prefix / "config.json").write_text(json.dumps({"current": "0.1.0"}))
+    home.mkdir()
+    systemctl_log = tmp_path / "systemctl.log"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_systemctl = fake_bin / "systemctl"
+    fake_systemctl.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"$*\" >> \"$NAK_TEST_SYSTEMCTL_LOG\"\n"
+    )
+    fake_systemctl.chmod(0o755)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("NAK_NODE_PREFIX", str(prefix))
+    monkeypatch.setenv("NAK_TEST_SYSTEMCTL_LOG", str(systemctl_log))
+    monkeypatch.setenv("PATH", f"{fake_bin}:{os.environ['PATH']}")
+    monkeypatch.delenv("NAK_JOIN_NO_SYSTEMD", raising=False)
+    if container:
+        monkeypatch.setenv("NAK_CONTAINER", "1")
+    else:
+        monkeypatch.delenv("NAK_CONTAINER", raising=False)
+
+    install = I.Installer(prefix, systemd=False, make_venv=False, unit_dir=units)
+    assert install.write_units(manifest) == []
+    assert not (units / "nak-signer.service").exists()
+    assert not (units / "nak-net.service").exists()
+
+    class Client:
+        status_calls = 0
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def status(self):
+            type(self).status_calls += 1
+            return {"ok": True}
+
+        def redeem(self, *_args, **_kwargs):
+            return {"state": "request sent", "name": "Inviter"}
+
+    monkeypatch.setattr(network_client, "NakClient", Client)
+    monkeypatch.setattr(joincode, "decode_invite", lambda _code: {"kind": "contact"})
+
+    assert join_setup.main(["--invite", "nki1.test", "--name", "Newcomer", "--home", str(home)]) == 0
+
+    assert (units / "nak-signer.service").is_file()
+    assert (units / "nak-net.service").is_file()
+    assert I.UNIT_MARKER in (units / "nak-signer.service").read_text()
+    calls = systemctl_log.read_text().splitlines()
+    assert "--user enable --now nak-signer.service nak-net.service" in calls
+    assert "--user restart nak-net.service" in calls
+    assert Client.status_calls == 1
 
 
 def test_join_next_steps_use_the_host_nakc_wrapper_inside_container(monkeypatch):

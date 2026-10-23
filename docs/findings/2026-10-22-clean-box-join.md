@@ -8,6 +8,14 @@ the first install had not written `nak-signer.service` or `nak-net.service`. The
 health wait expired before the node could redeem the invite. Per the task's stop rule, the test
 stopped there. No workaround or code change was made.
 
+The blocker is now fixed on branch `join/outsider-refresh`. After creating the identity files,
+`join_setup` invokes the `write-units` subcommand from the current signed release, then keeps the
+existing daemon reload, enable/start, restart, and wait-for-an-answer sequence. The same path covers
+`NAK_CONTAINER=1`, where `systemctl` is the container supervisor shim. The unit writer also refuses
+to replace an operator-owned, non-managed unit. This does not repair the already-published `0.15.20`
+release: outsiders receive the fix with the next signed release, and this clean-box test must be
+rerun after that release is published.
+
 The test ran on the hub in a container named `nak-cleanbox-20261022`. Times below are wall times
 observed during the run. The local date was 2026-10-22 (`America/Denver`); the container displayed
 UTC.
@@ -126,9 +134,11 @@ The container confirmed that `~/.config/systemd/user/` contained only `nak-updat
 `nak-update.timer`, while the signed manifest did contain both `nak-signer` and `nak-net` service
 definitions. This blocks every fresh systemd join on release `0.15.20`.
 
-I did not take the one-line-fix exception. A correct fix needs a regression test, a new signed
-release, and another clean-box run; working around the public release inside the test would not
-prove the documented path.
+I did not take the one-line-fix exception during the clean-box run. The branch now has a regression
+test that starts with a fresh temporary HOME and prefix, proves the initial installer pass skips the
+two identity-gated units, creates the identity gates, and verifies that host and container joins
+write and request enable/start for both services. Publishing a new signed release and rerunning this
+clean-box procedure remain required; working around `0.15.20` would not prove the documented path.
 
 ## Steps not reached
 

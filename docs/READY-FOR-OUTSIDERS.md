@@ -7,7 +7,7 @@ Direction: Biswa 2026-10-20 (trisul `plans/2026-10-17-houses-roads-windows.md` �
 Sizes: **S** = under a day · **M** = a few days, one review cycle · **L** = a week or more / needs a design.
 **D** marks a decision that is Biswa's, not engineering.
 
-State as of 2026-10-20 (release 0.15.20 live on hub, bro, container).
+State as of 2026-10-22 (release 0.15.20 live on hub, bro, container; first-join fix on branch only).
 
 ## 1. Join
 
@@ -16,7 +16,7 @@ State as of 2026-10-20 (release 0.15.20 live on hub, bro, container).
 | One-line install from an invite | `nak invite` → one line; sha-pinned installer, signed invite, pinned release key, keys made locally (docs/JOIN.md) | — | — |
 | Getting an invite at all | Only from an existing member running `nak invite` | A way for a stranger to ask for one without knowing a member (public request page or `nak join --request`, queued for an operator) | M + **D** (who may admit strangers) |
 | Being accepted | `nak requests` / `nak accept` by the inviter | Today every outsider is accepted by Biswa by hand. Needs a written admission policy per tier (stranger/known/trusted) and who besides Biswa may accept | S code, **D** policy |
-| Public release host | 2026-10-22: outsider routing proved (`10.42.0.1` blocked, public `latest.json` 200); invite used `~/.nakshatra/net/release-url`; signed `0.15.20` installed from `45.63.109.137:8960`; JOIN.md now documents the public host | Clean-box join then hit the missing first-install systemd units; fix and rerun ([finding](findings/2026-10-22-clean-box-join.md)) | S code + rerun |
+| Public release host | 2026-10-22: outsider routing proved (`10.42.0.1` blocked, public `latest.json` 200); invite used `~/.nakshatra/net/release-url`; signed `0.15.20` installed from `45.63.109.137:8960`; the missing first-install units are fixed on `join/outsider-refresh` for host and `nakc` paths | Publish the next signed release containing the fix, then rerun the clean-box join end to end ([finding](findings/2026-10-22-clean-box-join.md)) | S release + rerun |
 | Platforms | Linux, Windows via WSL (systemd), any OS with Docker via `nakc` | macOS native (no systemd); a Windows note that WSL stops idle distros (bro's durability problem) | M (mac) · S (note) |
 | Release signing + custody | Works, but the release key is `release-TEST.key` and person keys are plaintext TEST files (`custody test`) | A non-TEST release key held off the hub; person key off-box (vault/TPM + Face ID plan of 2026-10-20) before strangers trust our updates | M + **D** |
 
@@ -25,8 +25,8 @@ State as of 2026-10-20 (release 0.15.20 live on hub, bro, container).
 | Item | Exists | Missing | Size |
 |---|---|---|---|
 | MCP server | `nak-mcp`, 22 tools: messages, threads, agent cards, tasks (post/claim/submit), balance, wallet (read-only), models, ask, worker status; remote text always framed untrusted | — | — |
-| Harness docs | 2026-10-22: HARNESSES.md has one copy-paste block each for OpenClaw, Hermes, Claude Code, Codex config.toml, generic stdio, and the OpenAI endpoint; installed OpenClaw/Claude/Codex syntax checked; all 21 MCP tools listed | Hermes was not installed; clean-box MCP run was blocked before service start and must be rerun after the join fix | S rerun |
-| Agent permission lifetime | 2026-10-22: JOIN.md states the join caps, ≤365-day charter, 7-day wire lease, 30-day idle lapse, and tested `nak grant renew --caps …` forms for posting and capped payment | Live renewal on a freshly joined node was not reached because of the same systemd-unit blocker | S rerun |
+| Harness docs | 2026-10-22: HARNESSES.md has one copy-paste block each for OpenClaw, Hermes, Claude Code, Codex config.toml, generic stdio, and the OpenAI endpoint; installed OpenClaw/Claude/Codex syntax checked; all 21 MCP tools listed | Hermes was not installed; clean-box MCP must be rerun after the fixed signed release is published | S release + rerun |
+| Agent permission lifetime | 2026-10-22: JOIN.md states the join caps, ≤365-day charter, 7-day wire lease, 30-day idle lapse, and tested `nak grant renew --caps …` forms for posting and capped payment | Live renewal on a freshly joined node must be rerun after the fixed signed release is published | S release + rerun |
 | Small-model robustness | MCP accepts parameter aliases, plain "Not done: needs X" errors | 8B agents still report false success; a `nak_task_status` / verify step the agent is told to call | S |
 
 ## 3. Sell compute
@@ -69,7 +69,7 @@ State as of 2026-10-20 (release 0.15.20 live on hub, bro, container).
 ## Shortest path to "a stranger can do it alone"
 
 1. **D:** admission policy for strangers + who may accept (unblocks §1, §3, §4).
-2. **S:** JOIN.md/HARNESSES.md refresh (public host, `nak worker`, grant caps line) + a clean-box join test from outside the mesh.
+2. **S:** publish the signed release containing the first-join unit fix, then rerun the clean-box join from outside the mesh through MCP and live grant renewal.
 3. **M:** S7 devnet drill → deposits on (with Biswa) → wire starter credits.
 4. **M:** non-TEST release key + person key off-box.
 5. **M + D:** refund-after-submit rule; shared revocation.
