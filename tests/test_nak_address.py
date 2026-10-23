@@ -421,7 +421,7 @@ def test_cli_address_on_show_off_rotates(monkeypatch, tmp_path, capsys):
         raise AssertionError(req)
 
     monkeypatch.setattr(nak, "call", fake_call)
-    monkeypatch.setattr(nak, "_load_matching_person_key", lambda: key)
+    monkeypatch.setattr(nak, "PersonKey", lambda *_a, **_k: key)
     monkeypatch.setattr(nak, "_release_for_invite", lambda *_a: (RELEASE, "install {CODE}"))
     monkeypatch.setenv("NAK_NET_DIR", str(tmp_path / "net"))
     assert nak.main(["address", "on", "--days", "30", "--name", "Biswa"]) == 0

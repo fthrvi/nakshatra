@@ -31,6 +31,9 @@ _SCRIPTS = Path(__file__).resolve().parent.parent
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
+from network.person_custody import (  # noqa: E402
+    PersonKey, _person_key_path, _signing_home, custody_mode)
+
 AGENT = "agent"
 AGENT_CAPS = ("nak.msg", "nak.task.claim")
 AGENT_TTL_S = 365 * 86400
@@ -392,7 +395,7 @@ def ensure_identity(home: Path) -> dict:
     # This is the authority boundary. Decide it before mkdir/chmod/key generation or any other write.
     state = home / ".sthambha" / "signer"
     net = home / ".nakshatra" / "net"
-    person_path = home / ".sthambha" / "person-TEST.key"
+    person_path = _person_key_path(home)
     node_key = home / ".nakshatra" / "keys" / "worker.ed25519"
     try:
         # Snapshot every path used to classify this run before taking either branch. The only
@@ -406,6 +409,9 @@ def ensure_identity(home: Path) -> dict:
     first_initialisation = not (sthambha_authority_present or net_agent_present or net_store_present)
     if not first_initialisation:
         return _established_identity(home, state, net, person_path, node_key)
+    with _signing_home(home):
+        if custody_mode() == "broker":
+            PersonKey("grant-issue", f"Create initial grant for agent {agent}")
     if not callable(getattr(S, "load_or_create_lease_key", None)):
         # Compatibility must be decided before first-init creates any identity or authority state.
         raise SystemExit(OLD_SIGNER_MESSAGE)
@@ -427,7 +433,7 @@ def ensure_identity(home: Path) -> dict:
         done["node_key"] = "created"
     else:
         done["node_key"] = "kept"
-    person_priv = None
+    person_key_available = False
     if not person_path.exists() and (state / "person.pub").exists():
         person_pub = (state / "person.pub").read_text().strip()
         done["person_key"] = "not on this box (human custody kept)"
@@ -435,10 +441,12 @@ def ensure_identity(home: Path) -> dict:
         priv, _ = S.new_key()
         S.save_key(person_path, priv)
         done["person_key"] = "created (TEST custody: a file on this machine)"
-        person_priv, person_pub = S.load_key(person_path)
+        _person_priv, person_pub = S.load_key(person_path)
+        person_key_available = True
     else:
         done["person_key"] = "kept"
-        person_priv, person_pub = S.load_key(person_path)
+        _person_priv, person_pub = S.load_key(person_path)
+        person_key_available = True
     try:
         agent_files = S.open_agent_files(state, agent, create=True)
     except (OSError, S.SignerError) as exc:
@@ -456,14 +464,16 @@ def ensure_identity(home: Path) -> dict:
             done["signer"] = "kept"
         key_exists, grant_exists = agent_files.key_exists(), agent_files.grant_exists()
         if not key_exists and not grant_exists:
-            if person_priv is None:
+            if not person_key_available:
                 raise SystemExit(f"agent {agent!r} has no delegation and the person key is not on this box; "
                                  "create it with an explicit human delegation")
             agent_priv, agent_pub = S.new_key()
             _lease_priv, lease_pub = S.load_or_create_lease_key(state)
-            grant = S.issue_grant(
-                person_priv, agent, agent_pub, AGENT_CAPS, node=node_pub, ttl_s=AGENT_TTL_S,
-                lease={"issuer_pub": lease_pub, "max_s": AGENT_LEASE_S, "idle_s": AGENT_IDLE_S})
+            with _signing_home(home):
+                grant = S.issue_grant(
+                    PersonKey("grant-issue", f"Give agent {agent} {','.join(AGENT_CAPS)}"),
+                    agent, agent_pub, AGENT_CAPS, node=node_pub, ttl_s=AGENT_TTL_S,
+                    lease={"issuer_pub": lease_pub, "max_s": AGENT_LEASE_S, "idle_s": AGENT_IDLE_S})
             agent_files.write_key_and_grant(agent_priv, grant)
             done["agent"] = (f"'{agent}' may {', '.join(AGENT_CAPS)} under a 365-day charter; "
                              "active while used and lapses after 30 idle days")
@@ -615,7 +625,7 @@ def main(argv=None) -> int:
     openclaw_entry = json.dumps({"command": argv[0], "args": argv[1:]}, separators=(",", ":"))
     print(f"       OpenClaw: openclaw mcp set nakshatra {shlex.quote(openclaw_entry)} && openclaw config set tools.toolSearch false")
     print(f"       Hermes:   add an mcp_servers entry with command {mcp_command}")
-    if (a.home / ".sthambha" / "person-TEST.key").exists():
+    if _person_key_path(a.home).exists():
         custody_note = "your person key is a TEST file at ~/.sthambha/person-TEST.key: back it up, and never share it"
     else:
         custody_note = "your person key remains in human custody off this box"

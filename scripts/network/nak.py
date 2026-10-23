@@ -41,6 +41,7 @@ if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
 from release_trust import ReleaseTrustError, load_release_package_signers  # noqa: E402
+from network.person_custody import PersonKey, _person_key_path, custody_mode  # noqa: E402
 
 
 def call(sock_path: Path, req: dict) -> dict:
@@ -1820,11 +1821,11 @@ def _grant_renew_confined(args, signer_dir: Path, agent: str, signer_mod, agent_
             policy_changes.append(f"{name} -> {str(value).lower()}")
             constraints[name] = value
     effective_policy = verdict_policy.policy(constraints)
-    person_key = Path.home() / ".sthambha" / "person-TEST.key"
+    person_key = _person_key_path()
     fallback = _delegate_reuse_command(
         signer_dir, person_key, agent, caps, args.ttl,
         args.idle_days, args.lease_days, args.no_lease)
-    if not person_key.is_file():
+    if custody_mode() == "file" and not person_key.is_file():
         if cap_changes or policy_changes:
             print(f"person key is not available at {person_key}; the grant was not changed.\n"
                   "Spend caps can only be changed where the person key is available; verdict policy "
@@ -1852,12 +1853,13 @@ def _grant_renew_confined(args, signer_dir: Path, agent: str, signer_mod, agent_
         if answer.strip().lower() not in {"y", "yes"}:
             print("grant unchanged")
             return 1
-    try:
-        person_priv, person_pub = signer_mod.load_key(person_key)
-    except (OSError, ValueError) as exc:
-        raise SystemExit(f"cannot load the person key for renewal: {exc}") from exc
-    if person_pub != signer_person:
-        raise SystemExit(f"the person key at {person_key} does not match {signer_dir / 'person.pub'}")
+    if cap_changes:
+        person_kind = "spend-cap"
+        summary = f"Change spend caps for agent {agent}: {', '.join(cap_changes)}"
+    else:
+        person_kind = "grant-renew"
+        summary = f"Renew agent {agent} for {args.ttl} days with {','.join(caps)}"
+    person_priv = PersonKey(person_kind, summary)
     lease = None
     if not args.no_lease:
         _lease_priv, lease_pub = signer_mod.load_or_create_lease_key(signer_dir)
@@ -1892,21 +1894,6 @@ def _print_grant_status(grant: dict) -> None:
     if grant.get("verdict_policy"):
         from network.verdict import describe
         print("paid-task verdicts: " + describe(grant["verdict_policy"]))
-
-
-def _load_matching_person_key():
-    """Load the TEST-custody person key and bind it to the active signer's person.pub."""
-    signer_dir, _net_dir, _agent = _grant_paths()
-    from sthambha import signer as signer_mod
-    person_key = Path.home() / ".sthambha" / "person-TEST.key"
-    try:
-        signer_person = (signer_dir / "person.pub").read_text().strip()
-        person_priv, person_pub = signer_mod.load_key(person_key)
-    except (OSError, ValueError, signer_mod.SignerError) as exc:
-        raise SystemExit(f"cannot load the person key for this decision: {exc}") from exc
-    if person_pub != signer_person:
-        raise SystemExit(f"the person key at {person_key} does not match {signer_dir / 'person.pub'}")
-    return person_priv
 
 
 def _resolve_posted_task(sock: Path, ref: str) -> str:
@@ -1956,8 +1943,9 @@ def main(argv=None, *, http_post=None) -> int:
     q.add_argument("--verdict-ask-strangers", choices=["yes", "no"], default=None,
                    help="always ask for unrostered/stranger workers; omitted preserves it")
     q.add_argument("--yes", action="store_true", help="confirm explicitly when stdin is not a terminal")
-    p = sub.add_parser("invite"); p.add_argument("--person-key", type=Path,
-                                                 default=Path.home() / ".sthambha" / "person-TEST.key")
+    p = sub.add_parser("invite"); p.add_argument(
+        "--person-key", type=Path, default=None,
+        help="explicit file-key override (default: configured person custody)")
     p.add_argument("--ttl", type=int, default=86400); p.add_argument("--note", default="")
     p.add_argument("--release-url", default="", help="where newcomers download Nakshatra (default: this node's source)")
     p.add_argument("--code-only", action="store_true", help="print just the invite code")
@@ -2199,12 +2187,12 @@ def main(argv=None, *, http_post=None) -> int:
             print(f"newest refusal [{_ago(q['time'])}] {q['id']} to {q['to'][:12]}: {q['reason']}")
     elif a.cmd == "invite":
         import joincode
-        from cryptography.hazmat.primitives.asymmetric import ed25519
         if a.kind != "consumer" and a.starter:
             raise SystemExit("--starter is only valid with --kind consumer")
         http_post = http_post or _http_post_json
         st = call(s, {"op": "status"})
-        priv = ed25519.Ed25519PrivateKey.from_private_bytes(bytes.fromhex(a.person_key.read_text().strip()))
+        invite_for = a.note.strip() or a.from_name.strip() or a.kind
+        priv = PersonKey("invite", f"Create {a.kind} invite for {invite_for}", key_path=a.person_key)
         release, line = _release_for_invite(a.release_url)
         name_file = Path(os.environ.get("NAK_NET_DIR", Path.home() / ".nakshatra" / "net")) / "name"
         from_name = a.from_name or (name_file.read_text().strip() if name_file.exists() else "")
@@ -2251,7 +2239,8 @@ def main(argv=None, *, http_post=None) -> int:
                 return 0
             from network.nakd import address_control_statement
             ts = int(time.time())
-            signature = _load_matching_person_key().sign(
+            signature = PersonKey(
+                "address-control", f"Turn request address off {row['aid'][:8]}…").sign(
                 address_control_statement("address_off", row["aid"], ts)).hex()
             call(s, {"op": "address_off", "aid": row["aid"],
                      "ts": ts, "signature": signature})
@@ -2278,7 +2267,8 @@ def main(argv=None, *, http_post=None) -> int:
             from_name = a.name.strip()[:40] or (name_file.read_text().strip() if name_file.exists() else "")
             if a.name:
                 _write_private(name_file, (from_name + "\n").encode())
-            person_priv = _load_matching_person_key()
+            person_priv = PersonKey(
+                "address-control", f"Create public request address for {from_name or 'strangers'}")
             code = joincode.encode_address(
                 person_priv, st["node"],
                 [{"node": st["node"], "addrs": [st["relay"]]}], days=a.days,
@@ -2287,7 +2277,8 @@ def main(argv=None, *, http_post=None) -> int:
             from network.nakd import address_control_statement
             aid = joincode.decode_address(code)["aid"]
             ts = int(time.time())
-            signature = person_priv.sign(
+            signature = PersonKey(
+                "address-control", f"Turn request address on {aid[:8]}…").sign(
                 address_control_statement("register_address", aid, ts)).hex()
             call(s, {"op": "register_address", "code": code, "install_line": install_line,
                      "ts": ts, "signature": signature})
@@ -2322,7 +2313,10 @@ def main(argv=None, *, http_post=None) -> int:
                     return 1
                 from network.nakd import accept_statement
                 ts = int(time.time())
-                signature = _load_matching_person_key().sign(
+                stranger = pending[0].get("person", "unknown")
+                accepted_as = a.petname or pending[0].get("nickname") or "their chosen name"
+                signature = PersonKey(
+                    "contact-accept", f"Accept stranger {stranger[:8]}… as {accepted_as}").sign(
                     accept_statement(a.id, a.petname, ts)).hex()
                 proof = {"ts": ts, "signature": signature}
         r = call(s, {"op": a.cmd, "id": a.id,
@@ -2462,7 +2456,8 @@ def main(argv=None, *, http_post=None) -> int:
             if not sys.stdin.isatty():
                 raise SystemExit("nak task decide is interactive-only; run it in a terminal")
             task_hash = _resolve_posted_task(s, a.task)
-            person_priv = _load_matching_person_key()
+            person_priv = PersonKey(
+                "task-verdict", f"{a.decision.title()} paid task {task_hash[:12]}…")
             answer = input(f"{a.decision.upper()} paid task {task_hash[:12]}? [y/N] ")
             if answer.strip().lower() not in {"y", "yes"}:
                 print("task unchanged")

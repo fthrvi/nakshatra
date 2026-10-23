@@ -318,7 +318,7 @@ def test_cli_accept_builds_tty_and_person_signature_for_starter(monkeypatch):
     monkeypatch.setattr(nak.sys, "stdin", Terminal())
     monkeypatch.setattr("builtins.input", lambda _prompt: "yes")
     monkeypatch.setattr(nak, "call", fake_call)
-    monkeypatch.setattr(nak, "_load_matching_person_key", lambda: person)
+    monkeypatch.setattr(nak, "PersonKey", lambda *_a, **_k: person)
     assert nak.main(["accept", request_id, "--as", "friend"]) == 0
     proof = calls[1]
     person.public_key().verify(bytes.fromhex(proof["signature"]),
