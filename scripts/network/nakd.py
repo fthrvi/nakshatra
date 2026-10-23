@@ -986,13 +986,27 @@ class Node:
             path_label = "direct (p2p)" if path == "p2p" else path
             self.log(f"session up with {c['petname'] or person[:12]} ({path_label})")
             started = time.time()
-            self._run_session(person, sock, ch, path=path, p2p_failed=p2p_failed)
+            self._run_session(person, sock, ch, path=path, p2p_failed=p2p_failed, peer_node=c["node"])
             # A session that drops at once is a failure, not a success: keep backing off unless it
             # actually lasted (a peer that accepts and hangs up must not drive a tight loop).
             attempt = 0 if time.time() - started > 60 else attempt + 1
             self._backoff(attempt)
 
-    def _run_session(self, person: str, sock, ch, path: str = "relay", p2p_failed: bool = False) -> None:
+    def _note_authenticated(self, person: str, peer_node: str) -> None:
+        # Record the node key the handshake actually pinned, and only while it is still this
+        # contact's node: an accept that swaps the contact's node mid-handshake must not mark the
+        # new node authenticated on the strength of the old one's handshake.
+        contact = self.store.contact(person) or {}
+        if not peer_node or contact.get("node") != peer_node:
+            return
+        self.store.mark_contact_authenticated(person, peer_node)
+        for row in self.store.starter_rows(("pending",)):
+            if row["person"] == person and row.get("to_keyid") == peer_node:
+                self.store.starter_update(row["invite_id"], next_attempt=0)
+                self._spawn(f"starter:{row['invite_id']}", self._attempt_starter, row["invite_id"])
+
+    def _run_session(self, person: str, sock, ch, path: str = "relay", p2p_failed: bool = False,
+                     peer_node: str = "") -> None:
         lock = threading.Lock()
         with self._lock:
             if person in self._sessions:          # lost a race with another path: keep the first
@@ -1000,14 +1014,7 @@ class Node:
                 return
             self._sessions[person] = (ch, lock)
             self._paths[person] = path
-        contact = self.store.contact(person) or {}
-        authenticated_node = contact.get("node", "")
-        if authenticated_node:
-            self.store.mark_contact_authenticated(person, authenticated_node)
-            for row in self.store.starter_rows(("pending",)):
-                if row["person"] == person and row.get("to_keyid") == authenticated_node:
-                    self.store.starter_update(row["invite_id"], next_attempt=0)
-                    self._spawn(f"starter:{row['invite_id']}", self._attempt_starter, row["invite_id"])
+        self._note_authenticated(person, peer_node)
         advertised = False
 
         def advertise_endpoints_once() -> None:
@@ -1249,7 +1256,7 @@ class Node:
         incoming_path = "p2p" if self.p2p and _is_loopback_peer(conn) else "direct"
         label = "direct (p2p)" if incoming_path == "p2p" else "direct, incoming"
         self.log(f"session up with {c['petname'] or c['person'][:12]} ({label})")
-        self._run_session(c["person"], conn, ch, path=incoming_path)
+        self._run_session(c["person"], conn, ch, path=incoming_path, peer_node=peer)
 
     # ── tasks ────────────────────────────────────────────────────────────────────────────────
     # Poster: post_task → (claim arrives) assign the first valid claimer → (result arrives) judge by

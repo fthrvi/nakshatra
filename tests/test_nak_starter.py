@@ -425,3 +425,23 @@ s._db.close()
     assert current.request(rid_file.read_text())["ledger_key"] == "33" * 32
     assert {row[1] for row in current._q("PRAGMA table_info(invites)")} >= {"code"}
     assert {row[1] for row in current._q("PRAGMA table_info(requests)")} >= {"ledger_key"}
+
+
+def test_handshake_marks_only_the_node_it_pinned(net):
+    inviter = net("inviter", caps=("nak.msg", "nak.pay"), constraints=PAY)
+    consumer = net("consumer")
+    ledger = FakeStarterLedger()
+    inviter.node.settle = ledger
+    _accept_consumer(inviter, consumer, _consumer_invite(inviter))
+    store = inviter.node.store
+    assert wait(lambda: store.authenticated_contact_node(consumer.person_pub) == consumer.node.node)
+
+    # A handshake that pinned some other node (the contact's node changed underneath it) is
+    # not evidence for the contact's current node, and is never recorded.
+    store._q("DELETE FROM authenticated_contacts")
+    inviter.node._note_authenticated(consumer.person_pub, "ab" * 32)
+    assert store.authenticated_contact_node(consumer.person_pub) == ""
+    inviter.node._note_authenticated(consumer.person_pub, "")
+    assert store.authenticated_contact_node(consumer.person_pub) == ""
+    inviter.node._note_authenticated(consumer.person_pub, consumer.node.node)
+    assert store.authenticated_contact_node(consumer.person_pub) == consumer.node.node
