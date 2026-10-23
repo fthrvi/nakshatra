@@ -413,3 +413,22 @@ testbox          active    offline ...
 rows. The mode-`0600` invite file, invite stderr, captured join/MCP logs, result file, system-state
 file, and temporary image build context were all absent after cleanup. No invite, key, token, or
 signature is present in the repository.
+
+## Stranger join through a request address, 2026-10-23 on 0.15.24
+
+No invite. A fresh `ubuntu:24.04` systemd container, routes to 10/8, 172.16/12 and 192.168/16
+unreachable (mesh HTTP 000, public canary HTTP 200), new identity (person `484f48f1…`).
+
+| Step | Result |
+|---|---|
+| Biswa: `nak address on --days 1 --name Biswa` (person act, his terminal) | Pass: printed the `nka1.` line + sha-pinned install line for 0.15.24 |
+| Stranger pastes the line | Pass: installed 0.15.24, made keys, `nak-signer`/`nak-net` up, "your request was sent; nothing is shared until Biswa accepts" — 7.4 s |
+| Hub `nak requests` | Pass: `045a6cd4  address  friend …` within seconds |
+| Non-interactive accept (what an agent would do) | Pass: refused, "a person must accept this one", request unchanged |
+| Biswa: `nak accept 045a6cd4 --as strangerbox` in a terminal, `y` | Pass |
+| Contacts + two-way messages | Pass: both sides `active`; both messages delivered within 4 s |
+| Stranger's `nak-mcp` tools/list | Pass: 18 tools, no accept tool |
+| Container restart | Pass: contact still active, a new message delivered (the user manager was started by hand after the restart, as in the earlier run) |
+| Cleanup | `nak address off` (old line dead), `nak remove strangerbox`, container and image deleted; hub contacts back to bro, testbox, starter-test |
+
+The address line is not reproduced here; it was retired at the end of the test.
