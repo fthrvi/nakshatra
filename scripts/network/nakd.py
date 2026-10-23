@@ -91,6 +91,7 @@ STARTER_RETRY_MAX_S = 3600
 STARTER_RETRY_WINDOW_S = 7 * 86400
 ACCEPT_PROOF_MAX_SKEW_S = 120
 ADDRESS_DECLINE_BLOCK_S = 30 * 86400
+ADDRESS_PENDING_TTL_S = 7 * 86400
 ADDRESS_PENDING_TOTAL_MAX = 20
 ADDRESS_DAILY_MAX = 50
 # Worst case is 5 advertised endpoints × 3 s, a 10 s handshake, then the sidecar's 15 s DCUtR wait
@@ -174,6 +175,34 @@ def accept_statement(request_id: str, petname: str, ts: int) -> bytes:
                       "petname": petname, "ts": ts})
 
 
+def address_control_statement(op: str, aid: str, ts: int) -> bytes:
+    """Canonical person-signature payload for address registration and retirement."""
+    return canonical({"kind": "nak.address.control.v1", "op": op, "aid": aid, "ts": ts})
+
+
+def _verified_address_install_line(code: str, address: dict, line: str) -> str:
+    """Accept only the CLI's inert, release-pinned command shape.
+
+    The two manifest hashes are retained because an updated node may no longer have the old
+    manifest locally. Everything executable is reconstructed in the regular expression from the
+    person-signed release coordinates and the exact signed address code.
+    """
+    if not isinstance(line, str) or len(line) > 20_000:
+        raise ValueError("address install line is malformed")
+    release = address["release"]
+    base = f"{release['url']}/{release['channel']}/{release['version']}"
+    pattern = (
+        r"mkdir -p ~/nak-join && cd ~/nak-join && curl -fsSO " + _re.escape(base) +
+        r"/install\.py -O " + _re.escape(base) +
+        r"/releasekit\.py && printf '%s  install\.py\\n%s  releasekit\.py\\n' "
+        r"[0-9a-f]{64} [0-9a-f]{64} \| sha256sum -c --quiet && python3 install\.py join '" +
+        _re.escape(code) + r"'"
+    )
+    if _re.fullmatch(pattern, line) is None:
+        raise ValueError("address install line is not bound to its signed release and code")
+    return line
+
+
 # ── signer access ───────────────────────────────────────────────────────────────────────────────
 
 class SignerClient:
@@ -221,13 +250,14 @@ class Node:
                  agent: str, relay: tuple = DEFAULT_RELAY, log: Callable[[str], None] = lambda m: None,
                  settlement=None, direct_port: Optional[int] = None, p2p: Optional[dict] = None,
                  roster_loader: Optional[Callable[[], dict]] = None,
-                 roster_path: Optional[Path] = None):
+                 roster_path: Optional[Path] = None, clock: Optional[Callable[[], float]] = None):
         self._key = node_key
         self.node = ed25519.Ed25519PrivateKey.from_private_bytes(node_key).public_key().public_bytes_raw().hex()
         self._signer = signer
         self.agent = agent
         self.relay = relay
         self.log = log
+        self._clock = clock or time.time
         # Authenticate the signer's public identity before its data key can touch legacy state. A
         # valid but wrong signer must never get a chance to migrate this node's plaintext history.
         who = signer({"op": "whoami"})
@@ -292,7 +322,7 @@ class Node:
     def start(self) -> "Node":
         for inv in self.store.open_invites():
             self._spawn(f"invite:{inv['nonce']}", self._invite_loop, inv)
-        address = self.store.address(active_only=True)
+        address = self.store.address(active_only=True, now=int(self._clock()))
         if address:
             self._spawn(f"address:{address['aid']}", self._address_loop, address)
         for c in self.store.contacts():
@@ -464,7 +494,7 @@ class Node:
         pin = joincode.invite_pub({"ik": inv["ik"]})
         rid = joincode.invite_rendezvous({"nonce": nonce})
         attempt = 0
-        while not self._stop.is_set() and time.time() < inv["expires_at"]:
+        while not self._stop.is_set() and self._clock() < inv["expires_at"]:
             if not any(i["nonce"] == nonce for i in self.store.open_invites()):
                 return
             try:
@@ -473,25 +503,48 @@ class Node:
                 attempt += 1
                 self._backoff(attempt)
                 continue
+            except Exception as exc:  # noqa: BLE001 - one peer must never kill the listener
+                self.log(f"invite {nonce[:8]} dial: {exc}")
+                attempt += 1
+                self._backoff(attempt)
+                continue
             attempt = 0
             try:
                 sock.settimeout(30)
                 frame = recv_frame(ch)
-                reply = self._take_request(frame, nonce)
+                reply = self._take_request(frame, "invite", nonce)
                 send_frame(ch, reply)
                 if reply.get("t") == "ack":
                     return
-            except (OSError, SecureChannelError, ValueError) as e:
+            except Exception as e:  # noqa: BLE001 - isolate every untrusted pairing
                 self.log(f"invite {nonce[:8]}: {e}")
             finally:
                 _close(sock)
 
     # ── public request address (person side) ────────────────────────────────────────────────
-    def register_address(self, code: str, install_line: str = "") -> dict:
-        address = joincode.decode_address(code)
+    def _verify_address_proof(self, op: str, aid: str, ts, signature: str) -> None:
+        command = "nak address on" if op == "register_address" else "nak address off"
+        now = int(self._clock())
+        if isinstance(ts, bool) or not isinstance(ts, int) or abs(now - ts) > ACCEPT_PROOF_MAX_SKEW_S:
+            raise ValueError(f"a person must authorize this operation: {command}")
+        if not isinstance(signature, str) or len(signature) != 128:
+            raise ValueError(f"a person must authorize this operation: {command}")
+        try:
+            ed25519.Ed25519PublicKey.from_public_bytes(bytes.fromhex(self.person)).verify(
+                bytes.fromhex(signature), address_control_statement(op, aid, ts))
+        except (ValueError, TypeError, InvalidSignature) as exc:
+            raise ValueError(f"a person must authorize this operation: {command}") from exc
+
+    def register_address(self, code: str, install_line: str = "", *, ts=None,
+                         signature: str = "") -> dict:
+        now = int(self._clock())
+        address = joincode.decode_address(code, now=now)
         if address["inviter"] != self.person or address["inviter_node"] != self.node:
             raise ValueError("that address was not made for this person and node")
-        self.store.set_address(code, address["aid"], address["ik"], address["expires_at"], install_line)
+        self._verify_address_proof("register_address", address["aid"], ts, signature)
+        install_line = _verified_address_install_line(code, address, install_line)
+        self.store.set_address(code, address["aid"], address["ik"], address["expires_at"], install_line,
+                               now=now)
         self._spawn(f"address:{address['aid']}", self._address_loop, self.store.address(active_only=True))
         return {"aid": address["aid"], "expires_at": address["expires_at"]}
 
@@ -499,12 +552,23 @@ class Node:
         row = self.store.address()
         if not row:
             return {"enabled": False}
-        return {"enabled": bool(row["enabled"] and row["expires_at"] > int(time.time())),
-                "code": row["code"], "aid": row["aid"], "expires_at": row["expires_at"],
-                "install_line": row.get("install_line", "")}
+        enabled = bool(row["enabled"] and row["expires_at"] > int(self._clock()))
+        install_line = ""
+        if enabled:
+            try:
+                address = joincode.decode_address(row["code"], now=int(self._clock()))
+                install_line = _verified_address_install_line(
+                    row["code"], address, row.get("install_line", ""))
+            except Exception as exc:  # noqa: BLE001 - corrupt state is never rendered as a command
+                self.log(f"address {row['aid'][:8]}: refusing stored install line: {exc}")
+        return {"enabled": enabled, "code": row["code"], "aid": row["aid"],
+                "expires_at": row["expires_at"], "install_line": install_line}
 
-    def address_off(self) -> dict:
-        self.store.retire_address()
+    def address_off(self, aid: str, *, ts=None, signature: str = "") -> dict:
+        if not self._valid_hex(aid, 32):
+            raise ValueError("request address aid is malformed")
+        self._verify_address_proof("address_off", aid, ts, signature)
+        self.store.retire_address(aid, now=int(self._clock()))
         return {"enabled": False}
 
     def _address_loop(self, address: dict) -> None:
@@ -512,8 +576,8 @@ class Node:
         pin = joincode.address_pub(address)
         rid = joincode.address_rendezvous(address)
         attempt = 0
-        while not self._stop.is_set() and time.time() < address["expires_at"]:
-            current = self.store.address(active_only=True)
+        while not self._stop.is_set() and self._clock() < address["expires_at"]:
+            current = self.store.address(active_only=True, now=int(self._clock()))
             if not current or current["aid"] != aid:
                 return
             try:
@@ -522,76 +586,99 @@ class Node:
                 attempt += 1
                 self._backoff(attempt)
                 continue
+            except Exception as exc:  # noqa: BLE001 - one peer must never kill the listener
+                self.log(f"address {aid[:8]} dial: {exc}")
+                attempt += 1
+                self._backoff(attempt)
+                continue
             attempt = 0
             try:
                 sock.settimeout(30)
-                reply = self._take_request(recv_frame(ch), "")
+                reply = self._take_request(recv_frame(ch), "address", aid)
                 send_frame(ch, reply)
-            except (OSError, SecureChannelError, ValueError) as exc:
+            except Exception as exc:  # noqa: BLE001 - isolate every untrusted pairing
                 self.log(f"address {aid[:8]}: {exc}")
             finally:
                 _close(sock)
 
-    def _take_request(self, frame: Optional[dict], nonce: str) -> dict:
-        if not frame or frame.get("t") != "env":
+    @staticmethod
+    def _valid_hex(value, length: int) -> bool:
+        return isinstance(value, str) and len(value) == length and \
+            all(ch in "0123456789abcdef" for ch in value)
+
+    def _address_nack(self, person: str, reason: str) -> dict:
+        self.log(f"address request from {person[:12]} rejected locally: {reason}")
+        return {"t": "nack", "why": "request not accepted right now"}
+
+    def _take_request(self, frame: Optional[dict], listener_kind: str,
+                      listener_id: str = "") -> dict:
+        if listener_kind not in {"invite", "address"}:
+            return {"t": "nack", "why": "request listener kind is invalid"}
+        if not isinstance(frame, dict) or frame.get("t") != "env":
             return {"t": "nack", "why": "expected a signed request"}
-        env, body = frame.get("env") or {}, frame.get("body") or {}
-        if env.get("kind") != "contact.request" or not isinstance(body, dict):
+        env, body = frame.get("env"), frame.get("body")
+        if not isinstance(env, dict) or not isinstance(body, dict):
             return {"t": "nack", "why": "expected contact.request"}
+        if not isinstance(env.get("kind"), str) or env.get("kind") != "contact.request":
+            return {"t": "nack", "why": "expected contact.request"}
+        required_env_strings = {
+            "schema": 128, "from_node": 64, "author": 256, "to": 64,
+            "nonce": 24, "body_sha256": 64,
+        }
+        if any(not isinstance(env.get(key), str) or len(env[key]) > limit
+               for key, limit in required_env_strings.items()) or \
+                not self._valid_hex(env.get("from_node"), 64) or \
+                not self._valid_hex(env.get("to"), 64) or \
+                not self._valid_hex(env.get("nonce"), 24) or \
+                not self._valid_hex(env.get("body_sha256"), 64) or \
+                isinstance(env.get("ts"), bool) or not isinstance(env.get("ts"), int) or \
+                not isinstance(env.get("grant"), dict) or not isinstance(env.get("sig"), dict) or \
+                ("lease" in env and not isinstance(env["lease"], dict)) or \
+                ("custody" in env and not isinstance(env["custody"], str)):
+            return {"t": "nack", "why": "request envelope fields are malformed"}
+        person, node = body.get("person"), body.get("node")
+        nickname, mid = body.get("nickname"), body.get("mid")
+        if not self._valid_hex(person, 64) or not self._valid_hex(node, 64):
+            return {"t": "nack", "why": "request person or node key is malformed"}
+        if not isinstance(nickname, str) or len(nickname) > 40 or not self._valid_hex(mid, 24):
+            return {"t": "nack", "why": "request nickname or message id is malformed"}
+        allowed = {"person", "node", "nickname", "mid", "ledger_key", listener_kind}
+        if set(body) - allowed:
+            return {"t": "nack", "why": "request has unexpected fields"}
+        identity = body.get(listener_kind)
+        if not self._valid_hex(identity, 32) or identity != listener_id:
+            return {"t": "nack", "why": f"request is not bound to this {listener_kind}"}
+        ledger_key = body.get("ledger_key", "")
+        if "ledger_key" in body and (not self._valid_hex(ledger_key, 64) or ledger_key != node):
+            return {"t": "nack", "why": "request ledger key is not its node key"}
         try:
-            person, node = body["person"], body["node"]
-            verify_envelope(env, person)
-        except (KeyError, SignerError) as e:
+            verify_envelope(env, person, now=int(self._clock()))
+        except Exception as e:  # noqa: BLE001 - malformed nested grants/signatures are untrusted
             return {"t": "nack", "why": f"request does not verify: {e}"}
         if env.get("from_node") != node or env.get("to") != self.person or \
                 env.get("body_sha256") != body_hash(body):
             return {"t": "nack", "why": "request identity or contents do not match its signed envelope"}
-        has_invite, has_address = "invite" in body, "address" in body
-        if has_invite and has_address:
-            return {"t": "nack", "why": "request cannot carry both an invite and an address"}
-        if has_invite:
-            if body.get("invite") != nonce:
-                return {"t": "nack", "why": "request is not bound to this invite"}
-        elif has_address:
-            address = self.store.address(active_only=True)
-            if not address or body.get("address") != address["aid"]:
+        if listener_kind == "address":
+            address = self.store.address(active_only=True, now=int(self._clock()))
+            if not address or listener_id != address["aid"]:
                 return {"t": "nack", "why": "request address is off, expired, or no longer current"}
-        else:
-            return {"t": "nack", "why": "request has neither an invite nor an address"}
         if person == self.person:
             return {"t": "nack", "why": "cannot connect to yourself"}
-        ledger_key = body.get("ledger_key", "")
-        if has_address:
-            if self.store.is_blocked(person):
-                return {"t": "nack", "why": "not accepting requests from you"}
-            if self.store.contact(person) is not None:
-                return {"t": "nack", "why": "you are already a contact"}
-            per_person, total = self.store.pending_address_counts(person)
-            if per_person >= 1:
-                return {"t": "nack", "why": "you already have a pending address request"}
-            if total >= ADDRESS_PENDING_TOTAL_MAX:
-                return {"t": "nack", "why": "busy, try later"}
-            if self.store.recent_address_request_count(int(time.time()) - 86400) >= ADDRESS_DAILY_MAX:
-                return {"t": "nack", "why": "daily request limit reached, try later"}
-            if "ledger_key" in body and (not isinstance(ledger_key, str) or len(ledger_key) != 64
-                                         or any(ch not in "0123456789abcdef" for ch in ledger_key)
-                                         or ledger_key != node):
-                return {"t": "nack", "why": "request ledger key is not its node key"}
-            rid = self.store.add_request(
-                person, node, str(body.get("nickname", ""))[:40], "",
-                ledger_key if isinstance(ledger_key, str) else "", source="address",
-                source_id=body["address"])
+        if listener_kind == "address":
+            rid, reason, expired = self.store.admit_address_request(
+                person, node, nickname, ledger_key, listener_id, now=int(self._clock()),
+                pending_ttl_s=ADDRESS_PENDING_TTL_S,
+                pending_total_max=ADDRESS_PENDING_TOTAL_MAX, daily_max=ADDRESS_DAILY_MAX)
+            if expired:
+                self.log(f"expired {expired} stale address request(s)")
+            if not rid:
+                return self._address_nack(person, reason)
         else:
-            if "ledger_key" in body and (not isinstance(ledger_key, str) or len(ledger_key) != 64
-                                         or any(ch not in "0123456789abcdef" for ch in ledger_key)
-                                         or ledger_key != node):
-                return {"t": "nack", "why": "request ledger key is not its node key"}
-            if not self.store.consume_invite(nonce, person):
+            if not self.store.consume_invite(listener_id, person):
                 return {"t": "nack", "why": "invite already used or expired"}
-            rid = self.store.add_request(person, node, str(body.get("nickname", ""))[:40], nonce,
-                                         ledger_key if isinstance(ledger_key, str) else "")
-        self.log(f"connection request {rid} from {person[:12]} ({body.get('nickname', '')!r})")
-        return {"t": "ack", "mid": body.get("mid", "")}
+            rid = self.store.add_request(person, node, nickname, listener_id, ledger_key)
+        self.log(f"connection request {rid} from {person[:12]} ({nickname!r})")
+        return {"t": "ack", "mid": mid}
 
     # ── redeeming someone else's invite ──────────────────────────────────────────────────────
     def redeem(self, code: str, nickname: str = "", petname: str = "", wait_s: float = 0.0) -> dict:
@@ -2008,8 +2095,10 @@ class Node:
     def sweep(self, now: Optional[float] = None) -> int:
         """Expire tasks whose deadline passed without an accepted result: refund the poster's escrow and
         tell the assignee; mark this node's own offers/claims expired. Returns how many expired."""
-        now = time.time() if now is None else now
-        n = 0
+        now = self._clock() if now is None else now
+        n = self.store.expire_address_requests(int(now), ADDRESS_PENDING_TTL_S)
+        if n:
+            self.log(f"expired {n} stale address request(s)")
         self.reconcile_starters(now=int(now))
         self.reconcile_escrow()
         for t in self.store.tasks_in_states(("posted", "assigned", "awaiting_approval", "offered", "claimed")):
@@ -2378,11 +2467,14 @@ def handle(node: Node, req: dict) -> dict:
         if op == "register_invite":
             return {"ok": True, **node.register_invite(req["code"])}
         if op == "register_address":
-            return {"ok": True, **node.register_address(req["code"], req.get("install_line", ""))}
+            return {"ok": True, **node.register_address(
+                req["code"], req.get("install_line", ""), ts=req.get("ts"),
+                signature=req.get("signature", ""))}
         if op == "address_status":
             return {"ok": True, **node.address_status()}
         if op == "address_off":
-            return {"ok": True, **node.address_off()}
+            return {"ok": True, **node.address_off(
+                req.get("aid", ""), ts=req.get("ts"), signature=req.get("signature", ""))}
         if op == "redeem":
             return {"ok": True, **node.redeem(req["code"], req.get("nickname", ""), req.get("petname", ""),
                                               float(req.get("wait_s", 0)))}

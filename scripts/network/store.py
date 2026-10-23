@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS starter_obligations (invite_id TEXT PRIMARY KEY, pers
 CREATE TABLE IF NOT EXISTS address_state (slot INTEGER PRIMARY KEY CHECK(slot=1), code TEXT NOT NULL,
     aid TEXT NOT NULL, ik TEXT NOT NULL, expires_at INTEGER NOT NULL, created INTEGER NOT NULL,
     enabled INTEGER NOT NULL, install_line TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS retired_address_aids (aid TEXT PRIMARY KEY, retired_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS request_sources (request_id TEXT PRIMARY KEY, source TEXT NOT NULL,
     source_id TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS request_sources_source_idx ON request_sources(source, source_id);
@@ -93,6 +94,11 @@ class Store:
         os.chmod(self._db_path, 0o600)
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.executescript(SCHEMA)
+        # An address disabled by the pre-hardening build is already retired evidence. Preserve it
+        # before any caller can try to re-register the same aid after an upgrade.
+        self._db.execute(
+            "INSERT OR IGNORE INTO retired_address_aids(aid,retired_at) "
+            "SELECT aid,created FROM address_state WHERE enabled=0")
         self._lock = threading.Lock()
         self._raw = self.dir / "inbox-raw.jsonl"
         try:   # contacts.name_src: "yours" (the person named them) | "self-chosen" (their nickname / note)
@@ -376,13 +382,28 @@ class Store:
     # public request address (additive side table; legacy request/invite shapes stay untouched)
     def set_address(self, code: str, aid: str, ik: str, expires_at: int, install_line: str = "",
                     now: Optional[int] = None) -> None:
-        self._q(
-            "INSERT INTO address_state(slot,code,aid,ik,expires_at,created,enabled,install_line) "
-            "VALUES(1,?,?,?,?,?,1,?) "
-            "ON CONFLICT(slot) DO UPDATE SET code=excluded.code,aid=excluded.aid,ik=excluded.ik,"
-            "expires_at=excluded.expires_at,created=excluded.created,enabled=1,"
-            "install_line=excluded.install_line",
-            (code, aid, ik, int(expires_at), int(time.time() if now is None else now), install_line))
+        now = int(time.time() if now is None else now)
+
+        def fn(db):
+            if db.execute("SELECT 1 FROM retired_address_aids WHERE aid=?", (aid,)).fetchone():
+                raise ValueError("that request address aid was retired and cannot be registered again")
+            current = db.execute("SELECT aid,enabled FROM address_state WHERE slot=1").fetchone()
+            if current and not current[1]:
+                db.execute("INSERT OR IGNORE INTO retired_address_aids(aid,retired_at) VALUES (?,?)",
+                           (current[0], now))
+                if current[0] == aid:
+                    raise ValueError("that request address aid was retired and cannot be registered again")
+            if current and current[0] != aid:
+                db.execute("INSERT OR IGNORE INTO retired_address_aids(aid,retired_at) VALUES (?,?)",
+                           (current[0], now))
+            db.execute(
+                "INSERT INTO address_state(slot,code,aid,ik,expires_at,created,enabled,install_line) "
+                "VALUES(1,?,?,?,?,?,1,?) "
+                "ON CONFLICT(slot) DO UPDATE SET code=excluded.code,aid=excluded.aid,ik=excluded.ik,"
+                "expires_at=excluded.expires_at,created=excluded.created,enabled=1,"
+                "install_line=excluded.install_line",
+                (code, aid, ik, int(expires_at), now, install_line))
+        self._tx(fn)
 
     def address(self, *, active_only: bool = False, now: Optional[int] = None) -> Optional[dict]:
         rows = self._q(
@@ -396,10 +417,20 @@ class Store:
             return None
         return row
 
-    def retire_address(self) -> bool:
-        with self._lock:
-            cur = self._db.execute("UPDATE address_state SET enabled=0 WHERE slot=1 AND enabled=1")
-            return cur.rowcount == 1
+    def retire_address(self, aid: str, *, now: Optional[int] = None) -> bool:
+        now = int(time.time() if now is None else now)
+
+        def fn(db):
+            current = db.execute("SELECT aid,enabled FROM address_state WHERE slot=1").fetchone()
+            if not current or current[0] != aid:
+                raise ValueError("that request address is not current")
+            if not current[1]:
+                return False
+            db.execute("INSERT OR IGNORE INTO retired_address_aids(aid,retired_at) VALUES (?,?)",
+                       (aid, now))
+            db.execute("UPDATE address_state SET enabled=0 WHERE slot=1")
+            return True
+        return self._tx(fn)
 
     # requests (someone redeemed our invite and asks to connect)
     def add_request(self, person: str, node: str, nickname: str, invite_nonce: str,
@@ -502,6 +533,56 @@ class Store:
             "SELECT COUNT(*) FROM requests r JOIN request_sources s ON s.request_id=r.id "
             "WHERE s.source='address' AND r.received>=?", (int(since),))
         return int(rows[0][0])
+
+    @staticmethod
+    def _expire_address_requests(db, cutoff: int) -> int:
+        cur = db.execute(
+            "UPDATE requests SET state='expired' WHERE state='pending' AND received<=? "
+            "AND id IN (SELECT request_id FROM request_sources WHERE source='address')",
+            (int(cutoff),))
+        return cur.rowcount
+
+    def expire_address_requests(self, now: int, ttl_s: int) -> int:
+        return self._tx(lambda db: self._expire_address_requests(db, int(now) - int(ttl_s)))
+
+    def admit_address_request(self, person: str, node: str, nickname: str, ledger_key: str,
+                              aid: str, *, now: int, pending_ttl_s: int,
+                              pending_total_max: int, daily_max: int) -> tuple[Optional[str], str, int]:
+        """Check every stranger gate and insert under one BEGIN IMMEDIATE transaction."""
+        rid = secrets.token_hex(4)
+        sealed_nickname = self._enc("requests", "nickname", self._pk((rid,)), nickname[:40])
+
+        def fn(db):
+            expired = self._expire_address_requests(db, int(now) - int(pending_ttl_s))
+            blocked = db.execute("SELECT 1 FROM blocks WHERE person=? AND until>?",
+                                 (person, int(now))).fetchone()
+            if blocked:
+                return None, "blocked", expired
+            if db.execute("SELECT 1 FROM contacts WHERE person=?", (person,)).fetchone():
+                return None, "already a contact", expired
+            mine, total = db.execute(
+                "SELECT SUM(CASE WHEN r.person=? THEN 1 ELSE 0 END),COUNT(*) FROM requests r "
+                "JOIN request_sources s ON s.request_id=r.id "
+                "WHERE r.state='pending' AND s.source='address'", (person,)).fetchone()
+            if int(mine or 0) >= 1:
+                return None, "already has a pending address request", expired
+            if int(total or 0) >= int(pending_total_max):
+                return None, "pending address request cap reached", expired
+            recent = db.execute(
+                "SELECT COUNT(*) FROM requests r JOIN request_sources s ON s.request_id=r.id "
+                "WHERE s.source='address' AND r.received>=?", (int(now) - 86400,)).fetchone()[0]
+            if int(recent) >= int(daily_max):
+                return None, "daily address request cap reached", expired
+            db.execute("INSERT INTO requests (id,person,node,nickname,invite_nonce,received,state) "
+                       "VALUES (?,?,?,?,?,?, 'pending')",
+                       (rid, person, node, sealed_nickname, "", int(now)))
+            if ledger_key:
+                db.execute("INSERT INTO request_ledger_keys(request_id,ledger_key) VALUES (?,?)",
+                           (rid, ledger_key))
+            db.execute("INSERT INTO request_sources(request_id,source,source_id) VALUES (?, 'address', ?)",
+                       (rid, aid))
+            return rid, "", expired
+        return self._tx(fn)
 
     # address-request block list
     def block(self, person: str, until: int, reason: str = "manual block",

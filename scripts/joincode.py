@@ -90,6 +90,7 @@ def decode_join(code: str, *, now: int) -> dict:
 # {alg, keyid, value} signature block match Sthambha's signer and trisul's cap_guard.
 
 import hashlib
+import re
 import secrets
 import sqlite3
 import threading
@@ -264,8 +265,20 @@ def _validate_address_release(value: object) -> None:
         raise ValueError("address release entry is malformed")
     if not all(isinstance(v, str) and v for v in value.values()):
         raise ValueError("address release entry is malformed")
-    if not value["url"].startswith(("http://", "https://")):
-        raise ValueError("address release URL must be http(s)")
+    try:
+        parsed = urlsplit(value["url"])
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("address release URL is malformed") from exc
+    if (parsed.scheme not in {"http", "https"} or not parsed.hostname
+            or parsed.username is not None or parsed.password is not None
+            or parsed.query or parsed.fragment or value["url"].endswith("/")
+            or (port is not None and not 1 <= port <= 65535)
+            or not re.fullmatch(r"[A-Za-z0-9:/._~%\-\[\]]+", value["url"])):
+        raise ValueError("address release URL is malformed")
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", value["channel"]) or \
+            not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", value["version"]):
+        raise ValueError("address release channel or version is malformed")
     if len(value["pubkey"]) != 64 or any(c not in "0123456789abcdef" for c in value["pubkey"]):
         raise ValueError("address release key is malformed")
 

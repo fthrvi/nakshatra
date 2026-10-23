@@ -28,16 +28,19 @@ page, or message:
     nak address off                            # the current address dies immediately
 
 Every `on` mints a new address, so running it again rotates the old one out immediately. Addresses
-are off by default. A stranger pastes the printed line just like an invite. It installs the exact
-signed release named by the address, creates the stranger's identity locally, and sends only a
-connection request. The stranger sees, plainly, that nothing is shared until the named person
-accepts.
+are off by default, and an address ID that has ever been rotated out or turned off can never be
+registered again. Registering or turning off an address requires a fresh signature from the person
+key; an agent, MCP tool, or bare socket caller cannot do either operation. A stranger pastes the
+printed line just like an invite. It installs the exact signed release named by the address, creates
+the stranger's identity locally, and sends only a connection request. The stranger sees, plainly,
+that nothing is shared until the named person accepts.
 
 An address request always requires a person-signed interactive `nak accept <id>`; an MCP tool,
 socket caller, or non-interactive CLI cannot accept it. `nak requests` labels it `address` rather
 than `invite`. The receiver admits at most one pending address request per person key, 20 pending
-address requests total, and 50 new address requests in a rolling 24 hours. Declining one blocks
-that person key for 30 days. Blocks can also be managed directly:
+address requests total, and 50 new address requests in a rolling 24 hours. A pending address request
+expires after 7 days and no longer occupies a slot. Declining one blocks that person key for 30 days.
+Blocks can also be managed directly:
 
     nak block <person-key-or-request-id> --days 30
     nak blocked
@@ -46,8 +49,8 @@ that person key for 30 days. Blocks can also be managed directly:
 The address's rendezvous key (`ik`) is public by design: the address gives its holder only a way to
 **ask**, never a way to message, receive starter credit, or become a contact. The v1 listener handles
 one pairing at a time, so a flood can slow it down; relay limits and the local caps bound the damage
-but do not make it unavailable-proof. Trust the address only as much as the place where you found
-it—the signature proves it is intact and names a key, not who owns that key, exactly like an invite.
+but do not make it unavailable-proof. An address is trusted only as much as wherever you found it,
+exactly like an invite: the signature proves it is intact and names a key, not who owns that key.
 
 ## 2. You paste the line into a terminal
 

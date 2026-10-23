@@ -392,6 +392,17 @@ class TestRequestAddress:
         with pytest.raises(ValueError, match="1-365"):
             encode_address(key, _NODE, _PEERS, days=366, now=1000, release=self.release)
 
+    @pytest.mark.parametrize("changes", [
+        {"url": "https://releases.example/x;curl evil"},
+        {"channel": "canary;curl"},
+        {"version": "1.2.3' && evil"},
+    ])
+    def test_release_coordinates_are_safe_for_the_pinned_install_line(self, changes):
+        key, _ = _person()
+        release = dict(self.release, **changes)
+        with pytest.raises(ValueError, match="release"):
+            encode_address(key, _NODE, _PEERS, now=1000, release=release)
+
     def test_invite_and_address_kinds_never_cross_decode(self):
         key, _ = _person()
         invite = encode_invite(key, _NODE, _PEERS, now=1000)

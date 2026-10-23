@@ -2245,7 +2245,16 @@ def main(argv=None, *, http_post=None) -> int:
                   "  nak requests  →  nak accept <id> --as <name>", file=sys.stderr)
     elif a.cmd == "address":
         if a.address_cmd == "off":
-            call(s, {"op": "address_off"})
+            row = call(s, {"op": "address_status"})
+            if not row.get("enabled"):
+                print("request address is already off")
+                return 0
+            from network.nakd import address_control_statement
+            ts = int(time.time())
+            signature = _load_matching_person_key().sign(
+                address_control_statement("address_off", row["aid"], ts)).hex()
+            call(s, {"op": "address_off", "aid": row["aid"],
+                     "ts": ts, "signature": signature})
             print("request address off; the old address is dead immediately")
         elif a.address_cmd == "show":
             row = call(s, {"op": "address_status"})
@@ -2269,12 +2278,19 @@ def main(argv=None, *, http_post=None) -> int:
             from_name = a.name.strip()[:40] or (name_file.read_text().strip() if name_file.exists() else "")
             if a.name:
                 _write_private(name_file, (from_name + "\n").encode())
+            person_priv = _load_matching_person_key()
             code = joincode.encode_address(
-                _load_matching_person_key(), st["node"],
+                person_priv, st["node"],
                 [{"node": st["node"], "addrs": [st["relay"]]}], days=a.days,
                 from_name=from_name, release=release)
             install_line = line.replace("{CODE}", code)
-            call(s, {"op": "register_address", "code": code, "install_line": install_line})
+            from network.nakd import address_control_statement
+            aid = joincode.decode_address(code)["aid"]
+            ts = int(time.time())
+            signature = person_priv.sign(
+                address_control_statement("register_address", aid, ts)).hex()
+            call(s, {"op": "register_address", "code": code, "install_line": install_line,
+                     "ts": ts, "signature": signature})
             print(code)
             print(install_line)
             print("request address on (rotated): anyone with this line may ask; nothing is shared until you accept",

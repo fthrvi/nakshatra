@@ -30,6 +30,18 @@ def _invite(p, **kw):
     return joincode.encode_invite(p.person_priv, p.node.node, [{"node": p.node.node, "addrs": []}], release=REL, **kw)
 
 
+def _register_address(p, code):
+    address = joincode.decode_address(code)
+    base = f"{REL['url']}/{REL['channel']}/{REL['version']}"
+    line = (f"mkdir -p ~/nak-join && cd ~/nak-join && curl -fsSO {base}/install.py "
+            f"-O {base}/releasekit.py && printf '%s  install.py\\n%s  releasekit.py\\n' "
+            f"{'1' * 64} {'2' * 64} | sha256sum -c --quiet && python3 install.py join '{code}'")
+    ts = int(time.time())
+    signature = p.person_priv.sign(
+        nakd.address_control_statement("register_address", address["aid"], ts)).hex()
+    p.node.register_address(code, line, ts=ts, signature=signature)
+
+
 def _resign_invite(p, code, **changes):
     body = json.loads(joincode._unb64u(code[5:]))
     body.update(changes)
@@ -449,7 +461,7 @@ def test_join_setup_address_path_sends_request_and_prints_person_boundary(net, t
     code = joincode.encode_address(
         a.person_priv, a.node.node, [{"node": a.node.node, "addrs": []}],
         days=90, from_name="Biswa", release=REL)
-    a.node.register_address(code)
+    _register_address(a, code)
     home = tmp_path / "stranger"
     join_setup.ensure_identity(home)
     sg = signer_mod.Signer(home / ".sthambha" / "signer", custody="test")

@@ -221,7 +221,8 @@ def test_old_contact_request_without_ledger_key_connects_but_stays_pending(net):
     body = {"person": consumer.person_pub, "node": consumer.node.node, "nickname": "old",
             "invite": inv["nonce"], "mid": "a" * 24}
     env = consumer.node._sign("contact.request", inviter.person_pub, body)
-    assert inviter.node._take_request({"t": "env", "env": env, "body": body}, inv["nonce"])["t"] == "ack"
+    assert inviter.node._take_request(
+        {"t": "env", "env": env, "body": body}, "invite", inv["nonce"])["t"] == "ack"
     _human_accept(inviter, inviter.node.store.requests()[0]["id"], "old")
     starter = inviter.node.starter_status()["starters"][0]
     assert starter["state"] == "pending" and starter["to_keyid"] is None
@@ -251,7 +252,7 @@ def test_claimed_rostered_key_waits_for_that_node_but_connected_contact_pays(net
         "body_sha256": nakd.body_hash(body), "grant": grant,
     })
     assert inviter.node._take_request(
-        {"t": "env", "env": envelope, "body": body}, inv["nonce"])["t"] == "ack"
+        {"t": "env", "env": envelope, "body": body}, "invite", inv["nonce"])["t"] == "ack"
     request = inviter.node.store.requests()[0]
     _human_accept(inviter, request["id"], "consumer")
     assert wait(lambda: "waiting for consumer's node to connect" in
