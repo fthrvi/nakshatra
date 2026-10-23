@@ -16,7 +16,7 @@ State as of 2026-10-20 (release 0.15.20 live on hub, bro, container).
 | One-line install from an invite | `nak invite` → one line; sha-pinned installer, signed invite, pinned release key, keys made locally (docs/JOIN.md) | — | — |
 | Getting an invite at all | Only from an existing member running `nak invite` | A way for a stranger to ask for one without knowing a member (public request page or `nak join --request`, queued for an operator) | M + **D** (who may admit strangers) |
 | Being accepted | `nak requests` / `nak accept` by the inviter | Today every outsider is accepted by Biswa by hand. Needs a written admission policy per tier (stranger/known/trusted) and who besides Biswa may accept | S code, **D** policy |
-| Public release host | Releases are already published to the VPS (`45.63.109.137:8960`, signed `latest.json`) | JOIN.md still says "mesh only"; invites must name the public URL by default; one test join from a non-mesh box | S |
+| Public release host | 2026-10-22: outsider routing proved (`10.42.0.1` blocked, public `latest.json` 200); invite used `~/.nakshatra/net/release-url`; signed `0.15.20` installed from `45.63.109.137:8960`; JOIN.md now documents the public host | Clean-box join then hit the missing first-install systemd units; fix and rerun ([finding](findings/2026-10-22-clean-box-join.md)) | S code + rerun |
 | Platforms | Linux, Windows via WSL (systemd), any OS with Docker via `nakc` | macOS native (no systemd); a Windows note that WSL stops idle distros (bro's durability problem) | M (mac) · S (note) |
 | Release signing + custody | Works, but the release key is `release-TEST.key` and person keys are plaintext TEST files (`custody test`) | A non-TEST release key held off the hub; person key off-box (vault/TPM + Face ID plan of 2026-10-20) before strangers trust our updates | M + **D** |
 
@@ -25,8 +25,8 @@ State as of 2026-10-20 (release 0.15.20 live on hub, bro, container).
 | Item | Exists | Missing | Size |
 |---|---|---|---|
 | MCP server | `nak-mcp`, 22 tools: messages, threads, agent cards, tasks (post/claim/submit), balance, wallet (read-only), models, ask, worker status; remote text always framed untrusted | — | — |
-| Harness docs | docs/HARNESSES.md: OpenClaw, Hermes, Claude Code, Codex, OpenAI-compatible `127.0.0.1:11600/v1` | One copy-paste block per harness, tested on a clean box each release (today only OpenClaw is exercised, by bro) | S |
-| Agent permission lifetime | Sliding grant live today: charter (≤1 yr) + 7-day wire lease, active while used, lapses after 30 idle days, `nak grant renew` wakes it | Join still mints only `nak.msg,nak.task.claim`; posting/paying needs a human `nak grant renew --caps …` (correct by design; needs one line in JOIN.md) | S |
+| Harness docs | 2026-10-22: HARNESSES.md has one copy-paste block each for OpenClaw, Hermes, Claude Code, Codex config.toml, generic stdio, and the OpenAI endpoint; installed OpenClaw/Claude/Codex syntax checked; all 21 MCP tools listed | Hermes was not installed; clean-box MCP run was blocked before service start and must be rerun after the join fix | S rerun |
+| Agent permission lifetime | 2026-10-22: JOIN.md states the join caps, ≤365-day charter, 7-day wire lease, 30-day idle lapse, and tested `nak grant renew --caps …` forms for posting and capped payment | Live renewal on a freshly joined node was not reached because of the same systemd-unit blocker | S rerun |
 | Small-model robustness | MCP accepts parameter aliases, plain "Not done: needs X" errors | 8B agents still report false success; a `nak_task_status` / verify step the agent is told to call | S |
 
 ## 3. Sell compute
@@ -34,7 +34,7 @@ State as of 2026-10-20 (release 0.15.20 live on hub, bro, container).
 | Item | Exists | Missing | Size |
 |---|---|---|---|
 | Worker admission | `nak invite --kind worker --tier known` → redeem proves node key → roster row | Same "who invites a stranger" gap as §1 | (see §1) |
-| Running a worker | `nak worker build/on/off/status`, signed packages verified per byte, owner lease (machine owner's use wins), unload on idle, warm pools | JOIN.md still says workers use `worker.sh` (stale); a GPU preflight that tells the outsider "your card can serve X" before they start | S (doc) · M (preflight) |
+| Running a worker | 2026-10-22: JOIN.md now shows `nak worker build/on/off/status`, required signed-package/pillar inputs, owner lease (machine owner's use wins), and unload/reload on idle | A GPU preflight that tells the outsider "your card can serve X" before they start | M |
 | Models to serve | One signed package (`llama32-3b`) | More signed packages and a published catalog matching common consumer GPUs | M |
 | Getting paid | Paid inference live (hold before compute, worker earns); M2 task escrow live (hold at assign, paid on accept) | Earnings cash out only at known+ after a 7-day hold, and withdrawals are not switched on (see §5) | (see §5) |
 

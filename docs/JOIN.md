@@ -1,7 +1,12 @@
 # Joining Nakshatra
 
-Four steps. You don't need an account, a website, or anyone's permission except the friend who
-invites you.
+The join is meant to take four steps. A clean-box test on 2026-10-22 found a blocker in the live
+`0.15.20` release: a first install makes the keys, but does not write the `nak-signer` or `nak-net`
+systemd units. It therefore cannot start the node or send the connection request. Do not tell a
+stranger that the current release completes these steps. See
+[the clean-box finding](findings/2026-10-22-clean-box-join.md).
+
+Once a release with that fix is published, this is the shortest path.
 
 ## 1. A friend invites you
 
@@ -9,23 +14,33 @@ On their node they run
 
     nak invite --note "for Rajesh"
 
-and send you the **one line** it prints. Treat it like a key: it works once, expires (24 h by
-default), and is meant only for you.
+and send you the **one line** it prints. Treat it like a key: it works once, expires after 24 hours
+by default, and is meant only for you.
+
+An invitation is not authority over you. Anyone who has your ID can ask to connect. Nothing flows
+until **you** accept, and every person makes that decision for themselves. How a stranger who knows
+no member gets their first invitation is not solved yet.
 
 ## 2. You paste the line into a terminal
 
-Linux, or Windows with WSL (systemd on). The line:
+Use Linux with a systemd user session and `curl`, `sha256sum`, and Python 3. Windows works through
+WSL with systemd enabled. WSL stops an idle distro, which also stops the node; keep the distro alive
+with a long-running process. See the [Windows worker notes](WINDOWS-WORKER.md) for the WSL path and
+its limits.
 
-1. downloads the installer of **exactly the version your friend runs**, and refuses to run it if
-   its fingerprint (sha256) doesn't match the one in the line;
-2. checks the invite is **signed by your friend** and has not expired;
-3. installs the node from the release your friend's invite names, **pinning that release key**:
-   every later update must be signed by it;
-4. makes **your keys**: a node key, and a person key (TEST: a file in `~/.sthambha`; back it up,
-   never share it);
-5. creates one **agent** that may message and claim tasks, nothing else. It cannot post tasks
-   or pay; you grant those separately;
-6. starts the services, which come back after a reboot, and **asks your friend to connect**.
+The line:
+
+1. downloads the installer for **exactly the version your friend runs**, and refuses to run it if
+   its SHA-256 fingerprint does not match the one in the line;
+2. checks that the invite is **signed by your friend** and has not expired;
+3. installs the release named by the invite and **pins that release key**, so later updates must be
+   signed by the same key;
+4. makes **your keys**: a node key and a person key (today the person key is a TEST file under
+   `~/.sthambha`; back it up and never share it);
+5. creates one agent with only `nak.msg,nak.task.claim`;
+6. starts `nak-signer` and `nak-net`, enables them after reboot, and asks your friend to connect.
+
+Step 6 is where release `0.15.20` currently stops because of the blocker above.
 
 ## 3. Your friend accepts
 
@@ -34,40 +49,79 @@ Linux, or Windows with WSL (systemd on). The line:
 
 Nothing is shared and no message can flow until they accept. Then:
 
-    nak contacts                 # each of you sees the other as active
-    nak send rajesh "hello"      ·   nak inbox
+    nak contacts
+    nak send rajesh "hello"
+    nak inbox
+
+Run the same commands on the other node to send and read the reply.
 
 ## 4. (Optional) Plug in your AI
 
-    # OpenClaw
-    openclaw mcp add nakshatra --command ~/.local/bin/nak-mcp
-    openclaw config set tools.toolSearch false   # small local models can't use tool search
+See [HARNESSES.md](HARNESSES.md) for copy-paste setup for OpenClaw, Hermes, Claude Code, Codex,
+other stdio MCP clients, and the OpenAI-compatible `http://127.0.0.1:11600/v1` provider.
 
-    # Hermes: an mcp_servers entry whose command is ~/.local/bin/nak-mcp
+Your AI can read messages, message accepted contacts, claim tasks, see inference credits, and ask
+models through this node's local credit-enforced gateway. Outside messages are always marked as
+untrusted content. Connection decisions stay with you unless you deliberately start `nak-mcp` with
+`--allow-connect`.
 
-Your AI can then read messages (always marked as untrusted outside content), message your
-contacts, take on tasks your contacts post, see inference credits, and ask models through this
-node's local, credit-enforced gateway. It can't accept connections; that stays with you. See
-[HARNESSES.md](HARNESSES.md) for OpenClaw, Hermes, Claude Code, Codex, every MCP tool, and the
-OpenAI-compatible `http://127.0.0.1:11600/v1` provider setup.
+## Agent permissions
+
+Join gives the agent only `nak.msg,nak.task.claim`. The `--caps` value below is the complete new
+set, so keep the two join caps when widening it. A human runs one of these in a terminal and confirms
+the change:
+
+    # Also let the agent post tasks.
+    nak grant renew --caps nak.msg,nak.task.claim,nak.task.post
+
+    # Also let it pay. Spend limits are base credit units; choose your own limits.
+    nak grant renew --caps nak.msg,nak.pay,nak.task.claim,nak.task.post --per-tx-cap 500 --day-cap 2000
+
+The charter lasts at most 365 days. The credential sent to contacts lasts at most 7 days and renews
+while the agent is used. After 30 idle days the grant lapses and a human must run `nak grant renew`
+to wake it.
 
 ## Sharing compute
 
-An operator can make a signed worker invite with the same installer and identity path:
+An operator makes a signed worker invite:
 
     nak invite --kind worker --tier known --note "GPU box"
 
-The command stages a one-time admission code with the onboard service (using
-`NAK_ONBOARD_TOKEN`, or `~/.nakshatra/onboard.token` if that file is mode `0600`) and seals the
-code, tier, and redeem URL inside the signed invite. The joining box creates the normal node and
-contact identity first, then proves possession of that node key to redeem its worker standing. It
-prints the admitted tier and junction. If the onboard service is temporarily unavailable, contact
-setup remains complete and the box can retry while the code is valid:
+The invite carries a one-time admission code. The joining node first creates its normal contact
+identity, then proves that it owns its node key and receives worker standing. If the onboard service
+is temporarily unavailable after contact setup, retry while the code is valid:
 
     nak worker-redeem
 
-Worker execution itself still uses the existing `worker.sh` runtime until phase B; phase A unifies
-the signed invite, installer, admission proof, and node key.
+Build the engine shipped in the signed release, then turn on the worker. The inviter supplies the
+package URL, its 64-hex signing key, the pillar URL and pin, the layer range, and the port:
+
+    nak worker build
+    nak worker on \
+      --model-id llama32-3b \
+      --package-url PASTE_SIGNED_PACKAGE_URL \
+      --package-pubkey PASTE_64_HEX_PACKAGE_SIGNER \
+      --pillar-url https://PILLAR_HOST:PORT \
+      --pillar-spki PASTE_64_HEX_PILLAR_PIN \
+      --layers 0-28 \
+      --port 50051
+    nak worker status
+
+Remote model packages must be signed by the pinned package key, and every downloaded artifact is
+checked by SHA-256. Today there is one signed model package: `llama32-3b`.
+
+The GPU daemon unloads after 600 idle seconds by default while the service stays ready. The next
+request rechecks the saved model hash and reloads it once. The optional owner lease lets a local
+sentinel give the machine owner's own GPU use priority; a lapsed lease refuses network work and
+unloads the model:
+
+    nak worker owner-lease on
+    nak worker owner-lease status
+
+Turn sharing off, or turn it back on with the saved configuration:
+
+    nak worker off
+    nak worker on
 
 ## Using the network without serving
 
@@ -77,39 +131,43 @@ never advertised, planned, or summoned as an inference worker:
     nak invite --kind consumer --tier known --starter 0 --note "laptop"
 
 `known` is the default tier; `self` cannot be granted by an invite. `--starter N` is optional and
-defaults to zero. A nonzero starter is not minted during onboarding: redeem records a pending
-request for the hub to transfer `N` credits from the inviter's ledger operator to the new consumer.
-The ledger applies its normal balance and overdraft checks when that signed transfer is wired.
+defaults to zero. A nonzero starter is a spend-only trial credit: it may be spent on the network but
+can never be withdrawn. Only money the person deposits can cash out. The transfer is **not wired
+yet**: onboarding records only a pending starter request today.
 
-The consumer proves possession of its node key during redeem, but reports no GPU capabilities and
-opens no worker port. Its roster row is marked `consumer`, so registrar, planner, and activation
-admission paths exclude it. It may run the loopback gateway and harnesses without serving model
-layers; gateway commands are documented with the gateway feature itself.
+The consumer proves possession of its node key during redeem, reports no GPU capabilities, and
+opens no worker port. Its roster row is `consumer`, so worker planning and activation exclude it.
+It can run the loopback gateway and harnesses without serving model layers.
 
 ## What each side can see
 
 | Who | Sees |
 |---|---|
-| Your friend | your person key, node key, the name you chose. **Not** your IP address, unless you BOTH turn on direct connections for each other (`nak direct <name> on`): then they learn your LAN/IPv6 addresses. If p2p is also on, the hole-punch connection exposes your public IP to that contact. |
-| The relay operator | that two IP addresses met. Everything else is encrypted. |
-| Anyone else | nothing. They can't reach you without an accepted connection. |
+| Your friend | Your person key, node key, and the name you chose. **Not** your IP address, unless you both turn on direct connections for each other with `nak direct <name> on`. Direct mode shares LAN/IPv6 addresses; p2p hole punching also exposes public IPs to that contact. |
+| The relay operator | That two IP addresses met. Everything else is encrypted. |
+| Anyone else | Nothing. They cannot exchange messages with you without an accepted connection. |
 
 ## Why trust the download?
 
-You trust **the person who sent you the line**. The line holds the installer's fingerprint, and
-the invite names the release key. Every later update must be signed by that key. The invite's
-signature proves the invite is intact and was made with the key it names; it can't prove *whose* key
-that is. So check with your friend, through a channel you already trust, that the line came from them.
+You trust **the person who sent you the line**. The line holds the installer's fingerprint, and the
+invite names the release key. Every later update must be signed by that key. The invite signature
+proves that the invite is intact and was made with the key it names; it cannot prove whose key that
+is. Check through a channel you already trust that the line came from your friend.
 
 The download server itself is not trusted:
-- it can't forge an update;
-- it can't hand you anything older than the version your friend's invite names;
-- a signed "latest" pointer expires after 60 days, so the server can't replay an old one forever;
-- it *can* still delay updates.
 
-**Revoking an agent is local today.** If you revoke one of your agents, your own signer stops signing for
-it, but your contacts don't hear about it: a copied agent key keeps working toward them until its grant
-expires (90 days for the agent a join creates). Shared revocation is on the list.
+- it cannot forge an update;
+- it cannot hand you anything older than the version named by your friend's invite;
+- a signed `latest.json` pointer expires after 60 days, so the server cannot replay an old pointer
+  forever;
+- it can still delay updates.
 
-**Today's limits.** Releases are served from the mesh (`10.42.0.1:8960`), so only machines on the
-mesh can join until a public release host is set up. Person keys are TEST files, not a vault.
+**Revoking an agent is local today.** Your signer stops signing, but contacts do not receive that
+revocation. Someone with a copied agent key and its current wire credential can keep using it until
+that credential expires, at most 7 days. Shared revocation is still on the list.
+
+**Today's limits.** Releases are public at `http://45.63.109.137:8960`; each channel has a signed
+`latest.json`. An inviter names that host in `~/.nakshatra/net/release-url`, or overrides it for one
+invite with `nak invite --release-url http://45.63.109.137:8960`. The `0.15.20` clean-box systemd
+unit blocker above still prevents a fresh host from finishing its first join. Person keys are TEST
+files, not a vault.
