@@ -89,6 +89,7 @@ GRANT_WARN_S = 7 * 86400
 STARTER_RETRY_S = (60, 300, 1800)
 STARTER_RETRY_MAX_S = 3600
 STARTER_RETRY_WINDOW_S = 7 * 86400
+ACCEPT_PROOF_MAX_SKEW_S = 120
 # Worst case is 5 advertised endpoints × 3 s, a 10 s handshake, then the sidecar's 15 s DCUtR wait
 # plus its pinned handshake. Fifty seconds covers that sequence; only both-sides direct opt-ins wait.
 DIRECT_WAIT_S = 50.0
@@ -162,6 +163,12 @@ def recv_frame(ch) -> Optional[dict]:
 
 def body_hash(body: dict) -> str:
     return hashlib.sha256(canonical(body)).hexdigest()
+
+
+def accept_statement(request_id: str, petname: str, ts: int) -> bytes:
+    """Canonical person-signature payload for accepting a starter-bearing request."""
+    return canonical({"kind": "nak.contact.accept.v1", "request_id": request_id,
+                      "petname": petname, "ts": ts})
 
 
 # ── signer access ───────────────────────────────────────────────────────────────────────────────
@@ -559,23 +566,40 @@ class Node:
             self._backoff(attempt)
 
     # ── deciding requests ────────────────────────────────────────────────────────────────────
-    def accept(self, req_id: str, petname: str = "") -> dict:
+    def _starter_for_request(self, request: dict) -> Optional[dict]:
+        invite_row = self.store.invite(request["invite_nonce"])
+        if not invite_row or not invite_row.get("code"):
+            return None
+        inv = self._verified_starter_invite(invite_row["code"])
+        details = inv.get("consumer") if inv.get("kind") == "consumer" else None
+        if not details or details["starter"] <= 0:
+            return None
+        return {
+            "invite_id": details["code"], "to_keyid": request.get("ledger_key", ""),
+            "amount": details["starter"], "signed_invite": invite_row["code"],
+            "created": int(time.time()),
+            "reason": "" if request.get("ledger_key") else "recipient ledger key unknown",
+        }
+
+    def _verify_accept_proof(self, req_id: str, petname: str, ts, signature: str) -> None:
+        if isinstance(ts, bool) or not isinstance(ts, int) or abs(int(time.time()) - ts) > ACCEPT_PROOF_MAX_SKEW_S:
+            raise ValueError(f"a person must accept this one: nak accept {req_id}")
+        if not isinstance(signature, str) or len(signature) != 128:
+            raise ValueError(f"a person must accept this one: nak accept {req_id}")
+        try:
+            ed25519.Ed25519PublicKey.from_public_bytes(bytes.fromhex(self.person)).verify(
+                bytes.fromhex(signature), accept_statement(req_id, petname, ts))
+        except (ValueError, TypeError, InvalidSignature) as exc:
+            raise ValueError(f"a person must accept this one: nak accept {req_id}") from exc
+
+    def accept(self, req_id: str, petname: str = "", *, ts=None, signature: str = "") -> dict:
         self._require_grant("contact.accept")
         request = self.store.request(req_id)
         if not request:
             raise ValueError("no pending request with that id")
-        starter = None
-        invite_row = self.store.invite(request["invite_nonce"])
-        if invite_row and invite_row.get("code"):
-            inv = self._verified_starter_invite(invite_row["code"])
-            details = inv.get("consumer") if inv.get("kind") == "consumer" else None
-            if details and details["starter"] > 0:
-                starter = {
-                    "invite_id": details["code"], "to_keyid": request.get("ledger_key", ""),
-                    "amount": details["starter"], "signed_invite": invite_row["code"],
-                    "created": int(time.time()),
-                    "reason": "" if request.get("ledger_key") else "recipient ledger key unknown",
-                }
+        starter = self._starter_for_request(request)
+        if starter is not None:
+            self._verify_accept_proof(req_id, petname, ts, signature)
         r = self.store.decide_request(req_id, True, starter=starter)
         if not r:
             raise ValueError("no pending request with that id")
@@ -646,6 +670,12 @@ class Node:
             if not row.get("to_keyid"):
                 self._starter_pending(row, "recipient ledger key unknown", now)
                 return False
+            contact = self.store.contact(row["person"]) or {}
+            if (contact.get("node") != row["to_keyid"]
+                    or self.store.authenticated_contact_node(row["person"]) != row["to_keyid"]):
+                name = contact.get("petname") or row["person"][:12]
+                self._starter_pending(row, f"waiting for {name}'s node to connect", now)
+                return False
             try:
                 inv = self._verified_starter_invite(row["signed_invite"])
                 details = inv.get("consumer") if inv.get("kind") == "consumer" else None
@@ -701,7 +731,7 @@ class Node:
                 receipt = self.settle.starter(invite_id, row["to_keyid"], row["amount"])
             except SettlementError as exc:
                 reason = getattr(exc, "ledger_error", "") or str(exc)
-                if exc.status == 409:
+                if exc.status in {409, 422}:
                     self.store.starter_update(invite_id, state="failed", reason=reason[:200],
                                               updated=now, next_attempt=now,
                                               attempts=int(row.get("attempts") or 0) + 1)
@@ -970,6 +1000,14 @@ class Node:
                 return
             self._sessions[person] = (ch, lock)
             self._paths[person] = path
+        contact = self.store.contact(person) or {}
+        authenticated_node = contact.get("node", "")
+        if authenticated_node:
+            self.store.mark_contact_authenticated(person, authenticated_node)
+            for row in self.store.starter_rows(("pending",)):
+                if row["person"] == person and row.get("to_keyid") == authenticated_node:
+                    self.store.starter_update(row["invite_id"], next_attempt=0)
+                    self._spawn(f"starter:{row['invite_id']}", self._attempt_starter, row["invite_id"])
         advertised = False
 
         def advertise_endpoints_once() -> None:
@@ -2181,9 +2219,14 @@ def handle(node: Node, req: dict) -> dict:
             return {"ok": True, **node.redeem(req["code"], req.get("nickname", ""), req.get("petname", ""),
                                               float(req.get("wait_s", 0)))}
         if op == "requests":
-            return {"ok": True, "requests": node.store.requests()}
+            requests = node.store.requests()
+            for request in requests:
+                full = node.store.request(request["id"])
+                request["requires_person"] = bool(full and node._starter_for_request(full))
+            return {"ok": True, "requests": requests}
         if op == "accept":
-            return {"ok": True, **node.accept(req["id"], req.get("petname", ""))}
+            return {"ok": True, **node.accept(req["id"], req.get("petname", ""),
+                                               ts=req.get("ts"), signature=req.get("signature", ""))}
         if op == "decline":
             return {"ok": True, **node.decline(req["id"])}
         if op == "contacts":

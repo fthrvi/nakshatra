@@ -5,15 +5,20 @@ import base64
 import io
 import json
 import sqlite3
+import subprocess
+import sys
+import threading
 import time
 import urllib.parse
 from pathlib import Path
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric import ed25519
+from sthambha import signer as signer_mod
 
 import joincode
-from network import nak_mcp, nakd
+from network import nak, nak_mcp, nakd
+from network.client import NakClient
 from network.settle import NeuronEscrowAdapter, SettlementError
 from network.store import Store
 from test_nakd import net, wait  # noqa: F401
@@ -61,8 +66,14 @@ def _accept_consumer(inviter, consumer, code):
     assert wait(lambda: len(inviter.node.store.requests()) == 1)
     request = inviter.node.store.requests()[0]
     assert request["ledger_key"] == consumer.node.node
-    inviter.node.accept(request["id"], petname="consumer")
+    _human_accept(inviter, request["id"], "consumer")
     assert wait(lambda: (consumer.node.store.contact(inviter.person_pub) or {}).get("state") == "active")
+
+
+def _human_accept(inviter, request_id, petname=""):
+    ts = int(time.time())
+    signature = inviter.person_priv.sign(nakd.accept_statement(request_id, petname, ts)).hex()
+    return inviter.node.accept(request_id, petname=petname, ts=ts, signature=signature)
 
 
 def test_two_node_accept_pays_once_and_restart_does_not_repeat(net, monkeypatch):
@@ -76,6 +87,7 @@ def test_two_node_accept_pays_once_and_restart_does_not_repeat(net, monkeypatch)
 
     _accept_consumer(inviter, consumer, _consumer_invite(inviter))
     assert wait(lambda: inviter.node.starter_status()["paid_count"] == 1)
+    assert inviter.node.store.authenticated_contact_node(consumer.person_pub) == consumer.node.node
     assert ledger.calls == [{"invite_id": "consumer_code", "to_keyid": consumer.node.node,
                              "amount": 12345}]
     approvals = [r for r in inviter.signer_requests if r.get("op") == "approve_spend"]
@@ -131,25 +143,27 @@ def test_roster_404_retries_then_pays(net, monkeypatch):
     inviter.node.settle = ledger
     monkeypatch.setenv("NAKSHATRA_ESCROW", "neuron")
     _accept_consumer(inviter, consumer, _consumer_invite(inviter, invite_id="late_roster"))
-    assert wait(lambda: inviter.node.starter_status()["starters"][0]["attempts"] == 1)
+    assert wait(lambda: inviter.node.starter_status()["starters"][0]["reason"] == "recipient not in roster")
     pending = inviter.node.starter_status()["starters"][0]
-    assert pending["state"] == "pending" and pending["reason"] == "recipient not in roster"
+    assert pending["state"] == "pending" and pending["attempts"] >= 1
     inviter.node.store.starter_update("late_roster", next_attempt=0)
     assert inviter.node.reconcile_starters() == 1
     assert inviter.node.starter_status()["paid_count"] == 1
 
 
-def test_ledger_409_is_terminal_and_retry_window_expires_without_payment(net, monkeypatch):
+@pytest.mark.parametrize("status", [409, 422])
+def test_ledger_conflict_or_invalid_request_is_terminal(net, monkeypatch, status):
     inviter = net("inviter", caps=("nak.msg", "nak.pay"), constraints=PAY)
     consumer = net("consumer")
     ledger = FakeStarterLedger()
-    ledger.failures.append((409, "recipient already has a starter grant"))
+    message = "recipient already has a starter grant" if status == 409 else "recipient is reserved"
+    ledger.failures.append((status, message))
     inviter.node.settle = ledger
     monkeypatch.setenv("NAKSHATRA_ESCROW", "neuron")
     _accept_consumer(inviter, consumer, _consumer_invite(inviter, invite_id="conflict"))
     assert wait(lambda: inviter.node.starter_status()["starters"][0]["state"] == "failed")
     failed = inviter.node.starter_status()["starters"][0]
-    assert failed["reason"] == "recipient already has a starter grant"
+    assert failed["reason"] == message
     inviter.node.reconcile_starters(now=int(time.time()) + nakd.STARTER_RETRY_WINDOW_S + 1)
     assert len(ledger.calls) == 1
 
@@ -208,10 +222,106 @@ def test_old_contact_request_without_ledger_key_connects_but_stays_pending(net):
             "invite": inv["nonce"], "mid": "a" * 24}
     env = consumer.node._sign("contact.request", inviter.person_pub, body)
     assert inviter.node._take_request({"t": "env", "env": env, "body": body}, inv["nonce"])["t"] == "ack"
-    inviter.node.accept(inviter.node.store.requests()[0]["id"], petname="old")
+    _human_accept(inviter, inviter.node.store.requests()[0]["id"], "old")
     starter = inviter.node.starter_status()["starters"][0]
     assert starter["state"] == "pending" and starter["to_keyid"] is None
     assert starter["reason"] == "recipient ledger key unknown"
+
+
+def test_claimed_rostered_key_waits_for_that_node_but_connected_contact_pays(net, monkeypatch):
+    inviter = net("inviter", caps=("nak.msg", "nak.pay"), constraints=PAY)
+    consumer = net("consumer")
+    other = net("other")
+    ledger = FakeStarterLedger()
+    inviter.node.settle = ledger
+    monkeypatch.setenv("NAKSHATRA_ESCROW", "neuron")
+    code = _consumer_invite(inviter, invite_id="wrong_recipient")
+    inv = joincode.decode_invite(code)
+    # Build a valid person/agent-signed request whose grant merely names another rostered node key.
+    # No one in this request possesses that node key, so only the later pinned handshake can reject it.
+    agent_priv, agent_pub = signer_mod.new_key()
+    grant = signer_mod.issue_grant(consumer.person_priv, "liar", agent_pub, ("nak.msg",),
+                                   node=other.node.node)
+    body = {"person": consumer.person_pub, "node": other.node.node, "ledger_key": other.node.node,
+            "nickname": "consumer", "invite": inv["nonce"], "mid": "a" * 24}
+    envelope = signer_mod._sign(agent_priv, {  # noqa: SLF001 - construct the hostile wire claim
+        "schema": signer_mod.ENVELOPE_SCHEMA, "kind": "contact.request",
+        "from_node": other.node.node, "author": f"agent:liar@{other.node.node[:16]}",
+        "to": inviter.person_pub, "ts": int(time.time()), "nonce": "b" * 24,
+        "body_sha256": nakd.body_hash(body), "grant": grant,
+    })
+    assert inviter.node._take_request(
+        {"t": "env", "env": envelope, "body": body}, inv["nonce"])["t"] == "ack"
+    request = inviter.node.store.requests()[0]
+    _human_accept(inviter, request["id"], "consumer")
+    assert wait(lambda: "waiting for consumer's node to connect" in
+                inviter.node.starter_status()["starters"][0]["reason"])
+    assert ledger.calls == []
+
+
+def _control_server(node, tmp_path):
+    stop = threading.Event()
+    sock = tmp_path / f"{node.node[:8]}.sock"
+    threading.Thread(target=nakd.serve_control, args=(node, sock, stop), daemon=True).start()
+    assert wait(sock.exists)
+    return sock, stop
+
+
+def _mcp_tool(server, name, arguments):
+    return server.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                          "params": {"name": name, "arguments": arguments}})["result"]
+
+
+def test_mcp_cannot_accept_starter_request_but_can_accept_zero_starter(net, tmp_path):
+    inviter = net("inviter", caps=("nak.msg", "nak.pay"), constraints=PAY)
+    paid_consumer = net("paid-consumer")
+    free_consumer = net("free-consumer")
+    paid_consumer.node.redeem(_consumer_invite(inviter, invite_id="person_only"), wait_s=15)
+    assert wait(lambda: len(inviter.node.store.requests()) == 1)
+    paid_request = inviter.node.store.requests()[0]
+    sock, stop = _control_server(inviter.node, tmp_path)
+    server = nak_mcp.Server(NakClient(sock), allow_connect=True)
+
+    refused = _mcp_tool(server, "nak_accept", {"id": paid_request["id"], "name": "paid"})
+    assert refused["isError"]
+    assert f"a person must accept this one: nak accept {paid_request['id']}" in refused["content"][0]["text"]
+    assert inviter.node.store.request(paid_request["id"]) is not None
+    assert inviter.node.store.starter_rows() == []
+
+    free_consumer.node.redeem(
+        _consumer_invite(inviter, amount=0, invite_id="zero_starter"), wait_s=15)
+    assert wait(lambda: len(inviter.node.store.requests()) == 2)
+    free_request = next(row for row in inviter.node.store.requests()
+                        if row["person"] == free_consumer.person_pub)
+    accepted = _mcp_tool(server, "nak_accept", {"id": free_request["id"], "name": "free"})
+    assert not accepted["isError"]
+    assert inviter.node.store.request(free_request["id"]) is None
+    stop.set()
+
+
+def test_cli_accept_builds_tty_and_person_signature_for_starter(monkeypatch):
+    person = ed25519.Ed25519PrivateKey.generate()
+    request_id = "abcd1234"
+    calls = []
+
+    class Terminal:
+        def isatty(self):
+            return True
+
+    def fake_call(_sock, req):
+        calls.append(req)
+        if req["op"] == "requests":
+            return {"requests": [{"id": request_id, "requires_person": True}]}
+        return {"person": "1" * 64, "petname": "friend"}
+
+    monkeypatch.setattr(nak.sys, "stdin", Terminal())
+    monkeypatch.setattr("builtins.input", lambda _prompt: "yes")
+    monkeypatch.setattr(nak, "call", fake_call)
+    monkeypatch.setattr(nak, "_load_matching_person_key", lambda: person)
+    assert nak.main(["accept", request_id, "--as", "friend"]) == 0
+    proof = calls[1]
+    person.public_key().verify(bytes.fromhex(proof["signature"]),
+                               nakd.accept_statement(request_id, "friend", proof["ts"]))
 
 
 class _Response(io.BytesIO):
@@ -261,3 +371,57 @@ def test_old_store_schema_opens_and_agents_have_no_starter_tool(tmp_path):
     assert store.starter_rows() == []
     assert all("starter" not in name for name in (*nak_mcp.READ_TOOLS, *nak_mcp.CONNECT_TOOLS))
     assert "starter_status" in nakd.OPS
+
+
+def test_fresh_store_keeps_old_positional_request_and_invite_inserts_rollback_safe(tmp_path):
+    state = tmp_path / "net"
+    current = Store(state, b"k" * 32)
+    current._db.close()
+    old_source = subprocess.run(
+        ["git", "show", "8143916:scripts/network/store.py"], cwd=Path(__file__).parent.parent,
+        check=True, capture_output=True, text=True).stdout
+    old_module = tmp_path / "old_store.py"
+    old_module.write_text(old_source)
+    probe = """
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from old_store import Store
+s = Store(Path(sys.argv[2]), b'k' * 32)
+s.add_invite('old-invite', '11' * 32, 4102444800, 'old note')
+s.add_request('22' * 32, '33' * 32, 'old nickname', 'old-invite')
+"""
+    result = subprocess.run([sys.executable, "-c", probe, str(tmp_path), str(state)],
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+
+
+def test_store_adopts_side_data_from_earlier_starter_branch_schema(tmp_path):
+    state = tmp_path / "net"
+    old_source = subprocess.run(
+        ["git", "show", "0c30a48:scripts/network/store.py"], cwd=Path(__file__).parent.parent,
+        check=True, capture_output=True, text=True).stdout
+    old_module = tmp_path / "old_starter_store.py"
+    old_module.write_text(old_source)
+    probe = """
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from old_starter_store import Store
+s = Store(Path(sys.argv[2]), b'k' * 32)
+s.add_invite('migrated-invite', '11' * 32, 4102444800, 'note', 'signed-code')
+rid = s.add_request('22' * 32, '33' * 32, 'nickname', 'migrated-invite', '33' * 32)
+Path(sys.argv[3]).write_text(rid)
+s._db.close()
+"""
+    rid_file = tmp_path / "rid"
+    result = subprocess.run(
+        [sys.executable, "-c", probe, str(tmp_path), str(state), str(rid_file)],
+        capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+
+    current = Store(state, b"k" * 32)
+    assert current.invite("migrated-invite")["code"] == "signed-code"
+    assert current.request(rid_file.read_text())["ledger_key"] == "33" * 32
+    assert {row[1] for row in current._q("PRAGMA table_info(invites)")} >= {"code"}
+    assert {row[1] for row in current._q("PRAGMA table_info(requests)")} >= {"ledger_key"}

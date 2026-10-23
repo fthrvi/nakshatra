@@ -1903,7 +1903,7 @@ def _load_matching_person_key():
         signer_person = (signer_dir / "person.pub").read_text().strip()
         person_priv, person_pub = signer_mod.load_key(person_key)
     except (OSError, ValueError, signer_mod.SignerError) as exc:
-        raise SystemExit(f"cannot load the person key for task decision: {exc}") from exc
+        raise SystemExit(f"cannot load the person key for this decision: {exc}") from exc
     if person_pub != signer_person:
         raise SystemExit(f"the person key at {person_key} does not match {signer_dir / 'person.pub'}")
     return person_priv
@@ -2242,7 +2242,24 @@ def main(argv=None, *, http_post=None) -> int:
         for q in call(s, {"op": "requests"})["requests"] or []:
             print(f"{q['id']}  {q['nickname'] or '(no nickname)'}  person {q['person'][:16]}…  {_ago(q['received'])}")
     elif a.cmd in ("accept", "decline"):
-        r = call(s, {"op": a.cmd, "id": a.id, **({"petname": a.petname} if a.cmd == "accept" else {})})
+        proof = {}
+        if a.cmd == "accept":
+            pending = [row for row in call(s, {"op": "requests"})["requests"]
+                       if row.get("id") == a.id]
+            if pending and pending[0].get("requires_person"):
+                if not sys.stdin.isatty():
+                    raise SystemExit(f"a person must accept this one: nak accept {a.id}")
+                answer = input(f"ACCEPT starter-bearing request {a.id}? [y/N] ")
+                if answer.strip().lower() not in {"y", "yes"}:
+                    print("request unchanged")
+                    return 1
+                from network.nakd import accept_statement
+                ts = int(time.time())
+                signature = _load_matching_person_key().sign(
+                    accept_statement(a.id, a.petname, ts)).hex()
+                proof = {"ts": ts, "signature": signature}
+        r = call(s, {"op": a.cmd, "id": a.id,
+                     **({"petname": a.petname, **proof} if a.cmd == "accept" else {})})
         print(json.dumps(r))
     elif a.cmd == "contacts":
         for c in call(s, {"op": "contacts"})["contacts"]:

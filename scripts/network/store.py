@@ -46,6 +46,10 @@ CREATE TABLE IF NOT EXISTS agent_cards (person TEXT PRIMARY KEY, display_name TE
     offers TEXT NOT NULL, intents TEXT NOT NULL, paid TEXT NOT NULL, price_hint TEXT NOT NULL,
     models TEXT NOT NULL, supports TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS store_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS request_ledger_keys (request_id TEXT PRIMARY KEY, ledger_key TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS invite_codes (invite_id TEXT PRIMARY KEY, code TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS authenticated_contacts (person TEXT PRIMARY KEY, node TEXT NOT NULL,
+    authenticated_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS starter_obligations (invite_id TEXT PRIMARY KEY, person TEXT NOT NULL,
     to_keyid TEXT, amount INTEGER NOT NULL, signed_invite TEXT NOT NULL, state TEXT NOT NULL,
     reason TEXT, created INTEGER NOT NULL, updated INTEGER NOT NULL, next_attempt INTEGER NOT NULL,
@@ -59,7 +63,8 @@ class Store:
         "inbox": (("nonce",), ("text", "petname", "author", "aspect")),
         "contacts": (("person",), ("petname", "nickname")),
         "requests": (("id",), ("nickname",)),
-        "invites": (("nonce",), ("note", "code")),
+        "invites": (("nonce",), ("note",)),
+        "invite_codes": (("invite_id",), ("code",)),
         "outbox": (("nonce",), ("frame", "refused")),
         "tasks": (("task_hash", "role", "peer"), ("spec", "output", "verdict", "escrow_auth")),
         "agent_messages": (("mid",), ("text", "want", "refs", "budget", "harness")),
@@ -96,11 +101,6 @@ class Store:
             self._db.execute("ALTER TABLE outbox ADD COLUMN refused TEXT")
         except sqlite3.OperationalError:
             pass
-        for table, col in (("requests", "ledger_key TEXT"), ("invites", "code TEXT")):
-            try:
-                self._db.execute(f"ALTER TABLE {table} ADD COLUMN {col}")
-            except sqlite3.OperationalError:
-                pass
         for col in ("escrow_auth TEXT", "hold_id TEXT", "funding_state TEXT", "funding_reason TEXT",
                     "result_hash TEXT", "submit_state TEXT", "submit_reason TEXT",
                     "submit_attempts INTEGER NOT NULL DEFAULT 0", "receive_state TEXT",
@@ -114,6 +114,7 @@ class Store:
         except sqlite3.OperationalError:
             pass
         self._key_verified = self._verify_key_marker()
+        self._migrate_starter_side_tables()
         self._migrate()
         self._fix_modes()
 
@@ -170,6 +171,29 @@ class Store:
         if self._open(row[0], b"store-key-check") != "nak-store-key-v1":
             raise ValueError("Nakshatra store data-key check failed")
         return True
+
+    def _has_column(self, table: str, column: str) -> bool:
+        return any(row[1] == column for row in self._db.execute(f"PRAGMA table_info({table})"))
+
+    def _migrate_starter_side_tables(self) -> None:
+        """Adopt databases opened by the first starter branch without altering legacy tables.
+
+        That version appended columns to ``requests`` and ``invites``. Keeping those columns is
+        harmless, but fresh databases must retain the old positional-insert shapes so the previous
+        binary can roll back safely.
+        """
+        if self._has_column("requests", "ledger_key"):
+            self._db.execute(
+                "INSERT OR IGNORE INTO request_ledger_keys(request_id,ledger_key) "
+                "SELECT id,ledger_key FROM requests WHERE ledger_key IS NOT NULL AND ledger_key<>''")
+        if self._has_column("invites", "code"):
+            rows = self._db.execute(
+                "SELECT nonce,code FROM invites WHERE code IS NOT NULL AND code<>''").fetchall()
+            for nonce, sealed in rows:
+                code = self._dec("invites", "code", self._pk((nonce,)), sealed)
+                self._db.execute(
+                    "INSERT OR IGNORE INTO invite_codes(invite_id,code) VALUES (?,?)",
+                    (nonce, self._enc("invite_codes", "code", self._pk((nonce,)), code)))
 
     def _fix_modes(self) -> None:
         os.chmod(self.dir, 0o700)
@@ -305,9 +329,13 @@ class Store:
     # invites
     def add_invite(self, nonce: str, ik: str, expires_at: int, note: str = "", code: str = "") -> None:
         note = self._enc("invites", "note", self._pk((nonce,)), note)
-        code = self._enc("invites", "code", self._pk((nonce,)), code)
-        self._q("INSERT INTO invites (nonce,ik,expires_at,created,note,consumed_by,code) "
-                "VALUES (?,?,?,?,?,NULL,?)", (nonce, ik, expires_at, int(time.time()), note, code))
+        sealed_code = self._enc("invite_codes", "code", self._pk((nonce,)), code)
+
+        def fn(db):
+            db.execute("INSERT INTO invites (nonce,ik,expires_at,created,note,consumed_by) "
+                       "VALUES (?,?,?,?,?,NULL)", (nonce, ik, expires_at, int(time.time()), note))
+            db.execute("INSERT INTO invite_codes(invite_id,code) VALUES (?,?)", (nonce, sealed_code))
+        self._tx(fn)
 
     def open_invites(self, now: Optional[int] = None) -> list:
         now = int(now if now is not None else time.time())
@@ -326,14 +354,15 @@ class Store:
         return self._tx(fn)
 
     def invite(self, nonce: str) -> Optional[dict]:
-        rows = self._q("SELECT nonce,ik,expires_at,created,note,consumed_by,code FROM invites WHERE nonce=?",
-                       (nonce,))
+        rows = self._q(
+            "SELECT i.nonce,i.ik,i.expires_at,i.created,i.note,i.consumed_by,c.code "
+            "FROM invites i LEFT JOIN invite_codes c ON c.invite_id=i.nonce WHERE i.nonce=?", (nonce,))
         if not rows:
             return None
         row = dict(zip(("nonce", "ik", "expires_at", "created", "note", "consumed_by", "code"), rows[0]))
         primary_key = self._pk((nonce,))
-        for column in ("note", "code"):
-            row[column] = self._dec("invites", column, primary_key, row[column])
+        row["note"] = self._dec("invites", "note", primary_key, row["note"])
+        row["code"] = self._dec("invite_codes", "code", primary_key, row["code"])
         return row
 
     # requests (someone redeemed our invite and asks to connect)
@@ -341,23 +370,32 @@ class Store:
                     ledger_key: str = "") -> str:
         rid = secrets.token_hex(4)
         nickname = self._enc("requests", "nickname", self._pk((rid,)), nickname[:40])
-        self._q("INSERT INTO requests (id,person,node,nickname,invite_nonce,received,state,ledger_key) "
-                "VALUES (?,?,?,?,?,?,'pending',?)",
-                (rid, person, node, nickname, invite_nonce, int(time.time()), ledger_key or None))
+
+        def fn(db):
+            db.execute("INSERT INTO requests (id,person,node,nickname,invite_nonce,received,state) "
+                       "VALUES (?,?,?,?,?,?,'pending')",
+                       (rid, person, node, nickname, invite_nonce, int(time.time())))
+            if ledger_key:
+                db.execute("INSERT INTO request_ledger_keys(request_id,ledger_key) VALUES (?,?)",
+                           (rid, ledger_key))
+        self._tx(fn)
         return rid
 
     def requests(self, state: str = "pending") -> list:
         out = []
-        for r in self._q("SELECT id, person, node, nickname, received, ledger_key FROM requests WHERE state=?",
-                         (state,)):
+        for r in self._q(
+                "SELECT r.id,r.person,r.node,r.nickname,r.received,k.ledger_key FROM requests r "
+                "LEFT JOIN request_ledger_keys k ON k.request_id=r.id WHERE r.state=?", (state,)):
             row = dict(zip(("id", "person", "node", "nickname", "received", "ledger_key"), r))
             row["nickname"] = self._dec("requests", "nickname", self._pk((row["id"],)), row["nickname"])
             out.append(row)
         return out
 
     def request(self, rid: str, state: str = "pending") -> Optional[dict]:
-        rows = self._q("SELECT id,person,node,nickname,invite_nonce,received,state,ledger_key FROM requests "
-                       "WHERE id=? AND state=?", (rid, state))
+        rows = self._q(
+            "SELECT r.id,r.person,r.node,r.nickname,r.invite_nonce,r.received,r.state,k.ledger_key "
+            "FROM requests r LEFT JOIN request_ledger_keys k ON k.request_id=r.id "
+            "WHERE r.id=? AND r.state=?", (rid, state))
         if not rows:
             return None
         row = dict(zip(("id", "person", "node", "nickname", "invite_nonce", "received", "state",
@@ -368,8 +406,10 @@ class Store:
 
     def decide_request(self, rid: str, accept: bool, starter: Optional[dict] = None) -> Optional[dict]:
         def fn(db):
-            r = db.execute("SELECT person,node,nickname,invite_nonce,ledger_key FROM requests "
-                           "WHERE id=? AND state='pending'", (rid,)).fetchone()
+            r = db.execute(
+                "SELECT r.person,r.node,r.nickname,r.invite_nonce,k.ledger_key FROM requests r "
+                "LEFT JOIN request_ledger_keys k ON k.request_id=r.id "
+                "WHERE r.id=? AND r.state='pending'", (rid,)).fetchone()
             if not r:
                 return None
             db.execute("UPDATE requests SET state=? WHERE id=?", ("accepted" if accept else "declined", rid))
@@ -388,6 +428,16 @@ class Store:
                     "nickname": self._dec("requests", "nickname", self._pk((rid,)), r[2]),
                     "invite_nonce": r[3], "ledger_key": r[4] or ""}
         return self._tx(fn)
+
+    def mark_contact_authenticated(self, person: str, node: str, now: Optional[int] = None) -> None:
+        self._q(
+            "INSERT INTO authenticated_contacts(person,node,authenticated_at) VALUES (?,?,?) "
+            "ON CONFLICT(person) DO UPDATE SET node=excluded.node,authenticated_at=excluded.authenticated_at",
+            (person, node, int(time.time() if now is None else now)))
+
+    def authenticated_contact_node(self, person: str) -> str:
+        rows = self._q("SELECT node FROM authenticated_contacts WHERE person=?", (person,))
+        return rows[0][0] if rows else ""
 
     # starter credits
     def starter_rows(self, states: Optional[tuple[str, ...]] = None) -> list[dict]:
