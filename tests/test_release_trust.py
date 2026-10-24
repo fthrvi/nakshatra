@@ -20,6 +20,19 @@ import releasekit  # noqa: E402
 import install as release_install  # noqa: E402
 
 
+TEST_CATALOG = {
+    "llama32-3b": {
+        "layers": 28,
+        "requirements": {
+            "gpu_vram_bytes": 4 * 1024 ** 3,
+            "cpu_ram_bytes": 8 * 1024 ** 3,
+            "disk_free_bytes": 12 * 1024 ** 3,
+        },
+        "requirements_basis": "test fixture",
+    },
+}
+
+
 def _write_signed_release(prefix: Path, private_hex: str, version: str,
                           package_key: str) -> None:
     release_dir = prefix / "releases" / version
@@ -29,6 +42,7 @@ def _write_signed_release(prefix: Path, private_hex: str, version: str,
         "version": version,
         "package_signers": {
             "schema": "nak-package-signers/1", "keys": [package_key],
+            "packages": TEST_CATALOG,
         },
     }, private_hex)
     (release_dir / "manifest.json").write_text(json.dumps(manifest))
@@ -77,6 +91,11 @@ def _held_installer_lock(prefix: Path):
 def test_package_signers_come_from_verified_release_manifest(tmp_path):
     prefix, package_key, _private_hex = _installed_release(tmp_path)
     assert release_trust.load_release_package_signers(prefix) == frozenset({package_key})
+
+
+def test_package_catalog_comes_from_verified_release_manifest(tmp_path):
+    prefix, _package_key, _private_hex = _installed_release(tmp_path)
+    assert release_trust.load_release_package_catalog(prefix) == TEST_CATALOG
 
 
 def test_tampered_release_package_signers_are_refused(tmp_path):

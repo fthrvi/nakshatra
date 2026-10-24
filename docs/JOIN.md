@@ -127,8 +127,19 @@ is temporarily unavailable after contact setup, retry while the code is valid:
 
     nak worker-redeem
 
-Build the engine shipped in the signed release, then turn on the worker. The inviter supplies the
-package URL, its 64-hex signing key, the pillar URL and pin, the layer range, and the port:
+Check what this machine can serve before building. The preflight is read-only: it checks NVIDIA,
+AMD ROCm/sysfs, available RAM, free space under the worker state directory, and the build/runtime
+pieces already on the machine. It compares those facts with the package catalog carried by the
+signed node release and prints one next command. Use `--json` for automation:
+
+    nak worker preflight
+
+It reports each signed package as `can serve`, `can serve on CPU (slow)`, or `cannot serve` with the
+needed and detected capacity. Unknown probe results stay `unknown`; they are never guessed.
+
+If the result says to build, build the engine shipped in the signed release, then turn on the
+worker. The inviter supplies the package URL, its 64-hex signing key, the pillar URL and pin, the
+layer range, and the port:
 
     nak worker build
     nak worker on \
@@ -142,7 +153,9 @@ package URL, its 64-hex signing key, the pillar URL and pin, the layer range, an
     nak worker status
 
 Remote model packages must be signed by the pinned package key, and every downloaded artifact is
-checked by SHA-256. Today there is one signed model package: `llama32-3b`.
+checked by SHA-256. Today there is one signed model package: `llama32-3b`. Its preflight entry uses
+a conservative whole-package floor of 4 GiB VRAM, or 8 GiB available RAM for the slow CPU fallback,
+plus 12 GiB free disk for the package and engine build.
 
 The GPU daemon unloads after 600 idle seconds by default while the service stays ready. The next
 request rechecks the saved model hash and reloads it once. The optional owner lease lets a local

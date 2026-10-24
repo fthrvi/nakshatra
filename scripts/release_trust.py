@@ -19,6 +19,7 @@ PACKAGE_SIGNER_SCHEMA = "nak-package-signers/1"
 TRANSITION_SCHEMA = "nak-release-transition/1"
 TRANSITION_FILE = "release-transition.json"
 _ED25519_PUBLIC_KEY = re.compile(r"^[0-9a-f]{64}$")
+_PACKAGE_ID = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
 _VERSION = re.compile(r"^[0-9]+(?:\.[0-9]+)*$")
 
 
@@ -80,9 +81,9 @@ def _installer_lock_is_held(*, root_fd: int) -> bool:
         os.close(fd)
 
 
-def load_release_package_signers(
-        prefix: str | os.PathLike[str] | None = None) -> frozenset[str]:
-    """Verify the installed release manifest and return its package signer allowlist.
+def _load_release_package_policy(
+        prefix: str | os.PathLike[str] | None = None) -> dict:
+    """Verify the installed release manifest and return its package policy.
 
     ``config.json`` is the installer's committed release state. ``current`` must
     be exactly the relative link ``releases/<version>``. The selected directory
@@ -197,4 +198,39 @@ def load_release_package_signers(
             InvalidSignature) as e:
         raise ReleaseTrustError(
             f"installed release at {root} cannot establish package trust: {e}") from e
-    return frozenset(keys)
+    return policy
+
+
+def load_release_package_signers(
+        prefix: str | os.PathLike[str] | None = None) -> frozenset[str]:
+    """Verify the installed release and return its package signer allowlist."""
+    return frozenset(_load_release_package_policy(prefix)["keys"])
+
+
+def load_release_package_catalog(
+        prefix: str | os.PathLike[str] | None = None) -> dict[str, dict]:
+    """Return the hardware catalog carried by the verified signed release."""
+    policy = _load_release_package_policy(prefix)
+    packages = policy.get("packages")
+    if not isinstance(packages, dict) or not packages:
+        raise ReleaseTrustError("installed signed release has no worker package catalog")
+    catalog = {}
+    required_names = {"gpu_vram_bytes", "cpu_ram_bytes", "disk_free_bytes"}
+    for package_id, definition in packages.items():
+        if not isinstance(package_id, str) or not _PACKAGE_ID.fullmatch(package_id):
+            raise ReleaseTrustError("installed signed release has an invalid worker package id")
+        if not isinstance(definition, dict) or not isinstance(definition.get("requirements"), dict):
+            raise ReleaseTrustError(
+                f"installed signed release has invalid requirements for package {package_id}")
+        requirements = definition["requirements"]
+        if set(requirements) != required_names or any(
+                isinstance(value, bool) or not isinstance(value, int) or value <= 0
+                for value in requirements.values()):
+            raise ReleaseTrustError(
+                f"installed signed release has invalid requirements for package {package_id}")
+        catalog[package_id] = {
+            "layers": definition.get("layers"),
+            "requirements": dict(requirements),
+            "requirements_basis": definition.get("requirements_basis"),
+        }
+    return catalog

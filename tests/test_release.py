@@ -189,8 +189,19 @@ def test_first_install_health_can_load_release_package_signers(env, monkeypatch)
 def test_build_pins_package_signers_from_exact_component_commit(env, monkeypatch):
     policy_path = env["a"] / "pkg" / "package-signers.json"
     trusted = "12" * 32
+    packages = {
+        "llama32-3b": {
+            "layers": 28,
+            "requirements": {
+                "gpu_vram_bytes": 4 * 1024 ** 3,
+                "cpu_ram_bytes": 8 * 1024 ** 3,
+                "disk_free_bytes": 12 * 1024 ** 3,
+            },
+            "requirements_basis": "test fixture",
+        },
+    }
     policy_path.write_text(json.dumps({
-        "schema": "nak-package-signers/1", "keys": [trusted],
+        "schema": "nak-package-signers/1", "keys": [trusted], "packages": packages,
     }))
     subprocess.run(["git", "-C", str(env["a"]), "add", "."], check=True)
     subprocess.run([
@@ -210,7 +221,7 @@ def test_build_pins_package_signers_from_exact_component_commit(env, monkeypatch
 
     assert rk.verify(manifest, env["pub"])
     assert manifest["package_signers"] == {
-        "schema": "nak-package-signers/1", "keys": [trusted],
+        "schema": "nak-package-signers/1", "keys": [trusted], "packages": packages,
     }
 
 

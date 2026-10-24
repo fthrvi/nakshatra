@@ -39,6 +39,8 @@ SPEC = json.loads((Path(__file__).resolve().parent / "spec.json").read_text())
 _PINNED_REQUIREMENT = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([^;\s]+)$")
 _PACKAGE_SIGNER_SCHEMA = "nak-package-signers/1"
 _ED25519_PUBLIC_KEY = re.compile(r"^[0-9a-f]{64}$")
+_PACKAGE_ID = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
+_PACKAGE_REQUIREMENTS = {"gpu_vram_bytes", "cpu_ram_bytes", "disk_free_bytes"}
 
 
 def _requirement_pins(requirements: list[str], profile: str) -> dict[str, str]:
@@ -87,7 +89,7 @@ def _git(repo: Path, *args: str) -> str:
 
 
 def _package_signers(resolved: list[tuple]) -> dict | None:
-    """Load package trust policy from the exact component commit being released."""
+    """Load package trust/catalog policy from the exact component commit being released."""
     source = SPEC.get("package_signers")
     if source is None:
         return None
@@ -115,7 +117,40 @@ def _package_signers(resolved: list[tuple]) -> dict | None:
         raise RuntimeError("package_signers keys must be a non-empty list of lowercase Ed25519 hex keys")
     if len(keys) != len(set(keys)):
         raise RuntimeError("package_signers keys must not contain duplicates")
-    return {"schema": _PACKAGE_SIGNER_SCHEMA, "keys": list(keys)}
+    packages = policy.get("packages", {})
+    if not isinstance(packages, dict):
+        raise RuntimeError("package_signers packages must be an object")
+    normalized_packages = {}
+    for package_id, definition in packages.items():
+        if not isinstance(package_id, str) or not _PACKAGE_ID.fullmatch(package_id):
+            raise RuntimeError(f"package_signers has invalid package id {package_id!r}")
+        if not isinstance(definition, dict):
+            raise RuntimeError(f"package_signers package {package_id!r} must be an object")
+        requirements = definition.get("requirements")
+        if not isinstance(requirements, dict) or set(requirements) != _PACKAGE_REQUIREMENTS:
+            raise RuntimeError(
+                f"package_signers package {package_id!r} requirements must name "
+                f"{sorted(_PACKAGE_REQUIREMENTS)}")
+        if any(isinstance(value, bool) or not isinstance(value, int) or value <= 0
+               for value in requirements.values()):
+            raise RuntimeError(
+                f"package_signers package {package_id!r} requirements must be positive byte counts")
+        layers = definition.get("layers")
+        basis = definition.get("requirements_basis")
+        if isinstance(layers, bool) or not isinstance(layers, int) or layers <= 0:
+            raise RuntimeError(f"package_signers package {package_id!r} layers must be positive")
+        if not isinstance(basis, str) or not basis.strip():
+            raise RuntimeError(
+                f"package_signers package {package_id!r} requirements_basis must explain the estimate")
+        normalized_packages[package_id] = {
+            "layers": layers,
+            "requirements": {key: requirements[key] for key in sorted(requirements)},
+            "requirements_basis": basis,
+        }
+    result = {"schema": _PACKAGE_SIGNER_SCHEMA, "keys": list(keys)}
+    if normalized_packages:
+        result["packages"] = normalized_packages
+    return result
 
 
 def _archive(repo: Path, commit: str, paths: list, out: Path, overlays=()) -> None:

@@ -164,9 +164,15 @@ def test_worker_status_redacts_secret_shaped_fields_and_key_paths(monkeypatch):
     monkeypatch.setattr(nak, "_worker_status", lambda _sp: {
         "configured": True,
         "unit": {"active": "active"},
+        "preflight": {
+            "schema": "nak-worker-preflight/1",
+            "packages": [{"id": "llama32-3b", "verdict": "can serve"}],
+        },
         "token": "secret",
         "build": {"daemon_bin": "/home/u/.nakshatra/keys/worker.ed25519"},
     })
     output = Server(_UnusedClient()).call("nak_worker_status", {})
     assert "secret" not in output and "worker.ed25519" not in output
-    assert json.loads(output)["configured"] is True
+    parsed = json.loads(output)
+    assert parsed["configured"] is True
+    assert parsed["preflight"]["packages"][0]["verdict"] == "can serve"

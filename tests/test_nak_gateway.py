@@ -839,10 +839,12 @@ def test_gateway_off_worker_only_falls_back_to_worker_profile(tmp_path, monkeypa
 def test_release_has_separate_gateway_service():
     spec = json.loads((ROOT / "release" / "spec.json").read_text())
     signer_policy = json.loads((ROOT / spec["package_signers"]["path"]).read_text())
-    assert signer_policy == {
-        "schema": "nak-package-signers/1",
-        "keys": ["2a4d231e7a8a5a97fa89c429e7e3e8900a57f1d5cf780ca67ed053376c68dc77"],
-    }
+    assert signer_policy["schema"] == "nak-package-signers/1"
+    assert signer_policy["keys"] == [
+        "2a4d231e7a8a5a97fa89c429e7e3e8900a57f1d5cf780ca67ed053376c68dc77"]
+    assert signer_policy["packages"]["llama32-3b"]["layers"] == 28
+    assert set(signer_policy["packages"]["llama32-3b"]["requirements"]) == {
+        "gpu_vram_bytes", "cpu_ram_bytes", "disk_free_bytes"}
     service = spec["services"]["nakshatra-gateway"]
     assert service["requires"].endswith("/.nakshatra/gateway.env")
     assert service["profile"] == "inference"

@@ -41,7 +41,8 @@ _SCRIPTS = Path(__file__).resolve().parent.parent
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
-from release_trust import ReleaseTrustError, load_release_package_signers  # noqa: E402
+from release_trust import (ReleaseTrustError, load_release_package_catalog,
+                           load_release_package_signers)  # noqa: E402
 from network.person_custody import (  # noqa: E402
     PersonKey, _person_key_path, approval, broker_preflight, custody_mode, plain)
 
@@ -1537,7 +1538,22 @@ def _worker_status(_sp) -> dict:
         "build_state": build_state,
         "build": build,
         "unit": unit,
+        "preflight": _worker_preflight(_sp),
     }
+
+
+def _worker_preflight(_sp) -> dict:
+    """Probe this node without changing it, using only the signed release catalog."""
+    prefix = Path(os.environ.get("NAK_NODE_PREFIX", Path.home() / ".nakshatra-node"))
+    error = None
+    try:
+        catalog = load_release_package_catalog(prefix)
+    except ReleaseTrustError as e:
+        catalog = {}
+        error = str(e)
+    from worker_preflight import collect_preflight
+    return collect_preflight(
+        catalog, catalog_error=error, state_dir=_worker_paths()[0], run=_sp.run)
 
 
 def _worker_paid(_sp, action: str, args=None) -> dict | None:
@@ -2216,6 +2232,8 @@ def main(argv=None, *, http_post=None) -> int:
     gpsub.add_parser("status", help="show the payment-bound routing gate")
     p = sub.add_parser("worker", help="build and operate this node's signed-release inference worker")
     wsub = p.add_subparsers(dest="worker_cmd", required=True)
+    q = wsub.add_parser("preflight", help="check hardware and runtime against signed model packages")
+    q.add_argument("--json", action="store_true", help="print the machine-readable report")
     wsub.add_parser("build", help="compile the current release's verified engine for this GPU")
     q = wsub.add_parser("on", help="configure (once) and enable the worker service")
     q.add_argument("--model-id")
@@ -2329,7 +2347,14 @@ def main(argv=None, *, http_post=None) -> int:
             print(json.dumps(_gateway_status(_sp), indent=1, sort_keys=True))
     elif a.cmd == "worker":
         import subprocess as _sp
-        if a.worker_cmd == "build":
+        if a.worker_cmd == "preflight":
+            result = _worker_preflight(_sp)
+            if a.json:
+                print(json.dumps(result, indent=1, sort_keys=True))
+            else:
+                from worker_preflight import render_plain
+                print(render_plain(result))
+        elif a.worker_cmd == "build":
             _worker_build(_sp)
         elif a.worker_cmd == "on":
             _worker_enable(_sp, a)

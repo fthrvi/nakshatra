@@ -2,5 +2,16 @@
  "schema": "nak-package-signers/1",
  "keys": [
   "2a4d231e7a8a5a97fa89c429e7e3e8900a57f1d5cf780ca67ed053376c68dc77"
- ]
+ ],
+ "packages": {
+  "llama32-3b": {
+   "layers": 28,
+   "requirements": {
+    "gpu_vram_bytes": 4294967296,
+    "cpu_ram_bytes": 8589934592,
+    "disk_free_bytes": 12884901888
+   },
+   "requirements_basis": "Conservative whole-package floor: the served Llama 3.2 3B Q4 weights are about 2 GiB; the table allows another 2 GiB of GPU working space, 8 GiB available RAM for CPU fallback, and 12 GiB for the package plus a release engine build."
+  }
+ }
 }

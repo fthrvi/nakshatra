@@ -995,10 +995,14 @@ def test_worker_status_reports_build_and_unit_state(tmp_path, monkeypatch, capsy
         return type("R", (), {"returncode": 0, "stdout": value})()
 
     monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(nak, "_worker_preflight", lambda _sp: {
+        "schema": "nak-worker-preflight/1", "packages": [],
+    })
     assert nak.main(["worker", "status"]) == 0
     out = json.loads(capsys.readouterr().out)
     assert out["configured"] is True and out["build_state"] == "ready"
     assert out["unit"] == {"active": "active", "enabled": "enabled"}
+    assert out["preflight"]["schema"] == "nak-worker-preflight/1"
 
 
 @pytest.mark.parametrize("url", ["https://pillar.test/base", "https://pillar.test/?token=x",
