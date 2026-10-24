@@ -6,7 +6,7 @@ On create add a row (status=active, owner). On merge flip to `merged→<sha>`.
 | branch | sector | description | base | status | owner |
 |---|---|---|---|---|---|
 | custody/person-sign | custody | Route every person-key signature through person_sign(kind, statement) with file (default) and broker (stub) backends; no behaviour change. | forgejo/main@119ae8e | merged→e985ec7 | codex/friends-onboarding |
-| net/shared-revocation | network | Person-signed cumulative grant revocations shared over contact sessions, with offline export/import. | forgejo/main@119ae8e | active | claude/trisul-aa network lane (hub) + codex |
+| net/shared-revocation | network | Person-signed cumulative grant revocations shared over contact sessions, with offline export/import. | forgejo/main@1081a0d | merged→8131115 | claude/trisul-aa network lane (hub) + codex |
 | net/starter-credit | network | Wire starter credits: inviter node pays the person-signed starter amount on accept via a new ledger /spend/starter route (spend-only, one per recipient, capped). | forgejo/main@8143916 | merged→b41a9ea | claude/network + codex |
 | join/cleanbox-rerun | join | Rerun the clean-box outsider join against public release 0.15.22 and reconcile outsider documentation with the observed result. | forgejo/main@3f62d96 | merged→0f14eed | codex/friends-onboarding |
 | net/ledger-reply-shapes | network | Accept the real neuron ledger's task reply shapes (submit/received `replayed`, status `refund_after_submit`); fixture captured from the real ledger. | forgejo/main@dc54d66 | merged→3ceca37 | claude/network |
