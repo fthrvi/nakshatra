@@ -511,6 +511,22 @@ class Node:
         self._stop.wait(min(30.0, 0.3 * (2 ** min(attempt, 7))) * (0.5 + random.random()))
 
     # ── invites (inviter side) ────────────────────────────────────────────────────────────────
+    def node_sign_stage(self, body: dict) -> dict:
+        """Sign an onboard stage/cancel envelope with this node's roster identity."""
+        if not isinstance(body, dict) or body.get("v") != 2:
+            raise ValueError("stage request must be a v2 object")
+        if body.get("inviter_pubkey") != self.node:
+            raise ValueError("stage request is not for this node")
+        if "sig" in body:
+            raise ValueError("stage request is already signed")
+        canonical_body = json.dumps(
+            body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+        private = ed25519.Ed25519PrivateKey.from_private_bytes(self._key)
+        return {**body, "sig": private.sign(canonical_body).hex()}
+
+    def cancel_invite(self, nonce: str) -> dict:
+        return {"cancelled": self.store.consume_invite(nonce, "cancelled")}
+
     def register_invite(self, code: str) -> dict:
         """Accept an invite made with this person's key for this node and start waiting for it."""
         inv = joincode.decode_invite(code)
@@ -805,6 +821,25 @@ class Node:
             self._backoff(attempt)
 
     # ── deciding requests ────────────────────────────────────────────────────────────────────
+    def _request_invite_kind_tier(self, request: dict) -> tuple[str, str]:
+        if request.get("source") == "address":
+            return "address", ""
+        invite_row = self.store.invite(request.get("invite_nonce", ""))
+        if not invite_row or not invite_row.get("code"):
+            return "contact", ""
+        inv = self._verified_starter_invite(invite_row["code"])
+        kind = inv.get("kind", "contact")
+        details = inv.get(kind) if kind in {"worker", "consumer"} else None
+        return kind, details.get("tier", "") if isinstance(details, dict) else ""
+
+    def _request_requires_person(self, request: dict, *, starter=None,
+                                 starter_checked: bool = False) -> bool:
+        kind, tier = self._request_invite_kind_tier(request)
+        if not starter_checked:
+            starter = self._starter_for_request(request)
+        return bool(request.get("source") == "address" or starter
+                    or (kind in {"worker", "consumer"} and tier == "stranger"))
+
     def _starter_for_request(self, request: dict) -> Optional[dict]:
         # A public address can carry a syntactically valid ledger_key, but it never conveys the
         # person's signed consent to fund a stranger. Only signed consumer invites can do that.
@@ -841,7 +876,7 @@ class Node:
         if not request:
             raise ValueError("no pending request with that id")
         starter = self._starter_for_request(request)
-        if starter is not None or request.get("source") == "address":
+        if self._request_requires_person(request, starter=starter, starter_checked=True):
             self._verify_accept_proof(req_id, petname, ts, signature)
         r = self.store.decide_request(req_id, True, starter=starter)
         if not r:
@@ -2623,7 +2658,8 @@ def _hard_close(ch) -> None:
 
 # ── control socket (the CLI and, on Day 5, the MCP front door talk to this) ───────────────────
 
-OPS = {"status", "register_invite", "register_address", "address_status", "address_off",
+OPS = {"status", "node_sign_stage", "cancel_invite", "register_invite", "register_address",
+       "address_status", "address_off",
        "redeem", "requests", "accept", "decline", "block", "unblock", "blocked", "contacts", "remove", "send",
        "agent_send", "threads", "thread", "card", "card_set", "delivered", "inbox", "outbox",
        "task_post", "tasks", "task_status", "task_claim", "task_submit", "task_decide", "ledger", "escrow_status", "direct",
@@ -2647,6 +2683,10 @@ def handle(node: Node, req: dict) -> dict:
             return {"ok": True, **node.store.revocation_status()}
         if op == "register_invite":
             return {"ok": True, **node.register_invite(req["code"])}
+        if op == "node_sign_stage":
+            return {"ok": True, **node.node_sign_stage(req.get("body"))}
+        if op == "cancel_invite":
+            return {"ok": True, **node.cancel_invite(req.get("nonce", ""))}
         if op == "register_address":
             return {"ok": True, **node.register_address(
                 req["code"], req.get("install_line", ""), ts=req.get("ts"),
@@ -2663,8 +2703,9 @@ def handle(node: Node, req: dict) -> dict:
             requests = node.store.requests()
             for request in requests:
                 full = node.store.request(request["id"])
-                request["requires_person"] = bool(
-                    full and (full.get("source") == "address" or node._starter_for_request(full)))
+                kind, tier = node._request_invite_kind_tier(full or request)
+                request.update(kind=kind, tier=tier,
+                               requires_person=bool(full and node._request_requires_person(full)))
             return {"ok": True, "requests": requests}
         if op == "accept":
             return {"ok": True, **node.accept(req["id"], req.get("petname", ""),

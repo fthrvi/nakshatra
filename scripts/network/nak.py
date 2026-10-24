@@ -115,7 +115,7 @@ def _http_post_json(url: str, body: dict) -> dict:
     return result
 
 
-def _onboard_token() -> str:
+def _onboard_token(*, required: bool = True) -> str | None:
     token = os.environ.get("NAK_ONBOARD_TOKEN")
     if token is not None:
         token = token.strip()
@@ -125,6 +125,10 @@ def _onboard_token() -> str:
     path = Path.home() / ".nakshatra" / "onboard.token"
     try:
         info = path.lstat()
+    except FileNotFoundError:
+        if not required:
+            return None
+        raise SystemExit(f"worker invites need NAK_ONBOARD_TOKEN or {path}: file not found")
     except OSError as e:
         raise SystemExit(f"worker invites need NAK_ONBOARD_TOKEN or {path}: {e}")
     if path.is_symlink() or not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
@@ -135,7 +139,26 @@ def _onboard_token() -> str:
     return token
 
 
-def _stage_worker(redeem: str, tier: str, http_post, *, now: int | None = None) -> tuple[dict, int]:
+def _stage_auth(kind: str, tier: str, starter: int, ttl: int, node_sign) -> dict:
+    """Choose the unchanged owner credential or a member's node-signed stage envelope."""
+    token = _onboard_token(required=False)
+    if token is not None:
+        return {"token": token}
+    if tier != "stranger":
+        raise SystemExit("without the operator token you may invite at tier stranger only")
+    if starter > 10_000_000:
+        raise SystemExit("without the operator token --starter may not exceed 10000000")
+    body = {"v": 2, "kind": kind, "tier": tier, "starter": starter,
+            "ttl": ttl, "ts": int(time.time())}
+    signed = dict(node_sign(body))
+    signed.pop("ok", None)
+    if not isinstance(signed, dict) or not isinstance(signed.get("sig"), str):
+        raise SystemExit("nakd did not return a signed stage request")
+    return signed
+
+
+def _stage_worker(redeem: str, tier: str, auth: dict, http_post,
+                  *, now: int | None = None) -> tuple[dict, int]:
     staged_at = int(time.time() if now is None else now)
     try:
         parsed = urlsplit(redeem)
@@ -146,7 +169,7 @@ def _stage_worker(redeem: str, tier: str, http_post, *, now: int | None = None) 
     if parsed is None or parsed.scheme not in {"http", "https"} or not host or authority.endswith(":") or \
             (port is not None and not 1 <= port <= 65535):
         raise SystemExit("worker redeem URL must be an http(s) base URL")
-    result = http_post(redeem.rstrip("/") + "/worker-stage", {"token": _onboard_token(), "tier": tier})
+    result = http_post(redeem.rstrip("/") + "/worker-stage", {**auth, "tier": tier})
     code = result.get("code") if isinstance(result, dict) else None
     if not isinstance(code, str) or not code.strip() or len(code) > 64:
         raise SystemExit("onboard server returned an invalid worker code")
@@ -157,7 +180,7 @@ def _stage_worker(redeem: str, tier: str, http_post, *, now: int | None = None) 
 
 
 def _stage_consumer(redeem: str, tier: str, starter: int, inviter_pubkey: str,
-                    http_post, *, now: int | None = None) -> tuple[dict, int]:
+                    auth: dict, http_post, *, now: int | None = None) -> tuple[dict, int]:
     """Stage consumer admission; the server records (but does not execute) any starter transfer."""
     staged_at = int(time.time() if now is None else now)
     try:
@@ -172,7 +195,7 @@ def _stage_consumer(redeem: str, tier: str, starter: int, inviter_pubkey: str,
     if type(starter) is not int or not 0 <= starter <= 100_000_000:
         raise SystemExit("--starter must be an integer between 0 and 100000000")
     result = http_post(redeem.rstrip("/") + "/consumer-stage", {
-        "token": _onboard_token(), "tier": tier, "starter": starter,
+        **auth, "tier": tier, "starter": starter,
         "inviter_pubkey": inviter_pubkey,
     })
     code = result.get("code") if isinstance(result, dict) else None
@@ -2139,6 +2162,8 @@ def main(argv=None, *, http_post=None) -> int:
                    help="consumer starter credits, 0..100000000 base units (default: 0)")
     p.add_argument("--redeem", default=DEFAULT_ONBOARD_BASE,
                    help="onboard server base URL for a worker or consumer invite")
+    p = sub.add_parser("uninvite", help="cancel an invite you created")
+    p.add_argument("code")
     p = sub.add_parser("address", help="manage your opt-in public request address")
     adsub = p.add_subparsers(dest="address_cmd", required=True)
     q = adsub.add_parser("on", help="mint/rotate a shareable request address")
@@ -2431,10 +2456,19 @@ def main(argv=None, *, http_post=None) -> int:
         issued_at = int(time.time())
         worker = consumer = None
         if a.kind == "worker":
-            worker, staged_expiry = _stage_worker(a.redeem, a.tier, http_post, now=issued_at)
+            auth = _stage_auth(
+                a.kind, a.tier, a.starter, a.ttl,
+                lambda body: call(s, {"op": "node_sign_stage",
+                                      "body": {**body, "inviter_pubkey": st["node"]}}))
+            worker, staged_expiry = _stage_worker(
+                a.redeem, a.tier, auth, http_post, now=issued_at)
         elif a.kind == "consumer":
+            auth = _stage_auth(
+                a.kind, a.tier, a.starter, a.ttl,
+                lambda body: call(s, {"op": "node_sign_stage",
+                                      "body": {**body, "inviter_pubkey": st["node"]}}))
             consumer, staged_expiry = _stage_consumer(
-                a.redeem, a.tier, a.starter, st["node"], http_post, now=issued_at)
+                a.redeem, a.tier, a.starter, st["node"], auth, http_post, now=issued_at)
         else:
             staged_expiry = issued_at + a.ttl
         expires_at = min(issued_at + a.ttl, staged_expiry)
@@ -2458,6 +2492,28 @@ def main(argv=None, *, http_post=None) -> int:
             print(line.replace("{CODE}", code))
             print("\nThey paste it in a terminal (Linux or WSL with systemd). When their request arrives:"
                   "  nak requests  →  nak accept <id> --as <name>", file=sys.stderr)
+    elif a.cmd == "uninvite":
+        import joincode
+        inv = joincode.decode_invite(a.code, now=0)
+        st = call(s, {"op": "status"})
+        if inv.get("inviter") != st.get("person") or inv.get("inviter_node") != st.get("node"):
+            raise SystemExit("that invite was not made by this person and node")
+        if inv.get("kind") in {"worker", "consumer"}:
+            details = inv[inv["kind"]]
+            token = _onboard_token(required=False)
+            if token is not None:
+                cancel_body = {"token": token, "code": details["code"]}
+            else:
+                unsigned = {"v": 2, "code": details["code"],
+                            "inviter_pubkey": st["node"], "ts": int(time.time())}
+                cancel_body = call(s, {"op": "node_sign_stage", "body": unsigned})
+                cancel_body.pop("ok", None)
+            (http_post or _http_post_json)(
+                details["redeem"].rstrip("/") + "/invite-cancel", cancel_body)
+        result = call(s, {"op": "cancel_invite", "nonce": inv["nonce"]})
+        if not result.get("cancelled"):
+            raise SystemExit("invite is not open locally")
+        print("invite cancelled")
     elif a.cmd == "address":
         if a.address_cmd == "off":
             row = call(s, {"op": "address_status"})
@@ -2530,7 +2586,12 @@ def main(argv=None, *, http_post=None) -> int:
         join_setup.retry_worker_redeem(Path.home(), name=a.name, http_post=http_post)
     elif a.cmd == "requests":
         for q in call(s, {"op": "requests"})["requests"] or []:
-            print(f"{q['id']}  {q.get('source') or 'invite':7}  {q['nickname'] or '(no nickname)'}  "
+            kind = q.get("kind") or q.get("source") or "invite"
+            tier = q.get("tier") or ""
+            request_type = f"{kind} {tier}".strip()
+            if kind in {"worker", "consumer"}:
+                request_type += ", vouched by you"
+            print(f"{q['id']}  {request_type:31}  {q['nickname'] or '(no nickname)'}  "
                   f"person {q['person'][:16]}…  {_ago(q['received'])}")
     elif a.cmd in ("accept", "decline"):
         proof = {}

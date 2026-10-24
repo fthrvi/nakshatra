@@ -121,9 +121,16 @@ to wake it.
 
 ## Sharing compute
 
-An operator makes a signed worker invite:
+The owner can invite a worker at any tier. A rostered `known`, `trusted`, or `self` member can also
+invite at `stranger` tier without the operator token:
 
     nak invite --kind worker --tier known --note "GPU box"
+    nak invite --kind worker --tier stranger --note "GPU box"  # known+ member
+
+Member invites are limited to 3 outstanding and 5 in a rolling 30 days. Cancel one before it is
+used with `nak uninvite <code>`. Accepting a stranger-tier worker is always an interactive,
+person-signed decision by the inviter; an agent, MCP tool, or non-interactive socket caller cannot
+accept it.
 
 The invite carries a one-time admission code. The joining node first creates its normal contact
 identity, then proves that it owns its node key and receives worker standing. If the onboard service
@@ -176,17 +183,22 @@ Turn sharing off, or turn it back on with the saved configuration:
 
 ## Using the network without serving
 
-An operator can invite a laptop or harness as a consumer. It receives a ledger identity but is
-never advertised, planned, or summoned as an inference worker:
+The owner can invite a laptop or harness as a consumer at any tier. A `known`, `trusted`, or `self`
+member can invite one at `stranger` tier. It receives a ledger identity but is never advertised,
+planned, or summoned as an inference worker:
 
     nak invite --kind consumer --tier known --starter 0 --note "laptop"
+    nak invite --kind consumer --tier stranger --starter 10000000 --note "trial laptop"
 
 `known` is the default tier; `self` cannot be granted by an invite. `--starter N` is optional and
-defaults to zero. A nonzero starter is a spend-only trial credit: it may be spent on the network but
-can never be withdrawn. Only money the person deposits can cash out. On the devnet, accepting the
-consumer's contact request automatically pays the exact amount in the person-signed invite through
-the inviter's own `nak.pay` cap. A missing/lapsed grant or a not-yet-rostered consumer leaves the
-payment visibly pending and retrying; it is never paid around the signer.
+defaults to zero. For a member invite it is capped at 10,000,000 base units (0.10 USDC on devnet),
+with the same 3-outstanding and 5-per-30-days limits as worker invites. Use `nak uninvite <code>` to
+cancel an unused invite. A nonzero starter is a spend-only trial credit: it may be spent on the
+network but can never be withdrawn. Only money the person deposits can cash out. On the devnet,
+accepting the consumer's contact request automatically pays the exact amount in the person-signed
+invite through the inviter's own `nak.pay` cap. Every stranger-tier acceptance is interactive and
+person-signed. A missing/lapsed grant or a not-yet-rostered consumer leaves the payment visibly
+pending and retrying; it is never paid around the signer.
 
 The consumer proves possession of its node key during redeem, reports no GPU capabilities, and
 opens no worker port. Its roster row is `consumer`, so worker planning and activation exclude it.

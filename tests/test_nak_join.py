@@ -687,6 +687,174 @@ def test_nak_consumer_invite_stages_signed_starter_request(tmp_path, monkeypatch
     assert registered == [code]
 
 
+def test_nak_member_invite_posts_node_signed_stranger_envelope(tmp_path, monkeypatch, capsys):
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+    person = ed25519.Ed25519PrivateKey.generate()
+    person_path = tmp_path / "person.key"
+    person_path.write_text(person.private_bytes_raw().hex())
+    node = ed25519.Ed25519PrivateKey.generate()
+    node_pub = node.public_key().public_bytes_raw().hex()
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("NAK_NET_DIR", str(tmp_path / "net"))
+    monkeypatch.delenv("NAK_ONBOARD_TOKEN", raising=False)
+    monkeypatch.setattr(nak, "_release_for_invite", lambda _url="": (REL, ""))
+    registered = []
+
+    def fake_call(_sock, req):
+        if req["op"] == "status":
+            return {"node": node_pub, "relay": "relay.example:51820"}
+        if req["op"] == "node_sign_stage":
+            body = req["body"]
+            canonical = json.dumps(body, sort_keys=True, separators=(",", ":"),
+                                   ensure_ascii=False).encode()
+            return {**body, "sig": node.sign(canonical).hex(), "ok": True}
+        registered.append(req["code"])
+        return {}
+
+    posted = []
+
+    def fake_post(url, body):
+        posted.append((url, body))
+        unsigned = {key: value for key, value in body.items() if key != "sig"}
+        canonical = json.dumps(unsigned, sort_keys=True, separators=(",", ":"),
+                               ensure_ascii=False).encode()
+        ed25519.Ed25519PublicKey.from_public_bytes(bytes.fromhex(body["inviter_pubkey"])).verify(
+            bytes.fromhex(body["sig"]), canonical)
+        return {"code": "member-worker", "expires_at": 1600}
+
+    monkeypatch.setattr(nak, "call", fake_call)
+    monkeypatch.setattr(nak.time, "time", lambda: 1000)
+    assert nak.main(["invite", "--person-key", str(person_path), "--kind", "worker",
+                     "--tier", "stranger", "--from", "Alice",
+                     "--redeem", "https://onboard.example/base", "--code-only"],
+                    http_post=fake_post) == 0
+    code = capsys.readouterr().out.strip()
+    assert posted[0][0] == "https://onboard.example/base/worker-stage"
+    envelope = posted[0][1]
+    assert {key: envelope[key] for key in ("v", "kind", "tier", "starter", "inviter_pubkey",
+                                            "ttl", "ts")} == {
+        "v": 2, "kind": "worker", "tier": "stranger", "starter": 0,
+        "inviter_pubkey": node_pub, "ttl": 86400, "ts": 1000,
+    }
+    assert registered == [code]
+
+
+def test_member_stage_refuses_non_stranger_and_large_starter_before_signing(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("NAK_ONBOARD_TOKEN", raising=False)
+    signed = []
+    with pytest.raises(SystemExit, match="tier stranger only"):
+        nak._stage_auth("worker", "known", 0, 86400, signed.append)
+    with pytest.raises(SystemExit, match="may not exceed 10000000"):
+        nak._stage_auth("consumer", "stranger", 10_000_001, 86400, signed.append)
+    assert signed == []
+
+
+def test_member_consumer_stage_includes_capped_starter_in_signed_envelope(tmp_path, monkeypatch):
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+    node = ed25519.Ed25519PrivateKey.generate()
+    node_pub = node.public_key().public_bytes_raw().hex()
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("NAK_ONBOARD_TOKEN", raising=False)
+
+    def sign(body):
+        body = {**body, "inviter_pubkey": node_pub}
+        canonical = json.dumps(body, sort_keys=True, separators=(",", ":"),
+                               ensure_ascii=False).encode()
+        return {**body, "sig": node.sign(canonical).hex(), "ok": True}
+
+    monkeypatch.setattr(nak.time, "time", lambda: 1000)
+    auth = nak._stage_auth("consumer", "stranger", 5_000_000, 3600, sign)
+    posted = []
+    consumer, expires_at = nak._stage_consumer(
+        "https://onboard.example/base", "stranger", 5_000_000, node_pub, auth,
+        lambda url, body: posted.append((url, body)) or {"code": "member-consumer", "expires_at": 1600},
+        now=1000)
+    assert expires_at == 1600 and consumer["starter"] == 5_000_000
+    assert posted[0][1]["kind"] == "consumer" and posted[0][1]["starter"] == 5_000_000
+    assert "ok" not in posted[0][1]
+
+
+def test_onboard_403_reason_is_preserved(monkeypatch):
+    import io
+    from urllib.error import HTTPError
+
+    def refused(request, timeout):
+        raise HTTPError(request.full_url, 403, "forbidden", {},
+                        io.BytesIO(b'{"error":"invite right paused"}'))
+
+    monkeypatch.setattr(nak, "urlopen", refused)
+    with pytest.raises(SystemExit, match=r"\(403\): invite right paused"):
+        nak._http_post_json("https://onboard.example/worker-stage", {"not": "a secret"})
+
+
+def test_uninvite_cancels_server_then_local_invite(net, tmp_path, monkeypatch):
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+    inviter = net("member-cancel")
+    code = _invite(inviter, kind="worker", worker={
+        "redeem": "https://onboard.example/base", "code": "cancel-me", "tier": "stranger"})
+    registered = inviter.node.register_invite(code)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("NAK_ONBOARD_TOKEN", raising=False)
+
+    def fake_call(_sock, req):
+        result = nakd.handle(inviter.node, req)
+        assert result["ok"], result
+        return result
+
+    posted = []
+    monkeypatch.setattr(nak, "call", fake_call)
+    assert nak.main(["uninvite", code], http_post=lambda url, body: posted.append((url, body)) or {"ok": True}) == 0
+    assert posted[0][0] == "https://onboard.example/base/invite-cancel"
+    body = posted[0][1]
+    unsigned = {key: value for key, value in body.items() if key != "sig"}
+    canonical = json.dumps(unsigned, sort_keys=True, separators=(",", ":"),
+                           ensure_ascii=False).encode()
+    ed25519.Ed25519PublicKey.from_public_bytes(bytes.fromhex(inviter.node.node)).verify(
+        bytes.fromhex(body["sig"]), canonical)
+    assert body["code"] == "cancel-me" and body["inviter_pubkey"] == inviter.node.node
+    assert all(row["nonce"] != registered["nonce"] for row in inviter.node.store.open_invites())
+
+    contact_code = _invite(inviter)
+    contact = inviter.node.register_invite(contact_code)
+    assert nak.main(["uninvite", contact_code],
+                    http_post=lambda _url, _body: pytest.fail("contact cancel must stay local")) == 0
+    assert all(row["nonce"] != contact["nonce"] for row in inviter.node.store.open_invites())
+
+
+def test_stranger_worker_request_is_person_gated_but_known_is_not(net):
+    inviter, stranger, known = net("gate-inviter"), net("gate-stranger"), net("gate-known")
+
+    def request_for(party, tier):
+        code = _invite(inviter, kind="worker", worker={
+            "redeem": "https://onboard.example/base", "code": f"worker-{tier}", "tier": tier})
+        row = inviter.node.register_invite(code)
+        assert inviter.node.store.consume_invite(row["nonce"], party.person_pub)
+        rid = inviter.node.store.add_request(
+            party.person_pub, party.node.node, tier, row["nonce"], party.node.node)
+        return rid
+
+    stranger_id = request_for(stranger, "stranger")
+    stranger_row = next(row for row in nakd.handle(inviter.node, {"op": "requests"})["requests"]
+                        if row["id"] == stranger_id)
+    assert stranger_row["kind"] == "worker" and stranger_row["tier"] == "stranger"
+    assert stranger_row["requires_person"] is True
+    with pytest.raises(ValueError, match="a person must accept this one"):
+        inviter.node.accept(stranger_id, "stranger")
+    ts = int(time.time())
+    signature = inviter.person_priv.sign(
+        nakd.accept_statement(stranger_id, "stranger", ts)).hex()
+    assert inviter.node.accept(stranger_id, "stranger", ts=ts, signature=signature)["person"] == \
+        stranger.person_pub
+
+    known_id = request_for(known, "known")
+    known_row = next(row for row in nakd.handle(inviter.node, {"op": "requests"})["requests"]
+                     if row["id"] == known_id)
+    assert known_row["kind"] == "worker" and known_row["tier"] == "known"
+    assert known_row["requires_person"] is False
+    assert inviter.node.accept(known_id, "known")["person"] == known.person_pub
+
+
 def test_consumer_redeem_uses_node_key_proof_without_worker_capabilities(net, tmp_path):
     from cryptography.hazmat.primitives.asymmetric import ed25519
     a = net("inviter")
@@ -742,11 +910,13 @@ def test_consumer_redeem_persists_url_but_ignores_onboarding_package_key(net, tm
 def test_worker_stage_expiry_defaults_to_one_hour_and_rejects_bad_urls(monkeypatch):
     monkeypatch.setenv("NAK_ONBOARD_TOKEN", "operator-secret")
     worker, expires_at = nak._stage_worker(
-        "https://onboard.example/base", "known", lambda _url, _body: {"code": "staged-once"}, now=1000)
+        "https://onboard.example/base", "known", {"token": "operator-secret"},
+        lambda _url, _body: {"code": "staged-once"}, now=1000)
     assert worker["code"] == "staged-once" and expires_at == 4600
     for url in ("http:///missing-host", "http://host:bad", "http://host:0", "http://host:65536", "http://host:"):
         with pytest.raises(SystemExit, match=r"http\(s\)"):
-            nak._stage_worker(url, "known", lambda _url, _body: {"code": "never"}, now=1000)
+            nak._stage_worker(url, "known", {"token": "operator-secret"},
+                              lambda _url, _body: {"code": "never"}, now=1000)
 
 
 def test_starter_is_rejected_for_non_consumer_invites():
