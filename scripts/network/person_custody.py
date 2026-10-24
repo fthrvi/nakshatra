@@ -20,6 +20,8 @@ KINDS = {
     "spend-cap",
     "invite",
     "revoke",
+    "report",
+    "suspend",
 }
 
 _BROKER_UNAVAILABLE = (

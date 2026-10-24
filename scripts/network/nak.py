@@ -30,6 +30,7 @@ import re
 import sqlite3
 import sys
 import time
+import unicodedata
 from contextlib import contextmanager
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -90,6 +91,43 @@ def _ago(ts: int) -> str:
     return f"{d}s ago" if d < 120 else f"{d // 60}m ago" if d < 7200 else f"{d // 3600}h ago"
 
 
+def _visible_untrusted(value: object, limit: int = 500) -> str:
+    """Render remote text on one inert line, with controls made visibly non-operative."""
+    rendered = []
+    for char in str(value):
+        code = ord(char)
+        if char == "\n":
+            token = r"\n"
+        elif char == "\r":
+            token = r"\r"
+        elif char == "\t":
+            token = r"\t"
+        elif code == 0x1b:
+            token = r"\x1b"
+        elif unicodedata.category(char) in {"Cc", "Cf"}:
+            token = f"\\u{code:04x}" if code <= 0xffff else f"\\U{code:08x}"
+        else:
+            token = char
+        if sum(map(len, rendered)) + len(token) > limit:
+            rendered.append("…")
+            break
+        rendered.append(token)
+    return "".join(rendered)
+
+
+def _sanitized_untrusted_json(value):
+    if isinstance(value, str):
+        return _visible_untrusted(value)
+    if isinstance(value, list):
+        return [_sanitized_untrusted_json(item) for item in value]
+    if isinstance(value, dict):
+        return {_visible_untrusted(key, 64): _sanitized_untrusted_json(item)
+                for key, item in value.items()}
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return _visible_untrusted(value)
+
+
 # The public circuit relay (VPS). Its PeerId is the relay's identity: a sidecar refuses any other key there.
 DEFAULT_P2P_RELAY_ID = "12D3KooWDfHFtM8PP7TV46nssrix2hTL3kzMkv7kKMhULDakFGB7"
 DEFAULT_P2P_RELAYS = (f"/ip4/45.63.109.137/udp/29700/quic-v1/p2p/{DEFAULT_P2P_RELAY_ID},"
@@ -97,6 +135,17 @@ DEFAULT_P2P_RELAYS = (f"/ip4/45.63.109.137/udp/29700/quic-v1/p2p/{DEFAULT_P2P_RE
 DEFAULT_ONBOARD_BASE = "https://prithviloka.net/onboard"
 ONBOARD_STAGE_PURPOSE = "onboard-stage-v2"
 ONBOARD_CANCEL_PURPOSE = "onboard-cancel-v2"
+
+
+class _OnboardHTTPError(SystemExit):
+    """An HTTP refusal whose status remains available to recovery logic."""
+
+    def __init__(self, status: int, detail: str = ""):
+        self.status = int(status)
+        message = f"onboard server refused the request ({self.status})"
+        if detail:
+            message += f": {detail}"
+        super().__init__(message)
 
 
 def _http_post_json(url: str, body: dict) -> dict:
@@ -110,7 +159,26 @@ def _http_post_json(url: str, body: dict) -> dict:
             detail = json.loads(e.read().decode()).get("error", "")
         except (ValueError, AttributeError):
             detail = ""
-        raise SystemExit(f"onboard server refused the request ({e.code})" + (f": {detail}" if detail else ""))
+        detail = _visible_untrusted(detail, 500)
+        raise _OnboardHTTPError(e.code, detail)
+    except (OSError, URLError, ValueError) as e:
+        raise SystemExit(f"could not reach the onboard server: {e}")
+    if not isinstance(result, dict):
+        raise SystemExit("onboard server returned an invalid response")
+    return result
+
+
+def _http_get_json(url: str) -> dict:
+    req = Request(url, headers={"accept": "application/json"}, method="GET")
+    try:
+        with urlopen(req, timeout=20) as response:
+            result = json.loads(response.read().decode())
+    except HTTPError as e:
+        try:
+            detail = json.loads(e.read().decode()).get("error", "")
+        except (ValueError, AttributeError):
+            detail = ""
+        raise _OnboardHTTPError(e.code, _visible_untrusted(detail, 500))
     except (OSError, URLError, ValueError) as e:
         raise SystemExit(f"could not reach the onboard server: {e}")
     if not isinstance(result, dict):
@@ -133,7 +201,7 @@ def _onboard_token(*, required: bool = True) -> str | None:
             return None
         raise SystemExit(f"worker invites need NAK_ONBOARD_TOKEN or {path}: file not found")
     except OSError as e:
-        raise SystemExit(f"worker invites need NAK_ONBOARD_TOKEN or {path}: {e}")
+        raise SystemExit(f"onboard operator access needs NAK_ONBOARD_TOKEN or {path}: {e}")
     if path.is_symlink() or not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
         raise SystemExit(f"refusing {path}: operator token file must be a regular 0600 file")
     token = path.read_text().strip()
@@ -2151,6 +2219,246 @@ def _resolve_posted_task(sock: Path, ref: str) -> str:
     return rows[0]["task_hash"]
 
 
+def _admission_roster_has_node(node: str) -> bool:
+    path = Path.home() / ".nakshatra" / "admission-peers.tsv"
+    try:
+        lines = path.read_text().splitlines()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise SystemExit(f"refused: cannot read local admission roster {path}: {exc}") from exc
+    for line in lines:
+        fields = line.strip().split()
+        if fields and not fields[0].startswith("#") and fields[0] == node:
+            return True
+    return False
+
+
+def _resolve_node_reference(sock: Path, ref: str, status: dict | None = None,
+                            *, force_unknown: bool = False) -> str:
+    rows = call(sock, {"op": "contacts"})["contacts"]
+    status = status or call(sock, {"op": "status"})
+    if ref == status.get("node") or ref == status.get("person"):
+        raise SystemExit("refused: cannot suspend this person's own node")
+    hits = [row for row in rows if row.get("node") == ref or row.get("petname") == ref or
+            row.get("person") == ref or
+            (len(ref) >= 8 and str(row.get("person", "")).startswith(ref))]
+    if len(hits) == 1:
+        node = hits[0]["node"]
+        person = hits[0].get("person")
+    if len(hits) > 1:
+        raise SystemExit("refused: no single contact matches that node reference")
+    if not hits:
+        if re.fullmatch(r"[0-9a-f]{64}", ref or ""):
+            node, person = ref, None
+            if not force_unknown and not _admission_roster_has_node(node):
+                raise SystemExit(
+                    "refused: raw node is neither a contact nor in the local admission roster; "
+                    "use --force-unknown-node only after verifying the key")
+        else:
+            raise SystemExit("refused: no single contact matches that node reference")
+    if node == status.get("node") or (person and person == status.get("person")):
+        raise SystemExit("refused: cannot suspend this person's own node")
+    return node
+
+
+def _resolve_contact_reference(sock: Path, ref: str) -> dict:
+    rows = call(sock, {"op": "contacts"})["contacts"]
+    hits = [row for row in rows if row.get("petname") == ref or row.get("person") == ref or
+            (len(ref) >= 8 and str(row.get("person", "")).startswith(ref))]
+    if len(hits) != 1:
+        raise SystemExit("refused: no single contact matches that reference")
+    return hits[0]
+
+
+def _operator_onboard_base() -> str:
+    base = os.environ.get("NAK_ONBOARD_BASE", "").strip()
+    if not base:
+        state = Path(os.environ.get("NAK_NET_DIR", Path.home() / ".nakshatra" / "net"))
+        try:
+            base = (state / "onboard-base").read_text().strip()
+        except FileNotFoundError:
+            base = DEFAULT_ONBOARD_BASE
+        except OSError as exc:
+            raise SystemExit(f"cannot read onboard-base: {exc}") from exc
+    parsed = urlsplit(base)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or \
+            parsed.password or parsed.query or parsed.fragment:
+        raise SystemExit("onboard base must be an http(s) URL without credentials, query, or fragment")
+    return base.rstrip("/")
+
+
+def _server_suspension_record(base: str, token: str, http_post, http_get) -> dict:
+    """Fetch the signed server record, with compatibility for the redacted public view."""
+    public = http_get(base + "/suspensions")
+    record = public.get("record") if isinstance(public.get("record"), dict) else None
+    if public.get("schema") == "nak.suspensions.v1":
+        record = public
+    if record is None:
+        # Hardened servers expose only nodes+seq publicly.  Their authenticated operator view is
+        # the same signed record and is the compatible recovery source.
+        operator_view = http_post(base + "/operator/suspensions", {"token": token})
+        record = operator_view.get("record")
+    if not isinstance(record, dict):
+        raise SystemExit("onboard server did not return a signed suspension record")
+    return record
+
+
+def _operator_suspend(args, sock: Path, http_post, http_get) -> int:
+    verb = "suspend" if args.operator_cmd == "suspend" else "unsuspend"
+    reason = getattr(args, "reason", "")
+    abandoning = bool(getattr(args, "abandon_pending", False))
+    if abandoning and (args.target or reason or getattr(args, "force_unknown_node", False)):
+        raise SystemExit("--abandon-pending cannot be combined with a target, --reason, or --force-unknown-node")
+    if not abandoning and not args.target:
+        raise SystemExit(f"nak operator {verb} requires a node or contact")
+    summary = ("Abandon pending suspension update" if abandoning else
+               f"{verb.title()} node/contact {plain(args.target, 72)}")
+    if reason:
+        summary += f" for {json.dumps(plain(reason, 120), ensure_ascii=False)}"
+    broker_preflight("suspend", summary)
+    if not sys.stdin.isatty():
+        raise SystemExit(f"nak operator {verb} is interactive-only; run it in a terminal")
+    if not abandoning and verb == "suspend" and \
+            (not isinstance(reason, str) or not reason or len(reason) > 120):
+        raise SystemExit("--reason must be non-empty text of at most 120 characters")
+
+    status = call(sock, {"op": "status"})
+    state = call(sock, {"op": "suspensions"})
+    previous = state.get("own")
+    pending = state.get("pending")
+    from network.suspension import MAX_SEQ, make_record, verify_record
+    if previous:
+        try:
+            previous = verify_record(previous, status["person"])
+        except ValueError as exc:
+            raise SystemExit(f"refused: installed suspension record is invalid: {exc}") from exc
+    if pending:
+        try:
+            pending = verify_record(pending, status["person"])
+        except ValueError as exc:
+            raise SystemExit(f"refused: pending suspension record is invalid: {exc}") from exc
+    from network.nakd import person_action_statement, suspension_record_proof_payload
+    if abandoning:
+        if pending is None:
+            print("no pending suspension update")
+            return 0
+        answer = input(f"ABANDON pending operator record seq {pending['seq']}? [y/N] ")
+        if answer.strip().lower() not in {"y", "yes"}:
+            print("pending suspension update unchanged")
+            return 1
+        with approval("suspend", summary):
+            person_key = PersonKey("suspend", summary)
+            if person_key.public_key().public_bytes_raw().hex() != status["person"]:
+                raise SystemExit("the approved person key does not match nakd's person identity")
+            abandon_ts = int(time.time())
+            abandon_sig = person_key.sign(person_action_statement(
+                "abandon-suspension", suspension_record_proof_payload(pending), abandon_ts)).hex()
+        call(sock, {"op": "abandon_suspension", "record": pending,
+                    "ts": abandon_ts, "signature": abandon_sig})
+        print(f"abandoned pending operator record seq {pending['seq']}; server state was not changed")
+        return 0
+
+    node = _resolve_node_reference(
+        sock, args.target, status, force_unknown=bool(getattr(args, "force_unknown_node", False)))
+    nodes = set(previous["nodes"] if previous else [])
+    reasons = dict(previous["reasons"] if previous else {})
+    if verb == "suspend":
+        nodes.add(node)
+        reasons[node] = reason
+    else:
+        if node not in nodes:
+            raise SystemExit("refused: that node is not currently suspended")
+        nodes.remove(node)
+        reasons.pop(node, None)
+    seq = previous["seq"] + 1 if previous else 1
+    if seq > MAX_SEQ:
+        raise SystemExit(f"cannot create another suspension record: sequence limit {MAX_SEQ} reached")
+    retrying = pending is not None
+    if retrying and (pending["seq"] != seq or set(pending["nodes"]) != nodes
+                     or pending["reasons"] != reasons):
+        raise SystemExit(
+            f"refused: suspension record seq {pending['seq']} is pending; re-run its original "
+            "suspend/unsuspend command before starting a different change")
+    action = "SUSPEND" if verb == "suspend" else "UNSUSPEND"
+    retry_label = "RETRY " if retrying else ""
+    answer = input(
+        f"{retry_label}{action} node {node[:16]}… and publish operator record seq {seq}? [y/N] ")
+    if answer.strip().lower() not in {"y", "yes"}:
+        print("suspension state unchanged")
+        return 1
+
+    base = _operator_onboard_base()
+    token = _onboard_token()
+    if retrying:
+        record = pending
+        with approval("suspend", summary):
+            person_key = PersonKey("suspend", summary)
+            person_pub = person_key.public_key().public_bytes_raw().hex()
+            if person_pub != status["person"]:
+                raise SystemExit("the approved person key does not match nakd's person identity")
+            install_ts = int(time.time())
+            install_sig = person_key.sign(person_action_statement(
+                "install-suspension", suspension_record_proof_payload(record), install_ts)).hex()
+    else:
+        with approval("suspend", summary):
+            person_key = PersonKey("suspend", summary)
+            person_pub = person_key.public_key().public_bytes_raw().hex()
+            if person_pub != status["person"]:
+                raise SystemExit("the approved person key does not match nakd's person identity")
+            stage_ts = int(time.time())
+            record = make_record(person_key.sign, person_pub, seq, nodes, reasons, stage_ts)
+            stage_sig = person_key.sign(person_action_statement(
+                "stage-suspension", suspension_record_proof_payload(record), stage_ts)).hex()
+            install_ts = stage_ts
+            install_sig = person_key.sign(person_action_statement(
+                "install-suspension", suspension_record_proof_payload(record), install_ts)).hex()
+        # This write precedes the server request.  A timeout or lost response therefore leaves the
+        # exact signed bytes available for an idempotent retry instead of minting seq+1 again.
+        call(sock, {"op": "stage_suspension", "record": record,
+                    "ts": stage_ts, "signature": stage_sig})
+
+    try:
+        response = http_post(base + "/operator/suspend", {"token": token, "record": record})
+    except _OnboardHTTPError as exc:
+        if exc.status in {400, 403, 404}:
+            abandon_ts = int(time.time())
+            abandon_sig = person_key.sign(person_action_statement(
+                "abandon-suspension", suspension_record_proof_payload(record), abandon_ts)).hex()
+            call(sock, {"op": "abandon_suspension", "record": record,
+                        "ts": abandon_ts, "signature": abandon_sig})
+            raise SystemExit(f"{exc}; pending suspension update cleared; server state was unchanged")
+        if exc.status != 409:
+            raise
+        remote = _server_suspension_record(base, token, http_post, http_get)
+        try:
+            remote = verify_record(remote, status["person"])
+        except ValueError as verify_exc:
+            raise SystemExit(
+                f"refused: server suspension recovery record is invalid: {verify_exc}") from verify_exc
+        local_seq = previous["seq"] if previous else 0
+        if remote["seq"] <= local_seq:
+            raise SystemExit("refused: server stale-sequence recovery did not return newer state")
+        recovery_summary = f"Recover server suspension state at seq {remote['seq']}"
+        with approval("suspend", recovery_summary):
+            person_key = PersonKey("suspend", recovery_summary)
+            if person_key.public_key().public_bytes_raw().hex() != status["person"]:
+                raise SystemExit("the approved person key does not match nakd's person identity")
+            recovery_ts = int(time.time())
+            recovery_sig = person_key.sign(person_action_statement(
+                "recover-suspension", suspension_record_proof_payload(remote), recovery_ts)).hex()
+        recovered = call(sock, {"op": "recover_suspension", "record": remote,
+                                "ts": recovery_ts, "signature": recovery_sig})
+        raise SystemExit(
+            f"server suspension state advanced to seq {recovered['seq']}; installed it locally; "
+            "re-run the command with the new state")
+    call(sock, {"op": "install_suspension", "record": record,
+                "ts": install_ts, "signature": install_sig})
+    changed = response.get("suspended", []) if verb == "suspend" else response.get("restored", [])
+    print(f"operator record seq {seq} installed; {verb}ed {len(changed)} node(s)")
+    return 0
+
+
 class _NoAbbrevArgumentParser(argparse.ArgumentParser):
     """Keep every parser level strict; argparse otherwise abbreviates long options."""
 
@@ -2159,7 +2467,7 @@ class _NoAbbrevArgumentParser(argparse.ArgumentParser):
         super().__init__(*args, **kwargs)
 
 
-def main(argv=None, *, http_post=None) -> int:
+def main(argv=None, *, http_post=None, http_get=None) -> int:
     default_sock = Path(os.environ.get("NAK_NET_DIR", Path.home() / ".nakshatra" / "net")) / "nakd.sock"
     # ArgumentParser uses type(self) for every nested subparser, so the strict setting propagates
     # through gateway, wallet, worker, owner-lease, and task rather than stopping at the root.
@@ -2198,6 +2506,36 @@ def main(argv=None, *, http_post=None) -> int:
     rsub.add_parser("export", help="print this person's latest nkr1 record")
     q = rsub.add_parser("import", help="install an existing contact's nkr1 record")
     q.add_argument("blob")
+    p = sub.add_parser("suspensions", help="inspect or move person-signed suspension records")
+    ssub = p.add_subparsers(dest="suspensions_cmd")
+    ssub.add_parser("export", help="print this operator's latest nks1 record")
+    q = ssub.add_parser("import", help="install an existing contact's nks1 record")
+    q.add_argument("blob")
+    p = sub.add_parser("report", help="report a node or contact to the network operator")
+    p.add_argument("subject")
+    p.add_argument("--reason", required=True,
+                   choices=["spam", "fraud", "abuse", "bad-output", "other"])
+    p.add_argument("--note", default="")
+    p.add_argument("--task", default="", help="related 64-hex task hash")
+    p.add_argument("--mid", default="", help="related message id")
+    p = sub.add_parser("operator", help="review reports and publish suspension state")
+    osub = p.add_subparsers(dest="operator_cmd", required=True)
+    q = osub.add_parser("reports", help="show recent member reports")
+    q.add_argument("--since", default="7d")
+    q.add_argument("--json", action="store_true")
+    q = osub.add_parser("suspend", help="suspend one rostered node")
+    q.add_argument("target", nargs="?")
+    q.add_argument("--reason", default="")
+    q.add_argument("--force-unknown-node", action="store_true")
+    q.add_argument("--abandon-pending", action="store_true",
+                   help="person-authorized removal of a staged update the server did not apply")
+    q = osub.add_parser("unsuspend", help="restore one suspended node's prior tier")
+    q.add_argument("target")
+    q.add_argument("--force-unknown-node", action="store_true")
+    p = sub.add_parser("operator-trust", help="trust a contact's signed suspension records")
+    p.add_argument("contact")
+    p = sub.add_parser("operator-untrust", help="stop trusting a contact's suspension records")
+    p.add_argument("contact")
     p = sub.add_parser("invite"); p.add_argument(
         "--person-key", type=Path, default=None,
         help="explicit file key in file custody only (default: ~/.sthambha/person-TEST.key)")
@@ -2413,6 +2751,125 @@ def main(argv=None, *, http_post=None) -> int:
                 print(f"{contact.get('petname') or person[:16]}: received seq {row.get('seq', 0)} "
                       f"({row.get('count', 0)} grant(s)); own acked seq "
                       f"{result.get('sent', {}).get(person, 0)}")
+    elif a.cmd == "suspensions":
+        if a.suspensions_cmd == "export":
+            from network.suspension import encode_record
+            own = call(s, {"op": "suspensions"}).get("own")
+            if not own:
+                raise SystemExit("no suspension record has been created")
+            print(encode_record(own))
+        elif a.suspensions_cmd == "import":
+            summary = "Import a trusted operator suspension record"
+            broker_preflight("suspend", summary)
+            if not sys.stdin.isatty():
+                raise SystemExit("nak suspensions import is interactive-only; run it in a terminal")
+            from network.nakd import person_action_statement, suspension_record_proof_payload
+            from network.suspension import decode_record
+            try:
+                record = decode_record(a.blob)
+            except ValueError as exc:
+                raise SystemExit(f"refused: invalid suspension record: {exc}") from exc
+            answer = input(f"IMPORT suspension record seq {record['seq']} from "
+                           f"{record['person'][:16]}…? [y/N] ")
+            if answer.strip().lower() not in {"y", "yes"}:
+                print("suspension state unchanged")
+                return 1
+            with approval("suspend", summary):
+                person_key = PersonKey("suspend", summary)
+                proof_ts = int(time.time())
+                proof_sig = person_key.sign(person_action_statement(
+                    "import-suspension", suspension_record_proof_payload(record), proof_ts)).hex()
+            result = call(s, {"op": "import_suspension", "blob": a.blob,
+                              "ts": proof_ts, "signature": proof_sig})
+            print(f"imported seq {result['seq']} with {result['count']} suspended node(s)" +
+                  ("" if result["new"] else " (already known)"))
+        else:
+            result = call(s, {"op": "suspensions"})
+            own = result.get("own")
+            print(f"own seq {own['seq'] if own else 0}: " +
+                  (", ".join(own["nodes"]) if own and own["nodes"] else "no suspended nodes"))
+            pending = result.get("pending")
+            if pending:
+                print(f"pending server confirmation seq {pending['seq']}: " +
+                      (", ".join(pending["nodes"]) if pending["nodes"] else
+                       "no suspended nodes"))
+            trusted = set(result.get("operators", []))
+            for person, row in sorted(result.get("received", {}).items()):
+                label = "trusted operator" if person in trusted else "untrusted contact"
+                print(f"{person[:16]}…: received seq {row['seq']} ({row['count']} node(s), {label})")
+    elif a.cmd == "report":
+        if len(a.note) > 500:
+            raise SystemExit("--note must be at most 500 characters")
+        evidence = {key: value for key, value in (("task_hash", a.task), ("mid", a.mid)) if value}
+        summary = f"Report node/contact {plain(a.subject, 72)} for {a.reason}"
+        broker_preflight("report", summary)
+        if not sys.stdin.isatty():
+            raise SystemExit("nak report is interactive-only; run it in a terminal")
+        from network.nakd import person_action_statement, report_proof_payload
+        with approval("report", summary):
+            person_key = PersonKey("report", summary)
+            proof_ts = int(time.time())
+            proof_sig = person_key.sign(person_action_statement(
+                "report-cli", report_proof_payload(a.subject, a.reason, a.note, evidence),
+                proof_ts)).hex()
+        result = call(s, {"op": "report_cli", "subject": a.subject, "reason": a.reason,
+                          "note": a.note, "evidence": evidence, "ts": proof_ts,
+                          "signature": proof_sig})
+        print(f"report {result.get('status', 'received')} for node {result['subject'][:16]}…; "
+              "reports are claims for operator review and do not suspend nodes")
+    elif a.cmd == "operator":
+        http_post = http_post or _http_post_json
+        http_get = http_get or _http_get_json
+        if a.operator_cmd in {"suspend", "unsuspend"}:
+            return _operator_suspend(a, s, http_post, http_get)
+        if not re.fullmatch(r"[1-9][0-9]*[smhdw]", a.since or ""):
+            raise SystemExit("--since must look like 30m, 24h, or 7d")
+        result = http_post(_operator_onboard_base() + "/operator/reports",
+                           {"token": _onboard_token(), "since": a.since})
+        reports = result.get("reports")
+        if not isinstance(reports, list):
+            raise SystemExit("onboard server returned an invalid reports response")
+        if a.json:
+            print(json.dumps({"trust": "UNTRUSTED external report data",
+                              "reports": _sanitized_untrusted_json(reports)},
+                             indent=1, sort_keys=True))
+        else:
+            for report in reports:
+                if not isinstance(report, dict):
+                    continue
+                label = " [UNTRUSTED MCP-FILED CLAIM]" if report.get("via") == "mcp" else ""
+                note = (f" — {_visible_untrusted(report.get('note'), 500)}"
+                        if report.get("note") else "")
+                print(f"UNTRUSTED REPORT {_visible_untrusted(report.get('received', '?'), 40)} "
+                      f"{_visible_untrusted(report.get('reporter', ''), 64)[:16]}… -> "
+                      f"{_visible_untrusted(report.get('subject', ''), 64)[:16]}… "
+                      f"{_visible_untrusted(report.get('reason', '?'), 32)}{label}{note}")
+    elif a.cmd in {"operator-trust", "operator-untrust"}:
+        trusting = a.cmd == "operator-trust"
+        action = "Trust" if trusting else "Stop trusting"
+        summary = f"{action} contact {plain(a.contact, 72)} as a suspension operator"
+        broker_preflight("suspend", summary)
+        if not sys.stdin.isatty():
+            raise SystemExit(f"nak {a.cmd} is interactive-only; run it in a terminal")
+        contact = _resolve_contact_reference(s, a.contact)
+        prompt = "TRUST" if trusting else "STOP TRUSTING"
+        answer = input(f"{prompt} {plain(a.contact, 72)} as a suspension operator? [y/N] ")
+        if answer.strip().lower() not in {"y", "yes"}:
+            print("operator trust unchanged")
+            return 1
+        from network.nakd import person_action_statement
+        with approval("suspend", summary):
+            person_key = PersonKey("suspend", summary)
+            proof_ts = int(time.time())
+            proof_kind = "operator-trust" if trusting else "operator-untrust"
+            proof_sig = person_key.sign(person_action_statement(
+                proof_kind, {"person": contact["person"]}, proof_ts)).hex()
+        op = "operator_trust" if trusting else "operator_untrust"
+        result = call(s, {"op": op, "contact": contact["person"],
+                          "ts": proof_ts, "signature": proof_sig})
+        past = "trusted" if trusting else "stopped trusting"
+        print(f"{past} suspension operator [UNTRUSTED CONTACT LABEL] "
+              f"{_visible_untrusted(result['contact'], 72)} ({result['person'][:16]}…)")
     elif a.cmd == "wallet":
         _wallet_command(a)
     elif a.cmd == "balance":

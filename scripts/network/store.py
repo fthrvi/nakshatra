@@ -73,6 +73,17 @@ CREATE TABLE IF NOT EXISTS contact_revocation_seq (person TEXT PRIMARY KEY, seq 
     received_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS revocation_sent (person TEXT NOT NULL, node TEXT NOT NULL,
     seq INTEGER NOT NULL, PRIMARY KEY(person, node));
+CREATE TABLE IF NOT EXISTS own_suspension (record_json TEXT NOT NULL, seq INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS pending_own_suspension (record_json TEXT NOT NULL, seq INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS contact_suspensions (person TEXT NOT NULL, node TEXT NOT NULL,
+    reason TEXT NOT NULL, seq INTEGER NOT NULL, PRIMARY KEY(person, node));
+CREATE TABLE IF NOT EXISTS contact_suspension_seq (person TEXT PRIMARY KEY, seq INTEGER NOT NULL,
+    received_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS suspension_sent (person TEXT NOT NULL, node TEXT NOT NULL,
+    seq INTEGER NOT NULL, PRIMARY KEY(person, node));
+CREATE TABLE IF NOT EXISTS operator_persons (person TEXT PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS person_action_proofs (signature TEXT PRIMARY KEY, used_at INTEGER NOT NULL,
+    proof_ts INTEGER);
 """
 
 
@@ -103,6 +114,12 @@ class Store:
         os.chmod(self._db_path, 0o600)
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.executescript(SCHEMA)
+        try:
+            self._db.execute("ALTER TABLE person_action_proofs ADD COLUMN proof_ts INTEGER")
+        except sqlite3.OperationalError:
+            pass
+        self._db.execute(
+            "UPDATE person_action_proofs SET proof_ts=used_at WHERE proof_ts IS NULL")
         self._migrate_revocation_sent()
         # An address disabled by the pre-hardening build is already retired evidence. Preserve it
         # before any caller can try to re-register the same aid after an upgrade.
@@ -809,6 +826,224 @@ class Store:
             "ON c.person=r.person AND c.node=r.node")}
         return {"own": own, "received": received, "sent": sent}
 
+    # Public person-signed suspension state. Unlike revocations, each newer record replaces the
+    # previous set. contact_suspension_seq therefore survives an empty (unsuspend-all) record so a
+    # stale non-empty record cannot be replayed afterward.
+    def set_own_suspension(self, record: dict) -> None:
+        encoded = json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+        def fn(db):
+            row = db.execute("SELECT seq FROM own_suspension LIMIT 1").fetchone()
+            if row and int(record["seq"]) <= int(row[0]):
+                raise ValueError("suspension seq must be newer than the installed record")
+            db.execute("DELETE FROM own_suspension")
+            db.execute("INSERT INTO own_suspension(record_json,seq) VALUES (?,?)",
+                       (encoded, int(record["seq"])))
+        self._tx(fn)
+
+    def own_suspension(self) -> Optional[dict]:
+        rows = self._q("SELECT record_json FROM own_suspension LIMIT 1")
+        return json.loads(rows[0][0]) if rows else None
+
+    def set_pending_own_suspension(self, record: dict) -> bool:
+        """Durably stage the exact person-signed record that will be posted to the server."""
+        encoded = json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+        def fn(db):
+            own = db.execute("SELECT seq FROM own_suspension LIMIT 1").fetchone()
+            if own and int(record["seq"]) <= int(own[0]):
+                raise ValueError("pending suspension seq must be newer than the installed record")
+            pending = db.execute(
+                "SELECT record_json,seq FROM pending_own_suspension LIMIT 1").fetchone()
+            if pending:
+                if int(pending[1]) == int(record["seq"]) and pending[0] == encoded:
+                    return False
+                raise ValueError("another suspension record is already pending server confirmation")
+            db.execute(
+                "INSERT INTO pending_own_suspension(record_json,seq) VALUES (?,?)",
+                (encoded, int(record["seq"])))
+            return True
+        return self._tx(fn)
+
+    def pending_own_suspension(self) -> Optional[dict]:
+        rows = self._q("SELECT record_json FROM pending_own_suspension LIMIT 1")
+        return json.loads(rows[0][0]) if rows else None
+
+    def commit_pending_own_suspension(self, record: dict) -> None:
+        """Promote only the byte-equivalent record previously authorized and staged."""
+        encoded = json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+        def fn(db):
+            pending = db.execute(
+                "SELECT record_json,seq FROM pending_own_suspension LIMIT 1").fetchone()
+            if not pending or pending[0] != encoded or int(pending[1]) != int(record["seq"]):
+                raise ValueError("server-confirmed suspension record is not the pending record")
+            own = db.execute("SELECT seq FROM own_suspension LIMIT 1").fetchone()
+            if own and int(record["seq"]) <= int(own[0]):
+                raise ValueError("suspension seq must be newer than the installed record")
+            db.execute("DELETE FROM own_suspension")
+            db.execute("INSERT INTO own_suspension(record_json,seq) VALUES (?,?)",
+                       (encoded, int(record["seq"])))
+            db.execute("DELETE FROM pending_own_suspension")
+        self._tx(fn)
+
+    def abandon_pending_own_suspension(self, record: dict) -> None:
+        """Clear only the exact staged record a person explicitly authorized abandoning."""
+        encoded = json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+        def fn(db):
+            pending = db.execute(
+                "SELECT record_json,seq FROM pending_own_suspension LIMIT 1").fetchone()
+            if not pending or pending[0] != encoded or int(pending[1]) != int(record["seq"]):
+                raise ValueError("suspension record is not the pending record")
+            db.execute("DELETE FROM pending_own_suspension")
+        self._tx(fn)
+
+    def recover_own_suspension(self, record: dict) -> None:
+        """Adopt a newer server record after a staged update loses a sequence race."""
+        encoded = json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+        def fn(db):
+            pending = db.execute("SELECT 1 FROM pending_own_suspension LIMIT 1").fetchone()
+            if not pending:
+                raise ValueError("no pending suspension update to recover")
+            own = db.execute("SELECT seq FROM own_suspension LIMIT 1").fetchone()
+            own_seq = int(own[0]) if own else 0
+            if int(record["seq"]) <= own_seq:
+                raise ValueError("server suspension record is not newer than local state")
+            db.execute("DELETE FROM own_suspension")
+            db.execute("INSERT INTO own_suspension(record_json,seq) VALUES (?,?)",
+                       (encoded, int(record["seq"])))
+            db.execute("DELETE FROM pending_own_suspension")
+        self._tx(fn)
+
+    def apply_contact_suspension(self, person: str, record: dict) -> bool:
+        seq = int(record["seq"])
+        now = int(time.time())
+
+        def fn(db):
+            current = db.execute(
+                "SELECT seq FROM contact_suspension_seq WHERE person=?", (person,)).fetchone()
+            if current and seq <= int(current[0]):
+                return False
+            db.execute("DELETE FROM contact_suspensions WHERE person=?", (person,))
+            db.executemany(
+                "INSERT INTO contact_suspensions(person,node,reason,seq) VALUES (?,?,?,?)",
+                ((person, node, record["reasons"][node], seq) for node in record["nodes"]))
+            db.execute(
+                "INSERT INTO contact_suspension_seq(person,seq,received_at) VALUES (?,?,?) "
+                "ON CONFLICT(person) DO UPDATE SET seq=excluded.seq,received_at=excluded.received_at",
+                (person, seq, now))
+            return True
+        return self._tx(fn)
+
+    def suspended_nodes(self) -> set[str]:
+        nodes = {row[0] for row in self._q(
+            "SELECT DISTINCT s.node FROM contact_suspensions s "
+            "JOIN operator_persons o ON o.person=s.person "
+            "JOIN contacts c ON c.person=s.person")}
+        own = self.own_suspension()
+        if own and own.get("person") in self.operator_persons():
+            nodes.update(own.get("nodes", []))
+        return nodes
+
+    def suspension_sent_seq(self, person: str, node: str) -> int:
+        rows = self._q("SELECT seq FROM suspension_sent WHERE person=? AND node=?", (person, node))
+        return int(rows[0][0]) if rows else 0
+
+    def mark_suspension_sent(self, person: str, node: str, seq: int) -> None:
+        self._q(
+            "INSERT INTO suspension_sent(person,node,seq) VALUES (?,?,?) "
+            "ON CONFLICT(person,node) DO UPDATE SET seq=MAX(suspension_sent.seq,excluded.seq)",
+            (person, node, int(seq)))
+
+    def set_operator_person(self, person: str) -> None:
+        self._q("INSERT OR IGNORE INTO operator_persons(person) VALUES (?)", (person,))
+
+    def unset_operator_person(self, person: str) -> None:
+        self._q("DELETE FROM operator_persons WHERE person=?", (person,))
+
+    def operator_persons(self) -> set[str]:
+        return {row[0] for row in self._q("SELECT person FROM operator_persons ORDER BY person")}
+
+    def consume_person_action_proof(self, signature: str, proof_ts: int, now: int,
+                                    max_age_s: int) -> None:
+        """Atomically make a valid person proof single-use, including across daemon restarts."""
+        cutoff = int(now) - int(max_age_s)
+
+        def fn(db):
+            db.execute("DELETE FROM person_action_proofs WHERE proof_ts<?", (cutoff,))
+            try:
+                db.execute(
+                    "INSERT INTO person_action_proofs(signature,used_at,proof_ts) VALUES (?,?,?)",
+                    (signature, int(now), int(proof_ts)))
+            except sqlite3.IntegrityError as exc:
+                raise ValueError("person authorization proof has already been used") from exc
+        self._tx(fn)
+
+    def suspension_status(self) -> dict:
+        received = {person: {"seq": int(seq), "count": int(count)}
+                    for person, seq, count in self._q(
+                        "SELECT q.person,q.seq,COUNT(s.node) FROM contact_suspension_seq q "
+                        "LEFT JOIN contact_suspensions s ON s.person=q.person "
+                        "GROUP BY q.person,q.seq")}
+        sent = {person: int(seq) for person, seq in self._q(
+            "SELECT s.person,s.seq FROM suspension_sent s JOIN contacts c "
+            "ON c.person=s.person AND c.node=s.node")}
+        return {"own": self.own_suspension(), "pending": self.pending_own_suspension(),
+                "received": received, "sent": sent,
+                "operators": sorted(self.operator_persons()),
+                "suspended": sorted(self.suspended_nodes())}
+
+    def take_report_quota(self, via: str, now: int) -> None:
+        """Atomically spend one local report slot (10 total/day, at most 5 from MCP)."""
+        if via not in {"cli", "mcp"}:
+            raise ValueError("report via must be cli or mcp")
+        cutoff = int(now) - 86400
+
+        def fn(db):
+            row = db.execute("SELECT value FROM store_meta WHERE key='report_rate_v1'").fetchone()
+            try:
+                state = json.loads(row[0]) if row else {}
+                all_times = [int(value) for value in state.get("all", []) if int(value) > cutoff]
+                mcp_times = [int(value) for value in state.get("mcp", []) if int(value) > cutoff]
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ValueError("stored report rate state is malformed") from exc
+            if len(all_times) >= 10:
+                raise ValueError("local report limit reached (10 per 24 hours)")
+            if via == "mcp" and len(mcp_times) >= 5:
+                raise ValueError("local MCP report limit reached (5 per 24 hours)")
+            all_times.append(int(now))
+            if via == "mcp":
+                mcp_times.append(int(now))
+            encoded = json.dumps({"all": all_times, "mcp": mcp_times}, separators=(",", ":"))
+            db.execute(
+                "INSERT INTO store_meta(key,value) VALUES ('report_rate_v1',?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (encoded,))
+        self._tx(fn)
+
+    def refund_report_quota(self, via: str, now: int) -> None:
+        """Return the slot reserved for a report whose server post did not succeed."""
+        if via not in {"cli", "mcp"}:
+            raise ValueError("report via must be cli or mcp")
+
+        def fn(db):
+            row = db.execute("SELECT value FROM store_meta WHERE key='report_rate_v1'").fetchone()
+            if not row:
+                return
+            try:
+                state = json.loads(row[0])
+                all_times = [int(value) for value in state.get("all", [])]
+                mcp_times = [int(value) for value in state.get("mcp", [])]
+                all_times.remove(int(now))
+                if via == "mcp":
+                    mcp_times.remove(int(now))
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ValueError("stored report rate state is malformed") from exc
+            encoded = json.dumps({"all": all_times, "mcp": mcp_times}, separators=(",", ":"))
+            db.execute("UPDATE store_meta SET value=? WHERE key='report_rate_v1'", (encoded,))
+        self._tx(fn)
+
     def set_direct(self, person: str, on: bool) -> None:
         """Opt this contact in/out of direct paths. Turning it off also forgets their addresses."""
         if on:
@@ -826,8 +1061,15 @@ class Store:
 
     def remove_contact(self, person: str) -> None:
         def fn(db):
+            if db.execute(
+                    "SELECT 1 FROM operator_persons WHERE person=?", (person,)).fetchone():
+                raise ValueError(
+                    "this contact is a trusted operator; run nak operator-untrust first")
             db.execute("DELETE FROM contacts WHERE person=?", (person,))
             db.execute("DELETE FROM revocation_sent WHERE person=?", (person,))
+            db.execute("DELETE FROM suspension_sent WHERE person=?", (person,))
+            db.execute("DELETE FROM operator_persons WHERE person=?", (person,))
+            db.execute("DELETE FROM contact_suspensions WHERE person=?", (person,))
         self._tx(fn)
 
     # outbox

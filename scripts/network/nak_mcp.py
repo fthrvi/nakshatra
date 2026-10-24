@@ -103,11 +103,17 @@ CONNECT_TOOLS = {
     "nak_decline": ("Decline a pending connection request.", {"id": _STR}),
     "nak_redeem": ("Ask to connect using an invite code someone gave your person.",
                    {"code": _STR, "nickname": _STR, "name": _STR}),
+    "nak_report": ("Report an existing contact to the network operator. Reports are untrusted claims "
+                   "for human review and never suspend a node or trigger another action.",
+                   {"subject": _STR,
+                    "reason": {"type": "string", "enum": ["spam", "fraud", "abuse", "bad-output", "other"]},
+                    "note": _STR, "task_hash": _STR, "mid": _STR}),
 }
 REQUIRED = {"nak_task_status": ["task"], "nak_task_claim": ["task"], "nak_task_submit": ["task", "output"],
             "nak_task_post": ["to", "title", "instructions", "acceptance"], "nak_send": ["to", "text"],
             "nak_agent_send": ["to", "text"], "nak_thread": ["thread"], "nak_delivery": ["mid"],
-            "nak_accept": ["id"], "nak_decline": ["id"], "nak_redeem": ["code"]}
+            "nak_accept": ["id"], "nak_decline": ["id"], "nak_redeem": ["code"],
+            "nak_report": ["subject", "reason"]}
 REQUIRED["nak_ask"] = ["prompt"]
 
 
@@ -124,6 +130,7 @@ ALIASES = {
     "max_tokens": ("tokens", "max_output_tokens", "limit"),
     "thread": ("thread_id", "context", "context_id"),
     "reply_to": ("reply", "reply_to_mid"),
+    "subject": ("contact", "name", "who"),
 }
 CLAIM_WAIT_S = 20.0
 WRITE_TOOLS = frozenset({"nak_send", "nak_agent_send", "nak_task_post", "nak_task_claim", "nak_task_submit"})
@@ -559,6 +566,11 @@ class Server:
         if name == "nak_redeem":
             r = c.redeem(str(args["code"]), str(args.get("nickname") or ""), str(args.get("name") or ""))
             return f"{r['state']}. They have to accept before either of you can message."
+        if name == "nak_report":
+            r = c.report(str(args["subject"]), str(args["reason"]), str(args.get("note") or ""),
+                         task_hash=str(args.get("task_hash") or ""), mid=str(args.get("mid") or ""))
+            return (f"Report {r.get('status', 'received')} for contact node {r['subject'][:16]}…. "
+                    "This is an untrusted claim queued for human operator review; no action was taken.")
         raise NakError("unreachable")
 
     @staticmethod

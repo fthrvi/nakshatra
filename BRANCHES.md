@@ -5,9 +5,11 @@ On create add a row (status=active, owner). On merge flip to `merged→<sha>`.
 
 | branch | sector | description | base | status | owner |
 |---|---|---|---|---|---|
+| net/report-suspend-main | network | Rebase report/operator suspension onto current main; add refusal recovery, unknown-node fencing, and post-mutation suspension safety. | forgejo/main@749a5c9 | active | codex/root |
 | net/gpu-preflight | network | Read-only worker GPU/runtime preflight against the signed package catalog before build. | main@2a9dd7e | merged→da8c8c7 | codex for claude/trisul-aa network lane (hub) |
 | net/member-invites | network | Brief B: member-signed stranger worker/consumer invites, cancellation, and person-gated acceptance. | forgejo/main@2a9dd7e | merged→8fb987a | codex for claude/trisul-aa network lane (hub) |
 | net/usdc-units | network | Accept and display spend caps, starter credits, balances, wallets, and task rewards in human USDC while preserving base-unit wire schemas. | main@2a9dd7e | merged→15b6966 | codex for claude/trisul-aa network lane (hub) |
+| net/report-suspend | network | Member abuse reports plus TTY-only operator suspension records propagated and enforced across contact sessions. | forgejo/main@2a9dd7e | active | codex/root |
 | custody/person-sign | custody | Route every person-key signature through person_sign(kind, statement) with file (default) and broker (stub) backends; no behaviour change. | forgejo/main@119ae8e | merged→e985ec7 | codex/friends-onboarding |
 | net/shared-revocation | network | Person-signed cumulative grant revocations shared over contact sessions, with offline export/import. | forgejo/main@1081a0d | merged→8131115 | claude/trisul-aa network lane (hub) + codex |
 | net/starter-credit | network | Wire starter credits: inviter node pays the person-signed starter amount on accept via a new ledger /spend/starter route (spend-only, one per recipient, capped). | forgejo/main@8143916 | merged→b41a9ea | claude/network + codex |

@@ -263,6 +263,46 @@ This does not revoke the node key used by the ledger, and contacts running a ver
 shared-revocation release ignore session revocation frames until they update. The grant's wire lease
 or charter expiry remains the fallback bound for those older contacts.
 
+**Reports and suspension are separate.** `nak report <contact-or-node> --reason
+spam|fraud|abuse|bad-output|other [--note ...]` sends a node-signed claim to the onboarding server;
+it cannot change the roster. The CLI is TTY-only and carries a short-lived person proof so a local
+agent cannot forge CLI provenance; an unproved owner-socket report is always treated as MCP. The
+optional MCP `nak_report` tool is exposed only with
+`--allow-connect`, accepts an existing contact rather than a bare node key, and is capped at five
+reports per day (the node-wide cap is ten). Its result explicitly says that no action was taken.
+Report notes and evidence identifiers pass the same outbound secret-shaped-content check as
+messages and tasks; message IDs are 24-character lowercase hex and hold IDs must be identifiers.
+
+On the hub, a person reviews reports with `nak operator reports`. Suspension and restoration are
+TTY-only human acts: `nak operator suspend <node-or-contact> --reason ...` and `nak operator
+unsuspend <node-or-contact>`. They pass through person custody, update the onboard roster, then
+publish a full person-signed `nak.suspensions.v1` state record. The exact signed record is staged
+locally before the server request: if the response is lost, re-running the same command retries the
+same sequence and bytes. A server 400, 403, or 404 leaves its roster unchanged, so the CLI prints
+the server reason and clears the exact staged record with the already-approved person key. If an
+ambiguous failure cannot be retried, `nak operator suspend --abandon-pending` is the TTY-only,
+person-proved escape; it changes no server state. A bare 64-hex target must already be a contact or
+appear in `~/.nakshatra/admission-peers.tsv`; `--force-unknown-node` is the explicit exception after
+the operator verifies the key. If the server is already ahead, the CLI verifies and installs that
+newer person-signed state, then asks the person to re-run against it. `nak operator-trust <contact>` is an
+interactive, person-proved choice to enforce that contact's records; `nak operator-untrust
+<contact>` reverses it. A trusted operator contact cannot be removed: run the person-proved
+`nak operator-untrust <contact>` first, then remove it. Removal keeps the last sequence number so an
+old record cannot be replayed after re-adding them. Until trusted,
+received records are visible but do not fence anyone. Trusted records reject messages and tasks from
+listed node keys. A local post, claim, or submit to a suspended counterpart is refused before task
+or escrow state changes, so the same action can be retried after restoration. If suspension arrives
+after that preflight, the already-mutated action is still queued; it is never left half-complete.
+The same decide-once rule applies to an accepted inbound claim or result and its assignment or
+verdict reply. Background expiry, approval, assignment, receipt, and dispute reconciliation keep
+their already-final local/ledger state if a newly suspended recipient cannot be notified, and log
+the omitted task reply instead of reporting the completed transition as a failure.
+`nak suspensions
+export|import` moves the authenticated `nks1.` record through an
+offline trusted channel; import is also TTY/person-proved and accepts only an operator already
+trusted on that node. Person proofs expire after two minutes and are single-use. No MCP tool can
+suspend or unsuspend a node.
+
 **Today's limits.** Releases are public at `http://45.63.109.137:8960`; each channel has a signed
 `latest.json`. An inviter names that host in `~/.nakshatra/net/release-url`, or overrides it for one
 invite with `nak invite --release-url http://45.63.109.137:8960`. A clean outsider join through that

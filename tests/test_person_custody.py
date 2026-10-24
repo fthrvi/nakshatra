@@ -444,6 +444,7 @@ def test_person_authority_call_sites_are_explicitly_confined():
         ("network/nak.py", "encode_invite", "priv"),
         ("network/nak.py", "encode_address", "person_priv"),
         ("network/nak.py", "make_record", "person_priv.sign"),
+        ("network/nak.py", "make_record", "person_key.sign"),
     }
 
     for path in scripts.rglob("*.py"):

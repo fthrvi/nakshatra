@@ -43,6 +43,9 @@ import threading
 import time
 import unicodedata
 from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit
+from urllib.request import Request, urlopen
 
 from typing import Callable, Optional
 
@@ -76,8 +79,10 @@ except ImportError:  # the release ships both; a dev checkout may point at a sth
     sys.path.insert(0, _alt)
     from sthambha.signer import MAX_SKEW_S, SignerError, canonical, verify_envelope  # noqa: E402
 
-from network.revocation import (decode_record, read_private_json, revocation_lock,  # noqa: E402
-                                verify_record)
+from network.revocation import (decode_record as decode_revocation, read_private_json,  # noqa: E402
+                                revocation_lock, verify_record as verify_revocation)
+from network.suspension import (decode_record as decode_suspension,  # noqa: E402
+                                verify_record as verify_suspension)
 from network.units import MAX_SPEND_CAP  # noqa: E402
 
 MSG_DOMAIN = "nak-msg-v1"
@@ -106,6 +111,7 @@ ONBOARD_STAGE_PURPOSE = "onboard-stage-v2"
 ONBOARD_CANCEL_PURPOSE = "onboard-cancel-v2"
 ONBOARD_MEMBER_STARTER_MAX = 10_000_000
 ONBOARD_MEMBER_TTL_MAX_S = 86400
+PERSON_ACTION_PROOF_MAX_SKEW_S = 120
 ADDRESS_DECLINE_BLOCK_S = 30 * 86400
 ADDRESS_PENDING_TTL_S = 7 * 86400
 ADDRESS_PENDING_TOTAL_MAX = 20
@@ -122,11 +128,15 @@ MAX_CONTROL_LIMIT = 1000
 MAX_TASK_DEADLINE_S = 365 * 86400
 MAX_UNIX_TIMESTAMP = (1 << 63) - 1
 MAX_REDEEM_WAIT_S = 3600.0
+DEFAULT_ONBOARD_BASE = "https://prithviloka.net/onboard"
+REPORT_REASONS = {"spam", "fraud", "abuse", "bad-output", "other"}
 
 # Floor for every agent on every node: refuse outbound text carrying a recognisable secret or a bulk
 # encoded payload. Same formats as Prithvi's web egress DLP (mind/web_tools.py); a harness with its
 # own stricter check (Prithvi's agency_guard path) runs that first — this is the node's own floor.
 import re as _re
+REPORT_MID_RE = _re.compile(r"[0-9a-f]{24}\Z")
+REPORT_HOLD_ID_RE = _re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _SECRET_FMT = _re.compile(
     r"(-----BEGIN |ssh-rsa\s|AKIA[0-9A-Z]{16}|"
     r"gh[posru]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|"
@@ -144,6 +154,31 @@ def outbound_problem(text: str) -> str:
     if _BLOB.search(text):
         return "message contains a long encoded blob; not sending it"
     return ""
+
+
+def _http_post_json(url: str, body: dict) -> dict:
+    """Small report-only HTTP client. Operator HTTP stays in the interactive CLI."""
+    request = Request(url, data=json.dumps(body, separators=(",", ":")).encode(),
+                      headers={"content-type": "application/json"}, method="POST")
+    try:
+        with urlopen(request, timeout=20) as response:
+            result = json.loads(response.read().decode())
+    except HTTPError as exc:
+        try:
+            detail = json.loads(exc.read().decode()).get("error", "")
+        except (ValueError, AttributeError):
+            detail = ""
+        detail = "".join(
+            char if unicodedata.category(char) not in {"Cc", "Cf"} else
+            (f"\\x{ord(char):02x}" if ord(char) <= 0xff else f"\\u{ord(char):04x}")
+            for char in str(detail))[:500]
+        raise ValueError(f"onboard server refused report ({exc.code})" +
+                         (f": {detail}" if detail else "")) from exc
+    except (OSError, URLError, ValueError) as exc:
+        raise ValueError(f"could not reach the onboard server: {exc}") from exc
+    if not isinstance(result, dict):
+        raise ValueError("onboard server returned an invalid report response")
+    return result
 
 
 # ── framing over a SecureChannel ────────────────────────────────────────────────────────────────
@@ -193,6 +228,21 @@ def accept_statement(request_id: str, petname: str, ts: int) -> bytes:
     """Canonical person-signature payload for accepting a person-gated request."""
     return canonical({"kind": "nak.contact.accept.v1", "request_id": request_id,
                       "petname": petname, "ts": ts})
+
+
+def person_action_statement(kind: str, payload: dict, ts: int) -> bytes:
+    """Canonical short-lived proof for a person-only owner-socket operation."""
+    return canonical({"kind": kind, "payload": payload, "ts": ts})
+
+
+def suspension_record_proof_payload(record: dict) -> dict:
+    """Bind a person proof to the full serialized record, including its signature."""
+    raw = json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    return {"record_sha256": hashlib.sha256(raw).hexdigest()}
+
+
+def report_proof_payload(subject: str, reason: str, note: str, evidence: dict) -> dict:
+    return {"subject": subject, "reason": reason, "note": note, "evidence": evidence}
 
 
 def address_control_statement(op: str, aid: str, ts: int) -> bytes:
@@ -272,6 +322,7 @@ class Node:
                  roster_loader: Optional[Callable[[], dict]] = None,
                  roster_path: Optional[Path] = None, clock: Optional[Callable[[], float]] = None):
         self._key = node_key
+        self._state_dir = Path(state_dir)
         self.node = ed25519.Ed25519PrivateKey.from_private_bytes(node_key).public_key().public_bytes_raw().hex()
         self._signer = signer
         self.agent = agent
@@ -309,7 +360,7 @@ class Node:
                     pending = read_private_json(self._pending_revocation_path)
                     if pending is None:
                         break
-                    pending = verify_record(pending, self.person)
+                    pending = verify_revocation(pending, self.person)
                     current = self.store.own_revocation()
                     if not current or pending["seq"] > current["seq"]:
                         if current and not set(current["grant_ids"]).issubset(pending["grant_ids"]):
@@ -319,7 +370,7 @@ class Node:
                     latest = read_private_json(self._pending_revocation_path)
                     if latest is None:
                         break
-                    latest = verify_record(latest, self.person)
+                    latest = verify_revocation(latest, self.person)
                     if (latest["seq"], latest["sig"]) == (pending["seq"], pending["sig"]):
                         self._pending_revocation_path.unlink()
                         break
@@ -1287,8 +1338,20 @@ class Node:
                 row["name_source"] = (contact or {}).get("name_src") or "self-chosen"
         return thread, rows
 
-    def _queue(self, person: str, kind: str, body: dict, *, touch: bool = True) -> str:
+    def _queue_preflight(self, person: str, kind: str, *, check_suspension: bool = True) -> None:
+        """Run every queue refusal knowable before a caller mutates protocol state."""
+        contact = self.store.contact(person)
+        if check_suspension and isinstance(kind, str) and kind.startswith("task.") and contact and \
+                contact["node"] in self.store.suspended_nodes():
+            raise ValueError("node suspended by operator")
         self._require_grant(kind)
+
+    def _queue(self, person: str, kind: str, body: dict, *, touch: bool = True,
+               suspension_preflighted: bool = False) -> str:
+        # A task action that already passed its suspension preflight may have mutated durable task
+        # or escrow state before it gets here.  Do not make a second, racy suspension decision at
+        # that point.  Every other queue check (notably the live grant check) still runs.
+        self._queue_preflight(person, kind, check_suspension=not suspension_preflighted)
         mid = secrets.token_hex(12)
         queued_body = dict(body, mid=mid)
         if touch:
@@ -1300,6 +1363,26 @@ class Node:
         if ev:
             ev.set()
         return mid
+
+    def _queue_task_after_mutation(self, person: str, kind: str, body: dict, *,
+                                   touch: bool = False,
+                                   suspension_preflighted: bool = False) -> Optional[str]:
+        """Queue a task reply without turning a completed local transition into a false failure.
+
+        Background reconciliation cannot reserve a suspension decision before its ledger/store
+        mutation. If the contact becomes suspended before the reply is queued, keep the durable
+        final state and log the omitted notification. Every non-suspension refusal still raises.
+        """
+        try:
+            return self._queue(person, kind, body, touch=touch,
+                               suspension_preflighted=suspension_preflighted)
+        except ValueError as exc:
+            if str(exc) != "node suspended by operator":
+                raise
+            task_hash = body.get("task_hash") if isinstance(body, dict) else ""
+            label = task_hash[:12] if isinstance(task_hash, str) else "unknown"
+            self.log(f"task {label} state kept; {kind} not queued to suspended node {person[:12]}")
+            return None
 
     def delivered(self, mid: str) -> bool:
         return self.store.delivered(mid)
@@ -1427,6 +1510,7 @@ class Node:
         wake = self._wake.setdefault(person, threading.Event())
         down = threading.Event()
         sent_rev_seqs: set[int] = set()
+        sent_susp_seqs: set[int] = set()
         sock.settimeout(IDLE_S)
 
         def reader():
@@ -1445,9 +1529,14 @@ class Node:
                         if type(seq) is int and seq in sent_rev_seqs:
                             self.store.mark_revocation_sent(person, session_node, seq)
                             wake.set()
+                    elif t == "susp-ack":
+                        seq = frame.get("seq")
+                        if type(seq) is int and seq in sent_susp_seqs:
+                            self.store.mark_suspension_sent(person, session_node, seq)
+                            wake.set()
                     elif t == "revs":
                         try:
-                            rec = verify_record(frame.get("rec"), person)
+                            rec = verify_revocation(frame.get("rec"), person)
                             changed = self.store.apply_contact_revocation(person, rec)
                             if changed:
                                 cc = self.store.contact(person) or {}
@@ -1456,6 +1545,16 @@ class Node:
                             send_frame(ch, {"t": "revs-ack", "seq": rec["seq"]}, lock)
                         except Exception as e:  # peer-controlled side frame; keep the session alive
                             self.log(f"refused revocations from {person[:12]}: {type(e).__name__}: {e}")
+                    elif t == "susp":
+                        try:
+                            rec = verify_suspension(frame.get("rec"), person)
+                            changed = self.store.apply_contact_suspension(person, rec)
+                            if changed:
+                                self.log(f"operator {person[:12]} published "
+                                         f"{len(rec['nodes'])} suspended node(s)")
+                            send_frame(ch, {"t": "susp-ack", "seq": rec["seq"]}, lock)
+                        except Exception as e:  # peer-controlled side frame; keep the session alive
+                            self.log(f"refused suspensions from {person[:12]}: {type(e).__name__}: {e}")
                     elif t == "addr?":  # a direct:true capability proves their side opted in
                         cc = self.store.contact(person) or {}
                         if frame.get("direct") is True and cc.get("direct"):
@@ -1492,6 +1591,11 @@ class Node:
                         own_revs["seq"] not in sent_rev_seqs:
                     sent_rev_seqs.add(own_revs["seq"])
                     send_frame(ch, {"t": "revs", "rec": own_revs}, lock)
+                own_susp = self.store.own_suspension()
+                if own_susp and own_susp["seq"] > self.store.suspension_sent_seq(person, session_node) and \
+                        own_susp["seq"] not in sent_susp_seqs:
+                    sent_susp_seqs.add(own_susp["seq"])
+                    send_frame(ch, {"t": "susp", "rec": own_susp}, lock)
                 for item in self.store.pending_for(person):
                     try:
                         env = self._sign(item["kind"], person, item["body"], touch=False)
@@ -1543,6 +1647,8 @@ class Node:
             return {"t": "nack", "mid": mid, "why": f"does not verify: {e}"}
         if env.get("from_node") != c["node"] or env.get("to") != self.person or env.get("body_sha256") != body_hash(body):
             return {"t": "nack", "mid": mid, "why": "envelope not bound to this session"}
+        if c["node"] in self.store.suspended_nodes():
+            return {"t": "nack", "mid": mid, "why": "node suspended by operator"}
         kind = env.get("kind")
         if kind == "contact.accept":
             if c["state"] == "awaiting":
@@ -1683,7 +1789,8 @@ class Node:
         why = outbound_problem(f"{title}\n{instructions}")
         if why:
             raise ValueError(why)
-        self._require_grant("task.post")
+        for contact in targets:
+            self._queue_preflight(contact["person"], "task.post")
         spec = T.make_spec(self.person, title, instructions, acceptance, reward=reward,
                            deadline_s=deadline_s,
                            unit="credits" if self.settle.open_on_assign else "TEST")
@@ -1699,7 +1806,8 @@ class Node:
                                escrow_auth=authorisation if self.settle.open_on_assign else None,
                                funding_state=funding)
         for c in targets:
-            self._queue(c["person"], "task.post", {"task_hash": h, "spec": spec})
+            self._queue(c["person"], "task.post", {"task_hash": h, "spec": spec},
+                        suspension_preflighted=True)
         self.log(f"posted task {h[:12]} '{title}' to {len(targets)} contact(s)")
         return {"task_hash": h, "posted_to": [c["petname"] or c["person"][:12] for c in targets], "escrow": escrow}
 
@@ -1890,7 +1998,7 @@ class Node:
                 bytes.fromhex(fields[0])
             except ValueError:
                 continue
-            tier = fields[3] if fields[3] in {"stranger", "known", "trusted", "self"} else "stranger"
+            tier = fields[3] if fields[3] in {"stranger", "known", "trusted", "self", "suspended"} else "stranger"
             if fields[0] in peers and peers[fields[0]]["tier"] != tier:
                 tier = "stranger"
             peers[fields[0]] = {"tier": tier}
@@ -2021,7 +2129,8 @@ class Node:
 
     def _apply_task_decision(self, task_hash: str, accept: bool, reason: str, *, source: str,
                              touch: bool, output: Optional[str] = None,
-                             verdict: Optional[dict] = None, from_states: tuple = ("awaiting_approval",)) -> dict:
+                             verdict: Optional[dict] = None, from_states: tuple = ("awaiting_approval",),
+                             suspension_preflighted: bool = False) -> dict:
         task = self.store.task_get(task_hash, "poster", "")
         if not task:
             raise ValueError("no such posted task")
@@ -2062,7 +2171,8 @@ class Node:
             fields["output"] = output
         if not self.store.task_cas(task_hash, "poster", "", from_states, **fields):
             return self._apply_task_decision(task_hash, accept, reason, source=source, touch=touch,
-                                             output=output, verdict=final, from_states=from_states)
+                                             output=output, verdict=final, from_states=from_states,
+                                             suspension_preflighted=suspension_preflighted)
         settlement_action = "release" if accept else "refund"
         if (not accept and self.settle.open_on_assign and task["spec"]["reward"]["amount"] > 0
                 and task.get("hold_id")):
@@ -2084,7 +2194,9 @@ class Node:
         if receipt and receipt.get("event") == "disputed":
             body["funding_state"] = "disputed"
             self._defer_escrow_poll(task, self._clock())
-        self._queue(task["assignee"], "task.accept" if accept else "task.reject", body, touch=touch)
+        self._queue_task_after_mutation(
+            task["assignee"], "task.accept" if accept else "task.reject", body, touch=touch,
+            suspension_preflighted=suspension_preflighted)
         label = "paid by silence" if source == "silence" else source
         self.log(f"task {task_hash[:12]} {'ACCEPTED' if accept else 'REJECTED'} ({label})")
         return {"task_hash": task_hash, "state": desired, "idempotent": False}
@@ -2240,7 +2352,8 @@ class Node:
         if frame.get("kind") == "task.claim" and isinstance(h, str):
             self.store.task_cas(h, "worker", person, ("claimed",), state="offered")
 
-    def _open_assignment(self, h: str, person: str, *, touch: bool = False) -> None:
+    def _open_assignment(self, h: str, person: str, *, touch: bool = False,
+                         suspension_preflighted: bool = False) -> None:
         """Open (or, idempotently, re-open) the task hold for an `assigned` task that has none yet,
         record it, and only then tell the worker. client_nonce is the task hash, so a repeat after an
         ambiguous failure returns the SAME hold. Definitive ledger refusal: put the task back to
@@ -2284,8 +2397,10 @@ class Node:
             return
         if t["spec"]["deadline"] <= time.time():
             return          # hold recorded; the next sweep expires the task and refunds it
-        self._queue(person, "task.assign", {"task_hash": h, "epoch": 1, "worker": person,
-                                            "hold_id": hold_id}, touch=touch)
+        self._queue_task_after_mutation(
+            person, "task.assign", {"task_hash": h, "epoch": 1, "worker": person,
+                                     "hold_id": hold_id}, touch=touch,
+            suspension_preflighted=suspension_preflighted)
         self.log(f"task {h[:12]} assigned to {person[:12]}")
 
     def _finish_pending_assignments(self) -> None:
@@ -2310,9 +2425,10 @@ class Node:
             self._defer_escrow_poll(t, self._clock())
             if changed and t["assignee"]:
                 verdict = dict(t["verdict"] or {})
-                self._queue(t["assignee"], "task.reject",
-                            {"task_hash": t["task_hash"], "epoch": t["epoch"],
-                             **verdict, "funding_state": "disputed"}, touch=False)
+                self._queue_task_after_mutation(
+                    t["assignee"], "task.reject",
+                    {"task_hash": t["task_hash"], "epoch": t["epoch"],
+                     **verdict, "funding_state": "disputed"}, touch=False)
                 self.log(f"adopted ledger dispute for {t['task_hash'][:12]}; told the worker")
             return int(changed)
         if st and st.get("state") == "open":
@@ -2330,9 +2446,10 @@ class Node:
                 self._defer_escrow_poll(t, self._clock())
                 if t["assignee"]:
                     verdict = dict(t["verdict"] or {})
-                    self._queue(t["assignee"], "task.reject",
-                                {"task_hash": t["task_hash"], "epoch": t["epoch"],
-                                 **verdict, "funding_state": "disputed"}, touch=False)
+                    self._queue_task_after_mutation(
+                        t["assignee"], "task.reject",
+                        {"task_hash": t["task_hash"], "epoch": t["epoch"],
+                         **verdict, "funding_state": "disputed"}, touch=False)
                 self.log(f"reconciled stranded escrow for {t['task_hash'][:12]} (disputed)")
                 return 1
         elif st and st.get("state") == desired and self.settle.open_on_assign:
@@ -2352,8 +2469,9 @@ class Node:
             verdict["settlement"] = receipt
             self.store.task_cas(t["task_hash"], "poster", "", (t["state"],),
                                 verdict=json.dumps(verdict))
-            self._queue(t["assignee"], "task.accept" if t["state"] == "accepted" else "task.reject",
-                        {"task_hash": t["task_hash"], "epoch": t["epoch"], **verdict}, touch=False)
+            self._queue_task_after_mutation(
+                t["assignee"], "task.accept" if t["state"] == "accepted" else "task.reject",
+                {"task_hash": t["task_hash"], "epoch": t["epoch"], **verdict}, touch=False)
         self.log(f"reconciled stranded escrow for {t['task_hash'][:12]} ({t['state']})")
         return 1
 
@@ -2481,7 +2599,8 @@ class Node:
                             elif receipt and receipt.get("event") == "disputed":
                                 body["funding_state"] = "disputed"
                                 self._defer_escrow_poll(t, self._clock())
-                            self._queue(t["assignee"], "task.reject", body, touch=False)
+                            self._queue_task_after_mutation(
+                                t["assignee"], "task.reject", body, touch=False)
                         n += 1
                 elif t["role"] == "worker" and t["state"] in ("offered", "claimed", "assigned"):
                     n += self.store.task_cas(t["task_hash"], "worker", t["peer"],
@@ -2632,10 +2751,11 @@ class Node:
         t = self._worker_task(ref)
         if t["spec"]["deadline"] <= time.time():
             raise ValueError("that task's deadline has passed")
-        self._require_grant("task.claim")
+        self._queue_preflight(t["peer"], "task.claim")
         if not self.store.task_cas(t["task_hash"], "worker", t["peer"], ("offered",), state="claimed"):
             raise ValueError(f"cannot claim a task that is {t['state']}")
-        self._queue(t["peer"], "task.claim", {"task_hash": t["task_hash"]})
+        self._queue(t["peer"], "task.claim", {"task_hash": t["task_hash"]},
+                    suspension_preflighted=True)
         return {"task_hash": t["task_hash"], "state": "claimed"}
 
     def submit_task(self, ref: str, output: str) -> dict:
@@ -2647,10 +2767,10 @@ class Node:
             raise ValueError(why)
         if t["spec"]["deadline"] <= time.time():
             raise ValueError("that task's deadline has passed; the poster will not take a result now")
+        self._queue_preflight(t["peer"], "task.result")
         if not self._verify_worker_hold(t):
             current = self.store.task_get(t["task_hash"], "worker", t["peer"])
             raise ValueError(f"unfunded: {current['funding_reason'] or 'the task hold is not valid'}")
-        self._require_grant("task.result")
         passed, reasons = T.evaluate(t["spec"], output)       # the worker can see it would fail first
         result_hash = hashlib.sha256(output.encode("utf-8")).hexdigest()
         funded = self.settle.open_on_assign and t["spec"]["reward"]["amount"] > 0
@@ -2661,7 +2781,9 @@ class Node:
         submitted = self.store.task_get(t["task_hash"], "worker", t["peer"])
         if funded:
             self._mark_worker_submit(submitted)       # failure is durable/retried and never blocks delivery
-        self._queue(t["peer"], "task.result", {"task_hash": t["task_hash"], "epoch": t["epoch"], "output": output})
+        self._queue(t["peer"], "task.result",
+                    {"task_hash": t["task_hash"], "epoch": t["epoch"], "output": output},
+                    suspension_preflighted=True)
         return {"task_hash": t["task_hash"], "state": "submitted", "precheck_passed": passed, "precheck": reasons}
 
     def _task_receive(self, c: dict, kind: str, body: dict, env: dict) -> None:
@@ -2698,13 +2820,16 @@ class Node:
             if not paid:
                 if self.store.task_cas(h, "poster", "", ("posted",), state="assigned",
                                        assignee=c["person"], epoch=1):
-                    self._queue(c["person"], "task.assign",
-                                {"task_hash": h, "epoch": 1, "worker": c["person"]}, touch=False)
+                    self._queue_task_after_mutation(
+                        c["person"], "task.assign",
+                        {"task_hash": h, "epoch": 1, "worker": c["person"]}, touch=False,
+                        suspension_preflighted=True)
                     self.log(f"task {h[:12]} assigned to {who}")
                 elif t["assignee"] != c["person"]:
-                    self._queue(c["person"], "task.reject", {"task_hash": h, "epoch": 0,
-                                                             "reasons": ["already assigned to someone else"]},
-                                touch=False)
+                    self._queue_task_after_mutation(
+                        c["person"], "task.reject", {"task_hash": h, "epoch": 0,
+                                                      "reasons": ["already assigned to someone else"]},
+                        touch=False, suspension_preflighted=True)
                 return
             card = self.store.agent_card(c["person"])
             if not card or card.get("paid") is not True or not card.get("ledger_keyid"):
@@ -2721,11 +2846,12 @@ class Node:
                 if not (cur and cur["state"] == "assigned" and cur["assignee"] == c["person"]
                         and not cur["hold_id"]):
                     if not cur or cur["assignee"] != c["person"]:
-                        self._queue(c["person"], "task.reject", {"task_hash": h, "epoch": 0,
-                                                                 "reasons": ["already assigned to someone else"]},
-                                    touch=False)
+                        self._queue_task_after_mutation(
+                            c["person"], "task.reject", {"task_hash": h, "epoch": 0,
+                                                          "reasons": ["already assigned to someone else"]},
+                            touch=False, suspension_preflighted=True)
                     return
-            self._open_assignment(h, c["person"], touch=False)
+            self._open_assignment(h, c["person"], touch=False, suspension_preflighted=True)
             return
         if kind == "task.assign":
             if body.get("worker") != self.person or not isinstance(body.get("epoch"), int):
@@ -2800,7 +2926,7 @@ class Node:
             self._apply_task_decision(
                 h, action == V.ACCEPT, "" if passed else "; ".join(reasons),
                 source="automatic", touch=False, output=output, verdict=verdict,
-                from_states=("assigned",))
+                from_states=("assigned",), suspension_preflighted=True)
             return
         if kind in ("task.accept", "task.reject"):
             t = self.store.task_get(h, "worker", c["person"])
@@ -2848,7 +2974,7 @@ class Node:
 
     # ── shared revocation ────────────────────────────────────────────────────────────────────
     def install_own_revocation(self, record: dict) -> dict:
-        record = verify_record(record, self.person)
+        record = verify_revocation(record, self.person)
         self.store.set_own_revocation(record)
         for contact in self.store.contacts():
             self._wake.setdefault(contact["person"], threading.Event()).set()
@@ -2860,17 +2986,197 @@ class Node:
         This is equivalent to receiving the same record over that contact's session: the pinned
         person key authenticates it, and a valid record can only add revocations they signed.
         """
-        record = decode_record(blob)
+        record = decode_revocation(blob)
         person = record["person"]
         contact = self.store.contact(person)
         if not contact:
             raise ValueError("revocation record is not from an existing contact")
-        record = verify_record(record, contact["person"])
+        record = verify_revocation(record, contact["person"])
         changed = self.store.apply_contact_revocation(person, record)
         if changed:
             self.log(f"{contact['petname'] or person[:12]} revoked {len(record['grant_ids'])} grant(s)")
         return {"person": person, "seq": record["seq"], "count": len(record["grant_ids"]),
                 "new": changed}
+
+    # ── operator suspension and abuse reports ────────────────────────────────────────────────
+    def _verify_person_action(self, kind: str, payload: dict, ts, signature: str,
+                              command: str) -> None:
+        now = int(self._clock())
+        refused = f"a person must authorize this operation: {command}"
+        if isinstance(ts, bool) or not isinstance(ts, int) or \
+                ts < now - PERSON_ACTION_PROOF_MAX_SKEW_S or \
+                ts > now + PERSON_ACTION_PROOF_MAX_SKEW_S:
+            raise ValueError(refused)
+        if not isinstance(signature, str) or _re.fullmatch(r"[0-9a-f]{128}", signature) is None:
+            raise ValueError(refused)
+        try:
+            ed25519.Ed25519PublicKey.from_public_bytes(bytes.fromhex(self.person)).verify(
+                bytes.fromhex(signature), person_action_statement(kind, payload, ts))
+        except (ValueError, TypeError, InvalidSignature) as exc:
+            raise ValueError(refused) from exc
+        self.store.consume_person_action_proof(
+            signature, ts, now, PERSON_ACTION_PROOF_MAX_SKEW_S)
+
+    def install_own_suspension(self, record: dict, *, ts=None, signature: str = "") -> dict:
+        record = verify_suspension(record, self.person)
+        self._verify_person_action(
+            "install-suspension", suspension_record_proof_payload(record), ts, signature,
+            "nak operator suspend/unsuspend")
+        if self.store.pending_own_suspension() is not None:
+            self.store.commit_pending_own_suspension(record)
+        else:
+            self.store.set_own_suspension(record)
+        self._activate_own_suspension(record)
+        return {"seq": record["seq"], "count": len(record["nodes"])}
+
+    def _activate_own_suspension(self, record: dict) -> None:
+        # The local person's authenticated operator record is trusted by definition. Remote
+        # people still require the explicit TTY-only `nak operator-trust` act.
+        self.store.set_operator_person(self.person)
+        for contact in self.store.contacts():
+            self._wake.setdefault(contact["person"], threading.Event()).set()
+
+    def stage_own_suspension(self, record: dict, *, ts=None, signature: str = "") -> dict:
+        """Persist a person-authorized record before the fallible server request."""
+        record = verify_suspension(record, self.person)
+        self._verify_person_action(
+            "stage-suspension", suspension_record_proof_payload(record), ts, signature,
+            "nak operator suspend/unsuspend")
+        created = self.store.set_pending_own_suspension(record)
+        return {"seq": record["seq"], "count": len(record["nodes"]), "new": created}
+
+    def recover_own_suspension(self, record: dict, *, ts=None, signature: str = "") -> dict:
+        """Adopt a newer server copy while resolving a stale-sequence refusal."""
+        record = verify_suspension(record, self.person)
+        self._verify_person_action(
+            "recover-suspension", suspension_record_proof_payload(record), ts, signature,
+            "nak operator suspend/unsuspend stale-state recovery")
+        self.store.recover_own_suspension(record)
+        self._activate_own_suspension(record)
+        return {"seq": record["seq"], "count": len(record["nodes"])}
+
+    def abandon_own_suspension(self, record: dict, *, ts=None, signature: str = "") -> dict:
+        """Discard an exact staged update after a definitive server refusal or human escape."""
+        record = verify_suspension(record, self.person)
+        self._verify_person_action(
+            "abandon-suspension", suspension_record_proof_payload(record), ts, signature,
+            "nak operator suspend --abandon-pending")
+        self.store.abandon_pending_own_suspension(record)
+        return {"seq": record["seq"], "abandoned": True}
+
+    def import_suspension(self, blob: str, *, ts=None, signature: str = "") -> dict:
+        record = decode_suspension(blob)
+        person = record["person"]
+        contact = self.store.contact(person)
+        if not contact:
+            raise ValueError("suspension record is not from an existing contact")
+        record = verify_suspension(record, contact["person"])
+        if person not in self.store.operator_persons():
+            raise ValueError("suspension record is not from a trusted operator")
+        self._verify_person_action(
+            "import-suspension", suspension_record_proof_payload(record), ts, signature,
+            "nak suspensions import")
+        changed = self.store.apply_contact_suspension(person, record)
+        if changed:
+            self.log(f"operator {person[:12]} published {len(record['nodes'])} suspended node(s)")
+        return {"person": person, "seq": record["seq"], "count": len(record["nodes"]),
+                "new": changed}
+
+    def operator_trust(self, who: str, *, ts=None, signature: str = "") -> dict:
+        contact = self.store.resolve(who)
+        if not contact:
+            raise ValueError("operator trust requires an existing contact")
+        self._verify_person_action(
+            "operator-trust", {"person": contact["person"]}, ts, signature,
+            "nak operator-trust")
+        self.store.set_operator_person(contact["person"])
+        return {"person": contact["person"], "contact": contact["petname"] or contact["person"][:12]}
+
+    def operator_untrust(self, who: str, *, ts=None, signature: str = "") -> dict:
+        contact = self.store.resolve(who)
+        if not contact:
+            raise ValueError("operator untrust requires an existing contact")
+        self._verify_person_action(
+            "operator-untrust", {"person": contact["person"]}, ts, signature,
+            "nak operator-untrust")
+        self.store.unset_operator_person(contact["person"])
+        return {"person": contact["person"], "contact": contact["petname"] or contact["person"][:12]}
+
+    def _onboard_base(self) -> str:
+        base = os.environ.get("NAK_ONBOARD_BASE", "").strip()
+        if not base:
+            try:
+                base = (self._state_dir / "onboard-base").read_text().strip()
+            except FileNotFoundError:
+                base = DEFAULT_ONBOARD_BASE
+            except OSError as exc:
+                raise ValueError(f"cannot read onboard-base: {exc}") from exc
+        parsed = urlsplit(base)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or \
+                parsed.password or parsed.query or parsed.fragment:
+            raise ValueError("onboard base must be an http(s) URL without credentials, query, or fragment")
+        return base.rstrip("/")
+
+    def report(self, subject: str, reason: str, note: str = "", evidence=None, *, via: str = "mcp") -> dict:
+        if via not in {"cli", "mcp"}:
+            raise ValueError("report via must be cli or mcp")
+        contact = self.store.resolve(str(subject))
+        if contact:
+            subject_node = contact["node"]
+        elif via == "mcp":
+            raise ValueError("MCP reports require an existing contact")
+        else:
+            subject_node = str(subject)
+        if not isinstance(subject_node, str) or _re.fullmatch(r"[0-9a-f]{64}", subject_node) is None:
+            raise ValueError("report subject must be a contact or 64-character node key")
+        if reason not in REPORT_REASONS:
+            raise ValueError("report reason must be spam, fraud, abuse, bad-output, or other")
+        if not isinstance(note, str) or len(note) > 500:
+            raise ValueError("report note must be text of at most 500 characters")
+        why = outbound_problem(note)
+        if why:
+            raise ValueError(why)
+        evidence = {} if evidence is None else evidence
+        if not isinstance(evidence, dict) or set(evidence) - {"task_hash", "mid", "hold_id"}:
+            raise ValueError("report evidence may contain only task_hash, mid, and hold_id")
+        evidence = {key: value for key, value in evidence.items() if value not in (None, "")}
+        task_hash = evidence.get("task_hash")
+        if task_hash is not None and (not isinstance(task_hash, str) or
+                                      _re.fullmatch(r"[0-9a-f]{64}", task_hash) is None):
+            raise ValueError("report task_hash must be 64 lowercase hex characters")
+        mid = evidence.get("mid")
+        hold_id = evidence.get("hold_id")
+        for value in (mid, hold_id):
+            if isinstance(value, str):
+                why = outbound_problem(value)
+                if why:
+                    raise ValueError(why)
+        if mid is not None and (not isinstance(mid, str) or REPORT_MID_RE.fullmatch(mid) is None):
+            raise ValueError("report mid must be 24 lowercase hex characters")
+        if hold_id is not None and (not isinstance(hold_id, str) or
+                                    REPORT_HOLD_ID_RE.fullmatch(hold_id) is None):
+            raise ValueError("report hold_id must be an identifier of at most 128 characters")
+        now = int(self._clock())
+        body = {"v": 1, "reporter": self.node, "subject": subject_node, "reason": reason,
+                "note": note, "evidence": evidence, "ts": now, "via": via}
+        body["sig"] = ed25519.Ed25519PrivateKey.from_private_bytes(self._key).sign(canonical(body)).hex()
+        self.store.take_report_quota(via, now)
+        try:
+            result = _http_post_json(self._onboard_base() + "/report", body)
+            if result.get("status") not in {"received", "duplicate"}:
+                raise ValueError("onboard server returned an invalid report status")
+        except Exception:
+            self.store.refund_report_quota(via, now)
+            raise
+        return {"subject": subject_node, "status": result["status"]}
+
+    def report_cli(self, subject: str, reason: str, note: str = "", evidence=None, *,
+                   ts=None, signature: str = "") -> dict:
+        evidence = {} if evidence is None else evidence
+        self._verify_person_action(
+            "report-cli", report_proof_payload(subject, reason, note, evidence), ts, signature,
+            "nak report")
+        return self.report(subject, reason, note, evidence, via="cli")
 
     # ── read side ────────────────────────────────────────────────────────────────────────────
     def status(self) -> dict:
@@ -2943,7 +3249,10 @@ OPS = {"status", "node_sign_stage", "cancel_invite", "register_invite", "registe
        "redeem", "requests", "accept", "decline", "block", "unblock", "blocked", "contacts", "remove", "send",
        "agent_send", "threads", "thread", "card", "card_set", "delivered", "inbox", "outbox",
        "task_post", "tasks", "task_status", "task_claim", "task_submit", "task_decide", "ledger", "escrow_status", "direct",
-       "starter_status", "install_revocation", "import_revocation", "revocations"}
+       "starter_status", "install_revocation", "import_revocation", "revocations",
+       "report", "report_cli", "install_suspension", "stage_suspension",
+       "recover_suspension", "abandon_suspension", "import_suspension", "suspensions",
+       "operator_trust", "operator_untrust"}
 
 
 def _bounded_int(value, name: str, minimum: int, maximum: int) -> int:
@@ -2986,6 +3295,39 @@ def handle(node: Node, req: dict) -> dict:
             return {"ok": True, **node.import_revocation(req["blob"])}
         if op == "revocations":
             return {"ok": True, **node.store.revocation_status()}
+        if op == "report":
+            # The shared owner socket is also the MCP front door.  Caller-supplied provenance is
+            # never authoritative: an unproved request always receives the stricter MCP policy.
+            return {"ok": True, **node.report(
+                req["subject"], req["reason"], req.get("note", ""), req.get("evidence", {}),
+                via="mcp")}
+        if op == "report_cli":
+            return {"ok": True, **node.report_cli(
+                req["subject"], req["reason"], req.get("note", ""), req.get("evidence", {}),
+                ts=req.get("ts"), signature=req.get("signature", ""))}
+        if op == "install_suspension":
+            return {"ok": True, **node.install_own_suspension(
+                req["record"], ts=req.get("ts"), signature=req.get("signature", ""))}
+        if op == "stage_suspension":
+            return {"ok": True, **node.stage_own_suspension(
+                req["record"], ts=req.get("ts"), signature=req.get("signature", ""))}
+        if op == "recover_suspension":
+            return {"ok": True, **node.recover_own_suspension(
+                req["record"], ts=req.get("ts"), signature=req.get("signature", ""))}
+        if op == "abandon_suspension":
+            return {"ok": True, **node.abandon_own_suspension(
+                req["record"], ts=req.get("ts"), signature=req.get("signature", ""))}
+        if op == "import_suspension":
+            return {"ok": True, **node.import_suspension(
+                req["blob"], ts=req.get("ts"), signature=req.get("signature", ""))}
+        if op == "suspensions":
+            return {"ok": True, **node.store.suspension_status()}
+        if op == "operator_trust":
+            return {"ok": True, **node.operator_trust(
+                req["contact"], ts=req.get("ts"), signature=req.get("signature", ""))}
+        if op == "operator_untrust":
+            return {"ok": True, **node.operator_untrust(
+                req["contact"], ts=req.get("ts"), signature=req.get("signature", ""))}
         if op == "register_invite":
             return {"ok": True, **node.register_invite(req["code"])}
         if op == "node_sign_stage":

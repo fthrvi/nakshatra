@@ -118,6 +118,15 @@ class NakClient:
     def redeem(self, code: str, nickname: str = "", petname: str = "", wait_s: float = 20) -> dict:
         return self.call("redeem", code=code, nickname=nickname, petname=petname, wait_s=wait_s)
 
+    def report(self, subject: str, reason: str, note: str = "", *, task_hash: str = "",
+               mid: str = "", hold_id: str = "") -> dict:
+        evidence = {key: value for key, value in
+                    (("task_hash", task_hash), ("mid", mid), ("hold_id", hold_id)) if value}
+        return self.call("report", subject=subject, reason=reason, note=note, evidence=evidence)
+
+    def suspensions(self) -> dict:
+        return self.call("suspensions")
+
     # tasks
     def task_post(self, to, title: str, instructions: str, acceptance: list, reward: int = 0,
                   deadline_s: int = 3600) -> dict:

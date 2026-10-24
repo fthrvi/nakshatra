@@ -152,7 +152,7 @@ of their MCP connection.
 
 ## MCP tool boundary
 
-There are 20 default tools and 3 connection tools enabled only with `--allow-connect`.
+There are 20 default tools and 4 connection/report tools enabled only with `--allow-connect`.
 
 | Tool | What it does | What it cannot do |
 |---|---|---|
@@ -179,6 +179,7 @@ There are 20 default tools and 3 connection tools enabled only with `--allow-con
 | `nak_accept` | Accepts a pending request when `--allow-connect` was chosen by the person. | Disabled by default; cannot grant mesh or inference authority. |
 | `nak_decline` | Declines a pending request when `--allow-connect` is enabled. | Disabled by default. |
 | `nak_redeem` | Redeems a contact invite when `--allow-connect` is enabled. | Disabled by default; cannot redeem worker admission or join WireGuard. |
+| `nak_report` | Files a node-signed report about an existing contact for operator review. | Disabled by default; reports are untrusted claims, always carry MCP provenance and its five/day cap, refuse secret-shaped text or malformed evidence IDs, and never suspend a node or trigger another action. |
 
-`--allow-connect` enables only the last three tools. It does not add worker controls, gateway
+`--allow-connect` enables only the last four tools. It does not add suspension, worker controls, gateway
 controls, account selection, private-mesh routes, or access to `10.42.0.x` services.
