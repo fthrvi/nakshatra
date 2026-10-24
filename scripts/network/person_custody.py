@@ -19,6 +19,7 @@ KINDS = {
     "grant-renew",
     "spend-cap",
     "invite",
+    "revoke",
 }
 
 _BROKER_UNAVAILABLE = (

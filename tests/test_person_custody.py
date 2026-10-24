@@ -240,6 +240,7 @@ def test_broker_mode_refuses_real_grant_renew_without_changing_the_grant(
         (["address", "off"], ["address_status"]),
         (["task", "decide", "abcd", "accept"], []),
         (["invite", "--note", "secret"], []),
+        (["revoke", "0123456789abcdef"], []),
         (["accept", "484f48ab"], ["requests"]),
     ],
 )
@@ -416,24 +417,33 @@ def test_person_authority_call_sites_are_explicitly_confined():
     for path in scripts.rglob("*.py"):
         tree = ast.parse(path.read_text(), filename=str(path))
         for node in ast.walk(tree):
-            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            if not isinstance(node, ast.Call):
                 continue
-            if node.func.attr not in {"issue_grant", "encode_invite", "encode_address"}:
+            if (isinstance(node.func, ast.Attribute)
+                    and node.func.attr in {"issue_grant", "encode_invite", "encode_address"}):
+                operation = node.func.attr
+            elif isinstance(node.func, ast.Name) and node.func.id == "make_record":
+                operation = node.func.id
+            else:
                 continue
             first = node.args[0]
             if isinstance(first, ast.Name):
                 origin = first.id
+            elif (isinstance(first, ast.Attribute) and first.attr == "sign"
+                  and isinstance(first.value, ast.Name)):
+                origin = f"{first.value.id}.sign"
             elif (isinstance(first, ast.Call) and isinstance(first.func, ast.Name)
                   and first.func.id == "PersonKey"):
                 origin = "PersonKey(...)"
             else:
                 origin = ast.dump(first, include_attributes=False)
-            found.add((path.relative_to(scripts).as_posix(), node.func.attr, origin))
+            found.add((path.relative_to(scripts).as_posix(), operation, origin))
     assert found == {
         ("network/join_setup.py", "issue_grant", "PersonKey(...)"),
         ("network/nak.py", "issue_grant", "person_priv"),
         ("network/nak.py", "encode_invite", "priv"),
         ("network/nak.py", "encode_address", "person_priv"),
+        ("network/nak.py", "make_record", "person_priv.sign"),
     }
 
     for path in scripts.rglob("*.py"):

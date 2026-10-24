@@ -410,17 +410,30 @@ def test_cli_revoke_refuses_without_tty(monkeypatch, tmp_path):
         nak.main(["revoke", "0123456789abcdef"])
 
 
-def test_cli_revoke_refuses_without_person_key(monkeypatch, tmp_path, capsys):
+def test_cli_revoke_preflight_summary_is_plain_and_names_every_requested_id(monkeypatch):
+    summaries = []
+    monkeypatch.setattr(nak, "broker_preflight",
+                        lambda kind, summary: summaries.append((kind, summary)))
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+    with pytest.raises(SystemExit, match="interactive-only"):
+        nak.main(["revoke", "0123456789abcdef", "--grant-id", "fedc\n\u202eba9876543210"])
+    assert summaries == [("revoke", "Revoke grants 0123456789abcdef, fedcba9876543210")]
+
+
+def test_cli_revoke_refuses_without_person_key(monkeypatch, tmp_path):
     home = tmp_path
     net_dir = home / ".nakshatra" / "net"
     net_dir.mkdir(parents=True)
     (net_dir / "agent").write_text("pa")
-    (home / ".sthambha" / "signer").mkdir(parents=True)
+    signer_dir = home / ".sthambha" / "signer"
+    signer_dir.mkdir(parents=True)
+    _private, person = _key()
+    (signer_dir / "person.pub").write_text(person)
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
-    assert nak.main(["revoke", "0123456789abcdef"]) == 1
-    assert "person key is not available" in capsys.readouterr().err
-    assert not (home / ".sthambha" / "signer" / "revoked.txt").exists()
+    with pytest.raises(SystemExit, match="cannot load the person key for this decision"):
+        nak.main(["revoke", "0123456789abcdef"])
+    assert not (signer_dir / "revoked.txt").exists()
 
 
 def test_cli_revoke_persists_signed_record_while_daemon_is_down(monkeypatch, tmp_path, capsys):

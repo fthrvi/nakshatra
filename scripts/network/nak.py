@@ -1984,26 +1984,23 @@ def _revocation_lock(net_dir: Path):
 
 def _revoke(args, sock: Path) -> int:
     """The human-only boundary that revokes locally first, then publishes cumulatively."""
+    requested_values = [args.grant_id, *(args.more_grant_ids or [])]
+    summary = "Revoke grants " + ", ".join(
+        plain(value, 32) or "(empty)" for value in requested_values)
+    broker_preflight("revoke", summary)
     if not sys.stdin.isatty():
         raise SystemExit("nak revoke is interactive-only; run it in a terminal")
-    requested = [args.grant_id, *(args.more_grant_ids or [])]
+    requested = requested_values
     bad = [value for value in requested if re.fullmatch(r"[0-9a-f]{16}", value or "") is None]
     if bad:
         raise SystemExit("grant ids must be 16 lowercase hex characters")
     requested = sorted(set(requested))
     signer_dir, net_dir, _agent = _grant_paths()
-    person_key = Path.home() / ".sthambha" / "person-TEST.key"
-    if not person_key.is_file():
-        print(f"person key is not available at {person_key}; nothing was revoked.", file=sys.stderr)
-        return 1
-    from sthambha import signer as signer_mod
     try:
-        person_priv, person_pub = signer_mod.load_key(person_key)
-        signer_person = (signer_dir / "person.pub").read_text().strip()
-    except (OSError, ValueError, signer_mod.SignerError) as exc:
-        raise SystemExit(f"cannot load the person key for revocation: {exc}") from exc
-    if person_pub != signer_person:
-        raise SystemExit(f"the person key at {person_key} does not match {signer_dir / 'person.pub'}")
+        person_pub = (signer_dir / "person.pub").read_text().strip()
+    except OSError as exc:
+        raise SystemExit(f"cannot load the person identity for revocation: {exc}") from exc
+    person_priv = PersonKey("revoke", summary)
     from network.revocation import MAX_GRANTS, MAX_SEQ, make_record
     with _revocation_lock(net_dir):
         # These are deliberately inside the lock. They are cumulative inputs shared by every CLI
