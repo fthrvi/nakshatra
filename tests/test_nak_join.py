@@ -704,7 +704,7 @@ def test_nak_member_invite_posts_node_signed_stranger_envelope(tmp_path, monkeyp
         if req["op"] == "status":
             return {"node": node_pub, "relay": "relay.example:51820"}
         if req["op"] == "node_sign_stage":
-            body = req["body"]
+            body = {**req["body"], "nonce": "01" * 16}
             canonical = json.dumps(body, sort_keys=True, separators=(",", ":"),
                                    ensure_ascii=False).encode()
             return {**body, "sig": node.sign(canonical).hex(), "ok": True}
@@ -731,16 +731,18 @@ def test_nak_member_invite_posts_node_signed_stranger_envelope(tmp_path, monkeyp
     code = capsys.readouterr().out.strip()
     assert posted[0][0] == "https://onboard.example/base/worker-stage"
     envelope = posted[0][1]
-    assert {key: envelope[key] for key in ("v", "purpose", "kind", "tier", "starter",
+    assert set(envelope) == {"v", "purpose", "nonce", "kind", "tier", "starter",
+                             "inviter_pubkey", "ttl", "ts", "sig"}
+    assert {key: envelope[key] for key in ("v", "purpose", "nonce", "kind", "tier", "starter",
                                             "inviter_pubkey", "ttl", "ts")} == {
         "v": 2, "purpose": "onboard-stage-v2", "kind": "worker",
-        "tier": "stranger", "starter": 0,
+        "nonce": "01" * 16, "tier": "stranger", "starter": 0,
         "inviter_pubkey": node_pub, "ttl": 86400, "ts": 1000,
     }
     assert registered == [code]
 
 
-def test_node_sign_stage_only_signs_exact_domain_separated_envelopes(net):
+def test_node_sign_stage_only_signs_exact_domain_separated_envelopes(net, monkeypatch):
     from cryptography.hazmat.primitives.asymmetric import ed25519
 
     inviter = net("signing-oracle")
@@ -754,12 +756,21 @@ def test_node_sign_stage_only_signs_exact_domain_separated_envelopes(net):
         "v": 2, "purpose": "onboard-cancel-v2", "code": "valid_Code-2",
         "inviter_pubkey": inviter.node.node, "ts": now,
     }
+    nonces = iter(("01" * 16, "02" * 16, "03" * 16))
+    monkeypatch.setattr(nakd.secrets, "token_hex", lambda size: next(nonces) if size == 16 else None)
     public = ed25519.Ed25519PublicKey.from_public_bytes(bytes.fromhex(inviter.node.node))
-    for body in (stage, worker_stage, cancel):
+    expected_keys = (
+        {"v", "purpose", "nonce", "kind", "tier", "starter", "inviter_pubkey", "ttl", "ts", "sig"},
+        {"v", "purpose", "nonce", "kind", "tier", "starter", "inviter_pubkey", "ttl", "ts", "sig"},
+        {"v", "purpose", "nonce", "code", "inviter_pubkey", "ts", "sig"},
+    )
+    for body, keys in zip((stage, worker_stage, cancel), expected_keys):
         signed = inviter.node.node_sign_stage(body)
-        public.verify(bytes.fromhex(signed.pop("sig")), json.dumps(
-            body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode())
-        assert signed == body
+        assert set(signed) == keys
+        sig = signed.pop("sig")
+        public.verify(bytes.fromhex(sig), json.dumps(
+            signed, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode())
+        assert {key: value for key, value in signed.items() if key != "nonce"} == body
 
     refused = [
         {**stage, "tier": "trusted"},
@@ -768,12 +779,40 @@ def test_node_sign_stage_only_signs_exact_domain_separated_envelopes(net):
         {**stage, "purpose": "onboard-cancel-v2"},
         {**stage, "ts": now - 121},
         {**stage, "kind": "worker", "starter": 1},
+        {**stage, "nonce": "04" * 16},
         {**cancel, "code": "not/a/code"},
         {**cancel, "purpose": "onboard-stage-v2"},
+        {**cancel, "nonce": "05" * 16},
     ]
     for body in refused:
         with pytest.raises(ValueError, match="onboard signing request"):
             inviter.node.node_sign_stage(body)
+
+
+def test_node_sign_stage_generates_a_fresh_nonce_for_each_call(net, monkeypatch):
+    inviter = net("signing-nonce")
+    body = {
+        "v": 2, "purpose": "onboard-stage-v2", "kind": "worker", "tier": "stranger",
+        "starter": 0, "inviter_pubkey": inviter.node.node, "ttl": 86400,
+        "ts": int(time.time()),
+    }
+    generated = iter(("11" * 16, "22" * 16))
+    sizes = []
+
+    def token_hex(size):
+        sizes.append(size)
+        return next(generated)
+
+    monkeypatch.setattr(nakd.secrets, "token_hex", token_hex)
+
+    first = inviter.node.node_sign_stage(body)
+    second = inviter.node.node_sign_stage(body)
+
+    assert first["nonce"] == "11" * 16
+    assert second["nonce"] == "22" * 16
+    assert first["nonce"] != second["nonce"]
+    assert sizes == [16, 16]
+    assert "nonce" not in body
 
 
 def test_member_stage_refuses_non_stranger_and_large_starter_before_signing(tmp_path, monkeypatch):
@@ -795,7 +834,7 @@ def test_member_consumer_stage_includes_capped_starter_in_signed_envelope(tmp_pa
     monkeypatch.delenv("NAK_ONBOARD_TOKEN", raising=False)
 
     def sign(body):
-        body = {**body, "inviter_pubkey": node_pub}
+        body = {**body, "inviter_pubkey": node_pub, "nonce": "06" * 16}
         canonical = json.dumps(body, sort_keys=True, separators=(",", ":"),
                                ensure_ascii=False).encode()
         return {**body, "sig": node.sign(canonical).hex(), "ok": True}
@@ -812,16 +851,20 @@ def test_member_consumer_stage_includes_capped_starter_in_signed_envelope(tmp_pa
     assert "ok" not in posted[0][1]
 
 
-def test_onboard_403_reason_is_preserved(monkeypatch):
+@pytest.mark.parametrize("status,reason", [
+    (403, "invite right paused"),
+    (409, "replayed request"),
+])
+def test_onboard_error_reason_is_preserved(monkeypatch, status, reason):
     import io
     from urllib.error import HTTPError
 
     def refused(request, timeout):
-        raise HTTPError(request.full_url, 403, "forbidden", {},
-                        io.BytesIO(b'{"error":"invite right paused"}'))
+        raise HTTPError(request.full_url, status, "refused", {},
+                        io.BytesIO(json.dumps({"error": reason}).encode()))
 
     monkeypatch.setattr(nak, "urlopen", refused)
-    with pytest.raises(SystemExit, match=r"\(403\): invite right paused"):
+    with pytest.raises(SystemExit, match=rf"\({status}\): {reason}"):
         nak._http_post_json("https://onboard.example/worker-stage", {"not": "a secret"})
 
 
@@ -850,6 +893,8 @@ def test_uninvite_cancels_server_then_local_invite(net, tmp_path, monkeypatch):
     ed25519.Ed25519PublicKey.from_public_bytes(bytes.fromhex(inviter.node.node)).verify(
         bytes.fromhex(body["sig"]), canonical)
     assert body["purpose"] == "onboard-cancel-v2"
+    assert set(body) == {"v", "purpose", "nonce", "code", "inviter_pubkey", "ts", "sig"}
+    assert len(body["nonce"]) == 32 and all(ch in "0123456789abcdef" for ch in body["nonce"])
     assert body["code"] == "cancel-me" and body["inviter_pubkey"] == inviter.node.node
     assert all(row["nonce"] != registered["nonce"] for row in inviter.node.store.open_invites())
 

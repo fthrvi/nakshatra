@@ -557,6 +557,7 @@ class Node:
             valid = False
         if not valid:
             raise ValueError("onboard signing request is not an allowed stage or cancel envelope")
+        body = {**body, "nonce": secrets.token_hex(16)}
         canonical_body = json.dumps(
             body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
         private = ed25519.Ed25519PrivateKey.from_private_bytes(self._key)
