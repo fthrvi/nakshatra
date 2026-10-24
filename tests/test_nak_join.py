@@ -731,12 +731,49 @@ def test_nak_member_invite_posts_node_signed_stranger_envelope(tmp_path, monkeyp
     code = capsys.readouterr().out.strip()
     assert posted[0][0] == "https://onboard.example/base/worker-stage"
     envelope = posted[0][1]
-    assert {key: envelope[key] for key in ("v", "kind", "tier", "starter", "inviter_pubkey",
-                                            "ttl", "ts")} == {
-        "v": 2, "kind": "worker", "tier": "stranger", "starter": 0,
+    assert {key: envelope[key] for key in ("v", "purpose", "kind", "tier", "starter",
+                                            "inviter_pubkey", "ttl", "ts")} == {
+        "v": 2, "purpose": "onboard-stage-v2", "kind": "worker",
+        "tier": "stranger", "starter": 0,
         "inviter_pubkey": node_pub, "ttl": 86400, "ts": 1000,
     }
     assert registered == [code]
+
+
+def test_node_sign_stage_only_signs_exact_domain_separated_envelopes(net):
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+
+    inviter = net("signing-oracle")
+    now = int(time.time())
+    stage = {
+        "v": 2, "purpose": "onboard-stage-v2", "kind": "consumer", "tier": "stranger",
+        "starter": 10_000_000, "inviter_pubkey": inviter.node.node, "ttl": 86400, "ts": now,
+    }
+    worker_stage = {**stage, "kind": "worker", "starter": 0}
+    cancel = {
+        "v": 2, "purpose": "onboard-cancel-v2", "code": "valid_Code-2",
+        "inviter_pubkey": inviter.node.node, "ts": now,
+    }
+    public = ed25519.Ed25519PublicKey.from_public_bytes(bytes.fromhex(inviter.node.node))
+    for body in (stage, worker_stage, cancel):
+        signed = inviter.node.node_sign_stage(body)
+        public.verify(bytes.fromhex(signed.pop("sig")), json.dumps(
+            body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode())
+        assert signed == body
+
+    refused = [
+        {**stage, "tier": "trusted"},
+        {**stage, "starter": 10_000_001},
+        {**stage, "extra": "field"},
+        {**stage, "purpose": "onboard-cancel-v2"},
+        {**stage, "ts": now - 121},
+        {**stage, "kind": "worker", "starter": 1},
+        {**cancel, "code": "not/a/code"},
+        {**cancel, "purpose": "onboard-stage-v2"},
+    ]
+    for body in refused:
+        with pytest.raises(ValueError, match="onboard signing request"):
+            inviter.node.node_sign_stage(body)
 
 
 def test_member_stage_refuses_non_stranger_and_large_starter_before_signing(tmp_path, monkeypatch):
@@ -812,6 +849,7 @@ def test_uninvite_cancels_server_then_local_invite(net, tmp_path, monkeypatch):
                            ensure_ascii=False).encode()
     ed25519.Ed25519PublicKey.from_public_bytes(bytes.fromhex(inviter.node.node)).verify(
         bytes.fromhex(body["sig"]), canonical)
+    assert body["purpose"] == "onboard-cancel-v2"
     assert body["code"] == "cancel-me" and body["inviter_pubkey"] == inviter.node.node
     assert all(row["nonce"] != registered["nonce"] for row in inviter.node.store.open_invites())
 
@@ -853,6 +891,44 @@ def test_stranger_worker_request_is_person_gated_but_known_is_not(net):
     assert known_row["kind"] == "worker" and known_row["tier"] == "known"
     assert known_row["requires_person"] is False
     assert inviter.node.accept(known_id, "known")["person"] == known.person_pub
+
+
+def test_legacy_request_without_invite_metadata_fails_closed_for_mcp(net):
+    from network.client import NakError
+    from network import nak_mcp
+
+    inviter, requester = net("legacy-inviter"), net("legacy-requester")
+    code = _invite(inviter)
+    invite = inviter.node.register_invite(code)
+    inviter.node.store._db.execute(
+        "DELETE FROM invite_codes WHERE invite_id=?", (invite["nonce"],))
+    assert inviter.node.store.consume_invite(invite["nonce"], requester.person_pub)
+    request_id = inviter.node.store.add_request(
+        requester.person_pub, requester.node.node, "known person",
+        invite["nonce"], requester.node.node)
+
+    listed = nakd.handle(inviter.node, {"op": "requests"})["requests"]
+    row = next(row for row in listed if row["id"] == request_id)
+    assert row["kind"] == "unknown" and row["requires_person"] is True
+    with pytest.raises(ValueError, match="a person must accept this one"):
+        inviter.node.accept(request_id, "known person")
+
+    class DaemonClient:
+        def accept(self, req_id, petname):
+            reply = nakd.handle(inviter.node, {"op": "accept", "id": req_id, "petname": petname})
+            if not reply["ok"]:
+                raise NakError(reply["error"])
+            return reply
+
+    server = nak_mcp.Server(DaemonClient(), allow_connect=True)
+    result = server.handle({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "nak_accept",
+                   "arguments": {"id": request_id, "name": "known person"}},
+    })["result"]
+    assert result["isError"]
+    assert f"a person must accept this one: nak accept {request_id}" in result["content"][0]["text"]
+    assert inviter.node.store.request(request_id) is not None
 
 
 def test_consumer_redeem_uses_node_key_proof_without_worker_capabilities(net, tmp_path):

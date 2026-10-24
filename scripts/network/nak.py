@@ -94,6 +94,8 @@ DEFAULT_P2P_RELAY_ID = "12D3KooWDfHFtM8PP7TV46nssrix2hTL3kzMkv7kKMhULDakFGB7"
 DEFAULT_P2P_RELAYS = (f"/ip4/45.63.109.137/udp/29700/quic-v1/p2p/{DEFAULT_P2P_RELAY_ID},"
                       f"/ip4/45.63.109.137/tcp/29700/p2p/{DEFAULT_P2P_RELAY_ID}")
 DEFAULT_ONBOARD_BASE = "https://prithviloka.net/onboard"
+ONBOARD_STAGE_PURPOSE = "onboard-stage-v2"
+ONBOARD_CANCEL_PURPOSE = "onboard-cancel-v2"
 
 
 def _http_post_json(url: str, body: dict) -> dict:
@@ -148,7 +150,8 @@ def _stage_auth(kind: str, tier: str, starter: int, ttl: int, node_sign) -> dict
         raise SystemExit("without the operator token you may invite at tier stranger only")
     if starter > 10_000_000:
         raise SystemExit("without the operator token --starter may not exceed 10000000")
-    body = {"v": 2, "kind": kind, "tier": tier, "starter": starter,
+    body = {"v": 2, "purpose": ONBOARD_STAGE_PURPOSE,
+            "kind": kind, "tier": tier, "starter": starter,
             "ttl": ttl, "ts": int(time.time())}
     signed = dict(node_sign(body))
     signed.pop("ok", None)
@@ -2504,7 +2507,8 @@ def main(argv=None, *, http_post=None) -> int:
             if token is not None:
                 cancel_body = {"token": token, "code": details["code"]}
             else:
-                unsigned = {"v": 2, "code": details["code"],
+                unsigned = {"v": 2, "purpose": ONBOARD_CANCEL_PURPOSE,
+                            "code": details["code"],
                             "inviter_pubkey": st["node"], "ts": int(time.time())}
                 cancel_body = call(s, {"op": "node_sign_stage", "body": unsigned})
                 cancel_body.pop("ok", None)

@@ -93,6 +93,11 @@ STARTER_RETRY_S = (60, 300, 1800)
 STARTER_RETRY_MAX_S = 3600
 STARTER_RETRY_WINDOW_S = 7 * 86400
 ACCEPT_PROOF_MAX_SKEW_S = 120
+ONBOARD_SIGN_MAX_SKEW_S = 120
+ONBOARD_STAGE_PURPOSE = "onboard-stage-v2"
+ONBOARD_CANCEL_PURPOSE = "onboard-cancel-v2"
+ONBOARD_MEMBER_STARTER_MAX = 10_000_000
+ONBOARD_MEMBER_TTL_MAX_S = 86400
 ADDRESS_DECLINE_BLOCK_S = 30 * 86400
 ADDRESS_PENDING_TTL_S = 7 * 86400
 ADDRESS_PENDING_TOTAL_MAX = 20
@@ -512,13 +517,46 @@ class Node:
 
     # ── invites (inviter side) ────────────────────────────────────────────────────────────────
     def node_sign_stage(self, body: dict) -> dict:
-        """Sign an onboard stage/cancel envelope with this node's roster identity."""
-        if not isinstance(body, dict) or body.get("v") != 2:
-            raise ValueError("stage request must be a v2 object")
+        """Sign one exact, short-lived onboard stage or cancel envelope."""
+        if not isinstance(body, dict):
+            raise ValueError("onboard signing request must be an object")
         if body.get("inviter_pubkey") != self.node:
-            raise ValueError("stage request is not for this node")
-        if "sig" in body:
-            raise ValueError("stage request is already signed")
+            raise ValueError("onboard signing request is not for this node")
+        stage_keys = {"v", "purpose", "kind", "tier", "starter", "inviter_pubkey", "ttl", "ts"}
+        cancel_keys = {"v", "purpose", "code", "inviter_pubkey", "ts"}
+        ts = body.get("ts")
+        if type(ts) is not int or abs(int(time.time()) - ts) > ONBOARD_SIGN_MAX_SKEW_S:
+            raise ValueError("onboard signing request timestamp is stale")
+        if set(body) == stage_keys:
+            kind = body.get("kind")
+            starter = body.get("starter")
+            ttl = body.get("ttl")
+            valid = (
+                type(body.get("v")) is int
+                and body.get("v") == 2
+                and body.get("purpose") == ONBOARD_STAGE_PURPOSE
+                and kind in {"worker", "consumer"}
+                and body.get("tier") == "stranger"
+                and type(starter) is int
+                and 0 <= starter <= ONBOARD_MEMBER_STARTER_MAX
+                and (kind != "worker" or starter == 0)
+                and type(ttl) is int
+                and 60 <= ttl <= ONBOARD_MEMBER_TTL_MAX_S
+            )
+        elif set(body) == cancel_keys:
+            code = body.get("code")
+            valid = (
+                type(body.get("v")) is int
+                and body.get("v") == 2
+                and body.get("purpose") == ONBOARD_CANCEL_PURPOSE
+                and isinstance(code, str)
+                and 1 <= len(code) <= 64
+                and all(ch in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-" for ch in code)
+            )
+        else:
+            valid = False
+        if not valid:
+            raise ValueError("onboard signing request is not an allowed stage or cancel envelope")
         canonical_body = json.dumps(
             body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
         private = ed25519.Ed25519PrivateKey.from_private_bytes(self._key)
@@ -826,15 +864,24 @@ class Node:
             return "address", ""
         invite_row = self.store.invite(request.get("invite_nonce", ""))
         if not invite_row or not invite_row.get("code"):
-            return "contact", ""
-        inv = self._verified_starter_invite(invite_row["code"])
+            return "unknown", ""
+        try:
+            inv = self._verified_starter_invite(invite_row["code"])
+        except (TypeError, ValueError):
+            return "unknown", ""
         kind = inv.get("kind", "contact")
+        if kind == "contact":
+            return kind, ""
         details = inv.get(kind) if kind in {"worker", "consumer"} else None
-        return kind, details.get("tier", "") if isinstance(details, dict) else ""
+        if not isinstance(details, dict) or details.get("tier") not in {"stranger", "known", "trusted"}:
+            return "unknown", ""
+        return kind, details["tier"]
 
     def _request_requires_person(self, request: dict, *, starter=None,
                                  starter_checked: bool = False) -> bool:
         kind, tier = self._request_invite_kind_tier(request)
+        if kind == "unknown":
+            return True
         if not starter_checked:
             starter = self._starter_for_request(request)
         return bool(request.get("source") == "address" or starter
