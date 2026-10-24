@@ -45,6 +45,7 @@ from release_trust import (ReleaseTrustError, load_release_package_catalog,
                            load_release_package_signers)  # noqa: E402
 from network.person_custody import (  # noqa: E402
     PersonKey, _person_key_path, approval, broker_preflight, custody_mode, plain)
+from network.units import AmountError, MAX_SPEND_CAP, format_amount, parse_amount  # noqa: E402
 
 
 def call(sock_path: Path, req: dict) -> dict:
@@ -621,14 +622,26 @@ def _wallet_command(args) -> None:
             print(address if isinstance(address, str) and address
                   else "pending: deposit address creation queued")
         elif args.wallet_cmd == "status":
-            print(json.dumps(hook.wallet_status(), indent=1, sort_keys=True))
+            print(json.dumps(_display_amount_fields(
+                hook.wallet_status(), "balance", "withdrawable"), indent=1, sort_keys=True))
         elif args.wallet_cmd == "bind":
             print(json.dumps(hook.bind(args.address), indent=1, sort_keys=True))
         else:
             credits = _usdc_credits(args.usdc)
-            print(json.dumps(hook.withdraw(credits), indent=1, sort_keys=True))
+            print(json.dumps(_display_amount_fields(
+                hook.withdraw(credits), "amount"), indent=1, sort_keys=True))
     except LedgerUnavailable as exc:
         raise SystemExit(f"wallet refused: {exc}") from exc
+
+
+def _balance_command() -> None:
+    from ledger_client import LedgerUnavailable
+    try:
+        row = _display_amount_fields(
+            _wallet_hook().balance(), "balance", "available", "credit_limit", "limit")
+    except LedgerUnavailable as exc:
+        raise SystemExit(f"balance refused: {exc}") from exc
+    print(json.dumps(row, indent=1, sort_keys=True))
 
 
 def _gateway_installer(_sp, action: str) -> None:
@@ -1786,14 +1799,42 @@ def _delegate_reuse_command(state: Path, person_key: Path, agent: str, caps: lis
     return command + f" --idle-days {idle_days} --lease-days {lease_days}"
 
 
-MAX_SPEND_CAP = 10**14   # base units; 10^6 USDC-equivalent in credits, far above any devnet need
 OLD_SIGNER_MESSAGE = "signer too old for sliding grants; update the node or use --no-lease"
+
+
+def _cli_amount(text: str, *, max_base_units: int = MAX_SPEND_CAP) -> int:
+    try:
+        amount, legacy = parse_amount(text, max_base_units=max_base_units)
+    except AmountError as exc:
+        raise SystemExit(str(exc)) from exc
+    if legacy:
+        print(f"notice: read bare integer {text!r} as base units for backward compatibility; "
+              "append 'base', or use a decimal point, $ or USDC for human units", file=sys.stderr)
+    return amount
+
+
+def _display_amount_fields(row: dict, *names: str) -> dict:
+    shown = dict(row)
+    for name in names:
+        value = shown.get(name)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            shown.setdefault(f"{name}_usdc", format_amount(value))
+            shown[f"{name}_display"] = format_amount(value)
+    return shown
 
 
 def _grant_renew(args) -> int:
     """Human CLI boundary for re-signing one grant without rotating its agent key."""
     # The accurate statement summary is built after reading the current grant. This early, generic
     # preflight keeps broker custody ahead of the historical TTY check without moving file-mode work.
+    for flag, name in (("--per-tx-cap", "per_tx_cap"), ("--day-cap", "day_cap"),
+                       ("--verdict-auto-max", "verdict_auto_max")):
+        value = getattr(args, name)
+        if value is not None:
+            try:
+                setattr(args, name, _cli_amount(value))
+            except SystemExit as exc:
+                raise SystemExit(f"{flag} {exc}") from exc
     broker_preflight("grant-renew", "Renew the delegated agent grant")
     if not args.yes and not sys.stdin.isatty():
         raise SystemExit("nak grant renew is interactive-only; run it in a terminal or pass --yes explicitly")
@@ -1852,7 +1893,8 @@ def _grant_renew_confined(args, signer_dir: Path, agent: str, signer_mod, agent_
     cap_changes = []
     for name, value in (("per_tx_cap", args.per_tx_cap), ("day_cap", args.day_cap)):
         if value is not None and constraints.get(name) != value:
-            cap_changes.append(f"{name} {constraints.get(name, 0)} -> {value}")
+            cap_changes.append(
+                f"{name} {format_amount(int(constraints.get(name, 0)))} -> {format_amount(value)}")
             constraints[name] = value
     from network import verdict as verdict_policy
     policy_changes = []
@@ -1931,8 +1973,8 @@ def _grant_renew_confined(args, signer_dir: Path, agent: str, signer_mod, agent_
     renewed = signer_mod.issue_grant(person_priv, agent, agent_pub, caps, **grant_args)
     agent_files.write_grant(renewed)
     if cap_changes:
-        print(f"spend caps now {renewed['constraints'].get('per_tx_cap', 0)} per payment, "
-              f"{renewed['constraints'].get('day_cap', 0)} per day (base units)")
+        print(f"spend caps now {format_amount(renewed['constraints'].get('per_tx_cap', 0))} per payment, "
+              f"{format_amount(renewed['constraints'].get('day_cap', 0))} per day")
     print("verdict policy: " + verdict_policy.describe(verdict_policy.policy(renewed.get("constraints"))))
     authority = ("fixed-expiry legacy grant"
                  if args.no_lease else
@@ -1953,6 +1995,11 @@ def _print_grant_status(grant: dict) -> None:
         print(f"grant id: {grant['grant_id']}")
     if grant.get("warning"):
         print(f"WARNING: {grant['warning']}")
+    spend_caps = grant.get("spend_caps") or grant.get("constraints")
+    if isinstance(spend_caps, dict):
+        print("spend caps: "
+              f"{format_amount(int(spend_caps.get('per_tx_cap', 0)))} per payment; "
+              f"{format_amount(int(spend_caps.get('day_cap', 0)))} per day")
     if grant.get("verdict_policy"):
         from network.verdict import describe
         print("paid-task verdicts: " + describe(grant["verdict_policy"]))
@@ -2132,14 +2179,14 @@ def main(argv=None, *, http_post=None) -> int:
     q.add_argument("--no-lease", action="store_true",
                    help="issue a legacy fixed-expiry grant instead of a sliding charter")
     q.add_argument("--caps", help="explicit comma-separated cap set; omitted preserves current caps")
-    q.add_argument("--per-tx-cap", type=int, default=None, metavar="N",
-                   help="set the agent's nak.pay limit per payment (base units); omitted preserves it")
-    q.add_argument("--day-cap", type=int, default=None, metavar="N",
-                   help="set the agent's nak.pay limit per day (base units); omitted preserves it")
+    q.add_argument("--per-tx-cap", default=None, metavar="AMOUNT",
+                   help="nak.pay limit per payment (for example '0.25 USDC' or '25000000 base')")
+    q.add_argument("--day-cap", default=None, metavar="AMOUNT",
+                   help="nak.pay daily limit (for example '1.5 USDC' or '150000000 base')")
     q.add_argument("--verdict", choices=["auto", "ask", "threshold"], default=None,
                    help="paid answer policy; omitted preserves it")
-    q.add_argument("--verdict-auto-max", type=int, default=None, metavar="N",
-                   help="threshold auto-accept maximum in credit base units; omitted preserves it")
+    q.add_argument("--verdict-auto-max", default=None, metavar="AMOUNT",
+                   help="threshold auto-accept maximum in USDC or explicit base units; omitted preserves it")
     q.add_argument("--verdict-ask-strangers", choices=["yes", "no"], default=None,
                    help="always ask for unrostered/stranger workers; omitted preserves it")
     q.add_argument("--yes", action="store_true", help="confirm explicitly when stdin is not a terminal")
@@ -2161,8 +2208,9 @@ def main(argv=None, *, http_post=None) -> int:
     p.add_argument("--kind", choices=["contact", "worker", "consumer"], default="contact")
     p.add_argument("--tier", choices=["stranger", "known", "trusted"], default="known",
                    help="worker/consumer trust tier (self is never granted by an invite)")
-    p.add_argument("--starter", type=int, default=0,
-                   help="consumer starter credits, 0..100000000 base units (default: 0)")
+    p.add_argument("--starter", default=0,
+                   metavar="AMOUNT",
+                   help="devnet-only consumer starter (up to '1 USDC'; default: 0)")
     p.add_argument("--redeem", default=DEFAULT_ONBOARD_BASE,
                    help="onboard server base URL for a worker or consumer invite")
     p = sub.add_parser("uninvite", help="cancel an invite you created")
@@ -2229,6 +2277,7 @@ def main(argv=None, *, http_post=None) -> int:
     q.add_argument("address")
     q = walsub.add_parser("withdraw", help="request USDC to the bound payout address")
     q.add_argument("usdc", help="USDC amount (at least 1, up to 6 decimal places)")
+    sub.add_parser("balance", help="show this operator's signed ledger balance in USDC and base units")
     p = sub.add_parser("direct", help="allow/stop direct connections with a contact (reveals your LAN/IPv6)")
     p.add_argument("who"); p.add_argument("onoff", choices=["on", "off"])
     p = sub.add_parser("direct-listen", help="accept direct connections on this port (or 'off'); restarts nak-net")
@@ -2318,7 +2367,9 @@ def main(argv=None, *, http_post=None) -> int:
     tsub = p.add_subparsers(dest="tcmd", required=True)
     q = tsub.add_parser("post"); q.add_argument("to"); q.add_argument("title"); q.add_argument("instructions")
     q.add_argument("--rule", action="append", default=[], help='JSON rule, e.g. \'{"max_words": 60}\' (repeatable)')
-    q.add_argument("--reward", type=int, default=0); q.add_argument("--deadline", type=int, default=3600)
+    q.add_argument("--reward", default=0, metavar="AMOUNT",
+                   help="devnet reward in USDC or explicit base units (default: 0)")
+    q.add_argument("--deadline", type=int, default=3600)
     q = tsub.add_parser("list"); q.add_argument("--role", default="")
     q = tsub.add_parser("claim"); q.add_argument("task")
     q = tsub.add_parser("submit"); q.add_argument("task"); q.add_argument("output")
@@ -2364,6 +2415,8 @@ def main(argv=None, *, http_post=None) -> int:
                       f"{result.get('sent', {}).get(person, 0)}")
     elif a.cmd == "wallet":
         _wallet_command(a)
+    elif a.cmd == "balance":
+        _balance_command()
     elif a.cmd == "gateway":
         import subprocess as _sp
         if a.gateway_cmd == "on":
@@ -2420,8 +2473,11 @@ def main(argv=None, *, http_post=None) -> int:
             if starter.get("state") == "paid":
                 continue
             reason = f": {starter.get('reason')}" if starter.get("reason") else ""
+            amount = starter.get("amount")
+            shown_amount = (f" {format_amount(amount)} (devnet spend-only);"
+                            if isinstance(amount, int) and not isinstance(amount, bool) else "")
             print(f"starter {starter.get('invite_id')} to {starter.get('petname')}: "
-                  f"{starter.get('state')}{reason}")
+                  f"{shown_amount} {starter.get('state')}{reason}")
         print(f"direct listener {r.get('direct_port') or 'off'}  p2p "
               f"{(r.get('p2p') or {}).get('dial', 'off')}")
         g = r["grant"]
@@ -2432,6 +2488,11 @@ def main(argv=None, *, http_post=None) -> int:
             print(f"newest refusal [{_ago(q['time'])}] {q['id']} to {q['to'][:12]}: {q['reason']}")
     elif a.cmd == "invite":
         import joincode
+        try:
+            a.starter = (_cli_amount(a.starter, max_base_units=100_000_000)
+                         if isinstance(a.starter, str) else a.starter)
+        except SystemExit as exc:
+            raise SystemExit(f"--starter {exc}") from exc
         if a.kind != "consumer" and a.starter:
             raise SystemExit("--starter is only valid with --kind consumer")
         if a.person_key is not None and custody_mode() == "broker":
@@ -2480,6 +2541,8 @@ def main(argv=None, *, http_post=None) -> int:
                                       release=release, from_name=from_name,
                                       kind=a.kind, worker=worker, consumer=consumer)
         call(s, {"op": "register_invite", "code": code})
+        if a.kind == "consumer":
+            print(f"devnet starter: {format_amount(a.starter)} (spend-only)", file=sys.stderr)
         if a.code_only or not line:
             print(code)
             if a.kind in {"worker", "consumer"}:
@@ -2745,9 +2808,14 @@ def main(argv=None, *, http_post=None) -> int:
     elif a.cmd == "task":
         if a.tcmd == "post":
             rules = [json.loads(r) for r in a.rule] or [{"max_words": 200}]
+            try:
+                reward = _cli_amount(a.reward) if isinstance(a.reward, str) else a.reward
+            except SystemExit as exc:
+                raise SystemExit(f"--reward {exc}") from exc
             r = call(s, {"op": "task_post", "to": a.to, "title": a.title, "instructions": a.instructions,
-                         "acceptance": rules, "reward": a.reward, "deadline_s": a.deadline})
-            esc = f"; escrow open {r['escrow']['amount']} {r['escrow']['unit']}" if r.get("escrow") else ""
+                         "acceptance": rules, "reward": reward, "deadline_s": a.deadline})
+            esc = (f"; escrow open {format_amount(r['escrow']['amount'])} (devnet credits)"
+                   if r.get("escrow") else "")
             print(f"posted {r['task_hash'][:12]} to {', '.join(r['posted_to'])}{esc}")
         elif a.tcmd == "list":
             from network.client import render_tasks

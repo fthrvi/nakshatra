@@ -104,7 +104,12 @@ def test_nak_balance_is_signed_for_signer_with_no_account_parameter(tmp_path, mo
     monkeypatch.setattr(ledger_client.urllib.request, "urlopen", fake_urlopen)
     output = Server(_UnusedClient()).call("nak_balance", {})
 
-    assert json.loads(output) == {"balance": 77, "tier": "known"}
+    assert json.loads(output) == {
+        "balance": 77,
+        "balance_display": "0.00000077 USDC (77 base)",
+        "balance_usdc": "0.00000077 USDC (77 base)",
+        "tier": "known",
+    }
     assert observed[0][0] == "http://ledger.test/balance" and "account" not in observed[0][0]
     parts = dict(re.findall(r'(keyid|sig|ts)="([^"]+)"', observed[0][1]))
     assert parts["keyid"] == public
@@ -146,6 +151,8 @@ def test_nak_wallet_is_read_only_signed_and_redacts_key_material(tmp_path, monke
     assert set(value) == {"deposit_address", "status"}
     assert value["deposit_address"] == "1" * 32
     assert value["status"]["balance"] == 200_000_000
+    assert value["status"]["balance_display"] == "2 USDC (200000000 base)"
+    assert value["status"]["withdrawable_display"] == "1 USDC (100000000 base)"
     assert value["status"]["pending_withdrawals"] == [{"id": "w1"}]
     assert private.hex() not in output and public not in output
     assert str(key_path) not in output and "secret" not in output
@@ -176,3 +183,19 @@ def test_worker_status_redacts_secret_shaped_fields_and_key_paths(monkeypatch):
     parsed = json.loads(output)
     assert parsed["configured"] is True
     assert parsed["preflight"]["packages"][0]["verdict"] == "can serve"
+
+
+def test_stdio_loop_survives_unencodable_ids_and_deep_nesting(tmp_path):
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+    scripts = Path(__file__).resolve().parents[1] / "scripts"
+    env = dict(os.environ, HOME=str(tmp_path))
+    lines = ['{"jsonrpc":"2.0","id":"\\ud800","method":"ping"}', "[" * 100000 + "]" * 100000,
+             '{"jsonrpc":"2.0","id":7,"method":"ping"}']
+    proc = subprocess.run([sys.executable, "-m", "network.nak_mcp", "--sock", str(tmp_path / "none.sock")],
+                          input="\n".join(lines) + "\n", capture_output=True, text=True, cwd=scripts,
+                          env=env, timeout=60)
+    assert proc.returncode == 0
+    assert json.loads(proc.stdout.strip().splitlines()[-1]) == {"jsonrpc": "2.0", "id": 7, "result": {}}

@@ -33,6 +33,7 @@ if str(_SCRIPTS) not in sys.path:
 
 from network.person_custody import (  # noqa: E402
     PersonKey, _person_key_path, _raw_file_key, _signing_home, broker_preflight)
+from network.units import format_amount  # noqa: E402
 
 AGENT = "agent"
 AGENT_CAPS = ("nak.msg", "nak.task.claim")
@@ -612,7 +613,8 @@ def main(argv=None) -> int:
         else:
             starter = int(inv["consumer"].get("starter", 0))
             inviter_name = inv.get("from_name") or inv["inviter"][:12]
-            suffix = f"; starter credit {starter} arrives after {inviter_name} accepts you" if starter else ""
+            suffix = (f"; devnet starter {format_amount(starter)} arrives after "
+                      f"{inviter_name} accepts you" if starter else "")
             print(f"consumer standing: tier {standing['tier']}, operator {standing['operator']}{suffix}")
     print("\nnext:")
     print(f"  1. ask {inviter_name} to accept you (they run: nak requests, then nak accept <id>)")

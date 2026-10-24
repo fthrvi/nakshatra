@@ -24,6 +24,10 @@ class _FakeWallet:
         self.calls.append(("status", None))
         return {"balance": 200_000_000, "withdrawable": 100_000_000}
 
+    def balance(self):
+        self.calls.append(("balance", None))
+        return {"balance": 200_000_000, "tier": "known"}
+
     def bind(self, address):
         self.calls.append(("bind", address))
         return {"address": address, "changed": False}
@@ -42,7 +46,14 @@ def test_nak_wallet_commands_use_signed_client_and_convert_usdc(monkeypatch, cap
     assert capsys.readouterr().out.strip() == "pending: deposit address creation queued"
 
     assert nak.main(["wallet", "status"]) == 0
-    assert json.loads(capsys.readouterr().out)["withdrawable"] == 100_000_000
+    status = json.loads(capsys.readouterr().out)
+    assert status["withdrawable"] == 100_000_000
+    assert status["balance_display"] == "2 USDC (200000000 base)"
+
+    assert nak.main(["balance"]) == 0
+    balance = json.loads(capsys.readouterr().out)
+    assert balance["balance"] == 200_000_000
+    assert balance["balance_usdc"] == "2 USDC (200000000 base)"
 
     assert nak.main(["wallet", "bind", address]) == 0
     assert json.loads(capsys.readouterr().out)["address"] == address
@@ -50,7 +61,7 @@ def test_nak_wallet_commands_use_signed_client_and_convert_usdc(monkeypatch, cap
     assert nak.main(["wallet", "withdraw", "1.250001"]) == 0
     assert json.loads(capsys.readouterr().out)["amount"] == 125_000_100
     assert hook.calls == [
-        ("address", None), ("status", None), ("bind", address),
+        ("address", None), ("status", None), ("balance", None), ("bind", address),
         ("withdraw", 125_000_100),
     ]
 

@@ -288,17 +288,32 @@ def test_grant_renew_sets_spend_caps_only_when_named(tmp_path, monkeypatch, caps
     assert key_path.read_bytes() == before_key
     assert after["constraints"]["per_tx_cap"] == 500 and after["constraints"]["day_cap"] == 2000
     assert "nak.pay" in after["caps"]
-    assert "500 per payment, 2000 per day" in capsys.readouterr().out
+    assert "0.000005 USDC (500 base) per payment" in capsys.readouterr().out
     kind, summary = approvals[1]
     assert kind == "spend-cap"
     assert "ttl 365 days" in summary
     assert "caps nak.msg,nak.pay,nak.task.claim" in summary
     assert "widened caps nak.pay" in summary
-    assert "spend caps per_tx_cap 0 -> 500, day_cap 0 -> 2000" in summary
+    assert ("spend caps per_tx_cap 0 USDC (0 base) -> 0.000005 USDC (500 base), "
+            "day_cap 0 USDC (0 base) -> 0.00002 USDC (2000 base)") in summary
 
     assert nak.main(["grant", "renew", "--yes", "--day-cap", "3000"]) == 0
     again = json.loads(grant_path.read_text())
     assert again["constraints"]["per_tx_cap"] == 500 and again["constraints"]["day_cap"] == 3000
+
+
+def test_grant_renew_accepts_exact_human_usdc(tmp_path, monkeypatch, capsys):
+    _state, _key_path, grant_path = _temporary_identity(tmp_path, monkeypatch)
+
+    assert nak.main(["grant", "renew", "--yes", "--per-tx-cap", "0.25 USDC",
+                     "--day-cap", "$1.50"]) == 0
+
+    constraints = json.loads(grant_path.read_text())["constraints"]
+    assert constraints["per_tx_cap"] == 25_000_000
+    assert constraints["day_cap"] == 150_000_000
+    shown = capsys.readouterr()
+    assert "0.25 USDC (25000000 base)" in shown.out
+    assert "read bare integer" not in shown.err
 
 
 def test_grant_renew_keeps_renewal_key_error_text(tmp_path, monkeypatch):

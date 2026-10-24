@@ -112,8 +112,16 @@ the change:
     # Also let the agent post tasks.
     nak grant renew --caps nak.msg,nak.task.claim,nak.task.post
 
-    # Also let it pay. Spend limits are base credit units; choose your own limits.
-    nak grant renew --caps nak.msg,nak.pay,nak.task.claim,nak.task.post --per-tx-cap 500 --day-cap 2000
+    # Also let it pay. Amounts are human USDC; the signed grant still stores base units.
+    nak grant renew --caps nak.msg,nak.pay,nak.task.claim,nak.task.post \
+      --per-tx-cap "0.25 USDC" --day-cap "1 USDC"
+
+Amount input uses exact decimals, with 100,000,000 base units per USDC. Write `0.25`,
+`0.25 USDC`, `$0.25`, or `25000000 base`. For compatibility, a bare integer still means base
+units and prints a notice; this avoids silently changing old commands. `nak grant status` shows
+both forms. Task rewards and MCP `nak_task_post` use the same rule. `nak balance`, `nak wallet
+status`, task listings, and MCP balance, wallet, and task replies show USDC beside base units.
+Task rewards and starter credits are devnet-only.
 
 The charter lasts at most 365 days. The credential sent to contacts lasts at most 7 days and renews
 while the agent is used. After 30 idle days the grant lapses and a human must run `nak grant renew`
@@ -187,14 +195,14 @@ The owner can invite a laptop or harness as a consumer at any tier. A `known`, `
 member can invite one at `stranger` tier. It receives a ledger identity but is never advertised,
 planned, or summoned as an inference worker:
 
-    nak invite --kind consumer --tier known --starter 0 --note "laptop"
-    nak invite --kind consumer --tier stranger --starter 10000000 --note "trial laptop"
+    nak invite --kind consumer --tier known --starter "0.25 USDC" --note "laptop"
+    nak invite --kind consumer --tier stranger --starter "0.10 USDC" --note "trial laptop"
 
-`known` is the default tier; `self` cannot be granted by an invite. `--starter N` is optional and
-defaults to zero. For a member invite it is capped at 10,000,000 base units (0.10 USDC on devnet),
+`known` is the default tier; `self` cannot be granted by an invite. `--starter AMOUNT` is optional and
+defaults to zero. For a member invite it is capped at 0.10 USDC (10,000,000 base units) on devnet,
 with the same 3-outstanding and 5-per-30-days limits as worker invites. Use `nak uninvite <code>` to
-cancel an unused invite. A nonzero starter is a spend-only trial credit: it may be spent on the
-network but can never be withdrawn. Only money the person deposits can cash out. On the devnet,
+cancel an unused invite. A nonzero starter is a devnet-only, spend-only trial credit: it may be spent
+on the network but can never be withdrawn. Only money the person deposits can cash out. On the devnet,
 accepting the consumer's contact request automatically pays the exact amount in the person-signed
 invite through the inviter's own `nak.pay` cap. Every stranger-tier acceptance is interactive and
 person-signed. A missing/lapsed grant or a not-yet-rostered consumer leaves the payment visibly

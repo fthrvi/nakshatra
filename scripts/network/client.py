@@ -11,6 +11,8 @@ import os
 import socket
 from pathlib import Path
 
+from network.units import format_amount
+
 
 def default_sock() -> Path:
     return Path(os.environ.get("NAK_NET_DIR", Path.home() / ".nakshatra" / "net")) / "nakd.sock"
@@ -150,7 +152,7 @@ def render_tasks(rows: list) -> str:
     for r in rows:
         sp, who = r["spec"], _esc(r.get("peer_name") or (r.get("peer") or r.get("assignee") or "")[:12])
         line = (f"[{r['task_hash'][:12]}] {r['role']} · {r['state']} · '{_esc(sp['title'])}' · "
-                f"reward {sp['reward']['amount']} {sp['reward']['unit']}")
+                f"reward {format_amount(sp['reward']['amount'])} (devnet credits)")
         funding = r.get("funding_state")
         if funding:
             shown = "funded (payment pending)" if funding == "pending" else funding

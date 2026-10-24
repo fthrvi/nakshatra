@@ -63,7 +63,7 @@ State as of 2026-10-23 (release 0.15.22 on the public canary; clean outsider joi
 | Revocation | Person-signed cumulative revocations are local immediately, pushed over authenticated contact sessions, and exportable/importable as `nkr1.` blobs | Older contacts ignore the new frame until they update; the ledger still trusts node keys, which this does not revoke | S (upgrade rollout) |
 | Task escrow fairness | Pay-first holds, one open hold per task, auto-refund at deadline+24h | A payer can refund an open hold after the worker submits; needs a rule (e.g. hold locks at submit until verdict or deadline) | M + **D** |
 | Sybil / credit-line abuse | Overdraft tiers, 7-day maturity, cash-out only at known+ | Two colluding accounts can convert credit-line value into earnings (inference and tasks alike) | L + **D** |
-| Spend caps in human units | Caps enforced by the signer in base units (10^8 per USDC) | CLI/MCP show and accept USDC, not base units | S |
+| Spend caps in human units | Exact-decimal CLI/MCP input accepts USDC or explicit base units; grant status, balances, wallets, starters, and task rewards show human USDC beside unchanged signed/base-unit values. Bare integers remain base units with a notice. | — | — |
 | Abuse/report path | — | A way for a member to report and for an operator to suspend a node | M |
 
 ## Shortest path to "a stranger can do it alone"

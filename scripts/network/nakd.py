@@ -29,6 +29,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import math
 import os
 import random
 import secrets
@@ -77,6 +78,7 @@ except ImportError:  # the release ships both; a dev checkout may point at a sth
 
 from network.revocation import (decode_record, read_private_json, revocation_lock,  # noqa: E402
                                 verify_record)
+from network.units import MAX_SPEND_CAP  # noqa: E402
 
 MSG_DOMAIN = "nak-msg-v1"
 MAX_FRAME = 1 << 20
@@ -110,6 +112,10 @@ WAIT_S = 100.0          # under the relay's 120 s waiting TTL, so we re-register
 PING_S = 30.0
 IDLE_S = 95.0           # no frame (not even a ping) for this long = the peer is gone
 DEFAULT_RELAY = ("45.63.109.137", 51820)
+MAX_CONTROL_LIMIT = 1000
+MAX_TASK_DEADLINE_S = 365 * 86400
+MAX_UNIX_TIMESTAMP = (1 << 63) - 1
+MAX_REDEEM_WAIT_S = 3600.0
 
 # Floor for every agent on every node: refuse outbound text carrying a recognisable secret or a bulk
 # encoded payload. Same formats as Prithvi's web egress DLP (mind/web_tools.py); a harness with its
@@ -2650,13 +2656,18 @@ class Node:
         with self._lock:
             online = set(self._sessions)
         grant = self._grant_status()
+        constraints = grant.get("constraints") if isinstance(grant.get("constraints"), dict) else {}
+        grant["spend_caps"] = {
+            "per_tx_cap": _bounded_int(constraints.get("per_tx_cap", 0), "per_tx_cap", 0, MAX_SPEND_CAP),
+            "day_cap": _bounded_int(constraints.get("day_cap", 0), "day_cap", 0, MAX_SPEND_CAP),
+        }
         warning = self._grant_warning_text(grant)
         grant["status"] = self._grant_status_text(grant)
         lapsed = grant["status"].startswith("LAPSED:")
         grant["warning"] = "" if lapsed else (f"{warning}; run: nak grant renew" if warning else "")
         grant = {k: grant[k] for k in ("agent", "caps", "expires_at", "not_before", "revoked",
                                        "grant_id", "valid", "problem", "lease", "status", "warning",
-                                       "verdict_policy")
+                                       "verdict_policy", "spend_caps")
                  if k in grant}
         refused = self.store.refusal_summary()
         waiting = len(self.store.tasks_in_states(("awaiting_approval",), role="poster"))
@@ -2714,9 +2725,34 @@ OPS = {"status", "node_sign_stage", "cancel_invite", "register_invite", "registe
        "starter_status", "install_revocation", "import_revocation", "revocations"}
 
 
+def _bounded_int(value, name: str, minimum: int, maximum: int) -> int:
+    if type(value) is not int or not minimum <= value <= maximum:
+        raise ValueError(f"{name} must be an integer between {minimum} and {maximum}")
+    return value
+
+
+def _request_int(req: dict, name: str, default: int, minimum: int, maximum: int) -> int:
+    return _bounded_int(req[name] if name in req else default, name, minimum, maximum)
+
+
+def _optional_request_int(req: dict, name: str, minimum: int, maximum: int):
+    value = req.get(name)
+    return None if value is None else _bounded_int(value, name, minimum, maximum)
+
+
+def _request_number(req: dict, name: str, default: float, minimum: float, maximum: float) -> float:
+    value = req[name] if name in req else default
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) \
+            or not minimum <= value <= maximum:
+        raise ValueError(f"{name} must be a number between {minimum:g} and {maximum:g}")
+    return float(value)
+
+
 def handle(node: Node, req: dict) -> dict:
-    op = req.get("op")
     try:
+        if not isinstance(req, dict):
+            raise ValueError("request must be an object")
+        op = req.get("op")
         if op not in OPS:
             raise ValueError(f"unknown op {op!r}")
         if op == "status":
@@ -2737,16 +2773,18 @@ def handle(node: Node, req: dict) -> dict:
             return {"ok": True, **node.cancel_invite(req.get("nonce", ""))}
         if op == "register_address":
             return {"ok": True, **node.register_address(
-                req["code"], req.get("install_line", ""), ts=req.get("ts"),
+                req["code"], req.get("install_line", ""),
+                ts=_optional_request_int(req, "ts", 0, MAX_UNIX_TIMESTAMP),
                 signature=req.get("signature", ""))}
         if op == "address_status":
             return {"ok": True, **node.address_status()}
         if op == "address_off":
             return {"ok": True, **node.address_off(
-                req.get("aid", ""), ts=req.get("ts"), signature=req.get("signature", ""))}
+                req.get("aid", ""), ts=_optional_request_int(req, "ts", 0, MAX_UNIX_TIMESTAMP),
+                signature=req.get("signature", ""))}
         if op == "redeem":
             return {"ok": True, **node.redeem(req["code"], req.get("nickname", ""), req.get("petname", ""),
-                                              float(req.get("wait_s", 0)))}
+                                              _request_number(req, "wait_s", 0, 0, MAX_REDEEM_WAIT_S))}
         if op == "requests":
             requests = node.store.requests()
             for request in requests:
@@ -2757,11 +2795,12 @@ def handle(node: Node, req: dict) -> dict:
             return {"ok": True, "requests": requests}
         if op == "accept":
             return {"ok": True, **node.accept(req["id"], req.get("petname", ""),
-                                               ts=req.get("ts"), signature=req.get("signature", ""))}
+                                               ts=_optional_request_int(req, "ts", 0, MAX_UNIX_TIMESTAMP),
+                                               signature=req.get("signature", ""))}
         if op == "decline":
             return {"ok": True, **node.decline(req["id"])}
         if op == "block":
-            return {"ok": True, **node.block(req["person"], int(req.get("days", 30)))}
+            return {"ok": True, **node.block(req["person"], _request_int(req, "days", 30, 1, 3650))}
         if op == "unblock":
             return {"ok": True, **node.unblock(req["person"])}
         if op == "blocked":
@@ -2774,6 +2813,8 @@ def handle(node: Node, req: dict) -> dict:
             return {"ok": True, **node.send(req["to"], req["text"], req.get("aspect", ""))}
         if op == "agent_send":
             optional = {key: req[key] for key in ("want", "expires", "budget", "refs", "harness") if key in req}
+            if "expires" in optional:
+                optional["expires"] = _bounded_int(optional["expires"], "expires", 0, MAX_UNIX_TIMESTAMP)
             return {"ok": True, **node.agent_send(req["to"], req["text"], intent=req.get("intent", "ask"),
                                                   thread=req.get("thread", ""),
                                                   reply_to=req.get("reply_to", ""), **optional)}
@@ -2793,9 +2834,12 @@ def handle(node: Node, req: dict) -> dict:
             return {"ok": True, "delivered": state["state"] == "delivered", **state}
         if op == "task_post":
             return {"ok": True, **node.post_task(req["to"], req["title"], req["instructions"], req["acceptance"],
-                                                 int(req.get("reward", 0)), int(req.get("deadline_s", 3600)))}
+                                                 _request_int(req, "reward", 0, 0, MAX_SPEND_CAP),
+                                                 _request_int(req, "deadline_s", 3600, 1,
+                                                              MAX_TASK_DEADLINE_S))}
         if op == "tasks":
-            rows = node.store.tasks(req.get("role") or None, int(req.get("limit", 50)))
+            rows = node.store.tasks(req.get("role") or None,
+                                    _request_int(req, "limit", 50, 1, MAX_CONTROL_LIMIT))
             for r in rows:
                 r.pop("escrow_auth", None)
                 for internal in ("hold_id", "funding_state", "funding_reason"):
@@ -2820,16 +2864,19 @@ def handle(node: Node, req: dict) -> dict:
         if op == "task_decide":
             return {"ok": True, **node.decide_task(
                 req["task"], req["decision"], req.get("reason", ""),
-                ts=req.get("ts"), signature=req.get("signature", ""))}
+                ts=_optional_request_int(req, "ts", 0, MAX_UNIX_TIMESTAMP),
+                signature=req.get("signature", ""))}
         if op == "inbox":
-            msgs = node.store.inbox(int(req.get("since", 0)), int(req.get("limit", 50)))
+            msgs = node.store.inbox(_request_int(req, "since", 0, 0, MAX_UNIX_TIMESTAMP),
+                                    _request_int(req, "limit", 50, 1, MAX_CONTROL_LIMIT))
             for m in msgs:
                 m["name_source"] = (node.store.contact(m["from_person"]) or {}).get("name_src") or "self-chosen"
             return {"ok": True, "messages": msgs}
         if op == "outbox":
             return {"ok": True, "items": node.store.outbox(bool(req.get("refused")),
                                                                bool(req.get("text")),
-                                                               int(req.get("limit", 50)))}
+                                                               _request_int(req, "limit", 50, 1,
+                                                                            MAX_CONTROL_LIMIT))}
     except (KeyError, ValueError, RuntimeError) as e:
         return {"ok": False, "error": str(e) if not isinstance(e, KeyError) else f"missing {e}"}
     return {"ok": False, "error": "unreachable"}
