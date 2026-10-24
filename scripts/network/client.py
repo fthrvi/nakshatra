@@ -87,6 +87,10 @@ class NakClient:
     def delivered(self, mid: str) -> bool:
         return self.call("delivered", mid=mid)["delivered"]
 
+    def delivery(self, mid: str) -> dict:
+        r = self.call("delivered", mid=mid)
+        return {"state": r.get("state") or ("delivered" if r["delivered"] else "queued"), "reason": r.get("reason")}
+
     def outbox(self, refused: bool = False, text: bool = False, limit: int = 50) -> list:
         return self.call("outbox", refused=refused, text=text, limit=limit)["items"]
 

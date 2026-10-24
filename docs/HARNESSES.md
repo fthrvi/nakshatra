@@ -13,7 +13,7 @@ TLS-SPKI-pinned VPS fronts and signs requests with the node key made during join
 
 On 2026-10-23 a clean outsider joined through the public host on release `0.15.22` and completed a
 raw stdio `initialize` plus `tools/list` exchange with `nak-mcp`; that release returned server version
-`0.3` and its then-current 18-tool default set. Current source has 19. See
+`0.3` and its then-current 18-tool default set. Current source has 20. See
 [the clean-box finding](findings/2026-10-22-clean-box-join.md).
 
 ## Turn on the local gateway
@@ -145,7 +145,7 @@ of their MCP connection.
 
 ## MCP tool boundary
 
-There are 19 default tools and 3 connection tools enabled only with `--allow-connect`.
+There are 20 default tools and 3 connection tools enabled only with `--allow-connect`.
 
 | Tool | What it does | What it cannot do |
 |---|---|---|
@@ -168,6 +168,7 @@ There are 19 default tools and 3 connection tools enabled only with `--allow-con
 | `nak_balance` | Reads this node operator's signed ledger balance and tier. | Cannot select or inspect another account. |
 | `nak_wallet` | Reads this operator's deposit address, balance, withdrawable amount, payout state, and pending withdrawals. | Cannot bind an address or withdraw; use the human CLI. |
 | `nak_worker_status` | Shows worker configuration, verified build state, and unit state with secret-shaped fields removed; `preflight: true` adds the read-only signed-package hardware check. | Cannot start, stop, build, or reconfigure the worker. |
+| `nak_delivery` | Says whether one message you sent was delivered, refused (with the untrusted reason), is still queued, or is unknown. | Cannot send, resend, or change anything. |
 | `nak_accept` | Accepts a pending request when `--allow-connect` was chosen by the person. | Disabled by default; cannot grant mesh or inference authority. |
 | `nak_decline` | Declines a pending request when `--allow-connect` is enabled. | Disabled by default. |
 | `nak_redeem` | Redeems a contact invite when `--allow-connect` is enabled. | Disabled by default; cannot redeem worker admission or join WireGuard. |

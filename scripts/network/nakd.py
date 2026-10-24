@@ -2700,7 +2700,8 @@ def handle(node: Node, req: dict) -> dict:
                                                 models=req.get("models"), price_hint=req.get("price_hint", ""),
                                                 paid=bool(req.get("paid", False)))}
         if op == "delivered":
-            return {"ok": True, "delivered": node.delivered(req["mid"])}
+            state = node.store.delivery_state(req["mid"])
+            return {"ok": True, "delivered": state["state"] == "delivered", **state}
         if op == "task_post":
             return {"ok": True, **node.post_task(req["to"], req["title"], req["instructions"], req["acceptance"],
                                                  int(req.get("reward", 0)), int(req.get("deadline_s", 3600)))}

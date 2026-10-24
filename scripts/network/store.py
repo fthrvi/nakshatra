@@ -868,6 +868,16 @@ class Store:
         r = self._q("SELECT acked FROM outbox WHERE nonce=?", (nonce,))
         return bool(r and r[0][0])
 
+    def delivery_state(self, nonce: str) -> dict:
+        """unknown | queued | delivered | refused (a refusal is acked too, so `delivered()` alone cannot tell)."""
+        r = self._q("SELECT acked, refused FROM outbox WHERE nonce=?", (nonce,))
+        if not r:
+            return {"state": "unknown"}
+        acked, refused = r[0]
+        if refused is not None:
+            return {"state": "refused", "reason": self._dec("outbox", "refused", self._pk((nonce,)), refused)}
+        return {"state": "delivered" if acked else "queued"}
+
     def outbox(self, refused_only: bool = False, include_text: bool = False, limit: int = 50) -> list:
         where = " WHERE refused IS NOT NULL" if refused_only else ""
         rows = self._q("SELECT nonce, to_person, frame, created, acked, refused FROM outbox" + where +
