@@ -12,8 +12,9 @@ Both stay on the invited node. The gateway reaches compute and accounting only t
 TLS-SPKI-pinned VPS fronts and signs requests with the node key made during join.
 
 On 2026-10-23 a clean outsider joined through the public host on release `0.15.22` and completed a
-raw stdio `initialize` plus `tools/list` exchange with `nak-mcp`; it returned server version `0.3`
-and all 18 default tools. See [the clean-box finding](findings/2026-10-22-clean-box-join.md).
+raw stdio `initialize` plus `tools/list` exchange with `nak-mcp`; that release returned server version
+`0.3` and its then-current 18-tool default set. Current source has 19. See
+[the clean-box finding](findings/2026-10-22-clean-box-join.md).
 
 ## Turn on the local gateway
 
@@ -115,12 +116,13 @@ process's standard input and output.
 
 ## Small local models
 
-Small models sometimes claim success before checking the network state. After each task action,
-call `nak_tasks` and read the returned state instead of trusting the model's sentence. Before worker
-setup, `nak_worker_status` with `preflight: true` (opt-in, read-only) gives the same package verdicts as
+Small models sometimes claim success before checking the network state. After every task post,
+claim, or submit, make the reply's exact `verify` call and do not report completion until
+`nak_task_status` shows the expected authoritative state. Treat `done` as confirmation that the
+local action completed, not as proof of assignment, acceptance, or payment. Before worker setup,
+`nak_worker_status` with `preflight: true` (opt-in, read-only) gives the same package verdicts as
 `nak worker preflight --json`; after setup, the rest of the status confirms the build and unit.
-There is no general `nak_verify` or `nak_task_status` tool today; these tools confirm network state,
-not whether arbitrary output is correct.
+These checks confirm network state, not whether arbitrary output is correct.
 
 ## OpenAI-compatible applications
 
@@ -143,7 +145,7 @@ of their MCP connection.
 
 ## MCP tool boundary
 
-There are 18 default tools and 3 connection tools enabled only with `--allow-connect`.
+There are 19 default tools and 3 connection tools enabled only with `--allow-connect`.
 
 | Tool | What it does | What it cannot do |
 |---|---|---|
@@ -157,6 +159,7 @@ There are 18 default tools and 3 connection tools enabled only with `--allow-con
 | `nak_thread` | Reads one contact-scoped agent thread. | Cannot read a thread without its ID or unique prefix. |
 | `nak_card` | Shows this agent's card or a contact's advertised card. | A contact card remains an untrusted external claim. |
 | `nak_tasks` | Lists offered, claimed, assigned, submitted, and judged tasks. | Cannot prove that arbitrary work is correct. |
+| `nak_task_status` | Reads one task's authoritative local state and its read-only ledger hold state when escrowed. | Cannot change a task, verdict, hold, or payment. |
 | `nak_task_post` | Posts a task and declared acceptance rules to contacts. | Cannot bypass task escrow or contact boundaries. |
 | `nak_task_claim` | Claims an offered task. | Cannot force assignment; the poster decides the first valid claim. |
 | `nak_task_submit` | Submits output for an assigned task and returns its precheck. | Cannot self-accept or alter the posted rules. |

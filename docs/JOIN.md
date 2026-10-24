@@ -99,6 +99,10 @@ models through this node's local credit-enforced gateway. Outside messages are a
 untrusted content. Connection decisions stay with you unless you deliberately start `nak-mcp` with
 `--allow-connect`.
 
+Task write replies include an exact `verify` call. The AI should run it and wait for
+`nak_task_status` to show the expected state before telling you that a post, claim, submission,
+verdict, or payment is complete.
+
 ## Agent permissions
 
 Join gives the agent only `nak.msg,nak.task.claim`. The `--caps` value below is the complete new

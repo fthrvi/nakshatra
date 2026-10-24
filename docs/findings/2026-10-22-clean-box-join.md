@@ -185,8 +185,9 @@ no new request, and I did not touch the existing one.
    deposited money can cash out.
 9. The guide did not warn that an idle WSL distro stops the node. It now does and links the Windows
    worker notes without editing that separately owned file.
-10. Harness docs claimed 22 MCP tools and omitted four typed-agent tools. The server exposes 18
-    default tools plus 3 opt-in connection tools, 21 total; the table now lists all of them.
+10. Harness docs claimed 22 MCP tools and omitted four typed-agent tools. The tested release exposed
+    an 18-tool default set plus 3 opt-in connection tools, 21 total; current source has 19 default tools
+    after adding `nak_task_status`.
 
 ## Harness and grant checks after cleanup
 
@@ -197,8 +198,8 @@ examples match the software installed on the hub:
   confirmed `openclaw mcp set`, `claude mcp add --scope user ... -- <command>`, and Codex's
   `[mcp_servers.<name>]` stdio table. The Codex form also matches its official MCP documentation.
 - Sending JSON-RPC `initialize` and `tools/list` by hand to the hub's installed `nak-mcp` returned
-  server `nakshatra` version `0.3` and 18 default tools. Source and help confirmed the 3 additional
-  `--allow-connect` tools.
+  server `nakshatra` version `0.3` and 18 tools in that release. Current source has 19; source and
+  help confirmed the 3 additional `--allow-connect` tools.
 - Under a new temporary HOME, the installed signed release created a fresh identity and accepted
   both documented grant forms (automation added `--yes` because it had no terminal). The final
   grant had `nak.msg,nak.pay,nak.task.claim,nak.task.post`, spend limits 500/2000, a 7-day wire
@@ -364,7 +365,7 @@ container's `~/.local/bin/nak-mcp`. It exited zero in 76 ms with no standard err
 
 ```text
 initialize: protocolVersion 2024-11-05; server nakshatra 0.3
-tools/list: 18 default tools
+tools/list on release 0.15.22: 18 tools (current source: 19)
 nak_status, nak_contacts, nak_inbox, nak_requests, nak_send, nak_agent_send,
 nak_threads, nak_thread, nak_card, nak_tasks, nak_task_claim, nak_task_submit,
 nak_task_post, nak_models, nak_ask, nak_balance, nak_wallet, nak_worker_status
@@ -427,7 +428,7 @@ unreachable (mesh HTTP 000, public canary HTTP 200), new identity (person `484f4
 | Non-interactive accept (what an agent would do) | Pass: refused, "a person must accept this one", request unchanged |
 | Biswa: `nak accept 045a6cd4 --as strangerbox` in a terminal, `y` | Pass |
 | Contacts + two-way messages | Pass: both sides `active`; both messages delivered within 4 s |
-| Stranger's `nak-mcp` tools/list | Pass: 18 tools, no accept tool |
+| Stranger's `nak-mcp` tools/list | Pass on release 0.15.24: 18 tools, no accept tool (current source: 19) |
 | Container restart | Pass: contact still active, a new message delivered (the user manager was started by hand after the restart, as in the earlier run) |
 | Cleanup | `nak address off` (old line dead), `nak remove strangerbox`, container and image deleted; hub contacts back to bro, testbox, starter-test |
 

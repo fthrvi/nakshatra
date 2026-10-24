@@ -2221,6 +2221,82 @@ class Node:
         return {"task_hash": task["task_hash"], "funding": funding,
                 "hold_id": task["hold_id"], "settlement": status}
 
+    @staticmethod
+    def _task_age(ts: int, now: int) -> str:
+        seconds = max(0, now - int(ts or now))
+        if seconds < 10:
+            return "just now"
+        if seconds < 60:
+            return f"{seconds} sec ago"
+        if seconds < 3600:
+            return f"{seconds // 60} min ago"
+        if seconds < 86400:
+            return f"{seconds // 3600} hr ago"
+        return f"{seconds // 86400} day ago" if seconds < 172800 else f"{seconds // 86400} days ago"
+
+    @staticmethod
+    def _task_summary(task: dict, hold: Optional[dict], now: int) -> str:
+        state, role = task["state"], task["role"]
+        age = Node._task_age(task["updated"], now)
+        phrases = {
+            "posted": "waiting for a worker to claim",
+            "offered": "waiting for you to claim or leave it",
+            "claimed": "waiting for the poster to assign it",
+            "assigned": "waiting for your result" if role == "worker" else "waiting for the worker's result",
+            "submitted": "waiting for the poster's verdict",
+            "awaiting_approval": "waiting for your person's verdict",
+            "accepted": "the result was accepted",
+            "rejected": "the result was rejected",
+            "lost": "the poster assigned another worker",
+            "expired": "the deadline passed",
+        }
+        first = f"{state.replace('_', ' ').capitalize()} {age}; {phrases.get(state, 'check the state before acting')}."
+        amount = int(task["spec"]["reward"]["amount"])
+        if amount <= 0:
+            return first + " No payment attached."
+        funding = (hold or {}).get("funding")
+        hold_state = (hold or {}).get("state")
+        if funding == "paid" or hold_state in {"paid", "released"}:
+            return first + " Paid."
+        if funding == "refunded" or hold_state == "refunded":
+            return first + " Refunded."
+        return first + " Not paid yet."
+
+    def task_status(self, ref: str) -> dict:
+        """One task's local authoritative row plus the existing read-only hold lookup."""
+        rows = self.store.task_find(str(ref))
+        if len(rows) != 1:
+            raise ValueError("no single task matches that id")
+        task = rows[0]
+        precheck = None
+        if isinstance(task.get("output"), str):
+            passed, reasons = T.evaluate(task["spec"], task["output"])
+            precheck = {"passed": passed, "reasons": reasons}
+        hold = None
+        if task["spec"]["reward"]["amount"] > 0:
+            escrow = self.escrow_status(task["task_hash"])
+            settlement = escrow.get("settlement") or {}
+            hold = {
+                "funding": escrow["funding"],
+                "state": settlement.get("ledger_state") or settlement.get("state"),
+            }
+            for key in ("amount", "unit", "deadline"):
+                if key in settlement:
+                    hold[key] = settlement[key]
+        now = int(time.time())
+        return {
+            "task_hash": task["task_hash"],
+            "role": task["role"],
+            "state": task["state"],
+            "precheck": precheck,
+            "verdict": task.get("verdict"),
+            "reward": dict(task["spec"]["reward"]),
+            "hold": hold,
+            "deadline": task["spec"]["deadline"],
+            "updated": task["updated"],
+            "summary": self._task_summary(task, hold, now),
+        }
+
     def _verify_worker_hold(self, task: dict) -> bool:
         """Pay-first: only an exact open Neuron hold makes a rewarded assignment workable."""
         if task["spec"]["reward"]["amount"] <= 0 or not self.settle.open_on_assign:
@@ -2543,7 +2619,7 @@ def _hard_close(ch) -> None:
 OPS = {"status", "register_invite", "register_address", "address_status", "address_off",
        "redeem", "requests", "accept", "decline", "block", "unblock", "blocked", "contacts", "remove", "send",
        "agent_send", "threads", "thread", "card", "card_set", "delivered", "inbox", "outbox",
-       "task_post", "tasks", "task_claim", "task_submit", "task_decide", "ledger", "escrow_status", "direct",
+       "task_post", "tasks", "task_status", "task_claim", "task_submit", "task_decide", "ledger", "escrow_status", "direct",
        "starter_status", "install_revocation", "import_revocation", "revocations"}
 
 
@@ -2632,6 +2708,8 @@ def handle(node: Node, req: dict) -> dict:
                 r["peer_name"] = (c or {}).get("petname", "")
                 r["name_source"] = (c or {}).get("name_src") or "self-chosen"
             return {"ok": True, "tasks": rows}
+        if op == "task_status":
+            return {"ok": True, **node.task_status(req["task"])}
         if op == "direct":
             return {"ok": True, **node.set_direct(req["who"], bool(req.get("on")))}
         if op == "ledger":

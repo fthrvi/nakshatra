@@ -24,10 +24,10 @@ State as of 2026-10-23 (release 0.15.22 on the public canary; clean outsider joi
 
 | Item | Exists | Missing | Size |
 |---|---|---|---|
-| MCP server | `nak-mcp`, 18 default tools plus 3 opt-in connection tools: messages, threads, agent cards, tasks (post/claim/submit), balance, wallet (read-only), models, ask, worker status, and optional accept/decline/redeem; remote text always framed untrusted | — | — |
-| Harness docs | HARNESSES.md has one copy-paste block each for OpenClaw, Hermes, Claude Code, Codex config.toml, generic stdio, and the OpenAI endpoint; installed OpenClaw/Claude/Codex syntax was checked on 2026-10-22; a clean `0.15.22` outsider completed raw `nak-mcp` initialize + tools/list on 2026-10-23 and received all 18 default tools | Hermes was not installed, so its harness-specific configuration remains unverified | S |
+| MCP server | `nak-mcp`, 19 default tools plus 3 opt-in connection tools: messages, threads, agent cards, tasks (post/claim/submit/status), balance, wallet (read-only), models, ask, worker status, and optional accept/decline/redeem; remote text always framed untrusted | — | — |
+| Harness docs | HARNESSES.md has one copy-paste block each for OpenClaw, Hermes, Claude Code, Codex config.toml, generic stdio, and the OpenAI endpoint; installed OpenClaw/Claude/Codex syntax was checked on 2026-10-22; a clean `0.15.22` outsider completed raw `nak-mcp` initialize + tools/list on 2026-10-23 and received that release's 18 tools; current source has 19 | Hermes was not installed, so its harness-specific configuration remains unverified | S |
 | Agent permission lifetime | JOIN.md states the join caps, ≤365-day charter, 7-day wire lease, and 30-day idle lapse; on 2026-10-23 a freshly joined `0.15.22` node started with `nak.msg,nak.task.claim` and the documented capped-payment renewal succeeded interactively | — | — |
-| Small-model robustness | MCP accepts parameter aliases, plain "Not done: needs X" errors | 8B agents still report false success; a `nak_task_status` / verify step the agent is told to call | S |
+| Small-model robustness | MCP accepts parameter aliases; write replies carry `done` plus an exact `verify` call; `nak_task_status` reads the local task and escrow state; descriptions and HARNESSES tell agents to verify before reporting | — | — |
 
 ## 3. Sell compute
 

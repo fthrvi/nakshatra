@@ -126,6 +126,9 @@ class NakClient:
     def task_submit(self, task: str, output: str) -> dict:
         return self.call("task_submit", task=task, output=output)
 
+    def task_status(self, task: str) -> dict:
+        return self.call("task_status", task=task)
+
     def escrow_status(self, task: str) -> dict:
         return self.call("escrow_status", task=task)
 
