@@ -203,9 +203,21 @@ The download server itself is not trusted:
   forever;
 - it can still delay updates.
 
-**Revoking an agent is local today.** Your signer stops signing, but contacts do not receive that
-revocation. Someone with a copied agent key and its current wire credential can keep using it until
-that credential expires, at most 7 days. Shared revocation is still on the list.
+**Revocation is shared with contacts.** Run `nak grant status` to find the current grant id, then run
+`nak revoke <grant_id>` in an interactive terminal. The command stops the local signer from using
+that grant and creates a cumulative record signed by your person key. `nak-net` pushes the record to
+each contact over its authenticated session; contacts remember every revoked id and reject later
+envelopes under those grants. A later record cannot un-revoke an earlier id.
+
+`nak revocations export` prints the latest record as an `nkr1.` blob. Keep or pass that blob through
+a trusted channel if your node is gone; an existing contact can apply it with
+`nak revocations import <blob>`, and verifies it against the person key already pinned for you.
+Import deliberately works without a TTY: it is equivalent to receiving the record over that
+contact's session, because the pinned person key authenticates it and the signed record can only add
+revocations that contact chose.
+This does not revoke the node key used by the ledger, and contacts running a version older than this
+shared-revocation release ignore session revocation frames until they update. The grant's wire lease
+or charter expiry remains the fallback bound for those older contacts.
 
 **Today's limits.** Releases are public at `http://45.63.109.137:8960`; each channel has a signed
 `latest.json`. An inviter names that host in `~/.nakshatra/net/release-url`, or overrides it for one

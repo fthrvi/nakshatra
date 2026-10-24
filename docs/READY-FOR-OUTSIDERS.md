@@ -60,7 +60,7 @@ State as of 2026-10-23 (release 0.15.22 on the public canary; clean outsider joi
 
 | Item | Exists | Missing | Size |
 |---|---|---|---|
-| Revocation | Local: your signer stops signing | Contacts don't learn of revocations; the 7-day lease bounds a copied key only once every contact runs ≥0.15.20 | M |
+| Revocation | Person-signed cumulative revocations are local immediately, pushed over authenticated contact sessions, and exportable/importable as `nkr1.` blobs | Older contacts ignore the new frame until they update; the ledger still trusts node keys, which this does not revoke | S (upgrade rollout) |
 | Task escrow fairness | Pay-first holds, one open hold per task, auto-refund at deadline+24h | A payer can refund an open hold after the worker submits; needs a rule (e.g. hold locks at submit until verdict or deadline) | M + **D** |
 | Sybil / credit-line abuse | Overdraft tiers, 7-day maturity, cash-out only at known+ | Two colluding accounts can convert credit-line value into earnings (inference and tasks alike) | L + **D** |
 | Spend caps in human units | Caps enforced by the signer in base units (10^8 per USDC) | CLI/MCP show and accept USDC, not base units | S |
@@ -71,4 +71,4 @@ State as of 2026-10-23 (release 0.15.22 on the public canary; clean outsider joi
 1. **D:** admission policy for strangers + who may accept (unblocks §1, §3, §4).
 2. **M:** S7 devnet drill → deposits on (with Biswa); starter credits are wired for devnet.
 3. **M:** non-TEST release key + person key off-box.
-4. **M + D:** refund-after-submit rule; shared revocation.
+4. **M + D:** refund-after-submit rule; roll the shared-revocation version out to every contact.

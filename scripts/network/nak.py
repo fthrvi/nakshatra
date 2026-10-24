@@ -27,6 +27,7 @@ import secrets
 import shlex
 import stat
 import re
+import sqlite3
 import sys
 import time
 from contextlib import contextmanager
@@ -1903,11 +1904,170 @@ def _print_grant_status(grant: dict) -> None:
     print(f"agent {grant['agent']}  caps {','.join(grant['caps']) or '-'}  " +
           (grant.get("status") or "grant expires " +
            time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(grant['expires_at']))))
+    if grant.get("grant_id"):
+        print(f"grant id: {grant['grant_id']}")
     if grant.get("warning"):
         print(f"WARNING: {grant['warning']}")
     if grant.get("verdict_policy"):
         from network.verdict import describe
         print("paid-task verdicts: " + describe(grant["verdict_policy"]))
+
+
+def _stored_own_revocation(net_dir: Path, person_pub: str) -> dict | None:
+    """Load and authenticate prior cumulative state before it can influence a new signature."""
+    from network.revocation import read_private_json, verify_record
+
+    pending = net_dir / "pending-revocation.json"
+    try:
+        pending_record = read_private_json(pending)
+        if pending_record is not None:
+            pending_record = verify_record(pending_record, person_pub)
+    except ValueError as exc:
+        raise SystemExit(f"refused: invalid previous revocation record in {pending}: {exc}") from exc
+
+    db_path = net_dir / "net.sqlite"
+    if not db_path.is_file():
+        return pending_record
+    try:
+        db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            row = db.execute("SELECT record_json FROM own_revocation LIMIT 1").fetchone()
+        finally:
+            db.close()
+    except sqlite3.OperationalError as exc:
+        if "no such table: own_revocation" in str(exc):
+            return pending_record
+        raise SystemExit(f"refused: cannot read previous revocation record in {db_path}: {exc}") from exc
+    except (sqlite3.Error, OSError) as exc:
+        raise SystemExit(f"refused: cannot read previous revocation record in {db_path}: {exc}") from exc
+    if not row:
+        return pending_record
+    try:
+        stored_record = verify_record(json.loads(row[0]), person_pub)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"refused: invalid previous revocation record in {db_path}: {exc}") from exc
+    if pending_record is None:
+        return stored_record
+    # Both records are authenticated. Preserve their cumulative union even if a prior crash left
+    # the pending file and installed store at different sequences.
+    newest = pending_record if pending_record["seq"] >= stored_record["seq"] else stored_record
+    return dict(newest, grant_ids=sorted(
+        set(pending_record["grant_ids"]) | set(stored_record["grant_ids"])))
+
+
+@contextmanager
+def _revocation_lock(net_dir: Path):
+    """Serialize every local read/sign/install transaction across CLI processes."""
+    lock_path = net_dir / "pending-revocation.lock"
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(str(lock_path), flags, 0o600)
+    except OSError as exc:
+        raise SystemExit(f"refused: cannot open revocation lock {lock_path}: {exc}") from exc
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or \
+                stat.S_IMODE(info.st_mode) != 0o600:
+            raise SystemExit(
+                f"refused: revocation lock {lock_path} must be a current-user-owned 0600 regular file")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except OSError as exc:
+            raise SystemExit(f"refused: cannot lock revocation state at {lock_path}: {exc}") from exc
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def _revoke(args, sock: Path) -> int:
+    """The human-only boundary that revokes locally first, then publishes cumulatively."""
+    if not sys.stdin.isatty():
+        raise SystemExit("nak revoke is interactive-only; run it in a terminal")
+    requested = [args.grant_id, *(args.more_grant_ids or [])]
+    bad = [value for value in requested if re.fullmatch(r"[0-9a-f]{16}", value or "") is None]
+    if bad:
+        raise SystemExit("grant ids must be 16 lowercase hex characters")
+    requested = sorted(set(requested))
+    signer_dir, net_dir, _agent = _grant_paths()
+    person_key = Path.home() / ".sthambha" / "person-TEST.key"
+    if not person_key.is_file():
+        print(f"person key is not available at {person_key}; nothing was revoked.", file=sys.stderr)
+        return 1
+    from sthambha import signer as signer_mod
+    try:
+        person_priv, person_pub = signer_mod.load_key(person_key)
+        signer_person = (signer_dir / "person.pub").read_text().strip()
+    except (OSError, ValueError, signer_mod.SignerError) as exc:
+        raise SystemExit(f"cannot load the person key for revocation: {exc}") from exc
+    if person_pub != signer_person:
+        raise SystemExit(f"the person key at {person_key} does not match {signer_dir / 'person.pub'}")
+    from network.revocation import MAX_GRANTS, MAX_SEQ, make_record
+    with _revocation_lock(net_dir):
+        # These are deliberately inside the lock. They are cumulative inputs shared by every CLI
+        # process, so reading any of them before flock would reintroduce a lost-update window.
+        previous = _stored_own_revocation(net_dir, person_pub)
+        prior_ids = set(previous["grant_ids"]) if previous else set()
+        seq = previous["seq"] + 1 if previous else 1
+        if seq > MAX_SEQ:
+            raise SystemExit(f"cannot create another revocation record: sequence limit {MAX_SEQ} reached")
+
+        revoked_path = signer_dir / "revoked.txt"
+        existing = set()
+        try:
+            if revoked_path.exists():
+                existing = {line.strip() for line in revoked_path.read_text().splitlines()
+                            if re.fullmatch(r"[0-9a-f]{16}", line.strip())}
+        except OSError as exc:
+            raise SystemExit(f"could not read {revoked_path}: {exc}") from exc
+
+        already_revoked = prior_ids | existing
+        resulting = sorted(already_revoked | set(requested))
+        if len(resulting) > MAX_GRANTS:
+            raise SystemExit(f"cannot revoke more than {MAX_GRANTS} distinct grant ids")
+        rendered = ", ".join(
+            f"{grant_id} ({'previously revoked' if grant_id in already_revoked else 'new'})"
+            for grant_id in resulting)
+        answer = input(f"REVOKE resulting grant set: {rendered}; tell every contact? [y/N] ")
+        if answer.strip().lower() not in {"y", "yes"}:
+            print("nothing revoked")
+            return 1
+
+        try:
+            revoked_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            fd = os.open(str(revoked_path), os.O_WRONLY | os.O_CREAT | os.O_APPEND |
+                         getattr(os, "O_NOFOLLOW", 0), 0o600)
+            with os.fdopen(fd, "a") as out:
+                for grant_id in requested:
+                    out.write(grant_id + "\n")
+                out.flush()
+                os.fsync(out.fileno())
+            os.chmod(revoked_path, 0o600)
+        except OSError as exc:
+            raise SystemExit(f"could not update {revoked_path}: {exc}") from exc
+
+        record = make_record(person_priv.sign, person_pub, seq, resulting, int(time.time()))
+        try:
+            call(sock, {"op": "install_revocation", "record": record})
+            (net_dir / "pending-revocation.json").unlink(missing_ok=True)
+            delivery = "contacts will be told over their next live session"
+        except SystemExit as exc:
+            if "messaging service is not running" in str(exc):
+                _write_private(net_dir / "pending-revocation.json",
+                               (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode())
+                delivery = ("nak-net is down; the record will be installed when it starts "
+                            "(or re-run this command)")
+            else:
+                current = _stored_own_revocation(net_dir, person_pub)
+                if current and current["seq"] >= record["seq"]:
+                    raise SystemExit(
+                        "refused: revocation was not installed because a newer record exists; "
+                        "re-run nak revoke to merge it") from exc
+                raise
+    print(f"revoked {', '.join(requested)}; {delivery}")
+    return 0
 
 
 def _resolve_posted_task(sock: Path, ref: str) -> str:
@@ -1957,6 +2117,14 @@ def main(argv=None, *, http_post=None) -> int:
     q.add_argument("--verdict-ask-strangers", choices=["yes", "no"], default=None,
                    help="always ask for unrostered/stranger workers; omitted preserves it")
     q.add_argument("--yes", action="store_true", help="confirm explicitly when stdin is not a terminal")
+    p = sub.add_parser("revoke", help="human-only local and shared agent-grant revocation")
+    p.add_argument("grant_id")
+    p.add_argument("--grant-id", dest="more_grant_ids", action="append", default=[])
+    p = sub.add_parser("revocations", help="inspect or move person-signed revocation records")
+    rsub = p.add_subparsers(dest="revocations_cmd")
+    rsub.add_parser("export", help="print this person's latest nkr1 record")
+    q = rsub.add_parser("import", help="install an existing contact's nkr1 record")
+    q.add_argument("blob")
     p = sub.add_parser("invite"); p.add_argument(
         "--person-key", type=Path, default=None,
         help="explicit file key in file custody only (default: ~/.sthambha/person-TEST.key)")
@@ -2138,6 +2306,32 @@ def main(argv=None, *, http_post=None) -> int:
         if a.grant_cmd == "renew":
             return _grant_renew(a)
         _print_grant_status(call(s, {"op": "status"})["grant"])
+    elif a.cmd == "revoke":
+        return _revoke(a, s)
+    elif a.cmd == "revocations":
+        if a.revocations_cmd == "export":
+            from network.revocation import encode_record
+            own = call(s, {"op": "revocations"}).get("own")
+            if not own:
+                raise SystemExit("no revocation record has been created")
+            print(encode_record(own))
+        elif a.revocations_cmd == "import":
+            result = call(s, {"op": "import_revocation", "blob": a.blob})
+            print(f"imported seq {result['seq']} with {result['count']} revoked grant(s)"
+                  + ("" if result["new"] else " (already known)"))
+        else:
+            result = call(s, {"op": "revocations"})
+            own = result.get("own")
+            print(f"own seq {own['seq'] if own else 0}: " +
+                  (", ".join(own["grant_ids"]) if own and own["grant_ids"] else "no revoked grants"))
+            contacts = {row["person"]: row for row in call(s, {"op": "contacts"})["contacts"]}
+            people = sorted(set(contacts) | set(result.get("received", {})) | set(result.get("sent", {})))
+            for person in people:
+                row = result.get("received", {}).get(person, {})
+                contact = contacts.get(person, {})
+                print(f"{contact.get('petname') or person[:16]}: received seq {row.get('seq', 0)} "
+                      f"({row.get('count', 0)} grant(s)); own acked seq "
+                      f"{result.get('sent', {}).get(person, 0)}")
     elif a.cmd == "wallet":
         _wallet_command(a)
     elif a.cmd == "gateway":

@@ -21,6 +21,8 @@ from typing import Optional
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
+from network.revocation import MAX_GRANTS
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS contacts (person TEXT PRIMARY KEY, node TEXT NOT NULL, petname TEXT,
     nickname TEXT, state TEXT NOT NULL, added INTEGER NOT NULL);
@@ -64,6 +66,12 @@ CREATE TABLE IF NOT EXISTS request_sources (request_id TEXT PRIMARY KEY, source 
 CREATE INDEX IF NOT EXISTS request_sources_source_idx ON request_sources(source, source_id);
 CREATE TABLE IF NOT EXISTS blocks (person TEXT PRIMARY KEY, until INTEGER NOT NULL, reason TEXT NOT NULL,
     created INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS own_revocation (record_json TEXT NOT NULL, seq INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS contact_revocations (person TEXT NOT NULL, grant_id TEXT NOT NULL,
+    PRIMARY KEY(person, grant_id));
+CREATE TABLE IF NOT EXISTS contact_revocation_seq (person TEXT PRIMARY KEY, seq INTEGER NOT NULL,
+    received_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS revocation_sent (person TEXT PRIMARY KEY, seq INTEGER NOT NULL);
 """
 
 
@@ -697,6 +705,85 @@ class Store:
         if len(hits) > 1:
             raise ValueError(f"{who!r} matches {len(hits)} contacts; use a longer person key prefix")
         return hits[0] if hits else None
+
+    # Public, person-signed cumulative revocation state. These intentionally remain plaintext:
+    # grant ids and signed records are shared with every contact and contain no message content.
+    def set_own_revocation(self, record: dict) -> None:
+        encoded = json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+        def fn(db):
+            row = db.execute("SELECT record_json,seq FROM own_revocation LIMIT 1").fetchone()
+            if row:
+                try:
+                    current = json.loads(row[0])
+                    current_ids = set(current["grant_ids"])
+                    current_seq = current["seq"]
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise ValueError("installed own revocation record is malformed") from exc
+                if type(current_seq) is not int or current_seq != int(row[1]):
+                    raise ValueError("installed own revocation record is malformed")
+                if int(record["seq"]) <= current_seq:
+                    raise ValueError("revocation seq must be newer than the installed record")
+                if not current_ids.issubset(record["grant_ids"]):
+                    raise ValueError("new revocation record must retain every previously revoked grant")
+            db.execute("DELETE FROM own_revocation")
+            db.execute("INSERT INTO own_revocation(record_json,seq) VALUES (?,?)",
+                       (encoded, int(record["seq"])))
+        self._tx(fn)
+
+    def own_revocation(self) -> Optional[dict]:
+        rows = self._q("SELECT record_json FROM own_revocation LIMIT 1")
+        return json.loads(rows[0][0]) if rows else None
+
+    def apply_contact_revocation(self, person: str, record: dict) -> bool:
+        seq = record["seq"]
+        now = int(time.time())
+
+        def fn(db):
+            current = db.execute(
+                "SELECT seq FROM contact_revocation_seq WHERE person=?", (person,)).fetchone()
+            if current and seq <= current[0]:
+                return False
+            existing = {row[0] for row in db.execute(
+                "SELECT grant_id FROM contact_revocations WHERE person=?", (person,)).fetchall()}
+            if len(existing | set(record["grant_ids"])) > MAX_GRANTS:
+                raise ValueError(f"cumulative revocation set exceeds {MAX_GRANTS} grant ids")
+            db.executemany(
+                "INSERT OR IGNORE INTO contact_revocations(person,grant_id) VALUES (?,?)",
+                ((person, grant_id) for grant_id in record["grant_ids"]))
+            db.execute(
+                "INSERT INTO contact_revocation_seq(person,seq,received_at) VALUES (?,?,?) "
+                "ON CONFLICT(person) DO UPDATE SET seq=excluded.seq,received_at=excluded.received_at",
+                (person, seq, now))
+            return True
+        return self._tx(fn)
+
+    def revoked_grants(self, person: str) -> set[str]:
+        return {row[0] for row in self._q(
+            "SELECT grant_id FROM contact_revocations WHERE person=?", (person,))}
+
+    def contact_revocation_seq(self, person: str) -> int:
+        rows = self._q("SELECT seq FROM contact_revocation_seq WHERE person=?", (person,))
+        return int(rows[0][0]) if rows else 0
+
+    def revocation_sent_seq(self, person: str) -> int:
+        rows = self._q("SELECT seq FROM revocation_sent WHERE person=?", (person,))
+        return int(rows[0][0]) if rows else 0
+
+    def mark_revocation_sent(self, person: str, seq: int) -> None:
+        self._q(
+            "INSERT INTO revocation_sent(person,seq) VALUES (?,?) "
+            "ON CONFLICT(person) DO UPDATE SET seq=MAX(revocation_sent.seq,excluded.seq)",
+            (person, int(seq)))
+
+    def revocation_status(self) -> dict:
+        own = self.own_revocation()
+        received = {person: {"seq": int(seq), "count": int(count)}
+                    for person, seq, count in self._q(
+                        "SELECT s.person,s.seq,COUNT(r.grant_id) FROM contact_revocation_seq s "
+                        "LEFT JOIN contact_revocations r ON r.person=s.person GROUP BY s.person,s.seq")}
+        sent = {person: int(seq) for person, seq in self._q("SELECT person,seq FROM revocation_sent")}
+        return {"own": own, "received": received, "sent": sent}
 
     def set_direct(self, person: str, on: bool) -> None:
         """Opt this contact in/out of direct paths. Turning it off also forgets their addresses."""

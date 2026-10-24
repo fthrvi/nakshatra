@@ -75,6 +75,8 @@ except ImportError:  # the release ships both; a dev checkout may point at a sth
     sys.path.insert(0, _alt)
     from sthambha.signer import MAX_SKEW_S, SignerError, canonical, verify_envelope  # noqa: E402
 
+from network.revocation import decode_record, read_private_json, verify_record  # noqa: E402
+
 MSG_DOMAIN = "nak-msg-v1"
 MAX_FRAME = 1 << 20
 MAX_TEXT = 8000
@@ -279,6 +281,20 @@ class Node:
         if len(data_key) != 32:
             raise DataKeyError("signer returned an invalid data key")
         self.store = Store(state_dir, data_key)
+        self._pending_revocation_path = Path(state_dir) / "pending-revocation.json"
+        try:
+            pending = read_private_json(self._pending_revocation_path)
+            if pending is not None:
+                pending = verify_record(pending, self.person)
+                current = self.store.own_revocation()
+                if not current or pending["seq"] > current["seq"]:
+                    if current and not set(current["grant_ids"]).issubset(pending["grant_ids"]):
+                        raise ValueError("pending revocation record omits a previously revoked grant")
+                    self.store.set_own_revocation(pending)
+                self._pending_revocation_path.unlink()
+        except Exception as exc:
+            self.log(f"WARNING: leaving unreadable pending revocation record at "
+                     f"{self._pending_revocation_path}: {exc}")
         # Adapter #0 (local ledger, TEST units) unless a real one is passed; see network/settle.py.
         # THE accounting front door (accounting.py, U5) picks the escrow backend; tests may pass one.
         self.settle = settlement or _accounting.escrow(
@@ -658,7 +674,12 @@ class Node:
         if "ledger_key" in body and (not self._valid_hex(ledger_key, 64) or ledger_key != node):
             return {"t": "nack", "why": "request ledger key is not its node key"}
         try:
-            verify_envelope(env, person, now=int(self._clock()))
+            known = self.store.contact(person)
+            if known:
+                verify_envelope(env, person, now=int(self._clock()),
+                                revoked=self.store.revoked_grants(person))
+            else:
+                verify_envelope(env, person, now=int(self._clock()))
         except Exception as e:  # noqa: BLE001 - malformed nested grants/signatures are untrusted
             return {"t": "nack", "why": f"request does not verify: {e}"}
         if env.get("from_node") != node or env.get("to") != self.person or \
@@ -1289,6 +1310,7 @@ class Node:
                 pass
         wake = self._wake.setdefault(person, threading.Event())
         down = threading.Event()
+        sent_rev_seqs: set[int] = set()
         sock.settimeout(IDLE_S)
 
         def reader():
@@ -1302,6 +1324,22 @@ class Node:
                         send_frame(ch, self._receive(person, frame), lock)
                     elif t == "ack":
                         self.store.ack(str(frame.get("mid", "")), person)
+                    elif t == "revs-ack":
+                        seq = frame.get("seq")
+                        if type(seq) is int and seq in sent_rev_seqs:
+                            self.store.mark_revocation_sent(person, seq)
+                            wake.set()
+                    elif t == "revs":
+                        try:
+                            rec = verify_record(frame.get("rec"), person)
+                            changed = self.store.apply_contact_revocation(person, rec)
+                            if changed:
+                                cc = self.store.contact(person) or {}
+                                self.log(f"{cc.get('petname') or person[:12]} revoked "
+                                         f"{len(rec['grant_ids'])} grant(s)")
+                            send_frame(ch, {"t": "revs-ack", "seq": rec["seq"]}, lock)
+                        except Exception as e:  # peer-controlled side frame; keep the session alive
+                            self.log(f"refused revocations from {person[:12]}: {type(e).__name__}: {e}")
                     elif t == "addr?":  # a direct:true capability proves their side opted in
                         cc = self.store.contact(person) or {}
                         if frame.get("direct") is True and cc.get("direct"):
@@ -1333,6 +1371,11 @@ class Node:
             while not down.is_set() and not self._stop.is_set():
                 if not self.store.contact(person):
                     return
+                own_revs = self.store.own_revocation()
+                if own_revs and own_revs["seq"] > self.store.revocation_sent_seq(person) and \
+                        own_revs["seq"] not in sent_rev_seqs:
+                    sent_rev_seqs.add(own_revs["seq"])
+                    send_frame(ch, {"t": "revs", "rec": own_revs}, lock)
                 for item in self.store.pending_for(person):
                     try:
                         env = self._sign(item["kind"], person, item["body"], touch=False)
@@ -1379,7 +1422,7 @@ class Node:
         if not c or not mid:
             return {"t": "nack", "mid": mid, "why": "not a contact"}
         try:
-            verify_envelope(env, c["person"])
+            verify_envelope(env, c["person"], revoked=self.store.revoked_grants(person))
         except SignerError as e:
             return {"t": "nack", "mid": mid, "why": f"does not verify: {e}"}
         if env.get("from_node") != c["node"] or env.get("to") != self.person or env.get("body_sha256") != body_hash(body):
@@ -2393,6 +2436,32 @@ class Node:
             return
         raise ValueError(f"unknown task step {kind}")
 
+    # ── shared revocation ────────────────────────────────────────────────────────────────────
+    def install_own_revocation(self, record: dict) -> dict:
+        record = verify_record(record, self.person)
+        self.store.set_own_revocation(record)
+        for contact in self.store.contacts():
+            self._wake.setdefault(contact["person"], threading.Event()).set()
+        return {"seq": record["seq"], "count": len(record["grant_ids"])}
+
+    def import_revocation(self, blob: str) -> dict:
+        """Import a contact-signed record without a TTY.
+
+        This is equivalent to receiving the same record over that contact's session: the pinned
+        person key authenticates it, and a valid record can only add revocations they signed.
+        """
+        record = decode_record(blob)
+        person = record["person"]
+        contact = self.store.contact(person)
+        if not contact:
+            raise ValueError("revocation record is not from an existing contact")
+        record = verify_record(record, contact["person"])
+        changed = self.store.apply_contact_revocation(person, record)
+        if changed:
+            self.log(f"{contact['petname'] or person[:12]} revoked {len(record['grant_ids'])} grant(s)")
+        return {"person": person, "seq": record["seq"], "count": len(record["grant_ids"]),
+                "new": changed}
+
     # ── read side ────────────────────────────────────────────────────────────────────────────
     def status(self) -> dict:
         with self._lock:
@@ -2458,7 +2527,7 @@ OPS = {"status", "register_invite", "register_address", "address_status", "addre
        "redeem", "requests", "accept", "decline", "block", "unblock", "blocked", "contacts", "remove", "send",
        "agent_send", "threads", "thread", "card", "card_set", "delivered", "inbox", "outbox",
        "task_post", "tasks", "task_claim", "task_submit", "task_decide", "ledger", "escrow_status", "direct",
-       "starter_status"}
+       "starter_status", "install_revocation", "import_revocation", "revocations"}
 
 
 def handle(node: Node, req: dict) -> dict:
@@ -2470,6 +2539,12 @@ def handle(node: Node, req: dict) -> dict:
             return {"ok": True, **node.status()}
         if op == "starter_status":
             return {"ok": True, **node.starter_status()}
+        if op == "install_revocation":
+            return {"ok": True, **node.install_own_revocation(req["record"])}
+        if op == "import_revocation":
+            return {"ok": True, **node.import_revocation(req["blob"])}
+        if op == "revocations":
+            return {"ok": True, **node.store.revocation_status()}
         if op == "register_invite":
             return {"ok": True, **node.register_invite(req["code"])}
         if op == "register_address":
@@ -2589,7 +2664,7 @@ def serve_control(node: Node, sock_path: Path, stop: threading.Event) -> None:
                 return
             f = conn.makefile("rwb")
             for line in f:
-                if len(line) > 64 * 1024:
+                if len(line) > 384 * 1024:
                     return
                 try:
                     reply = handle(node, json.loads(line))
