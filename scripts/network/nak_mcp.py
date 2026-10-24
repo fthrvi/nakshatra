@@ -608,7 +608,8 @@ class Server:
                         text, err = str(reply), False
                 except (NakError, ValueError, TypeError) as e:
                     reply = None
-                    text, err = _not_done(f"{type(e).__name__}: {e}" if not isinstance(e, NakError) else e), True
+                    plain = isinstance(e, (NakError, AmountError))   # meant for the person, not a bug report
+                    text, err = _not_done(e if plain else f"{type(e).__name__}: {e}"), True
                 result = {"content": [{"type": "text", "text": text}], "isError": err}
                 if name in WRITE_TOOLS:
                     done = bool(getattr(reply, "done", False)) if not err else False
