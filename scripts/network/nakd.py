@@ -2255,6 +2255,8 @@ class Node:
         if amount <= 0:
             return first + " No payment attached."
         funding = (hold or {}).get("funding")
+        if funding == "unknown":
+            return first + " Payment state is unknown right now (the ledger could not be reached)."
         hold_state = (hold or {}).get("state")
         if funding == "paid" or hold_state in {"paid", "released"}:
             return first + " Paid."
@@ -2274,15 +2276,20 @@ class Node:
             precheck = {"passed": passed, "reasons": reasons}
         hold = None
         if task["spec"]["reward"]["amount"] > 0:
-            escrow = self.escrow_status(task["task_hash"])
-            settlement = escrow.get("settlement") or {}
-            hold = {
-                "funding": escrow["funding"],
-                "state": settlement.get("ledger_state") or settlement.get("state"),
-            }
-            for key in ("amount", "unit", "deadline"):
-                if key in settlement:
-                    hold[key] = settlement[key]
+            try:
+                escrow = self.escrow_status(task["task_hash"])
+            except ValueError as e:
+                # Ledger down: the local row is still authoritative for state, so return it.
+                hold = {"funding": "unknown", "error": str(e)[:120]}
+            else:
+                settlement = escrow.get("settlement") or {}
+                hold = {
+                    "funding": escrow["funding"],
+                    "state": settlement.get("ledger_state") or settlement.get("state"),
+                }
+                for key in ("amount", "unit", "deadline"):
+                    if key in settlement:
+                        hold[key] = settlement[key]
         now = int(time.time())
         return {
             "task_hash": task["task_hash"],

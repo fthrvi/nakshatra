@@ -572,7 +572,7 @@ def test_mcp_front_door(net, tmp_path):
     names = {t["name"] for t in srv.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})["result"]["tools"]}
     assert names == {"nak_status", "nak_contacts", "nak_inbox", "nak_requests", "nak_send",
                      "nak_agent_send", "nak_threads", "nak_thread", "nak_card",
-                     "nak_tasks", "nak_task_status", "nak_task_post", "nak_task_claim", "nak_task_submit",
+                     "nak_delivery", "nak_tasks", "nak_task_status", "nak_task_post", "nak_task_claim", "nak_task_submit",
                      "nak_models", "nak_ask", "nak_balance", "nak_wallet",
                      "nak_worker_status"}   # no connect tools
     call = lambda n, args: srv.handle({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
@@ -583,10 +583,14 @@ def test_mcp_front_door(net, tmp_path):
     assert r["isError"] and "not a contact" in r["content"][0]["text"]
     r = call("nak_send", {"to": "b", "text": "hello from the mcp"})
     assert not r["isError"]
-    assert r["done"] is True and r["verify"] == {"tool": "nak_status"}
-    assert r["structuredContent"] == {"done": True, "verify": {"tool": "nak_status"}}
     mid = r["content"][0]["text"].split("(id ")[1].split(")")[0]
+    assert r["done"] is False and r["verify"] == {"tool": "nak_delivery", "mid": mid}
+    assert r["structuredContent"] == {"done": False, "verify": {"tool": "nak_delivery", "mid": mid},
+                                      "queued": True, "mid": mid}
+    assert r["content"][0]["text"].startswith("Not done yet: queued")
     assert wait(lambda: a.node.delivered(mid))
+    seen = call("nak_delivery", {"mid": mid})
+    assert not seen["isError"] and seen["content"][0]["text"].startswith("Delivered")
     got = b.node.store.inbox()[0]
     assert got["text"] == "hello from the mcp" and got["aspect"] == "whole"
     # B's view of the inbox through its own front door is framed as untrusted
@@ -1047,8 +1051,8 @@ def test_mcp_write_replies_always_include_done_and_exact_verify(monkeypatch):
     client = Client()
     server = nak_mcp.Server(client)
     cases = [
-        ("nak_send", {"to": "peer", "text": "hi"}, {"tool": "nak_status"}),
-        ("nak_agent_send", {"to": "peer", "text": "hi"}, {"tool": "nak_thread", "thread": "th1"}),
+        ("nak_send", {"to": "peer", "text": "hi"}, {"tool": "nak_delivery", "mid": "m1"}),
+        ("nak_agent_send", {"to": "peer", "text": "hi"}, {"tool": "nak_delivery", "mid": "m2"}),
         ("nak_task_post", {"to": "peer", "title": "t", "instructions": "i",
                            "acceptance": [{"max_words": 2}]},
          {"tool": "nak_task_status", "task": "a" * 64}),
@@ -1063,8 +1067,12 @@ def test_mcp_write_replies_always_include_done_and_exact_verify(monkeypatch):
 
     for name, args, verify in cases:
         result = call(name, args)
-        assert result["done"] is True and result["verify"] == verify and not result["isError"]
-        assert result["structuredContent"] == {"done": True, "verify": verify}
+        queued = name in {"nak_send", "nak_agent_send"}   # delivery is asynchronous: never done at queue time
+        assert result["done"] is (not queued) and result["verify"] == verify and not result["isError"]
+        assert result["structuredContent"]["done"] is (not queued)
+        assert result["structuredContent"].get("queued", False) is queued
+        if queued:
+            assert result["content"][0]["text"].startswith("Not done yet: queued")
 
         client.fail = True
         failed = call(name, args)
@@ -1083,6 +1091,70 @@ def test_mcp_write_replies_always_include_done_and_exact_verify(monkeypatch):
     required = "Do not tell your person this is done until nak_task_status shows it."
     assert all(required in descriptions[name]
                for name in ("nak_task_post", "nak_task_claim", "nak_task_submit", "nak_task_status"))
+
+
+def test_mcp_submit_precheck_failure_is_not_done_and_keeps_error_text():
+    from network import nak_mcp
+
+    class Client:
+        passed = False
+
+        def task_submit(self, *_args):
+            return {"task_hash": "c" * 64, "precheck_passed": self.passed, "precheck": ["too long"]}
+
+        def send(self, *_args):
+            raise ValueError("not a contact: only known people")
+
+    client = Client()
+    server = nak_mcp.Server(client)
+
+    def call(name, args):
+        return server.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                              "params": {"name": name, "arguments": args}})["result"]
+
+    failed = call("nak_task_submit", {"task": "c" * 12, "output": "x"})
+    assert failed["done"] is False and not failed["isError"]
+    assert failed["content"][0]["text"].startswith("Not done:") and "too long" in failed["content"][0]["text"]
+    assert failed["verify"] == {"tool": "nak_task_status", "task": "c" * 64}
+    client.passed = True
+    assert call("nak_task_submit", {"task": "c" * 12, "output": "x"})["done"] is True
+    # a swallowed ValueError keeps its type and text so a programming bug stays visible
+    err = call("nak_send", {"to": "x", "text": "y"})
+    assert err["isError"] and err["done"] is False
+    assert err["content"][0]["text"] == "Not done: ValueError: not a contact: only known people"
+
+
+def test_send_to_offline_contact_is_queued_not_done(net, tmp_path):
+    from network.client import NakClient
+    from network.nak_mcp import Server
+    a, b = _pair(net)
+    sock, stop = _serve(a.node, tmp_path)
+    srv = Server(NakClient(sock))
+    r = srv.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": {"name": "nak_send", "arguments": {"to": "b", "text": "anyone there"}}})["result"]
+    mid = r["structuredContent"]["mid"]
+    assert r["done"] is False and r["structuredContent"]["queued"] is True and not r["isError"]
+    assert srv.call("nak_delivery", {"mid": "0" * 24}).startswith("Not delivered yet")
+    assert r["verify"] == {"tool": "nak_delivery", "mid": mid}
+    stop.set()
+
+
+def test_task_status_with_ledger_down_returns_local_state_and_unknown_funding(net):
+    from network.settle import SettlementError
+    party = net("status-ledger-down")
+    spec = task_mod.make_spec(party.person_pub, "paid", "external task text",
+                              [{"contains_all": ["ok"]}], reward=5, now=int(time.time()))
+    task_hash = task_mod.task_hash(spec)
+    assert party.node.store.task_insert(task_hash, "poster", "", spec, "posted")
+
+    def down(*_args, **_kwargs):
+        raise SettlementError("ledger unreachable")
+    party.node.settle.status = down
+    status = party.node.task_status(task_hash[:12])
+    assert status["state"] == "posted" and status["role"] == "poster"
+    assert status["hold"] == {"funding": "unknown", "error": "escrow: ledger unreachable"}
+    assert "Payment state is unknown right now" in status["summary"]
+    assert "Not paid yet" not in status["summary"]
 
 
 def test_mcp_forgives_guessed_param_names_and_waits_for_assignment(net, tmp_path):

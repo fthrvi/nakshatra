@@ -67,6 +67,8 @@ READ_TOOLS = {
                   {"role": {"type": "string", "description": "worker | poster | empty for both"}}),
     "nak_task_status": ("Authoritative local state for one task, plus its read-only ledger hold state when paid. "
                         "Do not tell your person this is done until nak_task_status shows it.", {"task": _STR}),
+    "nak_delivery": ("Whether one sent message (the id nak_send / nak_agent_send returned) has really been "
+                     "delivered to the contact, or is still queued because they are offline.", {"mid": _STR}),
     "nak_task_claim": ("Claim an offered task (id = its first 12+ hex chars). The poster assigns it to the first "
                        "valid claimer. Do not tell your person this is done until nak_task_status shows it.",
                        {"task": _STR}),
@@ -99,7 +101,7 @@ CONNECT_TOOLS = {
 }
 REQUIRED = {"nak_task_status": ["task"], "nak_task_claim": ["task"], "nak_task_submit": ["task", "output"],
             "nak_task_post": ["to", "title", "instructions", "acceptance"], "nak_send": ["to", "text"],
-            "nak_agent_send": ["to", "text"], "nak_thread": ["thread"],
+            "nak_agent_send": ["to", "text"], "nak_thread": ["thread"], "nak_delivery": ["mid"],
             "nak_accept": ["id"], "nak_decline": ["id"], "nak_redeem": ["code"]}
 REQUIRED["nak_ask"] = ["prompt"]
 
@@ -151,6 +153,9 @@ def _verify_call(name: str, args: dict, result: dict | None = None) -> dict:
         task = result.get("task_hash")
         return ({"tool": "nak_task_status", "task": task} if task
                 else {"tool": "nak_tasks", "role": "poster"})
+    if name in {"nak_send", "nak_agent_send"} and result.get("queued"):
+        # nak_thread shows what was written, not whether it arrived; only the outbox knows that.
+        return {"tool": "nak_delivery", "mid": result["queued"]}
     if name == "nak_agent_send":
         thread = result.get("thread") or str(args.get("thread") or "")
         return ({"tool": "nak_thread", "thread": thread} if thread else {"tool": "nak_threads"})
@@ -296,8 +301,11 @@ class Server:
                              for r in rows) or "No pending requests."
         if name == "nak_send":
             r = c.send(str(args["to"]), str(args["text"]), self.aspect)
-            text = f"Queued for {r['to']} (id {r['queued']}); it is delivered when they are online."
-            return ToolReply(text, done=True, verify=_verify_call(name, args, r))
+            # The daemon's send op only queues; delivery is asynchronous, so this is never done=True.
+            text = (f"Not done yet: queued for {r['to']} (id {r['queued']}); it is delivered when they come "
+                    f"online. Call nak_delivery with mid {r['queued']} to tell queued from delivered.")
+            return ToolReply(text, done=False, verify=_verify_call(name, args, r),
+                             structured={"done": False, "queued": True, "mid": r["queued"]})
         if name == "nak_agent_send":
             optional = {key: args[key] for key in ("want", "expires", "budget", "refs", "harness")
                         if key in args}
@@ -305,9 +313,16 @@ class Server:
                              intent=str(args.get("intent") or "ask"),
                              thread=str(args.get("thread") or ""),
                              reply_to=str(args.get("reply_to") or ""), **optional)
-            text = (f"Queued typed agent message for {r['to']} (id {r['queued']}, thread {r['thread']}). "
+            text = (f"Not done yet: queued typed agent message for {r['to']} (id {r['queued']}, thread "
+                    f"{r['thread']}); it is delivered when they come online. Call nak_delivery with mid "
+                    f"{r['queued']} to tell queued from delivered. "
                     "Attachment refs are metadata only; no file was transferred.")
-            return ToolReply(text, done=True, verify=_verify_call(name, args, r))
+            return ToolReply(text, done=False, verify=_verify_call(name, args, r),
+                             structured={"done": False, "queued": True, "mid": r["queued"]})
+        if name == "nak_delivery":
+            if c.delivered(str(args["mid"])):
+                return "Delivered: the contact's node acknowledged this message."
+            return "Not delivered yet: still queued (the contact is offline or has not acknowledged)."
         if name == "nak_threads":
             rows = c.threads()
             return ("\n".join(f"{row['thread']}  {row['contact']} "
@@ -422,6 +437,7 @@ class Server:
             lines = [status["summary"],
                      f"task: {status['task_hash']}",
                      f"role: {status['role']}; state: {status['state']}; deadline: {status['deadline']}",
+                     # reward/hold must only ever carry local, typed values; never splice remote strings in unframed.
                      f"reward: {json.dumps(status['reward'], sort_keys=True)}; "
                      f"hold: {json.dumps(status['hold'], sort_keys=True)}"]
             structured = dict(status)
@@ -473,8 +489,13 @@ class Server:
             return ToolReply(text, done=False, verify=_verify_call(name, args, r))
         if name == "nak_task_submit":
             r = c.task_submit(str(args["task"]), str(args["output"]))
-            pre = "passes the declared rules" if r["precheck_passed"] else f"would FAIL: {r['precheck']}"
-            text = f"Submitted {r['task_hash'][:12]}; precheck: {pre}. Verify the authoritative state next."
+            if not r["precheck_passed"]:
+                text = (f"Not done: output for {r['task_hash'][:12]} was handed in but would FAIL the "
+                        f"acceptance rules: {r['precheck']}. Fix the output to meet them and call "
+                        "nak_task_submit again if the task still allows it; check nak_task_status first.")
+                return ToolReply(text, done=False, verify=_verify_call(name, args, r))
+            text = (f"Submitted {r['task_hash'][:12]}; precheck: passes the declared rules. "
+                    "Verify the authoritative state next.")
             return ToolReply(text, done=True, verify=_verify_call(name, args, r))
         if name == "nak_task_post":
             acc = args["acceptance"]
@@ -524,13 +545,14 @@ class Server:
                         text, err = str(reply), False
                     except (NakError, ValueError, TypeError) as e:
                         reply = None
-                        text, err = _not_done(e), True
+                        text, err = _not_done(f"{type(e).__name__}: {e}" if not isinstance(e, NakError) else e), True
                 result = {"content": [{"type": "text", "text": text}], "isError": err}
                 if name in WRITE_TOOLS:
                     done = bool(getattr(reply, "done", False)) if not err else False
                     verify = getattr(reply, "verify", None) or _verify_call(name, args)
+                    extra = (getattr(reply, "structured", None) or {}) if not err else {}
                     result.update(done=done, verify=verify,
-                                  structuredContent={"done": done, "verify": verify})
+                                  structuredContent={"done": done, "verify": verify, **extra})
                 elif reply is not None and getattr(reply, "structured", None) is not None:
                     result["structuredContent"] = reply.structured
             else:
