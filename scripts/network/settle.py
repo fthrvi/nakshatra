@@ -84,6 +84,9 @@ class SettlementAdapter:
     def refund(self, task_hash: str, reason: str, *, hold_id: str = "") -> dict:
         raise NotImplementedError
 
+    def dispute(self, task_hash: str, reason: str, note: str, *, hold_id: str = "") -> dict:
+        raise NotImplementedError
+
     def status(self, task_hash: str, *, hold_id: str = "") -> Optional[dict]:
         raise NotImplementedError
 
@@ -191,7 +194,7 @@ class LedgerAdapter(SettlementAdapter):
 
 _HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 _INVITE_ID = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
-_TASK_STATES = {"open", "paid", "refunded"}
+_TASK_STATES = {"open", "disputed", "paid", "refunded"}
 
 
 class NeuronEscrowAdapter(SettlementAdapter):
@@ -265,10 +268,13 @@ class NeuronEscrowAdapter(SettlementAdapter):
                     f"Neuron ledger {label} refused HTTP {exc.code}")
                 error.status = exc.code
                 try:
-                    detail = json.loads(exc.read()).get("error", "")
+                    payload = json.loads(exc.read())
                 except Exception:  # noqa: BLE001 - an error body is optional and untrusted
-                    detail = ""
+                    payload = {}
+                detail = payload.get("error", "") if isinstance(payload, dict) else ""
                 error.ledger_error = str(detail)[:200] if isinstance(detail, str) else ""
+                code = payload.get("code", "") if isinstance(payload, dict) else ""
+                error.ledger_code = str(code)[:64] if isinstance(code, str) else ""
                 raise error from exc
             except Exception as exc:  # noqa: BLE001 - enforce mode fails every dependency error closed
                 raise SettlementError(
@@ -346,6 +352,18 @@ class NeuronEscrowAdapter(SettlementAdapter):
             raise SettlementError("Neuron ledger refunded a different task")
         return self._receipt(value, "refunded")
 
+    def dispute(self, task_hash, reason, note, *, hold_id=""):
+        resolved = self._hold_id(task_hash, hold_id)
+        value = self._hold(self._request("POST", "/spend/task/dispute", {
+            "hold_id": resolved, "reason": str(reason)[:64], "note": str(note)[:280],
+        }), expected_hold=resolved, expected_state="disputed")
+        expected = {"v", "hold_id", "task_hash", "worker_keyid", "amount", "deadline",
+                    "state", "replayed"}
+        if (set(value) != expected or not isinstance(value["replayed"], bool)
+                or value["task_hash"] != task_hash):
+            raise SettlementError("Neuron ledger returned an invalid task dispute response")
+        return self._receipt(value, "disputed")
+
     def submit(self, task_hash, result_hash, *, hold_id=""):
         if _HEX64.fullmatch(result_hash or "") is None:
             raise SettlementError("task result hash must be 64 lowercase hex characters")
@@ -386,10 +404,12 @@ class NeuronEscrowAdapter(SettlementAdapter):
         resolved = self._hold_id(task_hash, hold_id)
         path = "/spend/task/status?" + urllib.parse.urlencode({"hold_id": resolved})
         value = self._hold(self._request("GET", path), expected_hold=resolved)
-        expected = {"v", "hold_id", "task_hash", "payer_account", "worker_keyid", "amount",
+        required = {"v", "hold_id", "task_hash", "payer_account", "worker_keyid", "amount",
                     "deadline", "state", "server_time", "submitted_at", "result_hash",
                     "received_at", "received_hash", "refund_after_submit"}
-        if (set(value) != expected or value["task_hash"] != task_hash
+        optional = {"dispute_reason", "locked"}
+        if (not required.issubset(value) or not set(value).issubset(required | optional)
+                or value["task_hash"] != task_hash
                 or not isinstance(value["refund_after_submit"], bool)
                 or not isinstance(value["payer_account"], str)
                 or isinstance(value["server_time"], bool) or not isinstance(value["server_time"], int)
@@ -401,11 +421,21 @@ class NeuronEscrowAdapter(SettlementAdapter):
                 or isinstance(value["received_at"], bool) or not isinstance(value["received_at"], int)
                 or value["received_at"] < 0 or not isinstance(value["received_hash"], str)
                 or (value["received_hash"] and _HEX64.fullmatch(value["received_hash"]) is None)
-                or bool(value["received_at"]) != bool(value["received_hash"])):
+                or bool(value["received_at"]) != bool(value["received_hash"])
+                or ("locked" in value and (not isinstance(value["locked"], bool)
+                                            or value["locked"] != bool(value["submitted_at"])))
+                or ("dispute_reason" in value
+                    and value["dispute_reason"] is not None
+                    and (not isinstance(value["dispute_reason"], str)
+                         or not value["dispute_reason"]
+                         or len(value["dispute_reason"]) > 64))):
             raise SettlementError("Neuron ledger returned an invalid task status")
         out = dict(value)
+        out.setdefault("locked", bool(value["submitted_at"]))
+        out.setdefault("dispute_reason", None)
         out["ledger_state"] = value["state"]
-        out["state"] = {"open": "open", "paid": "released", "refunded": "refunded"}[value["state"]]
+        out["state"] = {"open": "open", "disputed": "disputed", "paid": "released",
+                        "refunded": "refunded"}[value["state"]]
         out["unit"] = "credits"
         out["adapter"] = self.name
         return out

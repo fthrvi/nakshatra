@@ -1,5 +1,5 @@
 {
- "_source": "captured from neuron 0f16873 V2LedgerService over HTTP (authorize, submit, received, pay, refund-after-submit, status at each step); regenerate if the ledger reply shapes change",
+ "_source": "old shapes captured from neuron 0f16873; dispute/locked/status shapes copied from the submit-lock ledger branch HTTP tests (CODEX-REPORT-submitlock.md)",
  "authorize": {
   "amount": 100,
   "deadline": 6000060,
@@ -17,6 +17,20 @@
   "task_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
   "v": 1,
   "worker_keyid": "3648e6d8310743d7c9068127edb9b86af83892440713054506837bbcc922758d"
+ },
+ "dispute": {
+  "amount": 100,
+  "deadline": 6000060,
+  "hold_id": "094f247b732d41ea8b5971eed318bcaa",
+  "replayed": false,
+  "state": "disputed",
+  "task_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "v": 1,
+  "worker_keyid": "3648e6d8310743d7c9068127edb9b86af83892440713054506837bbcc922758d"
+ },
+ "locked_refund_error": {
+  "code": "task_submitted_locked",
+  "error": "The worker has submitted. Accept to pay, or dispute; you cannot take the reward back yourself."
  },
  "pay": {
   "amount": 100,
@@ -91,6 +105,24 @@
   "state": "paid",
   "submitted_at": 6000000,
   "task_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "v": 1,
+  "worker_keyid": "3648e6d8310743d7c9068127edb9b86af83892440713054506837bbcc922758d"
+ },
+ "status_disputed": {
+  "amount": 100,
+  "deadline": 6000060,
+  "dispute_reason": "rejected",
+  "hold_id": "094f247b732d41ea8b5971eed318bcaa",
+  "locked": true,
+  "payer_account": "payer",
+  "received_at": 0,
+  "received_hash": "",
+  "refund_after_submit": false,
+  "result_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "server_time": 6000000,
+  "state": "disputed",
+  "submitted_at": 6000000,
+  "task_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
   "v": 1,
   "worker_keyid": "3648e6d8310743d7c9068127edb9b86af83892440713054506837bbcc922758d"
  },

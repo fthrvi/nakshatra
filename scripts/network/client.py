@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import time
 from pathlib import Path
 
 from network.units import format_amount
@@ -155,7 +156,19 @@ def render_tasks(rows: list) -> str:
                 f"reward {format_amount(sp['reward']['amount'])} (devnet credits)")
         funding = r.get("funding_state")
         if funding:
-            shown = "funded (payment pending)" if funding == "pending" else funding
+            if funding == "pending":
+                reason = r.get("funding_reason")
+                shown = (reason if reason in {
+                    "payment claimed, confirming with the ledger",
+                    "refund claimed, confirming with the ledger",
+                    "dispute claimed, confirming with the ledger",
+                } else "funded (payment pending)")
+            elif funding == "disputed":
+                backstop = time.strftime(
+                    "%Y-%m-%d", time.gmtime(int(sp["deadline"]) + 14 * 24 * 60 * 60))
+                shown = f"disputed — waiting for the operator (backstop {backstop})"
+            else:
+                shown = funding
             line += f" · escrow {shown}"
         if r["role"] == "worker":
             line += (f" · from {who}\n  passes if: {describe_rules(sp['acceptance'])}\n"

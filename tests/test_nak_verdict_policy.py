@@ -143,6 +143,7 @@ def test_task_decide_is_cli_only_and_requires_a_terminal(monkeypatch, tmp_path):
         nak.main(["task", "decide", "12345678", "accept", "--yes"])
     names = {tool["name"] for tool in nak_mcp.Server(object(), allow_connect=True).list_tools()}
     assert "nak_task_decide" not in names
+    assert "nak_task_dispute" not in names and "nak_task_resolve" not in names
 
 
 def test_waiting_answer_is_visible_in_cli_status_tasks_and_mcp(monkeypatch, capsys):
@@ -173,6 +174,24 @@ def test_waiting_answer_is_visible_in_cli_status_tasks_and_mcp(monkeypatch, caps
             return status
 
     assert "1 paid answer waiting for your decision" in nak_mcp.Server(Client()).call("nak_status", {})
+
+
+def test_disputed_task_shows_operator_wait_and_backstop_in_cli_and_mcp():
+    row = {"task_hash": "2" * 64, "role": "poster", "state": "rejected",
+           "peer": "", "assignee": "c" * 64, "peer_name": "worker", "name_source": "yours",
+           "funding_state": "disputed",
+           "spec": {"title": "drill", "instructions": "say ok", "deadline": 2_000_000_000,
+                    "acceptance": [{"max_words": 2}],
+                    "reward": {"amount": 5, "unit": "credits"}},
+           "verdict": {"passed": False, "reasons": ["rejected by person"]}}
+    expected = "disputed — waiting for the operator (backstop 2033-06-01)"
+    assert expected in render_tasks([row])
+
+    class Client:
+        def tasks(self, _role):
+            return [row]
+
+    assert expected in nak_mcp.Server(Client()).call("nak_tasks", {})
 
 
 def test_task_decide_loads_matching_person_key_and_sends_signed_proof(

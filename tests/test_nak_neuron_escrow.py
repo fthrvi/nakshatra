@@ -12,6 +12,7 @@ import threading
 import time
 import urllib.error
 import urllib.parse
+from pathlib import Path
 
 import pytest
 
@@ -49,7 +50,13 @@ class FakeTaskLedger:
         self.lie_open_once = False       # one stale status read that still says open
         self.sweep_on_pay = False        # the ledger's own sweep refunds the hold as pay arrives
         self.status_override = None
+        self.status_calls = []
         self.submit_hash_override = ""
+        self.supports_dispute = False
+        self.dispute_calls = 0
+        self.drop_dispute_response = False
+        self.refund_calls = 0
+        self.hide_submit_from_payer_once = False
 
     def fund(self, keyid, amount):
         self.balances[keyid] = self.balances.get(keyid, 0) + amount
@@ -57,7 +64,8 @@ class FakeTaskLedger:
         self.check()
 
     def check(self):
-        held = sum(row["amount"] for row in self.holds.values() if row["state"] == "open")
+        held = sum(row["amount"] for row in self.holds.values()
+                   if row["state"] in {"open", "disputed"})
         assert sum(self.balances.values()) + held == self.initial
 
     def authorize(self, payer, task_hash, worker, amount, deadline):
@@ -98,12 +106,16 @@ class FakeTaskLedger:
         return copy.deepcopy(row)
 
     def status(self, caller, hold_id):
+        self.status_calls.append((caller, hold_id))
         row = copy.deepcopy(self.holds[hold_id])
         if caller not in {row["payer_account"], row["worker_keyid"]}:
             raise SettlementError("task hold not found")
         if self.lie_open_once and caller == row["payer_account"]:
             self.lie_open_once = False
             row["state"] = "open"
+        if self.hide_submit_from_payer_once and caller == row["payer_account"]:
+            self.hide_submit_from_payer_once = False
+            row.update(submitted_at=0, result_hash="")
         if self.status_override and caller == row["worker_keyid"]:
             row.update(self.status_override)
         return row
@@ -189,17 +201,53 @@ class FakeTaskLedger:
         self.check()
 
     def refund(self, payer, hold_id, _reason):
+        self.refund_calls += 1
         row = self.holds[hold_id]
         if row["payer_account"] != payer:
             raise SettlementError("task hold not found")
         if row["state"] == "paid":
             raise SettlementError("task hold is paid")
+        if self.supports_dispute and row["state"] == "open" and row["submitted_at"]:
+            error = SettlementError("task submission is locked")
+            error.status = 409
+            error.ledger_code = "task_submitted_locked"
+            raise error
         if row["state"] == "open":
             row["state"] = "refunded"
             self.balances[payer] = self.balances.get(payer, 0) + row["amount"]
             self.transitions.append((hold_id, "refunded"))
         self.check()
         return copy.deepcopy(row)
+
+    def dispute(self, payer, hold_id, reason, note):
+        self.dispute_calls += 1
+        if not self.supports_dispute:
+            error = SettlementError("task dispute route not found")
+            error.status = 404
+            raise error
+        row = self.holds[hold_id]
+        if row["payer_account"] != payer:
+            raise SettlementError("task hold not found")
+        if row["state"] == "open":
+            assert row["submitted_at"] > 0
+            row["state"] = "disputed"
+            row["dispute_reason"] = reason
+            row["dispute_note"] = note
+            self.transitions.append((hold_id, "disputed"))
+        self.check()
+        if self.drop_dispute_response:
+            self.drop_dispute_response = False
+            raise SettlementError("dispute response lost")
+        return copy.deepcopy(row)
+
+    def resolve(self, hold_id, outcome):
+        row = self.holds[hold_id]
+        assert row["state"] == "disputed" and outcome in {"paid", "refunded"}
+        row["state"] = outcome
+        account = row["worker_keyid"] if outcome == "paid" else row["payer_account"]
+        self.balances[account] = self.balances.get(account, 0) + row["amount"]
+        self.transitions.append((hold_id, outcome))
+        self.check()
 
 
 class FakeNeuronAdapter:
@@ -226,7 +274,8 @@ class FakeNeuronAdapter:
     def status(self, task_hash, *, hold_id=""):
         row = self.ledger.status(self.keyid, hold_id)
         row["ledger_state"] = row["state"]
-        row["state"] = {"open": "open", "paid": "released", "refunded": "refunded"}[row["state"]]
+        row["state"] = {"open": "open", "disputed": "disputed", "paid": "released",
+                        "refunded": "refunded"}[row["state"]]
         row["unit"] = "credits"
         return row
 
@@ -239,6 +288,11 @@ class FakeNeuronAdapter:
         row = self.ledger.refund(self.keyid, hold_id, reason)
         assert row["task_hash"] == task_hash
         return self._receipt(row, "refunded")
+
+    def dispute(self, task_hash, reason, note, *, hold_id=""):
+        row = self.ledger.dispute(self.keyid, hold_id, reason, note)
+        assert row["task_hash"] == task_hash
+        return self._receipt(row, "disputed")
 
     def submit(self, task_hash, result_hash, *, hold_id=""):
         row = self.ledger.submit(self.keyid, hold_id, result_hash)
@@ -842,6 +896,183 @@ def test_reject_and_expiry_refund_once(net):
     assert [event for _hold, event in ledger2.transitions] == ["open", "refunded"]
 
 
+@pytest.mark.parametrize("outcome,funding", [("paid", "paid"), ("refunded", "refunded")])
+def test_reject_after_submit_disputes_once_and_adopts_operator_resolution(net, outcome, funding):
+    poster, worker, ledger = _pair(net, suffix=f"-dispute-{outcome}")
+    clock = [time.time()]
+    poster.node._clock = worker.node._clock = lambda: clock[0]
+    worker_logs = []
+    worker.node.log = worker_logs.append
+    ledger.supports_dispute = True
+    task_hash = _assign(poster, worker)
+    worker.node.submit_task(task_hash, "not acceptable")
+
+    assert wait(lambda: poster.node.store.task_get(task_hash, "poster")["funding_state"] == "disputed")
+    assert wait(lambda: _worker_row(worker.node, task_hash)[0]["funding_state"] == "disputed")
+    assert ledger.dispute_calls == 1 and ledger.refund_calls == 0
+    assert [event for _hold, event in ledger.transitions] == ["open", "disputed"]
+    disputed_hold = next(iter(ledger.holds.values()))
+    assert disputed_hold["dispute_reason"] == "rejected"
+    assert disputed_hold["dispute_note"] == "missing ['ok']"
+    assert "not acceptable" not in disputed_hold["dispute_note"]
+    assert poster.node.reconcile_escrow() == 0
+    assert poster.node.reconcile_escrow() == 0
+    assert ledger.dispute_calls == 1 and ledger.refund_calls == 0
+
+    hold_id = next(iter(ledger.holds))
+    ledger.resolve(hold_id, outcome)
+    clock[0] += nakd.ESCROW_POLL_INITIAL_S
+    assert poster.node.reconcile_escrow() == 1
+    assert poster.node.store.task_get(task_hash, "poster")["funding_state"] == funding
+    assert worker.node.reconcile_escrow() == 1
+    assert _worker_row(worker.node, task_hash)[0]["funding_state"] == funding
+    plain = "payment confirmed by the ledger" if outcome == "paid" else "refunded; no payment was received"
+    assert any(plain in line for line in worker_logs)
+    assert poster.node.reconcile_escrow() == 0
+
+
+def test_worker_never_trusts_a_forged_released_claim_and_promptly_confirms_real_payment(net):
+    poster, worker, ledger = _pair(net, suffix="-forged-release")
+    clock = [time.time()]
+    worker.node._clock = lambda: clock[0]
+    ledger.fail_pay = True
+    task_hash = _assign(poster, worker)
+    worker.node.submit_task(task_hash, "ok")
+    assert wait(lambda: poster.node.store.task_get(task_hash, "poster")["state"] == "accepted")
+    assert wait(lambda: _worker_row(worker.node, task_hash)[0]["state"] == "accepted")
+    hold = next(iter(ledger.holds.values()))
+    assert hold["state"] == "open"
+
+    contact = worker.node.store.contact(poster.person_pub)
+    forged = {"task_hash": task_hash, "epoch": 1, "passed": True, "reasons": [],
+              "settlement": {"adapter": "neuron", "event": "released", "amount": 5,
+                             "unit": "credits"}}
+    worker.node._task_receive(contact, "task.accept", forged, {})
+    waiting = worker.node.store.task_get(task_hash, "worker", poster.person_pub)
+    assert waiting["funding_state"] == "pending"
+    assert waiting["funding_reason"] == nakd.PAYMENT_CLAIMED_REASON
+    from network.client import render_tasks
+    assert nakd.PAYMENT_CLAIMED_REASON in render_tasks([waiting])
+
+    ledger.fail_pay = False
+    ledger.pay(poster.node.node, hold["hold_id"])
+    # The repeated inbound task event bypasses the scheduled poll and asks the scoped ledger now.
+    worker.node._task_receive(contact, "task.accept", forged, {})
+    assert worker.node.store.task_get(task_hash, "worker", poster.person_pub)["funding_state"] == "paid"
+
+
+def test_poster_adopts_a_lost_dispute_response_and_notifies_the_worker(net):
+    poster, worker, ledger = _pair(net, suffix="-lost-dispute")
+    ledger.supports_dispute = True
+    ledger.drop_dispute_response = True
+    task_hash = _assign(poster, worker)
+    worker.node.submit_task(task_hash, "not acceptable")
+    assert wait(lambda: poster.node.store.task_get(task_hash, "poster")["funding_state"] == "pending")
+    before = len([r for r in poster.signer_requests if r.get("kind") == "task.reject"])
+
+    assert poster.node.reconcile_escrow() == 1
+    assert poster.node.store.task_get(task_hash, "poster")["funding_state"] == "disputed"
+    assert wait(lambda: len([r for r in poster.signer_requests if r.get("kind") == "task.reject"]) > before)
+    assert wait(lambda: _worker_row(worker.node, task_hash)[0]["funding_state"] == "disputed")
+
+
+def test_waiting_hold_polls_back_off_and_are_capped_round_robin(net):
+    party = net("poll-cap")
+    ledger = FakeTaskLedger()
+    ledger.supports_dispute = True
+    party.node.settle = FakeNeuronAdapter(ledger, party.node.node)
+    clock = [1_900_000_000.0]
+    party.node._clock = lambda: clock[0]
+    peer = "ab" * 32
+    for index in range(20):
+        spec = task_mod.make_spec(peer, f"poll {index}", "wait", [{"max_words": 1}],
+                                  reward=1, unit="credits", deadline_s=600)
+        task_hash = task_mod.task_hash(spec)
+        hold_id = f"hold-poll-{index}"
+        ledger.holds[hold_id] = {
+            "v": 1, "hold_id": hold_id, "task_hash": task_hash,
+            "payer_account": peer, "worker_keyid": party.node.node, "amount": 1,
+            "deadline": spec["deadline"], "state": "disputed", "server_time": int(clock[0]),
+            "submitted_at": int(clock[0]), "result_hash": f"{index:064x}",
+            "received_at": 0, "received_hash": "", "dispute_reason": "rejected",
+        }
+        ledger.initial += 1
+        assert party.node.store.task_insert(task_hash, "worker", peer, spec, "rejected",
+                                            hold_id=hold_id, funding_state="disputed")
+
+    seen = []
+    for expected in (8, 8, 4):
+        before = len(ledger.status_calls)
+        party.node.reconcile_escrow()
+        batch = ledger.status_calls[before:]
+        assert len(batch) == expected <= nakd.ESCROW_STATUS_MAX_PER_PASS
+        seen.extend(hold_id for _caller, hold_id in batch)
+    assert len(set(seen)) == 20
+    before = len(ledger.status_calls)
+    party.node.reconcile_escrow()
+    clock[0] += nakd.ESCROW_POLL_INITIAL_S - 1
+    party.node.reconcile_escrow()
+    assert len(ledger.status_calls) == before
+    clock[0] += 1
+    party.node.reconcile_escrow()
+    assert len(ledger.status_calls) - before == nakd.ESCROW_STATUS_MAX_PER_PASS
+
+
+def test_ledger_outage_backs_off_instead_of_retrying_every_sweep(net):
+    from network.settle import SettlementError
+    party = net("poll-outage")
+    ledger = FakeTaskLedger()
+    ledger.supports_dispute = True
+    party.node.settle = FakeNeuronAdapter(ledger, party.node.node)
+    clock = [1_900_000_000.0]
+    party.node._clock = lambda: clock[0]
+    peer = "cd" * 32
+    spec = task_mod.make_spec(peer, "outage", "wait", [{"max_words": 1}],
+                              reward=1, unit="credits", deadline_s=600)
+    task_hash = task_mod.task_hash(spec)
+    assert party.node.store.task_insert(task_hash, "worker", peer, spec, "rejected",
+                                        hold_id="hold-outage", funding_state="disputed")
+    calls = []
+
+    def down(*_a, **_k):
+        calls.append(clock[0])
+        raise SettlementError("ledger unreachable")
+
+    party.node.settle.status = down
+    for _ in range(20):                      # ten simulated minutes of 30 s sweeps
+        party.node.reconcile_escrow()
+        clock[0] += 30
+    assert 1 <= len(calls) <= 5
+    gaps = [b - a for a, b in zip(calls, calls[1:])]
+    assert gaps == sorted(gaps) and all(g >= nakd.ESCROW_POLL_INITIAL_S for g in gaps)
+
+
+def test_locked_refund_response_switches_to_dispute(net):
+    poster, worker, ledger = _pair(net, suffix="-locked-refund")
+    ledger.supports_dispute = True
+    task_hash = _assign(poster, worker)
+    ledger.hide_submit_from_payer_once = True
+    worker.node.submit_task(task_hash, "not acceptable")
+
+    assert wait(lambda: poster.node.store.task_get(task_hash, "poster")["funding_state"] == "disputed")
+    assert ledger.refund_calls == 1 and ledger.dispute_calls == 1
+
+
+def test_old_ledger_without_dispute_route_refunds_and_logs_once(net):
+    poster, worker, ledger = _pair(net, suffix="-old-ledger")
+    logs = []
+    poster.node.log = logs.append
+    first = _assign(poster, worker)
+    worker.node.submit_task(first, "not acceptable")
+    assert wait(lambda: poster.node.store.task_get(first, "poster")["funding_state"] == "refunded")
+    task = poster.node.store.task_get(first, "poster")
+    poster.node._settle(first, task["spec"], "dispute", reason="rejected", hold_id=task["hold_id"])
+
+    warning = "ledger has no task-dispute route; using legacy refund behavior"
+    assert sum(warning in line for line in logs) == 1
+    assert ledger.refund_calls == 2 and ledger.dispute_calls == 2
+
+
 def test_crash_window_and_ledger_down_reconcile_exactly_once(net):
     poster, worker, ledger = _pair(net)
     task_hash = _assign(poster, worker)
@@ -919,7 +1150,6 @@ def test_real_neuron_adapter_uses_contract_routes_and_signed_query_path():
 def test_real_adapter_accepts_every_reply_the_real_neuron_ledger_sends():
     """Replies captured from neuron 0f16873 over HTTP. 0.15.21 shipped against hand-written
     fakes that disagreed with the real ledger on submit/received/status and refused them all."""
-    from pathlib import Path
     real = json.loads((Path(__file__).parent / "fixtures" / "neuron_task_replies.json").read_text())
     queue = []
 
@@ -955,6 +1185,12 @@ def test_real_adapter_accepts_every_reply_the_real_neuron_ledger_sends():
     assert adapter.refund(task2, "rejected", hold_id=a2["hold_id"])["event"] == "refunded"
     final = adapter.status(task2, hold_id=a2["hold_id"])
     assert final["state"] == "refunded" and final["refund_after_submit"] is True
+
+    adapter = adapter_for(["dispute", "status_disputed"])
+    assert adapter.dispute(task2, "rejected", "did not pass", hold_id=a2["hold_id"])["event"] == "disputed"
+    disputed = adapter.status(task2, hold_id=a2["hold_id"])
+    assert disputed["state"] == "disputed" and disputed["locked"] is True
+    assert disputed["dispute_reason"] == "rejected"
     assert queue == []
 
 
@@ -1044,6 +1280,20 @@ def test_adapter_maps_ledger_statuses_to_distinct_errors(code, exc):
     with pytest.raises(exc) as caught:
         adapter.refund("12" * 32, "why", hold_id="h")
     assert caught.value.status == code and isinstance(caught.value, SettlementError)
+
+
+def test_adapter_preserves_locked_refund_error_code():
+    fixture = json.loads((Path(__file__).parent / "fixtures" / "neuron_task_replies.json").read_text())
+
+    def refuse(request, **_kwargs):
+        body = io.BytesIO(json.dumps(fixture["locked_refund_error"]).encode())
+        raise urllib.error.HTTPError(request.full_url, 409, "no", {}, body)
+
+    adapter = NeuronEscrowAdapter(
+        "https://ledger.test", "ab" * 32, b"k" * 32, "56" * 32, opener=refuse)
+    with pytest.raises(HoldConflict) as caught:
+        adapter.refund("12" * 32, "rejected", hold_id="h")
+    assert caught.value.ledger_code == "task_submitted_locked"
 
 
 def test_verify_at_assign_then_immediate_submit_and_status_against_replay_ledger(net):

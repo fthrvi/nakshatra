@@ -61,7 +61,7 @@ State as of 2026-10-23 (release 0.15.22 on the public canary; clean outsider joi
 | Item | Exists | Missing | Size |
 |---|---|---|---|
 | Revocation | Person-signed cumulative revocations are local immediately, pushed over authenticated contact sessions, and exportable/importable as `nkr1.` blobs | Older contacts ignore the new frame until they update; the ledger still trusts node keys, which this does not revoke | S (upgrade rollout) |
-| Task escrow fairness | Pay-first holds, one open hold per task, auto-refund at deadline+24h | A payer can refund an open hold after the worker submits; needs a rule (e.g. hold locks at submit until verdict or deadline) | M + **D** |
+| Task escrow fairness | Pay-first holds; before submission a rejected/expired task refunds normally; after submission the payer can pay or dispute but cannot refund; disputes wait for an operator and have a deadline+14-day backstop; workers confirm every claimed outcome through their own scoped ledger status with bounded polling | Operator dispute handling is still a human operational duty | **D** / ops |
 | Sybil / credit-line abuse | Overdraft tiers, 7-day maturity, cash-out only at known+ | Two colluding accounts can convert credit-line value into earnings (inference and tasks alike) | L + **D** |
 | Spend caps in human units | Exact-decimal CLI/MCP input accepts USDC or explicit base units; grant status, balances, wallets, starters, and task rewards show human USDC beside unchanged signed/base-unit values. Bare integers remain base units with a notice. | — | — |
 | Abuse/report path | — | A way for a member to report and for an operator to suspend a node | M |
@@ -71,4 +71,4 @@ State as of 2026-10-23 (release 0.15.22 on the public canary; clean outsider joi
 1. **D:** admission policy for strangers + who may accept (unblocks §1, §3, §4).
 2. **M:** S7 devnet drill → deposits on (with Biswa); starter credits are wired for devnet.
 3. **M:** non-TEST release key + person key off-box.
-4. **M + D:** refund-after-submit rule; roll the shared-revocation version out to every contact.
+4. **D / ops:** staff task-dispute review; roll the shared-revocation version out to every contact.

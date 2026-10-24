@@ -90,6 +90,12 @@ APPROVAL_FINAL_S = 2 * 3600
 APPROVAL_MAX_PROMPTS = 8
 WORKER_SUBMIT_MAX_ATTEMPTS = 8
 POSTER_RECEIVE_MAX_ATTEMPTS = 8
+ESCROW_STATUS_MAX_PER_PASS = 8
+ESCROW_POLL_INITIAL_S = 60.0
+ESCROW_POLL_MAX_S = 6 * 3600.0
+PAYMENT_CLAIMED_REASON = "payment claimed, confirming with the ledger"
+REFUND_CLAIMED_REASON = "refund claimed, confirming with the ledger"
+_STATUS_DEFERRED = object()
 GRANT_WARN_S = 7 * 86400
 STARTER_RETRY_S = (60, 300, 1800)
 STARTER_RETRY_MAX_S = 3600
@@ -342,7 +348,11 @@ class Node:
         self._decision_proofs: set[str] = set()
         self._submit_lock = threading.Lock()
         self._receipt_lock = threading.Lock()
+        self._escrow_reconcile_lock = threading.RLock()
+        self._escrow_poll: dict[str, tuple[float, float]] = {}
+        self._escrow_rr_cursor = 0
         self._starter_lock = threading.Lock()
+        self._old_ledger_dispute_warned = False
         self._roster_loader = roster_loader
         self._roster_path = Path(roster_path) if roster_path is not None else None
         self._last_grant_warning_day: Optional[str] = None
@@ -1719,18 +1729,111 @@ class Node:
         return bool(task and self.store.task_cas(
             h, role, peer, (task["state"],), funding_state=state, funding_reason=reason))
 
+    @staticmethod
+    def _escrow_poll_key(task: dict) -> str:
+        return str(task.get("hold_id") or "")
+
+    def _escrow_poll_due(self, task: dict, now: float) -> bool:
+        with self._escrow_reconcile_lock:
+            poll = self._escrow_poll.get(self._escrow_poll_key(task))
+        return poll is None or now >= poll[0]
+
+    def _defer_escrow_poll(self, task: dict, now: float) -> None:
+        key = self._escrow_poll_key(task)
+        if not key:
+            return
+        with self._escrow_reconcile_lock:
+            prior = self._escrow_poll.get(key)
+            delay = prior[1] if prior else ESCROW_POLL_INITIAL_S
+            self._escrow_poll[key] = (now + delay, min(delay * 2, ESCROW_POLL_MAX_S))
+
+    def _clear_escrow_poll(self, task: dict) -> None:
+        with self._escrow_reconcile_lock:
+            self._escrow_poll.pop(self._escrow_poll_key(task), None)
+
+    def _worker_hold_matches(self, task: dict, status: dict) -> bool:
+        return bool(status and status.get("task_hash") == task["task_hash"]
+                    and status.get("worker_keyid") == self.node
+                    and status.get("amount") == task["spec"]["reward"]["amount"])
+
+    def _adopt_worker_hold_status(self, task: dict, status: dict, now: float) -> bool:
+        """Adopt only the worker-scoped ledger view; contact frames are never payment proof."""
+        if not self._worker_hold_matches(task, status):
+            self._set_funding(task["task_hash"], "worker", task["peer"], "pending",
+                              "ledger status did not match this task hold")
+            self._defer_escrow_poll(task, now)
+            return False
+        state = status.get("state")
+        prior = task.get("funding_state") or ""
+        if state == "released":
+            self._set_funding(task["task_hash"], "worker", task["peer"], "paid")
+            self._clear_escrow_poll(task)
+            if prior != "paid":
+                self.log(f"task {task['task_hash'][:12]} payment confirmed by the ledger")
+            return prior != "paid"
+        if state == "refunded":
+            self._set_funding(task["task_hash"], "worker", task["peer"], "refunded")
+            self._clear_escrow_poll(task)
+            if prior != "refunded":
+                self.log(f"task {task['task_hash'][:12]} was refunded; no payment was received")
+            return prior != "refunded"
+        if state == "disputed":
+            self._set_funding(task["task_hash"], "worker", task["peer"], "disputed",
+                              "waiting for the operator")
+            self._defer_escrow_poll(task, now)
+            if prior != "disputed":
+                self.log(f"task {task['task_hash'][:12]} payment is disputed; waiting for the operator")
+            return prior != "disputed"
+        # OPEN is not proof of either terminal outcome. Preserve a claimed-payment/refund hint so
+        # the person sees why the task is pending, but back off subsequent checks for this hold.
+        self._defer_escrow_poll(task, now)
+        return False
+
+    def _confirm_worker_settlement(self, task: dict) -> bool:
+        """Prompt worker-side confirmation after an inbound verdict that may follow a ledger move."""
+        now = self._clock()
+        self._clear_escrow_poll(task)
+        try:
+            status = self.settle.status(task["task_hash"], hold_id=task["hold_id"] or "")
+        except SettlementError as exc:
+            self._defer_escrow_poll(task, now)
+            self.log(f"task {task['task_hash'][:12]} settlement is not confirmed yet: {exc}")
+            return False
+        return self._adopt_worker_hold_status(task, status, now)
+
     def _settle(self, h: str, spec: dict, how: str, party: str = "", reason: str = "",
                 hold_id: str = "") -> Optional[dict]:
-        """release|refund the task's escrow, if it has one. Exactly-once is the adapter's job."""
+        """Release, refund, or dispute escrow. Exactly-once is the adapter's job."""
         if spec["reward"]["amount"] <= 0:
             return None
         if self.settle.open_on_assign and not hold_id:
             return None                         # a Neuron task expired before anyone was assigned
         try:
-            receipt = (self.settle.release(h, party, hold_id=hold_id) if how == "release"
-                       else self.settle.refund(h, reason, hold_id=hold_id))
+            if how == "release":
+                receipt = self.settle.release(h, party, hold_id=hold_id)
+            elif how == "dispute":
+                try:
+                    receipt = self.settle.dispute(
+                        h, "rejected", str(reason or "")[:280], hold_id=hold_id)
+                except SettlementError as exc:
+                    if exc.status != 404:
+                        raise
+                    if not self._old_ledger_dispute_warned:
+                        self.log("WARNING: ledger has no task-dispute route; using legacy refund behavior")
+                        self._old_ledger_dispute_warned = True
+                    receipt = self.settle.refund(h, reason, hold_id=hold_id)
+            else:
+                try:
+                    receipt = self.settle.refund(h, reason, hold_id=hold_id)
+                except SettlementError as exc:
+                    if getattr(exc, "ledger_code", "") != "task_submitted_locked":
+                        raise
+                    receipt = self.settle.dispute(
+                        h, "rejected", str(reason or "")[:280], hold_id=hold_id)
             if self.settle.open_on_assign:
-                self._set_funding(h, "poster", "", "paid" if how == "release" else "refunded")
+                funding = {"released": "paid", "refunded": "refunded",
+                           "disputed": "disputed"}.get(receipt.get("event"), "pending")
+                self._set_funding(h, "poster", "", funding)
             return receipt
         except SettlementError as e:
             self.log(f"settlement {how} for {h[:12]} refused: {e}")
@@ -1752,6 +1855,14 @@ class Node:
         grant = auth.get("grant") if isinstance(auth, dict) else {}
         return grant.get("constraints") if isinstance(grant, dict) and \
             isinstance(grant.get("constraints"), dict) else {}
+
+    @staticmethod
+    def _task_settlement_reason(task: dict) -> str:
+        if task.get("state") == "rejected":
+            reasons = (task.get("verdict") or {}).get("reasons") or []
+            if reasons:
+                return str(reasons[0])[:280]
+        return str(task.get("state") or "rejected")[:280]
 
     def _worker_is_stranger(self, contact: dict) -> bool:
         try:
@@ -1952,14 +2063,28 @@ class Node:
         if not self.store.task_cas(task_hash, "poster", "", from_states, **fields):
             return self._apply_task_decision(task_hash, accept, reason, source=source, touch=touch,
                                              output=output, verdict=final, from_states=from_states)
-        receipt = self._settle(task_hash, task["spec"], "release" if accept else "refund",
-                               party=task["assignee"] or "", reason=reason or desired,
+        settlement_action = "release" if accept else "refund"
+        if (not accept and self.settle.open_on_assign and task["spec"]["reward"]["amount"] > 0
+                and task.get("hold_id")):
+            try:
+                hold = self.settle.status(task_hash, hold_id=task["hold_id"])
+            except SettlementError:
+                hold = None                    # refund will detect task_submitted_locked if needed
+            if hold and (hold.get("locked") is True or int(hold.get("submitted_at") or 0) > 0):
+                settlement_action = "dispute"
+        settlement_reason = "accepted" if accept else str(final["reasons"][0])[:280]
+        receipt = self._settle(task_hash, task["spec"], settlement_action,
+                               party=task["assignee"] or "", reason=settlement_reason,
                                hold_id=task["hold_id"] or "")
-        if receipt is not None and not receipt.get("error"):
+        if (receipt is not None and not receipt.get("error")
+                and receipt.get("event") in {"released", "refunded"}):
             final["settlement"] = receipt
             self.store.task_cas(task_hash, "poster", "", (desired,), verdict=json.dumps(final))
-        self._queue(task["assignee"], "task.accept" if accept else "task.reject",
-                    {"task_hash": task_hash, "epoch": task["epoch"], **final}, touch=touch)
+        body = {"task_hash": task_hash, "epoch": task["epoch"], **final}
+        if receipt and receipt.get("event") == "disputed":
+            body["funding_state"] = "disputed"
+            self._defer_escrow_poll(task, self._clock())
+        self._queue(task["assignee"], "task.accept" if accept else "task.reject", body, touch=touch)
         label = "paid by silence" if source == "silence" else source
         self.log(f"task {task_hash[:12]} {'ACCEPTED' if accept else 'REJECTED'} ({label})")
         return {"task_hash": task_hash, "state": desired, "idempotent": False}
@@ -2176,74 +2301,150 @@ class Node:
             except ValueError as e:
                 self.log(f"assignment of {t['task_hash'][:12]} still not funded: {e}")
 
-    def reconcile_escrow(self) -> int:
-        """Settle escrow left OPEN for a task already in a final state (a crash between the state
-        change and the settlement). The ledger's own CAS keeps this exactly-once. Returns how many."""
-        fixed = 0
-        self._retry_worker_submits()
-        self._retry_poster_receipts()
-        self._rearm_approvals()
-        self._finish_pending_assignments()
-        for t in self.store.tasks_in_states(("accepted", "rejected", "expired"), role="poster"):
-            if t["spec"]["reward"]["amount"] <= 0:
-                continue
-            if self.settle.open_on_assign and t["funding_state"] in {"paid", "refunded"}:
-                continue
-            if self.settle.open_on_assign and not t["hold_id"]:
-                continue
-            try:
-                st = self.settle.status(t["task_hash"], hold_id=t["hold_id"] or "")
-            except SettlementError as e:
-                self.log(f"escrow status for {t['task_hash'][:12]} unavailable: {e}")
-                continue
-            desired = "released" if t["state"] == "accepted" else "refunded"
-            receipt = None
-            if st and st["state"] == "open":
-                receipt = self._settle(
-                    t["task_hash"], t["spec"], "release" if desired == "released" else "refund",
-                    party=t["assignee"] or "", reason=t["state"], hold_id=t["hold_id"] or "")
-                if receipt and receipt.get("error"):
-                    if not self._adopt_terminal(t):
-                        continue
-                    receipt = None
-                    fixed += 1
-                    continue
-            elif st and st["state"] == desired and self.settle.open_on_assign:
-                self._set_funding(t["task_hash"], "poster", "",
-                                  "paid" if desired == "released" else "refunded")
-                event = "released" if desired == "released" else "refunded"
-                receipt = {"adapter": self.settle.name, "event": event,
-                           "task_hash": t["task_hash"], "hold_id": t["hold_id"],
-                           "amount": st["amount"], "unit": st.get("unit", "credits")}
-            else:
-                if st and st["state"] in ("released", "refunded") and self._adopt_terminal(t):
-                    fixed += 1
-                continue
-            fixed += 1
-            if self.settle.open_on_assign and t["assignee"] and receipt:
+    def _reconcile_poster_hold(self, t: dict, st: dict, status_getter) -> int:
+        desired = "released" if t["state"] == "accepted" else "refunded"
+        receipt = None
+        if st and st.get("state") == "disputed":
+            changed = t.get("funding_state") != "disputed"
+            self._set_funding(t["task_hash"], "poster", "", "disputed")
+            self._defer_escrow_poll(t, self._clock())
+            if changed and t["assignee"]:
                 verdict = dict(t["verdict"] or {})
-                verdict["settlement"] = receipt
-                self.store.task_cas(t["task_hash"], "poster", "", (t["state"],),
-                                    verdict=json.dumps(verdict))
-                self._queue(t["assignee"], "task.accept" if t["state"] == "accepted" else "task.reject",
-                            {"task_hash": t["task_hash"], "epoch": t["epoch"], **verdict}, touch=False)
-            self.log(f"reconciled stranded escrow for {t['task_hash'][:12]} ({t['state']})")
-        return fixed
+                self._queue(t["assignee"], "task.reject",
+                            {"task_hash": t["task_hash"], "epoch": t["epoch"],
+                             **verdict, "funding_state": "disputed"}, touch=False)
+                self.log(f"adopted ledger dispute for {t['task_hash'][:12]}; told the worker")
+            return int(changed)
+        if st and st.get("state") == "open":
+            action = "release" if desired == "released" else "refund"
+            if (desired == "refunded"
+                    and (st.get("locked") is True or int(st.get("submitted_at") or 0) > 0)):
+                action = "dispute"
+            receipt = self._settle(
+                t["task_hash"], t["spec"], action,
+                party=t["assignee"] or "", reason=self._task_settlement_reason(t),
+                hold_id=t["hold_id"] or "")
+            if receipt and receipt.get("error"):
+                return int(self._adopt_terminal(t, status_getter=status_getter))
+            if receipt and receipt.get("event") == "disputed":
+                self._defer_escrow_poll(t, self._clock())
+                if t["assignee"]:
+                    verdict = dict(t["verdict"] or {})
+                    self._queue(t["assignee"], "task.reject",
+                                {"task_hash": t["task_hash"], "epoch": t["epoch"],
+                                 **verdict, "funding_state": "disputed"}, touch=False)
+                self.log(f"reconciled stranded escrow for {t['task_hash'][:12]} (disputed)")
+                return 1
+        elif st and st.get("state") == desired and self.settle.open_on_assign:
+            self._set_funding(t["task_hash"], "poster", "",
+                              "paid" if desired == "released" else "refunded")
+            event = "released" if desired == "released" else "refunded"
+            receipt = {"adapter": self.settle.name, "event": event,
+                       "task_hash": t["task_hash"], "hold_id": t["hold_id"],
+                       "amount": st["amount"], "unit": st.get("unit", "credits")}
+        else:
+            if st and st.get("state") in ("released", "refunded"):
+                return int(self._adopt_terminal(t, status=st))
+            return 0
+        self._clear_escrow_poll(t)
+        if self.settle.open_on_assign and t["assignee"] and receipt:
+            verdict = dict(t["verdict"] or {})
+            verdict["settlement"] = receipt
+            self.store.task_cas(t["task_hash"], "poster", "", (t["state"],),
+                                verdict=json.dumps(verdict))
+            self._queue(t["assignee"], "task.accept" if t["state"] == "accepted" else "task.reject",
+                        {"task_hash": t["task_hash"], "epoch": t["epoch"], **verdict}, touch=False)
+        self.log(f"reconciled stranded escrow for {t['task_hash'][:12]} ({t['state']})")
+        return 1
 
-    def _adopt_terminal(self, t: dict) -> bool:
+    def reconcile_escrow(self, prompt_task: str = "") -> int:
+        """Reconcile task holds without letting a dispute pile consume the ledger timestamp window."""
+        with self._escrow_reconcile_lock:
+            fixed = 0
+            self._retry_worker_submits()
+            self._retry_poster_receipts()
+            self._rearm_approvals()
+            self._finish_pending_assignments()
+            posters = [t for t in self.store.tasks_in_states(
+                ("accepted", "rejected", "expired"), role="poster")
+                if t["spec"]["reward"]["amount"] > 0
+                and not (self.settle.open_on_assign and t["funding_state"] in {"paid", "refunded"})
+                and not (self.settle.open_on_assign and not t["hold_id"])]
+            workers = []
+            if self.settle.open_on_assign:
+                workers = [t for t in self.store.tasks_in_states(
+                    ("submitted", "accepted", "rejected", "expired"), role="worker")
+                    if t["spec"]["reward"]["amount"] > 0 and t.get("hold_id")
+                    and t.get("funding_state") not in {"paid", "refunded", "unfunded"}]
+            candidates = posters + workers
+            if not candidates:
+                return fixed
+            if prompt_task:
+                for t in candidates:
+                    if t["task_hash"] == prompt_task:
+                        self._clear_escrow_poll(t)
+                candidates.sort(key=lambda t: t["task_hash"] != prompt_task)
+                start = 0
+            else:
+                start = self._escrow_rr_cursor % len(candidates)
+            budget = [ESCROW_STATUS_MAX_PER_PASS]
+
+            def get_status(task: dict):
+                if budget[0] <= 0:
+                    return _STATUS_DEFERRED
+                budget[0] -= 1
+                try:
+                    return self.settle.status(task["task_hash"], hold_id=task["hold_id"] or "")
+                except SettlementError as exc:
+                    self.log(f"escrow status for {task['task_hash'][:12]} unavailable: {exc}")
+                    return None
+
+            scanned = 0
+            for offset in range(len(candidates)):
+                index = (start + offset) % len(candidates)
+                t = candidates[index]
+                scanned += 1
+                if not self._escrow_poll_due(t, self._clock()):
+                    continue
+                st = get_status(t)
+                if st is _STATUS_DEFERRED:
+                    break
+                self._escrow_rr_cursor = (index + 1) % len(candidates)
+                if st is None:   # ledger unreachable: back off like any other wait, never retry every sweep
+                    self._defer_escrow_poll(t, self._clock())
+                    continue
+                if t["role"] == "poster":
+                    fixed += self._reconcile_poster_hold(t, st, get_status)
+                else:
+                    fixed += int(self._adopt_worker_hold_status(t, st, self._clock()))
+                if budget[0] <= 0:
+                    break
+            if scanned == len(candidates) and budget[0] == ESCROW_STATUS_MAX_PER_PASS:
+                self._escrow_rr_cursor = (start + 1) % len(candidates)
+            return fixed
+
+    def _adopt_terminal(self, t: dict, *, status: Optional[dict] = None,
+                        status_getter=None) -> bool:
         """The ledger refused our release/refund with 409 (the hold already reached the other terminal
         state, e.g. its own expiry sweep refunded it). Re-read it and record what the ledger says."""
         if not self.settle.open_on_assign:
             return False
-        try:
-            st = self.settle.status(t["task_hash"], hold_id=t["hold_id"] or "")
-        except SettlementError as e:
-            self.log(f"escrow status for {t['task_hash'][:12]} unavailable: {e}")
-            return False
+        st = status
+        if st is None and status_getter is not None:
+            st = status_getter(t)
+            if st is _STATUS_DEFERRED:
+                return False
+        elif st is None:
+            try:
+                st = self.settle.status(t["task_hash"], hold_id=t["hold_id"] or "")
+            except SettlementError as e:
+                self.log(f"escrow status for {t['task_hash'][:12]} unavailable: {e}")
+                return False
         if not st or st.get("state") not in ("released", "refunded"):
             return False
         self._set_funding(t["task_hash"], "poster", "",
                           "paid" if st["state"] == "released" else "refunded")
+        self._clear_escrow_poll(t)
         self.log(f"adopted ledger state {st['state']} for {t['task_hash'][:12]} ({t['state']})")
         return True
 
@@ -2274,8 +2475,12 @@ class Node:
                         if t["assignee"]:
                             body = {"task_hash": t["task_hash"], "epoch": t["epoch"],
                                     "reasons": ["deadline passed"]}
-                            if self.settle.open_on_assign and receipt and not receipt.get("error"):
+                            if (self.settle.open_on_assign and receipt and not receipt.get("error")
+                                    and receipt.get("event") in {"released", "refunded"}):
                                 body["settlement"] = receipt
+                            elif receipt and receipt.get("event") == "disputed":
+                                body["funding_state"] = "disputed"
+                                self._defer_escrow_poll(t, self._clock())
                             self._queue(t["assignee"], "task.reject", body, touch=False)
                         n += 1
                 elif t["role"] == "worker" and t["state"] in ("offered", "claimed", "assigned"):
@@ -2305,7 +2510,8 @@ class Node:
             status = self.settle.status(task["task_hash"], hold_id=task["hold_id"] or "")
         except SettlementError as e:
             raise ValueError(f"escrow: {e}") from e
-        funding = {"open": "funded", "released": "paid", "refunded": "refunded"}.get(
+        funding = {"open": "funded", "disputed": "disputed", "released": "paid",
+                   "refunded": "refunded"}.get(
             (status or {}).get("state"), "unfunded")
         return {"task_hash": task["task_hash"], "funding": funding,
                 "hold_id": task["hold_id"], "settlement": status}
@@ -2606,22 +2812,37 @@ class Node:
             if isinstance(settlement, dict):       # the poster's receipt (verifiable on-chain later)
                 v["settlement"] = {k: body["settlement"].get(k) for k in ("adapter", "event", "amount", "unit")}
             verdict = json.dumps(v)
+            paid_task = t["spec"]["reward"]["amount"] > 0 and self.settle.open_on_assign
+            event = settlement.get("event") if isinstance(settlement, dict) else ""
+            claimed = paid_task and (event in {"released", "refunded", "disputed"}
+                                     or body.get("funding_state") == "disputed")
+            claimed_reason = (PAYMENT_CLAIMED_REASON if event == "released"
+                              else REFUND_CLAIMED_REASON if event == "refunded"
+                              else "dispute claimed, confirming with the ledger")
             if body.get("epoch") == 0:
                 self.store.task_cas(h, "worker", c["person"], ("claimed",), state="lost", verdict=verdict)
             elif kind == "task.reject" and v["reasons"] == ["deadline passed"]:
+                funding = "pending" if claimed else ""
                 self.store.task_cas(h, "worker", c["person"], ("assigned", "submitted", "expired"),
                                     state="expired", verdict=verdict,
-                                    **({"funding_state": "refunded"} if isinstance(settlement, dict) else {}))
+                                    **({"funding_state": funding, "funding_reason": claimed_reason}
+                                       if funding else {}))
             else:
                 final_state = "accepted" if kind == "task.accept" else "rejected"
                 funding = ""
-                if t["spec"]["reward"]["amount"] > 0 and self.settle.open_on_assign:
-                    funding = ("paid" if kind == "task.accept" and isinstance(settlement, dict)
-                               else "refunded" if kind == "task.reject" and isinstance(settlement, dict)
-                               else "funded")
+                if paid_task:
+                    funding = "pending" if claimed else "funded"
                 self.store.task_cas(h, "worker", c["person"], ("submitted", "accepted", "rejected"),
                                     state=final_state, verdict=verdict,
-                                    **({"funding_state": funding} if funding else {}))
+                                    **({"funding_state": funding,
+                                        "funding_reason": claimed_reason if claimed else ""}
+                                       if funding else {}))
+            if paid_task and body.get("epoch") != 0:
+                current = self.store.task_get(h, "worker", c["person"])
+                if current:
+                    if claimed:
+                        self.log(f"task {h[:12]}: {claimed_reason}")
+                    self._confirm_worker_settlement(current)
             return
         raise ValueError(f"unknown task step {kind}")
 
