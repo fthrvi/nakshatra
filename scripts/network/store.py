@@ -71,7 +71,8 @@ CREATE TABLE IF NOT EXISTS contact_revocations (person TEXT NOT NULL, grant_id T
     PRIMARY KEY(person, grant_id));
 CREATE TABLE IF NOT EXISTS contact_revocation_seq (person TEXT PRIMARY KEY, seq INTEGER NOT NULL,
     received_at INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS revocation_sent (person TEXT PRIMARY KEY, seq INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS revocation_sent (person TEXT NOT NULL, node TEXT NOT NULL,
+    seq INTEGER NOT NULL, PRIMARY KEY(person, node));
 """
 
 
@@ -102,6 +103,7 @@ class Store:
         os.chmod(self._db_path, 0o600)
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.executescript(SCHEMA)
+        self._migrate_revocation_sent()
         # An address disabled by the pre-hardening build is already retired evidence. Preserve it
         # before any caller can try to re-register the same aid after an upgrade.
         self._db.execute(
@@ -216,6 +218,26 @@ class Store:
                 self._db.execute(
                     "INSERT OR IGNORE INTO invite_codes(invite_id,code) VALUES (?,?)",
                     (nonce, self._enc("invite_codes", "code", self._pk((nonce,)), code)))
+
+    def _migrate_revocation_sent(self) -> None:
+        """Replace the branch's person-only ACK cache with fail-closed person+node state.
+
+        Old rows cannot be bound safely: the contact node may already have changed before this
+        upgrade. Dropping only this public, replayable side table makes every contact receive the
+        cumulative record once more and leaves every pre-existing non-revocation table untouched.
+        """
+        if self._has_column("revocation_sent", "node"):
+            return
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            self._db.execute("DROP TABLE revocation_sent")
+            self._db.execute(
+                "CREATE TABLE revocation_sent (person TEXT NOT NULL, node TEXT NOT NULL, "
+                "seq INTEGER NOT NULL, PRIMARY KEY(person, node))")
+            self._db.execute("COMMIT")
+        except Exception:
+            self._db.execute("ROLLBACK")
+            raise
 
     def _fix_modes(self) -> None:
         os.chmod(self.dir, 0o700)
@@ -766,15 +788,15 @@ class Store:
         rows = self._q("SELECT seq FROM contact_revocation_seq WHERE person=?", (person,))
         return int(rows[0][0]) if rows else 0
 
-    def revocation_sent_seq(self, person: str) -> int:
-        rows = self._q("SELECT seq FROM revocation_sent WHERE person=?", (person,))
+    def revocation_sent_seq(self, person: str, node: str) -> int:
+        rows = self._q("SELECT seq FROM revocation_sent WHERE person=? AND node=?", (person, node))
         return int(rows[0][0]) if rows else 0
 
-    def mark_revocation_sent(self, person: str, seq: int) -> None:
+    def mark_revocation_sent(self, person: str, node: str, seq: int) -> None:
         self._q(
-            "INSERT INTO revocation_sent(person,seq) VALUES (?,?) "
-            "ON CONFLICT(person) DO UPDATE SET seq=MAX(revocation_sent.seq,excluded.seq)",
-            (person, int(seq)))
+            "INSERT INTO revocation_sent(person,node,seq) VALUES (?,?,?) "
+            "ON CONFLICT(person,node) DO UPDATE SET seq=MAX(revocation_sent.seq,excluded.seq)",
+            (person, node, int(seq)))
 
     def revocation_status(self) -> dict:
         own = self.own_revocation()
@@ -782,7 +804,9 @@ class Store:
                     for person, seq, count in self._q(
                         "SELECT s.person,s.seq,COUNT(r.grant_id) FROM contact_revocation_seq s "
                         "LEFT JOIN contact_revocations r ON r.person=s.person GROUP BY s.person,s.seq")}
-        sent = {person: int(seq) for person, seq in self._q("SELECT person,seq FROM revocation_sent")}
+        sent = {person: int(seq) for person, seq in self._q(
+            "SELECT r.person,r.seq FROM revocation_sent r JOIN contacts c "
+            "ON c.person=r.person AND c.node=r.node")}
         return {"own": own, "received": received, "sent": sent}
 
     def set_direct(self, person: str, on: bool) -> None:
@@ -801,7 +825,10 @@ class Store:
         self._q("UPDATE contacts SET direct_hint=NULL, p2p=0 WHERE person=?", (person,))
 
     def remove_contact(self, person: str) -> None:
-        self._q("DELETE FROM contacts WHERE person=?", (person,))
+        def fn(db):
+            db.execute("DELETE FROM contacts WHERE person=?", (person,))
+            db.execute("DELETE FROM revocation_sent WHERE person=?", (person,))
+        self._tx(fn)
 
     # outbox
     def queue(self, nonce: str, to_person: str, frame: dict) -> None:

@@ -75,7 +75,8 @@ except ImportError:  # the release ships both; a dev checkout may point at a sth
     sys.path.insert(0, _alt)
     from sthambha.signer import MAX_SKEW_S, SignerError, canonical, verify_envelope  # noqa: E402
 
-from network.revocation import decode_record, read_private_json, verify_record  # noqa: E402
+from network.revocation import (decode_record, read_private_json, revocation_lock,  # noqa: E402
+                                verify_record)
 
 MSG_DOMAIN = "nak-msg-v1"
 MAX_FRAME = 1 << 20
@@ -283,15 +284,30 @@ class Node:
         self.store = Store(state_dir, data_key)
         self._pending_revocation_path = Path(state_dir) / "pending-revocation.json"
         try:
-            pending = read_private_json(self._pending_revocation_path)
-            if pending is not None:
-                pending = verify_record(pending, self.person)
-                current = self.store.own_revocation()
-                if not current or pending["seq"] > current["seq"]:
-                    if current and not set(current["grant_ids"]).issubset(pending["grant_ids"]):
-                        raise ValueError("pending revocation record omits a previously revoked grant")
-                    self.store.set_own_revocation(pending)
-                self._pending_revocation_path.unlink()
+            with revocation_lock(state_dir):
+                # A conforming writer cannot replace this file while the lock is held. Re-reading
+                # before unlink also protects against an older/uncoordinated writer: consume its
+                # newer record instead of deleting a pathname that no longer names what we read.
+                for _attempt in range(16):
+                    pending = read_private_json(self._pending_revocation_path)
+                    if pending is None:
+                        break
+                    pending = verify_record(pending, self.person)
+                    current = self.store.own_revocation()
+                    if not current or pending["seq"] > current["seq"]:
+                        if current and not set(current["grant_ids"]).issubset(pending["grant_ids"]):
+                            raise ValueError(
+                                "pending revocation record omits a previously revoked grant")
+                        self.store.set_own_revocation(pending)
+                    latest = read_private_json(self._pending_revocation_path)
+                    if latest is None:
+                        break
+                    latest = verify_record(latest, self.person)
+                    if (latest["seq"], latest["sig"]) == (pending["seq"], pending["sig"]):
+                        self._pending_revocation_path.unlink()
+                        break
+                else:
+                    raise ValueError("pending revocation record changed too often during startup")
         except Exception as exc:
             self.log(f"WARNING: leaving unreadable pending revocation record at "
                      f"{self._pending_revocation_path}: {exc}")
@@ -1297,6 +1313,7 @@ class Node:
             advertised = True
 
         c0 = self.store.contact(person) or {}
+        session_node = peer_node or c0.get("node", "")
         if p2p_failed:
             try:
                 send_frame(ch, {"t": "addr", "endpoints": [], "p2p": False, "failed": True}, lock)
@@ -1327,7 +1344,7 @@ class Node:
                     elif t == "revs-ack":
                         seq = frame.get("seq")
                         if type(seq) is int and seq in sent_rev_seqs:
-                            self.store.mark_revocation_sent(person, seq)
+                            self.store.mark_revocation_sent(person, session_node, seq)
                             wake.set()
                     elif t == "revs":
                         try:
@@ -1372,7 +1389,7 @@ class Node:
                 if not self.store.contact(person):
                     return
                 own_revs = self.store.own_revocation()
-                if own_revs and own_revs["seq"] > self.store.revocation_sent_seq(person) and \
+                if own_revs and own_revs["seq"] > self.store.revocation_sent_seq(person, session_node) and \
                         own_revs["seq"] not in sent_rev_seqs:
                     sent_rev_seqs.add(own_revs["seq"])
                     send_frame(ch, {"t": "revs", "rec": own_revs}, lock)

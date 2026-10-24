@@ -5,6 +5,7 @@ import base64
 import json
 import os
 import re
+import sqlite3
 import sys
 import threading
 import time
@@ -169,6 +170,7 @@ def test_blob_rejects_noncanonical_and_over_size():
 def test_store_union_stale_and_sent_semantics(tmp_path):
     store = Store(tmp_path / "store", b"k" * 32)
     private, person = _key()
+    node = "ab" * 32
     first = _record(private, person, 2, ("1111111111111111", "2222222222222222"))
     later = _record(private, person, 3, ("2222222222222222",))
     stale = _record(private, person, 1, ("3333333333333333",))
@@ -177,9 +179,48 @@ def test_store_union_stale_and_sent_semantics(tmp_path):
     assert not store.apply_contact_revocation(person, stale)
     assert store.revoked_grants(person) == {"1111111111111111", "2222222222222222"}
     assert store.contact_revocation_seq(person) == 3
-    store.mark_revocation_sent(person, 3)
-    store.mark_revocation_sent(person, 2)
-    assert store.revocation_sent_seq(person) == 3
+    store.mark_revocation_sent(person, node, 3)
+    store.mark_revocation_sent(person, node, 2)
+    assert store.revocation_sent_seq(person, node) == 3
+
+
+def test_ack_is_due_again_after_remove_readd_or_in_place_node_change(tmp_path):
+    store = Store(tmp_path / "node-bound-acks", b"n" * 32)
+    private, person = _key()
+    first_node, second_node, third_node = "11" * 32, "22" * 32, "33" * 32
+    store.set_own_revocation(_record(private, person, 7))
+    store.upsert_contact(person, first_node, "active")
+    store.mark_revocation_sent(person, first_node, 7)
+    assert store.revocation_sent_seq(person, first_node) == 7
+
+    store.remove_contact(person)
+    assert store._q("SELECT person,node,seq FROM revocation_sent WHERE person=?", (person,)) == []
+    store.upsert_contact(person, second_node, "active")
+    assert store.own_revocation()["seq"] > store.revocation_sent_seq(person, second_node)
+    assert person not in store.revocation_status()["sent"]
+
+    store.mark_revocation_sent(person, second_node, 7)
+    store.upsert_contact(person, third_node, "active")
+    assert store.own_revocation()["seq"] > store.revocation_sent_seq(person, third_node)
+    assert person not in store.revocation_status()["sent"]
+
+
+def test_person_only_ack_table_migrates_fail_closed_and_idempotently(tmp_path):
+    state_dir = tmp_path / "old-ack-store"
+    state_dir.mkdir()
+    db = sqlite3.connect(state_dir / "net.sqlite")
+    db.execute("CREATE TABLE revocation_sent (person TEXT PRIMARY KEY, seq INTEGER NOT NULL)")
+    db.execute("INSERT INTO revocation_sent(person,seq) VALUES (?,?)", ("aa" * 32, 9))
+    db.commit()
+    db.close()
+
+    store = Store(state_dir, b"m" * 32)
+    assert [row[1] for row in store._db.execute("PRAGMA table_info(revocation_sent)")] == [
+        "person", "node", "seq"]
+    assert store.revocation_sent_seq("aa" * 32, "bb" * 32) == 0
+    store._db.close()
+    reopened = Store(state_dir, b"m" * 32)
+    assert reopened.revocation_sent_seq("aa" * 32, "bb" * 32) == 0
 
 
 def test_store_rejects_cumulative_union_over_limit_without_changing_state(tmp_path):
@@ -244,10 +285,10 @@ def test_end_to_end_push_revokes_and_ack_records_sent_seq(net):
     copied_env = a.node._sign("msg", b.person_pub, body, touch=False)
     grant_id = copied_env["grant"]["grant_id"]
     record = _record(a.person_priv, a.person_pub, 1, (grant_id,))
-    assert a.node.store.revocation_sent_seq(b.person_pub) == 0
+    assert a.node.store.revocation_sent_seq(b.person_pub, b.node.node) == 0
     a.node.install_own_revocation(record)
     assert wait(lambda: b.node.store.revoked_grants(a.person_pub) == {grant_id})
-    assert wait(lambda: a.node.store.revocation_sent_seq(b.person_pub) == 1)
+    assert wait(lambda: a.node.store.revocation_sent_seq(b.person_pub, b.node.node) == 1)
     reply = b.node._receive_checked(a.person_pub, {"env": copied_env, "body": body})
     assert reply == {"t": "nack", "mid": body["mid"], "why": "does not verify: grant revoked"}
 
@@ -257,7 +298,7 @@ def test_unsent_ack_does_not_advance_state(net):
     channel, lock = b.node._sessions[a.person_pub]
     nakd.send_frame(channel, {"t": "revs-ack", "seq": 999}, lock)
     time.sleep(0.2)
-    assert a.node.store.revocation_sent_seq(b.person_pub) == 0
+    assert a.node.store.revocation_sent_seq(b.person_pub, b.node.node) == 0
 
 
 def test_unacked_revocation_is_sent_only_once_per_session(net, monkeypatch):
@@ -280,7 +321,7 @@ def test_unacked_revocation_is_sent_only_once_per_session(net, monkeypatch):
         a.node._wake[b.person_pub].set()
         time.sleep(0.01)
     assert sent == [1]
-    assert a.node.store.revocation_sent_seq(b.person_pub) == 0
+    assert a.node.store.revocation_sent_seq(b.person_pub, b.node.node) == 0
     a.node.install_own_revocation(_record(
         a.person_priv, a.person_pub, 2, ("0123456789abcdef", "fedcba9876543210")))
     assert wait(lambda: sent == [1, 2])
@@ -576,6 +617,36 @@ def test_daemon_rejects_oversize_pending_before_reading_and_keeps_starting(tmp_p
         assert node.store.own_revocation() is None
         assert pending.stat().st_size == MAX_BLOB + 1
         assert any(f"exceeds the {MAX_BLOB}-byte size limit" in line for line in logs)
+    finally:
+        node.stop()
+
+
+def test_daemon_startup_installs_replacement_written_after_pending_read(tmp_path, monkeypatch):
+    state_dir, node_key, signer, private, person = _daemon_material(tmp_path, "pending-race")
+    pending = state_dir / "pending-revocation.json"
+    first = _record(private, person, 1, ("1111111111111111",))
+    second = _record(
+        private, person, 2, ("1111111111111111", "2222222222222222"))
+    pending.write_text(json.dumps(first))
+    pending.chmod(0o600)
+    real_read = nakd.read_private_json
+    reads = 0
+
+    def replace_after_first_read(path):
+        nonlocal reads
+        record = real_read(path)
+        reads += 1
+        if reads == 1:
+            path.write_text(json.dumps(second))
+            path.chmod(0o600)
+        return record
+
+    monkeypatch.setattr(nakd, "read_private_json", replace_after_first_read)
+    node = nakd.Node(state_dir, node_key, signer.handle, agent="pa",
+                     relay=("127.0.0.1", 9))
+    try:
+        assert node.store.own_revocation() == second
+        assert not pending.exists()
     finally:
         node.stop()
 

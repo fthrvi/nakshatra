@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import base64
 import binascii
+import fcntl
 import json
 import os
 import re
 import stat
+from contextlib import contextmanager
 from pathlib import Path
 
 from cryptography.exceptions import InvalidSignature
@@ -22,6 +24,37 @@ _PERSON_RE = re.compile(r"[0-9a-f]{64}\Z")
 _GRANT_RE = re.compile(r"[0-9a-f]{16}\Z")
 _SIG_RE = re.compile(r"[0-9a-f]{128}\Z")
 _FIELDS = {"schema", "person", "seq", "issued_at", "grant_ids", "sig"}
+
+
+class RevocationLockError(ValueError):
+    """The local pending-revocation lock could not be acquired safely."""
+
+
+@contextmanager
+def revocation_lock(state_dir: Path):
+    """Serialize pending-record read/install/remove transactions across local processes."""
+    lock_path = Path(state_dir) / "pending-revocation.lock"
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(str(lock_path), flags, 0o600)
+    except OSError as exc:
+        raise RevocationLockError(f"cannot open revocation lock {lock_path}: {exc}") from exc
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or \
+                stat.S_IMODE(info.st_mode) != 0o600:
+            raise RevocationLockError(
+                f"revocation lock {lock_path} must be a current-user-owned 0600 regular file")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except OSError as exc:
+            raise RevocationLockError(f"cannot lock revocation state at {lock_path}: {exc}") from exc
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
 
 def read_private_json(path: Path, max_bytes: int = MAX_BLOB) -> dict | None:

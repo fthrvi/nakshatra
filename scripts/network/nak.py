@@ -1958,28 +1958,12 @@ def _stored_own_revocation(net_dir: Path, person_pub: str) -> dict | None:
 @contextmanager
 def _revocation_lock(net_dir: Path):
     """Serialize every local read/sign/install transaction across CLI processes."""
-    lock_path = net_dir / "pending-revocation.lock"
-    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    from network.revocation import RevocationLockError, revocation_lock
     try:
-        fd = os.open(str(lock_path), flags, 0o600)
-    except OSError as exc:
-        raise SystemExit(f"refused: cannot open revocation lock {lock_path}: {exc}") from exc
-    try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or \
-                stat.S_IMODE(info.st_mode) != 0o600:
-            raise SystemExit(
-                f"refused: revocation lock {lock_path} must be a current-user-owned 0600 regular file")
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-        except OSError as exc:
-            raise SystemExit(f"refused: cannot lock revocation state at {lock_path}: {exc}") from exc
-        yield
-    finally:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        finally:
-            os.close(fd)
+        with revocation_lock(net_dir):
+            yield
+    except RevocationLockError as exc:
+        raise SystemExit(f"refused: {exc}") from exc
 
 
 def _revoke(args, sock: Path) -> int:
