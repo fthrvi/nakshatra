@@ -78,7 +78,10 @@ READ_TOOLS = {
                  "max_tokens": {"type": "integer", "description": "maximum reply tokens (default 256)"}}),
     "nak_balance": ("This node operator's inference-credit balance and tier (the signer is the account).", {}),
     "nak_wallet": ("This node operator's read-only wallet status and deposit address; cannot bind or withdraw.", {}),
-    "nak_worker_status": ("This node's worker configuration, verified build state, and unit state; no secrets.", {}),
+    "nak_worker_status": ("This node's worker configuration, verified build state, and unit state; no secrets. "
+                          "preflight=true also checks GPU/CPU, RAM, disk and runtime against the signed packages "
+                          "(runs GPU vendor tools; ask only when setting up a worker).",
+                          {"preflight": {"type": "boolean", "description": "include the hardware preflight (default false)"}}),
 }
 CONNECT_TOOLS = {
     "nak_accept": ("Accept a pending connection request (id from nak_requests); optional name to call them.",
@@ -357,7 +360,7 @@ class Server:
             }, sort_keys=True)
         if name == "nak_worker_status":
             from network.nak import _worker_status
-            return json.dumps(_safe_worker_status(_worker_status(subprocess)),
+            return json.dumps(_safe_worker_status(_worker_status(subprocess, preflight=args.get("preflight") is True)),
                               indent=1, sort_keys=True)
         if name == "nak_tasks":
             return render_tasks(c.tasks(str(args.get("role") or "")))

@@ -34,7 +34,7 @@ State as of 2026-10-23 (release 0.15.22 on the public canary; clean outsider joi
 | Item | Exists | Missing | Size |
 |---|---|---|---|
 | Worker admission | `nak invite --kind worker --tier known` → redeem proves node key → roster row | Same "who invites a stranger" gap as §1 | (see §1) |
-| Running a worker | `nak worker preflight` reports NVIDIA, AMD ROCm/sysfs, CPU fallback, RAM, worker-state disk, runtime readiness, and a plain verdict for each signed package before `build`; `--json` and the read-only `nak_worker_status.preflight` field expose the same shape. JOIN.md also shows build/on/off/status, owner priority, and idle unload/reload. | — | — |
+| Running a worker | `nak worker preflight` reports NVIDIA, AMD ROCm/sysfs, CPU fallback, RAM, worker-state disk, runtime readiness, and a plain verdict for each signed package before `build`; `--json` and `nak_worker_status` with `preflight=true` (opt-in; status polls never run GPU tools) expose the same shape. JOIN.md also shows build/on/off/status, owner priority, and idle unload/reload. | — | — |
 | Models to serve | The signed release catalog records conservative requirements for `llama32-3b` (4 GiB VRAM, or 8 GiB available RAM for CPU fallback; 12 GiB disk). | More signed packages matching common consumer GPUs | M |
 | Getting paid | Paid inference live (hold before compute, worker earns); M2 task escrow live (hold at assign, paid on accept) | Earnings cash out only at known+ after a 7-day hold, and withdrawals are not switched on (see §5) | (see §5) |
 

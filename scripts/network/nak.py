@@ -1508,7 +1508,7 @@ def _worker_relay(_sp, enabled: bool) -> None:
     print(f"worker relay {'ON' if enabled else 'OFF'}")
 
 
-def _worker_status(_sp) -> dict:
+def _worker_status(_sp, *, preflight: bool = False) -> dict:
     _root, record_path, env_path = _worker_paths()
     build = None
     build_state = "missing"
@@ -1529,7 +1529,7 @@ def _worker_status(_sp) -> dict:
         except OSError as e:
             unit[prop] = f"unavailable: {e}"
     paid_values = _env_file_values(env_path)
-    return {
+    status = {
         "configured": env_path.exists(),
         "allow_relayed_activation": _worker_relay_enabled(env_path),
         "paid_admission": paid_values.get("NAKSHATRA_PAID_ADMISSION") == "1",
@@ -1538,8 +1538,11 @@ def _worker_status(_sp) -> dict:
         "build_state": build_state,
         "build": build,
         "unit": unit,
-        "preflight": _worker_preflight(_sp),
     }
+    # The preflight runs GPU vendor tools (nvidia-smi, rocm-smi); only on an explicit request, never on a status poll.
+    if preflight:
+        status["preflight"] = _worker_preflight(_sp)
+    return status
 
 
 def _worker_preflight(_sp) -> dict:

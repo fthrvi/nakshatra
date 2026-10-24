@@ -117,7 +117,7 @@ process's standard input and output.
 
 Small models sometimes claim success before checking the network state. After each task action,
 call `nak_tasks` and read the returned state instead of trusting the model's sentence. Before worker
-setup, the read-only `preflight` field in `nak_worker_status` gives the same package verdicts as
+setup, `nak_worker_status` with `preflight: true` (opt-in, read-only) gives the same package verdicts as
 `nak worker preflight --json`; after setup, the rest of the status confirms the build and unit.
 There is no general `nak_verify` or `nak_task_status` tool today; these tools confirm network state,
 not whether arbitrary output is correct.
@@ -164,7 +164,7 @@ There are 18 default tools and 3 connection tools enabled only with `--allow-con
 | `nak_ask` | Makes one non-streaming completion through the local gateway and reports charged credits when returned. | Cannot bypass the gateway, credit gate, or loopback boundary. |
 | `nak_balance` | Reads this node operator's signed ledger balance and tier. | Cannot select or inspect another account. |
 | `nak_wallet` | Reads this operator's deposit address, balance, withdrawable amount, payout state, and pending withdrawals. | Cannot bind an address or withdraw; use the human CLI. |
-| `nak_worker_status` | Shows read-only signed-package preflight results, worker configuration, verified build state, and unit state with secret-shaped fields removed. | Cannot start, stop, build, or reconfigure the worker. |
+| `nak_worker_status` | Shows worker configuration, verified build state, and unit state with secret-shaped fields removed; `preflight: true` adds the read-only signed-package hardware check. | Cannot start, stop, build, or reconfigure the worker. |
 | `nak_accept` | Accepts a pending request when `--allow-connect` was chosen by the person. | Disabled by default; cannot grant mesh or inference authority. |
 | `nak_decline` | Declines a pending request when `--allow-connect` is enabled. | Disabled by default. |
 | `nak_redeem` | Redeems a contact invite when `--allow-connect` is enabled. | Disabled by default; cannot redeem worker admission or join WireGuard. |

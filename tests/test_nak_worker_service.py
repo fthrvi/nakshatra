@@ -1002,7 +1002,8 @@ def test_worker_status_reports_build_and_unit_state(tmp_path, monkeypatch, capsy
     out = json.loads(capsys.readouterr().out)
     assert out["configured"] is True and out["build_state"] == "ready"
     assert out["unit"] == {"active": "active", "enabled": "enabled"}
-    assert out["preflight"]["schema"] == "nak-worker-preflight/1"
+    assert "preflight" not in out   # status polls never run the GPU probes
+    assert nak._worker_status(subprocess, preflight=True)["preflight"]["schema"] == "nak-worker-preflight/1"
 
 
 @pytest.mark.parametrize("url", ["https://pillar.test/base", "https://pillar.test/?token=x",

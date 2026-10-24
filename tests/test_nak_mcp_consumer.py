@@ -161,7 +161,7 @@ def test_nak_wallet_is_read_only_signed_and_redacts_key_material(tmp_path, monke
 
 
 def test_worker_status_redacts_secret_shaped_fields_and_key_paths(monkeypatch):
-    monkeypatch.setattr(nak, "_worker_status", lambda _sp: {
+    monkeypatch.setattr(nak, "_worker_status", lambda _sp, **_kw: {
         "configured": True,
         "unit": {"active": "active"},
         "preflight": {
