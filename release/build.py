@@ -39,7 +39,10 @@ import releasekit as rk  # noqa: E402
 
 LATEST_TTL_S = 60 * 86400        # the signed "latest" pointer is refused after this (republish to extend)
 PINNED_GO_VERSION = "go1.25.7"
-SPEC = json.loads((Path(__file__).resolve().parent / "spec.json").read_text())
+REPO_ROOT = Path(__file__).resolve().parent.parent
+# Tests may replace this with an in-memory spec.  Keep the production spec lazy: a --ref build
+# must not read any release input from the working tree merely to discover where that ref lives.
+SPEC = None
 _PINNED_REQUIREMENT = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([^;\s]+)$")
 _PACKAGE_SIGNER_SCHEMA = "nak-package-signers/1"
 _ED25519_PUBLIC_KEY = re.compile(r"^[0-9a-f]{64}$")
@@ -92,19 +95,27 @@ def _git(repo: Path, *args: str) -> str:
     return subprocess.check_output(["git", "-C", str(repo), *args], text=True).strip()
 
 
+def _working_tree_spec() -> dict:
+    if SPEC is not None:
+        return SPEC
+    return json.loads((REPO_ROOT / "release" / "spec.json").read_text())
+
+
 def _spec_from_refs(refs: dict[str, str]) -> dict:
     """Load the release spec from the exact Nakshatra ref when one was requested."""
     ref = refs.get("nakshatra")
     if ref is None:
-        return SPEC
+        return _working_tree_spec()
     try:
-        component = next(c for c in SPEC["components"] if c["name"] == "nakshatra")
-        repo = Path(os.path.expanduser(component["repo"]))
+        # The checkout containing this build script is the only bootstrap locator.  In particular,
+        # do not read the live spec to learn its own repo path: that would let a dirty spec redirect
+        # every subsequent release input before we ever inspect the requested commit.
+        repo = REPO_ROOT
         commit = _git(repo, "rev-parse", f"{ref}^{{commit}}")
         raw = subprocess.check_output(
             ["git", "-C", str(repo), "show", f"{commit}:release/spec.json"], text=True)
         spec = json.loads(raw)
-    except (KeyError, StopIteration, subprocess.CalledProcessError, json.JSONDecodeError) as e:
+    except (subprocess.CalledProcessError, json.JSONDecodeError) as e:
         raise RuntimeError("could not load release/spec.json from the requested Nakshatra ref") from e
     if not isinstance(spec, dict) or not isinstance(spec.get("components"), list):
         raise RuntimeError("release/spec.json from the requested Nakshatra ref is malformed")

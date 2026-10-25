@@ -25,6 +25,7 @@ import base64
 import errno
 import fcntl
 import functools
+import hashlib
 import json
 import os
 import shutil
@@ -576,33 +577,33 @@ class Installer:
 
     # ── fetch + verify ──
     def _keyroll_tip(self, source: str, channel: str, work: Path, pubkey: str,
-                     forbidden: tuple[str, ...]) -> str:
+                     forbidden: tuple[str, ...]) -> tuple[str, tuple[str, ...]]:
         path = work / "keyroll.json"
         try:
             if not path.exists():
                 _fetch(source, f"{channel}/keyroll.json", path)
             chain = json.loads(path.read_text())
-            return rk.keyroll_tip(chain, pubkey, forbidden=forbidden)
+            return rk.keyroll_advance(chain, pubkey, forbidden=forbidden)
         except Exception as e:
             raise InstallError(
                 "release metadata is not signed by the pinned release key and keyroll.json does not provide "
                 f"a valid roll from the pinned key: {e}") from e
 
     def _release_signature_key(self, obj: dict, source: str, channel: str, work: Path,
-                               pubkey: str, forbidden: tuple[str, ...]) -> str:
+                               pubkey: str, forbidden: tuple[str, ...]) -> tuple[str, tuple[str, ...]]:
         if rk.verify(obj, pubkey):
-            return pubkey
+            return pubkey, ()
         keyid = ((obj.get("sig") or {}).get("keyid")
                  if isinstance(obj, dict) else None)
         shown = keyid if isinstance(keyid, str) else "malformed"
         try:
-            tip = self._keyroll_tip(source, channel, work, pubkey, forbidden)
+            tip, retired = self._keyroll_tip(source, channel, work, pubkey, forbidden)
         except InstallError as e:
             raise InstallError(f"release signature keyid {shown!r} is not trusted: {e}") from e
         if not rk.verify(obj, tip):
             raise InstallError(
                 f"release signature keyid {shown!r} is not the validated key-roll tip")
-        return tip
+        return tip, retired
 
     def fetch_verified(self, source: str, channel: str, pubkey: str, version=None,
                        *, forbidden_pubkeys=()) -> tuple:
@@ -611,7 +612,7 @@ class Installer:
         if version is None:
             _fetch(source, f"{channel}/latest.json", work / "latest.json")
             latest = json.loads((work / "latest.json").read_text())
-            latest_key = self._release_signature_key(
+            latest_key, latest_retired = self._release_signature_key(
                 latest, source, channel, work, pubkey, tuple(forbidden_pubkeys))
             if latest.get("channel") != channel:
                 raise InstallError("latest.json names a different release channel")
@@ -622,13 +623,21 @@ class Installer:
                 raise InstallError("the release host is serving an expired latest.json (stale or replayed)")
             version = latest["version"]
         _fetch(source, f"{channel}/{version}/manifest.json", work / "manifest.json")
-        man = json.loads((work / "manifest.json").read_text())
-        manifest_key = self._release_signature_key(
+        manifest_bytes = (work / "manifest.json").read_bytes()
+        if latest_key is not None:
+            got_manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+            if latest.get("manifest_sha256") != got_manifest_sha256:
+                raise InstallError(
+                    "manifest.json bytes do not match the sha256 signed by latest.json")
+        man = json.loads(manifest_bytes)
+        manifest_key, manifest_retired = self._release_signature_key(
             man, source, channel, work, pubkey, tuple(forbidden_pubkeys))
         if man.get("schema") != rk.MANIFEST_SCHEMA:
             raise InstallError("manifest.json has an unsupported schema")
         if latest_key is not None and manifest_key != latest_key:
             raise InstallError("latest.json and manifest.json are signed by different release keys")
+        if latest_key is not None and manifest_retired != latest_retired:
+            raise InstallError("latest.json and manifest.json do not use the same release-key roll")
         if man["version"] != version or man["channel"] != channel:
             raise InstallError("manifest names a different version or channel than requested")
         files = [(c["file"], c["sha256"]) for c in man["components"]]
@@ -642,6 +651,7 @@ class Installer:
             if got != want:
                 raise InstallError(f"{name} does not match the signed manifest (sha256 {got[:12]} != {want[:12]})")
         self._verified_release_key = manifest_key
+        self._verified_retired_keys = manifest_retired
         return man, work
 
     # ── unpack + environment ──
@@ -1255,7 +1265,7 @@ class Installer:
             shutil.rmtree(new_dir, ignore_errors=True)
             raise InstallError(f"first install of {man['version']} failed and was removed: {e}")
         if release_pubkey != pubkey:
-            history = [*history, pubkey]
+            history = [*history, *self._verified_retired_keys]
             # Preserve order while avoiding duplication from hand-edited legacy configs.
             cfg["pubkey_history"] = list(dict.fromkeys(history))
         cfg.update({"source": source, "channel": channel, "pubkey": release_pubkey, "current": man["version"],

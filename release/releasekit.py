@@ -66,16 +66,15 @@ def external_sign_message(message: bytes, command: str, pub_hex: str) -> dict:
         raise ValueError("external signer command is empty")
     result = subprocess.run(argv, input=message, capture_output=True)
     if result.returncode:
-        detail = result.stderr.decode("utf-8", "replace").strip()
-        raise RuntimeError(
-            f"external signer exited {result.returncode}" + (f": {detail}" if detail else ""))
-    try:
-        encoded = result.stdout.decode("ascii").strip()
-        if not re.fullmatch(r"[0-9a-fA-F]{128}", encoded):
-            raise ValueError
-        raw = bytes.fromhex(encoded)
-    except (UnicodeDecodeError, ValueError) as e:
-        raise RuntimeError("external signer did not return one hex Ed25519 signature") from e
+        # Broker output may contain approval context, operator identity, or secret material.  It is
+        # untrusted and must never be reflected through build/CLI exceptions or logs.
+        raise RuntimeError(f"external signer failed with exit code {result.returncode}")
+    # Validate as bytes first.  A UnicodeDecodeError retains the complete offending stdout on the
+    # exception object, so even chaining/suppressing one would violate the no-broker-output boundary.
+    encoded = result.stdout.strip()
+    if not re.fullmatch(rb"[0-9a-fA-F]{128}", encoded):
+        raise RuntimeError("external signer did not return one hex Ed25519 signature")
+    raw = bytes.fromhex(encoded.decode("ascii"))
     signature = _signature(pub_hex, raw)
     if not verify_signature(signature, pub_hex, message):
         raise RuntimeError("external signer returned a signature that does not verify")
@@ -176,8 +175,8 @@ def validate_keyroll_chain(chain: object) -> list[dict]:
     return chain
 
 
-def keyroll_tip(chain: object, pinned_pubkey: str, *, forbidden=()) -> str:
-    """Return the tip reachable forward from the pin; never infer trust from older links."""
+def keyroll_advance(chain: object, pinned_pubkey: str, *, forbidden=()) -> tuple[str, tuple[str, ...]]:
+    """Return the reachable tip and every old-side key retired by that traversal."""
     links = validate_keyroll_chain(chain)
     try:
         start = next(i for i, link in enumerate(links) if link["old_pubkey"] == pinned_pubkey)
@@ -186,13 +185,20 @@ def keyroll_tip(chain: object, pinned_pubkey: str, *, forbidden=()) -> str:
     forbidden = set(forbidden)
     # Connectivity was checked globally; this makes the trust direction explicit.
     expected = pinned_pubkey
+    retired = []
     for link in links[start:]:
         if link["old_pubkey"] != expected:
             raise ValueError("key-roll chain does not continue from the pinned key")
         if link["new_pubkey"] in forbidden:
             raise ValueError("key-roll chain would roll back to a previously trusted key")
+        retired.append(link["old_pubkey"])
         expected = link["new_pubkey"]
-    return expected
+    return expected, tuple(retired)
+
+
+def keyroll_tip(chain: object, pinned_pubkey: str, *, forbidden=()) -> str:
+    """Return the tip reachable forward from the pin; never infer trust from older links."""
+    return keyroll_advance(chain, pinned_pubkey, forbidden=forbidden)[0]
 
 
 # ── pure-Python Ed25519 verification (RFC 8032 §5.1.7), used only on a bare machine ──────────────

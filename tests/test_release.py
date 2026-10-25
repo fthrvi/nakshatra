@@ -105,6 +105,15 @@ def _write_roll(e, links: list[dict]) -> None:
     path.write_text(json.dumps(links))
 
 
+def _rebind_latest_to_manifest(e, out: Path) -> None:
+    """Keep tests that deliberately re-sign a manifest behind the real latest-byte binding."""
+    path = e["dist"] / "canary" / "latest.json"
+    latest = json.loads(path.read_text())
+    unsigned = {k: v for k, v in latest.items() if k != "sig"}
+    unsigned["manifest_sha256"] = rk.sha256_file(out / "manifest.json")
+    path.write_text(json.dumps(rk.sign(unsigned, e["key"].read_text().strip())))
+
+
 def _set_package_signer(e, key: str) -> None:
     policy = e["a"] / "pkg" / "package-signers.json"
     policy.write_text(json.dumps({
@@ -252,6 +261,7 @@ def test_build_pins_package_signers_from_exact_component_commit(env, monkeypatch
 
 def test_build_reads_release_spec_from_requested_nakshatra_ref(env, monkeypatch):
     repo = env["a"]
+    decoy = _repo(env["tmp"], "decoy", "WRONG = True\n")
     committed_spec = {
         "name": "from-requested-ref",
         "python": "3.12",
@@ -270,12 +280,19 @@ def test_build_reads_release_spec_from_requested_nakshatra_ref(env, monkeypatch)
         "commit", "-qm", "release spec",
     ], check=True)
     ref = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
-    # Both the module's bootstrap spec and the checkout now disagree with the requested commit.
+    # The build script's checkout is the bootstrap locator.  Both its in-memory fallback and dirty
+    # spec now point elsewhere; neither may influence a --ref build.
+    monkeypatch.setattr(B, "REPO_ROOT", repo)
     monkeypatch.setattr(B, "SPEC", {
         "name": "stale-bootstrap",
-        "components": [{"name": "nakshatra", "repo": str(repo)}],
+        "components": [{"name": "nakshatra", "repo": str(decoy)}],
     })
-    (repo / "release" / "spec.json").write_text(json.dumps(dict(committed_spec, name="dirty-working-tree")))
+    (repo / "release" / "spec.json").write_text(json.dumps(dict(
+        committed_spec,
+        name="dirty-working-tree",
+        components=[{"name": "nakshatra", "repo": str(decoy),
+                     "paths": ["pkg"], "pythonpath": "pkg"}],
+    )))
 
     out = B.build("0.2.0", "canary", {"nakshatra": ref}, env["key"],
                   env["dist"], env["uv"])
@@ -311,11 +328,59 @@ def test_external_release_signer_bad_signature_publishes_nothing(env):
     assert not (env["dist"] / "canary" / "latest.json").exists()
 
 
+def test_external_release_signer_never_exposes_output(env, capsys):
+    marker = "SIGNER-SECRET-MARKER"
+    signer = env["tmp"] / "refusing-signer.py"
+    signer.write_text(
+        "import sys\n"
+        "sys.stdin.buffer.read()\n"
+        f"print({marker!r})\n"
+        f"print({marker!r}, file=sys.stderr)\n"
+        "raise SystemExit(23)\n"
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        B.build(
+            "0.2.0", "canary", {}, None, env["dist"], env["uv"],
+            release_signer=f"{sys.executable} {signer}", release_pubkey=env["pub"])
+    captured = capsys.readouterr()
+    assert "exit code 23" in str(raised.value)
+    assert marker not in str(raised.value)
+    assert marker not in captured.out
+    assert marker not in captured.err
+
+    signer.write_text(
+        "import sys\n"
+        "sys.stdin.buffer.read()\n"
+        f"sys.stdout.buffer.write({marker.encode()!r} + b'\\xff')\n"
+    )
+    with pytest.raises(RuntimeError) as malformed:
+        B.build(
+            "0.2.1", "canary", {}, None, env["dist"], env["uv"],
+            release_signer=f"{sys.executable} {signer}", release_pubkey=env["pub"])
+    captured = capsys.readouterr()
+    assert marker not in str(malformed.value)
+    assert malformed.value.__context__ is None
+    assert marker not in captured.out
+    assert marker not in captured.err
+
+
 def test_tampered_artifact_refused_and_nothing_switched(env):
     out = _build(env, "0.1.0")
     tgz = next(out.glob("alpha-*.tar.gz"))
     tgz.write_bytes(tgz.read_bytes() + b"x")
     with pytest.raises(I.InstallError, match="does not match the signed manifest"):
+        env["inst"].install(str(env["dist"]), "canary", env["pub"])
+    assert not (env["tmp"] / "node" / "current").exists()
+
+
+def test_latest_manifest_sha256_mismatch_is_refused(env):
+    out = _build(env, "0.1.0")
+    # Whitespace preserves the manifest's canonical signature but changes its downloaded bytes.
+    manifest = out / "manifest.json"
+    manifest.write_bytes(manifest.read_bytes() + b"\n")
+
+    with pytest.raises(I.InstallError, match="sha256 signed by latest.json"):
         env["inst"].install(str(env["dist"]), "canary", env["pub"])
     assert not (env["tmp"] / "node" / "current").exists()
 
@@ -448,7 +513,9 @@ def test_release_key_roll_accepts_two_hops(env):
     ])
 
     assert "installed 0.1.2" in env["inst"].update()
-    assert json.loads((env["tmp"] / "node" / "config.json").read_text())["pubkey"] == new_pub
+    cfg = json.loads((env["tmp"] / "node" / "config.json").read_text())
+    assert cfg["pubkey"] == new_pub
+    assert cfg["pubkey_history"] == [env["pub"], rk.public_from_private(middle_key.read_text().strip())]
 
 
 def test_keyroll_cli_make_and_append(tmp_path):
@@ -488,6 +555,35 @@ def test_release_key_roll_refuses_return_to_an_earlier_key(env):
     _commit(env["a"], "alpha", "OK = True\nV = 3\n")
     _build_with_key(env, "0.1.2", env["key"])
     _write_roll(env, [_roll_link(new_key, env["key"], issued_at=2)])
+    with pytest.raises(I.InstallError, match="previously trusted key"):
+        env["inst"].update()
+    assert json.loads((env["tmp"] / "node" / "config.json").read_text())["pubkey"] == new_pub
+
+
+def test_release_key_roll_refuses_return_to_either_key_retired_by_two_hops(env):
+    _build(env, "0.1.0")
+    env["inst"].install(str(env["dist"]), "canary", env["pub"])
+    middle_key, middle_pub = _key(env["tmp"] / "middle-key")
+    new_key, new_pub = _key(env["tmp"] / "new-key")
+    _commit(env["a"], "alpha", "OK = True\nV = 2\n")
+    _build_with_key(env, "0.1.2", new_key)
+    _write_roll(env, [
+        _roll_link(env["key"], middle_key, 1),
+        _roll_link(middle_key, new_key, 2),
+    ])
+    env["inst"].update()
+    cfg = json.loads((env["tmp"] / "node" / "config.json").read_text())
+    assert cfg["pubkey_history"] == [env["pub"], middle_pub]
+
+    _commit(env["a"], "alpha", "OK = True\nV = 3\n")
+    _build_with_key(env, "0.1.3", middle_key)
+    _write_roll(env, [_roll_link(new_key, middle_key, 3)])
+    with pytest.raises(I.InstallError, match="previously trusted key"):
+        env["inst"].update()
+
+    _commit(env["a"], "alpha", "OK = True\nV = 4\n")
+    _build_with_key(env, "0.1.4", env["key"])
+    _write_roll(env, [_roll_link(new_key, env["key"], 4)])
     with pytest.raises(I.InstallError, match="previously trusted key"):
         env["inst"].update()
     assert json.loads((env["tmp"] / "node" / "config.json").read_text())["pubkey"] == new_pub
@@ -776,9 +872,7 @@ def test_archive_escaping_install_dir_refused(env):
             c["sha256"] = rk.sha256_file(tgz)
     signed = rk.sign({k: v for k, v in man.items() if k != "sig"}, env["key"].read_text().strip())
     (out / "manifest.json").write_text(json.dumps(signed))
-    latest = json.loads((env["dist"] / "canary" / "latest.json").read_text())
-    latest = rk.sign({k: v for k, v in latest.items() if k != "sig"}, env["key"].read_text().strip())
-    (env["dist"] / "canary" / "latest.json").write_text(json.dumps(latest))
+    _rebind_latest_to_manifest(env, out)
     with pytest.raises(I.InstallError, match="escapes the install dir"):
         env["inst"].install(str(env["dist"]), "canary", env["pub"])
     assert not (env["tmp"] / "escape.txt").exists()
@@ -1234,6 +1328,7 @@ def test_tampered_go_sidecar_is_refused(env, monkeypatch):
             component["sha256"] = rk.sha256_file(archive)  # outer archive is valid; inner hash is not
     man = rk.sign({k: v for k, v in man.items() if k != "sig"}, env["key"].read_text().strip())
     (out / "manifest.json").write_text(json.dumps(man))
+    _rebind_latest_to_manifest(env, out)
     with pytest.raises(I.InstallError, match="installed artifact nakshatra-sidecar does not match"):
         env["inst"].install(str(env["dist"]), "canary", env["pub"])
 
