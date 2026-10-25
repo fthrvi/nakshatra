@@ -35,8 +35,8 @@ from contextlib import contextmanager
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlsplit
-from urllib.request import Request, urlopen
+from urllib.parse import urlencode, urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 _SCRIPTS = Path(__file__).resolve().parent.parent
 if str(_SCRIPTS) not in sys.path:
@@ -134,6 +134,7 @@ DEFAULT_P2P_RELAY_ID = "12D3KooWDfHFtM8PP7TV46nssrix2hTL3kzMkv7kKMhULDakFGB7"
 DEFAULT_P2P_RELAYS = (f"/ip4/45.63.109.137/udp/29700/quic-v1/p2p/{DEFAULT_P2P_RELAY_ID},"
                       f"/ip4/45.63.109.137/tcp/29700/p2p/{DEFAULT_P2P_RELAY_ID}")
 DEFAULT_ONBOARD_BASE = "https://prithviloka.net/onboard"
+DEFAULT_OPERATOR_LEDGER = "http://127.0.0.1:18097"
 ONBOARD_STAGE_PURPOSE = "onboard-stage-v2"
 ONBOARD_CANCEL_PURPOSE = "onboard-cancel-v2"
 
@@ -147,6 +148,25 @@ class _OnboardHTTPError(SystemExit):
         if detail:
             message += f": {detail}"
         super().__init__(message)
+
+
+class _LedgerHTTPError(Exception):
+    """A signed ledger refusal whose status and escaped detail remain inspectable."""
+
+    def __init__(self, status: int, detail: str = ""):
+        self.status = int(status)
+        self.detail = _visible_untrusted(detail, 500)
+        message = f"ledger refused HTTP {self.status}"
+        if self.detail:
+            message += f": {self.detail}"
+        super().__init__(message)
+
+
+class _NoLedgerRedirects(HTTPRedirectHandler):
+    """Never forward a host-unbound Sthambha authorization header through a redirect."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise HTTPError(req.full_url, code, "ledger redirect refused", headers, fp)
 
 
 def _http_post_json(url: str, body: dict) -> dict:
@@ -2305,6 +2325,177 @@ def _server_suspension_record(base: str, token: str, http_post, http_get) -> dic
     return record
 
 
+def _operator_ledger_base(value: str) -> str:
+    """Validate the adjudication endpoint without resolving an attacker-controlled hostname."""
+    base = _bare_http_url(value, "ledger")
+    parsed = urlsplit(base)
+    if parsed.scheme == "http":
+        hostname = (parsed.hostname or "").lower()
+        loopback = hostname in {"localhost", "localhost."}
+        if not loopback:
+            try:
+                loopback = ipaddress.ip_address(hostname).is_loopback
+            except ValueError:
+                loopback = False
+        if not loopback:
+            raise SystemExit("--ledger must use https unless its host is loopback")
+    return base
+
+
+def _operator_ledger_request(base: str, private: bytes, keyid: str, method: str,
+                             path: str, body: dict | None = None) -> dict:
+    """Make one directly signed operator request to the ledger's spend listener."""
+    import nakshatra_auth
+
+    raw = (b"" if body is None else json.dumps(
+        body, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8"))
+    authorization, _sent_ts = nakshatra_auth.build_signed_envelope(
+        private, keyid, method, path, raw)
+    request = Request(
+        base + path,
+        data=raw if method == "POST" else None,
+        headers={"Authorization": authorization,
+                 "Accept": "application/json",
+                 **({"Content-Type": "application/json"} if method == "POST" else {})},
+        method=method,
+    )
+    try:
+        with build_opener(_NoLedgerRedirects()).open(request, timeout=20) as response:
+            value = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        try:
+            raw_error = exc.read(4096)
+            error_text = raw_error.decode("utf-8")
+            try:
+                payload = json.loads(error_text)
+            except ValueError:
+                payload = None
+            detail = payload.get("error", "") if isinstance(payload, dict) else error_text
+        except (OSError, UnicodeDecodeError, AttributeError):
+            detail = ""
+        raise _LedgerHTTPError(exc.code, detail if isinstance(detail, str) else "") from exc
+    except (OSError, URLError, UnicodeDecodeError, ValueError) as exc:
+        raise SystemExit(f"could not reach the ledger: {_visible_untrusted(exc, 500)}") from exc
+    if not isinstance(value, dict):
+        raise SystemExit("ledger returned an invalid non-object response")
+    return value
+
+
+def _operator_worker_key() -> tuple[bytes, str]:
+    from nakshatra_auth import load_worker_key
+
+    try:
+        return load_worker_key(Path.home() / ".nakshatra" / "keys" / "worker.ed25519")
+    except (OSError, ValueError, PermissionError) as exc:
+        raise SystemExit(f"cannot load the node worker key: {exc}") from exc
+
+
+def _operator_hold_status(base: str, private: bytes, keyid: str, hold_id: str) -> dict:
+    path = "/spend/task/status?" + urlencode({"hold_id": hold_id})
+    value = _operator_ledger_request(base, private, keyid, "GET", path)
+    required = {"hold_id", "task_hash", "payer_account", "worker_keyid", "amount", "state"}
+    if (not required.issubset(value)
+            or value.get("hold_id") != hold_id
+            or not isinstance(value.get("task_hash"), str)
+            or not isinstance(value.get("payer_account"), str)
+            or not isinstance(value.get("worker_keyid"), str)
+            or isinstance(value.get("amount"), bool)
+            or not isinstance(value.get("amount"), int)
+            or value["amount"] < 0
+            or value.get("state") not in {"open", "disputed", "paid", "refunded"}):
+        raise SystemExit("ledger returned an invalid task status")
+    return value
+
+
+def _short_id(value: object) -> str:
+    safe = _visible_untrusted(value, 64)
+    return safe if len(safe) <= 16 else safe[:16] + "…"
+
+
+def _print_operator_hold(value: dict) -> None:
+    reason = value.get("dispute_reason")
+    suffix = f"  reason {_visible_untrusted(reason, 64)}" if reason else ""
+    print(f"{_visible_untrusted(value['hold_id'], 128)}  {value['state']}  "
+          f"{format_amount(value['amount'])}  payer {_short_id(value['payer_account'])}  "
+          f"worker {_short_id(value['worker_keyid'])}  task {_short_id(value['task_hash'])}{suffix}")
+
+
+def _operator_disputes(args, sock: Path) -> int:
+    holds = list(args.hold)
+    for task in args.task:
+        local = call(sock, {"op": "escrow_status", "task": task})
+        hold_id = local.get("hold_id")
+        if not isinstance(hold_id, str) or not hold_id:
+            raise SystemExit(f"task {_visible_untrusted(task, 72)} has no task hold")
+        holds.append(hold_id)
+    if not holds:
+        raise SystemExit("nak operator disputes needs a task id or --hold HOLD_ID")
+    base = _operator_ledger_base(args.ledger)
+    private, keyid = _operator_worker_key()
+    for hold_id in holds:
+        try:
+            _print_operator_hold(_operator_hold_status(base, private, keyid, hold_id))
+        except _LedgerHTTPError as exc:
+            raise SystemExit(str(exc)) from exc
+    return 0
+
+
+def _operator_resolve(args) -> int:
+    summary = (f"Resolve ledger task hold {plain(args.hold_id, 72)} as {args.outcome} "
+               f"for {json.dumps(plain(args.reason, 64), ensure_ascii=False)}")
+    broker_preflight("resolve", summary)
+    if not sys.stdin.isatty():
+        raise SystemExit("nak operator resolve is interactive-only; run it in a terminal")
+    if not isinstance(args.reason, str) or not args.reason or len(args.reason) > 64:
+        raise SystemExit("--reason must be non-empty text of at most 64 characters")
+    if outbound_problem(args.reason):
+        raise SystemExit("--reason is sent to the ledger; it looks like it carries a secret or "
+                         "encoded blob — refusing")
+    base = _operator_ledger_base(args.ledger)
+    private, keyid = _operator_worker_key()
+    try:
+        status = _operator_hold_status(base, private, keyid, args.hold_id)
+    except _LedgerHTTPError as exc:
+        raise SystemExit(str(exc)) from exc
+    if status["state"] != "disputed":
+        raise SystemExit(f"refused: task hold is {status['state']}, not disputed")
+
+    prompt = (f"RESOLVE hold {_visible_untrusted(args.hold_id, 128)}  "
+              f"amount {format_amount(status['amount'])}  "
+              f"payer {_short_id(status['payer_account'])}  "
+              f"worker {_short_id(status['worker_keyid'])}  "
+              f"outcome {args.outcome.upper()}? [y/N] ")
+    if input(prompt).strip().lower() not in {"y", "yes"}:
+        print("task hold unchanged")
+        return 1
+
+    expected_state = "paid" if args.outcome == "pay" else "refunded"
+    body = {"hold_id": args.hold_id, "outcome": args.outcome, "reason": args.reason}
+    replayed = False
+    try:
+        result = _operator_ledger_request(
+            base, private, keyid, "POST", "/spend/task/resolve", body)
+    except _LedgerHTTPError as exc:
+        if exc.status != 409:
+            raise SystemExit(str(exc)) from exc
+        # A lost successful response followed by the same human decision is safe to adopt.  A
+        # genuinely conflicting 409 stays a refusal because its terminal state will not match.
+        try:
+            result = _operator_hold_status(base, private, keyid, args.hold_id)
+        except _LedgerHTTPError:
+            raise SystemExit(str(exc)) from exc
+        replayed = result.get("state") == expected_state
+        if not replayed:
+            raise SystemExit(str(exc)) from exc
+    if (result.get("hold_id") != args.hold_id or result.get("state") != expected_state
+            or ("replayed" in result and not isinstance(result.get("replayed"), bool))):
+        raise SystemExit("ledger returned an invalid task resolution response")
+    replayed = replayed or bool(result.get("replayed", False))
+    print(f"task hold {_visible_untrusted(args.hold_id, 128)} is {expected_state}"
+          + (" (replayed)" if replayed else ""))
+    return 0
+
+
 def _operator_suspend(args, sock: Path, http_post, http_get) -> int:
     verb = "suspend" if args.operator_cmd == "suspend" else "unsuspend"
     reason = getattr(args, "reason", "")
@@ -2527,6 +2718,18 @@ def main(argv=None, *, http_post=None, http_get=None) -> int:
     q = osub.add_parser("reports", help="show recent member reports")
     q.add_argument("--since", default="7d")
     q.add_argument("--json", action="store_true")
+    q = osub.add_parser("disputes", help="inspect named task holds on the ledger")
+    q.add_argument("task", nargs="*", help="local task id whose hold should be inspected")
+    q.add_argument("--hold", action="append", default=[], metavar="HOLD_ID",
+                   help="ledger hold id to inspect (repeatable)")
+    q.add_argument("--ledger", default=DEFAULT_OPERATOR_LEDGER,
+                   help=f"ledger origin (default: {DEFAULT_OPERATOR_LEDGER})")
+    q = osub.add_parser("resolve", help="human-only adjudication of one disputed task hold")
+    q.add_argument("hold_id")
+    q.add_argument("outcome", choices=["pay", "refund"])
+    q.add_argument("--reason", required=True)
+    q.add_argument("--ledger", default=DEFAULT_OPERATOR_LEDGER,
+                   help=f"ledger origin (default: {DEFAULT_OPERATOR_LEDGER})")
     q = osub.add_parser("suspend", help="suspend one rostered node")
     q.add_argument("target", nargs="?")
     q.add_argument("--reason", default="")
@@ -2826,6 +3029,10 @@ def main(argv=None, *, http_post=None, http_get=None) -> int:
         http_get = http_get or _http_get_json
         if a.operator_cmd in {"suspend", "unsuspend"}:
             return _operator_suspend(a, s, http_post, http_get)
+        if a.operator_cmd == "disputes":
+            return _operator_disputes(a, s)
+        if a.operator_cmd == "resolve":
+            return _operator_resolve(a)
         if not re.fullmatch(r"[1-9][0-9]*[smhdw]", a.since or ""):
             raise SystemExit("--since must look like 30m, 24h, or 7d")
         result = http_post(_operator_onboard_base() + "/operator/reports",

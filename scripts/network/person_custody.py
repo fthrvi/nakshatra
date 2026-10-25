@@ -23,6 +23,7 @@ KINDS = {
     "report",
     "suspend",
 }
+PREFLIGHT_ONLY_KINDS = {"resolve"}
 
 _BROKER_UNAVAILABLE = (
     "person custody is set to broker, but the phone-approval service is not available yet; "
@@ -140,7 +141,8 @@ def _broker_sign(kind: str, statement: bytes, summary: str) -> bytes:
 
 def broker_preflight(kind: str, summary: str) -> None:
     """Refuse an unavailable broker before prompts, writes, or state-changing calls."""
-    _check_request(kind, summary)
+    if kind not in PREFLIGHT_ONLY_KINDS:
+        _check_request(kind, summary)
     if custody_mode() == "broker":
         raise SystemExit(_BROKER_UNAVAILABLE)
 
