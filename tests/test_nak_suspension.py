@@ -37,6 +37,26 @@ def _key():
     return private, private.public_key().public_bytes_raw().hex()
 
 
+def _batch_sign(private, items):
+    """Independent test signer for the CLI's record-reference batch contract."""
+    results = []
+    for item in items:
+        if isinstance(item, bytes):
+            final = item
+        else:
+            _marker, ref, template = item
+            record = json.loads(results[ref][0])
+            record["sig"] = results[ref][1].hex()
+            digest = hashlib.sha256(json.dumps(
+                record, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+            proof = json.loads(template)
+            proof["payload"]["record_sha256"] = digest
+            final = json.dumps(
+                proof, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+        results.append((final, private.sign(final)))
+    return results
+
+
 def _record(private=None, person=None, seq=1, nodes=("11" * 32,), reasons=None, now=123):
     private = private or ed25519.Ed25519PrivateKey.generate()
     person = person or private.public_key().public_bytes_raw().hex()
@@ -865,8 +885,11 @@ def test_operator_suspend_lost_response_retries_the_exact_pending_record(monkeyp
     monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
     monkeypatch.setattr("builtins.input", lambda _prompt: "yes")
     monkeypatch.setattr(nak, "broker_preflight", lambda *_args: None)
-    monkeypatch.setattr(nak, "approval", approved)
     monkeypatch.setattr(nak, "PersonKey", FakePersonKey)
+    monkeypatch.setattr(nak, "person_sign_batch",
+                        lambda _kind, items, **_kwargs: _batch_sign(private, items))
+    monkeypatch.setattr(nak, "person_sign",
+                        lambda _kind, statement, **_kwargs: private.sign(statement))
     monkeypatch.setattr(nak, "call", fake_call)
     monkeypatch.setenv("NAK_ONBOARD_BASE", "https://onboard.invalid/base")
     monkeypatch.setenv("NAK_ONBOARD_TOKEN", "test-token")
@@ -934,8 +957,11 @@ def test_operator_suspend_stale_seq_adopts_signed_server_state_and_requests_reru
     monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
     monkeypatch.setattr("builtins.input", lambda _prompt: "yes")
     monkeypatch.setattr(nak, "broker_preflight", lambda *_args: None)
-    monkeypatch.setattr(nak, "approval", approved)
     monkeypatch.setattr(nak, "PersonKey", FakePersonKey)
+    monkeypatch.setattr(nak, "person_sign_batch",
+                        lambda _kind, items, **_kwargs: _batch_sign(private, items))
+    monkeypatch.setattr(nak, "person_sign",
+                        lambda _kind, statement, **_kwargs: private.sign(statement))
     monkeypatch.setattr(nak, "call", fake_call)
     monkeypatch.setenv("NAK_ONBOARD_BASE", "https://onboard.invalid/base")
     monkeypatch.setenv("NAK_ONBOARD_TOKEN", "test-token")
@@ -995,8 +1021,11 @@ def test_operator_suspend_definitive_refusal_clears_exact_pending_with_person_pr
     monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
     monkeypatch.setattr("builtins.input", lambda _prompt: "yes")
     monkeypatch.setattr(nak, "broker_preflight", lambda *_args: None)
-    monkeypatch.setattr(nak, "approval", approved)
     monkeypatch.setattr(nak, "PersonKey", FakePersonKey)
+    monkeypatch.setattr(nak, "person_sign_batch",
+                        lambda _kind, items, **_kwargs: _batch_sign(private, items))
+    monkeypatch.setattr(nak, "person_sign",
+                        lambda _kind, statement, **_kwargs: private.sign(statement))
     monkeypatch.setattr(nak, "call", fake_call)
     monkeypatch.setenv("NAK_ONBOARD_BASE", "https://onboard.invalid/base")
     monkeypatch.setenv("NAK_ONBOARD_TOKEN", "test-token")
@@ -1048,8 +1077,9 @@ def test_operator_suspend_manual_abandon_is_tty_and_person_proofed(monkeypatch):
     monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
     monkeypatch.setattr("builtins.input", lambda _prompt: "yes")
     monkeypatch.setattr(nak, "broker_preflight", lambda *_args: None)
-    monkeypatch.setattr(nak, "approval", approved)
     monkeypatch.setattr(nak, "PersonKey", FakePersonKey)
+    monkeypatch.setattr(nak, "person_sign",
+                        lambda _kind, statement, **_kwargs: private.sign(statement))
     monkeypatch.setattr(nak, "call", fake_call)
     assert nak.main(
         ["operator", "suspend", "--abandon-pending"],
@@ -1109,14 +1139,9 @@ def test_cli_proof_timestamps_are_taken_after_slow_approval(monkeypatch):
     clock = [1000]
     action_requests = []
 
-    @contextmanager
-    def slow_approval(_kind, _summary):
-        clock[0] += 200
-        yield
-
     class FakePersonKey:
         def __init__(self, *_args):
-            pass
+            clock[0] += 200
 
         def sign(self, _statement):
             return b"s" * 64
@@ -1137,7 +1162,6 @@ def test_cli_proof_timestamps_are_taken_after_slow_approval(monkeypatch):
     monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
     monkeypatch.setattr("builtins.input", lambda _prompt: "yes")
     monkeypatch.setattr(nak, "broker_preflight", lambda *_args: None)
-    monkeypatch.setattr(nak, "approval", slow_approval)
     monkeypatch.setattr(nak, "PersonKey", FakePersonKey)
     monkeypatch.setattr(nak.time, "time", lambda: clock[0])
     monkeypatch.setattr(nak, "call", fake_call)

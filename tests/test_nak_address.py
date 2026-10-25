@@ -435,6 +435,14 @@ def test_cli_address_on_show_off_rotates(monkeypatch, tmp_path, capsys):
 
     monkeypatch.setattr(nak, "call", fake_call)
     monkeypatch.setattr(nak, "PersonKey", CapturingPersonKey)
+    def sign_batch(_kind, items, **_kwargs):
+        results = []
+        for statement in items:
+            assert isinstance(statement, bytes)
+            signed.append(statement)
+            results.append((statement, key.sign(statement)))
+        return results
+    monkeypatch.setattr(nak, "person_sign_batch", sign_batch)
     monkeypatch.setattr(nak, "_release_for_invite", lambda *_a: (RELEASE, "install {CODE}"))
     monkeypatch.setenv("NAK_NET_DIR", str(tmp_path / "net"))
     assert nak.main(["address", "on", "--days", "30", "--name", "Biswa"]) == 0
