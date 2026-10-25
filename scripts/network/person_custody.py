@@ -96,6 +96,10 @@ class PersonAct:
         _assert_act_mode(self)
         return _new_person_act(kind, summary, self.mode, self.config, self.public_key)
 
+    def assert_current(self) -> None:
+        """Fail closed if custody changed after this preflight-only act began."""
+        _assert_act_mode(self)
+
 
 def _new_person_act(kind: str, summary: str, mode: str,
                     config: _BrokerConfig | None,

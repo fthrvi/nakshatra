@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 import threading
@@ -150,6 +151,32 @@ def _tty_yes(monkeypatch, answer="yes", prompts=None):
 def test_operator_resolve_refuses_non_tty_before_ledger(ledger, monkeypatch):
     monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
     with pytest.raises(SystemExit, match="interactive-only"):
+        nak.main(["operator", "resolve", ledger.hold["hold_id"], "pay",
+                  "--reason", "evidence checked", "--ledger", ledger.url])
+    assert ledger.requests == []
+
+
+def test_operator_resolve_pins_custody_and_never_reaches_a_person_key(
+        ledger, monkeypatch):
+    marker = Path(os.environ["HOME"]) / ".nakshatra" / "net" / "person-custody"
+    marker.parent.mkdir(parents=True)
+    marker.write_text("file\n")
+    marker.chmod(0o600)
+
+    def change_custody_during_act():
+        marker.write_text("broker\n")
+        return True
+
+    monkeypatch.setattr(sys.stdin, "isatty", change_custody_during_act)
+    monkeypatch.setattr(
+        nak, "_operator_worker_key",
+        lambda: pytest.fail("mode change reached the worker request key"))
+    monkeypatch.setattr(
+        nak, "PersonKey", lambda *_args, **_kwargs: pytest.fail("resolve reached a person key"))
+    monkeypatch.setattr(
+        nak, "person_sign", lambda *_args, **_kwargs: pytest.fail("resolve reached person_sign"))
+
+    with pytest.raises(SystemExit, match="changed from file to broker.*nothing was signed"):
         nak.main(["operator", "resolve", ledger.hold["hold_id"], "pay",
                   "--reason", "evidence checked", "--ledger", ledger.url])
     assert ledger.requests == []
