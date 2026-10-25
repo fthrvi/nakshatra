@@ -3146,7 +3146,8 @@ class Node:
         self.store.take_report_quota(via, now)
         try:
             result = _http_post_json(self._onboard_base() + "/report", body)
-            if result.get("status") not in {"received", "duplicate"}:
+            # The onboard server answers "recorded" (or "duplicate" for a replay of the same report).
+            if result.get("status") not in {"recorded", "duplicate"}:
                 raise ValueError("onboard server returned an invalid report status")
         except Exception:
             self.store.refund_report_quota(via, now)

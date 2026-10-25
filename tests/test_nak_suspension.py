@@ -1159,14 +1159,14 @@ def test_report_op_signs_and_caps_at_ten(tmp_path, monkeypatch):
         signature = bytes.fromhex(unsigned.pop("sig"))
         ed25519.Ed25519PublicKey.from_public_bytes(bytes.fromhex(body["reporter"])).verify(
             signature, canonical(unsigned))
-        return {"status": "received"}
+        return {"status": "recorded"}
 
     monkeypatch.setattr(nakd, "_http_post_json", post)
     monkeypatch.setenv("NAK_ONBOARD_BASE", "https://onboard.invalid/base")
     try:
         for index in range(10):
             result = party.node.report(subject, "abuse", f"report {index}", via="cli")
-            assert result["status"] == "received"
+            assert result["status"] == "recorded"
         with pytest.raises(ValueError, match="10 per 24 hours"):
             party.node.report(subject, "abuse", "eleventh", via="cli")
         assert len(seen) == 10
@@ -1205,7 +1205,7 @@ def test_failed_report_posts_refund_local_quota(tmp_path, monkeypatch):
         attempts += 1
         if attempts <= 10:
             raise ValueError("server unavailable")
-        return {"status": "received"}
+        return {"status": "recorded"}
 
     monkeypatch.setattr(nakd, "_http_post_json", post)
     try:
@@ -1213,7 +1213,7 @@ def test_failed_report_posts_refund_local_quota(tmp_path, monkeypatch):
             with pytest.raises(ValueError, match="server unavailable"):
                 party.node.report(subject, "abuse", via="cli")
         for _index in range(10):
-            assert party.node.report(subject, "abuse", via="cli")["status"] == "received"
+            assert party.node.report(subject, "abuse", via="cli")["status"] == "recorded"
         with pytest.raises(ValueError, match="10 per 24 hours"):
             party.node.report(subject, "abuse", via="cli")
         assert attempts == 20
@@ -1229,7 +1229,7 @@ def test_raw_report_via_cli_spoof_is_mcp_and_person_proof_earns_cli(tmp_path, mo
     party.node.store.upsert_contact(contact_person, subject_node, "active", "subject")
     seen = []
     monkeypatch.setattr(nakd, "_http_post_json",
-                        lambda _url, body: seen.append(body) or {"status": "received"})
+                        lambda _url, body: seen.append(body) or {"status": "recorded"})
     try:
         spoof = nakd.handle(party.node, {"op": "report", "subject": "subject",
                                          "reason": "abuse", "via": "cli"})

@@ -2819,7 +2819,7 @@ def main(argv=None, *, http_post=None, http_get=None) -> int:
         result = call(s, {"op": "report_cli", "subject": a.subject, "reason": a.reason,
                           "note": a.note, "evidence": evidence, "ts": proof_ts,
                           "signature": proof_sig})
-        print(f"report {result.get('status', 'received')} for node {result['subject'][:16]}…; "
+        print(f"report {result.get('status', 'recorded')} for node {result['subject'][:16]}…; "
               "reports are claims for operator review and do not suspend nodes")
     elif a.cmd == "operator":
         http_post = http_post or _http_post_json
