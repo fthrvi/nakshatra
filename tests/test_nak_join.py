@@ -548,6 +548,16 @@ def test_fresh_join_writes_and_enables_identity_gated_units(tmp_path, monkeypatc
 
     monkeypatch.setattr(network_client, "NakClient", Client)
     monkeypatch.setattr(joincode, "decode_invite", lambda _code: {"kind": "contact"})
+    real_run = subprocess.run
+    service_calls = []
+
+    def run(args, **kwargs):
+        if args and args[0] == "systemctl":
+            service_calls.append(args)
+            return subprocess.CompletedProcess(args, 0)
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(join_setup.subprocess, "run", run)
 
     assert join_setup.main(["--invite", "nki1.test", "--name", "Newcomer", "--home", str(home)]) == 0
 
@@ -557,9 +567,13 @@ def test_fresh_join_writes_and_enables_identity_gated_units(tmp_path, monkeypatc
     # The node's settlement backend (NAKSHATRA_ESCROW=neuron + pinned ledger) is the operator's
     # choice, written to net.env; without this hook a container node could never fund a Neuron hold.
     assert f"EnvironmentFile=-{home}/.nakshatra/net.env" in (units / "nak-net.service").read_text()
-    calls = systemctl_log.read_text().splitlines()
-    assert "--user enable --now nak-signer.service nak-net.service" in calls
-    assert "--user restart nak-net.service" in calls
+    assert ["systemctl", "--user", "enable", "--now",
+            "nak-signer.service", "nak-net.service"] in service_calls
+    assert ["systemctl", "--user", "restart", "nak-net.service"] in service_calls
+    assert systemctl_log.read_text().splitlines() == [
+        "--user daemon-reload",
+        "--user enable --now nak-update.timer",
+    ]
     assert Client.status_calls == 1
 
 
