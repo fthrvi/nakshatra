@@ -6,7 +6,7 @@ On create add a row (status=active, owner). On merge flip to `merged→<sha>`.
 | branch | sector | description | base | status | owner |
 |---|---|---|---|---|---|
 | net/nak-resolve | network | Human-only operator CLI for inspecting and resolving disputed Neuron task holds. | forgejo/main@817eb10 | merged→256f87d | codex for claude/trisul-aa network lane (hub) |
-| net/nak-keyroll | release | Release-key roll chain, external signer support, and ref-pinned release inputs. | forgejo/main@817eb10 | active | codex for claude/trisul-aa network lane (hub) |
+| net/nak-keyroll | release | Release-key roll chain, external signer support, and ref-pinned release inputs. | forgejo/main@817eb10 | merged→e56d346 | codex for claude/trisul-aa network lane (hub) |
 | net/report-suspend-main | network | Rebase report/operator suspension onto current main; add refusal recovery, unknown-node fencing, and post-mutation suspension safety. | forgejo/main@749a5c9 | merged→0efc67e | codex for claude/trisul-aa network lane (hub) |
 | net/gpu-preflight | network | Read-only worker GPU/runtime preflight against the signed package catalog before build. | main@2a9dd7e | merged→da8c8c7 | codex for claude/trisul-aa network lane (hub) |
 | net/member-invites | network | Brief B: member-signed stranger worker/consumer invites, cancellation, and person-gated acceptance. | forgejo/main@2a9dd7e | merged→8fb987a | codex for claude/trisul-aa network lane (hub) |
