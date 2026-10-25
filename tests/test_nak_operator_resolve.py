@@ -247,10 +247,31 @@ def test_operator_disputes_accepts_local_task_ids(ledger, monkeypatch):
 
 def test_plain_http_ledger_must_be_loopback(ledger, monkeypatch):
     _tty_yes(monkeypatch)
-    with pytest.raises(SystemExit, match="https unless its host is loopback"):
-        nak.main(["operator", "resolve", ledger.hold["hold_id"], "pay",
-                  "--reason", "review complete", "--ledger", "http://ledger.example:18097"])
+    for url in ("http://ledger.example:18097", "http://localhost:18097"):
+        with pytest.raises(SystemExit, match="https unless its host is a loopback IP"):
+            nak.main(["operator", "resolve", ledger.hold["hold_id"], "pay",
+                      "--reason", "review complete", "--ledger", url])
     assert ledger.requests == []
+
+
+def test_operator_ledger_request_ignores_environment_proxies(monkeypatch):
+    seen = []
+
+    class Opener:
+        def open(self, request, timeout):
+            raise SystemExit("stop")
+
+    def fake_build_opener(*handlers):
+        seen.extend(handlers)
+        return Opener()
+
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.example:3128")
+    monkeypatch.setattr(nak, "build_opener", fake_build_opener)
+    with pytest.raises(SystemExit):
+        nak._operator_ledger_request("http://127.0.0.1:18097", b"\x01" * 32, "ab" * 32, "GET",
+                                     "/spend/task/status?hold_id=x")
+    proxies = [h for h in seen if isinstance(h, nak.ProxyHandler)]
+    assert proxies and proxies[0].proxies == {}
 
 
 def test_mcp_never_exposes_dispute_resolution():

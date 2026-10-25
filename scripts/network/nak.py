@@ -36,7 +36,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
-from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener, urlopen
 
 _SCRIPTS = Path(__file__).resolve().parent.parent
 if str(_SCRIPTS) not in sys.path:
@@ -2330,15 +2330,13 @@ def _operator_ledger_base(value: str) -> str:
     base = _bare_http_url(value, "ledger")
     parsed = urlsplit(base)
     if parsed.scheme == "http":
-        hostname = (parsed.hostname or "").lower()
-        loopback = hostname in {"localhost", "localhost."}
+        # Plain http only to a literal loopback IP: a hostname (even "localhost") can resolve anywhere.
+        try:
+            loopback = ipaddress.ip_address(parsed.hostname or "").is_loopback
+        except ValueError:
+            loopback = False
         if not loopback:
-            try:
-                loopback = ipaddress.ip_address(hostname).is_loopback
-            except ValueError:
-                loopback = False
-        if not loopback:
-            raise SystemExit("--ledger must use https unless its host is loopback")
+            raise SystemExit("--ledger must use https unless its host is a loopback IP address")
     return base
 
 
@@ -2360,7 +2358,8 @@ def _operator_ledger_request(base: str, private: bytes, keyid: str, method: str,
         method=method,
     )
     try:
-        with build_opener(_NoLedgerRedirects()).open(request, timeout=20) as response:
+        # No environment proxies: the signed adjudication must go straight to the ledger.
+        with build_opener(ProxyHandler({}), _NoLedgerRedirects()).open(request, timeout=20) as response:
             value = json.loads(response.read().decode("utf-8"))
     except HTTPError as exc:
         try:
