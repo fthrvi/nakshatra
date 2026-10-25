@@ -297,9 +297,9 @@ def _validate_address_peers(peers: object) -> None:
             raise ValueError("address peer dial hints are malformed")
 
 
-def encode_address(person_priv, inviter_node: str, peers: list, *, days: int = 90,
-                   now: int | None = None, from_name: str = "", release: dict) -> str:
-    """Mint a public, reusable request address signed by the person's key.
+def build_unsigned_address(person_pub: str, inviter_node: str, peers: list, *, days: int = 90,
+                           now: int | None = None, from_name: str = "", release: dict) -> dict:
+    """Build the fields of a public request address before its person signature.
 
     ``ik`` is deliberately published. It authenticates only the rendezvous endpoint; the signed
     contact.request envelope authenticates each stranger. Possession therefore permits an ASK,
@@ -315,10 +315,12 @@ def encode_address(person_priv, inviter_node: str, peers: list, *, days: int = 9
     _validate_address_release(release)
     if not isinstance(from_name, str) or len(from_name) > 40:
         raise ValueError("address from_name is malformed")
+    if not isinstance(person_pub, str) or len(person_pub) != 64 or \
+            any(c not in "0123456789abcdef" for c in person_pub):
+        raise ValueError("address inviter is malformed")
     now = int(now if now is not None else _time.time())
-    inviter = person_priv.public_key().public_bytes_raw().hex()
     address = {
-        "v": 1, "kind": "address", "inviter": inviter, "inviter_node": inviter_node,
+        "v": 1, "kind": "address", "inviter": person_pub, "inviter_node": inviter_node,
         "peers": peers, "aid": secrets.token_hex(16),
         # Public seed by design: it pins the listener but conveys no contact authority.
         "ik": _ed.Ed25519PrivateKey.generate().private_bytes_raw().hex(),
@@ -326,10 +328,31 @@ def encode_address(person_priv, inviter_node: str, peers: list, *, days: int = 9
     }
     if from_name:
         address["from_name"] = from_name
-    address["sig"] = {"alg": "Ed25519", "keyid": inviter[:16],
-                      "value": base64.b64encode(person_priv.sign(_canon(address))).decode("ascii")}
-    raw = json.dumps(address, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return address
+
+
+def attach_address_signature(address: dict, signature: bytes) -> str:
+    """Encode an unsigned address with exactly the supplied raw Ed25519 signature."""
+    if not isinstance(address, dict) or "sig" in address:
+        raise ValueError("unsigned address is malformed")
+    if not isinstance(signature, bytes) or len(signature) != 64:
+        raise ValueError("address signer did not return a 64-byte signature")
+    signed = dict(address)
+    inviter = signed.get("inviter", "")
+    signed["sig"] = {"alg": "Ed25519", "keyid": inviter[:16],
+                     "value": base64.b64encode(signature).decode("ascii")}
+    raw = json.dumps(signed, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     return ADDRESS_PREFIX + _b64u(raw)
+
+
+def encode_address(person_priv, inviter_node: str, peers: list, *, days: int = 90,
+                   now: int | None = None, from_name: str = "", release: dict) -> str:
+    """Mint a public, reusable request address signed by the person's key."""
+    person_pub = person_priv.public_key().public_bytes_raw().hex()
+    address = build_unsigned_address(
+        person_pub, inviter_node, peers, days=days, now=now,
+        from_name=from_name, release=release)
+    return attach_address_signature(address, person_priv.sign(_canon(address)))
 
 
 def decode_address(code: str, *, now: int | None = None,

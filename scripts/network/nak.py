@@ -45,7 +45,8 @@ if str(_SCRIPTS) not in sys.path:
 from release_trust import (ReleaseTrustError, load_release_package_catalog,
                            load_release_package_signers)  # noqa: E402
 from network.person_custody import (  # noqa: E402
-    PersonKey, _person_key_path, approval, broker_preflight, custody_mode, plain)
+    PersonKey, _person_key_path, broker_preflight, custody_mode, person_sign,
+    person_sign_batch, plain)
 from network.units import AmountError, MAX_SPEND_CAP, format_amount, parse_amount  # noqa: E402
 from network.dlp import outbound_problem  # noqa: E402
 
@@ -1880,6 +1881,12 @@ def _grant_paths() -> tuple[Path, Path, str]:
 
 def _delegate_reuse_command(state: Path, person_key: Path, agent: str, caps: list[str], ttl_days: int,
                             idle_days: int, lease_days: int, no_lease: bool) -> str:
+    if custody_mode() == "broker":
+        command = ("nak grant renew --caps " + shlex.quote(",".join(caps)) +
+                   f" --ttl {ttl_days} --yes")
+        if no_lease:
+            return command + " --no-lease"
+        return command + f" --idle-days {idle_days} --lease-days {lease_days}"
     command = ("python -m sthambha.signer delegate --state " + shlex.quote(str(state)) +
             " --person-key " + shlex.quote(str(person_key)) + " --agent " + shlex.quote(agent) +
             " --caps " + shlex.quote(",".join(caps)) + f" --ttl {ttl_days * 86400} --reuse-key")
@@ -2166,7 +2173,9 @@ def _revoke(args, sock: Path) -> int:
     except OSError as exc:
         raise SystemExit(f"cannot load the person identity for revocation: {exc}") from exc
     person_priv = PersonKey("revoke", summary)
-    from network.revocation import MAX_GRANTS, MAX_SEQ, make_record
+    from network.revocation import (
+        MAX_GRANTS, MAX_SEQ, attach_signature, build_unsigned_record,
+        revocation_statement)
     with _revocation_lock(net_dir):
         # These are deliberately inside the lock. They are cumulative inputs shared by every CLI
         # process, so reading any of them before flock would reintroduce a lost-update window.
@@ -2197,6 +2206,11 @@ def _revoke(args, sock: Path) -> int:
             print("nothing revoked")
             return 1
 
+        unsigned_record = build_unsigned_record(
+            person_pub, seq, resulting, int(time.time()))
+        record = attach_signature(
+            unsigned_record, person_priv.sign(revocation_statement(unsigned_record)))
+
         try:
             revoked_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             fd = os.open(str(revoked_path), os.O_WRONLY | os.O_CREAT | os.O_APPEND |
@@ -2210,7 +2224,6 @@ def _revoke(args, sock: Path) -> int:
         except OSError as exc:
             raise SystemExit(f"could not update {revoked_path}: {exc}") from exc
 
-        record = make_record(person_priv.sign, person_pub, seq, resulting, int(time.time()))
         try:
             call(sock, {"op": "install_revocation", "record": record})
             (net_dir / "pending-revocation.json").unlink(missing_ok=True)
@@ -2521,7 +2534,7 @@ def _operator_suspend(args, sock: Path, http_post, http_get) -> int:
     state = call(sock, {"op": "suspensions"})
     previous = state.get("own")
     pending = state.get("pending")
-    from network.suspension import MAX_SEQ, make_record, verify_record
+    from network.suspension import MAX_SEQ, verify_record
     if previous:
         try:
             previous = verify_record(previous, status["person"])
@@ -2541,13 +2554,12 @@ def _operator_suspend(args, sock: Path, http_post, http_get) -> int:
         if answer.strip().lower() not in {"y", "yes"}:
             print("pending suspension update unchanged")
             return 1
-        with approval("suspend", summary):
-            person_key = PersonKey("suspend", summary)
-            if person_key.public_key().public_bytes_raw().hex() != status["person"]:
-                raise SystemExit("the approved person key does not match nakd's person identity")
-            abandon_ts = int(time.time())
-            abandon_sig = person_key.sign(person_action_statement(
-                "abandon-suspension", suspension_record_proof_payload(pending), abandon_ts)).hex()
+        person_key = PersonKey("suspend", summary)
+        if person_key.public_key().public_bytes_raw().hex() != status["person"]:
+            raise SystemExit("the approved person key does not match nakd's person identity")
+        abandon_ts = int(time.time())
+        abandon_sig = person_key.sign(person_action_statement(
+            "abandon-suspension", suspension_record_proof_payload(pending), abandon_ts)).hex()
         call(sock, {"op": "abandon_suspension", "record": pending,
                     "ts": abandon_ts, "signature": abandon_sig})
         print(f"abandoned pending operator record seq {pending['seq']}; server state was not changed")
@@ -2586,27 +2598,34 @@ def _operator_suspend(args, sock: Path, http_post, http_get) -> int:
     token = _onboard_token()
     if retrying:
         record = pending
-        with approval("suspend", summary):
-            person_key = PersonKey("suspend", summary)
-            person_pub = person_key.public_key().public_bytes_raw().hex()
-            if person_pub != status["person"]:
-                raise SystemExit("the approved person key does not match nakd's person identity")
-            install_ts = int(time.time())
-            install_sig = person_key.sign(person_action_statement(
-                "install-suspension", suspension_record_proof_payload(record), install_ts)).hex()
+        person_key = PersonKey("suspend", summary)
+        person_pub = person_key.public_key().public_bytes_raw().hex()
+        if person_pub != status["person"]:
+            raise SystemExit("the approved person key does not match nakd's person identity")
+        install_ts = int(time.time())
+        install_sig = person_key.sign(person_action_statement(
+            "install-suspension", suspension_record_proof_payload(record), install_ts)).hex()
     else:
-        with approval("suspend", summary):
-            person_key = PersonKey("suspend", summary)
-            person_pub = person_key.public_key().public_bytes_raw().hex()
-            if person_pub != status["person"]:
-                raise SystemExit("the approved person key does not match nakd's person identity")
-            stage_ts = int(time.time())
-            record = make_record(person_key.sign, person_pub, seq, nodes, reasons, stage_ts)
-            stage_sig = person_key.sign(person_action_statement(
-                "stage-suspension", suspension_record_proof_payload(record), stage_ts)).hex()
-            install_ts = stage_ts
-            install_sig = person_key.sign(person_action_statement(
-                "install-suspension", suspension_record_proof_payload(record), install_ts)).hex()
+        from network.suspension import attach_signature, build_unsigned_record, suspension_statement
+        person_key = PersonKey("suspend", summary)
+        person_pub = person_key.public_key().public_bytes_raw().hex()
+        if person_pub != status["person"]:
+            raise SystemExit("the approved person key does not match nakd's person identity")
+        stage_ts = int(time.time())
+        unsigned_record = build_unsigned_record(person_pub, seq, nodes, reasons, stage_ts)
+        zero_payload = {"record_sha256": "0" * 64}
+        stage_template = person_action_statement("stage-suspension", zero_payload, stage_ts)
+        install_ts = stage_ts
+        install_template = person_action_statement("install-suspension", zero_payload, install_ts)
+        signed = person_sign_batch(
+            "suspend",
+            [suspension_statement(unsigned_record),
+             ("ref", 0, stage_template),
+             ("ref", 0, install_template)],
+            summary=summary)
+        record = attach_signature(unsigned_record, signed[0][1])
+        stage_sig = signed[1][1].hex()
+        install_sig = signed[2][1].hex()
         # This write precedes the server request.  A timeout or lost response therefore leaves the
         # exact signed bytes available for an idempotent retry instead of minting seq+1 again.
         call(sock, {"op": "stage_suspension", "record": record,
@@ -2616,9 +2635,14 @@ def _operator_suspend(args, sock: Path, http_post, http_get) -> int:
         response = http_post(base + "/operator/suspend", {"token": token, "record": record})
     except _OnboardHTTPError as exc:
         if exc.status in {400, 403, 404}:
+            abandon_summary = f"Abandon rejected suspension update seq {record['seq']}"
+            broker_preflight("suspend", abandon_summary)
             abandon_ts = int(time.time())
-            abandon_sig = person_key.sign(person_action_statement(
-                "abandon-suspension", suspension_record_proof_payload(record), abandon_ts)).hex()
+            abandon_sig = person_sign(
+                "suspend",
+                person_action_statement(
+                    "abandon-suspension", suspension_record_proof_payload(record), abandon_ts),
+                summary=abandon_summary).hex()
             call(sock, {"op": "abandon_suspension", "record": record,
                         "ts": abandon_ts, "signature": abandon_sig})
             raise SystemExit(f"{exc}; pending suspension update cleared; server state was unchanged")
@@ -2634,13 +2658,13 @@ def _operator_suspend(args, sock: Path, http_post, http_get) -> int:
         if remote["seq"] <= local_seq:
             raise SystemExit("refused: server stale-sequence recovery did not return newer state")
         recovery_summary = f"Recover server suspension state at seq {remote['seq']}"
-        with approval("suspend", recovery_summary):
-            person_key = PersonKey("suspend", recovery_summary)
-            if person_key.public_key().public_bytes_raw().hex() != status["person"]:
-                raise SystemExit("the approved person key does not match nakd's person identity")
-            recovery_ts = int(time.time())
-            recovery_sig = person_key.sign(person_action_statement(
-                "recover-suspension", suspension_record_proof_payload(remote), recovery_ts)).hex()
+        broker_preflight("suspend", recovery_summary)
+        recovery_ts = int(time.time())
+        recovery_sig = person_sign(
+            "suspend",
+            person_action_statement(
+                "recover-suspension", suspension_record_proof_payload(remote), recovery_ts),
+            summary=recovery_summary).hex()
         recovered = call(sock, {"op": "recover_suspension", "record": remote,
                                 "ts": recovery_ts, "signature": recovery_sig})
         raise SystemExit(
@@ -2980,11 +3004,10 @@ def main(argv=None, *, http_post=None, http_get=None) -> int:
             if answer.strip().lower() not in {"y", "yes"}:
                 print("suspension state unchanged")
                 return 1
-            with approval("suspend", summary):
-                person_key = PersonKey("suspend", summary)
-                proof_ts = int(time.time())
-                proof_sig = person_key.sign(person_action_statement(
-                    "import-suspension", suspension_record_proof_payload(record), proof_ts)).hex()
+            person_key = PersonKey("suspend", summary)
+            proof_ts = int(time.time())
+            proof_sig = person_key.sign(person_action_statement(
+                "import-suspension", suspension_record_proof_payload(record), proof_ts)).hex()
             result = call(s, {"op": "import_suspension", "blob": a.blob,
                               "ts": proof_ts, "signature": proof_sig})
             print(f"imported seq {result['seq']} with {result['count']} suspended node(s)" +
@@ -3012,12 +3035,11 @@ def main(argv=None, *, http_post=None, http_get=None) -> int:
         if not sys.stdin.isatty():
             raise SystemExit("nak report is interactive-only; run it in a terminal")
         from network.nakd import person_action_statement, report_proof_payload
-        with approval("report", summary):
-            person_key = PersonKey("report", summary)
-            proof_ts = int(time.time())
-            proof_sig = person_key.sign(person_action_statement(
-                "report-cli", report_proof_payload(a.subject, a.reason, a.note, evidence),
-                proof_ts)).hex()
+        person_key = PersonKey("report", summary)
+        proof_ts = int(time.time())
+        proof_sig = person_key.sign(person_action_statement(
+            "report-cli", report_proof_payload(a.subject, a.reason, a.note, evidence),
+            proof_ts)).hex()
         result = call(s, {"op": "report_cli", "subject": a.subject, "reason": a.reason,
                           "note": a.note, "evidence": evidence, "ts": proof_ts,
                           "signature": proof_sig})
@@ -3068,12 +3090,11 @@ def main(argv=None, *, http_post=None, http_get=None) -> int:
             print("operator trust unchanged")
             return 1
         from network.nakd import person_action_statement
-        with approval("suspend", summary):
-            person_key = PersonKey("suspend", summary)
-            proof_ts = int(time.time())
-            proof_kind = "operator-trust" if trusting else "operator-untrust"
-            proof_sig = person_key.sign(person_action_statement(
-                proof_kind, {"person": contact["person"]}, proof_ts)).hex()
+        person_key = PersonKey("suspend", summary)
+        proof_ts = int(time.time())
+        proof_kind = "operator-trust" if trusting else "operator-untrust"
+        proof_sig = person_key.sign(person_action_statement(
+            proof_kind, {"person": contact["person"]}, proof_ts)).hex()
         op = "operator_trust" if trusting else "operator_untrust"
         result = call(s, {"op": op, "contact": contact["person"],
                           "ts": proof_ts, "signature": proof_sig})
@@ -3177,10 +3198,9 @@ def main(argv=None, *, http_post=None, http_get=None) -> int:
         broker_preflight("invite", invite_summary)
         http_post = http_post or _http_post_json
         st = call(s, {"op": "status"})
-        priv = PersonKey("invite", invite_summary, key_path=a.person_key or _person_key_path())
+        invite_key_path = (a.person_key or _person_key_path()) if custody_mode() == "file" else None
+        priv = PersonKey("invite", invite_summary, key_path=invite_key_path)
         release, line = _release_for_invite(a.release_url)
-        if a.from_name:
-            _write_private(name_file, (a.from_name.strip()[:40] + "\n").encode())
         if not from_name:
             print("tip: add --from <your name> so your friend sees who invited them (remembered after once)",
                   file=sys.stderr)
@@ -3207,6 +3227,8 @@ def main(argv=None, *, http_post=None, http_get=None) -> int:
                                       ttl_s=expires_at - issued_at, now=issued_at, note=a.note,
                                       release=release, from_name=from_name,
                                       kind=a.kind, worker=worker, consumer=consumer)
+        if a.from_name:
+            _write_private(name_file, (a.from_name.strip()[:40] + "\n").encode())
         call(s, {"op": "register_invite", "code": code})
         if a.kind == "consumer":
             print(f"devnet starter: {format_amount(a.starter)} (spend-only)", file=sys.stderr)
@@ -3289,20 +3311,24 @@ def main(argv=None, *, http_post=None, http_get=None) -> int:
             release, line = _release_for_invite()
             if not release or not line:
                 raise SystemExit("cannot publish an address until this node has a sha-pinned public release line")
+            person_key = PersonKey("address-control", address_summary)
+            person_pub = person_key.public_key().public_bytes_raw().hex()
+            unsigned_address = joincode.build_unsigned_address(
+                person_pub, st["node"],
+                [{"node": st["node"], "addrs": [st["relay"]]}], days=a.days,
+                from_name=from_name, release=release)
+            from network.nakd import address_control_statement
+            ts = int(time.time())
+            control_statement = address_control_statement(
+                "register_address", unsigned_address["aid"], ts)
+            signed = person_sign_batch(
+                "address-control", [joincode._canon(unsigned_address), control_statement],
+                summary=address_summary)
+            code = joincode.attach_address_signature(unsigned_address, signed[0][1])
+            install_line = line.replace("{CODE}", code)
+            signature = signed[1][1].hex()
             if a.name:
                 _write_private(name_file, (from_name + "\n").encode())
-            with approval("address-control", address_summary):
-                person_priv = PersonKey("address-control", address_summary)
-                code = joincode.encode_address(
-                    person_priv, st["node"],
-                    [{"node": st["node"], "addrs": [st["relay"]]}], days=a.days,
-                    from_name=from_name, release=release)
-                install_line = line.replace("{CODE}", code)
-                from network.nakd import address_control_statement
-                aid = joincode.decode_address(code)["aid"]
-                ts = int(time.time())
-                signature = PersonKey("address-control", address_summary).sign(
-                    address_control_statement("register_address", aid, ts)).hex()
             call(s, {"op": "register_address", "code": code, "install_line": install_line,
                      "ts": ts, "signature": signature})
             print(code)
@@ -3498,15 +3524,19 @@ def main(argv=None, *, http_post=None, http_get=None) -> int:
                 raise SystemExit("nak task decide is interactive-only; run it in a terminal")
             task_hash = _resolve_posted_task(s, a.task)
             task_summary = f"{a.decision.title()} paid task {task_hash[:12]}…"
-            person_priv = PersonKey("task-verdict", task_summary)
+            # Bind the configured public authority before prompting; the actual signature below
+            # still goes through person_sign so verdict_reason reaches the broker context.
+            PersonKey("task-verdict", task_summary)
             answer = input(f"{a.decision.upper()} paid task {task_hash[:12]}? [y/N] ")
             if answer.strip().lower() not in {"y", "yes"}:
                 print("task unchanged")
                 return 1
             from network import verdict as verdict_policy
             ts = int(time.time())
-            signature = person_priv.sign(
-                verdict_policy.decision_statement(task_hash, a.decision, a.reason, ts)).hex()
+            signature = person_sign(
+                "task-verdict",
+                verdict_policy.decision_statement(task_hash, a.decision, a.reason, ts),
+                summary=task_summary, context={"verdict_reason": a.reason}).hex()
             print(json.dumps(call(s, {"op": "task_decide", "task": task_hash,
                                       "decision": a.decision, "reason": a.reason,
                                       "ts": ts, "signature": signature})))
