@@ -40,8 +40,10 @@ PREFLIGHT_ONLY_KINDS = {"resolve"}
 _PRINCIPAL = "nakshatra-person"
 _WHAT = "nakshatra.person.v1"
 _BROKER_TIMEOUT_S = 3
-_BROKER_WAIT_S = 300
+_BROKER_DEFAULT_WAIT_S = 300
 _BROKER_POLL_S = 1
+_BROKER_V1_MIN_TTL_S = 10  # pillar_signer_broker.V1_MIN_TTL; compatibility is asserted in tests.
+_PROOF_SAFETY_MARGIN_S = 30
 _NOT_APPROVED = "person signing was not approved; nothing was signed"
 _HOME_OVERRIDE: contextvars.ContextVar[Path | None] = contextvars.ContextVar(
     "person_custody_home", default=None)
@@ -60,6 +62,21 @@ _SUSPENSION_PROOF_KINDS = {
 class _BrokerConfig:
     url: str
     token: str
+
+
+@dataclass(frozen=True)
+class PersonAct:
+    """One custody decision carried unchanged from preflight through signing."""
+    kind: str
+    summary: str
+    mode: str
+    config: _BrokerConfig | None
+    public_key: ed25519.Ed25519PublicKey | None
+
+    def for_signing(self, kind: str, summary: str) -> "PersonAct":
+        """Refine presentation/kind without re-reading custody or broker configuration."""
+        _check_request(kind, summary)
+        return PersonAct(kind, summary, self.mode, self.config, self.public_key)
 
 
 def _home() -> Path:
@@ -120,15 +137,67 @@ def plain(text: object, limit: int) -> str:
     return clean[:limit - 1].rstrip() + "…"
 
 
+def _read_owned_regular(path: Path, label: str, *, exact_mode: int | None = None,
+                        max_bytes: int = 16 * 1024) -> bytes:
+    """Read a small euid-owned file without following or racing a symlink."""
+    try:
+        before = path.lstat()
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise SystemExit(f"cannot read {label} {path}: {exc}") from exc
+    mode = stat.S_IMODE(before.st_mode)
+    if not stat.S_ISREG(before.st_mode):
+        raise SystemExit(f"{label} {path} must be a regular file")
+    if before.st_uid != os.geteuid():
+        raise SystemExit(f"{label} {path} must be owned by the effective user")
+    if exact_mode is not None:
+        if mode != exact_mode:
+            raise SystemExit(f"{label} {path} must have mode {exact_mode:04o}")
+    elif mode & 0o022:
+        raise SystemExit(f"{label} {path} must not be group/world writable")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(str(path), flags)
+    except OSError as exc:
+        raise SystemExit(f"cannot read {label} {path}: {exc}") from exc
+    try:
+        after = os.fstat(fd)
+        if (not stat.S_ISREG(after.st_mode) or after.st_uid != os.geteuid()
+                or (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino)):
+            raise SystemExit(f"{label} {path} changed while it was being opened")
+        after_mode = stat.S_IMODE(after.st_mode)
+        if ((exact_mode is not None and after_mode != exact_mode)
+                or (exact_mode is None and after_mode & 0o022)):
+            raise SystemExit(f"{label} {path} permissions changed while it was being opened")
+        if not 0 < after.st_size <= max_bytes:
+            raise SystemExit(f"{label} {path} is empty or too large")
+        raw = b""
+        while len(raw) <= max_bytes:
+            chunk = os.read(fd, min(4096, max_bytes + 1 - len(raw)))
+            if not chunk:
+                break
+            raw += chunk
+        if not raw or len(raw) > max_bytes:
+            raise SystemExit(f"{label} {path} is empty or too large")
+        return raw
+    finally:
+        os.close(fd)
+
+
 def custody_mode() -> str:
-    """Return the configured person-key backend. Missing configuration preserves file custody."""
+    """Return the configured backend once. Missing marker preserves legacy file custody.
+
+    After a broker import removes the historical private file, this fallback still fails closed:
+    file custody cannot sign without that file; it never regenerates or recovers authority.
+    """
     path = _custody_path()
     try:
-        mode = path.read_text().strip()
+        mode = _read_owned_regular(path, "person custody marker").decode("utf-8").strip()
     except FileNotFoundError:
         return "file"
-    except OSError as exc:
-        raise SystemExit(f"cannot read person custody mode from {path}: {exc}") from exc
+    except UnicodeDecodeError as exc:
+        raise SystemExit(f"person custody marker {path} is not UTF-8 text") from exc
     if mode not in {"file", "broker"}:
         raise SystemExit(
             f"invalid person custody mode {mode!r} in {path}; expected one word: file or broker")
@@ -170,30 +239,9 @@ def _load_matching_person_key(*, error_context: str = "this decision") -> ed2551
 
 
 def _read_private_token(path: Path) -> str:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
     try:
-        fd = os.open(str(path), flags)
-    except OSError as exc:
-        raise SystemExit(f"cannot read person broker token file {path}: {exc}") from exc
-    try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode):
-            raise SystemExit(f"person broker token file {path} must be a regular file")
-        if info.st_uid != os.getuid():
-            raise SystemExit(f"person broker token file {path} must be owned by the current user")
-        if stat.S_IMODE(info.st_mode) != 0o600:
-            raise SystemExit(f"person broker token file {path} must have mode 0600")
-        if not 0 < info.st_size <= 16 * 1024:
-            raise SystemExit(f"person broker token file {path} is empty or too large")
-        raw = b""
-        while len(raw) <= 16 * 1024:
-            chunk = os.read(fd, 4096)
-            if not chunk:
-                break
-            raw += chunk
-    finally:
-        os.close(fd)
-    try:
+        raw = _read_owned_regular(
+            path, "person broker token file", exact_mode=0o600, max_bytes=16 * 1024)
         token = raw.decode("utf-8").strip()
     except UnicodeDecodeError as exc:
         raise SystemExit(f"person broker token file {path} is not UTF-8 text") from exc
@@ -205,13 +253,12 @@ def _read_private_token(path: Path) -> str:
 def _broker_config() -> _BrokerConfig:
     path = _broker_config_path()
     try:
-        document = json.loads(path.read_text())
+        raw = _read_owned_regular(path, "person broker configuration")
+        document = json.loads(raw.decode("utf-8"))
     except FileNotFoundError as exc:
         raise SystemExit(f"person custody is broker but configuration is missing: {path}") from exc
-    except OSError as exc:
-        raise SystemExit(f"cannot read person broker configuration {path}: {exc}") from exc
     except (UnicodeError, json.JSONDecodeError) as exc:
-        raise SystemExit(f"invalid person broker configuration {path}: {exc}") from exc
+        raise SystemExit(f"invalid person broker configuration {path}") from exc
     if not isinstance(document, dict) or set(document) != {"url", "token_file"}:
         raise SystemExit(
             f"invalid person broker configuration {path}: expected only url and token_file")
@@ -231,6 +278,26 @@ def _broker_config() -> _BrokerConfig:
     return _BrokerConfig(url=url.rstrip("/"), token=_read_private_token(Path(token_file)))
 
 
+class _NoBrokerRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, _req, _fp, _code, _msg, _headers, _newurl):
+        return None
+
+
+_BROKER_OPENER = urllib.request.build_opener(_NoBrokerRedirects)
+
+
+def _broker_error_code(exc: urllib.error.HTTPError) -> str:
+    """Return only a bounded inert broker error identifier, never its body or headers."""
+    try:
+        value = json.loads(exc.read(4096).decode("utf-8")).get("error", "")
+    except (AttributeError, UnicodeError, ValueError, json.JSONDecodeError):
+        return ""
+    if not isinstance(value, str):
+        return ""
+    value = value[:64]
+    return value if re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", value) else ""
+
+
 def _broker_json(config: _BrokerConfig, method: str, path: str,
                  body: dict | None = None, *, timeout: float = _BROKER_TIMEOUT_S) -> dict:
     data = None if body is None else json.dumps(body, separators=(",", ":")).encode("utf-8")
@@ -240,36 +307,36 @@ def _broker_json(config: _BrokerConfig, method: str, path: str,
     request = urllib.request.Request(
         config.url + path, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with _BROKER_OPENER.open(request, timeout=timeout) as response:
             result = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        try:
-            error = json.loads(exc.read().decode("utf-8")).get("error", "")
-        except (AttributeError, UnicodeError, ValueError, json.JSONDecodeError):
-            error = ""
-        detail = f": {error}" if error else ""
-        raise SystemExit(f"person broker refused {path} (HTTP {exc.code}){detail}; nothing was signed") from exc
+        error = _broker_error_code(exc)
+        detail = f", code {error}" if error else ""
+        raise SystemExit(
+            f"person broker refused the request (HTTP {exc.code}{detail}); nothing was signed") from exc
     except (OSError, urllib.error.URLError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
-        raise SystemExit(f"person broker is unavailable or returned invalid data at {path}: {exc}; "
-                         "nothing was signed") from exc
+        raise SystemExit(
+            "person broker is unavailable or returned invalid data; nothing was signed") from exc
     if not isinstance(result, dict):
-        raise SystemExit(f"person broker returned a non-object at {path}; nothing was signed")
+        raise SystemExit("person broker returned invalid data; nothing was signed")
     return result
 
 
-def broker_preflight(kind: str, summary: str) -> None:
+def broker_preflight(kind: str, summary: str) -> PersonAct:
     """Refuse an unavailable broker before prompts, writes, or state-changing calls."""
     if kind not in PREFLIGHT_ONLY_KINDS:
         _check_request(kind, summary)
-    if custody_mode() != "broker":
-        return
-    config = _broker_config()
-    principal = _broker_json(config, "GET", "/principal/v1")
-    if principal.get("principal") != _PRINCIPAL:
-        raise SystemExit(
-            f"person broker authenticated the wrong principal {principal.get('principal')!r}; "
-            "expected 'nakshatra-person'; nothing was signed")
-    _person_public_key()
+    mode = custody_mode()
+    config = None
+    if mode == "broker":
+        config = _broker_config()
+        principal = _broker_json(config, "GET", "/principal/v1")
+        if principal.get("principal") != _PRINCIPAL:
+            raise SystemExit(
+                "person broker authenticated the wrong principal; expected "
+                 "'nakshatra-person'; nothing was signed")
+    public_key = _person_public_key() if mode == "broker" else None
+    return PersonAct(kind, summary, mode, config, public_key)
 
 
 def _canonical(value: dict) -> bytes:
@@ -365,6 +432,52 @@ def _error_context(kind: str) -> str:
     return "renewal" if kind in {"grant-renew", "spend-cap"} else "this decision"
 
 
+def _proof_skew_s(kind: str) -> int | None:
+    """Use nakd's actual verifier constants for statements that age during approval."""
+    if kind in {"contact-accept", "address-control"}:
+        from network import nakd
+        return nakd.ACCEPT_PROOF_MAX_SKEW_S
+    if kind in {"report", "suspend"}:
+        from network import nakd
+        return nakd.PERSON_ACTION_PROOF_MAX_SKEW_S
+    if kind == "task-verdict":
+        from network import verdict
+        return verdict.DECISION_MAX_SKEW_S
+    return None
+
+
+def _approval_wait_s(kind: str) -> int:
+    skew = _proof_skew_s(kind)
+    if skew is None:
+        return _BROKER_DEFAULT_WAIT_S
+    desired = skew - _PROOF_SAFETY_MARGIN_S
+    if desired < _BROKER_V1_MIN_TTL_S:
+        raise SystemExit(
+            "person broker minimum TTL is incompatible with nakd proof freshness: "
+            f"kind={kind}, skew={skew}s, safety_margin={_PROOF_SAFETY_MARGIN_S}s, "
+            f"broker_min={_BROKER_V1_MIN_TTL_S}s; nothing was signed")
+    return max(desired, _BROKER_V1_MIN_TTL_S)
+
+
+def _refuse_stale_signed_items(kind: str, results: list[tuple[bytes, bytes]], *,
+                               now: int | None = None) -> None:
+    """Last local fence before a caller can send or persist a newly signed short proof."""
+    skew = _proof_skew_s(kind)
+    if skew is None:
+        return
+    current = int(time.time()) if now is None else int(now)
+    for raw, _signature in results:
+        try:
+            value = json.loads(raw.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError):
+            continue
+        ts = value.get("ts") if isinstance(value, dict) else None
+        if type(ts) is int and current - ts > skew:
+            raise SystemExit(
+                f"person approval completed after the {skew}s nakd proof window; "
+                "nothing was sent or written")
+
+
 def _file_sign_batch(kind: str, items: list, person_hex: str) -> list[tuple[bytes, bytes]]:
     key = _load_matching_person_key(error_context=_error_context(kind))
     results: list[tuple[bytes, bytes]] = []
@@ -381,37 +494,42 @@ def _file_sign_batch(kind: str, items: list, person_hex: str) -> list[tuple[byte
 
 def _broker_sign_batch(kind: str, items: list, wire_items: list[dict], *, summary: str,
                        context: dict | None, person_key: ed25519.Ed25519PublicKey,
-                       person_hex: str) -> list[tuple[bytes, bytes]]:
-    config = _broker_config()
+                       person_hex: str, config: _BrokerConfig) -> list[tuple[bytes, bytes]]:
+    wait_s = _approval_wait_s(kind)
     exact_content = {"v": 1, "kind": kind, "items": wire_items}
     if context is not None:
         exact_content["context"] = context
+    deadline = time.monotonic() + wait_s
     enqueued = _broker_json(config, "POST", "/enqueue/v1", {
         "what": _WHAT,
         "tier": "high",
         "review": {"description": summary},
         "exact_content": exact_content,
         "idempotency_key": f"{_PRINCIPAL}:{secrets.token_hex(16)}",
-        "ttl": _BROKER_WAIT_S,
+        "ttl": wait_s,
     })
     request_id = enqueued.get("request_id")
     if not isinstance(request_id, str) or not request_id:
         raise SystemExit("person broker returned no request id; nothing was signed")
 
-    deadline = time.monotonic() + _BROKER_WAIT_S
     result_path = "/result/v1?" + urllib.parse.urlencode({"request_id": request_id})
     while True:
+        if time.monotonic() >= deadline:
+            raise SystemExit(_NOT_APPROVED)
         result = _broker_json(config, "GET", result_path)
         status = result.get("status")
         if status == "approved":
+            if time.monotonic() >= deadline:
+                raise SystemExit(_NOT_APPROVED)
             break
         if status in {"declined", "expired"}:
             raise SystemExit(_NOT_APPROVED)
         if status in {"unknown", "consumed"}:
             raise SystemExit(f"person broker returned terminal status {status!r}; nothing was signed")
-        if time.monotonic() >= deadline:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
             raise SystemExit(_NOT_APPROVED)
-        time.sleep(_BROKER_POLL_S)
+        time.sleep(min(_BROKER_POLL_S, remaining))
 
     response = _broker_json(config, "POST", "/person-sign/v1", {
         "request_id": request_id, "exact_content": exact_content,
@@ -450,29 +568,35 @@ def _broker_sign_batch(kind: str, items: list, wire_items: list[dict], *, summar
 
 
 def person_sign_batch(kind: str, items: list, *, summary: str,
-                      context: dict | None = None) -> list[tuple[bytes, bytes]]:
+                      context: dict | None = None,
+                      act: PersonAct | None = None) -> list[tuple[bytes, bytes]]:
     """Sign one atomic 1-8 item act, resolving suspension-record templates in order."""
     _check_request(kind, summary)
-    mode = custody_mode()
-    if mode == "broker":
-        broker_preflight(kind, summary)
-    public_key = _person_public_key()
+    act = broker_preflight(kind, summary) if act is None else act
+    if act.kind != kind:
+        raise SystemExit("person custody act kind changed during signing; nothing was signed")
+    mode = act.mode
+    public_key = act.public_key or _person_public_key()
     person_hex = public_key.public_bytes_raw().hex()
     normalized, wire = _validated_items(items, person_hex)
     checked_context = _validate_context(kind, normalized, context)
-    if custody_mode() != mode:
-        raise SystemExit("person custody mode changed during signing; nothing was signed")
     if mode == "broker":
-        return _broker_sign_batch(kind, normalized, wire, summary=summary,
-                                  context=checked_context, person_key=public_key,
-                                  person_hex=person_hex)
-    return _file_sign_batch(kind, normalized, person_hex)
+        if act.config is None:
+            raise SystemExit("person broker configuration was not carried from preflight")
+        results = _broker_sign_batch(
+            kind, normalized, wire, summary=summary, context=checked_context,
+            person_key=public_key, person_hex=person_hex, config=act.config)
+    else:
+        results = _file_sign_batch(kind, normalized, person_hex)
+    _refuse_stale_signed_items(kind, results)
+    return results
 
 
 def person_sign(kind: str, statement: bytes, *, summary: str,
-                context: dict | None = None) -> bytes:
+                context: dict | None = None, act: PersonAct | None = None) -> bytes:
     """Sign one classified statement through the configured person-custody backend."""
-    return person_sign_batch(kind, [statement], summary=summary, context=context)[0][1]
+    return person_sign_batch(
+        kind, [statement], summary=summary, context=context, act=act)[0][1]
 
 
 @contextmanager
@@ -488,18 +612,23 @@ def _signing_home(home: Path):
 class PersonKey:
     """The private-key-shaped adapter required by joincode and sthambha.signer."""
 
-    def __init__(self, kind: str, summary: str, *, key_path: Path | None = None):
+    def __init__(self, kind: str, summary: str, *, key_path: Path | None = None,
+                 act: PersonAct | None = None):
         _check_request(kind, summary)
         self._kind = kind
         self._summary = summary
-        mode = custody_mode()
+        self._act = broker_preflight(kind, summary) if act is None else act
+        if self._act.kind != kind:
+            raise SystemExit("person custody act kind changed before signing; nothing was signed")
+        mode = self._act.mode
         self._mode = mode
         if key_path is not None and mode == "broker":
             raise SystemExit("person custody is broker; --person-key is not allowed")
         if mode == "broker":
-            broker_preflight(kind, summary)
             self._key = None
-            self._public = _person_public_key()
+            if self._act.public_key is None:
+                raise SystemExit("person broker public identity was not carried from preflight")
+            self._public = self._act.public_key
         elif key_path is not None:
             # Invites historically parsed this raw file without requiring signer/person.pub.
             self._key, _person_pub = _raw_file_key(Path(key_path))
@@ -511,11 +640,11 @@ class PersonKey:
     def sign(self, data: bytes) -> bytes:
         if not isinstance(data, bytes) or not data:
             raise SystemExit("person-signing statement must not be empty")
-        if custody_mode() != self._mode:
-            raise SystemExit("person custody mode changed during signing; nothing was signed")
         if self._key is not None:
-            return self._key.sign(data)
-        return person_sign(self._kind, data, summary=self._summary)
+            result = [(data, self._key.sign(data))]
+            _refuse_stale_signed_items(self._kind, result)
+            return result[0][1]
+        return person_sign(self._kind, data, summary=self._summary, act=self._act)
 
     def public_key(self) -> ed25519.Ed25519PublicKey:
         return self._public

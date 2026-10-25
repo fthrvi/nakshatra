@@ -845,7 +845,7 @@ def test_operator_suspend_lost_response_retries_the_exact_pending_record(monkeyp
     key_opens = []
 
     class FakePersonKey:
-        def __init__(self, *_args):
+        def __init__(self, *_args, **_kwargs):
             key_opens.append(True)
 
         def public_key(self):
@@ -915,7 +915,7 @@ def test_operator_suspend_stale_seq_adopts_signed_server_state_and_requests_reru
     fetched = []
 
     class FakePersonKey:
-        def __init__(self, *_args):
+        def __init__(self, *_args, **_kwargs):
             pass
 
         def public_key(self):
@@ -982,7 +982,7 @@ def test_operator_suspend_definitive_refusal_clears_exact_pending_with_person_pr
     abandoned = []
 
     class FakePersonKey:
-        def __init__(self, *_args):
+        def __init__(self, *_args, **_kwargs):
             pass
 
         def public_key(self):
@@ -1046,7 +1046,7 @@ def test_operator_suspend_manual_abandon_is_tty_and_person_proofed(monkeypatch):
     state = {"own": None, "pending": pending}
 
     class FakePersonKey:
-        def __init__(self, *_args):
+        def __init__(self, *_args, **_kwargs):
             pass
 
         def public_key(self):
@@ -1140,7 +1140,7 @@ def test_cli_proof_timestamps_are_taken_after_slow_approval(monkeypatch):
     action_requests = []
 
     class FakePersonKey:
-        def __init__(self, *_args):
+        def __init__(self, *_args, **_kwargs):
             clock[0] += 200
 
         def sign(self, _statement):
@@ -1150,6 +1150,8 @@ def test_cli_proof_timestamps_are_taken_after_slow_approval(monkeypatch):
         if request["op"] == "contacts":
             return {"contacts": [{"person": person, "node": "44" * 32,
                                    "petname": "operator"}]}
+        if request["op"] == "resolve_report_subject":
+            return {"subject": request["subject"]}
         action_requests.append(request)
         if request["op"] == "report_cli":
             return {"subject": request["subject"], "status": "received"}
@@ -1255,6 +1257,16 @@ def test_raw_report_via_cli_spoof_is_mcp_and_person_proof_earns_cli(tmp_path, mo
     monkeypatch.setattr(nakd, "_http_post_json",
                         lambda _url, body: seen.append(body) or {"status": "recorded"})
     try:
+        resolved = nakd.handle(party.node, {
+            "op": "resolve_report_subject", "subject": "subject"})
+        assert resolved == {"ok": True, "subject": subject_node}
+        resolved_payload = nakd.report_proof_payload(subject_node, "abuse", "", {})
+        resolved_report = nakd.handle(party.node, {
+            "op": "report_cli", "subject": subject_node, "reason": "abuse",
+            **_proof(party.person_priv, "report-cli", resolved_payload),
+        })
+        assert resolved_report["ok"] and seen[-1]["subject"] == subject_node
+
         spoof = nakd.handle(party.node, {"op": "report", "subject": "subject",
                                          "reason": "abuse", "via": "cli"})
         assert spoof["ok"] and seen[-1]["via"] == "mcp"
