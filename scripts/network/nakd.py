@@ -3100,7 +3100,8 @@ class Node:
             raise ValueError("onboard base must be an http(s) URL without credentials, query, or fragment")
         return base.rstrip("/")
 
-    def report(self, subject: str, reason: str, note: str = "", evidence=None, *, via: str = "mcp") -> dict:
+    def resolve_report_subject(self, subject: str, *, via: str = "cli") -> str:
+        """Resolve exactly the node key report() will transmit, without changing state."""
         if via not in {"cli", "mcp"}:
             raise ValueError("report via must be cli or mcp")
         contact = self.store.resolve(str(subject))
@@ -3112,6 +3113,10 @@ class Node:
             subject_node = str(subject)
         if not isinstance(subject_node, str) or _re.fullmatch(r"[0-9a-f]{64}", subject_node) is None:
             raise ValueError("report subject must be a contact or 64-character node key")
+        return subject_node
+
+    def report(self, subject: str, reason: str, note: str = "", evidence=None, *, via: str = "mcp") -> dict:
+        subject_node = self.resolve_report_subject(subject, via=via)
         if reason not in REPORT_REASONS:
             raise ValueError("report reason must be spam, fraud, abuse, bad-output, or other")
         if not isinstance(note, str) or len(note) > 500:
@@ -3234,7 +3239,7 @@ OPS = {"status", "node_sign_stage", "cancel_invite", "register_invite", "registe
        "agent_send", "threads", "thread", "card", "card_set", "delivered", "inbox", "outbox",
        "task_post", "tasks", "task_status", "task_claim", "task_submit", "task_decide", "ledger", "escrow_status", "direct",
        "starter_status", "install_revocation", "import_revocation", "revocations",
-       "report", "report_cli", "install_suspension", "stage_suspension",
+       "report", "report_cli", "resolve_report_subject", "install_suspension", "stage_suspension",
        "recover_suspension", "abandon_suspension", "import_suspension", "suspensions",
        "operator_trust", "operator_untrust"}
 
@@ -3285,6 +3290,9 @@ def handle(node: Node, req: dict) -> dict:
             return {"ok": True, **node.report(
                 req["subject"], req["reason"], req.get("note", ""), req.get("evidence", {}),
                 via="mcp")}
+        if op == "resolve_report_subject":
+            return {"ok": True, "subject": node.resolve_report_subject(
+                req["subject"], via="cli")}
         if op == "report_cli":
             return {"ok": True, **node.report_cli(
                 req["subject"], req["reason"], req.get("note", ""), req.get("evidence", {}),

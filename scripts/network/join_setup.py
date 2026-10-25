@@ -431,8 +431,8 @@ def ensure_identity(home: Path) -> dict:
     if not first_initialisation:
         return _established_identity(home, state, net, person_path, node_key)
     with _signing_home(home):
-        broker_preflight("grant-issue", f"Create initial grant for agent {agent}")
-        broker = custody_mode() == "broker"
+        custody_act = broker_preflight("grant-issue", f"Create initial grant for agent {agent}")
+        broker = custody_act.mode == "broker"
     if broker:
         raise SystemExit(
             "person custody is broker, but a fresh node has no signer/person.pub to bind to; "
@@ -496,7 +496,10 @@ def ensure_identity(home: Path) -> dict:
             _lease_priv, lease_pub = S.load_or_create_lease_key(state)
             with _signing_home(home):
                 grant = S.issue_grant(
-                    PersonKey("grant-issue", f"Give agent {agent} {','.join(AGENT_CAPS)}"),
+                    PersonKey(
+                        "grant-issue", f"Give agent {agent} {','.join(AGENT_CAPS)}",
+                        act=custody_act.for_signing(
+                            "grant-issue", f"Give agent {agent} {','.join(AGENT_CAPS)}")),
                     agent, agent_pub, AGENT_CAPS, node=node_pub, ttl_s=AGENT_TTL_S,
                     lease={"issuer_pub": lease_pub, "max_s": AGENT_LEASE_S, "idle_s": AGENT_IDLE_S})
             agent_files.write_key_and_grant(agent_priv, grant)
