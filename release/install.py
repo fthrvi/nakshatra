@@ -398,15 +398,20 @@ class Installer:
         return self.prefix / "state" / TRANSITION_FILE
 
     @staticmethod
-    def _validated_transition(value: dict) -> tuple[str, str | None, str]:
-        if value.get("schema") != TRANSITION_SCHEMA or set(value) != {
-                "schema", "pubkey", "from", "to"}:
+    def _validated_transition(value: dict) -> tuple[str, str, str | None, str]:
+        fields = set(value) if isinstance(value, dict) else set()
+        if value.get("schema") != TRANSITION_SCHEMA or fields not in (
+                {"schema", "pubkey", "from", "to"},
+                {"schema", "pubkey", "previous_pubkey", "from", "to"}):
             raise InstallError("release transition record is malformed")
-        pubkey, from_version, to_version = value["pubkey"], value["from"], value["to"]
+        pubkey = value["pubkey"]
+        previous_pubkey = value.get("previous_pubkey", pubkey)
+        from_version, to_version = value["from"], value["to"]
         try:
-            if not isinstance(pubkey, str) or len(pubkey) != 64 \
-                    or any(char not in "0123456789abcdef" for char in pubkey):
-                raise ValueError
+            for key in (pubkey, previous_pubkey):
+                if not isinstance(key, str) or len(key) != 64 \
+                        or any(char not in "0123456789abcdef" for char in key):
+                    raise ValueError
             if from_version is not None:
                 if not isinstance(from_version, str):
                     raise ValueError
@@ -418,15 +423,19 @@ class Installer:
             raise InstallError("release transition record is malformed")
         if from_version == to_version:
             raise InstallError("release transition must change versions")
-        return pubkey, from_version, to_version
+        return previous_pubkey, pubkey, from_version, to_version
 
-    def _begin_transition(self, pubkey: str, from_version: str | None, to_version: str) -> None:
+    def _begin_transition(self, pubkey: str, from_version: str | None, to_version: str,
+                          *, new_pubkey: str | None = None) -> None:
+        target_pubkey = new_pubkey or pubkey
         transition = {
             "schema": TRANSITION_SCHEMA,
-            "pubkey": pubkey,
+            "pubkey": target_pubkey,
             "from": from_version,
             "to": to_version,
         }
+        if target_pubkey != pubkey:
+            transition["previous_pubkey"] = pubkey
         self._validated_transition(transition)
         _save_private_state(self.prefix, TRANSITION_FILE, transition)
 
@@ -455,7 +464,7 @@ class Installer:
         transition = _load_private_state(self.prefix, TRANSITION_FILE)
         if transition is None:
             return None
-        pubkey, from_version, to_version = self._validated_transition(transition)
+        previous_pubkey, pubkey, from_version, to_version = self._validated_transition(transition)
         recovered = {"state": "stale", "from": from_version, "to": to_version}
         cfg = _load_config(self.prefix)
         committed = cfg.get("current")
@@ -463,7 +472,8 @@ class Installer:
             raise InstallError(
                 f"release transition {from_version!r}->{to_version!r} conflicts with "
                 f"committed version {committed!r}")
-        if cfg.get("pubkey") not in (None, pubkey):
+        expected_key = pubkey if committed == to_version else previous_pubkey
+        if cfg.get("pubkey") not in (None, expected_key):
             raise InstallError("release transition key conflicts with the pinned release key")
         current = _current(self.prefix)
         if committed == to_version and current == to_version:
@@ -506,11 +516,12 @@ class Installer:
                 "current differs from config.json but no installer holds the prefix lock")
         transition = _load_private_state(self.prefix, TRANSITION_FILE)
         if transition is not None:
-            recorded_key, recorded_from, recorded_to = self._validated_transition(transition)
+            recorded_previous_key, recorded_key, recorded_from, recorded_to = \
+                self._validated_transition(transition)
             if (recorded_from, recorded_to) != (committed, current):
                 raise InstallError("release transition does not match the locked installer handoff")
             configured_key = cfg.get("pubkey")
-            if configured_key is not None and configured_key != recorded_key:
+            if configured_key is not None and configured_key != recorded_previous_key:
                 raise InstallError("release transition key conflicts with the pinned release key")
             pubkey = recorded_key
         else:
@@ -564,13 +575,46 @@ class Installer:
         return "; " + "; ".join(f"{status}: {', '.join(sorted(names))}" for status, names in sorted(grouped.items()))
 
     # ── fetch + verify ──
-    def fetch_verified(self, source: str, channel: str, pubkey: str, version=None) -> tuple:
+    def _keyroll_tip(self, source: str, channel: str, work: Path, pubkey: str,
+                     forbidden: tuple[str, ...]) -> str:
+        path = work / "keyroll.json"
+        try:
+            if not path.exists():
+                _fetch(source, f"{channel}/keyroll.json", path)
+            chain = json.loads(path.read_text())
+            return rk.keyroll_tip(chain, pubkey, forbidden=forbidden)
+        except Exception as e:
+            raise InstallError(
+                "release metadata is not signed by the pinned release key and keyroll.json does not provide "
+                f"a valid roll from the pinned key: {e}") from e
+
+    def _release_signature_key(self, obj: dict, source: str, channel: str, work: Path,
+                               pubkey: str, forbidden: tuple[str, ...]) -> str:
+        if rk.verify(obj, pubkey):
+            return pubkey
+        keyid = ((obj.get("sig") or {}).get("keyid")
+                 if isinstance(obj, dict) else None)
+        shown = keyid if isinstance(keyid, str) else "malformed"
+        try:
+            tip = self._keyroll_tip(source, channel, work, pubkey, forbidden)
+        except InstallError as e:
+            raise InstallError(f"release signature keyid {shown!r} is not trusted: {e}") from e
+        if not rk.verify(obj, tip):
+            raise InstallError(
+                f"release signature keyid {shown!r} is not the validated key-roll tip")
+        return tip
+
+    def fetch_verified(self, source: str, channel: str, pubkey: str, version=None,
+                       *, forbidden_pubkeys=()) -> tuple:
         work = Path(tempfile.mkdtemp(prefix="nak-release-"))
+        latest_key = None
         if version is None:
             _fetch(source, f"{channel}/latest.json", work / "latest.json")
             latest = json.loads((work / "latest.json").read_text())
-            if not rk.verify(latest, pubkey) or latest.get("channel") != channel:
-                raise InstallError("latest.json is not signed by the pinned release key")
+            latest_key = self._release_signature_key(
+                latest, source, channel, work, pubkey, tuple(forbidden_pubkeys))
+            if latest.get("channel") != channel:
+                raise InstallError("latest.json names a different release channel")
             # A host could replay an OLD signed latest.json forever (audit 2026-10-03, finding 1):
             # a signed pointer carries an expiry, and a stale one is refused.
             exp = latest.get("expires_at")
@@ -579,8 +623,12 @@ class Installer:
             version = latest["version"]
         _fetch(source, f"{channel}/{version}/manifest.json", work / "manifest.json")
         man = json.loads((work / "manifest.json").read_text())
-        if man.get("schema") != rk.MANIFEST_SCHEMA or not rk.verify(man, pubkey):
-            raise InstallError("manifest.json is not signed by the pinned release key")
+        manifest_key = self._release_signature_key(
+            man, source, channel, work, pubkey, tuple(forbidden_pubkeys))
+        if man.get("schema") != rk.MANIFEST_SCHEMA:
+            raise InstallError("manifest.json has an unsupported schema")
+        if latest_key is not None and manifest_key != latest_key:
+            raise InstallError("latest.json and manifest.json are signed by different release keys")
         if man["version"] != version or man["channel"] != channel:
             raise InstallError("manifest names a different version or channel than requested")
         files = [(c["file"], c["sha256"]) for c in man["components"]]
@@ -593,6 +641,7 @@ class Installer:
             got = rk.sha256_file(work / name)
             if got != want:
                 raise InstallError(f"{name} does not match the signed manifest (sha256 {got[:12]} != {want[:12]})")
+        self._verified_release_key = manifest_key
         return man, work
 
     # ── unpack + environment ──
@@ -1149,7 +1198,12 @@ class Installer:
         pubkey = pinned or pubkey
         if not pubkey:
             raise InstallError("first install needs --pubkey (the release key to trust)")
-        man, work = self.fetch_verified(source, channel, pubkey, version)
+        history = cfg.get("pubkey_history", [])
+        if not isinstance(history, list) or any(not isinstance(key, str) for key in history):
+            raise InstallError("config.json has a malformed release-key history")
+        man, work = self.fetch_verified(
+            source, channel, pubkey, version, forbidden_pubkeys=tuple(history))
+        release_pubkey = self._verified_release_key
         if min_version and _vt(man["version"]) < _vt(min_version):
             shutil.rmtree(work, ignore_errors=True)
             raise InstallError(f"the release host offers {man['version']}, older than {min_version} which your "
@@ -1185,7 +1239,7 @@ class Installer:
         # Resolve `current/...` argv while it still points to the old release. A pure-Python service
         # can have no old-release mmap/fd left by the time current is switched.
         pre_switch_used = _releases_in_use(self.prefix / "releases")
-        self._begin_transition(pubkey, prev, man["version"])
+        self._begin_transition(pubkey, prev, man["version"], new_pubkey=release_pubkey)
         try:
             _switch(self.prefix, man["version"])
             names = self._write_units_by_new_installer(man)
@@ -1200,7 +1254,11 @@ class Installer:
             self._restore_release(None, restart=False)
             shutil.rmtree(new_dir, ignore_errors=True)
             raise InstallError(f"first install of {man['version']} failed and was removed: {e}")
-        cfg.update({"source": source, "channel": channel, "pubkey": pubkey, "current": man["version"],
+        if release_pubkey != pubkey:
+            history = [*history, pubkey]
+            # Preserve order while avoiding duplication from hand-edited legacy configs.
+            cfg["pubkey_history"] = list(dict.fromkeys(history))
+        cfg.update({"source": source, "channel": channel, "pubkey": release_pubkey, "current": man["version"],
                     "previous": prev, "updated": int(time.time())})
         try:
             _save_config(self.prefix, cfg)
@@ -1275,10 +1333,14 @@ class Installer:
         if not prev or not (self.prefix / "releases" / prev).exists():
             raise InstallError("no previous release to roll back to")
         cur = _current(self.prefix)
+        man = json.loads((self.prefix / "releases" / prev / "manifest.json").read_text())
+        if man.get("schema") != rk.MANIFEST_SCHEMA or not rk.verify(man, cfg["pubkey"]):
+            raise InstallError(
+                "previous release is not signed by the currently pinned release key; "
+                "refusing a release-key rollback")
         self._begin_transition(cfg["pubkey"], cur, prev)
         try:
             _switch(self.prefix, prev)
-            man = json.loads((self.prefix / "releases" / prev / "manifest.json").read_text())
             self.restart(self.write_units(man), man, force=True)
         except Exception as e:
             self._restore_release(cur, restart=cur is not None)
@@ -1296,7 +1358,7 @@ class Installer:
         transition = _load_private_state(self.prefix, TRANSITION_FILE)
         transition_status = None
         if transition is not None:
-            _pubkey, from_version, to_version = self._validated_transition(transition)
+            _previous_pubkey, _pubkey, from_version, to_version = self._validated_transition(transition)
             if _install_lock_is_held(self.prefix):
                 transition_status = {"state": "pending", "from": from_version, "to": to_version}
             else:

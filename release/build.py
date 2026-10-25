@@ -5,6 +5,9 @@
         --ref nakshatra=<commit-or-branch> --ref sthambha=<commit-or-branch> \
         --release-key ~/.nakshatra-release/release-TEST.key --out ~/nakshatra-dist
 
+Or replace --release-key with --release-signer CMD --release-pubkey HEX. CMD receives canonical
+bytes on stdin and prints a hex Ed25519 signature, which is verified locally before publication.
+
 Output, under <out>/<channel>/<version>/:
     nakshatra-<commit12>.tar.gz   git archive plus static sidecar built from that exact commit
     sthambha-<commit12>.tar.gz    git archive of the Sthambha package at that commit
@@ -18,6 +21,7 @@ Nothing here is hand-built on a node: nodes only download, verify and unpack the
 from __future__ import annotations
 
 import argparse
+import hashlib
 import io
 import json
 import os
@@ -88,9 +92,28 @@ def _git(repo: Path, *args: str) -> str:
     return subprocess.check_output(["git", "-C", str(repo), *args], text=True).strip()
 
 
-def _package_signers(resolved: list[tuple]) -> dict | None:
+def _spec_from_refs(refs: dict[str, str]) -> dict:
+    """Load the release spec from the exact Nakshatra ref when one was requested."""
+    ref = refs.get("nakshatra")
+    if ref is None:
+        return SPEC
+    try:
+        component = next(c for c in SPEC["components"] if c["name"] == "nakshatra")
+        repo = Path(os.path.expanduser(component["repo"]))
+        commit = _git(repo, "rev-parse", f"{ref}^{{commit}}")
+        raw = subprocess.check_output(
+            ["git", "-C", str(repo), "show", f"{commit}:release/spec.json"], text=True)
+        spec = json.loads(raw)
+    except (KeyError, StopIteration, subprocess.CalledProcessError, json.JSONDecodeError) as e:
+        raise RuntimeError("could not load release/spec.json from the requested Nakshatra ref") from e
+    if not isinstance(spec, dict) or not isinstance(spec.get("components"), list):
+        raise RuntimeError("release/spec.json from the requested Nakshatra ref is malformed")
+    return spec
+
+
+def _package_signers(spec: dict, resolved: list[tuple]) -> dict | None:
     """Load package trust/catalog policy from the exact component commit being released."""
-    source = SPEC.get("package_signers")
+    source = spec.get("package_signers")
     if source is None:
         return None
     if not isinstance(source, dict) or set(source) != {"component", "path"}:
@@ -213,24 +236,43 @@ def _build_go_binary(repo: Path, commit: str, source: str, out: Path, go_bin: Pa
         return fields[2]
 
 
-def build(version: str, channel: str, refs: dict, key_path: Path, out_root: Path,
-          uv_bin: Path, now: int | None = None, go_bin: Path | None = None) -> Path:
+def _sign_object(obj: dict, key_path: Path | None, release_signer: str | None,
+                 release_pubkey: str | None) -> dict:
+    if key_path is not None:
+        return rk.sign(obj, key_path.read_text().strip())
+    if release_signer is None or release_pubkey is None:
+        raise ValueError("choose a release key or an external signer plus public key")
+    return rk.sign_external(obj, release_signer, release_pubkey)
+
+
+def build(version: str, channel: str, refs: dict, key_path: Path | None, out_root: Path,
+          uv_bin: Path, now: int | None = None, go_bin: Path | None = None, *,
+          release_signer: str | None = None, release_pubkey: str | None = None) -> Path:
     now = int(now if now is not None else time.time())
-    profile_specs = SPEC.get("profiles") or {}
+    if (key_path is None) == (release_signer is None):
+        raise ValueError("choose exactly one of release-key and release-signer")
+    if release_signer is not None and release_pubkey is None:
+        raise ValueError("release-pubkey is required with release-signer")
+    spec = _spec_from_refs(refs)
+    profile_specs = spec.get("profiles") or {}
     _validate_profile_subsumption(profile_specs)
-    out = out_root / channel / version
-    if out.exists():
-        raise SystemExit(f"{out} already exists; versions are immutable")
-    out.mkdir(parents=True)
+    final_out = out_root / channel / version
+    if final_out.exists():
+        raise SystemExit(f"{final_out} already exists; versions are immutable")
+    channel_dir = out_root / channel
+    channel_dir.mkdir(parents=True, exist_ok=True)
+    # Assemble under a hidden staging name. A broker refusal or bad signature publishes no
+    # partially-built immutable version and cannot disturb latest.json.
+    out = Path(tempfile.mkdtemp(prefix=f".{version}-build-", dir=channel_dir))
     resolved = []
-    for comp in SPEC["components"]:
+    for comp in spec["components"]:
         repo = Path(os.path.expanduser(comp["repo"]))
         commit = _git(repo, "rev-parse", f"{refs.get(comp['name'], comp.get('default_ref', 'HEAD'))}^{{commit}}")
         f = out / f"{comp['name']}-{commit[:12]}.tar.gz"
         resolved.append((comp, repo, commit, f))
     components, artifacts, overlays, toolchains = [], [], {}, {}
     with tempfile.TemporaryDirectory(prefix="nak-release-binaries-") as td:
-        for binary in SPEC.get("binaries", []):
+        for binary in spec.get("binaries", []):
             comp, repo, commit, _ = next(r for r in resolved if r[0]["name"] == binary["component"])
             built = Path(td) / binary["file"]
             go_version = _build_go_binary(repo, commit, binary["source"], built,
@@ -248,7 +290,7 @@ def build(version: str, channel: str, refs: dict, key_path: Path, out_root: Path
     # The two installer files, standalone, from the SAME commit as the tarball: what a newcomer's
     # pasted join line downloads and checks against the sha256 printed in their invite.
     bootstrap = {}
-    for comp, built in zip(SPEC["components"], components):
+    for comp, built in zip(spec["components"], components):
         repo = Path(os.path.expanduser(comp["repo"]))
         for fname in ("install.py", "releasekit.py"):
             r = subprocess.run(["git", "-C", str(repo), "show", f"{built['commit']}:release/{fname}"],
@@ -259,10 +301,10 @@ def build(version: str, channel: str, refs: dict, key_path: Path, out_root: Path
         if bootstrap:
             break
     req_in = out / "requirements.in"
-    req_in.write_text("\n".join(SPEC["requirements"]) + "\n")
+    req_in.write_text("\n".join(spec["requirements"]) + "\n")
     lock = out / "requirements.lock"
     subprocess.run([str(uv_bin), "pip", "compile", str(req_in), "--generate-hashes", "--quiet", "--no-header", "--no-annotate",
-                    "--python-version", SPEC["python"], "-o", str(lock)], check=True)
+                    "--python-version", spec["python"], "-o", str(lock)], check=True)
     req_in.unlink()
     # Optional PROFILES (e.g. "inference"): each is the base requirements PLUS its own, resolved TOGETHER
     # into one hash-locked file, so an opted-in node installs a single consistent environment instead of
@@ -270,38 +312,50 @@ def build(version: str, channel: str, refs: dict, key_path: Path, out_root: Path
     profiles = {}
     for pname, prof in profile_specs.items():
         p_in = out / f"requirements-{pname}.in"
-        p_in.write_text("\n".join(SPEC["requirements"] + prof["requirements"]) + "\n")
+        p_in.write_text("\n".join(spec["requirements"] + prof["requirements"]) + "\n")
         p_lock = out / f"requirements-{pname}.lock"
         subprocess.run([str(uv_bin), "pip", "compile", str(p_in), "--generate-hashes", "--quiet", "--no-header", "--no-annotate",
-                        "--python-version", SPEC["python"], "-o", str(p_lock)], check=True)
+                        "--python-version", spec["python"], "-o", str(p_lock)], check=True)
         p_in.unlink()
         profiles[pname] = {"lock": {"file": p_lock.name, "sha256": rk.sha256_file(p_lock)},
                            "requires": prof["requires"], "description": prof.get("description", ""),
                            "satisfied_by": list(prof.get("satisfied_by", []))}
     shutil.copy2(uv_bin, out / "uv")
     uv_version = subprocess.check_output([str(uv_bin), "--version"], text=True).split()[1]
-    manifest = {"schema": rk.MANIFEST_SCHEMA, "name": SPEC["name"], "version": version, "channel": channel,
-                "created": now, "python": SPEC["python"], "compat_major": int(version.split(".")[0]),
+    manifest = {"schema": rk.MANIFEST_SCHEMA, "name": spec["name"], "version": version, "channel": channel,
+                "created": now, "python": spec["python"], "compat_major": int(version.split(".")[0]),
                 "components": components,
                 "artifacts": artifacts,
                 "lock": {"file": lock.name, "sha256": rk.sha256_file(lock)},
                 "uv": {"file": "uv", "sha256": rk.sha256_file(out / "uv"), "version": uv_version},
-                "services": SPEC["services"], "health": SPEC["health"],
+                "services": spec["services"], "health": spec["health"],
                 "toolchains": toolchains,
-                "installer": SPEC.get("installer", ""), "commands": SPEC.get("commands", {}),
+                "installer": spec.get("installer", ""), "commands": spec.get("commands", {}),
                 "bootstrap": bootstrap, "profiles": profiles}
-    package_signers = _package_signers(resolved)
+    package_signers = _package_signers(spec, resolved)
     if package_signers is not None:
         manifest["package_signers"] = package_signers
-    priv_hex = key_path.read_text().strip()
-    signed = rk.sign(manifest, priv_hex)
-    (out / "manifest.json").write_text(json.dumps(signed, indent=1, sort_keys=True))
+    try:
+        signed = _sign_object(manifest, key_path, release_signer, release_pubkey)
+        manifest_text = json.dumps(signed, indent=1, sort_keys=True)
+        manifest_sha256 = hashlib.sha256(manifest_text.encode()).hexdigest()
+        # Obtain and verify BOTH broker approvals before making the version or pointer visible.
+        latest = _sign_object(
+            {"schema": "nak-release-latest/1", "channel": channel, "version": version,
+             "manifest_sha256": manifest_sha256, "created": now,
+             "expires_at": now + LATEST_TTL_S},
+            key_path, release_signer, release_pubkey)
+    except Exception:
+        shutil.rmtree(out, ignore_errors=True)
+        raise
+    (out / "manifest.json").write_text(manifest_text)
     # expires_at: a host can't replay an old pointer forever; a release must be republished within it.
-    latest = rk.sign({"schema": "nak-release-latest/1", "channel": channel, "version": version,
-                      "manifest_sha256": rk.sha256_file(out / "manifest.json"), "created": now,
-                      "expires_at": now + LATEST_TTL_S}, priv_hex)
-    (out_root / channel / "latest.json").write_text(json.dumps(latest, indent=1, sort_keys=True))
-    return out
+    os.replace(out, final_out)
+    latest_path = channel_dir / "latest.json"
+    latest_tmp = channel_dir / f".latest.json.{os.getpid()}.tmp"
+    latest_tmp.write_text(json.dumps(latest, indent=1, sort_keys=True))
+    os.replace(latest_tmp, latest_path)
+    return final_out
 
 
 def main(argv=None) -> int:
@@ -309,13 +363,21 @@ def main(argv=None) -> int:
     ap.add_argument("--version", required=True)
     ap.add_argument("--channel", default="canary", choices=["canary", "stable"])
     ap.add_argument("--ref", action="append", default=[], help="component=ref (repeatable)")
-    ap.add_argument("--release-key", type=Path, required=True)
+    signer = ap.add_mutually_exclusive_group(required=True)
+    signer.add_argument("--release-key", type=Path)
+    signer.add_argument("--release-signer", help="command reading canonical bytes and printing hex Ed25519 signature")
+    ap.add_argument("--release-pubkey", help="lowercase hex Ed25519 public key for --release-signer")
     ap.add_argument("--out", type=Path, default=Path.home() / "nakshatra-dist")
     ap.add_argument("--uv", type=Path, default=Path(shutil.which("uv") or "uv"))
     ap.add_argument("--go", type=Path, default=Path(shutil.which("go") or "go"))
     a = ap.parse_args(argv)
     refs = dict(r.split("=", 1) for r in a.ref)
-    out = build(a.version, a.channel, refs, a.release_key, a.out, a.uv, go_bin=a.go)
+    if a.release_signer and not a.release_pubkey:
+        ap.error("--release-pubkey is required with --release-signer")
+    if a.release_key and a.release_pubkey:
+        ap.error("--release-pubkey is only valid with --release-signer")
+    out = build(a.version, a.channel, refs, a.release_key, a.out, a.uv, go_bin=a.go,
+                release_signer=a.release_signer, release_pubkey=a.release_pubkey)
     print(f"built {out}")
     return 0
 

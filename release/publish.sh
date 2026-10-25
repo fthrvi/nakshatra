@@ -12,6 +12,10 @@ DIST="${NAK_DIST:-$HOME/nakshatra-dist}"
 VER=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['version'])" "$DIST/$CH/latest.json")
 ssh "$HOST" "mkdir -p '$DIR/$CH'"
 rsync -a --delete "$DIST/$CH/$VER/" "$HOST:$DIR/$CH/$VER/"
+if [ -f "$DIST/$CH/keyroll.json" ]; then
+  rsync -a "$DIST/$CH/keyroll.json" "$HOST:$DIR/$CH/keyroll.json.tmp"
+  ssh "$HOST" "mv '$DIR/$CH/keyroll.json.tmp' '$DIR/$CH/keyroll.json'"
+fi
 rsync -a "$DIST/$CH/latest.json" "$HOST:$DIR/$CH/latest.json.tmp"
 ssh "$HOST" "mv '$DIR/$CH/latest.json.tmp' '$DIR/$CH/latest.json' && cd '$DIR/$CH' && ls -1d */ | sed 's#/##' | sort -V | head -n -2 | xargs -r rm -rf && chmod -R a+rX '$DIR'"
 echo "published $CH $VER to $HOST:$DIR"

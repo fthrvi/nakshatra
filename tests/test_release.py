@@ -27,12 +27,14 @@ sys.path.insert(0, str(SCRIPTS))
 import releasekit as rk  # noqa: E402
 import build as B  # noqa: E402
 import install as I  # noqa: E402
+import keyroll as KR  # noqa: E402
 import release_trust  # noqa: E402
 
 from cryptography.hazmat.primitives.asymmetric import ed25519  # noqa: E402
 
 
 def _key(tmp: Path):
+    tmp.mkdir(parents=True, exist_ok=True)
     k = ed25519.Ed25519PrivateKey.generate()
     p = tmp / "release-TEST.key"
     p.write_text(k.private_bytes_raw().hex())
@@ -71,6 +73,7 @@ def env(tmp_path, monkeypatch):
         "services": {},
         "health": [[sys.executable, "-c", "import alpha_mod, beta_mod; assert alpha_mod.OK and beta_mod.OK"]]})
     monkeypatch.setattr(I, "UNIT_DIR", tmp_path / "units")   # belt and braces; the installer below is told explicitly
+    monkeypatch.setenv("NAK_NET_DIR", str(tmp_path / "net"))
     dist = tmp_path / "dist"
     inst = I.Installer(tmp_path / "node", systemd=False, make_venv=False, unit_dir=tmp_path / "units")
     return {"key": key, "pub": pub, "a": a, "b": b, "uv": fake_uv, "dist": dist, "inst": inst, "tmp": tmp_path}
@@ -78,6 +81,28 @@ def env(tmp_path, monkeypatch):
 
 def _build(e, version, **kw):
     return B.build(version, "canary", {}, e["key"], e["dist"], e["uv"], **kw)
+
+
+def _build_with_key(e, version: str, key: Path):
+    return B.build(version, "canary", {}, key, e["dist"], e["uv"])
+
+
+def _roll_link(old_key: Path, new_key: Path, issued_at: int = 1, reason: str = "test roll") -> dict:
+    old_private = old_key.read_text().strip()
+    new_private = new_key.read_text().strip()
+    statement = {
+        "schema": rk.KEYROLL_SCHEMA,
+        "old_pubkey": rk.public_from_private(old_private),
+        "new_pubkey": rk.public_from_private(new_private),
+        "issued_at": issued_at,
+        "reason": reason,
+    }
+    return rk.sign_keyroll(statement, old_private, new_private)
+
+
+def _write_roll(e, links: list[dict]) -> None:
+    path = e["dist"] / "canary" / "keyroll.json"
+    path.write_text(json.dumps(links))
 
 
 def _set_package_signer(e, key: str) -> None:
@@ -225,6 +250,67 @@ def test_build_pins_package_signers_from_exact_component_commit(env, monkeypatch
     }
 
 
+def test_build_reads_release_spec_from_requested_nakshatra_ref(env, monkeypatch):
+    repo = env["a"]
+    committed_spec = {
+        "name": "from-requested-ref",
+        "python": "3.12",
+        "requirements": ["cryptography==46.0.6"],
+        "components": [{
+            "name": "nakshatra", "repo": str(repo), "paths": ["pkg"], "pythonpath": "pkg",
+        }],
+        "services": {},
+        "health": [],
+    }
+    (repo / "release").mkdir()
+    (repo / "release" / "spec.json").write_text(json.dumps(committed_spec))
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run([
+        "git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t",
+        "commit", "-qm", "release spec",
+    ], check=True)
+    ref = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+    # Both the module's bootstrap spec and the checkout now disagree with the requested commit.
+    monkeypatch.setattr(B, "SPEC", {
+        "name": "stale-bootstrap",
+        "components": [{"name": "nakshatra", "repo": str(repo)}],
+    })
+    (repo / "release" / "spec.json").write_text(json.dumps(dict(committed_spec, name="dirty-working-tree")))
+
+    out = B.build("0.2.0", "canary", {"nakshatra": ref}, env["key"],
+                  env["dist"], env["uv"])
+    manifest = json.loads((out / "manifest.json").read_text())
+    assert manifest["name"] == "from-requested-ref"
+    assert manifest["components"][0]["commit"] == ref
+
+
+def test_external_release_signer_is_used_and_verified(env):
+    signer = env["tmp"] / "signer.py"
+    signer.write_text(
+        "import sys\n"
+        "from cryptography.hazmat.primitives.asymmetric import ed25519\n"
+        "key = bytes.fromhex(open(sys.argv[1]).read().strip())\n"
+        "print(ed25519.Ed25519PrivateKey.from_private_bytes(key).sign(sys.stdin.buffer.read()).hex())\n"
+    )
+    out = B.build(
+        "0.2.0", "canary", {}, None, env["dist"], env["uv"],
+        release_signer=f"{sys.executable} {signer} {env['key']}", release_pubkey=env["pub"])
+    assert rk.verify(json.loads((out / "manifest.json").read_text()), env["pub"])
+    assert rk.verify(json.loads((env["dist"] / "canary" / "latest.json").read_text()), env["pub"])
+
+
+def test_external_release_signer_bad_signature_publishes_nothing(env):
+    signer = env["tmp"] / "bad-signer.py"
+    signer.write_text("import sys\nsys.stdin.buffer.read()\nprint('00' * 64)\n")
+
+    with pytest.raises(RuntimeError, match="does not verify"):
+        B.build(
+            "0.2.0", "canary", {}, None, env["dist"], env["uv"],
+            release_signer=f"{sys.executable} {signer}", release_pubkey=env["pub"])
+    assert not (env["dist"] / "canary" / "0.2.0").exists()
+    assert not (env["dist"] / "canary" / "latest.json").exists()
+
+
 def test_tampered_artifact_refused_and_nothing_switched(env):
     out = _build(env, "0.1.0")
     tgz = next(out.glob("alpha-*.tar.gz"))
@@ -260,6 +346,151 @@ def test_update_installs_newer_only_and_records_previous(env):
     assert "installed 0.1.1" in env["inst"].update()
     cfg = json.loads((env["tmp"] / "node" / "config.json").read_text())
     assert cfg["current"] == "0.1.1" and cfg["previous"] == "0.1.0"
+
+
+def test_release_key_roll_is_accepted_and_repin_happens_after_install(env, monkeypatch):
+    package_key = "56" * 32
+    _set_package_signer(env, package_key)
+    _build(env, "0.1.0")
+    env["inst"].install(str(env["dist"]), "canary", env["pub"])
+    new_key, new_pub = _key(env["tmp"] / "new-key")
+    _commit(env["a"], "alpha", "OK = True\nV = 2\n")
+    _build_with_key(env, "0.1.1", new_key)
+    _write_roll(env, [_roll_link(env["key"], new_key)])
+    observed = []
+    real_health = env["inst"].health
+
+    def health(man):
+        observed.append({
+            "package_signers": release_trust.load_release_package_signers(env["inst"].prefix),
+            "committed_pubkey": json.loads((env["inst"].prefix / "config.json").read_text())["pubkey"],
+        })
+        return real_health(man)
+
+    monkeypatch.setattr(env["inst"], "health", health)
+
+    assert "installed 0.1.1" in env["inst"].update()
+    cfg = json.loads((env["tmp"] / "node" / "config.json").read_text())
+    assert cfg["pubkey"] == new_pub
+    assert cfg["pubkey_history"] == [env["pub"]]
+    assert observed == [{
+        "package_signers": frozenset({package_key}),
+        "committed_pubkey": env["pub"],
+    }]
+
+
+def test_release_key_roll_crash_before_commit_keeps_old_pin(env, monkeypatch):
+    class SimulatedProcessDeath(BaseException):
+        pass
+
+    _build(env, "0.1.0")
+    inst = env["inst"]
+    inst.install(str(env["dist"]), "canary", env["pub"])
+    new_key, new_pub = _key(env["tmp"] / "new-key")
+    _commit(env["a"], "alpha", "OK = True\nV = 2\n")
+    _build_with_key(env, "0.1.1", new_key)
+    _write_roll(env, [_roll_link(env["key"], new_key)])
+    monkeypatch.setattr(inst, "health", lambda _man: (_ for _ in ()).throw(SimulatedProcessDeath()))
+
+    with pytest.raises(SimulatedProcessDeath):
+        inst.update()
+    cfg = json.loads((inst.prefix / "config.json").read_text())
+    transition = json.loads(inst._transition_path.read_text())
+    assert cfg["pubkey"] == env["pub"]
+    assert transition["previous_pubkey"] == env["pub"]
+    assert transition["pubkey"] == new_pub
+
+    recovered = I.Installer(inst.prefix, systemd=False, make_venv=False,
+                            unit_dir=env["tmp"] / "units").status()
+    assert recovered["current"] == "0.1.0"
+    assert json.loads((inst.prefix / "config.json").read_text())["pubkey"] == env["pub"]
+
+
+def test_release_key_roll_chain_must_start_from_pinned_key(env):
+    _build(env, "0.1.0")
+    env["inst"].install(str(env["dist"]), "canary", env["pub"])
+    unrelated, _ = _key(env["tmp"] / "unrelated")
+    new_key, _ = _key(env["tmp"] / "new-key")
+    _commit(env["a"], "alpha", "OK = True\nV = 2\n")
+    _build_with_key(env, "0.1.1", new_key)
+    _write_roll(env, [_roll_link(unrelated, new_key)])
+
+    with pytest.raises(I.InstallError, match="no link starting at the pinned key"):
+        env["inst"].update()
+    assert json.loads((env["tmp"] / "node" / "config.json").read_text())["pubkey"] == env["pub"]
+
+
+@pytest.mark.parametrize("signature", ["sig_old", "sig_new"])
+def test_release_key_roll_refuses_bad_dual_signatures(env, signature):
+    _build(env, "0.1.0")
+    env["inst"].install(str(env["dist"]), "canary", env["pub"])
+    new_key, _ = _key(env["tmp"] / "new-key")
+    _commit(env["a"], "alpha", "OK = True\nV = 2\n")
+    _build_with_key(env, "0.1.1", new_key)
+    link = _roll_link(env["key"], new_key)
+    link[signature]["value"] = base64.b64encode(b"\0" * 64).decode()
+    _write_roll(env, [link])
+
+    with pytest.raises(I.InstallError, match=f"invalid {signature}"):
+        env["inst"].update()
+
+
+def test_release_key_roll_accepts_two_hops(env):
+    _build(env, "0.1.0")
+    env["inst"].install(str(env["dist"]), "canary", env["pub"])
+    middle_key, _ = _key(env["tmp"] / "middle-key")
+    new_key, new_pub = _key(env["tmp"] / "new-key")
+    _commit(env["a"], "alpha", "OK = True\nV = 3\n")
+    _build_with_key(env, "0.1.2", new_key)
+    _write_roll(env, [
+        _roll_link(env["key"], middle_key, 1),
+        _roll_link(middle_key, new_key, 2),
+    ])
+
+    assert "installed 0.1.2" in env["inst"].update()
+    assert json.loads((env["tmp"] / "node" / "config.json").read_text())["pubkey"] == new_pub
+
+
+def test_keyroll_cli_make_and_append(tmp_path):
+    old_key, _ = _key(tmp_path / "old")
+    middle_key, _ = _key(tmp_path / "middle")
+    new_key, new_pub = _key(tmp_path / "new")
+    chain_path = tmp_path / "keyroll.json"
+
+    assert KR.main([
+        "make", "--old-key", str(old_key), "--new-key", str(middle_key),
+        "--issued-at", "1", "--reason", "broker migration", "--out", str(chain_path),
+    ]) == 0
+    assert KR.main([
+        "append", "--chain", str(chain_path), "--old-key", str(middle_key),
+        "--new-key", str(new_key), "--issued-at", "2", "--reason", "broker replacement",
+    ]) == 0
+    chain = rk.validate_keyroll_chain(json.loads(chain_path.read_text()))
+    assert len(chain) == 2 and chain[-1]["new_pubkey"] == new_pub
+
+
+def test_keyroll_chain_length_is_bounded_before_signature_work():
+    with pytest.raises(ValueError, match="1..8"):
+        rk.validate_keyroll_chain([{}] * 9)
+
+
+def test_release_key_roll_refuses_return_to_an_earlier_key(env):
+    _build(env, "0.1.0")
+    env["inst"].install(str(env["dist"]), "canary", env["pub"])
+    new_key, new_pub = _key(env["tmp"] / "new-key")
+    _commit(env["a"], "alpha", "OK = True\nV = 2\n")
+    _build_with_key(env, "0.1.1", new_key)
+    _write_roll(env, [_roll_link(env["key"], new_key)])
+    env["inst"].update()
+    with pytest.raises(I.InstallError, match="refusing a release-key rollback"):
+        env["inst"].rollback()
+
+    _commit(env["a"], "alpha", "OK = True\nV = 3\n")
+    _build_with_key(env, "0.1.2", env["key"])
+    _write_roll(env, [_roll_link(new_key, env["key"], issued_at=2)])
+    with pytest.raises(I.InstallError, match="previously trusted key"):
+        env["inst"].update()
+    assert json.loads((env["tmp"] / "node" / "config.json").read_text())["pubkey"] == new_pub
 
 
 def test_c9f0fed_updater_bootstraps_transition_and_timer_crossing(env, monkeypatch):
@@ -511,11 +742,14 @@ def test_rollback_restarts_only_units_returned_by_write_units(tmp_path, monkeypa
     new = prefix / "releases" / "0.1.1"
     old.mkdir(parents=True)
     new.mkdir(parents=True)
-    old_man = {"version": "0.1.0", "services": {"kept": {}, "opted-out": {}}}
+    release_key, release_pub = _key(tmp_path / "release-key")
+    old_man = rk.sign({"schema": rk.MANIFEST_SCHEMA, "version": "0.1.0",
+                       "services": {"kept": {}, "opted-out": {}}},
+                      release_key.read_text().strip())
     (old / "manifest.json").write_text(json.dumps(old_man))
     (prefix / "current").symlink_to("releases/0.1.1")
     (prefix / "config.json").write_text(json.dumps({
-        "current": "0.1.1", "previous": "0.1.0", "pubkey": "12" * 32,
+        "current": "0.1.1", "previous": "0.1.0", "pubkey": release_pub,
     }))
     inst = I.Installer(prefix, systemd=True, make_venv=False, unit_dir=tmp_path / "units")
     restarted = []

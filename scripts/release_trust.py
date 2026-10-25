@@ -147,8 +147,11 @@ def _load_release_package_policy(
                             f"current release {installed_version} is not the committed installer version")
                     release_key = config.get("pubkey")
                 else:
+                    fields = set(transition) if isinstance(transition, dict) else set()
                     if not isinstance(transition, dict) or transition.get("schema") != TRANSITION_SCHEMA \
-                            or set(transition) != {"schema", "pubkey", "from", "to"}:
+                            or fields not in (
+                                {"schema", "pubkey", "from", "to"},
+                                {"schema", "pubkey", "previous_pubkey", "from", "to"}):
                         raise ValueError("release transition record is malformed")
                     transition_from, transition_to = transition["from"], transition["to"]
                     if transition_from is not None:
@@ -164,7 +167,8 @@ def _load_release_package_policy(
                             "release transition is stale because no installer holds the prefix lock")
                     release_key = transition.get("pubkey")
                     configured_key = config.get("pubkey")
-                    if configured_key is not None and configured_key != release_key:
+                    previous_key = transition.get("previous_pubkey", release_key)
+                    if configured_key is not None and configured_key != previous_key:
                         raise ValueError("release transition key conflicts with config.json")
         finally:
             os.close(root_fd)
