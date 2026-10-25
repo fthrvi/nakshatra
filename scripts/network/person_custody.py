@@ -188,14 +188,25 @@ def _read_owned_regular(path: Path, label: str, *, exact_mode: int | None = None
 def custody_mode() -> str:
     """Return the configured backend once. Missing marker preserves legacy file custody.
 
-    After a broker import removes the historical private file, this fallback still fails closed:
-    file custody cannot sign without that file; it never regenerates or recovers authority.
+    A broker configuration is durable evidence that custody was configured.  Once it exists,
+    losing (or being unable to read) the marker must never silently reactivate a leftover file key.
+    The marker may be absent only on a legacy installation with no broker configuration at all.
     """
     path = _custody_path()
     try:
         mode = _read_owned_regular(path, "person custody marker").decode("utf-8").strip()
     except FileNotFoundError:
-        return "file"
+        try:
+            _broker_config_path().lstat()
+        except FileNotFoundError:
+            return "file"
+        except OSError as exc:
+            raise SystemExit(
+                f"person broker configuration exists but cannot be inspected; "
+                f"refusing file custody: {_broker_config_path()}") from exc
+        raise SystemExit(
+            "person broker configuration exists but the person custody marker is missing; "
+            "refusing file custody")
     except UnicodeDecodeError as exc:
         raise SystemExit(f"person custody marker {path} is not UTF-8 text") from exc
     if mode not in {"file", "broker"}:
@@ -286,16 +297,74 @@ class _NoBrokerRedirects(urllib.request.HTTPRedirectHandler):
 _BROKER_OPENER = urllib.request.build_opener(_NoBrokerRedirects)
 
 
-def _broker_error_code(exc: urllib.error.HTTPError) -> str:
-    """Return only a bounded inert broker error identifier, never its body or headers."""
+_BROKER_ERROR_IDS = {
+    # HTTP authentication wrappers shared by these routes.
+    ("/principal/v1", 401, "unauthorized"): "auth",
+    ("/enqueue/v1", 401, "unauthorized"): "auth",
+    ("/result/v1", 401, "unauthorized"): "auth",
+    ("/person-sign/v1", 401, "unauthorized"): "auth",
+    # enqueue_v1
+    ("/enqueue/v1", 404, "v1_disabled"): "v1-off",
+    ("/enqueue/v1", 400, "JSON object required"): "bad-json",
+    ("/enqueue/v1", 403, "requester does not match the authenticated principal"): "principal-mismatch",
+    ("/enqueue/v1", 400, "what must be a versioned registry action"): "bad-action",
+    ("/enqueue/v1", 400, "tier must be low, medium, or high"): "bad-tier",
+    ("/enqueue/v1", 400, "idempotency_key is missing or malformed"): "bad-idempotency",
+    ("/enqueue/v1", 400, "review must contain exactly description"): "bad-review",
+    ("/enqueue/v1", 400, "review.description must be 1-500 characters"): "bad-review-text",
+    ("/enqueue/v1", 400, "exact_content is required"): "missing-content",
+    ("/enqueue/v1", 503, "person key not installed"): "key-unavailable",
+    ("/enqueue/v1", 400,
+     "nakshatra-person requires what=nakshatra.person.v1 and tier=high"): "bad-person-envelope",
+    ("/enqueue/v1", 400, "nakshatra person request was refused"): "person-refused",
+    ("/enqueue/v1", 400, "exact_content is too large (max 20000 canonical bytes)"): "content-too-large",
+    ("/enqueue/v1", 400, "ttl must be 10-300 seconds"): "bad-ttl",
+    ("/enqueue/v1", 409, "idempotency_key already names different content"): "idempotency-conflict",
+    ("/enqueue/v1", 503, "approval ledger is unavailable"): "ledger-unavailable",
+    ("/enqueue/v1", 409, "idempotent request is no longer available"): "request-gone",
+    ("/enqueue/v1", 409, "idempotent request is already approved"): "request-terminal",
+    ("/enqueue/v1", 409, "idempotent request is already declined"): "request-terminal",
+    ("/enqueue/v1", 409, "idempotent request is already expired"): "request-terminal",
+    ("/enqueue/v1", 409, "idempotent request is already consumed"): "request-terminal",
+    # result_v1
+    ("/result/v1", 404, "v1_disabled"): "v1-off",
+    ("/result/v1", 403, "request belongs to a different principal"): "wrong-owner",
+    # person_sign_v1 and its broker-ledger refusals.
+    ("/person-sign/v1", 404, "not found"): "route-missing",
+    ("/person-sign/v1", 403, "nakshatra-person principal required"): "wrong-principal",
+    ("/person-sign/v1", 503, "person key not installed"): "key-unavailable",
+    ("/person-sign/v1", 400, "person signing request has an invalid shape"): "bad-sign-request",
+    ("/person-sign/v1", 400, "request_id is required"): "missing-request-id",
+    ("/person-sign/v1", 400, "nakshatra person request was refused"): "person-refused",
+    ("/person-sign/v1", 409, "person signing request is malformed"): "bad-sign-request",
+    ("/person-sign/v1", 409,
+     "person signing requires the matching live approved request"): "approval-mismatch",
+    ("/person-sign/v1", 409,
+     "person signing requires a biometric approval door"): "non-biometric",
+    ("/person-sign/v1", 409,
+     "person signing approval receipt is unavailable"): "receipt-unavailable",
+    ("/person-sign/v1", 409,
+     "person signing approval receipt does not match its door"): "receipt-door-mismatch",
+    ("/person-sign/v1", 409, "person signing request was already signed"): "already-signed",
+    ("/person-sign/v1", 409,
+     "person signing callback returned an invalid batch"): "invalid-sign-batch",
+    ("/person-sign/v1", 409,
+     "person signing callback returned malformed output"): "invalid-sign-output",
+    ("/person-sign/v1", 503, "approval ledger is unavailable"): "ledger-unavailable",
+    ("/person-sign/v1", 500, "person signing failed"): "signing-failed",
+}
+
+
+def _broker_error_id(path: str, exc: urllib.error.HTTPError) -> str:
+    """Map an exact known response to a local identifier; never return remote text."""
     try:
         value = json.loads(exc.read(4096).decode("utf-8")).get("error", "")
     except (AttributeError, UnicodeError, ValueError, json.JSONDecodeError):
         return ""
     if not isinstance(value, str):
         return ""
-    value = value[:64]
-    return value if re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", value) else ""
+    route = urllib.parse.urlsplit(path).path
+    return _BROKER_ERROR_IDS.get((route, int(exc.code), value), "")
 
 
 def _broker_json(config: _BrokerConfig, method: str, path: str,
@@ -310,13 +379,14 @@ def _broker_json(config: _BrokerConfig, method: str, path: str,
         with _BROKER_OPENER.open(request, timeout=timeout) as response:
             result = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        error = _broker_error_code(exc)
-        detail = f", code {error}" if error else ""
-        raise SystemExit(
-            f"person broker refused the request (HTTP {exc.code}{detail}); nothing was signed") from exc
+        error_id = _broker_error_id(path, exc)
+        if error_id:
+            raise SystemExit(
+                f"approval service error (HTTP {exc.code}, code {error_id})") from None
+        raise SystemExit(f"approval service error (HTTP {exc.code})") from None
     except (OSError, urllib.error.URLError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
         raise SystemExit(
-            "person broker is unavailable or returned invalid data; nothing was signed") from exc
+            "person broker is unavailable or returned invalid data; nothing was signed") from None
     if not isinstance(result, dict):
         raise SystemExit("person broker returned invalid data; nothing was signed")
     return result
@@ -524,8 +594,8 @@ def _broker_sign_batch(kind: str, items: list, wire_items: list[dict], *, summar
             break
         if status in {"declined", "expired"}:
             raise SystemExit(_NOT_APPROVED)
-        if status in {"unknown", "consumed"}:
-            raise SystemExit(f"person broker returned terminal status {status!r}; nothing was signed")
+        if status != "pending":
+            raise SystemExit("person broker returned an invalid terminal status; nothing was signed")
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise SystemExit(_NOT_APPROVED)

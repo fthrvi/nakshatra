@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ast
 import base64
+from collections import Counter
 from contextlib import contextmanager, nullcontext
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -390,6 +391,16 @@ def test_expired_act_is_not_approved_and_signs_nothing(tmp_path, monkeypatch):
         assert len(broker.enqueues) == 1 and broker.sign_calls == 0
 
 
+def test_broker_success_body_never_reflects_an_unknown_status(tmp_path, monkeypatch):
+    with _broker(tmp_path, monkeypatch, status=TOKEN) as (broker, _private):
+        with pytest.raises(SystemExit) as refused:
+            person_custody.person_sign("invite", b"invite", summary="Invite")
+        assert str(refused.value) == (
+            "person broker returned an invalid terminal status; nothing was signed")
+        assert TOKEN not in str(refused.value)
+        assert len(broker.enqueues) == 1 and broker.sign_calls == 0
+
+
 def test_late_real_broker_wait_refuses_stale_proof_before_local_send_or_write(
         tmp_path, monkeypatch):
     with _broker(tmp_path, monkeypatch, pending_polls=1) as (broker, _private):
@@ -584,15 +595,30 @@ def test_custody_marker_must_be_owned_by_effective_uid(tmp_path, monkeypatch):
 def test_broker_http_error_is_fixed_bounded_and_never_echoes_body_or_headers(monkeypatch):
     error = urllib.error.HTTPError(
         "http://broker.invalid/enqueue/v1", 418, "header-secret", {"X-Secret": "header-value"},
-        io.BytesIO(b'{"error":"safe-code","detail":"body-secret"}'))
+        io.BytesIO(json.dumps({"error": "test-broker-token", "detail": "body-secret"}).encode()))
     monkeypatch.setattr(person_custody._BROKER_OPENER, "open", lambda *_args, **_kw: (_ for _ in ()).throw(error))
     with pytest.raises(SystemExit) as refused:
         person_custody._broker_json(
             person_custody._BrokerConfig("http://broker.invalid", "token"),
             "POST", "/enqueue/v1", {})
     message = str(refused.value)
-    assert message == "person broker refused the request (HTTP 418, code safe-code); nothing was signed"
+    assert message == "approval service error (HTTP 418)"
+    assert TOKEN not in message
     assert "body-secret" not in message and "header-secret" not in message and "header-value" not in message
+
+
+def test_broker_known_error_uses_only_the_closed_local_identifier(monkeypatch):
+    error = urllib.error.HTTPError(
+        "http://broker.invalid/person-sign/v1", 409, "remote-reason", {},
+        io.BytesIO(b'{"error":"person signing request was already signed"}'))
+    monkeypatch.setattr(
+        person_custody._BROKER_OPENER, "open",
+        lambda *_args, **_kw: (_ for _ in ()).throw(error))
+    with pytest.raises(SystemExit) as refused:
+        person_custody._broker_json(
+            person_custody._BrokerConfig("http://broker.invalid", "token"),
+            "POST", "/person-sign/v1", {})
+    assert str(refused.value) == "approval service error (HTTP 409, code already-signed)"
 
 
 def test_broker_redirects_are_disabled():
@@ -626,6 +652,18 @@ def test_missing_marker_keeps_file_compatibility_but_imported_key_fails_closed(
         person_custody.person_sign("invite", b"invite", summary="Invite")
 
 
+@pytest.mark.parametrize("marker_state", ["missing", "unreadable"])
+def test_broker_configuration_without_a_readable_marker_never_falls_back_to_file(
+        marker_state, tmp_path, monkeypatch):
+    _identity(tmp_path, monkeypatch)
+    net = tmp_path / ".nakshatra" / "net"
+    (net / "person-broker.json").write_text("{}")
+    if marker_state == "unreadable":
+        (net / "person-custody").write_bytes(b"\xff")
+    with pytest.raises(SystemExit, match="custody marker|refusing file custody"):
+        person_custody.person_sign("invite", b"invite", summary="Invite")
+
+
 def test_invite_override_cannot_bypass_broker(tmp_path, monkeypatch):
     with _broker(tmp_path, monkeypatch) as (_broker_server, _private):
         override, _pub = signer_mod.new_key()
@@ -653,14 +691,14 @@ def test_broker_recovery_commands_never_emit_private_person_key(tmp_path, monkey
         assert join.startswith("nak grant renew") and "--person-key" not in join
 
 
-@pytest.mark.parametrize("allowlisted_entry", [
-    ("network/join_setup.py", "_established_identity"),
-    ("network/join_setup.py", "ensure_identity"),
+@pytest.mark.parametrize("allowlisted_finding", [
+    ("network/join_setup.py", "_established_identity", "_raw_file_key", "person_path"),
+    ("network/join_setup.py", "ensure_identity", "_raw_file_key", "person_path"),
 ])
 def test_join_allowlist_entries_never_read_a_private_person_key_in_broker_mode(
-        allowlisted_entry, tmp_path, monkeypatch):
+        allowlisted_finding, tmp_path, monkeypatch):
     with _broker(tmp_path, monkeypatch) as (_broker_server, _private):
-        assert allowlisted_entry in _PRIVATE_CONSTRUCTOR_ALLOWLIST
+        assert _PRIVATE_CONSTRUCTOR_ALLOWLIST[allowlisted_finding] >= 1
         private_path = tmp_path / ".sthambha" / "person-TEST.key"
         private_path.write_text("not a key and deliberately unreadable by the broker path")
         monkeypatch.setattr(
@@ -672,8 +710,8 @@ def test_join_allowlist_entries_never_read_a_private_person_key_in_broker_mode(
 
 
 def test_grant_allowlist_entry_loads_only_agent_key_in_broker_mode(tmp_path, monkeypatch):
-    entry = ("network/nak.py", "_grant_renew_confined")
-    assert entry in _PRIVATE_CONSTRUCTOR_ALLOWLIST
+    finding = ("network/nak.py", "_grant_renew_confined", "agent_files.load_key", "")
+    assert _PRIVATE_CONSTRUCTOR_ALLOWLIST[finding] == 1
     with _broker(tmp_path, monkeypatch) as (broker, _private):
         monkeypatch.setattr(
             person_custody, "_load_matching_person_key",
@@ -682,8 +720,36 @@ def test_grant_allowlist_entry_loads_only_agent_key_in_broker_mode(tmp_path, mon
         assert broker.sign_calls == 1
 
 
+def test_declined_grant_renew_never_creates_a_lease_key(tmp_path, monkeypatch):
+    with _broker(tmp_path, monkeypatch, status="declined") as (broker, _private):
+        lease_path = tmp_path / ".sthambha" / "signer" / "lease.key"
+        lease_path.unlink(missing_ok=True)
+        before = _snapshot(tmp_path)
+        with pytest.raises(SystemExit, match="not approved"):
+            nak.main(["grant", "renew", "--yes"])
+        assert not lease_path.exists()
+        assert _snapshot(tmp_path) == before
+        assert broker.sign_calls == 0
+
+
+def test_approved_grant_renew_persists_the_in_memory_lease_key_after_signature(
+        tmp_path, monkeypatch):
+    with _broker(tmp_path, monkeypatch) as (broker, _private):
+        from cryptography.hazmat.primitives.asymmetric import ed25519
+        signer_dir = tmp_path / ".sthambha" / "signer"
+        lease_path = signer_dir / "lease.key"
+        lease_path.unlink(missing_ok=True)
+        assert nak.main(["grant", "renew", "--yes"]) == 0
+        seed = lease_path.read_bytes()
+        renewed = json.loads((signer_dir / "agents" / "agent.grant.json").read_text())
+        assert len(seed) == 32
+        assert ed25519.Ed25519PrivateKey.from_private_bytes(
+            seed).public_key().public_bytes_raw().hex() == renewed["lease"]["issuer_pub"]
+        assert broker.sign_calls == 1
+
+
 @pytest.mark.parametrize("mode", ["file", "broker"])
-def test_cli_report_resolves_contact_to_node_before_building_signed_statement(
+def test_cli_report_preserves_file_bytes_and_broker_resolves_from_local_store(
         mode, tmp_path, monkeypatch):
     if mode == "broker":
         context = _broker(tmp_path, monkeypatch)
@@ -693,6 +759,12 @@ def test_cli_report_resolves_contact_to_node_before_building_signed_statement(
     with context as (broker, private):
         node = "9b" * 32
         seen = []
+        if broker is not None:
+            from network.store import Store
+            signer_dir = tmp_path / ".sthambha" / "signer"
+            data_key = signer_mod.load_or_create_data_key(signer_dir)
+            Store(tmp_path / ".nakshatra" / "net", data_key).upsert_contact(
+                "8a" * 32, node, "active", petname="friend")
 
         class Terminal:
             def isatty(self):
@@ -700,14 +772,12 @@ def test_cli_report_resolves_contact_to_node_before_building_signed_statement(
 
         def fake_call(_sock, request):
             seen.append(request)
-            if request["op"] == "resolve_report_subject":
-                assert request["subject"] == "friend"
-                return {"subject": node}
             if request["op"] == "report_cli":
-                assert request["subject"] == node
+                expected_subject = node if broker is not None else "friend"
+                assert request["subject"] == expected_subject
                 statement = nakd.person_action_statement(
                     "report-cli",
-                    nakd.report_proof_payload(node, "abuse", "", {}), request["ts"])
+                    nakd.report_proof_payload(expected_subject, "abuse", "", {}), request["ts"])
                 private.public_key().verify(bytes.fromhex(request["signature"]), statement)
                 return {"subject": node, "status": "received"}
             raise AssertionError(request)
@@ -715,98 +785,180 @@ def test_cli_report_resolves_contact_to_node_before_building_signed_statement(
         monkeypatch.setattr(nak.sys, "stdin", Terminal())
         monkeypatch.setattr(nak, "call", fake_call)
         assert nak.main(["report", "friend", "--reason", "abuse"]) == 0
-        assert [request["op"] for request in seen] == [
-            "resolve_report_subject", "report_cli"]
+        assert [request["op"] for request in seen] == ["report_cli"]
         if broker is not None:
             raw = base64.b64decode(
                 broker.enqueues[0]["exact_content"]["items"][0]["b64"], validate=True)
             assert json.loads(raw)["payload"]["subject"] == node
-        # Deliberate parity exception: file custody now signs the resolved node too; the old
-        # typed-petname bytes were not the bytes nakd ultimately resolved and transmitted.
+
+
+def test_broker_report_refuses_an_unresolved_local_contact_without_daemon_lookup(
+        tmp_path, monkeypatch):
+    with _broker(tmp_path, monkeypatch) as (broker, _private):
+        from network.store import Store
+        signer_dir = tmp_path / ".sthambha" / "signer"
+        data_key = signer_mod.load_or_create_data_key(signer_dir)
+        Store(tmp_path / ".nakshatra" / "net", data_key)
+        monkeypatch.setattr(nak.sys, "stdin", type("Terminal", (), {"isatty": lambda self: True})())
+        monkeypatch.setattr(nak, "call", lambda *_args: pytest.fail("broker report used a daemon lookup"))
+        with pytest.raises(SystemExit, match="local contact name.*nothing was signed"):
+            nak.main(["report", "not-a-contact", "--reason", "abuse"])
+        assert broker.enqueues == [] and broker.sign_calls == 0
 
 
 @pytest.mark.parametrize("kind", ["worker", "consumer"])
-def test_declined_member_invite_cancels_all_staged_server_state(kind, tmp_path, monkeypatch):
+def test_declined_member_invite_makes_zero_stage_http_writes(kind, tmp_path, monkeypatch):
     with _broker(tmp_path, monkeypatch, status="declined") as (broker, _private):
         monkeypatch.setenv("NAK_ONBOARD_TOKEN", "operator-secret")
         monkeypatch.setattr(nak, "_release_for_invite", lambda _url="": ({}, ""))
-        staged = set()
         calls = []
 
         def fake_call(_sock, request):
             calls.append(request["op"])
             if request["op"] == "status":
                 return {"node": "ab" * 32, "relay": "relay.example:51820"}
+            if request["op"] == "node_sign_stage":
+                return {**request["body"], "nonce": "12" * 16, "sig": "34" * 64}
             raise AssertionError("declined invite must not be registered locally")
 
         def fake_post(url, body):
-            if url.endswith(f"/{kind}-stage"):
-                expected = {"token": "operator-secret", "tier": "known"}
-                if kind == "consumer":
-                    expected.update({"starter": 0, "inviter_pubkey": "ab" * 32})
-                assert body == expected
-                staged.add("declined-code")
-                return {"code": "declined-code", "expires_at": int(time.time()) + 600}
-            if url.endswith("/invite-cancel"):
-                assert body == {"token": "operator-secret", "code": "declined-code"}
-                staged.discard(body["code"])
-                return {"cancelled": True}
-            raise AssertionError(url)
+            raise AssertionError(f"declined invite performed an HTTP write: {url} {body}")
 
         monkeypatch.setattr(nak, "call", fake_call)
         with pytest.raises(SystemExit, match="not approved"):
             nak.main(["invite", "--kind", kind, "--tier", "known",
                       "--redeem", "https://onboard.example/base", "--code-only"],
                      http_post=fake_post)
-        assert staged == set()
-        assert calls == ["status"]
+        assert calls == ["status", "node_sign_stage"]
         assert broker.sign_calls == 0
 
 
-_PRIVATE_CONSTRUCTOR_ALLOWLIST = {
-    ("joincode.py", "encode_invite"): "generates the invite's one-use request secret",
-    ("joincode.py", "build_unsigned_address"): "generates the address's one-use request secret",
-    ("joincode.py", "address_pub"): "derives only the embedded address request public key",
-    ("joincode.py", "invite_pub"): "derives only the embedded invite request public key",
-    ("sidecar_key.py", "libp2p_ed25519_private"): "converts the node seed for libp2p",
-    ("worker.py", "Info"): "uses the worker node identity",
-    ("worker.py", "__init__"): "uses the worker node identity",
-    ("paid_admission.py", "_receipt"): "signs with a worker payment key supplied to the class",
-    ("identity_binding.py", "_ed_sign"): "generic worker-participation signing helper",
-    ("identity_binding.py", "pub_of"): "generic worker-participation public-key helper",
-    ("nakshatra_auth.py", "generate_keypair"): "creates a node/service keypair",
-    ("nakshatra_auth.py", "public_key_hex_from_private"): "derives a node/service public key",
-    ("nakshatra_auth.py", "sign_request"): "signs node/service HTTP requests",
-    ("network/join_setup.py", "redeem_worker_invite"): "loads the node key for worker redemption",
-    ("network/join_setup.py", "redeem_consumer_invite"): "loads the node key for consumer redemption",
-    ("network/nakd.py", "__init__"): "derives nakd's node identity",
-    ("network/nakd.py", "node_sign_stage"): "signs staging with nakd's node key",
-    ("network/nakd.py", "report"): "signs the outbound report with nakd's node key",
-    ("discovery/nakshatra_listing.py", "sign"): "signs discovery with its supplied node key",
-    ("packaging/nakshatra_package.py", "sign"): "signs packages with a dedicated release key",
-    ("transport/identity_handshake.py", "make_proof"): "signs transport proof with a node key",
-    ("transport/secure_channel.py", "secure_handshake"): "converts the transport node seed",
-    ("transport/connect.py", "_pub_of"): "derives a transport node public key",
-    ("test_identity_binding.py", "_key"): "script-local test generates a disposable key",
-    ("packaging/test_package_tool.py", "test_certify_signs_a_valid_package"): "test-only package key",
-    ("packaging/test_package_tool.py", "test_certify_refuses_invalid_package"): "test-only package key",
-    ("network/join_setup.py", "_established_identity"): "legacy person file read is file-mode-only",
-    ("network/join_setup.py", "ensure_identity"): "legacy person file creation/read is file-mode-only",
-    ("network/nak.py", "_grant_renew_confined"): "loads only the delegated agent key",
-}
+@pytest.mark.parametrize("kind", ["worker", "consumer"])
+def test_stage_post_failure_after_approval_outputs_no_invite(kind, tmp_path, monkeypatch, capsys):
+    with _broker(tmp_path, monkeypatch) as (broker, _private):
+        monkeypatch.setenv("NAK_ONBOARD_TOKEN", "operator-secret")
+        monkeypatch.setattr(nak, "_release_for_invite", lambda _url="": ({}, ""))
+        calls = []
+        posts = []
 
-_PERSON_PATH_ALLOWLIST = {
-    ("network/join_setup.py", "<module>"): "operator-facing legacy file-custody documentation",
-    ("network/join_setup.py", "main"): "operator-facing legacy backup reminder",
-    ("network/nak.py", "<module>"): "operator-facing CLI example for explicit file custody",
-    ("network/join_setup.py", "ensure_identity"): "file-mode bootstrap compatibility path",
-    ("network/nak.py", "_grant_renew_confined"): "file-mode fallback command construction",
-    ("network/nak.py", "main"): "file-mode invite override and help text",
-}
+        def fake_call(_sock, request):
+            calls.append(request["op"])
+            if request["op"] == "status":
+                return {"node": "ab" * 32, "relay": "relay.example:51820"}
+            if request["op"] == "node_sign_stage":
+                return {**request["body"], "nonce": "12" * 16, "sig": "34" * 64}
+            raise AssertionError("failed stage must not register an invite")
+
+        def fake_post(url, body):
+            posts.append((url, body))
+            if url.endswith(f"/{kind}-stage"):
+                raise SystemExit("stage unavailable")
+            if url.endswith("/invite-cancel"):
+                return {"cancelled": True}
+            raise AssertionError(url)
+
+        monkeypatch.setattr(nak, "call", fake_call)
+        with pytest.raises(SystemExit, match="stage unavailable"):
+            nak.main(["invite", "--kind", kind, "--tier", "known",
+                      "--redeem", "https://onboard.example/base", "--code-only"],
+                     http_post=fake_post)
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert posts[0][0].endswith(f"/{kind}-stage")
+        assert posts[1][0].endswith("/invite-cancel")
+        assert calls == ["status", "node_sign_stage"]
+        assert broker.sign_calls == 1
+
+
+_PRIVATE_CONSTRUCTOR_ALLOWLIST = Counter({
+    ("discovery/nakshatra_listing.py", "sign", "ed25519.Ed25519PrivateKey.from_private_bytes", "priv_bytes"): 1,
+    ("identity_binding.py", "_ed_sign", "ed25519.Ed25519PrivateKey.from_private_bytes", "bytes.fromhex(priv_hex)"): 1,
+    ("identity_binding.py", "pub_of", "ed25519.Ed25519PrivateKey.from_private_bytes", "bytes.fromhex(priv_hex)"): 1,
+    ("joincode.py", "address_pub", "_ed.Ed25519PrivateKey.from_private_bytes", "bytes.fromhex(address['ik'])"): 1,
+    ("joincode.py", "build_unsigned_address", "_ed.Ed25519PrivateKey.generate", ""): 1,
+    ("joincode.py", "encode_invite", "_ed.Ed25519PrivateKey.generate", ""): 1,
+    ("joincode.py", "invite_pub", "_ed.Ed25519PrivateKey.from_private_bytes", "bytes.fromhex(inv['ik'])"): 1,
+    ("nakshatra_auth.py", "generate_keypair", "ed25519.Ed25519PrivateKey.generate", ""): 1,
+    ("nakshatra_auth.py", "public_key_hex_from_private", "ed25519.Ed25519PrivateKey.from_private_bytes", "priv_bytes"): 1,
+    ("nakshatra_auth.py", "sign_request", "ed25519.Ed25519PrivateKey.from_private_bytes", "priv_bytes"): 1,
+    ("network/join_setup.py", "_established_identity", "_raw_file_key", "person_path"): 1,
+    ("network/join_setup.py", "_established_identity", "agent_files.load_key", ""): 1,
+    ("network/join_setup.py", "ensure_identity", "_raw_file_key", "person_path"): 2,
+    ("network/join_setup.py", "redeem_consumer_invite", "ed25519.Ed25519PrivateKey.from_private_bytes", "node_key.read_bytes()"): 1,
+    ("network/join_setup.py", "redeem_worker_invite", "ed25519.Ed25519PrivateKey.from_private_bytes", "node_key.read_bytes()"): 1,
+    ("network/nak.py", "_grant_renew_confined", "agent_files.load_key", ""): 1,
+    ("network/nak.py", "_grant_renew_confined", "_ed25519.Ed25519PrivateKey.from_private_bytes", "lease_seed"): 1,
+    ("network/nakd.py", "__init__", "ed25519.Ed25519PrivateKey.from_private_bytes", "node_key"): 1,
+    ("network/nakd.py", "node_sign_stage", "ed25519.Ed25519PrivateKey.from_private_bytes", "self._key"): 1,
+    ("network/nakd.py", "report", "ed25519.Ed25519PrivateKey.from_private_bytes", "self._key"): 1,
+    ("packaging/nakshatra_package.py", "sign", "ed25519.Ed25519PrivateKey.from_private_bytes", "priv_bytes"): 1,
+    ("packaging/test_package_tool.py", "test_certify_refuses_invalid_package", "ed25519.Ed25519PrivateKey.generate", ""): 1,
+    ("packaging/test_package_tool.py", "test_certify_signs_a_valid_package", "ed25519.Ed25519PrivateKey.generate", ""): 1,
+    ("paid_admission.py", "_receipt", "ed25519.Ed25519PrivateKey.from_private_bytes", "self.private_key"): 1,
+    ("sidecar_key.py", "libp2p_ed25519_private", "ed25519.Ed25519PrivateKey.from_private_bytes", "seed"): 1,
+    ("test_identity_binding.py", "_key", "ed25519.Ed25519PrivateKey.generate", ""): 1,
+    ("transport/connect.py", "_pub_of", "ed25519.Ed25519PrivateKey.from_private_bytes", "key"): 1,
+    ("transport/identity_handshake.py", "make_proof", "ed25519.Ed25519PrivateKey.from_private_bytes", "priv_bytes"): 1,
+    ("transport/secure_channel.py", "secure_handshake", "ed25519.Ed25519PrivateKey.from_private_bytes", "priv_ed_bytes"): 1,
+    ("worker.py", "Info", "ed25519.Ed25519PrivateKey.from_private_bytes", "self.worker_priv"): 1,
+    ("worker.py", "__init__", "ed25519.Ed25519PrivateKey.from_private_bytes", "worker_priv"): 1,
+})
+
+_PERSON_PATH_ALLOWLIST = Counter({
+    ("network/join_setup.py", "ensure_identity", "_person_key_path", "home"): 1,
+    ("network/join_setup.py", "main", "_person_key_path", "a.home"): 1,
+    ("network/nak.py", "_grant_renew_confined", "_person_key_path", ""): 1,
+    ("network/nak.py", "main", "_person_key_path", ""): 1,
+})
+
+_AUTHORITY_CALL_ALLOWLIST = Counter({
+    ("network/join_setup.py", "ensure_identity", "S.issue_grant",
+     "PersonKey('grant-issue', f'Give agent {agent} {','.join(AGENT_CAPS)}', "
+     "act=custody_act.for_signing('grant-issue', f'Give agent {agent} {','.join(AGENT_CAPS)}'))"): 1,
+    ("network/nak.py", "_grant_renew_confined", "signer_mod.issue_grant", "person_priv"): 1,
+    ("network/nak.py", "main", "joincode.encode_invite", "priv"): 1,
+})
+
+
+def _normalized(node) -> str:
+    return " ".join(ast.unparse(node).split()) if node is not None else ""
+
+
+def _folded_string(node) -> str | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left, right = _folded_string(node.left), _folded_string(node.right)
+        return left + right if left is not None and right is not None else None
+    if isinstance(node, ast.JoinedStr):
+        parts = []
+        for value in node.values:
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                parts.append(value.value)
+            elif isinstance(value, ast.FormattedValue):
+                folded = _folded_string(value.value)
+                if folded is None:
+                    return None
+                parts.append(folded)
+            else:
+                return None
+        return "".join(parts)
+    return None
+
+
+def _has_private_person_fragment(node) -> bool:
+    for candidate in ast.walk(node):
+        folded = _folded_string(candidate)
+        if folded is None:
+            continue
+        lowered = folded.lower()
+        if "person" in lowered and (".key" in lowered or "-test" in lowered):
+            return True
+    return False
 
 
 def _authority_guard_findings(scripts: Path):
-    calls, private_pairs, path_pairs = set(), set(), set()
+    calls, private_findings, path_findings = Counter(), Counter(), Counter()
     for path in scripts.rglob("*.py"):
         relative = path.relative_to(scripts).as_posix()
         if relative == "network/person_custody.py":
@@ -835,24 +987,32 @@ def _authority_guard_findings(scripts: Path):
 
         for node in ast.walk(tree):
             fn = owner(node)
-            if isinstance(node, ast.Constant) and isinstance(node.value, str) \
-                    and "person-TEST.key" in node.value:
-                path_pairs.add((relative, fn))
-            if isinstance(node, ast.Name) and node.id == "_person_key_path":
-                path_pairs.add((relative, fn))
-            if isinstance(node, ast.BinOp):
-                rendered = ast.unparse(node)
-                if ".sthambha" in rendered and "person" in rendered:
-                    path_pairs.add((relative, fn))
             if not isinstance(node, ast.Call):
                 continue
+            call_text = _normalized(node.func)
+            first_arg = _normalized(node.args[0]) if node.args else ""
             call_name = (node.func.id if isinstance(node.func, ast.Name)
                          else node.func.attr if isinstance(node.func, ast.Attribute) else "")
-            if call_name in aliases | {"load_key", "_raw_file_key", "from_private_bytes"}:
-                private_pairs.add((relative, fn))
+            private_call = call_name in aliases | {"load_key", "_raw_file_key", "from_private_bytes"}
             if (isinstance(node.func, ast.Attribute)
-                    and ast.unparse(node.func.value).endswith("Ed25519PrivateKey")):
-                private_pairs.add((relative, fn))
+                    and _normalized(node.func.value).endswith("Ed25519PrivateKey")):
+                private_call = True
+            if private_call:
+                private_findings[(relative, fn, call_text, first_arg)] += 1
+
+            path_expression = None
+            if call_name in {"read_bytes", "read_text"} and isinstance(node.func, ast.Attribute):
+                path_expression = node.func.value
+            elif call_name in {"open", "Path"} and node.args:
+                path_expression = node.args[0]
+            if path_expression is not None and (
+                    any(isinstance(part, ast.Name) and part.id == "_person_key_path"
+                        for part in ast.walk(path_expression))
+                    or _has_private_person_fragment(path_expression)):
+                path_findings[(relative, fn, call_text, _normalized(path_expression))] += 1
+            if call_name == "_person_key_path":
+                path_findings[(relative, fn, call_text, first_arg)] += 1
+
             if (isinstance(node.func, ast.Attribute)
                     and node.func.attr in {"issue_grant", "encode_invite", "encode_address"}):
                 operation = node.func.attr
@@ -860,33 +1020,18 @@ def _authority_guard_findings(scripts: Path):
                 operation = node.func.id
             else:
                 continue
-            first = node.args[0]
-            if isinstance(first, ast.Name):
-                origin = first.id
-            elif (isinstance(first, ast.Attribute) and first.attr == "sign"
-                  and isinstance(first.value, ast.Name)):
-                origin = f"{first.value.id}.sign"
-            elif (isinstance(first, ast.Call) and isinstance(first.func, ast.Name)
-                  and first.func.id == "PersonKey"):
-                origin = "PersonKey(...)"
-            else:
-                origin = ast.dump(first, include_attributes=False)
-            calls.add((relative, operation, origin))
-    return calls, private_pairs, path_pairs
+            calls[(relative, fn, call_text, first_arg)] += 1
+    return calls, private_findings, path_findings
 
 
 def test_person_authority_call_sites_and_private_loads_are_explicitly_confined():
     scripts = Path(__file__).resolve().parents[1] / "scripts"
-    calls, private_pairs, path_pairs = _authority_guard_findings(scripts)
-    assert calls == {
-        ("network/join_setup.py", "issue_grant", "PersonKey(...)"),
-        ("network/nak.py", "issue_grant", "person_priv"),
-        ("network/nak.py", "encode_invite", "priv"),
-    }
+    calls, private_findings, path_findings = _authority_guard_findings(scripts)
+    assert calls == _AUTHORITY_CALL_ALLOWLIST
     assert all(_PRIVATE_CONSTRUCTOR_ALLOWLIST.values())
     assert all(_PERSON_PATH_ALLOWLIST.values())
-    assert private_pairs == set(_PRIVATE_CONSTRUCTOR_ALLOWLIST)
-    assert path_pairs == set(_PERSON_PATH_ALLOWLIST)
+    assert private_findings == _PRIVATE_CONSTRUCTOR_ALLOWLIST
+    assert path_findings == _PERSON_PATH_ALLOWLIST
 
 
 def test_authority_guard_catches_injected_aliased_private_load(tmp_path):
@@ -897,7 +1042,40 @@ def test_authority_guard_catches_injected_aliased_private_load(tmp_path):
         "def injected_alias_load():\n"
         "    alias = signer_mod.load_key\n"
         "    return alias(_person_key_path())\n")
-    _calls, private_pairs, path_pairs = _authority_guard_findings(tmp_path)
-    assert ("network/nak.py", "injected_alias_load") in private_pairs
-    assert ("network/nak.py", "injected_alias_load") in path_pairs
-    assert ("network/nak.py", "injected_alias_load") not in _PRIVATE_CONSTRUCTOR_ALLOWLIST
+    _calls, private_findings, path_findings = _authority_guard_findings(tmp_path)
+    private = ("network/nak.py", "injected_alias_load", "alias", "_person_key_path()")
+    person_path = ("network/nak.py", "injected_alias_load", "_person_key_path", "")
+    assert private_findings[private] == 1
+    assert path_findings[person_path] == 1
+    assert private not in _PRIVATE_CONSTRUCTOR_ALLOWLIST
+
+
+def test_authority_guard_multiset_rejects_one_more_load_inside_allowlisted_function(tmp_path):
+    source = (Path(__file__).resolve().parents[1] / "scripts" / "network" /
+              "join_setup.py").read_text()
+    copy = tmp_path / "network"
+    copy.mkdir()
+    # Same function, same normalized call and argument: only a multiset notices the added load.
+    source = source.replace(
+        "_, stored_person_pub = _raw_file_key(person_path)",
+        "_, stored_person_pub = _raw_file_key(person_path)\n"
+        "            _raw_file_key(person_path)", 1)
+    (copy / "join_setup.py").write_text(source)
+    _calls, private_findings, _paths = _authority_guard_findings(tmp_path)
+    finding = ("network/join_setup.py", "_established_identity", "_raw_file_key", "person_path")
+    assert private_findings[finding] == _PRIVATE_CONSTRUCTOR_ALLOWLIST[finding] + 1
+    assert private_findings != _PRIVATE_CONSTRUCTOR_ALLOWLIST
+
+
+@pytest.mark.parametrize("expression", [
+    "Path('person-' + 'TEST.key').read_bytes()",
+    "open(Path(f\"{'person'}-{'TEST'}.key\"), 'rb')",
+])
+def test_authority_guard_constant_folds_private_person_paths(expression, tmp_path):
+    (tmp_path / "probe.py").write_text(
+        "from pathlib import Path\n"
+        "def injected_path():\n"
+        f"    return {expression}\n")
+    _calls, _private, path_findings = _authority_guard_findings(tmp_path)
+    assert path_findings
+    assert all(finding[0:2] == ("probe.py", "injected_path") for finding in path_findings)
