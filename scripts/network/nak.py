@@ -233,28 +233,25 @@ def _onboard_token(*, required: bool = True) -> str | None:
 
 
 def _stage_auth(kind: str, tier: str, starter: int, ttl: int, node_sign) -> dict:
-    """Build the complete node-signed stage envelope locally, before any HTTP write."""
+    """Choose the unchanged owner credential or a member's node-signed stage envelope."""
     token = _onboard_token(required=False)
-    if token is None and tier != "stranger":
+    if token is not None:
+        return {"token": token}
+    if tier != "stranger":
         raise SystemExit("without the operator token you may invite at tier stranger only")
-    if token is None and starter > 10_000_000:
+    if starter > 10_000_000:
         raise SystemExit("without the operator token --starter may not exceed 10000000")
     body = {"v": 2, "purpose": ONBOARD_STAGE_PURPOSE,
             "kind": kind, "tier": tier, "starter": starter,
             "ttl": ttl, "ts": int(time.time())}
     signed = dict(node_sign(body))
     signed.pop("ok", None)
-    if (not isinstance(signed, dict) or not isinstance(signed.get("sig"), str)
-            or not isinstance(signed.get("nonce"), str)
-            or re.fullmatch(r"[0-9a-f]{16,64}", signed["nonce"]) is None):
+    if not isinstance(signed, dict) or not isinstance(signed.get("sig"), str):
         raise SystemExit("nakd did not return a signed stage request")
-    if token is not None:
-        signed["token"] = token
     return signed
 
 
 def _stage_worker(redeem: str, tier: str, auth: dict, http_post,
-                  planned: dict | None = None,
                   *, now: int | None = None) -> tuple[dict, int]:
     staged_at = int(time.time() if now is None else now)
     try:
@@ -266,22 +263,18 @@ def _stage_worker(redeem: str, tier: str, auth: dict, http_post,
     if parsed is None or parsed.scheme not in {"http", "https"} or not host or authority.endswith(":") or \
             (port is not None and not 1 <= port <= 65535):
         raise SystemExit("worker redeem URL must be an http(s) base URL")
-    result = http_post(redeem.rstrip("/") + "/worker-stage", dict(auth))
+    result = http_post(redeem.rstrip("/") + "/worker-stage", {**auth, "tier": tier})
     code = result.get("code") if isinstance(result, dict) else None
     if not isinstance(code, str) or not code.strip() or len(code) > 64:
         raise SystemExit("onboard server returned an invalid worker code")
-    if planned is not None and code != planned["code"]:
-        planned["code"] = code  # cleanup must cancel the server's actual write
-        raise SystemExit("onboard server did not bind the approved worker invite code")
-    expires_at = result.get("expires_at", staged_at + int(auth.get("ttl", 3600)))
+    expires_at = result.get("expires_at", staged_at + 3600)
     if isinstance(expires_at, bool) or not isinstance(expires_at, int) or expires_at <= staged_at:
         raise SystemExit("onboard server returned an invalid worker code expiry")
     return {"redeem": redeem.rstrip("/"), "code": code, "tier": tier}, expires_at
 
 
 def _stage_consumer(redeem: str, tier: str, starter: int, inviter_pubkey: str,
-                    auth: dict, http_post, planned: dict | None = None,
-                    *, now: int | None = None) -> tuple[dict, int]:
+                    auth: dict, http_post, *, now: int | None = None) -> tuple[dict, int]:
     """Stage consumer admission; the server records (but does not execute) any starter transfer."""
     staged_at = int(time.time() if now is None else now)
     try:
@@ -295,14 +288,14 @@ def _stage_consumer(redeem: str, tier: str, starter: int, inviter_pubkey: str,
         raise SystemExit("consumer redeem URL must be an http(s) base URL")
     if type(starter) is not int or not 0 <= starter <= 100_000_000:
         raise SystemExit("--starter must be an integer between 0 and 100000000")
-    result = http_post(redeem.rstrip("/") + "/consumer-stage", dict(auth))
+    result = http_post(redeem.rstrip("/") + "/consumer-stage", {
+        **auth, "tier": tier, "starter": starter,
+        "inviter_pubkey": inviter_pubkey,
+    })
     code = result.get("code") if isinstance(result, dict) else None
     if (not isinstance(code, str) or not 1 <= len(code) <= 64
             or any(ch not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-" for ch in code)):
         raise SystemExit("onboard server returned an invalid consumer code")
-    if planned is not None and code != planned["code"]:
-        planned["code"] = code  # cleanup must cancel the server's actual write
-        raise SystemExit("onboard server did not bind the approved consumer invite code")
     expires_at = result.get("expires_at", staged_at + 3600)
     if isinstance(expires_at, bool) or not isinstance(expires_at, int) or expires_at <= staged_at:
         raise SystemExit("onboard server returned an invalid consumer code expiry")
@@ -322,6 +315,13 @@ def _cancel_staged_invite(sock: Path, staged: dict, node: str, http_post) -> Non
         body = call(sock, {"op": "node_sign_stage", "body": unsigned})
         body.pop("ok", None)
     http_post(staged["redeem"].rstrip("/") + "/invite-cancel", body)
+
+
+def _cancel_local_invite(sock: Path, code: str) -> None:
+    """Close a possibly registered invite after a lost reply or later failure."""
+    import joincode
+    nonce = joincode.decode_invite(code, now=0)["nonce"]
+    call(sock, {"op": "cancel_invite", "nonce": nonce})
 
 
 def _p2p_installer(_sp, action: str) -> None:
@@ -3308,61 +3308,55 @@ def main(argv=None, *, http_post=None, http_get=None) -> int:
             print("tip: add --from <your name> so your friend sees who invited them (remembered after once)",
                   file=sys.stderr)
         issued_at = int(time.time())
-        worker = consumer = staged = stage_auth = None
-        stage_post_attempted = False
+        worker = consumer = staged = None
+        code = None
+        register_attempted = False
         try:
-            # The stage nonce is also its one-time code.  Build and node-sign that stage request
-            # locally, then obtain the PERSON signature over the exact invite that names it.  The
-            # first server mutation is deliberately after biometric approval.
             if a.kind == "worker":
-                stage_auth = _stage_auth(
+                auth = _stage_auth(
                     a.kind, a.tier, a.starter, a.ttl,
                     lambda body: call(s, {"op": "node_sign_stage",
                                           "body": {**body, "inviter_pubkey": st["node"]}}))
-                worker = {"redeem": a.redeem.rstrip("/"),
-                          "code": stage_auth["nonce"], "tier": a.tier}
+                worker, staged_expiry = _stage_worker(
+                    a.redeem, a.tier, auth, http_post, now=issued_at)
                 staged = worker
             elif a.kind == "consumer":
-                stage_auth = _stage_auth(
+                auth = _stage_auth(
                     a.kind, a.tier, a.starter, a.ttl,
                     lambda body: call(s, {"op": "node_sign_stage",
                                           "body": {**body, "inviter_pubkey": st["node"]}}))
-                consumer = {"redeem": a.redeem.rstrip("/"),
-                            "code": stage_auth["nonce"], "tier": a.tier,
-                            "starter": a.starter}
+                consumer, staged_expiry = _stage_consumer(
+                    a.redeem, a.tier, a.starter, st["node"], auth, http_post,
+                    now=issued_at)
                 staged = consumer
-            expires_at = issued_at + a.ttl
+            else:
+                staged_expiry = issued_at + a.ttl
+            expires_at = min(issued_at + a.ttl, staged_expiry)
             code = joincode.encode_invite(
                 priv, st["node"], [{"node": st["node"], "addrs": [st["relay"]]}],
-                ttl_s=a.ttl, now=issued_at, note=a.note,
+                ttl_s=expires_at - issued_at, now=issued_at, note=a.note,
                 release=release, from_name=from_name,
                 kind=a.kind, worker=worker, consumer=consumer)
-
-            if a.kind == "worker":
-                stage_post_attempted = True
-                _worker_result, staged_expiry = _stage_worker(
-                    a.redeem, a.tier, stage_auth, http_post, planned=staged,
-                    now=issued_at)
-                if staged_expiry < expires_at:
-                    raise SystemExit("onboard server returned a worker expiry shorter than the approved invite")
-            elif a.kind == "consumer":
-                stage_post_attempted = True
-                _consumer_result, staged_expiry = _stage_consumer(
-                    a.redeem, a.tier, a.starter, st["node"], stage_auth, http_post,
-                    planned=staged, now=issued_at)
-                if staged_expiry < expires_at:
-                    raise SystemExit("onboard server returned a consumer expiry shorter than the approved invite")
+            register_attempted = True
             call(s, {"op": "register_invite", "code": code})
             if a.from_name:
                 _write_private(name_file, (a.from_name.strip()[:40] + "\n").encode())
         except BaseException as original:
-            if stage_post_attempted and staged is not None:
+            cleanup_failures = []
+            if register_attempted and code is not None:
+                try:
+                    _cancel_local_invite(s, code)
+                except BaseException as cancel_exc:
+                    cleanup_failures.append(f"local {type(cancel_exc).__name__}")
+            if staged is not None:
                 try:
                     _cancel_staged_invite(s, staged, st["node"], http_post)
                 except BaseException as cancel_exc:
-                    raise SystemExit(
-                        "invite did not complete and staged server state could not be cancelled; "
-                        f"manual cancellation is required ({type(cancel_exc).__name__})") from original
+                    cleanup_failures.append(f"server {type(cancel_exc).__name__}")
+            if cleanup_failures:
+                raise SystemExit(
+                    "invite did not complete and cleanup could not be confirmed; manual "
+                    f"cancellation is required ({', '.join(cleanup_failures)})") from original
             raise
         if a.kind == "consumer":
             print(f"devnet starter: {format_amount(a.starter)} (spend-only)", file=sys.stderr)

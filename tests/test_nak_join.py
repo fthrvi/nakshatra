@@ -623,7 +623,9 @@ def test_invite_prefers_the_public_release_host(tmp_path, monkeypatch):
     assert release["url"] == "http://45.63.109.137:8960" and "45.63.109.137:8960/canary/0.6.3/install.py" in line
 
 
-def test_nak_worker_invite_stages_code_with_injected_http(tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize("tier", ["known", "trusted"])
+def test_file_worker_invite_matches_main_operator_token_flow(
+        tier, tmp_path, monkeypatch, capsys):
     from cryptography.hazmat.primitives.asymmetric import ed25519
     person = ed25519.Ed25519PrivateKey.generate()
     person_path = tmp_path / "person.key"
@@ -638,7 +640,7 @@ def test_nak_worker_invite_stages_code_with_injected_http(tmp_path, monkeypatch,
         if req["op"] == "status":
             return {"node": "a" * 64, "relay": "relay.example:51820"}
         if req["op"] == "node_sign_stage":
-            return {**req["body"], "nonce": "01" * 16, "sig": "02" * 64}
+            raise AssertionError("forgejo/main's operator-token flow does not node-sign staging")
         registered.append(req["code"])
         return {}
 
@@ -650,19 +652,17 @@ def test_nak_worker_invite_stages_code_with_injected_http(tmp_path, monkeypatch,
 
     monkeypatch.setattr(nak, "call", fake_call)
     monkeypatch.setattr(nak.time, "time", lambda: 1000)
-    assert nak.main(["invite", "--person-key", str(person_path), "--kind", "worker", "--tier", "known",
+    assert nak.main(["invite", "--person-key", str(person_path), "--kind", "worker", "--tier", tier,
                      "--from", "Alice",
                      "--redeem", "https://onboard.example/base", "--code-only"], http_post=fake_post) == 0
     output = capsys.readouterr()
     code = output.out.strip()
     inv = joincode.decode_invite(code, now=1001)
     assert posted == [("https://onboard.example/base/worker-stage", {
-        "v": 2, "purpose": "onboard-stage-v2", "kind": "worker", "tier": "known",
-        "starter": 0, "ttl": 86400, "ts": 1000, "inviter_pubkey": "a" * 64,
-        "nonce": "01" * 16, "sig": "02" * 64, "token": "operator-secret",
+        "token": "operator-secret", "tier": tier,
     })]
     assert inv["worker"] == {"redeem": "https://onboard.example/base",
-                             "code": "01" * 16, "tier": "known"}
+                             "code": "01" * 16, "tier": tier}
     assert inv["expires_at"] == 87400 and "Unix 87400" in output.err
     assert registered == [code]
     assert oct((tmp_path / "net" / "name").stat().st_mode & 0o777) == "0o600"
@@ -683,7 +683,7 @@ def test_nak_consumer_invite_stages_signed_starter_request(tmp_path, monkeypatch
         if req["op"] == "status":
             return {"node": "a" * 64, "relay": "relay.example:51820"}
         if req["op"] == "node_sign_stage":
-            return {**req["body"], "nonce": "03" * 16, "sig": "04" * 64}
+            raise AssertionError("forgejo/main's operator-token flow does not node-sign staging")
         registered.append(req["code"])
         return {}
 
@@ -703,14 +703,84 @@ def test_nak_consumer_invite_stages_signed_starter_request(tmp_path, monkeypatch
     code = output.out.strip()
     inv = joincode.decode_invite(code, now=1001)
     assert posted == [("https://onboard.example/base/consumer-stage", {
-        "v": 2, "purpose": "onboard-stage-v2", "kind": "consumer", "tier": "known",
-        "starter": 1234, "ttl": 86400, "ts": 1000, "inviter_pubkey": "a" * 64,
-        "nonce": "03" * 16, "sig": "04" * 64, "token": "operator-secret",
+        "token": "operator-secret", "tier": "known", "starter": 1234,
+        "inviter_pubkey": "a" * 64,
     })]
     assert inv["consumer"] == {"redeem": "https://onboard.example/base",
                                "code": "03" * 16, "tier": "known", "starter": 1234}
     assert inv["expires_at"] == 87400 and "consumer invite expires" in output.err
     assert registered == [code]
+
+
+@pytest.mark.parametrize("failure", ["name-write", "register-response", "stage-cancel-response"])
+def test_invite_failure_cancels_any_durable_local_registration(
+        failure, tmp_path, monkeypatch):
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+    from network.store import Store
+
+    person = ed25519.Ed25519PrivateKey.generate()
+    person_path = tmp_path / "person.key"
+    person_path.write_text(person.private_bytes_raw().hex())
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("NAK_NET_DIR", str(tmp_path / "net"))
+    monkeypatch.setenv("NAK_ONBOARD_TOKEN", "operator-secret")
+    monkeypatch.setattr(nak, "_release_for_invite", lambda _url="": (REL, ""))
+    monkeypatch.setattr(nak.time, "time", lambda: 1000)
+    store = Store(tmp_path / "local-store", b"k" * 32)
+    registered_nonce = None
+
+    def fake_call(_sock, request):
+        nonlocal registered_nonce
+        if request["op"] == "status":
+            return {"node": "a" * 64, "relay": "relay.example:51820"}
+        if request["op"] == "node_sign_stage":
+            raise AssertionError("operator-token staging must not node-sign")
+        if request["op"] == "register_invite":
+            inv = joincode.decode_invite(request["code"], now=1001)
+            registered_nonce = inv["nonce"]
+            store.add_invite(
+                inv["nonce"], inv["ik"], inv["expires_at"], inv.get("note", ""),
+                request["code"])
+            if failure == "register-response":
+                raise SystemExit("daemon response lost")
+            return {}
+        if request["op"] == "cancel_invite":
+            assert request["nonce"] == registered_nonce
+            return {"cancelled": store.consume_invite(
+                request["nonce"], "cancelled", now=1001)}
+        raise AssertionError(request)
+
+    remote_stages = set()
+
+    def fake_post(url, body):
+        if url.endswith("/worker-stage"):
+            remote_stages.add("server-issued-code")
+            return {"code": "server-issued-code", "expires_at": 87400}
+        if url.endswith("/invite-cancel"):
+            remote_stages.discard(body["code"])
+            if failure == "stage-cancel-response":
+                raise SystemExit("stage cancel response lost")
+            return {"cancelled": True}
+        raise AssertionError(url)
+
+    monkeypatch.setattr(nak, "call", fake_call)
+    if failure in {"name-write", "stage-cancel-response"}:
+        monkeypatch.setattr(
+            nak, "_write_private", lambda *_args: (_ for _ in ()).throw(
+                SystemExit("name write failed")))
+    match = "cleanup could not be confirmed" if failure == "stage-cancel-response" else (
+        "daemon response lost" if failure == "register-response" else "name write failed")
+    with pytest.raises(SystemExit, match=match):
+        nak.main([
+            "invite", "--person-key", str(person_path), "--kind", "worker",
+            "--tier", "known", "--from", "Alice",
+            "--redeem", "https://onboard.example/base", "--code-only",
+        ], http_post=fake_post)
+
+    assert registered_nonce is not None
+    assert store.open_invites(now=1001) == []
+    assert store.invite(registered_nonce)["consumed_by"] == "cancelled"
+    assert remote_stages == set()
 
 
 def test_nak_member_invite_posts_node_signed_stranger_envelope(tmp_path, monkeypatch, capsys):
