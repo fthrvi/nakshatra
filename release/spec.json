@@ -70,6 +70,7 @@
     "{home}/.nakshatra/net"
    ],
    "requires": "{home}/.nakshatra/net/agent",
+   "env_file": "{home}/.nakshatra/net.env",
    "components": [
     "nakshatra",
     "sthambha"

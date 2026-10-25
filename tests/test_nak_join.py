@@ -554,6 +554,9 @@ def test_fresh_join_writes_and_enables_identity_gated_units(tmp_path, monkeypatc
     assert (units / "nak-signer.service").is_file()
     assert (units / "nak-net.service").is_file()
     assert I.UNIT_MARKER in (units / "nak-signer.service").read_text()
+    # The node's settlement backend (NAKSHATRA_ESCROW=neuron + pinned ledger) is the operator's
+    # choice, written to net.env; without this hook a container node could never fund a Neuron hold.
+    assert f"EnvironmentFile=-{home}/.nakshatra/net.env" in (units / "nak-net.service").read_text()
     calls = systemctl_log.read_text().splitlines()
     assert "--user enable --now nak-signer.service nak-net.service" in calls
     assert "--user restart nak-net.service" in calls
