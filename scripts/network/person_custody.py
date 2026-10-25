@@ -48,6 +48,7 @@ _NOT_APPROVED = "person signing was not approved; nothing was signed"
 _HOME_OVERRIDE: contextvars.ContextVar[Path | None] = contextvars.ContextVar(
     "person_custody_home", default=None)
 _HEX64_RE = re.compile(r"[0-9a-f]{64}\Z")
+_BROKER_REQUEST_ID_RE = re.compile(r"[0-9a-f]{16}\Z")
 _ZERO_RECORD_HASH = "0" * 64
 _SUSPENSION_PROOF_KINDS = {
     "stage-suspension",
@@ -420,6 +421,10 @@ class _BrokerTransient(Exception):
         self.message = message
 
 
+class _BrokerAlreadySigned(Exception):
+    """The broker consumed this request, but its successful reply was lost."""
+
+
 def _broker_json(config: _BrokerConfig, method: str, path: str,
                  body: dict | None = None, *, timeout: float = _BROKER_TIMEOUT_S,
                  retry_transient: bool = False) -> dict:
@@ -436,6 +441,8 @@ def _broker_json(config: _BrokerConfig, method: str, path: str,
         error_id, broker_retryable = _broker_error_info(path, exc)
         message = (f"approval service error (HTTP {exc.code}, code {error_id})"
                    if error_id else f"approval service error (HTTP {exc.code})")
+        if retry_transient and error_id == "already-signed":
+            raise _BrokerAlreadySigned from None
         if retry_transient and (int(exc.code) in {502, 503, 504} or broker_retryable):
             raise _BrokerTransient(message) from None
         raise SystemExit(message) from None
@@ -476,6 +483,13 @@ def _broker_json_until(config: _BrokerConfig, method: str, path: str,
             return _broker_json(
                 config, method, path, body,
                 timeout=min(_BROKER_TIMEOUT_S, remaining), retry_transient=True)
+        except _BrokerAlreadySigned:
+            if phase != "sign":
+                raise SystemExit("person broker returned an invalid signing state") from None
+            raise SystemExit(
+                "the person-signing request was signed and consumed, but its signatures "
+                "were lost in transit; nothing was sent or written. Starting the act again "
+                "will ask for a new approval") from None
         except _BrokerTransient as exc:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -679,8 +693,9 @@ def _broker_sign_batch(kind: str, items: list, wire_items: list[dict], *, summar
         "ttl": wait_s,
     })
     request_id = enqueued.get("request_id")
-    if not isinstance(request_id, str) or not request_id:
-        raise SystemExit("person broker returned no request id; nothing was signed")
+    if (not isinstance(request_id, str)
+            or _BROKER_REQUEST_ID_RE.fullmatch(request_id) is None):
+        raise SystemExit("person broker returned an invalid request id; nothing was signed")
 
     result_path = "/result/v1?" + urllib.parse.urlencode({"request_id": request_id})
     while True:
