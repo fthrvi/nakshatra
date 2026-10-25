@@ -1282,3 +1282,21 @@ def test_mcp_report_is_opt_in_and_rejects_non_contact(tmp_path):
             server.call("nak_report", {"subject": "11" * 32, "reason": "abuse"})
     finally:
         party.node.stop()
+
+
+@pytest.mark.parametrize("reason", ["leaked sk-proj-" + "A" * 24, "code nki1.abc", "-----BEGIN key"])
+def test_suspension_reason_never_carries_a_secret_out(reason):
+    node = "11" * 32
+    with pytest.raises(ValueError, match="secret-shaped token or encoded blob"):
+        _record(nodes=(node,), reasons={node: reason})
+
+    # A record signed elsewhere with such a reason is refused on receipt too, never installed or relayed.
+    private, person = _key()
+    record = {"schema": "nak.suspensions.v1", "person": person, "seq": 1, "issued_at": 123,
+              "nodes": [node], "reasons": {node: reason}, "sig": "0" * 128}
+    from network.suspension import suspension_statement as statement
+    record["sig"] = private.sign(statement(record)).hex()
+    with pytest.raises(ValueError, match="secret-shaped token or encoded blob"):
+        verify_record(record, person)
+    with pytest.raises(ValueError):
+        decode_record(encode_record(record))

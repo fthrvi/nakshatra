@@ -10,6 +10,8 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric import ed25519
 from sthambha.signer import canonical
 
+from network.dlp import outbound_problem
+
 SCHEMA = "nak.suspensions.v1"
 PREFIX = "nks1."
 MAX_NODES = 4096
@@ -65,6 +67,9 @@ def _validate(record: dict, person_hex: str) -> None:
         raise ValueError("suspension reasons must contain exactly the suspended nodes")
     if any(not isinstance(reason, str) or len(reason) > 120 for reason in reasons.values()):
         raise ValueError("each suspension reason must be text of at most 120 characters")
+    if any(outbound_problem(reason) for reason in reasons.values()):
+        # The record goes to the onboard server and every contact: never carry a secret out.
+        raise ValueError("a suspension reason contains a secret-shaped token or encoded blob")
     if not isinstance(record.get("sig"), str) or _SIG_RE.fullmatch(record["sig"]) is None:
         raise ValueError("suspension signature must be 128 lowercase hex characters")
     if _encoded_size(record) > MAX_BLOB:

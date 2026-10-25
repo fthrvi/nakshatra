@@ -47,6 +47,7 @@ from release_trust import (ReleaseTrustError, load_release_package_catalog,
 from network.person_custody import (  # noqa: E402
     PersonKey, _person_key_path, approval, broker_preflight, custody_mode, plain)
 from network.units import AmountError, MAX_SPEND_CAP, format_amount, parse_amount  # noqa: E402
+from network.dlp import outbound_problem  # noqa: E402
 
 
 def call(sock_path: Path, req: dict) -> dict:
@@ -2322,6 +2323,9 @@ def _operator_suspend(args, sock: Path, http_post, http_get) -> int:
     if not abandoning and verb == "suspend" and \
             (not isinstance(reason, str) or not reason or len(reason) > 120):
         raise SystemExit("--reason must be non-empty text of at most 120 characters")
+    if reason and outbound_problem(reason):
+        raise SystemExit("--reason is sent to the onboard server and every contact; "
+                         "it looks like it carries a secret or encoded blob — refusing")
 
     status = call(sock, {"op": "status"})
     state = call(sock, {"op": "suspensions"})
