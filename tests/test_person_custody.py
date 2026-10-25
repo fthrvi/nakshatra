@@ -74,7 +74,8 @@ class FakeBroker:
     def __init__(self, private, *, status="approved", corrupt="",
                  principal="nakshatra-person", pending_polls=0,
                  result_failures=0, sign_failures=0,
-                 drop_approved_result=False):
+                 drop_approved_result=False, drop_sign_response=False,
+                 returned_request_id=None):
         self.private = private
         self.status = status
         self.corrupt = corrupt
@@ -84,11 +85,15 @@ class FakeBroker:
         self.sign_failures = sign_failures
         self.drop_approved_result = drop_approved_result
         self.dropped_approved_result = False
+        self.drop_sign_response = drop_sign_response
+        self.dropped_sign_response = False
+        self.returned_request_id = returned_request_id
         self.enqueues = []
         self.sign_calls = 0
         self.principal_calls = 0
         self.result_calls = 0
         self._requests = {}
+        self._signed_requests = set()
         owner = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -155,7 +160,8 @@ class FakeBroker:
                             or body.get("ttl") != person_custody._approval_wait_s(exact.get("kind"))):
                         self._reply(400, {"error": "invalid enqueue"})
                         return
-                    request_id = f"request-{len(owner.enqueues) + 1}"
+                    request_id = (owner.returned_request_id
+                                  or f"{len(owner.enqueues) + 1:016x}")
                     owner.enqueues.append(body)
                     owner._requests[request_id] = exact
                     self._reply(200, {"request_id": request_id})
@@ -167,6 +173,9 @@ class FakeBroker:
                         self._reply(503, {"error": "temporary", "retryable": True})
                         return
                     request_id = body.get("request_id")
+                    if request_id in owner._signed_requests:
+                        self._reply(409, {"error": "person signing request was already signed"})
+                        return
                     exact = owner._requests.get(request_id)
                     if exact is None or body.get("exact_content") != exact or owner.status != "approved":
                         self._reply(409, {"error": "not approved"})
@@ -177,6 +186,13 @@ class FakeBroker:
                     elif owner.corrupt == "item":
                         finals[0] += b" substituted"
                         signatures[0] = owner.private.sign(finals[0])
+                    owner._signed_requests.add(request_id)
+                    if owner.drop_sign_response and not owner.dropped_sign_response:
+                        owner.dropped_sign_response = True
+                        self.close_connection = True
+                        self.connection.shutdown(socket.SHUT_RDWR)
+                        self.connection.close()
+                        return
                     self._reply(200, {
                         "request_id": request_id,
                         "signatures": [signature.hex() for signature in signatures],
@@ -206,13 +222,16 @@ class FakeBroker:
 @contextmanager
 def _broker(tmp_path, monkeypatch, *, status="approved", corrupt="", remove_private=True,
             principal="nakshatra-person", pending_polls=0,
-            result_failures=0, sign_failures=0, drop_approved_result=False):
+            result_failures=0, sign_failures=0, drop_approved_result=False,
+            drop_sign_response=False, returned_request_id=None):
     signer_dir, private = _identity(tmp_path, monkeypatch)
     broker = FakeBroker(
         private, status=status, corrupt=corrupt, principal=principal,
         pending_polls=pending_polls, result_failures=result_failures,
         sign_failures=sign_failures,
-        drop_approved_result=drop_approved_result).start()
+        drop_approved_result=drop_approved_result,
+        drop_sign_response=drop_sign_response,
+        returned_request_id=returned_request_id).start()
     try:
         net = tmp_path / ".nakshatra" / "net"
         token = tmp_path / "broker.token"
@@ -420,10 +439,22 @@ def test_broker_success_body_never_reflects_an_unknown_status(tmp_path, monkeypa
             person_custody.person_sign("invite", b"invite", summary="Invite")
         assert str(refused.value) == (
             "person broker returned an invalid terminal status; nothing was signed; "
-            "approval may already have been granted; request_id=request-1 can be retried "
+            "approval may already have been granted; request_id=0000000000000001 can be retried "
             "without a new prompt")
         assert TOKEN not in str(refused.value)
         assert len(broker.enqueues) == 1 and broker.sign_calls == 0
+
+
+def test_broker_returned_bearer_as_request_id_is_refused_without_leaking(
+        tmp_path, monkeypatch):
+    with _broker(
+            tmp_path, monkeypatch, returned_request_id=TOKEN) as (broker, _private):
+        with pytest.raises(SystemExit) as refused:
+            person_custody.person_sign("invite", b"invite", summary="Invite")
+        assert str(refused.value) == (
+            "person broker returned an invalid request id; nothing was signed")
+        assert TOKEN not in str(refused.value)
+        assert broker.result_calls == 0 and broker.sign_calls == 0
 
 
 def test_late_real_broker_wait_refuses_stale_proof_before_local_send_or_write(
@@ -522,6 +553,25 @@ def test_broker_lost_approved_result_proceeds_from_consumed_with_same_request_id
         assert broker.dropped_approved_result is True
         assert broker.result_calls == 2 and broker.sign_calls == 1
         assert len(broker.enqueues) == 1
+
+
+def test_broker_lost_sign_response_reports_consumed_and_requires_new_approval(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr(person_custody, "_BROKER_RETRY_INITIAL_S", 0)
+    monkeypatch.setattr(person_custody, "_BROKER_RETRY_MAX_S", 0)
+    with _broker(tmp_path, monkeypatch, drop_sign_response=True) as (broker, _private):
+        with pytest.raises(SystemExit) as refused:
+            person_custody.person_sign(
+                "invite", b"signed response was lost", summary="Invite")
+        message = str(refused.value)
+        assert "request was signed and consumed" in message
+        assert "signatures were lost in transit" in message
+        assert "nothing was sent or written" in message
+        assert "Starting the act again will ask for a new approval" in message
+        assert "retried without another prompt" not in message
+        assert "without a new prompt" not in message
+        assert broker.dropped_sign_response is True
+        assert broker.sign_calls == 2 and len(broker.enqueues) == 1
 
 
 def test_declined_cli_accept_never_calls_state_changing_daemon_op(tmp_path, monkeypatch):
@@ -975,19 +1025,36 @@ def test_stage_post_failure_happens_before_approval_and_outputs_no_invite(
 _PERSON_LITERAL_ALLOWLIST = {
     ("network/join_setup.py",
      "2. person key      ~/.sthambha/person-TEST.key           TEST custody: a file, not a vault"):
-        "operator-facing bootstrap layout documents the legacy file-custody location",
+        (1, "operator-facing bootstrap layout documents the legacy file-custody location"),
     ("network/join_setup.py",
      "3. signer state    ~/.sthambha/signer/                   node.pub, person.pub"):
-        "operator-facing bootstrap layout documents public signer identity state",
+        (1, "operator-facing bootstrap layout documents public signer identity state"),
+    ("network/join_setup.py",
+     '"""Whether ~/.sthambha contains anything except an empty signer directory."""'):
+        (1, "the broker migration fence documents the authority directory it inspects"),
+    ("network/join_setup.py", 'state = home / ".sthambha" / "signer"'):
+        (1, "join setup must initialize the established public signer-state directory"),
+    ("network/join_setup.py",
+     'sthambha_authority_present = _sthambha_authority_present(home / ".sthambha", state)'):
+        (1, "broker migration must refuse residual authority material in the legacy directory"),
     ("network/join_setup.py",
      'custody_note = "your person key is a TEST file at ~/.sthambha/person-TEST.key: back it up, and never share it"'):
-        "file-custody setup warning tells the operator what must be backed up",
+        (1, "file-custody setup warning tells the operator what must be backed up"),
     ("network/nak.py",
      'nak invite --person-key ~/.sthambha/person-TEST.key [--ttl 86400] [--note "for Rajesh"]'):
-        "CLI module help preserves the established explicit-key example",
+        (1, "CLI module help preserves the established explicit-key example"),
+    ("network/nak.py",
+     'signer_dir = Path(os.environ.get("NAK_SIGNER_DIR", Path.home() / ".sthambha" / "signer"))'):
+        (2, "two confined grant flows need the public signer and agent-key state directory"),
     ("network/nak.py",
      'help="explicit file key in file custody only (default: ~/.sthambha/person-TEST.key)")'):
-        "the file-only --person-key option documents its legacy default",
+        (1, "the file-only --person-key option documents its legacy default"),
+    ("network/nakd.py",
+     'signer_dir = Path(os.environ.get("NAK_SIGNER_DIR", Path.home() / ".sthambha" / "signer"))'):
+        (1, "the daemon loads only its public identity and delegated node/agent state here"),
+    ("network/nakd.py",
+     '"NAK_SIGNER_SOCK", home / ".sthambha" / "signer" / "signer.sock")))'):
+        (1, "the daemon connects to the separately confined signer socket"),
 }
 
 
@@ -1079,7 +1146,8 @@ def _has_private_person_fragment(node) -> bool:
 
 
 def _person_literal_findings(scripts: Path) -> Counter:
-    """Find literal source lines that can reconstruct the private person-key location."""
+    """Find every forbidden marker in each string literal or f-string fragment."""
+    markers = ("test.key", "person-test", ".sthambha")
     findings = Counter()
     for path in scripts.rglob("*.py"):
         relative = path.relative_to(scripts).as_posix()
@@ -1093,15 +1161,13 @@ def _person_literal_findings(scripts: Path) -> Counter:
             if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
                 continue
             lowered = node.value.lower()
-            if "person-test" not in lowered and not (
-                    ".sthambha" in lowered and "person" in lowered):
+            if not any(marker in lowered for marker in markers):
                 continue
             span = range(node.lineno - 1, (node.end_lineno or node.lineno))
             relevant = []
             for index in span:
                 line_lower = lines[index].lower()
-                if "person-test" in line_lower or (
-                        ".sthambha" in line_lower and "person" in line_lower):
+                if any(marker in line_lower for marker in markers):
                     relevant.append(index)
             # Constant folding can combine adjacent fragments whose individual source text does
             # not contain the complete marker. Still report the literal's opening line.
@@ -1182,9 +1248,13 @@ def test_person_authority_call_sites_and_private_loads_are_explicitly_confined()
     scripts = Path(__file__).resolve().parents[1] / "scripts"
     calls, private_findings, path_findings = _authority_guard_findings(scripts)
     literal_findings = _person_literal_findings(scripts)
+    literal_allowlist = Counter({
+        finding: count for finding, (count, _reason) in _PERSON_LITERAL_ALLOWLIST.items()
+    })
     assert calls == _AUTHORITY_CALL_ALLOWLIST
-    assert all(_PERSON_LITERAL_ALLOWLIST.values())
-    assert literal_findings == Counter(_PERSON_LITERAL_ALLOWLIST.keys())
+    assert all(count >= 1 and reason
+               for count, reason in _PERSON_LITERAL_ALLOWLIST.values())
+    assert literal_findings == literal_allowlist
     assert all(_PRIVATE_CONSTRUCTOR_ALLOWLIST.values())
     assert all(_PERSON_PATH_ALLOWLIST.values())
     assert private_findings == _PRIVATE_CONSTRUCTOR_ALLOWLIST
@@ -1243,6 +1313,18 @@ def test_authority_literal_guard_catches_reviewer_fstring_mutation(tmp_path):
     (tmp_path / "probe.py").write_text(
         "from pathlib import Path\n"
         "def injected_path(suffix):\n"
+        f"    {line}\n")
+    findings = _person_literal_findings(tmp_path)
+    assert findings == Counter({("probe.py", line): 1})
+    assert not set(findings) <= set(_PERSON_LITERAL_ALLOWLIST)
+
+
+def test_authority_literal_guard_catches_reviewer_split_literal_mutation(tmp_path):
+    line = ('private_path = Path(".sthambha") / ("person-" + "TEST.key"); '
+            'private_path.read_bytes()')
+    (tmp_path / "probe.py").write_text(
+        "from pathlib import Path\n"
+        "def injected_path():\n"
         f"    {line}\n")
     findings = _person_literal_findings(tmp_path)
     assert findings == Counter({("probe.py", line): 1})
