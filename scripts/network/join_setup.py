@@ -32,7 +32,8 @@ if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
 from network.person_custody import (  # noqa: E402
-    PersonKey, _person_key_path, _raw_file_key, _signing_home, broker_preflight)
+    PersonKey, _person_key_path, _raw_file_key, _signing_home, broker_preflight,
+    custody_mode)
 from network.units import format_amount  # noqa: E402
 
 AGENT = "agent"
@@ -229,7 +230,10 @@ def retry_worker_redeem(home: Path, *, name: str = "", http_post=None) -> dict:
     return result
 
 
-def _delegate_command(state: Path, person_key: Path, agent: str, caps, *, reuse_key: bool) -> str:
+def _delegate_command(state: Path, person_key: Path, agent: str, caps, *, reuse_key: bool,
+                      broker: bool = False) -> str:
+    if broker:
+        return "nak grant renew --caps " + ",".join(sorted(set(caps)))
     argv = ["python", "-m", "sthambha.signer", "delegate", "--state", str(state),
             "--person-key", str(person_key), "--agent", agent,
             "--caps", ",".join(sorted(set(caps))), "--ttl", str(AGENT_TTL_S)]
@@ -281,12 +285,21 @@ def _established_identity(home: Path, state: Path, net: Path, person_path: Path,
     """Read and validate an established node without changing a single file."""
     from sthambha import signer as S
 
+    with _signing_home(home):
+        broker = custody_mode() == "broker"
     person_pub_path, node_pub_path, agent_path = (
         state / "person.pub", state / "node.pub", net / "agent")
     missing_identity = [str(path) for path in (person_pub_path, node_pub_path, agent_path)
                         if not path.exists()]
     if missing_identity:
-        command = _delegate_command(state, person_path, AGENT, AGENT_CAPS, reuse_key=False)
+        if broker:
+            raise SystemExit(
+                "established broker-custody identity is incomplete; refusing automatic repair and "
+                "leaving all files untouched. Restore the missing public identity file(s): " +
+                ", ".join(missing_identity) +
+                ". Broker custody never accepts a --person-key recovery command")
+        command = _delegate_command(
+            state, person_path, AGENT, AGENT_CAPS, reuse_key=False, broker=broker)
         raise SystemExit("established node identity is incomplete; refusing automatic repair and leaving all "
                          "files untouched. Restore the missing identity file(s): " +
                          ", ".join(missing_identity) + ". Human recovery must name the authority explicitly: " +
@@ -299,7 +312,7 @@ def _established_identity(home: Path, state: Path, net: Path, person_path: Path,
             raise ValueError(f"node key {node_key} is missing")
         if S._node_pub_from_key(node_key) != node_pub:  # noqa: SLF001 — signer owns this format
             raise ValueError("the node key does not match signer node.pub")
-        if person_path.exists():
+        if person_path.exists() and not broker:
             _, stored_person_pub = _raw_file_key(person_path)
             if stored_person_pub != person_pub:
                 raise ValueError("the TEST custody person key does not match signer person.pub")
@@ -353,7 +366,13 @@ def _established_identity(home: Path, state: Path, net: Path, person_path: Path,
         # Reusing a surviving key is safe only when the grant is the missing half. Other structural
         # mismatches need an explicit human key rotation, which omits --reuse-key deliberately.
         reuse_key = key_exists and not grant_exists
-        command = _delegate_command(state, person_path, agent, caps, reuse_key=reuse_key)
+        if broker and not reuse_key:
+            raise SystemExit(
+                f"established broker-custody delegation for agent {agent!r} is incomplete or "
+                f"mismatched ({problem}); refusing automatic key rotation and leaving all files "
+                "untouched. Restore the signer state; broker custody never accepts --person-key")
+        command = _delegate_command(
+            state, person_path, agent, caps, reuse_key=reuse_key, broker=broker)
         raise SystemExit(f"established node delegation for agent {agent!r} is incomplete or mismatched "
                          f"({problem}); refusing to mint, rotate, or rename it and leaving all files untouched. "
                          f"Human recovery must name the authority explicitly: {command}")
@@ -378,7 +397,8 @@ def _established_identity(home: Path, state: Path, net: Path, person_path: Path,
         agent_result += f"; {'; '.join(notices)}; human renewal only: {command}"
     return {
         "node_key": "kept",
-        "person_key": ("kept" if person_path.exists() else "not on this box (human custody kept)"),
+        "person_key": ("broker custody (local private file ignored)" if broker else
+                       "kept" if person_path.exists() else "not on this box (human custody kept)"),
         "signer": "kept",
         "agent": agent_result,
         "person": person_pub,
@@ -412,6 +432,11 @@ def ensure_identity(home: Path) -> dict:
         return _established_identity(home, state, net, person_path, node_key)
     with _signing_home(home):
         broker_preflight("grant-issue", f"Create initial grant for agent {agent}")
+        broker = custody_mode() == "broker"
+    if broker:
+        raise SystemExit(
+            "person custody is broker, but a fresh node has no signer/person.pub to bind to; "
+            "restore the broker-owned public person identity before initializing this node")
     if not callable(getattr(S, "load_or_create_lease_key", None)):
         # Compatibility must be decided before first-init creates any identity or authority state.
         raise SystemExit(OLD_SIGNER_MESSAGE)

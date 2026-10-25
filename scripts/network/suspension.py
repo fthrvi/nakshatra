@@ -76,21 +76,36 @@ def _validate(record: dict, person_hex: str) -> None:
         raise ValueError(f"suspension record exceeds the {MAX_BLOB // 1024} KiB encoded limit")
 
 
-def make_record(sign_fn, person_hex: str, seq: int, nodes, reasons, now: int) -> dict:
-    """Build and sign one normalized full-state suspension record."""
+def build_unsigned_record(person_hex: str, seq: int, nodes, reasons, now: int) -> dict:
+    """Build the normalized placeholder form whose canonical bytes are person-signed."""
     normalized = sorted(set(nodes)) if isinstance(nodes, (list, tuple, set, frozenset)) else nodes
     reason_map = dict(reasons) if isinstance(reasons, dict) else reasons
     record = {"schema": SCHEMA, "person": person_hex, "seq": seq, "issued_at": now,
               "nodes": normalized, "reasons": reason_map, "sig": "0" * 128}
     _validate(record, person_hex)
+    return record
+
+
+def attach_signature(record: dict, signature: bytes) -> dict:
+    """Attach one raw Ed25519 signature without changing any signed record field."""
+    if not isinstance(record, dict) or record.get("sig") != "0" * 128:
+        raise ValueError("unsigned suspension record must carry the zero signature placeholder")
+    if not isinstance(signature, bytes) or len(signature) != 64:
+        raise ValueError("suspension signer did not return a 64-byte signature")
+    signed = dict(record, nodes=list(record.get("nodes", [])), reasons=dict(record.get("reasons", {})))
+    signed["sig"] = signature.hex()
+    _validate(signed, signed.get("person", ""))
+    return signed
+
+
+def make_record(sign_fn, person_hex: str, seq: int, nodes, reasons, now: int) -> dict:
+    """Build and sign one normalized full-state suspension record."""
+    record = build_unsigned_record(person_hex, seq, nodes, reasons, now)
     try:
         signature = sign_fn(suspension_statement(record))
     except Exception as exc:
         raise ValueError(f"could not sign suspension record: {exc}") from exc
-    if not isinstance(signature, bytes) or len(signature) != 64:
-        raise ValueError("suspension signer did not return a 64-byte signature")
-    record["sig"] = signature.hex()
-    return record
+    return attach_signature(record, signature)
 
 
 def verify_record(record: dict, person_hex: str) -> dict:

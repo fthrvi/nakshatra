@@ -137,21 +137,35 @@ def _validate_unsigned(record: dict, person_hex: str) -> None:
         raise ValueError("revocation signature must be 128 lowercase hex characters")
 
 
-def make_record(sign_fn, person_hex: str, seq: int, grant_ids, now: int) -> dict:
-    """Build and sign one normalized cumulative record."""
+def build_unsigned_record(person_hex: str, seq: int, grant_ids, now: int) -> dict:
+    """Build the normalized fields covered by a revocation signature."""
     ids = sorted(set(grant_ids)) if isinstance(grant_ids, (list, tuple, set, frozenset)) else grant_ids
     record = {"schema": SCHEMA, "person": person_hex, "seq": seq,
               "issued_at": now, "grant_ids": ids, "sig": "0" * 128}
     _validate_unsigned(record, person_hex)
-    unsigned = {key: value for key, value in record.items() if key != "sig"}
-    try:
-        signature = sign_fn(revocation_statement(unsigned))
-    except Exception as exc:  # keep the public API consistently ValueError-based
-        raise ValueError(f"could not sign revocation record: {exc}") from exc
+    return record
+
+
+def attach_signature(record: dict, signature: bytes) -> dict:
+    """Attach one raw Ed25519 signature without changing signed record fields."""
+    if not isinstance(record, dict) or record.get("sig") != "0" * 128:
+        raise ValueError("unsigned revocation record must carry the zero signature placeholder")
     if not isinstance(signature, bytes) or len(signature) != 64:
         raise ValueError("revocation signer did not return a 64-byte signature")
-    record["sig"] = signature.hex()
-    return record
+    signed = dict(record, grant_ids=list(record.get("grant_ids", [])))
+    signed["sig"] = signature.hex()
+    _validate_unsigned(signed, signed.get("person", ""))
+    return signed
+
+
+def make_record(sign_fn, person_hex: str, seq: int, grant_ids, now: int) -> dict:
+    """Build and sign one normalized cumulative record."""
+    record = build_unsigned_record(person_hex, seq, grant_ids, now)
+    try:
+        signature = sign_fn(revocation_statement(record))
+    except Exception as exc:  # keep the public API consistently ValueError-based
+        raise ValueError(f"could not sign revocation record: {exc}") from exc
+    return attach_signature(record, signature)
 
 
 def verify_record(record: dict, person_hex: str) -> dict:
