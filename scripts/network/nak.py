@@ -45,8 +45,8 @@ if str(_SCRIPTS) not in sys.path:
 from release_trust import (ReleaseTrustError, load_release_package_catalog,
                            load_release_package_signers)  # noqa: E402
 from network.person_custody import (  # noqa: E402
-    PersonKey, _person_key_path, broker_preflight, custody_mode, person_sign,
-    person_sign_batch, plain)
+    PersonKey, _person_key_path, _read_owned_regular, broker_preflight, custody_mode,
+    person_sign, person_sign_batch, plain)
 from network.units import AmountError, MAX_SPEND_CAP, format_amount, parse_amount  # noqa: E402
 from network.dlp import outbound_problem  # noqa: E402
 
@@ -233,25 +233,28 @@ def _onboard_token(*, required: bool = True) -> str | None:
 
 
 def _stage_auth(kind: str, tier: str, starter: int, ttl: int, node_sign) -> dict:
-    """Choose the unchanged owner credential or a member's node-signed stage envelope."""
+    """Build the complete node-signed stage envelope locally, before any HTTP write."""
     token = _onboard_token(required=False)
-    if token is not None:
-        return {"token": token}
-    if tier != "stranger":
+    if token is None and tier != "stranger":
         raise SystemExit("without the operator token you may invite at tier stranger only")
-    if starter > 10_000_000:
+    if token is None and starter > 10_000_000:
         raise SystemExit("without the operator token --starter may not exceed 10000000")
     body = {"v": 2, "purpose": ONBOARD_STAGE_PURPOSE,
             "kind": kind, "tier": tier, "starter": starter,
             "ttl": ttl, "ts": int(time.time())}
     signed = dict(node_sign(body))
     signed.pop("ok", None)
-    if not isinstance(signed, dict) or not isinstance(signed.get("sig"), str):
+    if (not isinstance(signed, dict) or not isinstance(signed.get("sig"), str)
+            or not isinstance(signed.get("nonce"), str)
+            or re.fullmatch(r"[0-9a-f]{16,64}", signed["nonce"]) is None):
         raise SystemExit("nakd did not return a signed stage request")
+    if token is not None:
+        signed["token"] = token
     return signed
 
 
 def _stage_worker(redeem: str, tier: str, auth: dict, http_post,
+                  planned: dict | None = None,
                   *, now: int | None = None) -> tuple[dict, int]:
     staged_at = int(time.time() if now is None else now)
     try:
@@ -263,18 +266,22 @@ def _stage_worker(redeem: str, tier: str, auth: dict, http_post,
     if parsed is None or parsed.scheme not in {"http", "https"} or not host or authority.endswith(":") or \
             (port is not None and not 1 <= port <= 65535):
         raise SystemExit("worker redeem URL must be an http(s) base URL")
-    result = http_post(redeem.rstrip("/") + "/worker-stage", {**auth, "tier": tier})
+    result = http_post(redeem.rstrip("/") + "/worker-stage", dict(auth))
     code = result.get("code") if isinstance(result, dict) else None
     if not isinstance(code, str) or not code.strip() or len(code) > 64:
         raise SystemExit("onboard server returned an invalid worker code")
-    expires_at = result.get("expires_at", staged_at + 3600)
+    if planned is not None and code != planned["code"]:
+        planned["code"] = code  # cleanup must cancel the server's actual write
+        raise SystemExit("onboard server did not bind the approved worker invite code")
+    expires_at = result.get("expires_at", staged_at + int(auth.get("ttl", 3600)))
     if isinstance(expires_at, bool) or not isinstance(expires_at, int) or expires_at <= staged_at:
         raise SystemExit("onboard server returned an invalid worker code expiry")
     return {"redeem": redeem.rstrip("/"), "code": code, "tier": tier}, expires_at
 
 
 def _stage_consumer(redeem: str, tier: str, starter: int, inviter_pubkey: str,
-                    auth: dict, http_post, *, now: int | None = None) -> tuple[dict, int]:
+                    auth: dict, http_post, planned: dict | None = None,
+                    *, now: int | None = None) -> tuple[dict, int]:
     """Stage consumer admission; the server records (but does not execute) any starter transfer."""
     staged_at = int(time.time() if now is None else now)
     try:
@@ -288,14 +295,14 @@ def _stage_consumer(redeem: str, tier: str, starter: int, inviter_pubkey: str,
         raise SystemExit("consumer redeem URL must be an http(s) base URL")
     if type(starter) is not int or not 0 <= starter <= 100_000_000:
         raise SystemExit("--starter must be an integer between 0 and 100000000")
-    result = http_post(redeem.rstrip("/") + "/consumer-stage", {
-        **auth, "tier": tier, "starter": starter,
-        "inviter_pubkey": inviter_pubkey,
-    })
+    result = http_post(redeem.rstrip("/") + "/consumer-stage", dict(auth))
     code = result.get("code") if isinstance(result, dict) else None
     if (not isinstance(code, str) or not 1 <= len(code) <= 64
             or any(ch not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-" for ch in code)):
         raise SystemExit("onboard server returned an invalid consumer code")
+    if planned is not None and code != planned["code"]:
+        planned["code"] = code  # cleanup must cancel the server's actual write
+        raise SystemExit("onboard server did not bind the approved consumer invite code")
     expires_at = result.get("expires_at", staged_at + 3600)
     if isinstance(expires_at, bool) or not isinstance(expires_at, int) or expires_at <= staged_at:
         raise SystemExit("onboard server returned an invalid consumer code expiry")
@@ -1258,6 +1265,30 @@ def _write_private(path: Path, data: bytes) -> None:
     os.replace(tmp, path)
 
 
+def _write_private_new(path: Path, data: bytes) -> None:
+    """Atomically create one owner-only file without replacing a concurrent winner."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp")
+    linked = False
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            view = memoryview(data)
+            while view:
+                view = view[os.write(fd, view):]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.link(tmp, path)
+        linked = True
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            if not linked:
+                raise
+
+
 def _worker_build(_sp) -> dict:
     prefix = Path(os.environ.get("NAK_NODE_PREFIX", Path.home() / ".nakshatra-node"))
     tree, man = _release_engine_tree(prefix)
@@ -1893,6 +1924,29 @@ def _grant_paths() -> tuple[Path, Path, str]:
     return signer_dir, net_dir, agent
 
 
+def _broker_report_subject(subject: str) -> str:
+    """Resolve a broker-mode report target from the local store, without a daemon RPC."""
+    if isinstance(subject, str) and re.fullmatch(r"[0-9a-f]{64}", subject) is not None:
+        return subject
+    signer_dir = Path(os.environ.get("NAK_SIGNER_DIR", Path.home() / ".sthambha" / "signer"))
+    net_dir = Path(os.environ.get("NAK_NET_DIR", Path.home() / ".nakshatra" / "net"))
+    data_key_path = signer_dir / "datakey"
+    try:
+        data_key = _read_owned_regular(
+            data_key_path, "Nakshatra store data key", exact_mode=0o600, max_bytes=32)
+        from network.store import resolve_contact_readonly
+        contact = resolve_contact_readonly(net_dir, data_key, subject)
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        raise SystemExit(
+            "broker custody could not resolve the report target from the local contact store; "
+            "nothing was signed") from exc
+    if not contact or re.fullmatch(r"[0-9a-f]{64}", str(contact.get("node", ""))) is None:
+        raise SystemExit(
+            "broker custody requires a local contact name or a 64-character node key for reports; "
+            "nothing was signed")
+    return contact["node"]
+
+
 def _delegate_reuse_command(state: Path, person_key: Path, agent: str, caps: list[str], ttl_days: int,
                             idle_days: int, lease_days: int, no_lease: bool,
                             *, custody: str | None = None) -> str:
@@ -2077,15 +2131,40 @@ def _grant_renew_confined(args, signer_dir: Path, agent: str, signer_mod, agent_
     person_priv = PersonKey(
         person_kind, summary, act=custody_act.for_signing(person_kind, summary))
     lease = None
+    pending_lease_key = None
+    lease_path = signer_dir / "lease.key"
+    lease_written = False
     if not args.no_lease:
-        _lease_priv, lease_pub = signer_mod.load_or_create_lease_key(signer_dir)
+        if lease_path.exists():
+            from cryptography.hazmat.primitives.asymmetric import ed25519 as _ed25519
+            lease_seed = _read_owned_regular(
+                lease_path, "lease key", exact_mode=0o600, max_bytes=32)
+            if len(lease_seed) != 32:
+                raise SystemExit(f"cannot renew with malformed lease key {lease_path}")
+            _lease_priv = _ed25519.Ed25519PrivateKey.from_private_bytes(lease_seed)
+            lease_pub = _lease_priv.public_key().public_bytes_raw().hex()
+        else:
+            # A new lease key is part of the approved grant, but not part of preflight.
+            # Keep it only in memory until the PERSON signature has actually returned.
+            pending_lease_key, lease_pub = signer_mod.new_key()
         lease = {"issuer_pub": lease_pub, "max_s": args.lease_days * 86400,
                  "idle_s": args.idle_days * 86400}
     grant_args = {"node": current["node"], "ttl_s": args.ttl * 86400, "constraints": constraints}
     if lease is not None:
         grant_args["lease"] = lease
-    renewed = signer_mod.issue_grant(person_priv, agent, agent_pub, caps, **grant_args)
-    agent_files.write_grant(renewed)
+    try:
+        renewed = signer_mod.issue_grant(person_priv, agent, agent_pub, caps, **grant_args)
+        if pending_lease_key is not None:
+            _write_private_new(lease_path, pending_lease_key.private_bytes_raw())
+            lease_written = True
+        agent_files.write_grant(renewed)
+    except BaseException:
+        if lease_written:
+            try:
+                lease_path.unlink(missing_ok=True)
+            except BaseException:
+                pass
+        raise
     if cap_changes:
         print(f"spend caps now {format_amount(renewed['constraints'].get('per_tx_cap', 0))} per payment, "
               f"{format_amount(renewed['constraints'].get('day_cap', 0))} per day")
@@ -3048,14 +3127,16 @@ def main(argv=None, *, http_post=None, http_get=None) -> int:
         if len(a.note) > 500:
             raise SystemExit("--note must be at most 500 characters")
         evidence = {key: value for key, value in (("task_hash", a.task), ("mid", a.mid)) if value}
-        # Deliberate file-mode parity exception: older clients signed the typed petname and
-        # nakd later rewrote it to the node key. Resolve first so both custody backends sign
-        # exactly the subject nakd will accept and transmit.
-        subject = call(s, {"op": "resolve_report_subject", "subject": a.subject})["subject"]
         summary = f"Report node/contact {plain(a.subject, 72)} for {a.reason}"
         custody_act = broker_preflight("report", summary)
         if not sys.stdin.isatty():
             raise SystemExit("nak report is interactive-only; run it in a terminal")
+        # Preserve the established file-custody bytes exactly: file mode signs the operator's
+        # typed subject and lets nakd resolve it as it always has.  Broker mode must present the
+        # actual node key to the approval parser, so resolve it from nakd's local encrypted store
+        # without adding a daemon operation that older nakd versions do not understand.
+        subject = (_broker_report_subject(a.subject)
+                   if getattr(custody_act, "mode", "file") == "broker" else a.subject)
         from network.nakd import person_action_statement, report_proof_payload
         person_key = PersonKey("report", summary, act=custody_act)
         proof_ts = int(time.time())
@@ -3227,43 +3308,58 @@ def main(argv=None, *, http_post=None, http_get=None) -> int:
             print("tip: add --from <your name> so your friend sees who invited them (remembered after once)",
                   file=sys.stderr)
         issued_at = int(time.time())
-        worker = consumer = staged = None
+        worker = consumer = staged = stage_auth = None
+        stage_post_attempted = False
         try:
-            # Worker/consumer invite bytes contain the one-time staged code, so exact-byte
-            # approval cannot precede staging. Every exit after staging uses the server's
-            # existing authenticated cancellation route.
+            # The stage nonce is also its one-time code.  Build and node-sign that stage request
+            # locally, then obtain the PERSON signature over the exact invite that names it.  The
+            # first server mutation is deliberately after biometric approval.
             if a.kind == "worker":
-                auth = _stage_auth(
+                stage_auth = _stage_auth(
                     a.kind, a.tier, a.starter, a.ttl,
                     lambda body: call(s, {"op": "node_sign_stage",
                                           "body": {**body, "inviter_pubkey": st["node"]}}))
-                worker, staged_expiry = _stage_worker(
-                    a.redeem, a.tier, auth, http_post, now=issued_at)
+                worker = {"redeem": a.redeem.rstrip("/"),
+                          "code": stage_auth["nonce"], "tier": a.tier}
                 staged = worker
             elif a.kind == "consumer":
-                auth = _stage_auth(
+                stage_auth = _stage_auth(
                     a.kind, a.tier, a.starter, a.ttl,
                     lambda body: call(s, {"op": "node_sign_stage",
                                           "body": {**body, "inviter_pubkey": st["node"]}}))
-                consumer, staged_expiry = _stage_consumer(
-                    a.redeem, a.tier, a.starter, st["node"], auth, http_post, now=issued_at)
+                consumer = {"redeem": a.redeem.rstrip("/"),
+                            "code": stage_auth["nonce"], "tier": a.tier,
+                            "starter": a.starter}
                 staged = consumer
-            else:
-                staged_expiry = issued_at + a.ttl
-            expires_at = min(issued_at + a.ttl, staged_expiry)
+            expires_at = issued_at + a.ttl
             code = joincode.encode_invite(
                 priv, st["node"], [{"node": st["node"], "addrs": [st["relay"]]}],
-                ttl_s=expires_at - issued_at, now=issued_at, note=a.note,
+                ttl_s=a.ttl, now=issued_at, note=a.note,
                 release=release, from_name=from_name,
                 kind=a.kind, worker=worker, consumer=consumer)
+
+            if a.kind == "worker":
+                stage_post_attempted = True
+                _worker_result, staged_expiry = _stage_worker(
+                    a.redeem, a.tier, stage_auth, http_post, planned=staged,
+                    now=issued_at)
+                if staged_expiry < expires_at:
+                    raise SystemExit("onboard server returned a worker expiry shorter than the approved invite")
+            elif a.kind == "consumer":
+                stage_post_attempted = True
+                _consumer_result, staged_expiry = _stage_consumer(
+                    a.redeem, a.tier, a.starter, st["node"], stage_auth, http_post,
+                    planned=staged, now=issued_at)
+                if staged_expiry < expires_at:
+                    raise SystemExit("onboard server returned a consumer expiry shorter than the approved invite")
+            call(s, {"op": "register_invite", "code": code})
             if a.from_name:
                 _write_private(name_file, (a.from_name.strip()[:40] + "\n").encode())
-            call(s, {"op": "register_invite", "code": code})
         except BaseException as original:
-            if staged is not None:
+            if stage_post_attempted and staged is not None:
                 try:
                     _cancel_staged_invite(s, staged, st["node"], http_post)
-                except Exception as cancel_exc:
+                except BaseException as cancel_exc:
                     raise SystemExit(
                         "invite did not complete and staged server state could not be cancelled; "
                         f"manual cancellation is required ({type(cancel_exc).__name__})") from original

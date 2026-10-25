@@ -87,6 +87,57 @@ CREATE TABLE IF NOT EXISTS person_action_proofs (signature TEXT PRIMARY KEY, use
 """
 
 
+def resolve_contact_readonly(state_dir: Path, data_key: bytes, who: str) -> Optional[dict]:
+    """Resolve a contact from nakd's encrypted store without opening it for writes.
+
+    This is intentionally a small read-only projection of :meth:`Store.resolve`.  It is used by
+    the broker-custody CLI before PERSON approval, when asking nakd to resolve the name would add a
+    daemon protocol dependency and break older daemons.
+    """
+    if not isinstance(data_key, bytes) or len(data_key) != 32:
+        raise ValueError("the Nakshatra store requires a 32-byte signer data key")
+    if not who:
+        return None
+    db_path = Path(state_dir) / "net.sqlite"
+    db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    aead = ChaCha20Poly1305(data_key)
+
+    def opened(value, aad: bytes):
+        if value is None or not (isinstance(value, str) and value.startswith("enc1:")):
+            return value
+        raw = base64.b64decode(value[5:], validate=True)
+        if len(raw) < 28:
+            raise ValueError("encrypted store value is truncated")
+        return aead.decrypt(raw[:12], raw[12:], aad).decode("utf-8")
+
+    try:
+        marker = db.execute("SELECT value FROM store_meta WHERE key='key_check'").fetchone()
+        if marker and opened(marker[0], b"store-key-check") != "nak-store-key-v1":
+            raise ValueError("Nakshatra store data-key check failed")
+        rows = db.execute(
+            "SELECT person,node,petname FROM contacts ORDER BY added").fetchall()
+        contacts = []
+        for person, node, petname in rows:
+            primary_key = json.dumps([person], separators=(",", ":"), ensure_ascii=False)
+            contacts.append({
+                "person": person,
+                "node": node,
+                "petname": opened(
+                    petname, f"contacts\0petname\0{primary_key}".encode("utf-8")),
+            })
+    finally:
+        db.close()
+    for contact in contacts:
+        if contact["person"] == who:
+            return contact
+    hits = [contact for contact in contacts
+            if contact["petname"] == who
+            or (len(who) >= 8 and contact["person"].startswith(who))]
+    if len(hits) > 1:
+        raise ValueError(f"{who!r} matches {len(hits)} contacts; use a longer person key prefix")
+    return hits[0] if hits else None
+
+
 class Store:
     _ENCRYPTED = {
         "inbox": (("nonce",), ("text", "petname", "author", "aspect")),

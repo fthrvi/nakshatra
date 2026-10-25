@@ -637,6 +637,8 @@ def test_nak_worker_invite_stages_code_with_injected_http(tmp_path, monkeypatch,
     def fake_call(_sock, req):
         if req["op"] == "status":
             return {"node": "a" * 64, "relay": "relay.example:51820"}
+        if req["op"] == "node_sign_stage":
+            return {**req["body"], "nonce": "01" * 16, "sig": "02" * 64}
         registered.append(req["code"])
         return {}
 
@@ -644,7 +646,7 @@ def test_nak_worker_invite_stages_code_with_injected_http(tmp_path, monkeypatch,
 
     def fake_post(url, body):
         posted.append((url, body))
-        return {"code": "staged-once", "expires_at": 1600}
+        return {"code": "01" * 16, "expires_at": 87400}
 
     monkeypatch.setattr(nak, "call", fake_call)
     monkeypatch.setattr(nak.time, "time", lambda: 1000)
@@ -654,10 +656,14 @@ def test_nak_worker_invite_stages_code_with_injected_http(tmp_path, monkeypatch,
     output = capsys.readouterr()
     code = output.out.strip()
     inv = joincode.decode_invite(code, now=1001)
-    assert posted == [("https://onboard.example/base/worker-stage",
-                       {"token": "operator-secret", "tier": "known"})]
-    assert inv["worker"] == {"redeem": "https://onboard.example/base", "code": "staged-once", "tier": "known"}
-    assert inv["expires_at"] == 1600 and "Unix 1600" in output.err
+    assert posted == [("https://onboard.example/base/worker-stage", {
+        "v": 2, "purpose": "onboard-stage-v2", "kind": "worker", "tier": "known",
+        "starter": 0, "ttl": 86400, "ts": 1000, "inviter_pubkey": "a" * 64,
+        "nonce": "01" * 16, "sig": "02" * 64, "token": "operator-secret",
+    })]
+    assert inv["worker"] == {"redeem": "https://onboard.example/base",
+                             "code": "01" * 16, "tier": "known"}
+    assert inv["expires_at"] == 87400 and "Unix 87400" in output.err
     assert registered == [code]
     assert oct((tmp_path / "net" / "name").stat().st_mode & 0o777) == "0o600"
 
@@ -676,6 +682,8 @@ def test_nak_consumer_invite_stages_signed_starter_request(tmp_path, monkeypatch
     def fake_call(_sock, req):
         if req["op"] == "status":
             return {"node": "a" * 64, "relay": "relay.example:51820"}
+        if req["op"] == "node_sign_stage":
+            return {**req["body"], "nonce": "03" * 16, "sig": "04" * 64}
         registered.append(req["code"])
         return {}
 
@@ -683,7 +691,7 @@ def test_nak_consumer_invite_stages_signed_starter_request(tmp_path, monkeypatch
 
     def fake_post(url, body):
         posted.append((url, body))
-        return {"code": "consumer-once", "expires_at": 1600}
+        return {"code": "03" * 16, "expires_at": 87400}
 
     monkeypatch.setattr(nak, "call", fake_call)
     monkeypatch.setattr(nak.time, "time", lambda: 1000)
@@ -695,12 +703,13 @@ def test_nak_consumer_invite_stages_signed_starter_request(tmp_path, monkeypatch
     code = output.out.strip()
     inv = joincode.decode_invite(code, now=1001)
     assert posted == [("https://onboard.example/base/consumer-stage", {
-        "token": "operator-secret", "tier": "known", "starter": 1234,
-        "inviter_pubkey": "a" * 64,
+        "v": 2, "purpose": "onboard-stage-v2", "kind": "consumer", "tier": "known",
+        "starter": 1234, "ttl": 86400, "ts": 1000, "inviter_pubkey": "a" * 64,
+        "nonce": "03" * 16, "sig": "04" * 64, "token": "operator-secret",
     })]
     assert inv["consumer"] == {"redeem": "https://onboard.example/base",
-                               "code": "consumer-once", "tier": "known", "starter": 1234}
-    assert inv["expires_at"] == 1600 and "consumer invite expires" in output.err
+                               "code": "03" * 16, "tier": "known", "starter": 1234}
+    assert inv["expires_at"] == 87400 and "consumer invite expires" in output.err
     assert registered == [code]
 
 
@@ -737,7 +746,7 @@ def test_nak_member_invite_posts_node_signed_stranger_envelope(tmp_path, monkeyp
                                ensure_ascii=False).encode()
         ed25519.Ed25519PublicKey.from_public_bytes(bytes.fromhex(body["inviter_pubkey"])).verify(
             bytes.fromhex(body["sig"]), canonical)
-        return {"code": "member-worker", "expires_at": 1600}
+        return {"code": "01" * 16, "expires_at": 87400}
 
     monkeypatch.setattr(nak, "call", fake_call)
     monkeypatch.setattr(nak.time, "time", lambda: 1000)
