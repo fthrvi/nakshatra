@@ -2552,7 +2552,7 @@ def _operator_disputes(args, sock: Path) -> int:
 def _operator_resolve(args) -> int:
     summary = (f"Resolve ledger task hold {plain(args.hold_id, 72)} as {args.outcome} "
                f"for {json.dumps(plain(args.reason, 64), ensure_ascii=False)}")
-    broker_preflight("resolve", summary)
+    custody_act = broker_preflight("resolve", summary)
     if not sys.stdin.isatty():
         raise SystemExit("nak operator resolve is interactive-only; run it in a terminal")
     if not isinstance(args.reason, str) or not args.reason or len(args.reason) > 64:
@@ -2561,6 +2561,9 @@ def _operator_resolve(args) -> int:
         raise SystemExit("--reason is sent to the ledger; it looks like it carries a secret or "
                          "encoded blob — refusing")
     base = _operator_ledger_base(args.ledger)
+    # Resolution is deliberately preflight-only: ledger requests use the worker/operator key,
+    # never the person key. Keep the custody mode pinned through this human act nonetheless.
+    custody_act.assert_current()
     private, keyid = _operator_worker_key()
     try:
         status = _operator_hold_status(base, private, keyid, args.hold_id)
@@ -2581,6 +2584,7 @@ def _operator_resolve(args) -> int:
     expected_state = "paid" if args.outcome == "pay" else "refunded"
     body = {"hold_id": args.hold_id, "outcome": args.outcome, "reason": args.reason}
     replayed = False
+    custody_act.assert_current()
     try:
         result = _operator_ledger_request(
             base, private, keyid, "POST", "/spend/task/resolve", body)

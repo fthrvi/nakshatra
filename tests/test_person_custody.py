@@ -446,6 +446,20 @@ def test_preflight_rejects_a_token_registered_to_the_wrong_principal(tmp_path, m
         assert broker.enqueues == [] and broker.sign_calls == 0
 
 
+def test_resolve_is_authenticated_preflight_only_and_not_a_signing_kind(
+        tmp_path, monkeypatch):
+    with _broker(tmp_path, monkeypatch) as (broker, _private):
+        act = person_custody.broker_preflight("resolve", "Resolve disputed hold")
+        assert act.kind == "resolve" and act.mode == "broker"
+        act.assert_current()
+        assert broker.enqueues == [] and broker.sign_calls == 0
+
+        with pytest.raises(SystemExit, match="unknown person-signing kind 'resolve'"):
+            person_custody.person_sign(
+                "resolve", b"must never become a broker shape", summary="Resolve disputed hold")
+        assert broker.enqueues == [] and broker.sign_calls == 0
+
+
 def test_broker_act_refuses_if_marker_changes_before_signing(tmp_path, monkeypatch):
     with _broker(tmp_path, monkeypatch) as (broker, _private):
         act = person_custody.broker_preflight("invite", "Invite")
