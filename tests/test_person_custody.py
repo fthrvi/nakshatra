@@ -72,12 +72,18 @@ def _independent_sign(private, items):
 
 class FakeBroker:
     def __init__(self, private, *, status="approved", corrupt="",
-                 principal="nakshatra-person", pending_polls=0):
+                 principal="nakshatra-person", pending_polls=0,
+                 result_failures=0, sign_failures=0,
+                 drop_approved_result=False):
         self.private = private
         self.status = status
         self.corrupt = corrupt
         self.principal = principal
         self.pending_polls = pending_polls
+        self.result_failures = result_failures
+        self.sign_failures = sign_failures
+        self.drop_approved_result = drop_approved_result
+        self.dropped_approved_result = False
         self.enqueues = []
         self.sign_calls = 0
         self.principal_calls = 0
@@ -118,11 +124,21 @@ class FakeBroker:
                     owner.result_calls += 1
                     request_id = urllib.parse.parse_qs(parsed.query).get("request_id", [""])[0]
                     state = owner._requests.get(request_id)
-                    if state and owner.pending_polls:
+                    if state and owner.result_failures:
+                        owner.result_failures -= 1
+                        self._reply(503, {"error": "temporary", "retryable": True})
+                    elif state and owner.pending_polls:
                         owner.pending_polls -= 1
                         self._reply(200, {"status": "pending"})
+                    elif state and owner.drop_approved_result and not owner.dropped_approved_result:
+                        owner.dropped_approved_result = True
+                        self.close_connection = True
+                        self.connection.shutdown(socket.SHUT_RDWR)
+                        self.connection.close()
                     else:
-                        self._reply(200, {"status": owner.status if state else "unknown"})
+                        status = ("consumed" if state and owner.dropped_approved_result
+                                  else owner.status if state else "unknown")
+                        self._reply(200, {"status": status})
                     return
                 self._reply(404, {"error": "unknown route"})
 
@@ -146,6 +162,10 @@ class FakeBroker:
                     return
                 if self.path == "/person-sign/v1":
                     owner.sign_calls += 1
+                    if owner.sign_failures:
+                        owner.sign_failures -= 1
+                        self._reply(503, {"error": "temporary", "retryable": True})
+                        return
                     request_id = body.get("request_id")
                     exact = owner._requests.get(request_id)
                     if exact is None or body.get("exact_content") != exact or owner.status != "approved":
@@ -185,11 +205,14 @@ class FakeBroker:
 
 @contextmanager
 def _broker(tmp_path, monkeypatch, *, status="approved", corrupt="", remove_private=True,
-            principal="nakshatra-person", pending_polls=0):
+            principal="nakshatra-person", pending_polls=0,
+            result_failures=0, sign_failures=0, drop_approved_result=False):
     signer_dir, private = _identity(tmp_path, monkeypatch)
     broker = FakeBroker(
         private, status=status, corrupt=corrupt, principal=principal,
-        pending_polls=pending_polls).start()
+        pending_polls=pending_polls, result_failures=result_failures,
+        sign_failures=sign_failures,
+        drop_approved_result=drop_approved_result).start()
     try:
         net = tmp_path / ".nakshatra" / "net"
         token = tmp_path / "broker.token"
@@ -396,7 +419,9 @@ def test_broker_success_body_never_reflects_an_unknown_status(tmp_path, monkeypa
         with pytest.raises(SystemExit) as refused:
             person_custody.person_sign("invite", b"invite", summary="Invite")
         assert str(refused.value) == (
-            "person broker returned an invalid terminal status; nothing was signed")
+            "person broker returned an invalid terminal status; nothing was signed; "
+            "approval may already have been granted; request_id=request-1 can be retried "
+            "without a new prompt")
         assert TOKEN not in str(refused.value)
         assert len(broker.enqueues) == 1 and broker.sign_calls == 0
 
@@ -421,15 +446,68 @@ def test_preflight_rejects_a_token_registered_to_the_wrong_principal(tmp_path, m
         assert broker.enqueues == [] and broker.sign_calls == 0
 
 
-def test_broker_act_cannot_be_switched_to_file_by_marker_change(tmp_path, monkeypatch):
-    with _broker(tmp_path, monkeypatch) as (broker, private):
+def test_broker_act_refuses_if_marker_changes_before_signing(tmp_path, monkeypatch):
+    with _broker(tmp_path, monkeypatch) as (broker, _private):
         act = person_custody.broker_preflight("invite", "Invite")
         key = person_custody.PersonKey("invite", "Invite", act=act)
         (tmp_path / ".nakshatra" / "net" / "person-custody").write_text("file\n")
-        statement = b"the act remains broker-backed"
-        signature = key.sign(statement)
+        with pytest.raises(SystemExit, match="changed from broker to file.*nothing was signed"):
+            key.sign(b"the stale act must not sign")
+        assert broker.enqueues == [] and broker.sign_calls == 0
+
+
+def test_person_act_constructor_is_private():
+    with pytest.raises(TypeError, match="construction is private"):
+        person_custody.PersonAct("invite", "Invite", "file", None, None)
+
+
+def test_forged_file_act_under_broker_custody_refuses_before_private_key_load(
+        tmp_path, monkeypatch):
+    with _broker(tmp_path, monkeypatch) as (broker, _private):
+        forged = object.__new__(person_custody.PersonAct)
+        for name, value in {
+            "kind": "invite", "summary": "Invite", "mode": "file",
+            "config": None, "public_key": None,
+            "_sentinel": person_custody._PERSON_ACT_SENTINEL,
+        }.items():
+            object.__setattr__(forged, name, value)
+        monkeypatch.setattr(
+            person_custody, "_load_matching_person_key",
+            lambda **_kwargs: pytest.fail("forged act reached the private person key"))
+        with pytest.raises(SystemExit, match="changed from file to broker.*nothing was signed"):
+            person_custody.person_sign(
+                "invite", b"reviewer forged act", summary="Invite", act=forged)
+        assert broker.enqueues == [] and broker.sign_calls == 0
+
+
+@pytest.mark.parametrize("endpoint", ["result", "person-sign"])
+def test_broker_retries_two_503s_within_the_same_human_act(
+        endpoint, tmp_path, monkeypatch):
+    options = {"result_failures": 2} if endpoint == "result" else {"sign_failures": 2}
+    monkeypatch.setattr(person_custody, "_BROKER_RETRY_INITIAL_S", 0)
+    monkeypatch.setattr(person_custody, "_BROKER_RETRY_MAX_S", 0)
+    with _broker(tmp_path, monkeypatch, **options) as (broker, private):
+        statement = b"one act, one request id"
+        signature = person_custody.person_sign("invite", statement, summary="Invite")
         private.public_key().verify(signature, statement)
-        assert broker.sign_calls == 1
+        assert len(broker.enqueues) == 1
+        if endpoint == "result":
+            assert broker.result_calls == 3 and broker.sign_calls == 1
+        else:
+            assert broker.result_calls == 1 and broker.sign_calls == 3
+
+
+def test_broker_lost_approved_result_proceeds_from_consumed_with_same_request_id(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr(person_custody, "_BROKER_RETRY_INITIAL_S", 0)
+    monkeypatch.setattr(person_custody, "_BROKER_RETRY_MAX_S", 0)
+    with _broker(tmp_path, monkeypatch, drop_approved_result=True) as (broker, private):
+        statement = b"approved response was lost"
+        signature = person_custody.person_sign("invite", statement, summary="Invite")
+        private.public_key().verify(signature, statement)
+        assert broker.dropped_approved_result is True
+        assert broker.result_calls == 2 and broker.sign_calls == 1
+        assert len(broker.enqueues) == 1
 
 
 def test_declined_cli_accept_never_calls_state_changing_daemon_op(tmp_path, monkeypatch):
@@ -807,34 +885,46 @@ def test_broker_report_refuses_an_unresolved_local_contact_without_daemon_lookup
 
 
 @pytest.mark.parametrize("kind", ["worker", "consumer"])
-def test_declined_member_invite_makes_zero_stage_http_writes(kind, tmp_path, monkeypatch):
+def test_declined_broker_invite_cancels_the_already_staged_server_code(
+        kind, tmp_path, monkeypatch):
     with _broker(tmp_path, monkeypatch, status="declined") as (broker, _private):
         monkeypatch.setenv("NAK_ONBOARD_TOKEN", "operator-secret")
         monkeypatch.setattr(nak, "_release_for_invite", lambda _url="": ({}, ""))
         calls = []
+        posts = []
 
         def fake_call(_sock, request):
             calls.append(request["op"])
             if request["op"] == "status":
                 return {"node": "ab" * 32, "relay": "relay.example:51820"}
             if request["op"] == "node_sign_stage":
-                return {**request["body"], "nonce": "12" * 16, "sig": "34" * 64}
+                raise AssertionError("operator-token staging must not request a node signature")
             raise AssertionError("declined invite must not be registered locally")
 
         def fake_post(url, body):
-            raise AssertionError(f"declined invite performed an HTTP write: {url} {body}")
+            posts.append((url, body))
+            if url.endswith(f"/{kind}-stage"):
+                return {"code": f"{kind}-server-code", "expires_at": int(time.time()) + 3600}
+            if url.endswith("/invite-cancel"):
+                return {"cancelled": True}
+            raise AssertionError(url)
 
         monkeypatch.setattr(nak, "call", fake_call)
         with pytest.raises(SystemExit, match="not approved"):
             nak.main(["invite", "--kind", kind, "--tier", "known",
                       "--redeem", "https://onboard.example/base", "--code-only"],
                      http_post=fake_post)
-        assert calls == ["status", "node_sign_stage"]
+        assert calls == ["status"]
+        assert posts[0][1]["token"] == "operator-secret"
+        assert posts[1] == (
+            "https://onboard.example/base/invite-cancel",
+            {"token": "operator-secret", "code": f"{kind}-server-code"})
         assert broker.sign_calls == 0
 
 
 @pytest.mark.parametrize("kind", ["worker", "consumer"])
-def test_stage_post_failure_after_approval_outputs_no_invite(kind, tmp_path, monkeypatch, capsys):
+def test_stage_post_failure_happens_before_approval_and_outputs_no_invite(
+        kind, tmp_path, monkeypatch, capsys):
     with _broker(tmp_path, monkeypatch) as (broker, _private):
         monkeypatch.setenv("NAK_ONBOARD_TOKEN", "operator-secret")
         monkeypatch.setattr(nak, "_release_for_invite", lambda _url="": ({}, ""))
@@ -846,15 +936,13 @@ def test_stage_post_failure_after_approval_outputs_no_invite(kind, tmp_path, mon
             if request["op"] == "status":
                 return {"node": "ab" * 32, "relay": "relay.example:51820"}
             if request["op"] == "node_sign_stage":
-                return {**request["body"], "nonce": "12" * 16, "sig": "34" * 64}
+                raise AssertionError("operator-token staging must not request a node signature")
             raise AssertionError("failed stage must not register an invite")
 
         def fake_post(url, body):
             posts.append((url, body))
             if url.endswith(f"/{kind}-stage"):
                 raise SystemExit("stage unavailable")
-            if url.endswith("/invite-cancel"):
-                return {"cancelled": True}
             raise AssertionError(url)
 
         monkeypatch.setattr(nak, "call", fake_call)
@@ -865,9 +953,28 @@ def test_stage_post_failure_after_approval_outputs_no_invite(kind, tmp_path, mon
         captured = capsys.readouterr()
         assert captured.out == ""
         assert posts[0][0].endswith(f"/{kind}-stage")
-        assert posts[1][0].endswith("/invite-cancel")
-        assert calls == ["status", "node_sign_stage"]
-        assert broker.sign_calls == 1
+        assert len(posts) == 1
+        assert calls == ["status"]
+        assert broker.enqueues == [] and broker.sign_calls == 0
+
+
+_PERSON_LITERAL_ALLOWLIST = {
+    ("network/join_setup.py",
+     "2. person key      ~/.sthambha/person-TEST.key           TEST custody: a file, not a vault"):
+        "operator-facing bootstrap layout documents the legacy file-custody location",
+    ("network/join_setup.py",
+     "3. signer state    ~/.sthambha/signer/                   node.pub, person.pub"):
+        "operator-facing bootstrap layout documents public signer identity state",
+    ("network/join_setup.py",
+     'custody_note = "your person key is a TEST file at ~/.sthambha/person-TEST.key: back it up, and never share it"'):
+        "file-custody setup warning tells the operator what must be backed up",
+    ("network/nak.py",
+     'nak invite --person-key ~/.sthambha/person-TEST.key [--ttl 86400] [--note "for Rajesh"]'):
+        "CLI module help preserves the established explicit-key example",
+    ("network/nak.py",
+     'help="explicit file key in file custody only (default: ~/.sthambha/person-TEST.key)")'):
+        "the file-only --person-key option documents its legacy default",
+}
 
 
 _PRIVATE_CONSTRUCTOR_ALLOWLIST = Counter({
@@ -957,6 +1064,39 @@ def _has_private_person_fragment(node) -> bool:
     return False
 
 
+def _person_literal_findings(scripts: Path) -> Counter:
+    """Find literal source lines that can reconstruct the private person-key location."""
+    findings = Counter()
+    for path in scripts.rglob("*.py"):
+        relative = path.relative_to(scripts).as_posix()
+        if relative == "network/person_custody.py":
+            continue
+        source = path.read_text()
+        lines = source.splitlines()
+        tree = ast.parse(source, filename=str(path))
+        matched_lines = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+                continue
+            lowered = node.value.lower()
+            if "person-test" not in lowered and not (
+                    ".sthambha" in lowered and "person" in lowered):
+                continue
+            span = range(node.lineno - 1, (node.end_lineno or node.lineno))
+            relevant = []
+            for index in span:
+                line_lower = lines[index].lower()
+                if "person-test" in line_lower or (
+                        ".sthambha" in line_lower and "person" in line_lower):
+                    relevant.append(index)
+            # Constant folding can combine adjacent fragments whose individual source text does
+            # not contain the complete marker. Still report the literal's opening line.
+            matched_lines.update(relevant or [node.lineno - 1])
+        for index in sorted(matched_lines):
+            findings[(relative, lines[index].strip())] += 1
+    return findings
+
+
 def _authority_guard_findings(scripts: Path):
     calls, private_findings, path_findings = Counter(), Counter(), Counter()
     for path in scripts.rglob("*.py"):
@@ -1027,7 +1167,10 @@ def _authority_guard_findings(scripts: Path):
 def test_person_authority_call_sites_and_private_loads_are_explicitly_confined():
     scripts = Path(__file__).resolve().parents[1] / "scripts"
     calls, private_findings, path_findings = _authority_guard_findings(scripts)
+    literal_findings = _person_literal_findings(scripts)
     assert calls == _AUTHORITY_CALL_ALLOWLIST
+    assert all(_PERSON_LITERAL_ALLOWLIST.values())
+    assert literal_findings == Counter(_PERSON_LITERAL_ALLOWLIST.keys())
     assert all(_PRIVATE_CONSTRUCTOR_ALLOWLIST.values())
     assert all(_PERSON_PATH_ALLOWLIST.values())
     assert private_findings == _PRIVATE_CONSTRUCTOR_ALLOWLIST
@@ -1079,3 +1222,14 @@ def test_authority_guard_constant_folds_private_person_paths(expression, tmp_pat
     _calls, _private, path_findings = _authority_guard_findings(tmp_path)
     assert path_findings
     assert all(finding[0:2] == ("probe.py", "injected_path") for finding in path_findings)
+
+
+def test_authority_literal_guard_catches_reviewer_fstring_mutation(tmp_path):
+    line = 'return Path(f"{Path.home()}/.sthambha/person-{suffix}.key").read_bytes()'
+    (tmp_path / "probe.py").write_text(
+        "from pathlib import Path\n"
+        "def injected_path(suffix):\n"
+        f"    {line}\n")
+    findings = _person_literal_findings(tmp_path)
+    assert findings == Counter({("probe.py", line): 1})
+    assert not set(findings) <= set(_PERSON_LITERAL_ALLOWLIST)

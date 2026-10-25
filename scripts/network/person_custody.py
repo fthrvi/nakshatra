@@ -16,7 +16,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from cryptography.exceptions import InvalidSignature
@@ -56,6 +56,9 @@ _SUSPENSION_PROOF_KINDS = {
     "recover-suspension",
     "import-suspension",
 }
+_PERSON_ACT_SENTINEL = object()
+_BROKER_RETRY_INITIAL_S = 0.1
+_BROKER_RETRY_MAX_S = 1.0
 
 
 @dataclass(frozen=True)
@@ -64,7 +67,7 @@ class _BrokerConfig:
     token: str
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class PersonAct:
     """One custody decision carried unchanged from preflight through signing."""
     kind: str
@@ -72,11 +75,33 @@ class PersonAct:
     mode: str
     config: _BrokerConfig | None
     public_key: ed25519.Ed25519PublicKey | None
+    _sentinel: object = field(repr=False, compare=False)
+
+    def __init__(self, kind: str, summary: str, mode: str,
+                 config: _BrokerConfig | None,
+                 public_key: ed25519.Ed25519PublicKey | None, *,
+                 _sentinel: object | None = None):
+        if _sentinel is not _PERSON_ACT_SENTINEL:
+            raise TypeError("PersonAct construction is private; use broker_preflight()")
+        object.__setattr__(self, "kind", kind)
+        object.__setattr__(self, "summary", summary)
+        object.__setattr__(self, "mode", mode)
+        object.__setattr__(self, "config", config)
+        object.__setattr__(self, "public_key", public_key)
+        object.__setattr__(self, "_sentinel", _sentinel)
 
     def for_signing(self, kind: str, summary: str) -> "PersonAct":
-        """Refine presentation/kind without re-reading custody or broker configuration."""
+        """Refine presentation/kind while preserving the pinned custody configuration."""
         _check_request(kind, summary)
-        return PersonAct(kind, summary, self.mode, self.config, self.public_key)
+        _assert_act_mode(self)
+        return _new_person_act(kind, summary, self.mode, self.config, self.public_key)
+
+
+def _new_person_act(kind: str, summary: str, mode: str,
+                    config: _BrokerConfig | None,
+                    public_key: ed25519.Ed25519PublicKey | None) -> PersonAct:
+    return PersonAct(
+        kind, summary, mode, config, public_key, _sentinel=_PERSON_ACT_SENTINEL)
 
 
 def _home() -> Path:
@@ -213,6 +238,18 @@ def custody_mode() -> str:
         raise SystemExit(
             f"invalid person custody mode {mode!r} in {path}; expected one word: file or broker")
     return mode
+
+
+def _assert_act_mode(act: PersonAct) -> str:
+    """Reject forged acts and custody changes before any signing-key operation."""
+    if not isinstance(act, PersonAct) or getattr(act, "_sentinel", None) is not _PERSON_ACT_SENTINEL:
+        raise SystemExit("invalid person custody act; nothing was signed")
+    current = custody_mode()
+    if current != act.mode:
+        raise SystemExit(
+            f"person custody mode changed from {act.mode} to {current} during this act; "
+            "nothing was signed")
+    return current
 
 
 def _raw_file_key(path: Path) -> tuple[ed25519.Ed25519PrivateKey, str]:
@@ -355,20 +392,33 @@ _BROKER_ERROR_IDS = {
 }
 
 
-def _broker_error_id(path: str, exc: urllib.error.HTTPError) -> str:
-    """Map an exact known response to a local identifier; never return remote text."""
+def _broker_error_info(path: str, exc: urllib.error.HTTPError) -> tuple[str, bool]:
+    """Map a response to a closed local identifier and its explicit retry hint."""
     try:
-        value = json.loads(exc.read(4096).decode("utf-8")).get("error", "")
+        document = json.loads(exc.read(4096).decode("utf-8"))
     except (AttributeError, UnicodeError, ValueError, json.JSONDecodeError):
-        return ""
+        return "", False
+    if not isinstance(document, dict):
+        return "", False
+    value = document.get("error", "")
     if not isinstance(value, str):
-        return ""
+        return "", document.get("retryable") is True
     route = urllib.parse.urlsplit(path).path
-    return _BROKER_ERROR_IDS.get((route, int(exc.code), value), "")
+    return (_BROKER_ERROR_IDS.get((route, int(exc.code), value), ""),
+            document.get("retryable") is True)
+
+
+class _BrokerTransient(Exception):
+    """A transport or broker-declared transient failure safe to retry in one act."""
+
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.message = message
 
 
 def _broker_json(config: _BrokerConfig, method: str, path: str,
-                 body: dict | None = None, *, timeout: float = _BROKER_TIMEOUT_S) -> dict:
+                 body: dict | None = None, *, timeout: float = _BROKER_TIMEOUT_S,
+                 retry_transient: bool = False) -> dict:
     data = None if body is None else json.dumps(body, separators=(",", ":")).encode("utf-8")
     headers = {"Authorization": f"Bearer {config.token}"}
     if data is not None:
@@ -379,17 +429,58 @@ def _broker_json(config: _BrokerConfig, method: str, path: str,
         with _BROKER_OPENER.open(request, timeout=timeout) as response:
             result = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        error_id = _broker_error_id(path, exc)
-        if error_id:
-            raise SystemExit(
-                f"approval service error (HTTP {exc.code}, code {error_id})") from None
-        raise SystemExit(f"approval service error (HTTP {exc.code})") from None
-    except (OSError, urllib.error.URLError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+        error_id, broker_retryable = _broker_error_info(path, exc)
+        message = (f"approval service error (HTTP {exc.code}, code {error_id})"
+                   if error_id else f"approval service error (HTTP {exc.code})")
+        if retry_transient and (int(exc.code) in {502, 503, 504} or broker_retryable):
+            raise _BrokerTransient(message) from None
+        raise SystemExit(message) from None
+    except (OSError, urllib.error.URLError, TimeoutError, ConnectionError):
+        message = "person broker is unavailable; nothing was signed"
+        if retry_transient:
+            raise _BrokerTransient(message) from None
+        raise SystemExit(message) from None
+    except (UnicodeError, ValueError, json.JSONDecodeError):
         raise SystemExit(
             "person broker is unavailable or returned invalid data; nothing was signed") from None
     if not isinstance(result, dict):
         raise SystemExit("person broker returned invalid data; nothing was signed")
     return result
+
+
+def _uncertain_broker_failure(phase: str, request_id: str, detail: str) -> SystemExit:
+    if phase == "result":
+        state = "approval may already have been granted"
+    else:
+        state = "approval was granted and signing may already have completed"
+    return SystemExit(
+        f"{detail}; {state}; request_id={request_id} can be retried without a new prompt")
+
+
+def _broker_json_until(config: _BrokerConfig, method: str, path: str,
+                       body: dict | None, *, deadline: float,
+                       request_id: str, phase: str, act: PersonAct) -> dict:
+    """Retry one result/sign request with bounded backoff inside the act deadline."""
+    delay = _BROKER_RETRY_INITIAL_S
+    while True:
+        _assert_act_mode(act)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise _uncertain_broker_failure(
+                phase, request_id, "person approval deadline expired after a transient failure")
+        try:
+            return _broker_json(
+                config, method, path, body,
+                timeout=min(_BROKER_TIMEOUT_S, remaining), retry_transient=True)
+        except _BrokerTransient as exc:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise _uncertain_broker_failure(phase, request_id, exc.message) from None
+            sleep_for = min(delay, remaining)
+            time.sleep(sleep_for)
+            delay = min(_BROKER_RETRY_MAX_S, max(delay * 2, _BROKER_RETRY_INITIAL_S))
+        except SystemExit as exc:
+            raise _uncertain_broker_failure(phase, request_id, str(exc)) from None
 
 
 def broker_preflight(kind: str, summary: str) -> PersonAct:
@@ -406,7 +497,7 @@ def broker_preflight(kind: str, summary: str) -> PersonAct:
                 "person broker authenticated the wrong principal; expected "
                  "'nakshatra-person'; nothing was signed")
     public_key = _person_public_key() if mode == "broker" else None
-    return PersonAct(kind, summary, mode, config, public_key)
+    return _new_person_act(kind, summary, mode, config, public_key)
 
 
 def _canonical(value: dict) -> bytes:
@@ -548,7 +639,9 @@ def _refuse_stale_signed_items(kind: str, results: list[tuple[bytes, bytes]], *,
                 "nothing was sent or written")
 
 
-def _file_sign_batch(kind: str, items: list, person_hex: str) -> list[tuple[bytes, bytes]]:
+def _file_sign_batch(kind: str, items: list, person_hex: str,
+                     act: PersonAct) -> list[tuple[bytes, bytes]]:
+    _assert_act_mode(act)
     key = _load_matching_person_key(error_context=_error_context(kind))
     results: list[tuple[bytes, bytes]] = []
     for item in items:
@@ -558,18 +651,21 @@ def _file_sign_batch(kind: str, items: list, person_hex: str) -> list[tuple[byte
             _marker, ref, template = item
             final = _fill_suspension_template(
                 results[ref][0], results[ref][1], template, person_hex)
+        _assert_act_mode(act)
         results.append((final, key.sign(final)))
     return results
 
 
 def _broker_sign_batch(kind: str, items: list, wire_items: list[dict], *, summary: str,
                        context: dict | None, person_key: ed25519.Ed25519PublicKey,
-                       person_hex: str, config: _BrokerConfig) -> list[tuple[bytes, bytes]]:
+                       person_hex: str, config: _BrokerConfig,
+                       act: PersonAct) -> list[tuple[bytes, bytes]]:
     wait_s = _approval_wait_s(kind)
     exact_content = {"v": 1, "kind": kind, "items": wire_items}
     if context is not None:
         exact_content["context"] = context
     deadline = time.monotonic() + wait_s
+    _assert_act_mode(act)
     enqueued = _broker_json(config, "POST", "/enqueue/v1", {
         "what": _WHAT,
         "tier": "high",
@@ -585,25 +681,33 @@ def _broker_sign_batch(kind: str, items: list, wire_items: list[dict], *, summar
     result_path = "/result/v1?" + urllib.parse.urlencode({"request_id": request_id})
     while True:
         if time.monotonic() >= deadline:
-            raise SystemExit(_NOT_APPROVED)
-        result = _broker_json(config, "GET", result_path)
+            raise _uncertain_broker_failure(
+                "result", request_id, "person approval deadline expired without a terminal result")
+        result = _broker_json_until(
+            config, "GET", result_path, None, deadline=deadline,
+            request_id=request_id, phase="result", act=act)
         status = result.get("status")
-        if status == "approved":
+        if status in {"approved", "consumed"}:
             if time.monotonic() >= deadline:
-                raise SystemExit(_NOT_APPROVED)
+                raise _uncertain_broker_failure(
+                    "result", request_id, "person approval deadline expired")
             break
         if status in {"declined", "expired"}:
             raise SystemExit(_NOT_APPROVED)
         if status != "pending":
-            raise SystemExit("person broker returned an invalid terminal status; nothing was signed")
+            raise _uncertain_broker_failure(
+                "result", request_id,
+                "person broker returned an invalid terminal status; nothing was signed")
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise SystemExit(_NOT_APPROVED)
+            raise _uncertain_broker_failure(
+                "result", request_id, "person approval deadline expired while status was pending")
         time.sleep(min(_BROKER_POLL_S, remaining))
 
-    response = _broker_json(config, "POST", "/person-sign/v1", {
-        "request_id": request_id, "exact_content": exact_content,
-    })
+    response = _broker_json_until(
+        config, "POST", "/person-sign/v1",
+        {"request_id": request_id, "exact_content": exact_content},
+        deadline=deadline, request_id=request_id, phase="sign", act=act)
     if response.get("request_id") != request_id:
         raise SystemExit("person broker substituted the signing request id; nothing was accepted")
     signatures_raw, returned_raw = response.get("signatures"), response.get("items_b64")
@@ -643,6 +747,7 @@ def person_sign_batch(kind: str, items: list, *, summary: str,
     """Sign one atomic 1-8 item act, resolving suspension-record templates in order."""
     _check_request(kind, summary)
     act = broker_preflight(kind, summary) if act is None else act
+    _assert_act_mode(act)
     if act.kind != kind:
         raise SystemExit("person custody act kind changed during signing; nothing was signed")
     mode = act.mode
@@ -655,9 +760,9 @@ def person_sign_batch(kind: str, items: list, *, summary: str,
             raise SystemExit("person broker configuration was not carried from preflight")
         results = _broker_sign_batch(
             kind, normalized, wire, summary=summary, context=checked_context,
-            person_key=public_key, person_hex=person_hex, config=act.config)
+            person_key=public_key, person_hex=person_hex, config=act.config, act=act)
     else:
-        results = _file_sign_batch(kind, normalized, person_hex)
+        results = _file_sign_batch(kind, normalized, person_hex, act)
     _refuse_stale_signed_items(kind, results)
     return results
 
@@ -688,6 +793,7 @@ class PersonKey:
         self._kind = kind
         self._summary = summary
         self._act = broker_preflight(kind, summary) if act is None else act
+        _assert_act_mode(self._act)
         if self._act.kind != kind:
             raise SystemExit("person custody act kind changed before signing; nothing was signed")
         mode = self._act.mode
@@ -710,7 +816,9 @@ class PersonKey:
     def sign(self, data: bytes) -> bytes:
         if not isinstance(data, bytes) or not data:
             raise SystemExit("person-signing statement must not be empty")
+        _assert_act_mode(self._act)
         if self._key is not None:
+            _assert_act_mode(self._act)
             result = [(data, self._key.sign(data))]
             _refuse_stale_signed_items(self._kind, result)
             return result[0][1]
