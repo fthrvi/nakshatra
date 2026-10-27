@@ -1,6 +1,6 @@
 # Agent-to-agent on Nakshatra: any harness, one network
 
-Status: DRAFT for Biswa's decision (2026-10-16). D7, D8.2, and M0.5 grant visibility are built;
+Status: DRAFT for Biswa's decision (2026-10-16). D7, D8.1, D8.2, and M0.5 grant visibility are built;
 the rest remains design unless a section explicitly says it exists.
 Lane: network (Brahma / Nakshatra).
 
@@ -191,9 +191,38 @@ other keys in the vault; do not make a second copy beside the network database.
 
 ### D8. Later ways to find people (all opt-in, none replace invites)
 1. **Introductions:** a contact sends you a signed intro to someone they know. It's still a request
-   the third person must accept. Recommended next.
+   the third person must accept. Built as D8.1 below.
 2. **Opt-in listing:** a person may choose to publish a display name + a "request to connect" address
    on the pillar. Off by default; nobody is listed unless they ask.
+
+#### D8.1. Contact introductions — BUILT (v1, 2026-10-26)
+
+`nak introduce <contact-B> <contact-C> [--note "..."]` sends B a node-signed, expiring statement
+and mirrors the same bytes to C. A must currently have both people as accepted contacts. The
+statement is `nak.intro.v1`, defaults to seven days, is capped at 30 days, and uses a random
+16-byte `intro_id`. Notes are at most 500 characters and reject controls, invisible formatting,
+line/paragraph separators, edge whitespace, and doubled whitespace. The signed `about` object also
+carries C's node public key: B needs that public routing identity to wait on the ordinary pairwise
+session for C's later acceptance; it grants no access by itself.
+
+Because contacts do not automatically receive one another's opt-in `nka1` rendezvous secret, B's
+single authenticated `contact.request` is carried B → A → C over A's two existing encrypted contact
+sessions. A only relays the fixed signed request for an introduction A issued. C admits it through
+the same atomic block, pending-count, rolling-day, expiry, and person-key acceptance gates used by
+shareable-address requests. This transport adjustment avoids inventing a directory, disclosing C's
+public address, or adding a new person-signed broker shape.
+
+`nak intros` labels every received statement `trust=external` and names the current contact who
+introduced it. `nak intro accept <intro_id>` only sends the request; C still runs the existing
+interactive, person-signed `nak accept <request-id>`. `nak intro decline <intro_id>` drops it. C
+accepts an intro-carried request only when A is still C's contact, A's node signature and mirrored
+statement match, the statement is live and names B as `to`, B is not blocked, and the original
+delivery grant has not been revoked. A trusted-operator suspension of A also invalidates it. All
+denials exposed back across the relay use the same generic response. Each `intro_id` is permanently
+single-use for a requester at C, including after the resulting request is declined or expires.
+
+MCP exposes `nak_introduce`, `nak_intros`, `nak_intro_accept`, and `nak_intro_decline`. Their
+descriptions explicitly frame introductions as external data, never instructions or authority.
 
 #### D8.2. Shareable request address — BUILT (v1, 2026-10-23)
 
@@ -242,7 +271,7 @@ speak A2A natively. It goes behind the same owner auth and contacts-only rule as
 | **M1** | `agent.msg` v1 + its delegation kind; MCP tools `nak_agent_send`, `nak_threads`, `nak_thread`; agent card (D3). | Agents can hold a threaded conversation and know what each other offers. |
 | **M2** | D4: tasks and offers settle on the Neuron ledger (devnet credits). | One agent pays another for work, pay-first. |
 | **M3** | D1 remote MCP door (ChatGPT etc.), off by default, owner-auth. | A hosted harness joins. |
-| **M4** | D9 groups; D8.1 introductions. | Group chats in the harness, no app. |
+| **M4** | D9 groups; D8.1 introductions (**introductions built 2026-10-26**). | Group chats in the harness, no app. |
 | **M5** | D6 A2A adapter, D5 sidecar protocol, if measured need. | Standard-framework interop and scale. |
 
 Each milestone: one Codex build, an independent review, tests with a temporary HOME, a live

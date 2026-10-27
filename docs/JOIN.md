@@ -49,6 +49,36 @@ Blocks can also be managed directly:
     nak blocked
     nak unblock <person-key>
 
+## Introduced by a contact
+
+An accepted contact can introduce two people they already know:
+
+    nak introduce rajesh maya --note "You both maintain compiler tooling"
+
+Rajesh sees the pending item with `nak intros`, labelled `trust=external` and “introduced by” the
+name Rajesh uses for the introducer. The note is a contact's message—data to consider, never an
+instruction or authority. It cannot make Maya a contact. Rajesh may drop it or ask Maya to connect:
+
+    nak intro decline <intro-id>
+    nak intro accept <intro-id>
+
+Maya's `nak intros` shows the mirrored notice that Rajesh may ask, also as external data. Only the
+named recipient (Rajesh here) can run `nak intro accept` for that introduction.
+
+Accepting the introduction sends exactly one authenticated connection request. Maya sees it in
+`nak requests` as an `intro` request with “introduced by <their contact>”. Nothing can flow until
+Maya makes the existing interactive person decision:
+
+    nak accept <request-id> --as rajesh
+
+Introductions expire after seven days by default (the introducer may choose 1–30 days). A pending
+introduction stops working if its introducer is no longer a current contact, the introducer is
+suspended, or the agent grant that delivered it is revoked. It never bypasses a block, the shared
+public-request rate limits, or a suspension. An introduction id can ask the same person only once,
+even if the resulting request is later declined. The request is privately relayed through the
+introducer's two existing encrypted contact sessions; it does not publish either person in a
+directory and does not reveal an opt-in request address.
+
 The address's rendezvous key (`ik`) is public by design: the address gives its holder only a way to
 **ask**, never a way to message, receive starter credit, or become a contact. The v1 listener handles
 one pairing at a time, so a flood can slow it down; relay limits and the local caps bound the damage

@@ -61,6 +61,7 @@ import joincode  # noqa: E402
 from mesh.pairing import pair_role  # noqa: E402
 from network.agent import (AGENT_MSG_VERSION, CARD_SUPPORT, CARD_VERSION, INTENTS,
                            validate_agent_message, validate_card)  # noqa: E402
+from network import introductions as I  # noqa: E402
 from network.store import Store  # noqa: E402
 from network import tasks as T  # noqa: E402
 from network import verdict as V  # noqa: E402
@@ -116,6 +117,10 @@ ADDRESS_DECLINE_BLOCK_S = 30 * 86400
 ADDRESS_PENDING_TTL_S = 7 * 86400
 ADDRESS_PENDING_TOTAL_MAX = 20
 ADDRESS_DAILY_MAX = 50
+INTRO_DELIVERY_ASPECT = I.KIND
+INTRO_REQUEST_ASPECT = "nak.intro.request.v1"
+INTRO_FORWARD_ASPECT = "nak.intro.forward.v1"
+INTRO_REQUEST_KIND = "nak.intro.request.v1"
 # Worst case is 5 advertised endpoints × 3 s, a 10 s handshake, then the sidecar's 15 s DCUtR wait
 # plus its pinned handshake. Fifty seconds covers that sequence; only both-sides direct opt-ins wait.
 DIRECT_WAIT_S = 50.0
@@ -306,7 +311,8 @@ class Node:
                  roster_path: Optional[Path] = None, clock: Optional[Callable[[], float]] = None):
         self._key = node_key
         self._state_dir = Path(state_dir)
-        self.node = ed25519.Ed25519PrivateKey.from_private_bytes(node_key).public_key().public_bytes_raw().hex()
+        self._node_private = ed25519.Ed25519PrivateKey.from_private_bytes(node_key)
+        self.node = self._node_private.public_key().public_bytes_raw().hex()
         self._signer = signer
         self.agent = agent
         self.relay = relay
@@ -913,6 +919,8 @@ class Node:
     def _request_invite_kind_tier(self, request: dict) -> tuple[str, str]:
         if request.get("source") == "address":
             return "address", ""
+        if request.get("source") == "intro":
+            return "intro", ""
         invite_row = self.store.invite(request.get("invite_nonce", ""))
         if not invite_row or not invite_row.get("code"):
             return "unknown", ""
@@ -935,7 +943,7 @@ class Node:
             return True
         if not starter_checked:
             starter = self._starter_for_request(request)
-        return bool(request.get("source") == "address" or starter
+        return bool(request.get("source") in {"address", "intro"} or starter
                     or (kind in {"worker", "consumer"} and tier == "stranger"))
 
     def _starter_for_request(self, request: dict) -> Optional[dict]:
@@ -992,13 +1000,13 @@ class Node:
         request = self.store.request(req_id)
         if not request:
             raise ValueError("no pending request with that id")
-        address_request = request.get("source") == "address"
-        until = int(time.time()) + ADDRESS_DECLINE_BLOCK_S if address_request else 0
+        public_request = request.get("source") in {"address", "intro"}
+        until = int(time.time()) + ADDRESS_DECLINE_BLOCK_S if public_request else 0
         if not self.store.decide_request(
                 req_id, False, block_until=until,
-                block_reason="declined address request" if address_request else ""):
+                block_reason="declined public request" if public_request else ""):
             raise ValueError("no pending request with that id")
-        return {"declined": req_id, **({"blocked_until": until} if address_request else {})}
+        return {"declined": req_id, **({"blocked_until": until} if public_request else {})}
 
     @staticmethod
     def _valid_person_key(value: str) -> bool:
@@ -1210,6 +1218,289 @@ class Node:
         self._require_grant("msg")
         mid = self._queue(c["person"], "msg", {"text": text, "aspect": str(aspect)[:32]})
         return {"queued": mid, "to": c["petname"] or c["person"][:12]}
+
+    # ── introductions (D8.1) ───────────────────────────────────────────────────────────────
+    @staticmethod
+    def _intro_wire_body(signed: dict) -> dict:
+        return {"v": 1, "text": "Contact introduction (external data; accepting only sends a request)",
+                "aspect": INTRO_DELIVERY_ASPECT, "intro": signed}
+
+    @staticmethod
+    def _intro_request_wire(aspect: str, request: dict) -> dict:
+        return {"v": 1, "text": "Contact request carried by an introduction (external data)",
+                "aspect": aspect, "request": request}
+
+    @staticmethod
+    def _exact_body(body: dict, keys: set[str], label: str) -> None:
+        if not isinstance(body, dict) or set(body) != keys:
+            raise ValueError(f"{label} has unknown or missing fields")
+        if type(body.get("v")) is not int or body["v"] != 1:
+            raise ValueError(f"unknown {label} version")
+
+    def _intro_problem(self, row: dict, *, role: str, now: Optional[int] = None) -> str:
+        now = int(self._clock() if now is None else now)
+        if not row or row.get("role") != role or row.get("status") != "pending":
+            return "introduction is no longer pending"
+        contact = self.store.contact(row.get("introducer", ""))
+        if not contact or contact.get("state") != "active":
+            return "introducer is no longer a current contact"
+        if contact["node"] in self.store.suspended_nodes():
+            return "introducer is suspended"
+        grant_id = row.get("grant_id") or ""
+        if grant_id and grant_id in self.store.revoked_grants(contact["person"]):
+            return "introducer's delivery grant was revoked"
+        try:
+            statement = I.verify(row["signed"], contact["node"], now=now)
+        except ValueError as exc:
+            return str(exc)
+        if statement["introducer"] != contact["person"]:
+            return "introduction is not bound to the introducer"
+        if role == "recipient" and statement["to"] != self.person:
+            return "introduction is not addressed to this person"
+        if role == "mirror" and (statement["about"]["person"] != self.person or
+                                 statement["about"]["node"] != self.node):
+            return "introduction mirror is not about this person and node"
+        return ""
+
+    def introduce(self, to: str, about: str, note: str = "", *, days: int = 7) -> dict:
+        if isinstance(days, bool) or not isinstance(days, int) or not 1 <= days <= 30:
+            raise ValueError("introduction days must be between 1 and 30")
+        recipient, introduced = self.store.resolve(to), self.store.resolve(about)
+        if not recipient or recipient.get("state") != "active":
+            raise ValueError("introduction recipient must be an accepted contact")
+        if not introduced or introduced.get("state") != "active":
+            raise ValueError("introduced person must be an accepted contact")
+        if recipient["person"] == introduced["person"]:
+            raise ValueError("introduction recipient and introduced person must be different")
+        suspended = self.store.suspended_nodes()
+        if recipient["node"] in suspended or introduced["node"] in suspended:
+            raise ValueError("cannot introduce a suspended contact")
+        note = I.strict_text(note, "note", I.MAX_NOTE)
+        display_name = I.strict_text(
+            introduced.get("petname") or introduced["person"][:12],
+            "display name", I.MAX_NAME, empty=False)
+        # Check both delivery targets before creating durable state.  The two ordinary msg
+        # envelopes use the already-delegated nak.msg capability; the statement itself is signed
+        # by the node key, never by the person key.
+        grant = self._require_grant("msg")
+        self._queue_preflight(recipient["person"], "msg")
+        self._queue_preflight(introduced["person"], "msg")
+        now = int(self._clock())
+        statement = I.build_statement(
+            introducer=self.person, to=recipient["person"],
+            about_person=introduced["person"], about_node=introduced["node"],
+            display_name=display_name, note=note, issued_at=now,
+            expires_at=now + days * 86400)
+        signed = I.sign(self._node_private, statement)
+        recipient_mid, mirror_mid = secrets.token_hex(12), secrets.token_hex(12)
+        recipient_body, mirror_body = dict(self._intro_wire_body(signed), mid=recipient_mid), \
+            dict(self._intro_wire_body(signed), mid=mirror_mid)
+        self._touch_signing_activity("msg", recipient["person"], recipient_body)
+        self._touch_signing_activity("msg", introduced["person"], mirror_body)
+        self.store.put_introduction(signed, "sent", grant.get("grant_id", ""), now=now)
+        self.store.queue_many([
+            (recipient_mid, recipient["person"], {"kind": "msg", "body": recipient_body}),
+            (mirror_mid, introduced["person"], {"kind": "msg", "body": mirror_body}),
+        ])
+        for person in (recipient["person"], introduced["person"]):
+            event = self._wake.get(person)
+            if event:
+                event.set()
+        return {"intro_id": statement["intro_id"], "to": recipient["petname"],
+                "about": display_name, "expires_at": statement["expires_at"],
+                "queued": [recipient_mid, mirror_mid]}
+
+    def intros(self) -> list[dict]:
+        rows = []
+        for role in ("recipient", "mirror"):
+            for stored in self.store.introductions(role, "pending"):
+                statement = stored["statement"]
+                introducer = self.store.contact(stored["introducer"]) or {}
+                problem = self._intro_problem(stored, role=role)
+                rows.append({
+                    "intro_id": stored["intro_id"], "role": role, "trust": "external",
+                    "introduced_by": introducer.get("petname") or stored["introducer"][:12],
+                    "introducer": stored["introducer"], "to": statement["to"],
+                    "about": dict(statement["about"]), "note": statement["note"],
+                    "issued_at": statement["issued_at"], "expires_at": statement["expires_at"],
+                    "valid": not problem, "problem": problem,
+                })
+        rows.sort(key=lambda row: (row["issued_at"], row["intro_id"], row["role"]))
+        return rows
+
+    def _resolve_intro(self, prefix: str) -> dict:
+        if not isinstance(prefix, str) or len(prefix) < 8:
+            raise ValueError("intro_id must be at least 8 lowercase hex characters")
+        matches = [row for row in self.store.introductions("recipient", "pending")
+                   if row["intro_id"].startswith(prefix)]
+        if len(matches) != 1:
+            raise ValueError("no unique pending introduction with that id")
+        return matches[0]
+
+    def intro_accept(self, intro_id: str) -> dict:
+        row = self._resolve_intro(intro_id)
+        problem = self._intro_problem(row, role="recipient")
+        if problem:
+            raise ValueError(f"introduction cannot be accepted: {problem}")
+        statement = row["statement"]
+        introduced = statement["about"]
+        if self.store.is_blocked(introduced["person"], now=int(self._clock())):
+            raise ValueError("introduction cannot be accepted: introduced person is blocked")
+        existing = self.store.contact(introduced["person"])
+        if existing and existing.get("state") == "active":
+            raise ValueError("already connected to the introduced person")
+        introducer = self.store.contact(statement["introducer"])
+        if not introducer or introducer.get("state") != "active":
+            raise ValueError("introduction cannot be accepted: introducer is no longer a contact")
+        if introduced["node"] in self.store.suspended_nodes():
+            raise ValueError("introduction cannot be accepted: introduced person is suspended")
+        self._queue_preflight(introducer["person"], "msg")
+        self._require_grant("contact.request")
+        nickname = ""
+        try:
+            nickname = (self._state_dir / "name").read_text().strip()
+        except OSError:
+            pass
+        if nickname:
+            nickname = I.strict_text(nickname[:I.MAX_NAME], "saved name", I.MAX_NAME)
+        request_body = {
+            "v": 1, "kind": INTRO_REQUEST_KIND,
+            "person": self.person, "node": self.node, "ledger_key": self.node,
+            "nickname": nickname, "intro": row["signed"], "mid": secrets.token_hex(12),
+        }
+        request_env = self._sign("contact.request", introduced["person"], request_body)
+        request = {"env": request_env, "body": request_body}
+        if not self.store.set_introduction_status(row["intro_id"], "requested"):
+            raise ValueError("introduction is no longer pending")
+        # As with redeem(), be ready on the ordinary pairwise rendezvous before C accepts.
+        try:
+            self.store.upsert_contact(introduced["person"], introduced["node"], "awaiting",
+                                      introduced["display_name"], name_src="yours")
+            queued = self._queue(
+                introducer["person"], "msg", self._intro_request_wire(INTRO_REQUEST_ASPECT, request))
+        except Exception:
+            self.store.set_introduction_status(row["intro_id"], "pending", expected="requested")
+            raise
+        self._ensure_session(introduced["person"])
+        return {"intro_id": row["intro_id"], "queued": queued,
+                "to": introduced["display_name"], "state": "request queued"}
+
+    def intro_decline(self, intro_id: str) -> dict:
+        row = self._resolve_intro(intro_id)
+        if not self.store.set_introduction_status(row["intro_id"], "declined"):
+            raise ValueError("introduction is no longer pending")
+        return {"declined": row["intro_id"]}
+
+    def _validate_nested_intro_request(self, request: dict, *, requester_person: str = "") -> tuple[dict, dict, dict]:
+        if not isinstance(request, dict) or set(request) != {"env", "body"}:
+            raise ValueError("introduction request has unknown or missing fields")
+        env, body = request.get("env"), request.get("body")
+        expected = {"v", "kind", "person", "node", "ledger_key", "nickname", "intro", "mid"}
+        if not isinstance(env, dict) or not isinstance(body, dict) or set(body) != expected:
+            raise ValueError("introduction contact request has unknown or missing fields")
+        if type(body.get("v")) is not int or body["v"] != 1 or body.get("kind") != INTRO_REQUEST_KIND:
+            raise ValueError("unknown introduction request kind or version")
+        person, node = body.get("person"), body.get("node")
+        if not self._valid_hex(person, 64) or not self._valid_hex(node, 64) or body.get("ledger_key") != node:
+            raise ValueError("introduction requester identity is malformed")
+        if requester_person and person != requester_person:
+            raise ValueError("introduction requester is not the forwarding contact")
+        nickname = body.get("nickname")
+        if not isinstance(nickname, str) or len(nickname) > I.MAX_NAME:
+            raise ValueError("introduction requester nickname is malformed")
+        if nickname:
+            I.strict_text(nickname, "requester nickname", I.MAX_NAME)
+        if not self._valid_hex(body.get("mid"), 24):
+            raise ValueError("introduction request message id is malformed")
+        return env, body, I.verify(body.get("intro"), self.node, now=int(self._clock()), allow_expired=True)
+
+    def _forward_intro_request(self, sender: dict, outer_env: dict, body: dict) -> dict:
+        self._exact_body(body, {"v", "text", "aspect", "request", "mid"}, "introduction relay request")
+        if body.get("aspect") != INTRO_REQUEST_ASPECT:
+            raise ValueError("unknown introduction relay request kind")
+        env, request_body, _unused = self._validate_nested_intro_request(
+            body["request"], requester_person=sender["person"])
+        signed = request_body["intro"]
+        sent = self.store.introduction(signed["statement"]["intro_id"])
+        if not sent or sent.get("role") != "sent" or not I.same(sent["signed"], signed):
+            raise ValueError("introduction was not issued by this node")
+        statement = I.verify(signed, self.node, now=int(self._clock()))
+        if statement["introducer"] != self.person or statement["to"] != sender["person"]:
+            raise ValueError("introduction is not bound to this requester")
+        introduced = self.store.contact(statement["about"]["person"])
+        if not introduced or introduced.get("state") != "active" or \
+                introduced["node"] != statement["about"]["node"]:
+            raise ValueError("introduced person is no longer a current contact")
+        if introduced["node"] in self.store.suspended_nodes():
+            raise ValueError("introduced person is suspended")
+        try:
+            verify_envelope(env, sender["person"], now=int(self._clock()),
+                            revoked=self.store.revoked_grants(sender["person"]))
+        except Exception as exc:  # nested, peer-controlled grant/signature shape
+            raise ValueError("introduction contact request does not verify") from exc
+        if env.get("kind") != "contact.request" or env.get("from_node") != sender["node"] or \
+                env.get("to") != introduced["person"] or env.get("body_sha256") != body_hash(request_body):
+            raise ValueError("introduction contact request is not bound to its requester and recipient")
+        self.store.raw_log({"received": int(self._clock()), "source": "nakshatra", "trust": "external",
+                            "from_person": sender["person"], "envelope": outer_env, "body": body})
+        self._queue(introduced["person"], "msg",
+                    self._intro_request_wire(INTRO_FORWARD_ASPECT, body["request"]), touch=False)
+        return statement
+
+    def _admit_intro_request(self, introducer: dict, outer_env: dict, body: dict) -> str:
+        self._exact_body(body, {"v", "text", "aspect", "request", "mid"}, "introduction forward")
+        if body.get("aspect") != INTRO_FORWARD_ASPECT:
+            raise ValueError("unknown introduction forward kind")
+        request = body["request"]
+        if not isinstance(request, dict) or set(request) != {"env", "body"}:
+            raise ValueError("introduction request has unknown or missing fields")
+        env, request_body = request.get("env"), request.get("body")
+        expected = {"v", "kind", "person", "node", "ledger_key", "nickname", "intro", "mid"}
+        if not isinstance(env, dict) or not isinstance(request_body, dict) or set(request_body) != expected:
+            raise ValueError("introduction contact request has unknown or missing fields")
+        if type(request_body.get("v")) is not int or request_body["v"] != 1 or \
+                request_body.get("kind") != INTRO_REQUEST_KIND:
+            raise ValueError("unknown introduction request kind or version")
+        person, node = request_body.get("person"), request_body.get("node")
+        nickname = request_body.get("nickname")
+        if not self._valid_hex(person, 64) or not self._valid_hex(node, 64) or \
+                request_body.get("ledger_key") != node or not self._valid_hex(request_body.get("mid"), 24):
+            raise ValueError("introduction requester identity is malformed")
+        if not isinstance(nickname, str) or len(nickname) > I.MAX_NAME:
+            raise ValueError("introduction requester nickname is malformed")
+        if nickname:
+            I.strict_text(nickname, "requester nickname", I.MAX_NAME)
+        try:
+            verify_envelope(env, person, now=int(self._clock()))
+        except Exception as exc:
+            raise ValueError("introduction contact request does not verify") from exc
+        if env.get("kind") != "contact.request" or env.get("from_node") != node or \
+                env.get("to") != self.person or env.get("body_sha256") != body_hash(request_body):
+            raise ValueError("introduction contact request is not bound to this node")
+        signed = request_body.get("intro")
+        statement = I.verify(signed, introducer["node"], now=int(self._clock()))
+        if statement["introducer"] != introducer["person"] or statement["to"] != person or \
+                statement["about"]["person"] != self.person or statement["about"]["node"] != self.node:
+            raise ValueError("introduction does not bind this introducer, requester, and recipient")
+        mirror = self.store.introduction(statement["intro_id"])
+        if not mirror or not I.same(mirror["signed"], signed):
+            raise ValueError("matching introduction mirror was not received")
+        problem = self._intro_problem(mirror, role="mirror")
+        if problem:
+            raise ValueError(problem)
+        rid, reason, expired = self.store.admit_intro_request(
+            person, node, nickname, statement["intro_id"], introducer["person"],
+            now=int(self._clock()), pending_ttl_s=ADDRESS_PENDING_TTL_S,
+            pending_total_max=ADDRESS_PENDING_TOTAL_MAX, daily_max=ADDRESS_DAILY_MAX)
+        if expired:
+            self.log(f"expired {expired} stale public request(s)")
+        if not rid:
+            raise ValueError(reason)
+        self.store.raw_log({"received": int(self._clock()), "source": "nakshatra", "trust": "external",
+                            "from_person": introducer["person"], "envelope": outer_env, "body": body})
+        self.log(f"connection request {rid} from {person[:12]} introduced by "
+                 f"{introducer.get('petname') or introducer['person'][:12]}")
+        return rid
 
     def agent_send(self, who: str, text: str, *, intent: str = "ask", thread: str = "",
                    reply_to: str = "", want=None, expires=None, budget=None, refs=None,
@@ -1642,6 +1933,56 @@ class Node:
             return {"t": "ack", "mid": mid}
         if c["state"] != "active":
             return {"t": "nack", "mid": mid, "why": "connection not accepted yet"}
+        aspect = body.get("aspect") if kind == "msg" else None
+        if aspect == INTRO_DELIVERY_ASPECT:
+            if self.store.is_seen(mid):
+                return {"t": "ack", "mid": mid}
+            try:
+                self._exact_body(body, {"v", "text", "aspect", "intro", "mid"},
+                                 "introduction delivery")
+                statement = I.verify(body["intro"], c["node"], now=int(self._clock()))
+                if statement["introducer"] != person:
+                    raise ValueError("introduction is not bound to its contact")
+                if statement["to"] == self.person:
+                    role = "recipient"
+                elif statement["about"]["person"] == self.person and \
+                        statement["about"]["node"] == self.node:
+                    role = "mirror"
+                else:
+                    raise ValueError("introduction is neither addressed to nor about this node")
+                self.store.raw_log({"received": int(self._clock()), "source": "nakshatra",
+                                    "trust": "external", "from_person": person,
+                                    "envelope": env, "body": body})
+                self.store.put_introduction(
+                    body["intro"], role, str((env.get("grant") or {}).get("grant_id") or ""),
+                    now=int(self._clock()))
+                self.store.first_time(mid)
+                return {"t": "ack", "mid": mid}
+            except ValueError as exc:
+                self.log(f"refused introduction from {person[:12]}: {exc}")
+                return {"t": "nack", "mid": mid, "why": "malformed introduction"}
+        if aspect == INTRO_REQUEST_ASPECT:
+            if self.store.is_seen(mid):
+                return {"t": "ack", "mid": mid}
+            try:
+                self._forward_intro_request(c, env, body)
+                self.store.first_time(mid)
+                return {"t": "ack", "mid": mid}
+            except ValueError as exc:
+                self.log(f"refused introduction relay from {person[:12]}: {exc}")
+                return {"t": "nack", "mid": mid, "why": "request not accepted right now"}
+        if aspect == INTRO_FORWARD_ASPECT:
+            if self.store.is_seen(mid):
+                return {"t": "ack", "mid": mid}
+            try:
+                self._admit_intro_request(c, env, body)
+                self.store.first_time(mid)
+                return {"t": "ack", "mid": mid}
+            except ValueError as exc:
+                self.log(f"refused introduced request from {person[:12]}: {exc}")
+                return {"t": "nack", "mid": mid, "why": "request not accepted right now"}
+        if isinstance(aspect, str) and aspect.startswith("nak.intro."):
+            return {"t": "nack", "mid": mid, "why": "unknown introduction kind"}
         if kind == "contact.card":
             card_body = validate_card(body)
             if card_body.get("ledger_keyid") and card_body["ledger_keyid"] != c["node"]:
@@ -3236,6 +3577,7 @@ def _hard_close(ch) -> None:
 OPS = {"status", "node_sign_stage", "cancel_invite", "register_invite", "register_address",
        "address_status", "address_off",
        "redeem", "requests", "accept", "decline", "block", "unblock", "blocked", "contacts", "remove", "send",
+       "introduce", "intros", "intro_accept", "intro_decline",
        "agent_send", "threads", "thread", "card", "card_set", "delivered", "inbox", "outbox",
        "task_post", "tasks", "task_status", "task_claim", "task_submit", "task_decide", "ledger", "escrow_status", "direct",
        "starter_status", "install_revocation", "import_revocation", "revocations",
@@ -3347,7 +3689,20 @@ def handle(node: Node, req: dict) -> dict:
                 kind, tier = node._request_invite_kind_tier(full or request)
                 request.update(kind=kind, tier=tier,
                                requires_person=bool(full and node._request_requires_person(full)))
+                if request.get("source") == "intro" and request.get("introducer"):
+                    contact = node.store.contact(request["introducer"]) or {}
+                    request["introduced_by"] = contact.get("petname") or request["introducer"][:12]
             return {"ok": True, "requests": requests}
+        if op == "introduce":
+            return {"ok": True, **node.introduce(
+                req["to"], req["about"], req.get("note", ""),
+                days=_request_int(req, "days", 7, 1, 30))}
+        if op == "intros":
+            return {"ok": True, "intros": node.intros()}
+        if op == "intro_accept":
+            return {"ok": True, **node.intro_accept(req["id"])}
+        if op == "intro_decline":
+            return {"ok": True, **node.intro_decline(req["id"])}
         if op == "accept":
             return {"ok": True, **node.accept(req["id"], req.get("petname", ""),
                                                ts=_optional_request_int(req, "ts", 0, MAX_UNIX_TIMESTAMP),

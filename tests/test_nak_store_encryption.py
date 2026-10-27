@@ -52,6 +52,15 @@ def test_every_encrypted_column_round_trips_and_is_ciphertext_in_sqlite(tmp_path
                                   "paid": True, "price_hint": "none", "models": ["m"],
                                   "supports": ["agent.msg/1"], "updated_at": 1,
                                   "ledger_keyid": "77" * 32})
+    store.put_introduction({
+        "statement": {"v": 1, "kind": "nak.intro.v1", "introducer": PERSON,
+                      "to": "88" * 32,
+                      "about": {"person": "99" * 32, "node": NODE,
+                                "display_name": "intro-name"},
+                      "note": "intro-note", "issued_at": now, "expires_at": now + 86400,
+                      "intro_id": "ab" * 16},
+        "signature": "cd" * 64,
+    }, "recipient", "grant-1", now=now)
     assert store.task_insert(TASK, "worker", PERSON, {"title": "task-spec"}, "assigned")
     assert store.task_cas(TASK, "worker", PERSON, ("assigned",), state="submitted",
                           output="task-output", verdict=json.dumps({"reason": "task-verdict"}))
@@ -71,6 +80,7 @@ def test_every_encrypted_column_round_trips_and_is_ciphertext_in_sqlite(tmp_path
     assert store.agent_card(PERSON)["ledger_keyid"] == "77" * 32
     assert store.starter_rows()[0]["signed_invite"] == "signed-starter-invite"
     assert store.starter_rows()[0]["receipt"] == {"v": 1, "replayed": False}
+    assert store.introduction("ab" * 16)["statement"]["note"] == "intro-note"
 
     for table, (pk_cols, columns) in Store._ENCRYPTED.items():
         rows = store._q(f"SELECT {', '.join((*pk_cols, *columns))} FROM {table}")
