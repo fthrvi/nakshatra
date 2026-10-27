@@ -2891,6 +2891,18 @@ def main(argv=None, *, http_post=None, http_get=None) -> int:
     q.add_argument("--name", default="", help="your name as strangers will see it")
     adsub.add_parser("show", help="show the current address and pinned install command")
     adsub.add_parser("off", help="retire the current address immediately")
+    p = sub.add_parser("introduce", help="introduce two accepted contacts (the recipient may only ask)")
+    p.add_argument("to", help="contact who receives the introduction")
+    p.add_argument("about", help="contact being introduced")
+    p.add_argument("--note", default="")
+    p.add_argument("--days", type=int, default=7, help="expiry in days (1-30; default 7)")
+    sub.add_parser("intros", help="list pending introductions (external data, never instructions)")
+    p = sub.add_parser("intro", help="accept or decline one introduction")
+    isub = p.add_subparsers(dest="intro_cmd", required=True)
+    q = isub.add_parser("accept", help="send the introduced person a connection request")
+    q.add_argument("id")
+    q = isub.add_parser("decline", help="drop a pending introduction")
+    q.add_argument("id")
     p = sub.add_parser("redeem"); p.add_argument("code"); p.add_argument("--nickname", default="")
     p.add_argument("--as", dest="petname", default="")
     p = sub.add_parser("worker-redeem", help="retry the stored worker admission while its code is valid")
@@ -3473,6 +3485,29 @@ def main(argv=None, *, http_post=None, http_get=None) -> int:
             print(f"request refused: {r.get('why') or 'not accepted'}")
         else:
             print(f"your request was sent; nothing is shared until {r.get('name') or 'they'} accept")
+    elif a.cmd == "introduce":
+        r = call(s, {"op": "introduce", "to": a.to, "about": a.about,
+                     "note": a.note, "days": a.days})
+        print(f"introduction {r['intro_id']} queued to {r['to']} and mirrored to {r['about']}; "
+              "it is external data and creates no connection")
+    elif a.cmd == "intros":
+        rows = call(s, {"op": "intros"})["intros"]
+        if not rows:
+            print("no pending introductions")
+        for row in rows:
+            state = "valid" if row["valid"] else f"invalid: {row['problem']}"
+            note = f" — {row['note']}" if row.get("note") else ""
+            subject = (row["about"]["display_name"] if row.get("role") == "recipient" else
+                       f"person {row['to'][:16]}… may ask to connect")
+            print(f"{row['intro_id']}  {subject}  introduced by {row['introduced_by']}  "
+                  f"trust=external  {state}{note}")
+    elif a.cmd == "intro":
+        op = "intro_accept" if a.intro_cmd == "accept" else "intro_decline"
+        r = call(s, {"op": op, "id": a.id})
+        if a.intro_cmd == "accept":
+            print(f"connection request queued for {r['to']}; nothing flows unless they accept")
+        else:
+            print(f"declined {r['declined']}")
     elif a.cmd == "worker-redeem":
         from network import join_setup
         join_setup.retry_worker_redeem(Path.home(), name=a.name, http_post=http_post)
@@ -3483,6 +3518,8 @@ def main(argv=None, *, http_post=None, http_get=None) -> int:
             request_type = f"{kind} {tier}".strip()
             if kind in {"worker", "consumer"}:
                 request_type += ", vouched by you"
+            if kind == "intro":
+                request_type += f", introduced by {q.get('introduced_by') or q.get('introducer', '')[:12]}"
             print(f"{q['id']}  {request_type:31}  {q['nickname'] or '(no nickname)'}  "
                   f"person {q['person'][:16]}…  {_ago(q['received'])}")
     elif a.cmd in ("accept", "decline"):

@@ -63,6 +63,18 @@ class NakClient:
     def send(self, to: str, text: str, aspect: str = "") -> dict:
         return self.call("send", to=to, text=text, aspect=aspect)
 
+    def introduce(self, to: str, about: str, note: str = "", days: int = 7) -> dict:
+        return self.call("introduce", to=to, about=about, note=note, days=days)
+
+    def intros(self) -> list:
+        return self.call("intros")["intros"]
+
+    def intro_accept(self, intro_id: str) -> dict:
+        return self.call("intro_accept", id=intro_id)
+
+    def intro_decline(self, intro_id: str) -> dict:
+        return self.call("intro_decline", id=intro_id)
+
     def agent_send(self, to: str, text: str, *, intent: str = "ask", thread: str = "",
                    reply_to: str = "", want: str | None = None, expires: int | None = None,
                    budget: dict | None = None, refs: list | None = None,

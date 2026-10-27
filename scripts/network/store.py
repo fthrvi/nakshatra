@@ -84,6 +84,14 @@ CREATE TABLE IF NOT EXISTS suspension_sent (person TEXT NOT NULL, node TEXT NOT 
 CREATE TABLE IF NOT EXISTS operator_persons (person TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS person_action_proofs (signature TEXT PRIMARY KEY, used_at INTEGER NOT NULL,
     proof_ts INTEGER);
+CREATE TABLE IF NOT EXISTS introductions (intro_id TEXT PRIMARY KEY, role TEXT NOT NULL,
+    introducer TEXT NOT NULL, about_person TEXT NOT NULL, statement TEXT NOT NULL,
+    signature TEXT NOT NULL, grant_id TEXT NOT NULL, received INTEGER NOT NULL,
+    status TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS intro_uses (intro_id TEXT NOT NULL, requester TEXT NOT NULL,
+    used_at INTEGER NOT NULL, PRIMARY KEY(intro_id, requester));
+CREATE TABLE IF NOT EXISTS request_introductions (request_id TEXT PRIMARY KEY, intro_id TEXT NOT NULL,
+    introducer TEXT NOT NULL);
 """
 
 
@@ -151,6 +159,7 @@ class Store:
         "agent_cards": (("person",), ("display_name", "offers", "intents", "paid", "price_hint",
                                           "models", "supports", "updated_at", "ledger_keyid")),
         "starter_obligations": (("invite_id",), ("signed_invite", "reason", "receipt")),
+        "introductions": (("intro_id",), ("statement",)),
     }
 
     def __init__(self, state_dir: Path, data_key: bytes):
@@ -563,6 +572,9 @@ class Store:
             row["ledger_key"] = row["ledger_key"] or ""
             row["source"] = row["source"] or "invite"
             row["source_id"] = row["source_id"] or ""
+            if row["source"] == "intro":
+                intro = self.request_introduction(row["id"])
+                row["introducer"] = (intro or {}).get("introducer", "")
             out.append(row)
         return out
 
@@ -581,6 +593,9 @@ class Store:
         row["ledger_key"] = row["ledger_key"] or ""
         row["source"] = row["source"] or "invite"
         row["source_id"] = row["source_id"] or ""
+        if row["source"] == "intro":
+            intro = self.request_introduction(rid)
+            row["introducer"] = (intro or {}).get("introducer", "")
         return row
 
     def decide_request(self, rid: str, accept: bool, starter: Optional[dict] = None,
@@ -622,21 +637,22 @@ class Store:
         rows = self._q(
             "SELECT SUM(CASE WHEN r.person=? THEN 1 ELSE 0 END),COUNT(*) FROM requests r "
             "JOIN request_sources s ON s.request_id=r.id "
-            "WHERE r.state='pending' AND s.source='address'", (person,))
+            "WHERE r.state='pending' AND s.source IN ('address','intro')", (person,))
         mine, total = rows[0] if rows else (0, 0)
         return int(mine or 0), int(total or 0)
 
     def recent_address_request_count(self, since: int) -> int:
         rows = self._q(
             "SELECT COUNT(*) FROM requests r JOIN request_sources s ON s.request_id=r.id "
-            "WHERE s.source='address' AND r.received>=?", (int(since),))
+            "WHERE s.source IN ('address','intro') AND r.received>=?", (int(since),))
         return int(rows[0][0])
 
     @staticmethod
     def _expire_address_requests(db, cutoff: int) -> int:
         cur = db.execute(
             "UPDATE requests SET state='expired' WHERE state='pending' AND received<=? "
-            "AND id IN (SELECT request_id FROM request_sources WHERE source='address')",
+            "AND id IN (SELECT request_id FROM request_sources "
+            "WHERE source IN ('address','intro'))",
             (int(cutoff),))
         return cur.rowcount
 
@@ -661,14 +677,15 @@ class Store:
             mine, total = db.execute(
                 "SELECT SUM(CASE WHEN r.person=? THEN 1 ELSE 0 END),COUNT(*) FROM requests r "
                 "JOIN request_sources s ON s.request_id=r.id "
-                "WHERE r.state='pending' AND s.source='address'", (person,)).fetchone()
+                "WHERE r.state='pending' AND s.source IN ('address','intro')", (person,)).fetchone()
             if int(mine or 0) >= 1:
                 return None, "already has a pending address request", expired
             if int(total or 0) >= int(pending_total_max):
                 return None, "pending address request cap reached", expired
             recent = db.execute(
                 "SELECT COUNT(*) FROM requests r JOIN request_sources s ON s.request_id=r.id "
-                "WHERE s.source='address' AND r.received>=?", (int(now) - 86400,)).fetchone()[0]
+                "WHERE s.source IN ('address','intro') AND r.received>=?",
+                (int(now) - 86400,)).fetchone()[0]
             if int(recent) >= int(daily_max):
                 return None, "daily address request cap reached", expired
             db.execute("INSERT INTO requests (id,person,node,nickname,invite_nonce,received,state) "
@@ -679,6 +696,113 @@ class Store:
                            (rid, ledger_key))
             db.execute("INSERT INTO request_sources(request_id,source,source_id) VALUES (?, 'address', ?)",
                        (rid, aid))
+            return rid, "", expired
+        return self._tx(fn)
+
+    # D8.1 contact-mediated introductions.  Statements contain names/notes and are therefore
+    # encrypted at rest; keys, roles, timestamps and replay tombstones are routing metadata.
+    def put_introduction(self, signed: dict, role: str, grant_id: str = "",
+                         now: Optional[int] = None) -> dict:
+        if role not in {"sent", "recipient", "mirror"}:
+            raise ValueError("introduction role is invalid")
+        statement = signed["statement"]
+        intro_id = statement["intro_id"]
+        encoded = json.dumps(statement, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        sealed = self._enc("introductions", "statement", self._pk((intro_id,)), encoded)
+        signature = str(signed["signature"])
+        now = int(time.time() if now is None else now)
+
+        def fn(db):
+            existing = db.execute(
+                "SELECT role,statement,signature FROM introductions WHERE intro_id=?",
+                (intro_id,)).fetchone()
+            if existing:
+                prior = self._dec("introductions", "statement", self._pk((intro_id,)), existing[1])
+                if existing[0] != role or prior != encoded or existing[2] != signature:
+                    raise ValueError("intro_id already names a different introduction")
+                return False
+            db.execute(
+                "INSERT INTO introductions "
+                "(intro_id,role,introducer,about_person,statement,signature,grant_id,received,status) "
+                "VALUES (?,?,?,?,?,?,?,?, 'pending')",
+                (intro_id, role, statement["introducer"], statement["about"]["person"], sealed,
+                 signature, str(grant_id), now))
+            return True
+        return {"stored": self._tx(fn), "intro_id": intro_id}
+
+    def introduction(self, intro_id: str) -> Optional[dict]:
+        rows = self._q(
+            "SELECT intro_id,role,introducer,about_person,statement,signature,grant_id,received,status "
+            "FROM introductions WHERE intro_id=?", (intro_id,))
+        if not rows:
+            return None
+        row = dict(zip(("intro_id", "role", "introducer", "about_person", "statement",
+                        "signature", "grant_id", "received", "status"), rows[0]))
+        raw = self._dec("introductions", "statement", self._pk((intro_id,)), row["statement"])
+        row["statement"] = json.loads(raw)
+        row["signed"] = {"statement": row["statement"], "signature": row.pop("signature")}
+        return row
+
+    def introductions(self, role: str = "recipient", status: str = "pending") -> list[dict]:
+        ids = self._q(
+            "SELECT intro_id FROM introductions WHERE role=? AND status=? ORDER BY received,intro_id",
+            (role, status))
+        return [self.introduction(row[0]) for row in ids]
+
+    def set_introduction_status(self, intro_id: str, status: str, *, expected: str = "pending") -> bool:
+        if status not in {"pending", "requested", "declined", "invalid"}:
+            raise ValueError("introduction status is invalid")
+        with self._lock:
+            cur = self._db.execute(
+                "UPDATE introductions SET status=? WHERE intro_id=? AND status=?",
+                (status, intro_id, expected))
+            return cur.rowcount == 1
+
+    def request_introduction(self, request_id: str) -> Optional[dict]:
+        rows = self._q(
+            "SELECT intro_id,introducer FROM request_introductions WHERE request_id=?", (request_id,))
+        return {"intro_id": rows[0][0], "introducer": rows[0][1]} if rows else None
+
+    def admit_intro_request(self, person: str, node: str, nickname: str, intro_id: str,
+                            introducer: str, *, now: int, pending_ttl_s: int,
+                            pending_total_max: int, daily_max: int) -> tuple[Optional[str], str, int]:
+        """Atomically apply the public-request gates and the per-(C, requester) replay tombstone."""
+        rid = secrets.token_hex(4)
+        sealed_nickname = self._enc("requests", "nickname", self._pk((rid,)), nickname[:40])
+
+        def fn(db):
+            expired = self._expire_address_requests(db, int(now) - int(pending_ttl_s))
+            if db.execute("SELECT 1 FROM blocks WHERE person=? AND until>?", (person, int(now))).fetchone():
+                return None, "blocked", expired
+            if db.execute("SELECT 1 FROM contacts WHERE person=?", (person,)).fetchone():
+                return None, "already a contact", expired
+            if db.execute("SELECT 1 FROM intro_uses WHERE intro_id=? AND requester=?",
+                          (intro_id, person)).fetchone():
+                return None, "introduction already used", expired
+            mine, total = db.execute(
+                "SELECT SUM(CASE WHEN r.person=? THEN 1 ELSE 0 END),COUNT(*) FROM requests r "
+                "JOIN request_sources s ON s.request_id=r.id WHERE r.state='pending' "
+                "AND s.source IN ('address','intro')", (person,)).fetchone()
+            if int(mine or 0) >= 1:
+                return None, "already has a pending public request", expired
+            if int(total or 0) >= int(pending_total_max):
+                return None, "pending public request cap reached", expired
+            recent = db.execute(
+                "SELECT COUNT(*) FROM requests r JOIN request_sources s ON s.request_id=r.id "
+                "WHERE s.source IN ('address','intro') AND r.received>=?",
+                (int(now) - 86400,)).fetchone()[0]
+            if int(recent) >= int(daily_max):
+                return None, "daily public request cap reached", expired
+            db.execute("INSERT INTO intro_uses(intro_id,requester,used_at) VALUES (?,?,?)",
+                       (intro_id, person, int(now)))
+            db.execute("INSERT INTO requests (id,person,node,nickname,invite_nonce,received,state) "
+                       "VALUES (?,?,?,?,?,?, 'pending')",
+                       (rid, person, node, sealed_nickname, "", int(now)))
+            db.execute("INSERT INTO request_ledger_keys(request_id,ledger_key) VALUES (?,?)", (rid, node))
+            db.execute("INSERT INTO request_sources(request_id,source,source_id) VALUES (?, 'intro', ?)",
+                       (rid, intro_id))
+            db.execute("INSERT INTO request_introductions(request_id,intro_id,introducer) VALUES (?,?,?)",
+                       (rid, intro_id, introducer))
             return rid, "", expired
         return self._tx(fn)
 
@@ -1128,6 +1252,18 @@ class Store:
         raw = self._enc("outbox", "frame", self._pk((nonce,)), json.dumps(frame))
         self._q("INSERT INTO outbox (nonce, to_person, frame, created) VALUES (?,?,?,?)",
                 (nonce, to_person, raw, int(time.time())))
+
+    def queue_many(self, items: list[tuple[str, str, dict]]) -> None:
+        """Atomically queue a small fan-out so an introduction cannot be delivered without its mirror."""
+        now = int(time.time())
+        rows = [(nonce, person,
+                 self._enc("outbox", "frame", self._pk((nonce,)), json.dumps(frame)), now)
+                for nonce, person, frame in items]
+
+        def fn(db):
+            db.executemany(
+                "INSERT INTO outbox (nonce,to_person,frame,created) VALUES (?,?,?,?)", rows)
+        self._tx(fn)
 
     def pending_for(self, person: str) -> list:
         return [json.loads(self._dec("outbox", "frame", self._pk((r[0],)), r[1])) for r in
