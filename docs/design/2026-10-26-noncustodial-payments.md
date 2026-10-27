@@ -459,16 +459,35 @@ The devnet defaults (5 USDC / 30-day delegate, 1 USDC per transaction, the 20 US
    runs the redeemer (when its unredeemed total passes a threshold or once a day) and pays its own
    fees. The crank code in M5 becomes part of the worker node, not a hub service.
 3. **Fee: 3%** (`fee_bps = 300`), paid to the R&D treasury's USDC token account.
-4. **No pause switch and no `max_escrow_amount`.** Both are operator controls; remove them from
-   `Config`. Indexer and reconcile become optional open-source monitoring tools with no kill switch,
-   because there is nothing custodial to stop.
-5. **No control after launch.** Devnet stays upgradeable while building. On mainnet the program is
-   deployed after the audit with `fee_bps` and the fee wallet fixed, then the upgrade authority is
-   revoked (`--final`) and no config authority remains. Nobody, including Nakshatra, can then change
-   the rules or touch user funds. §8's upgrade/config rows apply only to devnet.
-6. **Task disputes — PENDING Biswa's call.** A Nakshatra-held arbiter is a form of control.
-   Recommended: (a) a **per-task arbiter** named by payer and worker at `task_open` (or none); the
-   program enforces it exactly as §5 describes, and with none the dispute resolves by the 14-day
-   backstop. Alternatives: (b) no arbiter at all (a dispute splits 50/50 or refunds after the
-   backstop); (c) keep a Nakshatra arbiter. §2.2's `task_resolve` changes from `config.arbiter` to
-   `task.arbiter`.
+4. **No pause switch and no `max_escrow_amount`.** Both were operator-only settings; remove them from
+   `Config`. Indexer and reconcile leave the money path: any node may run them as monitoring tools,
+   with no kill switch, because nothing custodial exists to stop.
+5. **Upgradeable, controlled by a Nakshatra multisig, behind an announced delay.** The upgrade authority
+   is a multisig (Squads), never one key. Every upgrade, and every `Config` change (fee, fee wallet), is
+   announced on chain and takes effect only after **48 hours**. That delay is longer than the 6-hour
+   withdrawal window, so anyone who disagrees can withdraw before it applies. Config changes go
+   through `config_propose` → `config_apply` (after `effective_at = now + 48 h`), enforced by the
+   program; program upgrades get the same delay through the multisig's time-lock. Be honest in user
+   docs: the upgrade key can change any rule, and the delay is the protection.
+6. **6-hour withdrawal window.** `escrow_withdraw` becomes `escrow_withdraw_request(amount)` →
+   `escrow_withdraw_execute()` after `withdraw_at = now + 6 h`. At execute time the amount must still
+   be ≤ `vault.amount − committed`. Workers keep redeeming signed vouchers during the window, so a
+   payer cannot walk away mid-job. Channel caps stay committed (fully collateralized), so a worker
+   need not watch for withdrawal requests to stay safe. Close-request grace stays 24 h for channels.
+7. **Inference payments are final** (accepted). The payer's own node receives every token before it
+   signs the next cumulative voucher, and a worker cannot redeem without that signature, so a node
+   cannot be paid for work it did not do. Delivered and signed-for work is never refunded.
+8. **Tasks: paid on verification, refunded only for non-delivery or failed verification.** This replaces
+   the accept/dispute/arbiter flow of §2.2/§5:
+   - At `task_open` the payer names a **verifier key**: the payer's own node (deterministic checks:
+     tests pass, hash matches) or a **verifier node** for results that need judgment.
+   - `task_submit(result_hash)` by the worker; the verifier signs `pass` or `fail` over
+     `(program, task, result_hash)`; `task_verify(pass)` pays the worker at once (minus fee);
+     `task_verify(fail)` refunds the payer.
+   - No submission by the deadline → anyone can refund. Submitted but the verifier silent for
+     `accept_grace_s` → silence pays the worker (protects workers from an absent verifier).
+   - Fairness rule to settle in M3: a payer who verifies its own task could falsely fail good work.
+     So payer-as-verifier is allowed only for checks the worker can reproduce, and the result is
+     logged on chain; judgment tasks use a verifier node. **Decentralized verification** (other nodes
+     re-run a sample of work and compare; cheating workers lose reputation or a stake) is the path,
+     designed in detail at M3. No Nakshatra-held arbiter.
