@@ -54,6 +54,9 @@ class NakClient:
     def contacts(self) -> list:
         return self.call("contacts")["contacts"]
 
+    def contact(self, who: str) -> dict:
+        return self.call("contact", who=who)["contact"]
+
     def requests(self) -> list:
         return self.call("requests")["requests"]
 

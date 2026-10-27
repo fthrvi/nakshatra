@@ -264,7 +264,7 @@ accepted normally, but its starter obligation remains `pending: recipient ledger
 
 | Who | Sees |
 |---|---|
-| Your friend | Your person key, node key, and the name you chose. **Not** your IP address, unless you both turn on direct connections for each other with `nak direct <name> on`. Direct mode shares LAN/IPv6 addresses; p2p hole punching also exposes public IPs to that contact. |
+| Your friend | Your person key, node key, the name you chose, and your node's self-reported person-key custody mode (`file on disk` or `phone approval`). **Not** your IP address, unless you both turn on direct connections for each other with `nak direct <name> on`. Direct mode shares LAN/IPv6 addresses; p2p hole punching also exposes public IPs to that contact. |
 | The relay operator | That two IP addresses met. Everything else is encrypted. |
 | Anyone else | Nothing. They cannot exchange messages with you without an accepted connection. |
 

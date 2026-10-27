@@ -343,7 +343,10 @@ class Server:
             caps = (f"; spend caps {format_amount(spend_caps.get('per_tx_cap', 0))} per payment, "
                     f"{format_amount(spend_caps.get('day_cap', 0))} per day"
                     if isinstance(spend_caps, dict) and spend_caps else "")
-            return (f"person {s['person'][:16]}… node {s['node'][:16]}… custody {s['custody']}; "
+            own_custody = {"file": "file on disk", "broker-biometric": "phone approval"}.get(
+                s.get("key_custody"), s.get("key_custody", "unknown"))
+            return (f"person {s['person'][:16]}… node {s['node'][:16]}… "
+                    f"key custody {own_custody}; "
                     f"{len(s['contacts'])} contacts, {s['pending_requests']} pending requests; "
                     f"agent {g['agent']} caps {','.join(g['caps']) or '-'} "
                     f"{g.get('status') or 'expires ' + str(g['expires_at'])}"
@@ -351,7 +354,8 @@ class Server:
         if name == "nak_contacts":
             rows = c.contacts()
             return "\n".join(f"{r['petname'] or r['person'][:12]} ({r['state']}, "
-                             f"{'online' if r.get('online') else 'offline'})" for r in rows) or "No contacts yet."
+                             f"{'online' if r.get('online') else 'offline'}; key custody: "
+                             f"{r.get('key_custody', 'unknown')})" for r in rows) or "No contacts yet."
         if name == "nak_inbox":
             return render_inbox(c.inbox(limit=_integer_arg(args, "limit", 20, 1, MAX_MCP_LIMIT)))
         if name == "nak_requests":

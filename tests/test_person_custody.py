@@ -1077,6 +1077,7 @@ _PRIVATE_CONSTRUCTOR_ALLOWLIST = Counter({
     ("network/nak.py", "_grant_renew_confined", "agent_files.load_key", ""): 1,
     ("network/nak.py", "_grant_renew_confined", "_ed25519.Ed25519PrivateKey.from_private_bytes", "lease_seed"): 1,
     ("network/nakd.py", "__init__", "ed25519.Ed25519PrivateKey.from_private_bytes", "node_key"): 1,
+    ("network/nakd.py", "_own_custody_statement", "ed25519.Ed25519PrivateKey.from_private_bytes", "self._key"): 1,
     ("network/nakd.py", "node_sign_stage", "ed25519.Ed25519PrivateKey.from_private_bytes", "self._key"): 1,
     ("network/nakd.py", "report", "ed25519.Ed25519PrivateKey.from_private_bytes", "self._key"): 1,
     ("packaging/nakshatra_package.py", "sign", "ed25519.Ed25519PrivateKey.from_private_bytes", "priv_bytes"): 1,

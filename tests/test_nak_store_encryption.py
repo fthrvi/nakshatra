@@ -14,11 +14,12 @@ from pathlib import Path
 
 import pytest
 from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives.asymmetric import ed25519
 
 _REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO / "scripts"))
 
-from network import nakd  # noqa: E402
+from network import custody_card, nakd  # noqa: E402
 from network.store import SCHEMA, Store  # noqa: E402
 
 
@@ -61,6 +62,10 @@ def test_every_encrypted_column_round_trips_and_is_ciphertext_in_sqlite(tmp_path
                       "intro_id": "ab" * 16},
         "signature": "cd" * 64,
     }, "recipient", "grant-1", now=now)
+    custody = custody_card.issue(
+        PERSON, "file", ed25519.Ed25519PrivateKey.generate(), since=1, issued_at=2)
+    store.set_own_custody_statement(custody)
+    store.set_contact_custody_statement(PERSON, custody, received_at=3)
     assert store.task_insert(TASK, "worker", PERSON, {"title": "task-spec"}, "assigned")
     assert store.task_cas(TASK, "worker", PERSON, ("assigned",), state="submitted",
                           output="task-output", verdict=json.dumps({"reason": "task-verdict"}))
@@ -81,6 +86,8 @@ def test_every_encrypted_column_round_trips_and_is_ciphertext_in_sqlite(tmp_path
     assert store.starter_rows()[0]["signed_invite"] == "signed-starter-invite"
     assert store.starter_rows()[0]["receipt"] == {"v": 1, "replayed": False}
     assert store.introduction("ab" * 16)["statement"]["note"] == "intro-note"
+    assert store.own_custody_statement() == custody
+    assert store.contact_custody_statement(PERSON) == custody
 
     for table, (pk_cols, columns) in Store._ENCRYPTED.items():
         rows = store._q(f"SELECT {', '.join((*pk_cols, *columns))} FROM {table}")
