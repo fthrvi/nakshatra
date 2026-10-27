@@ -90,6 +90,8 @@ CREATE TABLE IF NOT EXISTS introductions (intro_id TEXT PRIMARY KEY, role TEXT N
     status TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS intro_uses (intro_id TEXT NOT NULL, requester TEXT NOT NULL,
     used_at INTEGER NOT NULL, PRIMARY KEY(intro_id, requester));
+CREATE TABLE IF NOT EXISTS intro_forwarded (intro_id TEXT NOT NULL, requester TEXT NOT NULL,
+    forwarded_at INTEGER NOT NULL, PRIMARY KEY(intro_id, requester));
 CREATE TABLE IF NOT EXISTS request_introductions (request_id TEXT PRIMARY KEY, intro_id TEXT NOT NULL,
     introducer TEXT NOT NULL);
 """
@@ -188,7 +190,7 @@ class Store:
             "SELECT aid,created FROM address_state WHERE enabled=0")
         self._lock = threading.Lock()
         self._raw = self.dir / "inbox-raw.jsonl"
-        try:   # contacts.name_src: "yours" (the person named them) | "self-chosen" (their nickname / note)
+        try:   # contacts.name_src: "yours" (local person chose it) | "self-chosen" (externally supplied)
             self._db.execute("ALTER TABLE contacts ADD COLUMN name_src TEXT")
         except sqlite3.OperationalError:
             pass
@@ -700,7 +702,7 @@ class Store:
         return self._tx(fn)
 
     # D8.1 contact-mediated introductions.  Statements contain names/notes and are therefore
-    # encrypted at rest; keys, roles, timestamps and replay tombstones are routing metadata.
+    # encrypted at rest; keys, roles, timestamps and replay/forward tombstones are routing metadata.
     def put_introduction(self, signed: dict, role: str, grant_id: str = "",
                          now: Optional[int] = None) -> dict:
         if role not in {"sent", "recipient", "mirror"}:
@@ -762,6 +764,18 @@ class Store:
         rows = self._q(
             "SELECT intro_id,introducer FROM request_introductions WHERE request_id=?", (request_id,))
         return {"intro_id": rows[0][0], "introducer": rows[0][1]} if rows else None
+
+    def claim_intro_forward(self, intro_id: str, requester: str,
+                            now: Optional[int] = None) -> bool:
+        """Atomically claim A's one allowed B -> C forward for this introduction."""
+        now = int(time.time() if now is None else now)
+
+        def fn(db):
+            cur = db.execute(
+                "INSERT OR IGNORE INTO intro_forwarded(intro_id,requester,forwarded_at) "
+                "VALUES (?,?,?)", (intro_id, requester, now))
+            return cur.rowcount == 1
+        return self._tx(fn)
 
     def admit_intro_request(self, person: str, node: str, nickname: str, intro_id: str,
                             introducer: str, *, now: int, pending_ttl_s: int,
@@ -885,6 +899,29 @@ class Store:
         update_names = (", name_src=excluded.name_src, petname=excluded.petname" if petname else "")
         self._q("INSERT INTO contacts (person, node, petname, nickname, state, added, name_src) VALUES (?,?,?,?,?,?,?) "
                 "ON CONFLICT(person) DO UPDATE SET node=excluded.node, state=excluded.state" + update_names, values)
+
+    def prepare_intro_contact(self, person: str, node: str, petname: str) -> bool:
+        """Create an awaiting introduced contact, or reuse only the same pinned node and local name."""
+        primary_key = self._pk((person,))
+        sealed_petname = self._enc("contacts", "petname", primary_key, petname)
+        sealed_nickname = self._enc("contacts", "nickname", primary_key, "")
+
+        def fn(db):
+            existing = db.execute(
+                "SELECT node,state FROM contacts WHERE person=?", (person,)).fetchone()
+            if existing:
+                if existing[1] == "active":
+                    raise ValueError("already connected to the introduced person")
+                if existing[0] != node:
+                    raise ValueError("existing contact node does not match the introduction")
+                db.execute("UPDATE contacts SET state='awaiting' WHERE person=?", (person,))
+                return False
+            db.execute(
+                "INSERT INTO contacts (person,node,petname,nickname,state,added,name_src) "
+                "VALUES (?,?,?,?, 'awaiting',?, 'self-chosen')",
+                (person, node, sealed_petname, sealed_nickname, int(time.time())))
+            return True
+        return self._tx(fn)
 
     def set_contact_state(self, person: str, state: str) -> None:
         self._q("UPDATE contacts SET state=? WHERE person=?", (state, person))
