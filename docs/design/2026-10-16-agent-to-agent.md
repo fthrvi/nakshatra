@@ -1,7 +1,7 @@
 # Agent-to-agent on Nakshatra: any harness, one network
 
-Status: DRAFT for Biswa's decision (2026-10-16). D7, D8.2, and M0.5 grant visibility are built;
-the rest remains design unless a section explicitly says it exists.
+Status: DRAFT for Biswa's decision (2026-10-16). D3 agent cards, D3.1 custody cards, D7, D8.2,
+and M0.5 grant visibility are built; the rest remains design unless a section explicitly says it exists.
 Lane: network (Brahma / Nakshatra).
 
 ## 1. The question
@@ -124,6 +124,21 @@ Each node publishes a small signed card to its contacts: display name, what the 
 words, which intents it accepts, whether it takes paid asks, price hints, models it can serve.
 Never public, never listed on the pillar. Answers "what can your agent do for me" without a
 directory of strangers.
+
+#### D3.1. Person-key custody card — BUILT (v1, 2026-10-26)
+
+Each node also sends accepted contacts a node-signed `nak.custody.v1` statement naming its person
+key, the locally derived mode (`file` or `broker-biometric`), when that mode began, issuance time,
+and an expiry no more than 30 days away. This is **self-reported by the contact's known node**, not
+attested by the person key or the approval broker. The UI says so explicitly.
+
+The mode comes only from the protected local `person-custody` marker and broker config/token checks;
+there is no user-supplied mode flag. The statement is pushed after contact acceptance, when the
+mode changes, and before expiry over the existing authenticated pairwise channel. It is never
+published on the pillar or sent before both people are contacts. A receiver verifies the pinned
+contact node signature, exact person binding, 30-day lifetime and monotonic `issued_at`; invalid,
+expired, missing or older claims display as `unknown` and never break a contact listing. Unknown
+statement kinds and versions are refused without taking down the session.
 
 ## 5. Trust rules (unchanged from nakd, made explicit)
 

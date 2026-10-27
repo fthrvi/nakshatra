@@ -24,3 +24,18 @@ If approval or any later step fails, Nakshatra uses the existing server cancel r
 possibly registered local invite. The onboarding server may retain a durable cancelled/audit row;
 it must not leave the stage redeemable. A locally cancelled invite may likewise remain as consumed
 audit evidence but is not returned by the open-invites path.
+
+## What contacts can see
+
+Accepted contacts can see the current person-key custody mode in `nak contacts`, `nak contact show`,
+and the MCP `nak_contacts` result. `file` is shown as `file on disk`; broker custody is shown as
+`phone approval`. The display always labels the value **self-reported by their node**. It is a
+node-key-signed report about that node's protected local configuration, not a signature or
+attestation by the person key, phone, or broker.
+
+The node derives this value from the same protected marker/config/token rules described above; no
+CLI caller supplies it. It sends the report only to accepted contacts, on acceptance, after a mode
+change, and before its maximum 30-day expiry. It is never sent to the pillar or used as a directory
+signal. The receiver checks the known contact node signature, person-key binding, expiry, and
+monotonic issuance time. Missing, expired, malformed, wrongly signed, or stale reports show as
+`unknown` and do not prevent contacts from being listed or messaged.

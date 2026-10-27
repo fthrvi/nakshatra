@@ -5,6 +5,7 @@ On create add a row (status=active, owner). On merge flip to `merged→<sha>`.
 
 | branch | sector | description | base | status | owner |
 |---|---|---|---|---|---|
+| net/custody-card | network | Share node-signed, self-reported person-key custody mode with contacts and surface it in CLI/MCP listings. | custody/person-broker@f564920 | active | claude/trisul friends-onboarding lane (hub) via codex |
 | net/nak-resolve | network | Human-only operator CLI for inspecting and resolving disputed Neuron task holds. | forgejo/main@817eb10 | merged→256f87d | codex for claude/trisul-aa network lane (hub) |
 | net/nak-keyroll | release | Release-key roll chain, external signer support, and ref-pinned release inputs. | forgejo/main@817eb10 | merged→e56d346 | codex for claude/trisul-aa network lane (hub) |
 | net/report-suspend-main | network | Rebase report/operator suspension onto current main; add refusal recovery, unknown-node fencing, and post-mutation suspension safety. | forgejo/main@749a5c9 | merged→0efc67e | codex for claude/trisul-aa network lane (hub) |

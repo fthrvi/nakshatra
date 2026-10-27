@@ -120,12 +120,12 @@ def _net_dir() -> Path:
     return Path(os.environ.get("NAK_NET_DIR", Path.home() / ".nakshatra" / "net"))
 
 
-def _custody_path() -> Path:
-    return _net_dir() / "person-custody"
+def _custody_path(net_dir: Path | None = None) -> Path:
+    return (Path(net_dir) if net_dir is not None else _net_dir()) / "person-custody"
 
 
-def _broker_config_path() -> Path:
-    return _net_dir() / "person-broker.json"
+def _broker_config_path(net_dir: Path | None = None) -> Path:
+    return (Path(net_dir) if net_dir is not None else _net_dir()) / "person-broker.json"
 
 
 def _person_key_path(home: Path | None = None) -> Path:
@@ -215,25 +215,25 @@ def _read_owned_regular(path: Path, label: str, *, exact_mode: int | None = None
         os.close(fd)
 
 
-def custody_mode() -> str:
+def custody_mode(*, net_dir: Path | None = None) -> str:
     """Return the configured backend once. Missing marker preserves legacy file custody.
 
     A broker configuration is durable evidence that custody was configured.  Once it exists,
     losing (or being unable to read) the marker must never silently reactivate a leftover file key.
     The marker may be absent only on a legacy installation with no broker configuration at all.
     """
-    path = _custody_path()
+    path = _custody_path(net_dir)
     try:
         mode = _read_owned_regular(path, "person custody marker").decode("utf-8").strip()
     except FileNotFoundError:
         try:
-            _broker_config_path().lstat()
+            _broker_config_path(net_dir).lstat()
         except FileNotFoundError:
             return "file"
         except OSError as exc:
             raise SystemExit(
                 f"person broker configuration exists but cannot be inspected; "
-                f"refusing file custody: {_broker_config_path()}") from exc
+                f"refusing file custody: {_broker_config_path(net_dir)}") from exc
         raise SystemExit(
             "person broker configuration exists but the person custody marker is missing; "
             "refusing file custody")
@@ -303,8 +303,8 @@ def _read_private_token(path: Path) -> str:
     return token
 
 
-def _broker_config() -> _BrokerConfig:
-    path = _broker_config_path()
+def _broker_config(*, net_dir: Path | None = None) -> _BrokerConfig:
+    path = _broker_config_path(net_dir)
     try:
         raw = _read_owned_regular(path, "person broker configuration")
         document = json.loads(raw.decode("utf-8"))
@@ -849,3 +849,17 @@ class PersonKey:
 
 def custody_label() -> str:
     return "test" if custody_mode() == "file" else "broker"
+
+
+def custody_statement_mode(*, net_dir: Path | None = None) -> str:
+    """Return the contact-visible mode after validating the pinned local configuration.
+
+    Unlike a signing preflight this is read-only and never contacts the approval broker.  Broker
+    mode still validates the protected config and token file: a marker alone is not enough to
+    claim biometric custody, and a broker config without its marker must not fall back to file.
+    """
+    mode = custody_mode(net_dir=net_dir)
+    if mode == "broker":
+        _broker_config(net_dir=net_dir)
+        return "broker-biometric"
+    return "file"

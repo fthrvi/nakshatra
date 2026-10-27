@@ -134,6 +134,47 @@ def test_connect_only_after_accept_then_message_both_ways(net):
     assert b.node.store.inbox()[0]["text"] == "got it" and b.node.store.inbox()[0]["aspect"] == "whole"
 
 
+def test_two_temp_nodes_exchange_and_refresh_contact_only_custody_statements(net):
+    a, b = net("custody-a"), net("custody-b")
+    b.node.redeem(a.invite(), petname="a", wait_s=15)
+    a.node.accept(a.node.store.requests()[0]["id"], petname="b")
+    assert wait(lambda: (b.node.store.contact(a.person_pub) or {}).get("state") == "active")
+    assert wait(lambda: (a.node.store.contact_custody_statement(b.person_pub) or {}).get("mode") == "file")
+    assert wait(lambda: (b.node.store.contact_custody_statement(a.person_pub) or {}).get("mode") == "file")
+
+    first = a.node.store.contact_custody_statement(b.person_pub)
+    from network import custody_card
+    near_expiry = custody_card.issue(
+        b.person_pub, "file", ed25519.Ed25519PrivateKey.from_private_bytes(b.node_key),
+        since=first["since"], issued_at=first["issued_at"] + 1,
+        expires_at=first["issued_at"] + custody_card.REFRESH_BEFORE_S)
+    b.node.store.set_own_custody_statement(near_expiry)
+    b.node._wake[a.person_pub].set()
+    assert wait(lambda: (a.node.store.contact_custody_statement(b.person_pub) or {}).get("issued_at", 0)
+                > near_expiry["issued_at"])
+
+    first = a.node.store.contact_custody_statement(b.person_pub)
+    token = b.dir / "broker.token"
+    token.write_text("test-token\n")
+    token.chmod(0o600)
+    config = b.dir / "net" / "person-broker.json"
+    config.write_text(json.dumps({
+        "url": "http://127.0.0.1:7788", "token_file": str(token),
+    }))
+    config.chmod(0o600)
+    marker = b.dir / "net" / "person-custody"
+    marker.write_text("broker\n")
+    marker.chmod(0o600)
+    b.node._wake[a.person_pub].set()
+
+    assert wait(lambda: (a.node.store.contact_custody_statement(b.person_pub) or {}).get("mode")
+                == "broker-biometric")
+    refreshed = a.node.store.contact_custody_statement(b.person_pub)
+    assert refreshed["issued_at"] > first["issued_at"]
+    assert b.node.status()["key_custody"] == "broker-biometric"
+    assert a.node.status()["contacts"][0]["key_custody"].startswith("phone approval (self-reported")
+
+
 def test_two_charter_nodes_deliver_a_message_with_a_short_lease(net):
     a, b = net("charter-a", lease=True), net("charter-b", lease=True)
     b.node.redeem(a.invite(), petname="a", wait_s=15)

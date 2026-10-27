@@ -2903,6 +2903,10 @@ def main(argv=None, *, http_post=None, http_get=None) -> int:
     p = sub.add_parser("unblock"); p.add_argument("person")
     sub.add_parser("blocked")
     sub.add_parser("contacts")
+    p = sub.add_parser("contact", help="inspect one accepted contact")
+    csub = p.add_subparsers(dest="contact_cmd", required=True)
+    q = csub.add_parser("show")
+    q.add_argument("who")
     p = sub.add_parser("remove"); p.add_argument("who")
     p = sub.add_parser("send"); p.add_argument("to"); p.add_argument("text")
     p.add_argument("--aspect", default="")
@@ -3255,7 +3259,10 @@ def main(argv=None, *, http_post=None, http_get=None) -> int:
             print(json.dumps(_owner_lease_status(), indent=1, sort_keys=True))
     elif a.cmd == "status":
         r = call(s, {"op": "status"})
-        print(f"person {r['person'][:16]}…  node {r['node'][:16]}…  custody {r['custody']}  relay {r['relay']}")
+        own_custody = {"file": "file on disk", "broker-biometric": "phone approval"}.get(
+            r.get("key_custody"), r.get("key_custody", "unknown"))
+        print(f"person {r['person'][:16]}…  node {r['node'][:16]}…  "
+              f"key custody {own_custody}  relay {r['relay']}")
         print(f"{len(r['contacts'])} contacts, {r['pending_requests']} pending requests, {r['open_invites']} open invites")
         waiting = int(r.get("awaiting_approval") or 0)
         if waiting:
@@ -3527,7 +3534,14 @@ def main(argv=None, *, http_post=None, http_get=None) -> int:
             via = f" via {c['path']}" if c.get("path") else ""
             d = " [direct ok]" if c.get("direct") else ""
             print(f"{c['petname'] or '-':16} {c['state']:9} {('online' + via) if c['online'] else 'offline':16} "
-                  f"{c['person'][:16]}…{d}")
+                  f"{c['person'][:16]}…{d}  key custody: {c.get('key_custody', 'unknown')}")
+    elif a.cmd == "contact":
+        c = call(s, {"op": "contact", "who": a.who})["contact"]
+        via = f" via {c['path']}" if c.get("path") else ""
+        print(f"contact {c['petname'] or c['person'][:16]} "
+              f"({('online' + via) if c.get('online') else 'offline'})")
+        print(f"person {c['person']}\nnode {c['node']}")
+        print(f"key custody: {c.get('key_custody', 'unknown')}")
     elif a.cmd == "remove":
         print(json.dumps(call(s, {"op": "remove", "who": a.who})))
     elif a.cmd == "send":

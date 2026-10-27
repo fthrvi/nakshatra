@@ -84,6 +84,10 @@ CREATE TABLE IF NOT EXISTS suspension_sent (person TEXT NOT NULL, node TEXT NOT 
 CREATE TABLE IF NOT EXISTS operator_persons (person TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS person_action_proofs (signature TEXT PRIMARY KEY, used_at INTEGER NOT NULL,
     proof_ts INTEGER);
+CREATE TABLE IF NOT EXISTS own_custody_statement (slot INTEGER PRIMARY KEY CHECK(slot=1),
+    statement_json TEXT NOT NULL, issued_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS contact_custody_statements (person TEXT PRIMARY KEY,
+    statement_json TEXT NOT NULL, issued_at INTEGER NOT NULL, received_at INTEGER NOT NULL);
 """
 
 
@@ -151,6 +155,8 @@ class Store:
         "agent_cards": (("person",), ("display_name", "offers", "intents", "paid", "price_hint",
                                           "models", "supports", "updated_at", "ledger_keyid")),
         "starter_obligations": (("invite_id",), ("signed_invite", "reason", "receipt")),
+        "own_custody_statement": (("slot",), ("statement_json",)),
+        "contact_custody_statements": (("person",), ("statement_json",)),
     }
 
     def __init__(self, state_dir: Path, data_key: bytes):
@@ -1121,7 +1127,70 @@ class Store:
             db.execute("DELETE FROM suspension_sent WHERE person=?", (person,))
             db.execute("DELETE FROM operator_persons WHERE person=?", (person,))
             db.execute("DELETE FROM contact_suspensions WHERE person=?", (person,))
+            db.execute("DELETE FROM contact_custody_statements WHERE person=?", (person,))
         self._tx(fn)
+
+    # Node-signed, contact-only person-key custody statements. The exact statement is encrypted at
+    # rest; only its monotonic timestamp remains visible for compare-and-set updates.
+    def set_own_custody_statement(self, statement: dict) -> None:
+        issued_at = statement["issued_at"]
+        encoded = json.dumps(statement, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        sealed = self._enc("own_custody_statement", "statement_json", self._pk((1,)), encoded)
+        self._q(
+            "INSERT INTO own_custody_statement(slot,statement_json,issued_at) VALUES(1,?,?) "
+            "ON CONFLICT(slot) DO UPDATE SET statement_json=excluded.statement_json,"
+            "issued_at=excluded.issued_at",
+            (sealed, issued_at),
+        )
+
+    def own_custody_statement(self) -> Optional[dict]:
+        rows = self._q(
+            "SELECT statement_json FROM own_custody_statement WHERE slot=1")
+        if not rows:
+            return None
+        raw = self._dec(
+            "own_custody_statement", "statement_json", self._pk((1,)), rows[0][0])
+        value = json.loads(raw)
+        if not isinstance(value, dict):
+            raise ValueError("stored own custody statement is malformed")
+        return value
+
+    def set_contact_custody_statement(self, person: str, statement: dict,
+                                      *, received_at: Optional[int] = None) -> bool:
+        """Store only a strictly newer verified statement; stale replays are ignored atomically."""
+        issued_at = statement["issued_at"]
+        encoded = json.dumps(statement, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        sealed = self._enc(
+            "contact_custody_statements", "statement_json", self._pk((person,)), encoded)
+        received = int(time.time() if received_at is None else received_at)
+
+        def fn(db):
+            current = db.execute(
+                "SELECT issued_at FROM contact_custody_statements WHERE person=?", (person,)
+            ).fetchone()
+            if current and int(current[0]) >= issued_at:
+                return False
+            db.execute(
+                "INSERT INTO contact_custody_statements(person,statement_json,issued_at,received_at) "
+                "VALUES(?,?,?,?) ON CONFLICT(person) DO UPDATE SET "
+                "statement_json=excluded.statement_json,issued_at=excluded.issued_at,"
+                "received_at=excluded.received_at",
+                (person, sealed, issued_at, received),
+            )
+            return True
+        return self._tx(fn)
+
+    def contact_custody_statement(self, person: str) -> Optional[dict]:
+        rows = self._q(
+            "SELECT statement_json FROM contact_custody_statements WHERE person=?", (person,))
+        if not rows:
+            return None
+        raw = self._dec(
+            "contact_custody_statements", "statement_json", self._pk((person,)), rows[0][0])
+        value = json.loads(raw)
+        if not isinstance(value, dict):
+            raise ValueError("stored contact custody statement is malformed")
+        return value
 
     # outbox
     def queue(self, nonce: str, to_person: str, frame: dict) -> None:

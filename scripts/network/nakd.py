@@ -61,6 +61,7 @@ import joincode  # noqa: E402
 from mesh.pairing import pair_role  # noqa: E402
 from network.agent import (AGENT_MSG_VERSION, CARD_SUPPORT, CARD_VERSION, INTENTS,
                            validate_agent_message, validate_card)  # noqa: E402
+from network import custody_card, person_custody  # noqa: E402
 from network.store import Store  # noqa: E402
 from network import tasks as T  # noqa: E402
 from network import verdict as V  # noqa: E402
@@ -322,7 +323,7 @@ class Node:
         if agent not in who.get("agents", []):
             raise RuntimeError(f"the signer has no delegation for agent {agent!r}")
         self.person = who["person"]
-        self.custody = who.get("custody", "")
+        self.custody = who.get("custody", "")  # legacy signer label; not the contact-visible claim
         key_reply = signer({"op": "data_key"})
         if not key_reply.get("ok"):
             raise DataKeyError(f"signer data key unavailable: {key_reply.get('error')}")
@@ -376,6 +377,7 @@ class Node:
         self._sessions: dict[str, tuple] = {}                 # contact person -> (channel, send lock)
         self._wake: dict[str, threading.Event] = {}
         self._lock = threading.Lock()
+        self._custody_lock = threading.Lock()
         self._approval_lock = threading.Lock()
         self._approval_running: set[str] = set()
         self._decision_lock = threading.Lock()
@@ -390,6 +392,9 @@ class Node:
         self._roster_loader = roster_loader
         self._roster_path = Path(roster_path) if roster_path is not None else None
         self._last_grant_warning_day: Optional[str] = None
+        # Fail closed at startup if durable broker configuration has lost its marker, or if a broker
+        # marker no longer has a valid protected config/token. No statement is published in that case.
+        self._own_custody_statement()
         self._warn_grant(force=True)
 
     @staticmethod
@@ -449,6 +454,67 @@ class Node:
         if not r.get("ok"):
             raise RuntimeError(f"signer refused: {r.get('error')}")
         return r["envelope"]
+
+    def _own_custody_statement(self) -> dict:
+        """Return a current node-signed statement, rotating on mode change or before expiry."""
+        with self._custody_lock:
+            now = int(self._clock())
+            mode = person_custody.custody_statement_mode(net_dir=self._state_dir)
+            previous = self.store.own_custody_statement()
+            checked = None
+            if previous:
+                try:
+                    checked = custody_card.verify(
+                        previous, expected_person=self.person, expected_node=self.node, now=now,
+                        allow_expired=True)
+                except ValueError:
+                    checked = None
+                if checked and checked["mode"] == mode and \
+                        checked["expires_at"] > now + custody_card.REFRESH_BEFORE_S:
+                    return checked
+            since = now
+            issued_at = now
+            if checked is not None:
+                prior_issued = checked["issued_at"]
+                if type(prior_issued) is int:
+                    issued_at = max(issued_at, prior_issued + 1)
+                if checked["mode"] == mode:
+                    since = checked["since"]
+            statement = custody_card.issue(
+                self.person, mode,
+                ed25519.Ed25519PrivateKey.from_private_bytes(self._key),
+                since=since, issued_at=issued_at,
+            )
+            self.store.set_own_custody_statement(statement)
+            return statement
+
+    def _contact_custody(self, contact: dict, *, now: Optional[int] = None) -> tuple[str, Optional[dict]]:
+        """Never let absent or damaged peer-controlled state break a contact read."""
+        current = int(self._clock() if now is None else now)
+        try:
+            statement = self.store.contact_custody_statement(contact["person"])
+            if statement is None:
+                return "unknown", None
+            checked = custody_card.verify(
+                statement, expected_person=contact["person"], expected_node=contact["node"],
+                now=current)
+            return custody_card.display(checked, now=current), checked
+        except Exception:  # encrypted-row corruption and every invalid/expired claim are unknown
+            return "unknown", None
+
+    def _contact_view(self, contact: dict, *, online: bool = False, path: str = "") -> dict:
+        label, statement = self._contact_custody(contact)
+        return dict(contact, online=online, path=path, key_custody=label,
+                    custody_statement=statement)
+
+    def contact_show(self, who: str) -> dict:
+        contact = self.store.resolve(who)
+        if not contact:
+            raise ValueError("no such contact")
+        with self._lock:
+            online = contact["person"] in self._sessions
+            path = self._paths.get(contact["person"], "")
+        return self._contact_view(contact, online=online, path=path)
 
     def _touch_signing_activity(self, kind: str, to: str, body: dict) -> None:
         """Touch once at the initiating boundary; background delivery signs touch=false."""
@@ -1453,6 +1519,21 @@ class Node:
                 self.store.starter_update(row["invite_id"], next_attempt=0)
                 self._spawn(f"starter:{row['invite_id']}", self._attempt_starter, row["invite_id"])
 
+    def _receive_custody_frame(self, person: str, frame: dict, *, session_node: str) -> bool:
+        """Verify and monotonically store one contact-only node self-attestation."""
+        if not isinstance(frame, dict) or set(frame) != {"t", "statement"}:
+            raise ValueError("custody frame fields are missing or unknown")
+        contact = self.store.contact(person)
+        if not contact or contact["state"] != "active":
+            raise ValueError("custody statements are accepted only from active contacts")
+        if not session_node or session_node != contact["node"]:
+            raise ValueError("custody statement is not bound to this contact session")
+        statement = custody_card.verify(
+            frame["statement"], expected_person=person, expected_node=session_node,
+            now=int(self._clock()))
+        return self.store.set_contact_custody_statement(
+            person, statement, received_at=int(self._clock()))
+
     def _run_session(self, person: str, sock, ch, path: str = "relay", p2p_failed: bool = False,
                      peer_node: str = "") -> None:
         lock = threading.Lock()
@@ -1494,6 +1575,7 @@ class Node:
         down = threading.Event()
         sent_rev_seqs: set[int] = set()
         sent_susp_seqs: set[int] = set()
+        sent_custody_issued = -1
         sock.settimeout(IDLE_S)
 
         def reader():
@@ -1538,6 +1620,19 @@ class Node:
                             send_frame(ch, {"t": "susp-ack", "seq": rec["seq"]}, lock)
                         except Exception as e:  # peer-controlled side frame; keep the session alive
                             self.log(f"refused suspensions from {person[:12]}: {type(e).__name__}: {e}")
+                    elif t == "custody":
+                        try:
+                            changed = self._receive_custody_frame(
+                                person, frame, session_node=session_node)
+                            if changed:
+                                cc = self.store.contact(person) or {}
+                                self.log(f"{cc.get('petname') or person[:12]} reported updated key custody")
+                        except Exception as e:  # peer-controlled side frame; keep the session alive
+                            self.log(f"refused custody statement from {person[:12]}: "
+                                     f"{type(e).__name__}: {e}")
+                            send_frame(ch, {"t": "custody-nack", "why": "invalid custody statement"}, lock)
+                    elif t == "custody-nack":
+                        self.log(f"{person[:12]} refused this node's custody statement")
                     elif t == "addr?":  # a direct:true capability proves their side opted in
                         cc = self.store.contact(person) or {}
                         if frame.get("direct") is True and cc.get("direct"):
@@ -1557,6 +1652,15 @@ class Node:
                         if str(frame.get("why", "")).startswith(REOPENED):
                             self._claim_reopened(str(frame.get("mid", "")), person)
                         self.log(f"{person[:12]} refused {str(frame.get('mid', ''))[:8]}: {frame.get('why')}")
+                    elif t == "ping":
+                        pass
+                    elif t == "frame-nack":
+                        self.log(f"{person[:12]} refused unknown session frame")
+                    else:
+                        # Additive protocol: old peers may ignore new known kinds, but this build never
+                        # silently treats an unknown kind as meaningful and never crashes on one.
+                        self.log(f"refused unknown session frame from {person[:12]}")
+                        send_frame(ch, {"t": "frame-nack", "why": "unknown frame kind"}, lock)
             except (OSError, SecureChannelError, ValueError) as e:
                 self.log(f"session {person[:12]}: {e}")
             finally:
@@ -1589,6 +1693,18 @@ class Node:
                         self.log(f"{item['kind']} to {person[:12]} not sent: {e}")
                         continue
                     send_frame(ch, {"t": "env", "env": env, "body": item["body"]}, lock)
+                contact = self.store.contact(person) or {}
+                if contact.get("state") == "active":
+                    try:
+                        statement = self._own_custody_statement()
+                    except (SystemExit, OSError, ValueError) as exc:
+                        # A broken/mid-change local config publishes nothing. Keep the session alive
+                        # so messages still work and retry the read-only derivation on the next wake.
+                        self.log(f"custody statement unavailable: {exc}")
+                    else:
+                        if statement["issued_at"] != sent_custody_issued:
+                            send_frame(ch, {"t": "custody", "statement": statement}, lock)
+                            sent_custody_issued = statement["issued_at"]
                 if time.time() - last_ping > PING_S:
                     send_frame(ch, {"t": "ping"}, lock)
                     last_ping = time.time()
@@ -1639,6 +1755,9 @@ class Node:
                 self.log(f"{c['petname'] or person[:12]} accepted the connection")
                 # This publication is forced by the peer's accept, not initiated locally.
                 self._send_card_if_set(person, touch=False)
+                wake = self._wake.get(person)
+                if wake:
+                    wake.set()  # publish our custody statement on this accepted session now
             return {"t": "ack", "mid": mid}
         if c["state"] != "active":
             return {"t": "nack", "mid": mid, "why": "connection not accepted yet"}
@@ -3188,9 +3307,16 @@ class Node:
         refused = self.store.refusal_summary()
         waiting = len(self.store.tasks_in_states(("awaiting_approval",), role="poster"))
         starters = self.starter_status()
+        try:
+            own_custody = self._own_custody_statement()["mode"]
+        except (SystemExit, OSError, ValueError) as exc:
+            own_custody = "unavailable"
+            self.log(f"custody status unavailable: {exc}")
         return {"person": self.person, "node": self.node, "custody": self.custody,
+                "key_custody": own_custody,
                 "relay": f"{self.relay[0]}:{self.relay[1]}",
-                "contacts": [dict(c, online=c["person"] in online, path=self._paths.get(c["person"], ""))
+                "contacts": [self._contact_view(
+                    c, online=c["person"] in online, path=self._paths.get(c["person"], ""))
                              for c in self.store.contacts()],
                 "direct_port": self.direct_port,
                 "p2p": self.p2p,
@@ -3235,7 +3361,7 @@ def _hard_close(ch) -> None:
 
 OPS = {"status", "node_sign_stage", "cancel_invite", "register_invite", "register_address",
        "address_status", "address_off",
-       "redeem", "requests", "accept", "decline", "block", "unblock", "blocked", "contacts", "remove", "send",
+       "redeem", "requests", "accept", "decline", "block", "unblock", "blocked", "contacts", "contact", "remove", "send",
        "agent_send", "threads", "thread", "card", "card_set", "delivered", "inbox", "outbox",
        "task_post", "tasks", "task_status", "task_claim", "task_submit", "task_decide", "ledger", "escrow_status", "direct",
        "starter_status", "install_revocation", "import_revocation", "revocations",
@@ -3362,6 +3488,8 @@ def handle(node: Node, req: dict) -> dict:
             return {"ok": True, "blocked": node.blocked()}
         if op == "contacts":
             return {"ok": True, "contacts": node.status()["contacts"]}
+        if op == "contact":
+            return {"ok": True, "contact": node.contact_show(req["who"])}
         if op == "remove":
             return {"ok": True, **node.remove(req["who"])}
         if op == "send":
