@@ -79,6 +79,12 @@ even if the resulting request is later declined. The request is privately relaye
 introducer's two existing encrypted contact sessions; it does not publish either person in a
 directory and does not reveal an opt-in request address.
 
+Replaying the same valid request at the introducer does not queue another forward: each
+introduction-and-requester pair is forwarded at most once. If you already have a pending contact
+for the introduced person, its pinned node must match the introduction and the name you chose for
+it is preserved. For a new pending contact, the displayed name is explicitly marked as supplied by
+someone else rather than as a name you chose.
+
 The address's rendezvous key (`ik`) is public by design: the address gives its holder only a way to
 **ask**, never a way to message, receive starter credit, or become a contact. The v1 listener handles
 one pairing at a time, so a flood can slow it down; relay limits and the local caps bound the damage

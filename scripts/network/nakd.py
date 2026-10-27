@@ -1349,6 +1349,8 @@ class Node:
         existing = self.store.contact(introduced["person"])
         if existing and existing.get("state") == "active":
             raise ValueError("already connected to the introduced person")
+        if existing and existing.get("node") != introduced["node"]:
+            raise ValueError("introduction cannot be accepted: existing contact node does not match")
         introducer = self.store.contact(statement["introducer"])
         if not introducer or introducer.get("state") != "active":
             raise ValueError("introduction cannot be accepted: introducer is no longer a contact")
@@ -1374,8 +1376,8 @@ class Node:
             raise ValueError("introduction is no longer pending")
         # As with redeem(), be ready on the ordinary pairwise rendezvous before C accepts.
         try:
-            self.store.upsert_contact(introduced["person"], introduced["node"], "awaiting",
-                                      introduced["display_name"], name_src="yours")
+            self.store.prepare_intro_contact(
+                introduced["person"], introduced["node"], introduced["display_name"])
             queued = self._queue(
                 introducer["person"], "msg", self._intro_request_wire(INTRO_REQUEST_ASPECT, request))
         except Exception:
@@ -1441,6 +1443,10 @@ class Node:
         if env.get("kind") != "contact.request" or env.get("from_node") != sender["node"] or \
                 env.get("to") != introduced["person"] or env.get("body_sha256") != body_hash(request_body):
             raise ValueError("introduction contact request is not bound to its requester and recipient")
+        self._queue_preflight(introduced["person"], "msg")
+        if not self.store.claim_intro_forward(
+                statement["intro_id"], sender["person"], now=int(self._clock())):
+            return statement
         self.store.raw_log({"received": int(self._clock()), "source": "nakshatra", "trust": "external",
                             "from_person": sender["person"], "envelope": outer_env, "body": body})
         self._queue(introduced["person"], "msg",

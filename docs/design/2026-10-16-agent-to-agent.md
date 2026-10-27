@@ -195,7 +195,7 @@ other keys in the vault; do not make a second copy beside the network database.
 2. **Opt-in listing:** a person may choose to publish a display name + a "request to connect" address
    on the pillar. Off by default; nobody is listed unless they ask.
 
-#### D8.1. Contact introductions — BUILT (v1, 2026-10-26)
+#### D8.1. Contact introductions — BUILT + REVIEW-HARDENED (v1, 2026-10-26)
 
 `nak introduce <contact-B> <contact-C> [--note "..."]` sends B a node-signed, expiring statement
 and mirrors the same bytes to C. A must currently have both people as accepted contacts. The
@@ -220,6 +220,12 @@ statement match, the statement is live and names B as `to`, B is not blocked, an
 delivery grant has not been revoked. A trusted-operator suspension of A also invalidates it. All
 denials exposed back across the relay use the same generic response. Each `intro_id` is permanently
 single-use for a requester at C, including after the resulting request is declined or expires.
+The introducer also keeps a permanent per-`(intro_id, requester)` forward tombstone, so replaying a
+valid carried request cannot grow its outbox toward the introduced person. On the requester, an
+existing non-active contact row is reused only when its pinned node matches the introduction; its
+locally chosen petname is never replaced by introducer-supplied text. A newly created awaiting row
+marks that display name as externally supplied (`self-chosen` in the existing name-source vocabulary),
+never `yours`.
 
 MCP exposes `nak_introduce`, `nak_intros`, `nak_intro_accept`, and `nak_intro_decline`. Their
 descriptions explicitly frame introductions as external data, never instructions or authority.

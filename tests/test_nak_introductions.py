@@ -51,6 +51,16 @@ def _forward_frame(a, c, intro_id):
     return None
 
 
+def _frames_with_aspect(sender, recipient, aspect):
+    frames = []
+    for (mid,) in sender.node.store._q(
+            "SELECT nonce FROM outbox WHERE to_person=? ORDER BY created,nonce", (recipient.person_pub,)):
+        frame = sender.node.store.outbox_frame(mid, recipient.person_pub)
+        if frame and (frame.get("body") or {}).get("aspect") == aspect:
+            frames.append(frame)
+    return frames
+
+
 def test_three_node_happy_path_stays_a_request_until_person_accepts(net):
     a, b, c = _triad(net)
     result = _introduce(a, b, c)
@@ -69,7 +79,11 @@ def test_three_node_happy_path_stays_a_request_until_person_accepts(net):
 
     accepted = b.node.intro_accept(result["intro_id"])
     assert accepted["state"] == "request queued"
-    assert (b.node.store.contact(c.person_pub) or {})["state"] == "awaiting"
+    awaiting = b.node.store.contact(c.person_pub) or {}
+    assert awaiting["state"] == "awaiting"
+    assert awaiting["petname"] == "c" and awaiting["name_src"] == "self-chosen"
+    assert b.node.store._q(
+        "SELECT petname FROM contacts WHERE person=?", (c.person_pub,))[0][0].startswith("enc1:")
     with pytest.raises(ValueError, match="not been accepted"):
         b.node.send("c", "must not flow yet")
     assert wait(lambda: len(c.node.store.requests()) == 1)
@@ -85,6 +99,60 @@ def test_three_node_happy_path_stays_a_request_until_person_accepts(net):
     mid = b.node.send("c", "hello after your acceptance")["queued"]
     assert wait(lambda: b.node.delivered(mid))
     assert c.node.store.inbox()[0]["text"] == "hello after your acceptance"
+
+
+def test_intro_accept_refuses_existing_contact_on_another_node_without_mutating_it(net):
+    a, b, c = _triad(net)
+    result = _introduce(a, b, c)
+    b.node.store.upsert_contact(
+        c.person_pub, "f0" * 32, "awaiting", "my existing name", "existing nickname",
+        name_src="yours")
+    before = b.node.store.contact(c.person_pub)
+
+    with pytest.raises(ValueError, match="existing contact node does not match"):
+        b.node.intro_accept(result["intro_id"])
+
+    assert b.node.store.contact(c.person_pub) == before
+    assert b.node.store.introduction(result["intro_id"])["status"] == "pending"
+    assert c.node.store.requests() == []
+
+
+def test_intro_accept_preserves_existing_petname_for_the_same_node(net):
+    a, b, c = _triad(net)
+    result = _introduce(a, b, c)
+    b.node.store.upsert_contact(
+        c.person_pub, c.node.node, "awaiting", "my chosen name", "existing nickname",
+        name_src="yours")
+
+    b.node.intro_accept(result["intro_id"])
+
+    contact = b.node.store.contact(c.person_pub)
+    assert contact["state"] == "awaiting"
+    assert contact["petname"] == "my chosen name"
+    assert contact["nickname"] == "existing nickname"
+    assert contact["name_src"] == "yours"
+
+
+def test_replayed_valid_intro_request_is_forwarded_only_once(net):
+    a, b, c = _triad(net)
+    result = _introduce(a, b, c)
+    b.node.intro_accept(result["intro_id"])
+    assert wait(lambda: len(c.node.store.requests()) == 1)
+    assert wait(lambda: len(_frames_with_aspect(a, c, nakd.INTRO_FORWARD_ASPECT)) == 1)
+    request_frames = _frames_with_aspect(b, a, nakd.INTRO_REQUEST_ASPECT)
+    assert len(request_frames) == 1
+    request_body = {key: value for key, value in request_frames[0]["body"].items() if key != "mid"}
+
+    replay_mids = [
+        b.node._queue(a.person_pub, "msg", request_body, touch=False)
+        for _ in range(8)
+    ]
+
+    assert wait(lambda: all(b.node.store.delivered(mid) for mid in replay_mids))
+    assert len(_frames_with_aspect(a, c, nakd.INTRO_FORWARD_ASPECT)) == 1
+    assert a.node.store._q(
+        "SELECT intro_id,requester FROM intro_forwarded") == [
+            (result["intro_id"], b.person_pub)]
 
 
 def test_expired_intro_is_visible_as_invalid_and_cannot_send_a_request(net):
