@@ -11,6 +11,13 @@ direct-only transport, per-worker cumulative receipts, session isolation) carrie
   and transact from their own wallets.
 - Adding Nakshatra to a harness creates the user's wallet automatically, on their own device, with
   no extra steps: one onboarding script, idempotent.
+- **Nakshatra runs nothing in the money path and controls nothing.** The network is open source;
+  users interact with the program directly. No fee sponsorship, no Nakshatra-run crank, no pause
+  switch. Users hold the SOL for their own transactions.
+- **The treasury fee is 3%**, for R&D, fixed in the program.
+
+These owner revisions override any earlier wording below that assumes a sponsor, a crank, a pause
+switch, a launch cap or a Nakshatra-held arbiter (see §14).
 
 Unit: USDC (classic SPL token, 6 decimals).
 
@@ -26,10 +33,9 @@ vault. Money leaves an escrow only three ways, all enforced by the program:
 
 Agents pay without a human per request through an on-chain **delegate**: a session key with a
 lifetime cap and expiry, which the wallet registers once. The Neuron ledger stops being money; it
-becomes the admission meter and the channel book, a read model of the chain plus vouchers. The hub
-runs a **crank** that submits redeems and timeouts, pays SOL, and holds no authority, plus the
-existing indexer/reconcile loop repurposed to program events. Fees land in a multisig-owned token
-account.
+becomes the admission meter and the channel book, a read model of the chain plus vouchers. Redeems
+and timeouts are permissionless: each worker's own node submits them and pays its own fees.
+Nakshatra runs no service in the money path. A 3% fee lands in the R&D treasury's token account.
 
 ## 1. Decision and the alternatives rejected
 
@@ -442,3 +448,27 @@ outreach loop.
 
 The devnet defaults (5 USDC / 30-day delegate, 1 USDC per transaction, the 20 USDC backup warning,
 0.02 SOL/day sponsorship) can each be changed with one config line.
+
+## 14. Owner revisions (Biswa, 2026-10-26) — these override earlier sections
+
+1. **No fee sponsorship.** Drop §13.4 item 1, the `POST /pay/sponsor` route and milestone M4b. Users
+   hold the SOL for their own transactions (about 0.01 SOL once for rent, refunded on close, plus
+   ~0.000005 SOL per transaction). Onboarding (§13.1) creates the wallet and prints its address; the
+   user funds it with USDC and a little SOL. `rent_payer` is always the signer who created the account.
+2. **No Nakshatra-run crank.** Redeem and `task_timeout` stay permissionless. The worker's own node
+   runs the redeemer (when its unredeemed total passes a threshold or once a day) and pays its own
+   fees. The crank code in M5 becomes part of the worker node, not a hub service.
+3. **Fee: 3%** (`fee_bps = 300`), paid to the R&D treasury's USDC token account.
+4. **No pause switch and no `max_escrow_amount`.** Both are operator controls; remove them from
+   `Config`. Indexer and reconcile become optional open-source monitoring tools with no kill switch,
+   because there is nothing custodial to stop.
+5. **No control after launch.** Devnet stays upgradeable while building. On mainnet the program is
+   deployed after the audit with `fee_bps` and the fee wallet fixed, then the upgrade authority is
+   revoked (`--final`) and no config authority remains. Nobody, including Nakshatra, can then change
+   the rules or touch user funds. §8's upgrade/config rows apply only to devnet.
+6. **Task disputes — PENDING Biswa's call.** A Nakshatra-held arbiter is a form of control.
+   Recommended: (a) a **per-task arbiter** named by payer and worker at `task_open` (or none); the
+   program enforces it exactly as §5 describes, and with none the dispute resolves by the 14-day
+   backstop. Alternatives: (b) no arbiter at all (a dispute splits 50/50 or refunds after the
+   backstop); (c) keep a Nakshatra arbiter. §2.2's `task_resolve` changes from `config.arbiter` to
+   `task.arbiter`.
