@@ -5,8 +5,8 @@
         --ref nakshatra=<commit-or-branch> --ref sthambha=<commit-or-branch> \
         --release-key ~/.nakshatra-release/release-TEST.key --out ~/nakshatra-dist
 
-Or replace --release-key with --release-signer CMD --release-pubkey HEX. CMD receives canonical
-bytes on stdin and prints a hex Ed25519 signature, which is verified locally before publication.
+Or replace --release-key with --release-signer CMD --release-pubkey HEX, or with
+--release-broker CONFIG_DIR for one biometric approval covering both signed objects.
 
 Output, under <out>/<channel>/<version>/:
     nakshatra-<commit12>.tar.gz   git archive plus static sidecar built from that exact commit
@@ -36,6 +36,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import releasekit as rk  # noqa: E402
+import broker_signer  # noqa: E402
 
 LATEST_TTL_S = 60 * 86400        # the signed "latest" pointer is refused after this (republish to extend)
 PINNED_GO_VERSION = "go1.25.7"
@@ -258,10 +259,11 @@ def _sign_object(obj: dict, key_path: Path | None, release_signer: str | None,
 
 def build(version: str, channel: str, refs: dict, key_path: Path | None, out_root: Path,
           uv_bin: Path, now: int | None = None, go_bin: Path | None = None, *,
-          release_signer: str | None = None, release_pubkey: str | None = None) -> Path:
+          release_signer: str | None = None, release_pubkey: str | None = None,
+          release_broker: Path | None = None) -> Path:
     now = int(now if now is not None else time.time())
-    if (key_path is None) == (release_signer is None):
-        raise ValueError("choose exactly one of release-key and release-signer")
+    if sum(value is not None for value in (key_path, release_signer, release_broker)) != 1:
+        raise ValueError("choose exactly one of release-key, release-signer, and release-broker")
     if release_signer is not None and release_pubkey is None:
         raise ValueError("release-pubkey is required with release-signer")
     spec = _spec_from_refs(refs)
@@ -347,15 +349,20 @@ def build(version: str, channel: str, refs: dict, key_path: Path | None, out_roo
     if package_signers is not None:
         manifest["package_signers"] = package_signers
     try:
-        signed = _sign_object(manifest, key_path, release_signer, release_pubkey)
-        manifest_text = json.dumps(signed, indent=1, sort_keys=True)
-        manifest_sha256 = hashlib.sha256(manifest_text.encode()).hexdigest()
-        # Obtain and verify BOTH broker approvals before making the version or pointer visible.
-        latest = _sign_object(
-            {"schema": "nak-release-latest/1", "channel": channel, "version": version,
-             "manifest_sha256": manifest_sha256, "created": now,
-             "expires_at": now + LATEST_TTL_S},
-            key_path, release_signer, release_pubkey)
+        if release_broker is not None:
+            # One approved batch; broker_signer binds item 1 to the locally reconstructed signed
+            # manifest and verifies both returned bytes and signatures before returning either.
+            signed, latest = broker_signer.sign_release(manifest, release_broker)
+            manifest_text = json.dumps(signed, indent=1, sort_keys=True)
+        else:
+            signed = _sign_object(manifest, key_path, release_signer, release_pubkey)
+            manifest_text = json.dumps(signed, indent=1, sort_keys=True)
+            manifest_sha256 = hashlib.sha256(manifest_text.encode()).hexdigest()
+            latest = _sign_object(
+                {"schema": "nak-release-latest/1", "channel": channel, "version": version,
+                 "manifest_sha256": manifest_sha256, "created": now,
+                 "expires_at": now + LATEST_TTL_S},
+                key_path, release_signer, release_pubkey)
     except Exception:
         shutil.rmtree(out, ignore_errors=True)
         raise
@@ -369,6 +376,37 @@ def build(version: str, channel: str, refs: dict, key_path: Path | None, out_roo
     return final_out
 
 
+def refresh_latest_pointer(version: str, channel: str, out_root: Path,
+                           release_broker: Path, now: int | None = None) -> Path:
+    """Re-sign latest.json for an existing, broker-key-signed immutable version."""
+    now = int(time.time()) if now is None else int(now)
+    manifest_path = out_root / channel / version / "manifest.json"
+    try:
+        manifest_raw = manifest_path.read_bytes()
+        manifest = json.loads(manifest_raw)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"cannot load existing release manifest {manifest_path}") from exc
+    public_hex = broker_signer.load_release_public(release_broker)
+    if (not isinstance(manifest, dict) or manifest.get("version") != version
+            or manifest.get("channel") != channel or not rk.verify(manifest, public_hex)):
+        raise RuntimeError("existing release manifest is not valid for the broker release key")
+    unsigned = {
+        "schema": "nak-release-latest/1",
+        "channel": channel,
+        "version": version,
+        "manifest_sha256": hashlib.sha256(manifest_raw).hexdigest(),
+        "created": now,
+        "expires_at": now + LATEST_TTL_S,
+    }
+    latest = broker_signer.refresh_latest(unsigned, release_broker)
+    channel_dir = out_root / channel
+    latest_path = channel_dir / "latest.json"
+    latest_tmp = channel_dir / f".latest.json.{os.getpid()}.tmp"
+    latest_tmp.write_text(json.dumps(latest, indent=1, sort_keys=True))
+    os.replace(latest_tmp, latest_path)
+    return latest_path
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--version", required=True)
@@ -377,6 +415,8 @@ def main(argv=None) -> int:
     signer = ap.add_mutually_exclusive_group(required=True)
     signer.add_argument("--release-key", type=Path)
     signer.add_argument("--release-signer", help="command reading canonical bytes and printing hex Ed25519 signature")
+    signer.add_argument("--release-broker", type=Path,
+                        help="directory containing release-broker.json and release.pub")
     ap.add_argument("--release-pubkey", help="lowercase hex Ed25519 public key for --release-signer")
     ap.add_argument("--out", type=Path, default=Path.home() / "nakshatra-dist")
     ap.add_argument("--uv", type=Path, default=Path(shutil.which("uv") or "uv"))
@@ -385,10 +425,11 @@ def main(argv=None) -> int:
     refs = dict(r.split("=", 1) for r in a.ref)
     if a.release_signer and not a.release_pubkey:
         ap.error("--release-pubkey is required with --release-signer")
-    if a.release_key and a.release_pubkey:
+    if (a.release_key or a.release_broker) and a.release_pubkey:
         ap.error("--release-pubkey is only valid with --release-signer")
     out = build(a.version, a.channel, refs, a.release_key, a.out, a.uv, go_bin=a.go,
-                release_signer=a.release_signer, release_pubkey=a.release_pubkey)
+                release_signer=a.release_signer, release_pubkey=a.release_pubkey,
+                release_broker=a.release_broker)
     print(f"built {out}")
     return 0
 

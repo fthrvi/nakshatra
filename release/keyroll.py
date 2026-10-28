@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 
 import releasekit as rk
+import broker_signer
 
 
 def _private_signer(path: Path, expected_pubkey: str | None = None):
@@ -64,15 +65,38 @@ def _add_signer_args(parser: argparse.ArgumentParser, side: str) -> None:
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument(f"--{side}-key", type=Path, help=f"file containing the {side} private key")
     group.add_argument(f"--{side}-signer", help=f"external command signing canonical bytes on stdin")
+    if side == "new":
+        group.add_argument("--new-broker", type=Path,
+                           help="directory containing release-broker.json and release.pub")
     parser.add_argument(f"--{side}-pubkey", help=f"lowercase hex {side} public key (required for signer)")
 
 
 def _link_from_args(args) -> dict:
     old_pub, old_sign = _signer(args, "old")
-    new_pub, new_sign = _signer(args, "new")
-    return make_link(old_pubkey=old_pub, old_sign=old_sign,
-                     new_pubkey=new_pub, new_sign=new_sign,
-                     issued_at=args.issued_at, reason=args.reason)
+    if args.new_broker is None:
+        new_pub, new_sign = _signer(args, "new")
+        return make_link(old_pubkey=old_pub, old_sign=old_sign,
+                         new_pubkey=new_pub, new_sign=new_sign,
+                         issued_at=args.issued_at, reason=args.reason)
+    if args.old_key is None:
+        raise ValueError("--new-broker requires the old side to use --old-key FILE")
+    broker_pub = broker_signer.load_release_public(args.new_broker)
+    new_pub = args.new_pubkey or broker_pub
+    if new_pub != broker_pub:
+        raise broker_signer.BrokerSigningError("key-roll new_pubkey does not match release.pub")
+    statement = {
+        "schema": rk.KEYROLL_SCHEMA,
+        "old_pubkey": old_pub,
+        "new_pubkey": new_pub,
+        "issued_at": args.issued_at,
+        "reason": args.reason,
+    }
+    message = rk.canonical_keyroll(statement)
+    link = dict(
+        statement, sig_old=old_sign(message),
+        sig_new=broker_signer.sign_keyroll_new(statement, args.new_broker))
+    rk.validate_keyroll_chain([link])
+    return link
 
 
 def main(argv=None) -> int:

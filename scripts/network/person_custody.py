@@ -9,15 +9,15 @@ import json
 import os
 import re
 import secrets
-import stat
 import time
 import unicodedata
 import urllib.error
 import urllib.parse
-import urllib.request
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from release import broker_transport
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric import ed25519
@@ -62,10 +62,7 @@ _BROKER_RETRY_INITIAL_S = 0.1
 _BROKER_RETRY_MAX_S = 1.0
 
 
-@dataclass(frozen=True)
-class _BrokerConfig:
-    url: str
-    token: str
+_BrokerConfig = broker_transport.BrokerConfig
 
 
 @dataclass(frozen=True, init=False)
@@ -169,50 +166,8 @@ def plain(text: object, limit: int) -> str:
 
 def _read_owned_regular(path: Path, label: str, *, exact_mode: int | None = None,
                         max_bytes: int = 16 * 1024) -> bytes:
-    """Read a small euid-owned file without following or racing a symlink."""
-    try:
-        before = path.lstat()
-    except FileNotFoundError:
-        raise
-    except OSError as exc:
-        raise SystemExit(f"cannot read {label} {path}: {exc}") from exc
-    mode = stat.S_IMODE(before.st_mode)
-    if not stat.S_ISREG(before.st_mode):
-        raise SystemExit(f"{label} {path} must be a regular file")
-    if before.st_uid != os.geteuid():
-        raise SystemExit(f"{label} {path} must be owned by the effective user")
-    if exact_mode is not None:
-        if mode != exact_mode:
-            raise SystemExit(f"{label} {path} must have mode {exact_mode:04o}")
-    elif mode & 0o022:
-        raise SystemExit(f"{label} {path} must not be group/world writable")
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
-    try:
-        fd = os.open(str(path), flags)
-    except OSError as exc:
-        raise SystemExit(f"cannot read {label} {path}: {exc}") from exc
-    try:
-        after = os.fstat(fd)
-        if (not stat.S_ISREG(after.st_mode) or after.st_uid != os.geteuid()
-                or (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino)):
-            raise SystemExit(f"{label} {path} changed while it was being opened")
-        after_mode = stat.S_IMODE(after.st_mode)
-        if ((exact_mode is not None and after_mode != exact_mode)
-                or (exact_mode is None and after_mode & 0o022)):
-            raise SystemExit(f"{label} {path} permissions changed while it was being opened")
-        if not 0 < after.st_size <= max_bytes:
-            raise SystemExit(f"{label} {path} is empty or too large")
-        raw = b""
-        while len(raw) <= max_bytes:
-            chunk = os.read(fd, min(4096, max_bytes + 1 - len(raw)))
-            if not chunk:
-                break
-            raw += chunk
-        if not raw or len(raw) > max_bytes:
-            raise SystemExit(f"{label} {path} is empty or too large")
-        return raw
-    finally:
-        os.close(fd)
+    return broker_transport.read_owned_regular(
+        path, label, exact_mode=exact_mode, max_bytes=max_bytes)
 
 
 def custody_mode(*, net_dir: Path | None = None) -> str:
@@ -305,38 +260,13 @@ def _read_private_token(path: Path) -> str:
 
 def _broker_config(*, net_dir: Path | None = None) -> _BrokerConfig:
     path = _broker_config_path(net_dir)
-    try:
-        raw = _read_owned_regular(path, "person broker configuration")
-        document = json.loads(raw.decode("utf-8"))
-    except FileNotFoundError as exc:
-        raise SystemExit(f"person custody is broker but configuration is missing: {path}") from exc
-    except (UnicodeError, json.JSONDecodeError) as exc:
-        raise SystemExit(f"invalid person broker configuration {path}") from exc
-    if not isinstance(document, dict) or set(document) != {"url", "token_file"}:
-        raise SystemExit(
-            f"invalid person broker configuration {path}: expected only url and token_file")
-    url, token_file = document.get("url"), document.get("token_file")
-    if not isinstance(url, str) or not isinstance(token_file, str) or not token_file:
-        raise SystemExit(f"invalid person broker configuration {path}: url and token_file must be text")
-    parsed = urllib.parse.urlsplit(url)
-    try:
-        port = parsed.port
-    except ValueError as exc:
-        raise SystemExit(f"invalid person broker URL in {path}: {exc}") from exc
-    if (parsed.scheme != "http" or not parsed.hostname or port is None or parsed.username is not None
-            or parsed.password is not None or parsed.path not in {"", "/"}
-            or parsed.query or parsed.fragment):
-        raise SystemExit(
-            f"invalid person broker URL in {path}: expected http://host:port with no path")
-    return _BrokerConfig(url=url.rstrip("/"), token=_read_private_token(Path(token_file)))
+    return broker_transport.load_broker_config(
+        path, subject="person",
+        missing_message="person custody is broker but configuration is missing: {path}")
 
 
-class _NoBrokerRedirects(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, _req, _fp, _code, _msg, _headers, _newurl):
-        return None
-
-
-_BROKER_OPENER = urllib.request.build_opener(_NoBrokerRedirects)
+_NoBrokerRedirects = broker_transport.NoBrokerRedirects
+_BROKER_OPENER = broker_transport.BROKER_OPENER
 
 
 _BROKER_ERROR_IDS = {
@@ -413,50 +343,20 @@ def _broker_error_info(path: str, exc: urllib.error.HTTPError) -> tuple[str, boo
             document.get("retryable") is True)
 
 
-class _BrokerTransient(Exception):
-    """A transport or broker-declared transient failure safe to retry in one act."""
-
-    def __init__(self, message: str):
-        super().__init__(message)
-        self.message = message
-
-
-class _BrokerAlreadySigned(Exception):
-    """The broker consumed this request, but its successful reply was lost."""
+_BrokerTransient = broker_transport.BrokerTransient
+_BrokerAlreadySigned = broker_transport.BrokerAlreadySigned
 
 
 def _broker_json(config: _BrokerConfig, method: str, path: str,
                  body: dict | None = None, *, timeout: float = _BROKER_TIMEOUT_S,
                  retry_transient: bool = False) -> dict:
-    data = None if body is None else json.dumps(body, separators=(",", ":")).encode("utf-8")
-    headers = {"Authorization": f"Bearer {config.token}"}
-    if data is not None:
-        headers["Content-Type"] = "application/json"
-    request = urllib.request.Request(
-        config.url + path, data=data, headers=headers, method=method)
-    try:
-        with _BROKER_OPENER.open(request, timeout=timeout) as response:
-            result = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        error_id, broker_retryable = _broker_error_info(path, exc)
-        message = (f"approval service error (HTTP {exc.code}, code {error_id})"
-                   if error_id else f"approval service error (HTTP {exc.code})")
-        if retry_transient and error_id == "already-signed":
-            raise _BrokerAlreadySigned from None
-        if retry_transient and (int(exc.code) in {502, 503, 504} or broker_retryable):
-            raise _BrokerTransient(message) from None
-        raise SystemExit(message) from None
-    except (OSError, urllib.error.URLError, TimeoutError, ConnectionError):
-        message = "person broker is unavailable; nothing was signed"
-        if retry_transient:
-            raise _BrokerTransient(message) from None
-        raise SystemExit(message) from None
-    except (UnicodeError, ValueError, json.JSONDecodeError):
-        raise SystemExit(
-            "person broker is unavailable or returned invalid data; nothing was signed") from None
-    if not isinstance(result, dict):
-        raise SystemExit("person broker returned invalid data; nothing was signed")
-    return result
+    return broker_transport.request_json(
+        config, method, path, body, opener=_BROKER_OPENER, timeout=timeout,
+        error_info=_broker_error_info,
+        unavailable_message="person broker is unavailable; nothing was signed",
+        invalid_message="person broker is unavailable or returned invalid data; nothing was signed",
+        non_object_message="person broker returned invalid data; nothing was signed",
+        retry_transient=retry_transient)
 
 
 def _uncertain_broker_failure(phase: str, request_id: str, detail: str) -> SystemExit:
@@ -471,34 +371,19 @@ def _uncertain_broker_failure(phase: str, request_id: str, detail: str) -> Syste
 def _broker_json_until(config: _BrokerConfig, method: str, path: str,
                        body: dict | None, *, deadline: float,
                        request_id: str, phase: str, act: PersonAct) -> dict:
-    """Retry one result/sign request with bounded backoff inside the act deadline."""
-    delay = _BROKER_RETRY_INITIAL_S
-    while True:
-        _assert_act_mode(act)
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise _uncertain_broker_failure(
-                phase, request_id, "person approval deadline expired after a transient failure")
-        try:
-            return _broker_json(
-                config, method, path, body,
-                timeout=min(_BROKER_TIMEOUT_S, remaining), retry_transient=True)
-        except _BrokerAlreadySigned:
-            if phase != "sign":
-                raise SystemExit("person broker returned an invalid signing state") from None
-            raise SystemExit(
-                "the person-signing request was signed and consumed, but its signatures "
-                "were lost in transit; nothing was sent or written. Starting the act again "
-                "will ask for a new approval") from None
-        except _BrokerTransient as exc:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise _uncertain_broker_failure(phase, request_id, exc.message) from None
-            sleep_for = min(delay, remaining)
-            time.sleep(sleep_for)
-            delay = min(_BROKER_RETRY_MAX_S, max(delay * 2, _BROKER_RETRY_INITIAL_S))
-        except SystemExit as exc:
-            raise _uncertain_broker_failure(phase, request_id, str(exc)) from None
+    return broker_transport.request_json_until(
+        lambda req_method, req_path, req_body, **kwargs: _broker_json(
+            config, req_method, req_path, req_body, **kwargs),
+        method, path, body, deadline=deadline, request_id=request_id, phase=phase,
+        assert_current=lambda: _assert_act_mode(act), uncertain_failure=_uncertain_broker_failure,
+        deadline_detail="person approval deadline expired after a transient failure",
+        invalid_state_detail="person broker returned an invalid signing state",
+        already_signed_detail=(
+            "the person-signing request was signed and consumed, but its signatures "
+            "were lost in transit; nothing was sent or written. Starting the act again "
+            "will ask for a new approval"),
+        timeout_s=_BROKER_TIMEOUT_S, retry_initial_s=_BROKER_RETRY_INITIAL_S,
+        retry_max_s=_BROKER_RETRY_MAX_S)
 
 
 def broker_preflight(kind: str, summary: str) -> PersonAct:
