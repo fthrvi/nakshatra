@@ -1,4 +1,4 @@
-"""Shared, fail-closed transport helpers for local approval-broker clients."""
+"""Shared, fail-closed transport helpers for node and release approval-broker clients."""
 from __future__ import annotations
 
 import json

@@ -7,16 +7,19 @@ import hashlib
 import json
 import re
 import secrets
+import sys
 import time
 import urllib.error
 import urllib.parse
 from pathlib import Path
 
+_SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
+sys.path.insert(0, str(_SCRIPTS))
+from network import broker_transport  # noqa: E402
+
 try:  # Package import for installed code; direct import for release/*.py command-line tools.
-    from . import broker_transport
     from . import releasekit as rk
 except ImportError:  # pragma: no cover - exercised by the command-line module layout.
-    import broker_transport
     import releasekit as rk
 
 

@@ -387,7 +387,8 @@ def refresh_latest_pointer(version: str, channel: str, out_root: Path,
     except (OSError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"cannot load existing release manifest {manifest_path}") from exc
     public_hex = broker_signer.load_release_public(release_broker)
-    if (not isinstance(manifest, dict) or manifest.get("version") != version
+    if (not isinstance(manifest, dict) or manifest.get("schema") != rk.MANIFEST_SCHEMA
+            or manifest.get("version") != version
             or manifest.get("channel") != channel or not rk.verify(manifest, public_hex)):
         raise RuntimeError("existing release manifest is not valid for the broker release key")
     unsigned = {

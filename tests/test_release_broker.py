@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -255,3 +256,51 @@ def test_refresh_latest_happy_path_uses_refresh_kind(release_env):
         assert [request["exact_content"]["kind"] for request in broker.enqueues] == [
             "release", "refresh"]
         assert broker.sign_calls == 2
+
+
+def test_refresh_refuses_signed_latest_masquerading_as_manifest(release_env):
+    with _broker_config(release_env["tmp"]) as (broker, config, _private):
+        version_dir = _build(release_env, config)
+        latest_path = release_env["dist"] / "canary" / "latest.json"
+        signed_latest = latest_path.read_bytes()
+        latest_path.unlink()
+        (version_dir / "manifest.json").write_bytes(signed_latest)
+
+        with pytest.raises(RuntimeError, match="not valid for the broker release key"):
+            B.refresh_latest_pointer(
+                "1.2.3", "canary", release_env["dist"], config, now=456)
+
+        assert not latest_path.exists()
+        assert len(broker.enqueues) == 1
+        assert broker.sign_calls == 1
+
+
+def test_installed_node_imports_need_only_scripts_and_sthambha(tmp_path):
+    repo = Path(__file__).resolve().parent.parent
+    candidates = (
+        os.environ.get("NAK_STHAMBHA_PATH", ""),
+        *os.environ.get("PYTHONPATH", "").split(os.pathsep),
+        str(Path.home() / "sthambha"),
+        str(Path.home() / "sthambha-signer"),
+        str(repo.parent / "sthambha"),
+        "/home/prithvi/sthambha",
+    )
+    sthambha = next(
+        (Path(candidate) for candidate in candidates
+         if candidate and (Path(candidate) / "sthambha" / "signer.py").exists()),
+        None,
+    )
+    assert sthambha is not None, "the node-import regression needs a Sthambha checkout"
+    scripts = repo / "scripts"
+    code = (
+        "import sys; "
+        f"roots = [{str(scripts)!r}, {str(sthambha)!r}]; "
+        "sys.path[:0] = roots; "
+        "assert sys.path[:2] == roots; "
+        f"assert {str(repo)!r} not in sys.path; "
+        "import network.person_custody, network.nak, network.nakd"
+    )
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", code], cwd=tmp_path,
+        text=True, capture_output=True, check=False)
+    assert result.returncode == 0, result.stderr
