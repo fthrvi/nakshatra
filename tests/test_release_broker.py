@@ -334,3 +334,38 @@ def test_malformed_broker_status_line_is_never_reflected():
     listener.close()
     assert "BROKER-OUTPUT" not in str(caught.value)
     assert caught.value.__cause__ is None and caught.value.__suppress_context__
+
+
+def test_malformed_broker_error_body_is_never_reflected():
+    import socket
+    import threading
+
+    from network import broker_transport
+
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+
+    def serve():
+        conn, _ = listener.accept()
+        with conn:
+            conn.recv(65536)
+            conn.sendall(b"HTTP/1.1 500 REASON-SECRET\r\nTransfer-Encoding: chunked\r\n\r\n"
+                         b"zz-CHUNK-SECRET\r\n")
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    config = broker_transport.BrokerConfig(f"http://127.0.0.1:{listener.getsockname()[1]}", "tok")
+
+    def error_info(_path, exc):
+        return json.loads(exc.read().decode("utf-8"))["error"], False
+
+    with pytest.raises(SystemExit) as caught:
+        broker_transport.request_json(
+            config, "GET", "/pending/v1", error_info=error_info,
+            unavailable_message="approval service unavailable",
+            invalid_message="approval service returned an invalid reply")
+    thread.join(timeout=5)
+    listener.close()
+    assert "SECRET" not in str(caught.value)
+    assert caught.value.__cause__ is None and caught.value.__suppress_context__

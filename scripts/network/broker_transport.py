@@ -149,7 +149,10 @@ def request_json(config: BrokerConfig, method: str, path: str, body: dict | None
         with opener.open(request, timeout=timeout) as response:
             result = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        error_id, broker_retryable = error_info(path, exc)
+        try:
+            error_id, broker_retryable = error_info(path, exc)
+        except Exception:  # a malformed error body must not surface peer bytes in a traceback
+            error_id, broker_retryable = "", False
         message = (f"approval service error (HTTP {exc.code}, code {error_id})"
                    if error_id else f"approval service error (HTTP {exc.code})")
         if retry_transient and error_id == "already-signed":
