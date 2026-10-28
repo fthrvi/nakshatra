@@ -5,6 +5,7 @@ On create add a row (status=active, owner). On merge flip to `merged→<sha>`.
 
 | branch | sector | description | base | status | owner |
 |---|---|---|---|---|---|
+| release/broker-signer | release | Release signing through the approval broker (principal nakshatra-release): broker_signer client, build.py --release-broker (one approval per release), keyroll new side via broker. | forgejo/main@d84ee9f | active | codex for claude/trisul-aa network lane (hub) |
 | net/introductions | network | D8.1 contact-mediated, node-signed introductions with explicit third-person acceptance. | forgejo/main@aa44798 | merged→3509f27 | friends-onboarding lane via codex; landed by claude/trisul-aa network lane (hub) |
 | net/custody-card | network | Share node-signed, self-reported person-key custody mode with contacts and surface it in CLI/MCP listings. | forgejo/main@20f55d9 | merged→17a0b78 | friends-onboarding lane via codex; review fix + landed by claude/trisul-aa network lane (hub) |
 | net/nak-resolve | network | Human-only operator CLI for inspecting and resolving disputed Neuron task holds. | forgejo/main@817eb10 | merged→256f87d | codex for claude/trisul-aa network lane (hub) |
