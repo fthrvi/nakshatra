@@ -261,6 +261,7 @@ def build(version: str, channel: str, refs: dict, key_path: Path | None, out_roo
           uv_bin: Path, now: int | None = None, go_bin: Path | None = None, *,
           release_signer: str | None = None, release_pubkey: str | None = None,
           release_broker: Path | None = None) -> Path:
+    fixed_now = now is not None
     now = int(now if now is not None else time.time())
     if sum(value is not None for value in (key_path, release_signer, release_broker)) != 1:
         raise ValueError("choose exactly one of release-key, release-signer, and release-broker")
@@ -335,6 +336,10 @@ def build(version: str, channel: str, refs: dict, key_path: Path | None, out_roo
                            "satisfied_by": list(prof.get("satisfied_by", []))}
     shutil.copy2(uv_bin, out / "uv")
     uv_version = subprocess.check_output([str(uv_bin), "--version"], text=True).split()[1]
+    if not fixed_now:
+        # Stamp at signing time, not build start: artifact builds take minutes and the approval broker
+        # requires created (M and L share it) to be within 900 s of its own clock when it signs.
+        now = int(time.time())
     manifest = {"schema": rk.MANIFEST_SCHEMA, "name": spec["name"], "version": version, "channel": channel,
                 "created": now, "python": spec["python"], "compat_major": int(version.split(".")[0]),
                 "components": components,
