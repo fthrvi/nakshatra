@@ -304,3 +304,33 @@ def test_installed_node_imports_need_only_scripts_and_sthambha(tmp_path):
         [sys.executable, "-I", "-c", code], cwd=tmp_path,
         text=True, capture_output=True, check=False)
     assert result.returncode == 0, result.stderr
+
+
+def test_malformed_broker_status_line_is_never_reflected():
+    import socket
+    import threading
+
+    from network import broker_transport
+
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+
+    def serve():
+        conn, _ = listener.accept()
+        with conn:
+            conn.recv(65536)
+            conn.sendall(b"BROKER-OUTPUT-SECRET\r\n\r\n")
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    config = broker_transport.BrokerConfig(f"http://127.0.0.1:{listener.getsockname()[1]}", "tok")
+    with pytest.raises(SystemExit) as caught:
+        broker_transport.request_json(
+            config, "GET", "/pending/v1", error_info=lambda _p, _e: ("", False),
+            unavailable_message="approval service unavailable",
+            invalid_message="approval service returned an invalid reply")
+    thread.join(timeout=5)
+    listener.close()
+    assert "BROKER-OUTPUT" not in str(caught.value)
+    assert caught.value.__cause__ is None and caught.value.__suppress_context__

@@ -1,6 +1,7 @@
 """Shared, fail-closed transport helpers for node and release approval-broker clients."""
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import stat
@@ -156,7 +157,9 @@ def request_json(config: BrokerConfig, method: str, path: str, body: dict | None
         if retry_transient and (int(exc.code) in {502, 503, 504} or broker_retryable):
             raise BrokerTransient(message) from None
         raise SystemExit(message) from None
-    except (OSError, urllib.error.URLError, TimeoutError, ConnectionError):
+    except (OSError, urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException):
+        # A malformed response (e.g. a garbage status line) carries peer bytes in its message; treat
+        # it like a dropped connection and never reflect it.
         if retry_transient:
             raise BrokerTransient(unavailable_message) from None
         raise SystemExit(unavailable_message) from None
