@@ -469,10 +469,15 @@ class Node:
             previous = self.store.own_custody_statement()
             checked = None
             if previous:
+                # Our own prior card is the monotonic floor. Verify it at the later of now and its
+                # own issued_at, so a backward clock correction cannot discard that floor and
+                # issue a lower-timestamp card that contacts would refuse as stale.
+                prior_issued = previous.get("issued_at") if isinstance(previous, dict) else None
+                verify_at = max(now, prior_issued) if type(prior_issued) is int else now
                 try:
                     checked = custody_card.verify(
-                        previous, expected_person=self.person, expected_node=self.node, now=now,
-                        allow_expired=True)
+                        previous, expected_person=self.person, expected_node=self.node,
+                        now=verify_at, allow_expired=True)
                 except ValueError:
                     checked = None
                 if checked and checked["mode"] == mode and \

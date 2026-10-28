@@ -213,3 +213,36 @@ def test_cli_and_mcp_contact_lists_label_self_report(monkeypatch, capsys):
 
     rendered = nak_mcp.Server(Client()).call("nak_contacts", {})
     assert "key custody: phone approval (self-reported by their node, 3d ago)" in rendered
+
+
+def test_backward_clock_correction_keeps_own_issued_at_monotonic(tmp_path, monkeypatch):
+    store = Store(tmp_path / "state", b"g" * 32)
+    node_key = ed25519.Ed25519PrivateKey.generate()
+    node = node_key.public_key().public_bytes_raw().hex()
+    _person_key, person = _keypair()
+    sender = object.__new__(nakd.Node)
+    sender.store = store
+    sender.person = person
+    sender.node = node
+    sender._key = node_key.private_bytes_raw()
+    sender._state_dir = tmp_path / "state"
+    sender._custody_lock = __import__("threading").Lock()
+    mode = {"value": "file"}
+    monkeypatch.setattr(person_custody, "custody_statement_mode", lambda **_kw: mode["value"])
+
+    sender._clock = lambda: 1000
+    first = sender._own_custody_statement()
+    assert first["issued_at"] == 1000
+
+    # The clock is corrected backward by more than the future-skew allowance, then custody changes.
+    sender._clock = lambda: 600
+    mode["value"] = "broker-biometric"
+    second = sender._own_custody_statement()
+    assert second["mode"] == "broker-biometric"
+    assert second["issued_at"] == 1001
+    assert store.own_custody_statement() == second
+
+    # A receiver that stored the first card accepts the rotation once its clock allows it.
+    receiver = Store(tmp_path / "receiver", b"h" * 32)
+    assert receiver.set_contact_custody_statement(person, first, received_at=1000) is True
+    assert receiver.set_contact_custody_statement(person, second, received_at=1001) is True
