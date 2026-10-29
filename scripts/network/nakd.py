@@ -1296,6 +1296,9 @@ class Node:
                 if (delegate["escrow"] != derived["escrow"]
                         or delegate["key"] != node_address):
                     raise ValueError("starter delegate account does not match the obligation")
+                # The obligation promises `cap` spendable from now: sufficient remaining capacity
+                # pays it; otherwise only `cap` becomes newly spendable via spent + cap.  A lost
+                # broadcast cannot replay here because every chain attempt is recorded before send.
                 usable = (
                     delegate["generation"] == escrow["generation"]
                     and not delegate["disabled"]

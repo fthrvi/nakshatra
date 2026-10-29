@@ -408,6 +408,23 @@ def test_expired_larger_cap_renews_with_exactly_signed_amount_spendable(
     assert struct.pack("<Q", larger) not in rpc.sent[0].message
 
 
+def test_active_delegate_adds_only_the_starter_to_remaining_capacity(
+        chain_node, monkeypatch):
+    node, wallet, row = chain_node
+    rpc = StarterRpc(
+        wallet, vault_amount=2_000_000, existing_cap=1_000_000, existing_spent=1,
+        existing_expires=1_800_000_000, node_balance=nakd.STARTER_NODE_SOL)
+    monkeypatch.setattr(pay_chain, "PayRpc", lambda _url: rpc)
+
+    node._chain_starter(row)
+
+    assert len(rpc.sent) == 1
+    args = (RECIPIENT + struct.pack(
+        "<QqB", 1_000_001, rpc.chain_now + 30 * 86400,
+        pay_chain.DELEGATE_OPEN_CHANNEL))
+    assert pay_chain.anchor_discriminator("delegate_set") + args in rpc.sent[0].message
+
+
 @pytest.mark.parametrize(("changes", "match"), [
     ({"vault_amount": 999_999}, "inviter escrow lacks 1.000000 USDC"),
     ({"wallet_balance": 1, "vault_amount": 2_000_000}, "wallet lacks SOL"),
