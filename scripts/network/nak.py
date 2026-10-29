@@ -834,6 +834,63 @@ def _pay_limits_path() -> Path:
     return Path.home() / ".nakshatra" / "pay" / "limits.json"
 
 
+def _pay_backup_ack_path() -> Path:
+    return _pay_limits_path().with_name("backup-confirmed")
+
+
+def _pay_backup_confirmed() -> bool:
+    path = _pay_backup_ack_path()
+    if not os.path.lexists(path):
+        return False
+    try:
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise SystemExit(f"refusing {path}: backup acknowledgement must be a regular file")
+        if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600:
+            raise SystemExit(
+                f"refusing {path}: backup acknowledgement must be uid-owned mode 0600")
+        value = path.read_text(encoding="ascii")
+    except SystemExit:
+        raise
+    except (OSError, UnicodeError) as exc:
+        raise SystemExit(f"cannot read backup acknowledgement at {path}: {exc}") from exc
+    if value != "confirmed\n":
+        raise SystemExit(f"refusing invalid backup acknowledgement at {path}")
+    return True
+
+
+def _save_pay_backup_confirmation() -> None:
+    if _pay_backup_confirmed():
+        return
+    path = _pay_backup_ack_path()
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path.parent, 0o700)
+    temp = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp")
+    try:
+        fd = os.open(temp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            view = memoryview(b"confirmed\n")
+            while view:
+                view = view[os.write(fd, view):]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(temp, path)
+        os.chmod(path, 0o600)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def _warn_unbacked_pay_balance(balance: int) -> None:
+    if balance > 20_000_000 and not _pay_backup_confirmed():
+        print(
+            "warning: escrow holds more than 20 USDC; back up the wallet seed, then "
+            "run `nak pay backup --confirm` to acknowledge the backup",
+            file=sys.stderr,
+        )
+
+
 def _validate_pay_limits(values: dict) -> dict:
     required = {"cap_total", "days", "per_tx", "per_day"}
     if set(values) != required:
@@ -1047,10 +1104,13 @@ def _pay_status(wallet: dict) -> None:
             raise SystemExit("escrow address exists but is not owned by NAK_PAY_PROGRAM")
         escrow = chain.decode_escrow(escrow_info["data"])
         vault_info = rpc.account_info(escrow["vault"])
-        if vault_info is not None and vault_info["owner"] != chain.TOKEN_PROGRAM_ID:
+        if vault_info is None:
+            raise SystemExit("escrow exists but its canonical vault is missing")
+        if vault_info["owner"] != chain.TOKEN_PROGRAM_ID:
             raise SystemExit("escrow vault is not owned by the classic SPL Token program")
-        balance = chain.token_amount(vault_info["data"]) if vault_info else 0
+        balance = chain.token_amount(vault_info["data"])
         print(f"escrow balance: {_pay_amount(balance)} USDC")
+        _warn_unbacked_pay_balance(balance)
         print(f"escrow committed: {_pay_amount(escrow['committed'])} USDC")
         delegate_address = chain.delegate_pda(d["escrow"], bytes.fromhex(node_hex), program)[0]
         delegate_info = rpc.account_info(delegate_address)
@@ -1065,7 +1125,20 @@ def _pay_status(wallet: dict) -> None:
 
 
 def _pay_command(args) -> None:
-    from network.pay_wallet import load_wallet
+    from network.pay_wallet import bip39_mnemonic, load_wallet
+
+    if args.pay_cmd == "backup":
+        if not sys.stdin.isatty() or not sys.stdout.isatty():
+            raise SystemExit("nak pay backup is interactive-only; run it in a terminal")
+        wallet = load_wallet(Path.home())
+        if args.confirm:
+            _save_pay_backup_confirmation()
+            print("wallet backup acknowledgement recorded")
+            return
+        if input('type "backup" to print the private wallet seed phrase: ').strip() != "backup":
+            raise SystemExit("wallet backup cancelled; nothing was printed")
+        print(bip39_mnemonic(wallet["seed"]))
+        return
 
     if args.pay_cmd == "export":
         if not sys.stdin.isatty():
@@ -1117,6 +1190,14 @@ def _pay_command(args) -> None:
     if args.pay_cmd == "deposit":
         amount = _pay_usdc(args.amount, "--amount")
         instructions = chain.escrow_deposit(wallet["address"], mint, amount, program)
+        vault = chain.vault_pda(chain.escrow_pda(wallet["address"], program)[0], program)[0]
+        vault_info = rpc.account_info(vault)
+        if vault_info is None:
+            raise SystemExit("escrow exists but its canonical vault is missing")
+        if vault_info["owner"] != chain.TOKEN_PROGRAM_ID:
+            raise SystemExit("escrow vault is not owned by the classic SPL Token program")
+        current_balance = chain.token_amount(vault_info["data"])
+        _warn_unbacked_pay_balance(current_balance + amount)
         ata = chain.associated_token_address(wallet["address"], mint)[0]
         rent = 0 if rpc.account_info(ata) is not None else rpc.rent_exemption(165)
         _pay_send(rpc, chain, instructions, wallet, rent=rent)
@@ -3370,6 +3451,9 @@ def main(argv=None, *, http_post=None, http_get=None) -> int:
     withdraw.add_argument("--amount", help="USDC amount to request")
     withdraw.add_argument("--execute", action="store_true", help="execute the pending withdrawal")
     paysub.add_parser("channels", help="list the local payer channel book with on-chain state")
+    q = paysub.add_parser("backup", help="interactively print or acknowledge a BIP39 seed backup")
+    q.add_argument("--confirm", action="store_true",
+                   help="record that the seed phrase has been backed up without printing it")
     q = paysub.add_parser("export", help="interactively export the Phantom/Solflare keypair")
     q.add_argument("--keypair", action="store_true", required=True,
                    help="print the 64-byte seed + public key as a JSON integer array")

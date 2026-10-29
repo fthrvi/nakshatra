@@ -1,6 +1,7 @@
 """Onboarding's local Solana wallet: immutable seed, offline CLI, devnet-only RPC."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -197,6 +198,53 @@ def test_nak_pay_export_prints_the_standard_64_byte_keypair_after_confirmation(
     exported = bytes(json.loads(capsys.readouterr().out))
     assert exported == wallet["seed"] + wallet["public_key"]
     assert len(exported) == 64
+
+
+def test_bip39_wordlist_and_official_256_bit_vectors():
+    wordlist = Path(pay_wallet.__file__).with_name("bip39_english.txt")
+    assert hashlib.sha256(wordlist.read_bytes()).hexdigest() == (
+        "2f5eed53a4727b4bf8880d8f3f199efc90e58503646d9ff8eff3a2ed3b24dbda")
+    assert pay_wallet.bip39_mnemonic(bytes(32)) == " ".join(["abandon"] * 23 + ["art"])
+    assert pay_wallet.bip39_mnemonic(bytes([0xff]) * 32) == " ".join(["zoo"] * 23 + ["vote"])
+
+
+@pytest.mark.parametrize(("stdin_tty", "stdout_tty"), [(False, True), (True, False)])
+def test_nak_pay_backup_refuses_without_input_and_output_ttys(
+        stdin_tty, stdout_tty, monkeypatch, capsys):
+    pay_wallet.ensure_wallet(_home())
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: stdin_tty)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: stdout_tty)
+
+    with pytest.raises(SystemExit, match="interactive-only"):
+        nak.main(["pay", "backup"])
+    assert capsys.readouterr().out == ""
+
+
+def test_nak_pay_backup_prints_24_words_only_after_confirmation(monkeypatch, capsys):
+    monkeypatch.setattr(pay_wallet.os, "urandom", lambda size: bytes(size))
+    pay_wallet.ensure_wallet(_home())
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _prompt: "backup")
+
+    assert nak.main(["pay", "backup"]) == 0
+
+    assert capsys.readouterr().out.strip() == " ".join(["abandon"] * 23 + ["art"])
+
+
+def test_nak_pay_backup_confirm_records_private_ack_without_seed(monkeypatch, capsys):
+    wallet = pay_wallet.ensure_wallet(_home())
+    mnemonic = pay_wallet.bip39_mnemonic(wallet["seed"])
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+
+    assert nak.main(["pay", "backup", "--confirm"]) == 0
+
+    output = capsys.readouterr().out
+    assert mnemonic not in output
+    ack = _home() / ".nakshatra" / "pay" / "backup-confirmed"
+    assert ack.read_text() == "confirmed\n"
+    assert stat.S_IMODE(ack.stat().st_mode) == 0o600
 
 
 class _RPCServer:

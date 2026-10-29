@@ -250,9 +250,10 @@ def test_decode_escrow_rejects_invalid_pending_option_tag():
 
 
 class FakeRpc:
-    def __init__(self, *, genesis="local-test", balance=100_000_000):
+    def __init__(self, *, genesis="local-test", balance=100_000_000, token_balance=0):
         self.genesis = genesis
         self.balance = balance
+        self.token_balance = token_balance
         self.methods: list[str] = []
         self.sent = 0
         self.ready = False
@@ -294,7 +295,10 @@ class FakeRpc:
         data = None
         if self.ready and address == self.escrow: data = _escrow_data(self.owner, self.vault)
         elif self.ready and address == self.delegate: data = _delegate_data(self.escrow, self.node, expires=int(time.time()) + 30*86400)
-        elif self.ready and address == self.vault: data = bytes(165)
+        elif self.ready and address == self.vault:
+            data = bytearray(165)
+            struct.pack_into("<Q", data, 64, self.token_balance)
+            data = bytes(data)
         elif self.ready and address == pay_chain.owner_state_pda(self.owner, PROGRAM)[0]: data = bytes(17)
         value = None if data is None else {"data":[base64.b64encode(data).decode(),"base64"],"executable":False,"lamports":1,"owner":PROGRAM if len(data) != 165 else pay_chain.TOKEN_PROGRAM_ID,"rentEpoch":0,"space":len(data)}
         return {"context":{"slot":1},"value":value}
@@ -354,6 +358,43 @@ def test_cli_limits_validation(_temp_home, argv, match):
     _make_keys(_temp_home)
     with pytest.raises(SystemExit, match=match):
         nak.main(argv)
+
+
+@pytest.mark.parametrize(("amount", "warned"), [("20", False), ("20.000001", True)])
+def test_cli_deposit_warns_when_resulting_escrow_exceeds_20_usdc(
+        _temp_home, monkeypatch, capsys, amount, warned):
+    wallet = _make_keys(_temp_home)
+    node = ed25519.Ed25519PrivateKey.from_private_bytes(
+        bytes(range(101, 133))).public_key().public_bytes_raw()
+    rpc = FakeRpc(); rpc.configure(wallet, node)
+
+    with rpc as url:
+        monkeypatch.setenv("NAK_PAY_RPC", url)
+        assert nak.main(["pay", "deposit", "--amount", amount]) == 0
+
+    warning = "run `nak pay backup --confirm`"
+    assert (warning in capsys.readouterr().err) is warned
+
+
+def test_cli_status_warns_above_20_usdc_until_backup_is_confirmed(
+        _temp_home, monkeypatch, capsys):
+    wallet = _make_keys(_temp_home)
+    node = ed25519.Ed25519PrivateKey.from_private_bytes(
+        bytes(range(101, 133))).public_key().public_bytes_raw()
+    rpc = FakeRpc(token_balance=20_000_001); rpc.configure(wallet, node); rpc.ready = True
+
+    with rpc as url:
+        monkeypatch.setenv("NAK_PAY_RPC", url)
+        assert nak.main(["pay", "status"]) == 0
+        assert "run `nak pay backup --confirm`" in capsys.readouterr().err
+
+        monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+        monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+        assert nak.main(["pay", "backup", "--confirm"]) == 0
+        capsys.readouterr()
+
+        assert nak.main(["pay", "status"]) == 0
+        assert capsys.readouterr().err == ""
 
 
 @pytest.mark.parametrize("amount", [

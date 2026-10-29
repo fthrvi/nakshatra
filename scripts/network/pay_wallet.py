@@ -5,6 +5,7 @@ filesystem-only operations; network access belongs at the CLI boundary.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import secrets
 import stat
@@ -15,6 +16,7 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 _BASE58_INDEX = {char: index for index, char in enumerate(BASE58_ALPHABET)}
+_BIP39_WORDLIST_SHA256 = "2f5eed53a4727b4bf8880d8f3f199efc90e58503646d9ff8eff3a2ed3b24dbda"
 
 
 def base58_encode(value: bytes) -> str:
@@ -43,6 +45,32 @@ def base58_decode(value: str) -> bytes:
     zeroes = len(value) - len(value.lstrip("1"))
     body = (number.to_bytes((number.bit_length() + 7) // 8, "big") if number else b"")
     return b"\0" * zeroes + body
+
+
+def bip39_mnemonic(entropy: bytes) -> str:
+    """Encode standard-length entropy with the official BIP39 English list."""
+    raw = bytes(entropy)
+    if len(raw) not in {16, 20, 24, 28, 32}:
+        raise ValueError("BIP39 entropy must contain 16, 20, 24, 28, or 32 bytes")
+    wordlist_path = Path(__file__).with_name("bip39_english.txt")
+    try:
+        wordlist_bytes = wordlist_path.read_bytes()
+        words = wordlist_bytes.decode("ascii").splitlines()
+    except (OSError, UnicodeError) as exc:
+        raise ValueError(f"cannot read the BIP39 English wordlist: {exc}") from exc
+    if (hashlib.sha256(wordlist_bytes).hexdigest() != _BIP39_WORDLIST_SHA256
+            or len(words) != 2048):
+        raise ValueError("the BIP39 English wordlist failed its integrity check")
+
+    entropy_bits = len(raw) * 8
+    checksum_bits = entropy_bits // 32
+    checksum = hashlib.sha256(raw).digest()[0] >> (8 - checksum_bits)
+    encoded = (int.from_bytes(raw, "big") << checksum_bits) | checksum
+    word_count = (entropy_bits + checksum_bits) // 11
+    return " ".join(
+        words[(encoded >> (11 * (word_count - index - 1))) & 0x7ff]
+        for index in range(word_count)
+    )
 
 
 def _paths(home: Path) -> tuple[Path, Path, Path, Path]:
