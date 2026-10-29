@@ -321,6 +321,10 @@ class FakeChannelState:
             raise VoucherError("escrow account does not exist") from exc
 
 
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+RPC_RESPONSE_MAX = 1 << 20  # a Channel/Escrow account reply is a few KiB
+
+
 class JsonRpcChannelState:
     """Devnet/local ``getAccountInfo`` reader with strict owner checks."""
 
@@ -328,6 +332,16 @@ class JsonRpcChannelState:
                  opener: Callable = urllib.request.urlopen):
         if not isinstance(rpc_url, str) or not rpc_url:
             raise VoucherError("Solana RPC URL is required")
+        parts = urllib.parse.urlsplit(rpc_url)
+        host = (parts.hostname or "").lower()
+        if parts.scheme == "https" and host:
+            pass
+        elif parts.scheme == "http" and host in _LOOPBACK_HOSTS:
+            pass
+        else:
+            # Channel signers and owners are read from this endpoint; a plaintext remote RPC would let
+            # anyone on the path forge them, so only TLS or a loopback test validator is trusted.
+            raise VoucherError("Solana RPC must be https://, or http:// on loopback only")
         self.rpc_url = rpc_url
         self.timeout = float(timeout)
         self.opener = opener
@@ -348,7 +362,10 @@ class JsonRpcChannelState:
             headers={"Content-Type": "application/json"})
         try:
             with self.opener(request, timeout=self.timeout) as response:
-                decoded = json.loads(response.read())
+                raw = response.read(RPC_RESPONSE_MAX + 1)
+                if len(raw) > RPC_RESPONSE_MAX:
+                    raise VoucherError(f"Solana RPC {method} response is too large")
+                decoded = json.loads(raw)
             if (not isinstance(decoded, dict)
                     or decoded.get("jsonrpc") != "2.0"
                     or decoded.get("id") != request_id
@@ -369,7 +386,7 @@ class JsonRpcChannelState:
         if not isinstance(genesis, str) or not genesis:
             raise VoucherError("Solana RPC returned malformed getGenesisHash response")
         host = (urllib.parse.urlsplit(self.rpc_url).hostname or "").lower()
-        local = host == "localhost" or host == "127.0.0.1" or host == "::1"
+        local = host in _LOOPBACK_HOSTS
         if genesis == MAINNET_GENESIS_HASH:
             raise VoucherError("Solana mainnet RPC is forbidden for Nakshatra payments")
         if genesis != DEVNET_GENESIS_HASH and not local:

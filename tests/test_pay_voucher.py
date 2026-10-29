@@ -1110,3 +1110,67 @@ def test_unset_mode_preserves_legacy_wire_bytes(tmp_path, monkeypatch):
     assert receipt == expected
     assert manager.chain_receipt_wire(claim, receipt) == ""
     store.close()
+
+
+def test_consumer_refuses_receipt_claiming_more_tokens_than_received(
+        tmp_path, monkeypatch):
+    manager, consumer, claim, worker_vouchers, _ledger = _chain_admission(
+        tmp_path, monkeypatch, session="overclaim")
+    receipt = None
+    for index in range(1, 18):
+        receipt = _run_step(manager, claim, index, 1)
+        if receipt is not None:
+            break
+    assert receipt is not None
+    consumer.observe(WORKER_HEX, manager.chain_receipt_wire(claim, receipt))
+    generated = int(receipt["cumulative_generated_tokens"])
+    with pytest.raises(pay.VoucherError, match="has not received"):
+        consumer.acknowledge_delivery(prompt_tokens=1, generated_tokens=generated - 1)
+    assert not consumer.outgoing(WORKER_HEX)
+    consumer.book.close()
+    manager.store.close()
+    worker_vouchers.close()
+
+
+@pytest.mark.parametrize("url", [
+    "http://api.devnet.solana.com",
+    "http://10.42.0.1:8899",
+    "ftp://127.0.0.1:8899",
+    "https://",
+])
+def test_rpc_refuses_plaintext_remote_and_odd_schemes(url):
+    with pytest.raises(pay.VoucherError, match="https://"):
+        pay.JsonRpcChannelState(url)
+
+
+@pytest.mark.parametrize("url", [
+    "https://api.devnet.solana.com",
+    "http://127.0.0.1:8899",
+    "http://localhost:8899",
+    "http://[::1]:8899",
+])
+def test_rpc_accepts_tls_or_loopback(url):
+    assert pay.JsonRpcChannelState(url).rpc_url == url
+
+
+def test_rpc_oversized_response_fails_closed():
+    class Endless:
+        def __init__(self):
+            self.asked = None
+
+        def read(self, size=-1):
+            self.asked = size
+            return b" " * (size if size and size > 0 else 10 * pay.RPC_RESPONSE_MAX)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+    body = Endless()
+    state = pay.JsonRpcChannelState(
+        "http://127.0.0.1:1", opener=lambda _request, timeout: body)
+    with pytest.raises(pay.VoucherError, match="too large"):
+        state.read_channel(CHANNEL, PROGRAM)
+    assert body.asked == pay.RPC_RESPONSE_MAX + 1
