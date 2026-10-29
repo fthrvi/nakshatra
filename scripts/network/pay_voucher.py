@@ -11,16 +11,19 @@ protobuf and legacy wire bytes do not change.  Values beginning ``nakpay1.``
 are canonical compact JSON (the prefix is outside the JSON):
 
 * first payer -> worker frame (the legacy token is an opaque correlation value
-  only in chain mode; the worker does not claim it from the credit ledger)::
+  only in chain mode; the worker does not claim it from the credit ledger).
+  ``channel_base`` is the payer's on-chain lower bound, while
+  ``max_signed_total`` is its durable exposure ceiling::
 
     {"channel":"<base58>","channel_base":<u64>,"claim_token":"<opaque>",
      "hold_id":"<scope>","kind":"init","max_output_tokens":<u64>,
-     "max_prompt_tokens":<u64>,"model_id":"<scope>",
+     "max_prompt_tokens":<u64>,"max_signed_total":<u64>,"model_id":"<scope>",
      "program":"<base58>","session_id":"<scope>","v":1}
 
 * checkpoint worker -> payer response::
 
-    {"kind":"receipt","receipt":{...usage receipt v2...},
+    {"channel_base":<worker-derived u64>,"kind":"receipt",
+     "receipt":{...usage receipt v2...},
      "signature":"<128 lowercase hex>","v":1}
 
 * later payer -> worker frame::
@@ -488,37 +491,43 @@ class PayerChannel:
     worker_key: str
     cap: int
     channel_base: int
-    last_vouched_total: int
+    max_signed_total: int
 
 
 class PayerChannelBook(_Book):
-    """Mode-0600 payer channel pins and monotonic voucher totals."""
+    """Mode-0600 channel pins, session bases, and signing exposure ceilings."""
 
     def __init__(self, path: str | Path | None = None):
         super().__init__(path or Path.home() / ".nakshatra" / "pay" / "channels.sqlite")
         self._db.execute(
             "CREATE TABLE IF NOT EXISTS channels("
             "program TEXT NOT NULL, channel TEXT PRIMARY KEY, worker_key TEXT NOT NULL UNIQUE, "
-            "cap TEXT NOT NULL, channel_base TEXT NOT NULL, last_vouched_total TEXT NOT NULL)"
+            "cap TEXT NOT NULL, channel_base TEXT NOT NULL, max_signed_total TEXT NOT NULL)"
         )
+        columns = {
+            row[1] for row in self._db.execute("PRAGMA table_info(channels)")
+        }
+        if "max_signed_total" not in columns and "last_vouched_total" in columns:
+            self._db.execute(
+                "ALTER TABLE channels RENAME COLUMN last_vouched_total TO max_signed_total")
         self._secure()
 
     @staticmethod
     def _row(row: sqlite3.Row) -> PayerChannel:
         return PayerChannel(row["program"], row["channel"], row["worker_key"],
                             int(row["cap"]), int(row["channel_base"]),
-                            int(row["last_vouched_total"]))
+                            int(row["max_signed_total"]))
 
     def put(self, *, program: str, channel: str, worker_key: str, cap: int,
-            channel_base: int = 0, last_vouched_total: int = 0) -> PayerChannel:
+            channel_base: int = 0, max_signed_total: int = 0) -> PayerChannel:
         base = _u64(channel_base, "channel base")
-        last = _u64(last_vouched_total, "last voucher total")
-        if base > last:
-            raise VoucherError("channel base cannot exceed the last voucher total")
+        ceiling = _u64(max_signed_total, "maximum signed total")
+        if base > ceiling:
+            raise VoucherError("channel base cannot exceed the payer signing ceiling")
         values = (
             _pubkey_text(program, "program id"), _pubkey_text(channel, "channel"),
             str(worker_key).lower(), str(_u64(cap, "channel cap")),
-            str(base), str(last),
+            str(base), str(ceiling),
         )
         if re.fullmatch(r"[0-9a-f]{64}", values[2]) is None:
             raise VoucherError("worker key must be 32-byte lowercase hex")
@@ -530,19 +539,17 @@ class PayerChannelBook(_Book):
                 if existing is None:
                     self._db.execute(
                         "INSERT INTO channels(program,channel,worker_key,cap,channel_base,"
-                        "last_vouched_total) VALUES(?,?,?,?,?,?)", values)
+                        "max_signed_total) VALUES(?,?,?,?,?,?)", values)
                 else:
                     if (existing["program"] != values[0]
                             or existing["worker_key"] != values[2]
                             or int(existing["cap"]) != int(values[3])):
                         raise VoucherError(
                             "channel program, worker, and cap are immutable")
-                    if last < int(existing["last_vouched_total"]):
-                        raise VoucherError("voucher total would decrease")
-                    if base < int(existing["channel_base"]):
-                        raise VoucherError("channel base would decrease")
+                    if ceiling < int(existing["max_signed_total"]):
+                        raise VoucherError("payer signing ceiling would decrease")
                     self._db.execute(
-                        "UPDATE channels SET channel_base=?,last_vouched_total=? "
+                        "UPDATE channels SET channel_base=?,max_signed_total=? "
                         "WHERE channel=?", (values[4], values[5], values[1]))
                 self._db.execute("COMMIT")
             except Exception:
@@ -569,18 +576,49 @@ class PayerChannelBook(_Book):
             require_open_channel(channel_state)
             if channel_state.cap != row.cap:
                 raise VoucherError("on-chain channel cap differs from pinned channel book")
-            effective_last = max(row.last_vouched_total, channel_state.redeemed)
-            outstanding = effective_last - channel_state.redeemed
-            available = channel_state.cap - channel_state.redeemed - outstanding
+            if row.max_signed_total < channel_state.redeemed:
+                raise VoucherError(
+                    "payer signing ceiling is below the on-chain redeemed total")
+            available = channel_state.cap - row.max_signed_total
             if available < required_capacity_micro_usdc(max_cost_credits):
                 raise VoucherError("channel has insufficient uncommitted capacity")
             self._db.execute(
-                "UPDATE channels SET channel_base=?,last_vouched_total=? WHERE channel=?",
-                (str(effective_last), str(effective_last), row.channel))
+                "UPDATE channels SET channel_base=? WHERE channel=?",
+                (str(channel_state.redeemed), row.channel))
             row = PayerChannel(row.program, row.channel, row.worker_key, row.cap,
-                               effective_last, effective_last)
+                               channel_state.redeemed, row.max_signed_total)
         self._secure()
         return row
+
+    def adopt_session_base(self, channel: str, base: int, *,
+                           on_chain_redeemed: int) -> PayerChannel:
+        """Adopt the worker-derived base without expanding payer exposure."""
+        key = _pubkey_text(channel, "channel")
+        amount = _u64(base, "worker-derived channel base")
+        redeemed = _u64(on_chain_redeemed, "on-chain redeemed total")
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._db.execute(
+                    "SELECT * FROM channels WHERE channel=?", (key,)).fetchone()
+                if row is None:
+                    raise VoucherError("unknown payer channel")
+                if amount < redeemed:
+                    raise VoucherError(
+                        "worker-derived base is below the on-chain redeemed total")
+                if amount > int(row["max_signed_total"]):
+                    raise VoucherError(
+                        "worker-derived base is above the payer signing ceiling")
+                self._db.execute(
+                    "UPDATE channels SET channel_base=? WHERE channel=?",
+                    (str(amount), key))
+                self._db.execute("COMMIT")
+            except Exception:
+                self._db.execute("ROLLBACK")
+                raise
+        self._secure()
+        return self._row(self._db.execute(
+            "SELECT * FROM channels WHERE channel=?", (key,)).fetchone())
 
     def record(self, channel: str, total: int) -> PayerChannel:
         key = _pubkey_text(channel, "channel")
@@ -592,14 +630,14 @@ class PayerChannelBook(_Book):
                     "SELECT * FROM channels WHERE channel=?", (key,)).fetchone()
                 if row is None:
                     raise VoucherError("unknown payer channel")
-                current = int(row["last_vouched_total"])
-                if amount < current:
-                    raise VoucherError("voucher total would decrease")
+                current = int(row["max_signed_total"])
+                if amount < int(row["channel_base"]):
+                    raise VoucherError("voucher total is below the session base")
                 if amount > int(row["cap"]):
                     raise VoucherError("voucher total exceeds channel cap")
                 if amount > current:
                     self._db.execute(
-                        "UPDATE channels SET last_vouched_total=? WHERE channel=?",
+                        "UPDATE channels SET max_signed_total=? WHERE channel=?",
                         (str(amount), key))
                 self._db.execute("COMMIT")
             except Exception:
@@ -639,6 +677,20 @@ def _process_start_time(pid: int) -> str | None:
         raise VoucherError("cannot parse voucher reservation process") from exc
 
 
+def _boot_id() -> str:
+    """Return the Linux boot identity, failing closed if it is unavailable."""
+    try:
+        value = Path("/proc/sys/kernel/random/boot_id").read_text(
+            encoding="ascii").strip().lower()
+    except OSError as exc:
+        raise VoucherError("cannot verify voucher reservation boot") from exc
+    if re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            value) is None:
+        raise VoucherError("cannot parse voucher reservation boot")
+    return value
+
+
 def _reservation_id(value: object) -> str:
     if not isinstance(value, str) or not value or len(value.encode("utf-8")) > 512:
         raise VoucherError("voucher reservation id is invalid")
@@ -659,8 +711,16 @@ class WorkerVoucherStore(_Book):
             "CREATE TABLE IF NOT EXISTS reservations("
             "channel TEXT PRIMARY KEY, reservation_id TEXT NOT NULL, "
             "pid INTEGER NOT NULL, process_start TEXT NOT NULL, "
-            "acquired_at INTEGER NOT NULL)"
+            "boot_id TEXT NOT NULL, acquired_at INTEGER NOT NULL)"
         )
+        reservation_columns = {
+            row[1] for row in self._db.execute("PRAGMA table_info(reservations)")
+        }
+        if "boot_id" not in reservation_columns:
+            # An old row has no trustworthy boot identity.  The empty value is
+            # deliberately treated as live below rather than reclaimed.
+            self._db.execute(
+                "ALTER TABLE reservations ADD COLUMN boot_id TEXT NOT NULL DEFAULT ''")
         self._secure()
 
     def acquire_reservation(self, channel: str, reservation_id: str) -> None:
@@ -669,6 +729,7 @@ class WorkerVoucherStore(_Book):
         owner = _reservation_id(reservation_id)
         pid = os.getpid()
         process_start = _process_start_time(pid)
+        boot_id = _boot_id()
         if process_start is None:
             raise VoucherError("cannot identify voucher reservation process")
         with self._lock:
@@ -680,18 +741,23 @@ class WorkerVoucherStore(_Book):
                     same_owner = (
                         row["reservation_id"] == owner
                         and int(row["pid"]) == pid
-                        and row["process_start"] == process_start)
+                        and row["process_start"] == process_start
+                        and row["boot_id"] == boot_id)
                     if not same_owner:
-                        live_start = _process_start_time(int(row["pid"]))
-                        if live_start == row["process_start"]:
+                        stored_boot = row["boot_id"]
+                        if not stored_boot:
+                            raise VoucherError(
+                                "cannot verify existing voucher reservation boot")
+                        if stored_boot == boot_id and _process_start_time(
+                                int(row["pid"])) == row["process_start"]:
                             raise VoucherError("channel busy")
                         self._db.execute(
                             "DELETE FROM reservations WHERE channel=?", (key,))
                 self._db.execute(
                     "INSERT OR REPLACE INTO reservations("
-                    "channel,reservation_id,pid,process_start,acquired_at) "
-                    "VALUES(?,?,?,?,?)",
-                    (key, owner, pid, process_start, int(time.time())))
+                    "channel,reservation_id,pid,process_start,boot_id,acquired_at) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (key, owner, pid, process_start, boot_id, int(time.time())))
                 self._db.execute("COMMIT")
             except Exception:
                 self._db.execute("ROLLBACK")
@@ -702,10 +768,12 @@ class WorkerVoucherStore(_Book):
         row = self._db.execute(
             "SELECT * FROM reservations WHERE channel=?", (channel,)).fetchone()
         process_start = _process_start_time(os.getpid())
+        boot_id = _boot_id()
         if (row is None
                 or row["reservation_id"] != reservation_id
                 or int(row["pid"]) != os.getpid()
-                or row["process_start"] != process_start):
+                or row["process_start"] != process_start
+                or row["boot_id"] != boot_id):
             raise VoucherError("channel reservation is not held by this session")
 
     def assert_reservation(self, channel: str, reservation_id: str) -> None:
@@ -718,11 +786,12 @@ class WorkerVoucherStore(_Book):
         key = _pubkey_text(channel, "channel")
         owner = _reservation_id(reservation_id)
         process_start = _process_start_time(os.getpid())
+        boot_id = _boot_id()
         with self._lock:
             self._db.execute(
                 "DELETE FROM reservations WHERE channel=? AND reservation_id=? "
-                "AND pid=? AND process_start=?",
-                (key, owner, os.getpid(), process_start))
+                "AND pid=? AND process_start=? AND boot_id=?",
+                (key, owner, os.getpid(), process_start, boot_id))
         self._secure()
 
     def latest(self, channel: str) -> VoucherRecord | None:
@@ -812,12 +881,19 @@ def parse_wire(value: str) -> dict:
 def init_wire(claim_token: str, *, program: str, channel: str,
               channel_base: int, hold_id: str, session_id: str,
               model_id: str, max_prompt_tokens: int,
-              max_output_tokens: int) -> str:
+              max_output_tokens: int,
+              max_signed_total: int | None = None) -> str:
+    base = _u64(channel_base, "channel base")
+    ceiling = _u64(
+        base if max_signed_total is None else max_signed_total,
+        "maximum signed total")
+    if base > ceiling:
+        raise VoucherError("channel base cannot exceed the payer signing ceiling")
     return _wire({
         "v": 1, "kind": "init", "claim_token": str(claim_token),
         "program": _pubkey_text(program, "program id"),
         "channel": _pubkey_text(channel, "channel"),
-        "channel_base": _u64(channel_base, "channel base"),
+        "channel_base": base, "max_signed_total": ceiling,
         "hold_id": str(hold_id), "session_id": str(session_id),
         "model_id": str(model_id),
         "max_prompt_tokens": _u64(max_prompt_tokens, "maximum prompt tokens"),
@@ -838,13 +914,17 @@ def voucher_wire(*, program: str, channel: str, total: int,
     return _wire(value)
 
 
-def receipt_wire(receipt: Mapping[str, object], signature_hex: str) -> str:
+def receipt_wire(receipt: Mapping[str, object], signature_hex: str, *,
+                 channel_base: int) -> str:
     if (not isinstance(signature_hex, str)
             or re.fullmatch(r"[0-9a-f]{128}", signature_hex) is None):
         raise VoucherError("receipt signature must be 64-byte lowercase hex")
     bytes.fromhex(signature_hex)
-    return _wire({"v": 1, "kind": "receipt", "receipt": dict(receipt),
-                  "signature": signature_hex})
+    return _wire({
+        "v": 1, "kind": "receipt", "receipt": dict(receipt),
+        "signature": signature_hex,
+        "channel_base": _u64(channel_base, "worker-derived channel base"),
+    })
 
 
 def public_key_bytes(private_key: object) -> bytes:
@@ -873,6 +953,9 @@ class ConsumerVoucherManager:
         self.channels: dict[str, PayerChannel] = {}
         self.plan = {str(stage["worker_keyid"]): dict(stage) for stage in plan}
         self.receipts: dict[str, list[dict]] = {key: [] for key in self.plan}
+        self.session_bases: dict[str, int | None] = {
+            key: None for key in self.plan
+        }
         self.pending: dict[str, str] = {}
         self.sent: dict[str, str] = {}
         for worker_key in self.plan:
@@ -894,6 +977,7 @@ class ConsumerVoucherManager:
             raise VoucherError("chain session scope is incomplete")
         return init_wire(claim_token, program=self.program, channel=channel.channel,
                          channel_base=channel.channel_base,
+                         max_signed_total=channel.max_signed_total,
                          hold_id=self.hold_id, session_id=self.session_id,
                          model_id=self.model_id,
                          max_prompt_tokens=self.max_prompt_tokens,
@@ -912,7 +996,7 @@ class ConsumerVoucherManager:
             return
         control = parse_wire(value)
         if control.get("kind") != "receipt" or set(control) != {
-                "v", "kind", "receipt", "signature"}:
+                "v", "kind", "receipt", "signature", "channel_base"}:
             raise VoucherError("worker returned an invalid receipt control envelope")
         receipt = control["receipt"]
         if not isinstance(receipt, dict):
@@ -927,6 +1011,16 @@ class ConsumerVoucherManager:
                            ensure_ascii=True).encode("utf-8"))
         except (InvalidSignature, TypeError, ValueError) as exc:
             raise VoucherError("worker receipt signature is invalid") from exc
+        channel = self.channels[worker_key]
+        account = self.state.read_channel(channel.channel, self.program)
+        base = _u64(control["channel_base"], "worker-derived channel base")
+        previous_base = self.session_bases[worker_key]
+        if previous_base is not None and base != previous_base:
+            raise VoucherError("worker-derived channel base changed within the session")
+        adopted = self.book.adopt_session_base(
+            channel.channel, base, on_chain_redeemed=account.redeemed)
+        self.channels[worker_key] = adopted
+        self.session_bases[worker_key] = base
         self.receipts[worker_key].append(receipt)
 
     def acknowledge_delivery(self, *, prompt_tokens: int,
@@ -959,9 +1053,12 @@ class ConsumerVoucherManager:
                 if price != expected:
                     raise VoucherError("receipt cumulative cost is inconsistent")
                 total = credits_to_total(channel.channel_base, price)
+                # Expand the durable exposure ceiling before producing a
+                # signature.  A crash after this write may safely re-sign any
+                # total at or below the ceiling in a later session.
+                self.book.record(channel.channel, total)
                 signature = sign_voucher(
                     self.private_key, self.program, channel.channel, total)
-                self.book.record(channel.channel, total)
                 self.pending[worker_key] = voucher_wire(
                     program=self.program, channel=channel.channel, total=total,
                     signature=signature)

@@ -675,7 +675,8 @@ class PaidAdmission:
                 if (chain_init.get("kind") != "init"
                         or set(chain_init) != {
                             "v", "kind", "claim_token", "program", "channel",
-                            "channel_base", "hold_id", "session_id", "model_id",
+                            "channel_base", "max_signed_total", "hold_id",
+                            "session_id", "model_id",
                             "max_prompt_tokens", "max_output_tokens",
                         }):
                     raise self._pay.VoucherError("invalid chain init envelope")
@@ -771,10 +772,16 @@ class PaidAdmission:
             latest = self.voucher_store.latest(init["channel"])
             latest_total = latest.total if latest is not None else account.redeemed
             derived_base = max(account.redeemed, latest_total)
-            base = self._pay._u64(init["channel_base"], "channel base")
-            if base != derived_base:
+            payer_base = self._pay._u64(init["channel_base"], "channel base")
+            ceiling = self._pay._u64(
+                init["max_signed_total"], "maximum signed total")
+            if payer_base > derived_base:
                 raise self._pay.VoucherError(
-                    "sender channel base does not match worker-derived base")
+                    "sender channel base exceeds the worker-derived base")
+            if derived_base > ceiling:
+                raise self._pay.VoucherError(
+                    "worker-derived base exceeds the payer signing ceiling")
+            base = derived_base
             if base > account.cap:
                 raise self._pay.VoucherError("channel base exceeds channel cap")
             if (base + self._pay.required_capacity_micro_usdc(
@@ -892,7 +899,8 @@ class PaidAdmission:
             session["channel_base"], int(receipt["cumulative_cost"]))
         session["pending_total"] = total
         signature = self.store.receipt_signature(receipt["receipt_id"])
-        wire = self._pay.receipt_wire(receipt, signature)
+        wire = self._pay.receipt_wire(
+            receipt, signature, channel_base=session["channel_base"])
         try:
             account = self.channel_state.read_channel(
                 session["channel"], self.pay_program)

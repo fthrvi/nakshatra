@@ -6,6 +6,7 @@ import json
 import os
 import base64
 import queue
+import sqlite3
 import stat
 import struct
 import sys
@@ -183,19 +184,148 @@ def test_floor_is_applied_to_cumulative_credits_not_checkpoint_deltas():
     assert sum(delta // pay.RATE for delta in checkpoints) == 0
 
 
-def test_payer_book_never_lowers_a_vouched_total(tmp_path):
+def test_payer_book_keeps_ceiling_while_allowing_safe_resign(tmp_path):
     book = pay.PayerChannelBook(tmp_path / "pay" / "channels.sqlite")
     book.put(program=PROGRAM, channel=CHANNEL, worker_key=WORKER_HEX,
-             cap=1000, channel_base=10, last_vouched_total=10)
+             cap=1000, channel_base=10, max_signed_total=10)
     book.record(CHANNEL, 12)
-    with pytest.raises(pay.VoucherError, match="decrease"):
-        book.record(CHANNEL, 11)
+    # Totals at or below the persisted ceiling were already authorized and
+    # may be re-signed after a crash; they do not lower the ceiling.
+    book.record(CHANNEL, 11)
     with pytest.raises(pay.VoucherError, match="decrease"):
         book.put(program=PROGRAM, channel=CHANNEL, worker_key=WORKER_HEX,
-                 cap=1000, channel_base=10, last_vouched_total=11)
-    assert book.for_worker(WORKER_HEX).last_vouched_total == 12
+                 cap=1000, channel_base=10, max_signed_total=11)
+    assert book.for_worker(WORKER_HEX).max_signed_total == 12
     assert stat.S_IMODE((tmp_path / "pay").stat().st_mode) == 0o700
     assert stat.S_IMODE((tmp_path / "pay" / "channels.sqlite").stat().st_mode) == 0o600
+    book.close()
+
+
+def test_payer_book_migrates_legacy_total_to_signing_ceiling(tmp_path):
+    path = tmp_path / "legacy" / "channels.sqlite"
+    path.parent.mkdir(mode=0o700)
+    db = sqlite3.connect(path)
+    db.execute(
+        "CREATE TABLE channels(program TEXT NOT NULL, channel TEXT PRIMARY KEY,"
+        "worker_key TEXT NOT NULL UNIQUE, cap TEXT NOT NULL,"
+        "channel_base TEXT NOT NULL, last_vouched_total TEXT NOT NULL)")
+    db.execute(
+        "INSERT INTO channels VALUES(?,?,?,?,?,?)",
+        (PROGRAM, CHANNEL, WORKER_HEX, "1000", "10", "12"))
+    db.commit()
+    db.close()
+
+    book = pay.PayerChannelBook(path)
+    row = book.for_worker(WORKER_HEX)
+    assert (row.channel_base, row.max_signed_total) == (10, 12)
+    columns = {entry[1] for entry in book._db.execute(
+        "PRAGMA table_info(channels)")}
+    assert "max_signed_total" in columns
+    assert "last_vouched_total" not in columns
+    book.close()
+
+
+def test_payer_crash_ceiling_is_not_reused_as_the_next_session_base(
+        tmp_path, monkeypatch):
+    """A persisted-but-unsent authorization may be safely re-signed below its ceiling."""
+    monkeypatch.setenv("NAK_PAY_MODE", "chain")
+    _install_pay_wallet(Path(os.environ["HOME"]))
+    state = _state(cap=1000, redeemed=0)
+    payer_path = tmp_path / "crash" / "payer.sqlite"
+    book = pay.PayerChannelBook(payer_path)
+    book.put(program=PROGRAM, channel=CHANNEL, worker_key=WORKER_HEX,
+             cap=1000, channel_base=0, max_signed_total=0)
+    # This is the durable write immediately before a signature/send.  The
+    # process dies before the worker can persist the resulting voucher.
+    book.record(CHANNEL, 4)
+    assert book.for_worker(WORKER_HEX).max_signed_total == 4
+    book.close()
+    vouchers = pay.WorkerVoucherStore(tmp_path / "crash" / "worker.sqlite")
+    paid_store = admission.PaidAdmissionStore(tmp_path / "crash" / "paid.sqlite")
+    manager = admission.PaidAdmission(
+        _Ledger(_claim("crash-restart", layer_end=100)), paid_store,
+        WORKER_SEED, model_id="model", layer_start=0, layer_end=100,
+        clock=lambda: 100, voucher_store=vouchers, channel_state=state,
+        pay_program=PROGRAM)
+    assert manager.check_ready()
+
+    restarted = pay.PayerChannelBook(payer_path)
+    consumer = pay.ConsumerVoucherManager(
+        book=restarted, state=state, program=PROGRAM, private_key=PAYER_SEED,
+        plan=[{"worker_keyid": WORKER_HEX, "layer_start": 0,
+               "layer_end": 100}],
+        max_cost_by_worker={WORKER_HEX: 200},
+        session_id="crash-restart", hold_id="hold", model_id="model",
+        max_prompt_tokens=1, max_output_tokens=1)
+    claim = manager.claim(
+        PAYER_HEX, "crash-restart", consumer.first_wire(WORKER_HEX, TOKEN))
+    assert manager._chain_session(claim)["channel_base"] == 0
+
+    receipt = _run_step(manager, claim, 1, 1)
+    consumer.observe(WORKER_HEX, manager.chain_receipt_wire(claim, receipt))
+    consumer.acknowledge_delivery(prompt_tokens=1, generated_tokens=1)
+    control = pay.parse_wire(consumer.outgoing(WORKER_HEX))
+    assert control["total"] == 2
+    assert control["total"] <= 0 + (receipt["cumulative_cost"] // pay.RATE)
+    row = restarted.for_worker(WORKER_HEX)
+    assert row.channel_base == 0
+    assert row.max_signed_total == 4
+
+    with pytest.raises(pay.VoucherError, match="below the on-chain redeemed"):
+        restarted.adopt_session_base(CHANNEL, 0, on_chain_redeemed=1)
+
+    consumer.book.close()
+    manager.store.close()
+    vouchers.close()
+
+
+def test_payer_adopts_worker_stored_voucher_before_signing_new_work(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("NAK_PAY_MODE", "chain")
+    _install_pay_wallet(Path(os.environ["HOME"]))
+    state = _state(cap=1000, redeemed=0)
+    vouchers = pay.WorkerVoucherStore(tmp_path / "adopt" / "worker.sqlite")
+    vouchers.accept(
+        _voucher(total=2), configured_program=PROGRAM, state=state,
+        expected_channel=CHANNEL)
+    paid_store = admission.PaidAdmissionStore(tmp_path / "adopt" / "paid.sqlite")
+    manager = admission.PaidAdmission(
+        _Ledger(_claim("adopt", layer_end=100)), paid_store, WORKER_SEED,
+        model_id="model", layer_start=0, layer_end=100, clock=lambda: 100,
+        voucher_store=vouchers, channel_state=state, pay_program=PROGRAM)
+    assert manager.check_ready()
+
+    book = pay.PayerChannelBook(tmp_path / "adopt" / "payer.sqlite")
+    book.put(program=PROGRAM, channel=CHANNEL, worker_key=WORKER_HEX,
+             cap=1000, channel_base=0, max_signed_total=4)
+    consumer = pay.ConsumerVoucherManager(
+        book=book, state=state, program=PROGRAM, private_key=PAYER_SEED,
+        plan=[{"worker_keyid": WORKER_HEX, "layer_start": 0,
+               "layer_end": 100}],
+        max_cost_by_worker={WORKER_HEX: 200}, session_id="adopt",
+        hold_id="hold", model_id="model", max_prompt_tokens=1,
+        max_output_tokens=1)
+    claim = manager.claim(
+        PAYER_HEX, "adopt", consumer.first_wire(WORKER_HEX, TOKEN))
+    assert manager._chain_session(claim)["channel_base"] == 2
+
+    receipt = _run_step(manager, claim, 1, 1)
+    consumer.observe(WORKER_HEX, manager.chain_receipt_wire(claim, receipt))
+    assert consumer.channels[WORKER_HEX].channel_base == 2
+    consumer.acknowledge_delivery(prompt_tokens=1, generated_tokens=1)
+    assert pay.parse_wire(consumer.outgoing(WORKER_HEX))["total"] == 4
+
+    consumer.book.close()
+    manager.store.close()
+    vouchers.close()
+
+
+def test_payer_refuses_worker_base_above_ever_signed_ceiling(tmp_path):
+    book = pay.PayerChannelBook(tmp_path / "ceiling.sqlite")
+    book.put(program=PROGRAM, channel=CHANNEL, worker_key=WORKER_HEX,
+             cap=1000, channel_base=0, max_signed_total=3)
+    with pytest.raises(pay.VoucherError, match="above the payer signing ceiling"):
+        book.adopt_session_base(CHANNEL, 4, on_chain_redeemed=0)
     book.close()
 
 
@@ -208,6 +338,8 @@ def test_consumer_preflight_requires_chain_authority_and_capacity(tmp_path):
             book=book, state=_state(cap=10), program=PROGRAM,
             private_key=WRONG_SEED, plan=plan,
             max_cost_by_worker={WORKER_HEX: 100})
+    book.put(program=PROGRAM, channel=CHANNEL, worker_key=WORKER_HEX,
+             cap=10, channel_base=10, max_signed_total=10)
     with pytest.raises(pay.VoucherError, match="insufficient"):
         pay.ConsumerVoucherManager(
             book=book, state=_state(cap=10, redeemed=10), program=PROGRAM,
@@ -329,7 +461,7 @@ def _chain_admission(tmp_path, monkeypatch, *, session="session", cap=1000,
     assert manager.check_ready()
     book = pay.PayerChannelBook(tmp_path / session / "payer-channels.sqlite")
     book.put(program=PROGRAM, channel=CHANNEL, worker_key=WORKER_HEX,
-             cap=cap, channel_base=redeemed, last_vouched_total=redeemed)
+             cap=cap, channel_base=redeemed, max_signed_total=redeemed)
     consumer = pay.ConsumerVoucherManager(
         book=book, state=state, program=PROGRAM, private_key=PAYER_SEED,
         plan=[{"worker_keyid": WORKER_HEX, "layer_start": 0,
@@ -421,11 +553,12 @@ def test_worker_reserves_one_session_per_channel_and_advances_base(
         assert manager.check_ready()
         return manager
 
-    def init_for(session, base):
+    def init_for(session, base, ceiling=None):
         return pay.init_wire(
             TOKEN, program=PROGRAM, channel=CHANNEL, channel_base=base,
             hold_id="hold", session_id=session, model_id="model",
-            max_prompt_tokens=1, max_output_tokens=40)
+            max_prompt_tokens=1, max_output_tokens=40,
+            max_signed_total=base if ceiling is None else ceiling)
 
     first = manager_for("reservation-a")
     claim_a = first.claim(PAYER_HEX, "reservation-a", init_for("reservation-a", 10))
@@ -451,16 +584,49 @@ def test_worker_reserves_one_session_per_channel_and_advances_base(
     first.release_chain_session(claim_a)
 
     with pytest.raises(admission.PaidAdmissionError,
-                       match="does not match worker-derived base"):
+                       match="exceeds the payer signing ceiling"):
         second.claim(PAYER_HEX, "reservation-b", init_for("reservation-b", 10))
     claim_b = second.claim(
-        PAYER_HEX, "reservation-b", init_for("reservation-b", 12))
+        PAYER_HEX, "reservation-b", init_for("reservation-b", 10, 12))
     assert second._chain_session(claim_b)["channel_base"] == 12
 
     second.release_chain_session(claim_b)
     first.store.close()
     second.store.close()
     vouchers.close()
+
+
+def test_worker_reservation_identity_includes_boot_id(tmp_path, monkeypatch):
+    monkeypatch.setattr(pay, "_process_start_time", lambda _pid: "12345")
+    boot = {"value": "11111111-1111-1111-1111-111111111111"}
+    monkeypatch.setattr(pay, "_boot_id", lambda: boot["value"])
+    store = pay.WorkerVoucherStore(tmp_path / "boot" / "vouchers.sqlite")
+    pid = os.getpid()
+
+    store._db.execute(
+        "INSERT INTO reservations(channel,reservation_id,pid,process_start,"
+        "boot_id,acquired_at) VALUES(?,?,?,?,?,?)",
+        (CHANNEL, "old-boot", pid, "12345",
+         "00000000-0000-0000-0000-000000000000", 1))
+    store.acquire_reservation(CHANNEL, "new-boot")
+    row = store._db.execute(
+        "SELECT * FROM reservations WHERE channel=?", (CHANNEL,)).fetchone()
+    assert row["reservation_id"] == "new-boot"
+    assert row["boot_id"] == boot["value"]
+
+    with pytest.raises(pay.VoucherError, match="channel busy"):
+        store.acquire_reservation(CHANNEL, "same-boot-contender")
+
+    def unreadable_boot():
+        raise pay.VoucherError("cannot verify voucher reservation boot")
+
+    monkeypatch.setattr(pay, "_boot_id", unreadable_boot)
+    with pytest.raises(pay.VoucherError, match="cannot verify.*boot"):
+        store.acquire_reservation(CHANNEL, "unknown-boot-contender")
+    assert store._db.execute(
+        "SELECT reservation_id FROM reservations WHERE channel=?",
+        (CHANNEL,)).fetchone()[0] == "new-boot"
+    store.close()
 
 
 def test_voucher_silence_bound_counts_credits_before_rounding(
@@ -546,7 +712,7 @@ def test_worker_derives_channel_base_and_refuses_sender_value(tmp_path, monkeypa
         hold_id="hold", session_id="base", model_id="model",
         max_prompt_tokens=1, max_output_tokens=40)
     with pytest.raises(admission.PaidAdmissionError,
-                       match="does not match worker-derived base"):
+                       match="exceeds the worker-derived base"):
         manager.claim(PAYER_HEX, "base", forged)
     store.close()
     vouchers.close()
