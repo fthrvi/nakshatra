@@ -652,3 +652,18 @@ send(rpc,[pay.config_init({'authority':authority.pubkey(),'config':config,'progr
         except subprocess.TimeoutExpired:
             process.kill(); process.wait(timeout=5)
         log.close()
+
+
+def test_cli_withdraw_request_never_guesses_unlock_time_from_local_clock(
+        _temp_home, monkeypatch, capsys):
+    wallet = _make_keys(_temp_home)
+    node = ed25519.Ed25519PrivateKey.from_private_bytes(bytes(range(101, 133))).public_key().public_bytes_raw()
+    rpc = FakeRpc(); rpc.configure(wallet, node)
+    rpc.ready = True  # escrow exists, but its pending_withdraw is not visible yet
+    monkeypatch.setattr(nak.time, "time", lambda: 5_000_000)
+    with rpc as url:
+        monkeypatch.setenv("NAK_PAY_RPC", url)
+        assert nak.main(["pay", "withdraw", "--amount", "0.5"]) == 0
+    out = capsys.readouterr().out
+    assert "withdraw_at: unknown" in out
+    assert str(5_000_000 + 21600) not in out

@@ -1249,7 +1249,12 @@ def _pay_command(args) -> None:
             escrow = chain.escrow_pda(wallet["address"], program)[0]
             current = rpc.account_info(escrow)
             pending = chain.decode_escrow(current["data"])["pending_withdraw"] if current else None
-            print(f"withdraw_at: {pending['withdraw_at'] if pending else int(time.time()) + 21600}")
+            if pending:
+                print(f"withdraw_at: {pending['withdraw_at']}")
+            else:
+                # Never guess the unlock time from the local clock; the chain is the source.
+                print("withdraw_at: unknown (the request is not visible on-chain yet; "
+                      "check nak pay status)")
 
 
 def _balance_command() -> None:
