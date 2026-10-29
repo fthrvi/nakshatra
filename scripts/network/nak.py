@@ -712,15 +712,31 @@ def _wallet_hook():
     return wallet(url=url, spki_hash=pin)
 
 
-def _usdc_credits(text: str) -> int:
+def _exact_usdc_units(text: str, *, scale: int, error: str) -> int:
+    """Convert plain USDC text to integer units without Decimal context rounding."""
+    if not isinstance(text, str) or re.fullmatch(r"[0-9]+(?:\.[0-9]*)?", text) is None:
+        raise SystemExit(error)
     try:
         value = Decimal(text)
     except (InvalidOperation, ValueError) as exc:
-        raise SystemExit("withdraw amount must be a positive USDC decimal") from exc
-    micros = value * 1_000_000
-    if not value.is_finite() or value <= 0 or micros != micros.to_integral_value():
-        raise SystemExit("withdraw amount must be positive with at most 6 USDC decimals")
-    return int(micros) * 100
+        raise SystemExit(error) from exc
+    sign, digits, exponent = value.as_tuple()
+    if (not value.is_finite() or sign or value.is_zero()
+            or not isinstance(exponent, int) or exponent < -6):
+        raise SystemExit(error)
+    coefficient = 0
+    for digit in digits:
+        coefficient = coefficient * 10 + digit
+    units = coefficient * (10 ** (exponent + scale))
+    if units >= 2**64:
+        raise SystemExit(error)
+    return units
+
+
+def _usdc_credits(text: str) -> int:
+    return _exact_usdc_units(
+        text, scale=8,
+        error="withdraw amount must be positive with at most 6 USDC decimals")
 
 
 def _wallet_command(args) -> None:
@@ -804,15 +820,9 @@ _PAY_DEFAULTS = {
 
 
 def _pay_usdc(value: str, name: str) -> int:
-    try:
-        amount = Decimal(value)
-    except (InvalidOperation, ValueError) as exc:
-        raise SystemExit(f"{name} must be a positive USDC decimal") from exc
-    micros = amount * 1_000_000
-    if (not amount.is_finite() or amount <= 0
-            or micros != micros.to_integral_value() or micros >= 2**64):
-        raise SystemExit(f"{name} must be positive with at most 6 USDC decimals")
-    return int(micros)
+    return _exact_usdc_units(
+        value, scale=6,
+        error=f"{name} must be positive with at most 6 USDC decimals")
 
 
 def _pay_amount(value: int) -> str:

@@ -302,6 +302,21 @@ def test_cli_limits_validation(_temp_home, argv, match):
         nak.main(argv)
 
 
+@pytest.mark.parametrize("amount", [
+    "0.00000099999999999999999999999999999999999999",
+    "1.0000000000000000000000000000001",
+    "1.0000001",
+    "-1",
+    "nan",
+    "1e3",
+    "1e400",
+    "18446744073709551616",
+])
+def test_pay_usdc_parser_rejects_inexact_or_unsafe_amounts(amount):
+    with pytest.raises(SystemExit, match="positive with at most 6 USDC decimals"):
+        nak._pay_usdc(amount, "--amount")
+
+
 @pytest.mark.slow
 def test_local_validator_pay_flow(tmp_path, _temp_home, monkeypatch):
     """CLI + builders against a private validator and locally loaded programs."""

@@ -66,7 +66,18 @@ def test_nak_wallet_commands_use_signed_client_and_convert_usdc(monkeypatch, cap
     ]
 
 
-@pytest.mark.parametrize("amount", ["0", "-1", "nan", "1.0000001", "not-money"])
+@pytest.mark.parametrize("amount", [
+    "0",
+    "-1",
+    "nan",
+    "1.0000001",
+    "0.00000099999999999999999999999999999999999999",
+    "1.0000000000000000000000000000001",
+    "1e3",
+    "1e400",
+    "18446744073709551616",
+    "not-money",
+])
 def test_nak_wallet_withdraw_rejects_invalid_usdc_before_call(
     amount, monkeypatch
 ):
