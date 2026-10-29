@@ -377,6 +377,7 @@ class JsonRpcChannelState:
         self._request_id = 0
         self._lock = threading.Lock()
         self._cluster_checked = False
+        self._cluster_genesis: str | None = None
 
     def _rpc(self, method: str, params: list[object]) -> object:
         with self._lock:
@@ -395,6 +396,19 @@ class JsonRpcChannelState:
                 if len(raw) > RPC_RESPONSE_MAX:
                     raise VoucherError(f"Solana RPC {method} response is too large")
                 decoded = json.loads(raw)
+            if (isinstance(decoded, dict)
+                    and decoded.get("jsonrpc") == "2.0"
+                    and decoded.get("id") == request_id
+                    and set(decoded) == {"jsonrpc", "id", "error"}):
+                error = decoded["error"]
+                if not isinstance(error, dict):
+                    raise VoucherError(f"Solana RPC returned malformed {method} error")
+                code = error.get("code")
+                message = error.get("message")
+                if isinstance(code, bool) or not isinstance(code, int) or not isinstance(message, str):
+                    raise VoucherError(f"Solana RPC returned malformed {method} error")
+                safe = "".join(ch for ch in message if ch.isprintable())[:500]
+                raise VoucherError(f"Solana RPC {method} was refused ({code}): {safe}")
             if (not isinstance(decoded, dict)
                     or decoded.get("jsonrpc") != "2.0"
                     or decoded.get("id") != request_id
@@ -417,12 +431,14 @@ class JsonRpcChannelState:
         host = (urllib.parse.urlsplit(self.rpc_url).hostname or "").lower()
         local = host in _LOOPBACK_HOSTS
         if genesis == MAINNET_GENESIS_HASH:
-            raise VoucherError("Solana mainnet RPC is forbidden for Nakshatra payments")
+            raise VoucherError(
+                "Solana mainnet RPC is forbidden: Nakshatra payments are DEVNET-ONLY")
         if genesis != DEVNET_GENESIS_HASH and not local:
             raise VoucherError(
                 "Solana RPC cluster is neither devnet nor a loopback test validator")
         with self._lock:
             self._cluster_checked = True
+            self._cluster_genesis = genesis
 
     def _account(self, address: str, program_id: str) -> bytes:
         self._ensure_cluster()
@@ -610,6 +626,11 @@ class PayerChannelBook(_Book):
         if row is None:
             raise VoucherError("payer has no channel for worker")
         return self._row(row)
+
+    def list_channels(self) -> list[PayerChannel]:
+        """Return the payer's channel pins without exposing the sqlite handle."""
+        return [self._row(row) for row in self._db.execute(
+            "SELECT * FROM channels ORDER BY worker_key,channel")]
 
     def begin_session(self, worker_key: str, *, program: str, state: ChannelState,
                       max_cost_credits: int) -> PayerChannel:
@@ -1111,14 +1132,15 @@ class ConsumerVoucherManager:
 
 
 def configured_program() -> str:
-    value = os.environ.get("NAKSHATRA_PAY_PROGRAM_ID", "").strip()
+    value = os.environ.get("NAK_PAY_PROGRAM", "").strip()
     if not value:
-        raise VoucherError("NAKSHATRA_PAY_PROGRAM_ID is required in chain mode")
+        raise VoucherError("NAK_PAY_PROGRAM is required in chain mode")
     return _pubkey_text(value, "configured program id")
 
 
 def configured_state() -> JsonRpcChannelState:
-    url = os.environ.get("NAKSHATRA_PAY_RPC_URL", "").strip()
+    url = (os.environ.get("NAK_PAY_RPC", "").strip()
+           or os.environ.get("NAKSHATRA_PAY_RPC_URL", "").strip())
     if not url:
-        raise VoucherError("NAKSHATRA_PAY_RPC_URL is required in chain mode")
+        raise VoucherError("NAK_PAY_RPC is required in chain mode")
     return JsonRpcChannelState(url)

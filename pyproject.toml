@@ -17,6 +17,7 @@ build-backend = "setuptools.build_meta"
 # command are the same command. That is the whole point: a check nobody remembers to run
 # is not a check.
 testpaths = ["tests", "scripts"]
+markers = ["slow: launches heavyweight local-only integration tooling"]
 
 # ⛔ deploy/ IS DELIBERATELY EXCLUDED, AND NOT BECAUSE ITS TESTS FAIL.
 # deploy/test_eagle_cmd5.py, test_sleep_wake.py and test_eagle_kv_isolation.py are hardware

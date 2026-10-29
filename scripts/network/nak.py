@@ -745,8 +745,8 @@ def _wallet_command(args) -> None:
         raise SystemExit(f"wallet refused: {exc}") from exc
 
 
-_SOLANA_DEVNET_GENESIS = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1"
-_SOLANA_MAINNET_GENESIS = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2d4"
+_SOLANA_DEVNET_GENESIS = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG"
+_SOLANA_MAINNET_GENESIS = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d"
 
 
 class _NoPayRedirects(HTTPRedirectHandler):
@@ -795,6 +795,265 @@ def _format_sol(lamports: int) -> str:
     return f"{whole}.{fraction:09d}".rstrip("0")
 
 
+_PAY_DEFAULTS = {
+    "cap_total": 5_000_000,
+    "days": 30,
+    "per_tx": 1_000_000,
+    "per_day": 5_000_000,
+}
+
+
+def _pay_usdc(value: str, name: str) -> int:
+    try:
+        amount = Decimal(value)
+    except (InvalidOperation, ValueError) as exc:
+        raise SystemExit(f"{name} must be a positive USDC decimal") from exc
+    micros = amount * 1_000_000
+    if (not amount.is_finite() or amount <= 0
+            or micros != micros.to_integral_value() or micros >= 2**64):
+        raise SystemExit(f"{name} must be positive with at most 6 USDC decimals")
+    return int(micros)
+
+
+def _pay_amount(value: int) -> str:
+    whole, fraction = divmod(int(value), 1_000_000)
+    return str(whole) if not fraction else f"{whole}.{fraction:06d}".rstrip("0")
+
+
+def _pay_limits_path() -> Path:
+    return Path.home() / ".nakshatra" / "pay" / "limits.json"
+
+
+def _validate_pay_limits(values: dict) -> dict:
+    required = {"cap_total", "days", "per_tx", "per_day"}
+    if set(values) != required:
+        raise SystemExit("pay limits must contain cap_total, days, per_tx, and per_day")
+    for key in ("cap_total", "per_tx", "per_day"):
+        if isinstance(values[key], bool) or not isinstance(values[key], int) or not 0 < values[key] < 2**64:
+            raise SystemExit(f"pay limit {key} must be a positive USDC amount")
+    if isinstance(values["days"], bool) or not isinstance(values["days"], int) or not 1 <= values["days"] <= 3650:
+        raise SystemExit("pay limit days must be between 1 and 3650")
+    if values["per_tx"] > values["per_day"]:
+        raise SystemExit("pay limit per-tx cannot exceed per-day")
+    if values["per_day"] > values["cap_total"]:
+        raise SystemExit("pay limit per-day cannot exceed the on-chain cap")
+    return dict(values)
+
+
+def _load_pay_limits() -> dict:
+    path = _pay_limits_path()
+    if not path.exists():
+        return dict(_PAY_DEFAULTS)
+    try:
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise SystemExit(f"refusing {path}: pay limits must be a regular file")
+        if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600:
+            raise SystemExit(f"refusing {path}: pay limits must be uid-owned mode 0600")
+        values = json.loads(path.read_text(encoding="utf-8"))
+    except SystemExit:
+        raise
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise SystemExit(f"cannot read pay limits at {path}: {exc}") from exc
+    if not isinstance(values, dict):
+        raise SystemExit("pay limits must be a JSON object")
+    return _validate_pay_limits(values)
+
+
+def _save_pay_limits(values: dict) -> None:
+    values = _validate_pay_limits(values)
+    path = _pay_limits_path()
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path.parent, 0o700)
+    if os.path.lexists(path) and path.is_symlink():
+        raise SystemExit(f"refusing {path}: pay limits must not be a symlink")
+    temp = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp")
+    body = (json.dumps(values, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    try:
+        fd = os.open(temp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            view = memoryview(body)
+            while view:
+                view = view[os.write(fd, view):]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(temp, path)
+        os.chmod(path, 0o600)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def _pay_chain_settings(*, require_rpc: bool = True):
+    from network import pay_chain
+
+    rpc_url = pay_chain.configured_rpc_url(os.environ)
+    if require_rpc and not rpc_url:
+        raise SystemExit("NAK_PAY_RPC is required for this on-chain payment command")
+    program = pay_chain.configured_pubkey(os.environ, "NAK_PAY_PROGRAM")
+    mint = pay_chain.configured_pubkey(os.environ, "NAK_PAY_MINT")
+    try:
+        rpc = pay_chain.PayRpc(rpc_url) if rpc_url else None
+        if rpc is not None:
+            rpc.ensure_cluster()
+    except (ValueError, pay_chain.VoucherError) as exc:
+        raise SystemExit(str(exc)) from exc
+    return pay_chain, rpc, program, mint
+
+
+def _pay_wallet_and_node(*, signing: bool = True):
+    from network.pay_wallet import load_wallet
+    from nakshatra_auth import load_worker_key
+
+    wallet = load_wallet(Path.home())
+    if signing and wallet["custody"] == "broker":
+        raise SystemExit(
+            "wallet custody is broker; on-chain wallet signing is not available yet")
+    try:
+        node_seed, node_hex = load_worker_key(
+            Path.home() / ".nakshatra" / "keys" / "worker.ed25519")
+    except (OSError, ValueError, PermissionError) as exc:
+        raise SystemExit(f"cannot load the node worker key: {exc}") from exc
+    return wallet, node_seed, bytes.fromhex(node_hex)
+
+
+def _pay_send(rpc, chain, instructions, wallet: dict, *, rent: int = 0) -> str:
+    try:
+        blockhash = rpc.latest_blockhash()
+        message = chain.compile_message(instructions, wallet["address"], blockhash)
+        fee = rpc.fee_for_message(message.data)
+        balance = rpc.balance(wallet["address"])
+        needed = int(rent) + fee
+        if balance < needed:
+            raise SystemExit(
+                f"wallet {wallet['address']} has too little SOL: needs "
+                f"{_format_sol(needed)} SOL, has {_format_sol(balance)} SOL; nothing was sent")
+        tx = chain.sign_transaction(
+            instructions, wallet["address"], blockhash,
+            {wallet["address"]: wallet["seed"]})
+        signature = rpc.send_and_confirm(tx)
+        cluster = rpc.cluster_label()
+    except SystemExit:
+        raise
+    except (ValueError, chain.VoucherError) as exc:
+        raise SystemExit(f"pay transaction refused: {exc}") from exc
+    print(f"cluster: {cluster}")
+    print(f"transaction: {signature}")
+    print(f"explorer: {chain.explorer_link(signature, cluster)}")
+    return signature
+
+
+def _pay_ensure() -> None:
+    wallet, _node_seed, node_public = _pay_wallet_and_node()
+    chain, rpc, program, mint = _pay_chain_settings()
+    limits = _load_pay_limits()
+    path = _pay_limits_path()
+    if not path.exists():
+        _save_pay_limits(limits)
+    d = chain._derived(wallet["address"], program)
+    delegate_address = chain.delegate_pda(d["escrow"], node_public, program)[0]
+    try:
+        escrow_info = rpc.account_info(d["escrow"])
+        delegate_info = rpc.account_info(delegate_address)
+        owner_state_info = rpc.account_info(d["owner_state"])
+        vault_info = rpc.account_info(d["vault"])
+        instructions = []
+        rent = 0
+        escrow_state = None
+        if escrow_info is None:
+            instructions.extend(chain.escrow_init(wallet["address"], mint, program))
+            if owner_state_info is None:
+                rent += rpc.rent_exemption(17)
+            rent += rpc.rent_exemption(163) + rpc.rent_exemption(165)
+        elif escrow_info["owner"] != program:
+            raise SystemExit("escrow address exists but is not owned by NAK_PAY_PROGRAM")
+        elif vault_info is None:
+            raise SystemExit("escrow exists but its canonical vault is missing")
+        else:
+            escrow_state = chain.decode_escrow(escrow_info["data"])
+            if escrow_state["owner"] != wallet["address"] or escrow_state["vault"] != d["vault"]:
+                raise SystemExit("escrow account does not match the configured wallet and vault")
+            if vault_info["owner"] != chain.TOKEN_PROGRAM_ID:
+                raise SystemExit("escrow vault is not owned by the classic SPL Token program")
+
+        current = None
+        if delegate_info is not None:
+            if delegate_info["owner"] != program:
+                raise SystemExit("delegate address exists but is not owned by NAK_PAY_PROGRAM")
+            current = chain.decode_delegate(delegate_info["data"])
+        expires_soon = current is None or current["expires_at"] <= int(time.time()) + 7 * 86400
+        changed = (escrow_info is None or current is None
+                   or (escrow_state is not None and current["generation"] != escrow_state["generation"])
+                   or current["cap_total"] != limits["cap_total"]
+                   or current["flags"] != chain.DELEGATE_FLAGS_ALL or current["disabled"])
+        if expires_soon or changed:
+            if current is not None and current["spent"] > limits["cap_total"]:
+                raise SystemExit("saved on-chain cap is below the delegate's amount already spent")
+            if current is None:
+                rent += rpc.rent_exemption(115)
+            expires_at = int(time.time()) + limits["days"] * 86400
+            instructions.extend(chain.delegate_set(
+                wallet["address"], node_public, limits["cap_total"], expires_at,
+                chain.DELEGATE_FLAGS_ALL, program))
+        if not instructions:
+            print("pay escrow and node delegate are already configured")
+            return
+        _pay_send(rpc, chain, instructions, wallet, rent=rent)
+    except SystemExit:
+        raise
+    except (ValueError, chain.VoucherError) as exc:
+        raise SystemExit(f"pay ensure refused: {exc}") from exc
+
+
+def _pay_status(wallet: dict) -> None:
+    from network import pay_chain as chain
+
+    print(f"address: {wallet['address']}")
+    print(f"custody: {wallet['custody']}")
+    rpc_url = chain.configured_rpc_url(os.environ)
+    if not rpc_url:
+        print("balance: set NAK_PAY_RPC to a devnet RPC to show balances")
+        return
+    try:
+        rpc = chain.PayRpc(rpc_url)
+        rpc.ensure_cluster()
+        print(f"balance: {_format_sol(rpc.balance(wallet['address']))} SOL")
+        program_value = os.environ.get("NAK_PAY_PROGRAM", "").strip()
+        mint_value = os.environ.get("NAK_PAY_MINT", "").strip()
+        if not program_value or not mint_value:
+            print("escrow: set NAK_PAY_PROGRAM and NAK_PAY_MINT to show on-chain payment state")
+            return
+        program = chain.configured_pubkey(os.environ, "NAK_PAY_PROGRAM")
+        chain.configured_pubkey(os.environ, "NAK_PAY_MINT")
+        _node_seed, node_hex = __import__("nakshatra_auth").load_worker_key(
+            Path.home() / ".nakshatra" / "keys" / "worker.ed25519")
+        d = chain._derived(wallet["address"], program)
+        escrow_info = rpc.account_info(d["escrow"])
+        if escrow_info is None:
+            print("escrow: not initialized")
+            return
+        if escrow_info["owner"] != program:
+            raise SystemExit("escrow address exists but is not owned by NAK_PAY_PROGRAM")
+        escrow = chain.decode_escrow(escrow_info["data"])
+        vault_info = rpc.account_info(escrow["vault"])
+        if vault_info is not None and vault_info["owner"] != chain.TOKEN_PROGRAM_ID:
+            raise SystemExit("escrow vault is not owned by the classic SPL Token program")
+        balance = chain.token_amount(vault_info["data"]) if vault_info else 0
+        print(f"escrow balance: {_pay_amount(balance)} USDC")
+        print(f"escrow committed: {_pay_amount(escrow['committed'])} USDC")
+        delegate_address = chain.delegate_pda(d["escrow"], bytes.fromhex(node_hex), program)[0]
+        delegate_info = rpc.account_info(delegate_address)
+        if delegate_info is None:
+            print("delegate: not configured")
+        else:
+            delegate = chain.decode_delegate(delegate_info["data"])
+            print(f"delegate cap: {_pay_amount(delegate['cap_total'])} USDC")
+            print(f"delegate expires: {delegate['expires_at']}")
+    except (OSError, ValueError, PermissionError, chain.VoucherError) as exc:
+        raise SystemExit(f"pay status refused: {exc}") from exc
+
+
 def _pay_command(args) -> None:
     from network.pay_wallet import load_wallet
 
@@ -811,25 +1070,60 @@ def _pay_command(args) -> None:
     if args.pay_cmd == "address":
         print(wallet["address"])
         return
-
-    print(f"address: {wallet['address']}")
-    print(f"custody: {wallet['custody']}")
-    rpc = os.environ.get("NAK_PAY_RPC", "").strip()
-    if not rpc:
-        print("balance: set NAK_PAY_RPC to a devnet RPC to show balances")
+    if args.pay_cmd == "status":
+        _pay_status(wallet)
         return
-    rpc, local = _pay_rpc_url(rpc)
-    opener = build_opener(ProxyHandler({}), _NoPayRedirects())
-    genesis = _pay_rpc_request(opener, rpc, "getGenesisHash", [])
-    if genesis == _SOLANA_MAINNET_GENESIS:
-        raise SystemExit("refusing Solana mainnet RPC: real money is DEVNET-ONLY")
-    if genesis != _SOLANA_DEVNET_GENESIS and not local:
-        raise SystemExit("refusing non-devnet Solana RPC: real money is DEVNET-ONLY")
-    balance = _pay_rpc_request(opener, rpc, "getBalance", [wallet["address"]])
-    if (not isinstance(balance, dict) or isinstance(balance.get("value"), bool)
-            or not isinstance(balance.get("value"), int) or balance["value"] < 0):
-        raise SystemExit("pay RPC getBalance returned an invalid lamport balance")
-    print(f"balance: {_format_sol(balance['value'])} SOL")
+    if args.pay_cmd == "ensure":
+        _pay_ensure()
+        return
+    if args.pay_cmd == "limits":
+        values = {"cap_total": _pay_usdc(args.cap, "--cap"), "days": args.days,
+                  "per_tx": _pay_usdc(args.per_tx, "--per-tx"),
+                  "per_day": _pay_usdc(args.per_day, "--per-day")}
+        _save_pay_limits(values)
+        _pay_ensure()
+        return
+
+    if args.pay_cmd == "channels":
+        chain, rpc, _program, _mint = _pay_chain_settings()
+        from network.pay_voucher import PayerChannelBook
+        with PayerChannelBook() as book:
+            rows = book.list_channels()
+        if not rows:
+            print("no payer channels")
+        for row in rows:
+            try:
+                state = rpc.read_channel(row.channel, row.program)
+                print(f"{row.worker_key}  {row.channel}  cap {_pay_amount(state.cap)} USDC  "
+                      f"redeemed {_pay_amount(state.redeemed)} USDC  {state.status.lower()}")
+            except chain.VoucherError as exc:
+                print(f"{row.worker_key}  {row.channel}  unavailable: {exc}")
+        return
+
+    if args.pay_cmd in {"deposit", "withdraw"}:
+        _pay_ensure()
+    wallet, _node_seed, _node_public = _pay_wallet_and_node()
+    chain, rpc, program, mint = _pay_chain_settings()
+    if args.pay_cmd == "deposit":
+        amount = _pay_usdc(args.amount, "--amount")
+        instructions = chain.escrow_deposit(wallet["address"], mint, amount, program)
+        ata = chain.associated_token_address(wallet["address"], mint)[0]
+        rent = 0 if rpc.account_info(ata) is not None else rpc.rent_exemption(165)
+        _pay_send(rpc, chain, instructions, wallet, rent=rent)
+    elif args.pay_cmd == "withdraw":
+        if args.execute:
+            instructions = chain.escrow_withdraw_execute(wallet["address"], mint, program)
+            ata = chain.associated_token_address(wallet["address"], mint)[0]
+            rent = 0 if rpc.account_info(ata) is not None else rpc.rent_exemption(165)
+            _pay_send(rpc, chain, instructions, wallet, rent=rent)
+        else:
+            amount = _pay_usdc(args.amount, "--amount")
+            _pay_send(rpc, chain, chain.escrow_withdraw_request(
+                wallet["address"], amount, program), wallet)
+            escrow = chain.escrow_pda(wallet["address"], program)[0]
+            current = rpc.account_info(escrow)
+            pending = chain.decode_escrow(current["data"])["pending_withdraw"] if current else None
+            print(f"withdraw_at: {pending['withdraw_at'] if pending else int(time.time()) + 21600}")
 
 
 def _balance_command() -> None:
@@ -3053,6 +3347,19 @@ def main(argv=None, *, http_post=None, http_get=None) -> int:
     paysub = p.add_subparsers(dest="pay_cmd", required=True)
     paysub.add_parser("address", help="print the Solana pay address")
     paysub.add_parser("status", help="show the address, custody mode, and optional devnet SOL balance")
+    paysub.add_parser("ensure", help="idempotently initialize escrow and renew this node's delegate")
+    q = paysub.add_parser("limits", help="save hard/soft USDC limits and run ensure")
+    q.add_argument("--cap", required=True, help="on-chain lifetime delegate cap in USDC")
+    q.add_argument("--days", required=True, type=int, help="delegate lifetime in days (1-3650)")
+    q.add_argument("--per-tx", required=True, help="local per-transaction cap in USDC")
+    q.add_argument("--per-day", required=True, help="local daily cap in USDC")
+    q = paysub.add_parser("deposit", help="deposit USDC from the wallet's associated token account")
+    q.add_argument("--amount", required=True, help="USDC amount")
+    q = paysub.add_parser("withdraw", help="request a withdrawal, or execute it after six hours")
+    withdraw = q.add_mutually_exclusive_group(required=True)
+    withdraw.add_argument("--amount", help="USDC amount to request")
+    withdraw.add_argument("--execute", action="store_true", help="execute the pending withdrawal")
+    paysub.add_parser("channels", help="list the local payer channel book with on-chain state")
     q = paysub.add_parser("export", help="interactively export the Phantom/Solflare keypair")
     q.add_argument("--keypair", action="store_true", required=True,
                    help="print the 64-byte seed + public key as a JSON integer array")
