@@ -108,6 +108,60 @@ def test_message_order_and_transaction_signature_verifies():
     assert tx.data == b"\x01" + tx.signatures[0] + tx.message
 
 
+def _confirmation_rpc(monkeypatch, statuses):
+    signature = pay_chain.b58encode(b"s" * 64)
+    transaction = pay_chain.SignedTransaction(b"transaction", b"message", (), signature)
+    rpc = pay_chain.PayRpc("http://127.0.0.1:1")
+    monkeypatch.setattr(rpc, "_ensure_cluster", lambda: None)
+    remaining = list(statuses)
+    calls = []
+
+    def fake_rpc(method, _params):
+        calls.append(method)
+        if method == "sendTransaction":
+            return signature
+        assert method == "getSignatureStatuses"
+        status = remaining.pop(0) if remaining else None
+        return {"value": [status]}
+
+    now = [0.0]
+    monkeypatch.setattr(rpc, "_rpc", fake_rpc)
+    monkeypatch.setattr(pay_chain.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(pay_chain.time, "sleep", lambda delay: now.__setitem__(0, now[0] + delay))
+    return rpc, transaction, calls
+
+
+def test_send_and_confirm_does_not_accept_confirmed_then_null(monkeypatch):
+    rpc, transaction, _calls = _confirmation_rpc(monkeypatch, [
+        {"err": None, "confirmationStatus": "confirmed"},
+        None,
+    ])
+
+    with pytest.raises(pay_chain.VoucherError, match=rf"final state is unknown.*{transaction.signature}"):
+        rpc.send_and_confirm(transaction, timeout=0.3)
+
+
+def test_send_and_confirm_waits_through_confirmed_for_finalized(monkeypatch):
+    rpc, transaction, calls = _confirmation_rpc(monkeypatch, [
+        {"err": None, "confirmationStatus": "confirmed"},
+        {"err": None, "confirmationStatus": "finalized"},
+    ])
+
+    assert rpc.send_and_confirm(transaction, timeout=1) == transaction.signature
+    assert calls == ["sendTransaction", "getSignatureStatuses", "getSignatureStatuses"]
+
+
+def test_send_and_confirm_fails_immediately_on_transaction_error(monkeypatch):
+    rpc, transaction, calls = _confirmation_rpc(monkeypatch, [
+        {"err": {"InstructionError": [0, "Custom"]}, "confirmationStatus": "confirmed"},
+        {"err": None, "confirmationStatus": "finalized"},
+    ])
+
+    with pytest.raises(pay_chain.VoucherError, match="transaction failed"):
+        rpc.send_and_confirm(transaction, timeout=1)
+    assert calls == ["sendTransaction", "getSignatureStatuses"]
+
+
 def test_all_builders_match_neuron_and_solders_byte_for_byte():
     python = Path("/home/prithvi/.cache/nak-solana/venv-chain/bin/python")
     if not python.exists():
@@ -219,7 +273,7 @@ class FakeRpc:
                 elif method == "sendTransaction":
                     raw = base64.b64decode(params[0]); result = pay_chain.b58encode(raw[1:65])
                     outer.sent += 1; outer.ready = True
-                elif method == "getSignatureStatuses": result = {"context":{"slot":1},"value":[{"slot":1,"confirmations":1,"err":None,"confirmationStatus":"confirmed"}]}
+                elif method == "getSignatureStatuses": result = {"context":{"slot":1},"value":[{"slot":1,"confirmations":None,"err":None,"confirmationStatus":"finalized"}]}
                 else: raise AssertionError(method)
                 body = json.dumps({"jsonrpc":"2.0","id":request["id"],"result":result}).encode()
                 self.send_response(200); self.send_header("content-length", str(len(body))); self.end_headers(); self.wfile.write(body)

@@ -475,7 +475,7 @@ class PayRpc(JsonRpcChannelState):
             raise VoucherError("RPC returned an invalid transaction fee")
         return value
 
-    def send_and_confirm(self, transaction: SignedTransaction, *, timeout: float = 30.0) -> str:
+    def send_and_confirm(self, transaction: SignedTransaction, *, timeout: float = 60.0) -> str:
         self._ensure_cluster()
         returned = self._rpc("sendTransaction", [
             base64.b64encode(transaction.data).decode("ascii"),
@@ -497,10 +497,12 @@ class PayRpc(JsonRpcChannelState):
                     raise VoucherError("RPC returned malformed signature status")
                 if last.get("err") is not None:
                     raise VoucherError(f"transaction failed: {last['err']!r}")
-                if last.get("confirmationStatus") in {"confirmed", "finalized"}:
+                if last.get("confirmationStatus") == "finalized":
                     return returned
             time.sleep(0.15)
-        raise VoucherError(f"transaction confirmation timed out; last status={last!r}")
+        raise VoucherError(
+            f"transaction final state is unknown; signature {returned}; "
+            f"last status={last!r}")
 
 
 _ESCROW_DISC = hashlib.sha256(b"account:Escrow").digest()[:8]
