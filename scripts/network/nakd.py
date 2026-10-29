@@ -1270,11 +1270,13 @@ class Node:
                     and max(0, delegate["cap_total"] - delegate["spent"]) >= cap
                 )
                 if usable:
+                    recorded = attempts[-1] if attempts else {}
                     return {
-                        "v": 1, "kind": "chain-starter", "signature": row["chain_signature"],
+                        "v": 1, "kind": "chain-starter",
+                        "signature": str(recorded.get("signature") or ""),
                         "escrow": derived["escrow"], "delegate": delegate_address,
                         "cap": delegate["cap_total"], "expires_at": delegate["expires_at"],
-                        "sol_lamports": row["sol_lamports"], "ts": chain_now,
+                        "sol_lamports": int(recorded.get("sol_lamports") or 0), "ts": chain_now,
                         "existing": True,
                     }
                 if delegate["disabled"] and delegate["generation"] == escrow["generation"]:
@@ -1335,12 +1337,8 @@ class Node:
             # The complete signed intent is durable before sendTransaction.  A crash here leaves
             # an unbroadcast signature that must age past its last valid block height before retry.
             self.store.starter_update(
-                row["invite_id"], chain_attempts=attempts,
-                sol_lamports=top_up, chain_signature=transaction.signature,
-                updated=chain_now)
+                row["invite_id"], chain_attempts=attempts, updated=chain_now)
             row["chain_attempts"] = attempts
-            row["sol_lamports"] = top_up
-            row["chain_signature"] = transaction.signature
 
             try:
                 signature = rpc.send_and_confirm(transaction)

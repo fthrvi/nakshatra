@@ -195,8 +195,7 @@ def chain_node(tmp_path, monkeypatch):
     wallet = pay_wallet.ensure_wallet(home)
     row = {
         "invite_id": "starter-one", "to_keyid": RECIPIENT.hex(),
-        "amount": 100_000_000, "sol_lamports": 0, "chain_signature": "",
-        "chain_attempts": [],
+        "amount": 100_000_000, "chain_attempts": [],
     }
     node = object.__new__(nakd.Node)
     node.store = StarterStore(row)
@@ -217,7 +216,7 @@ def test_chain_starter_sends_one_delegate_and_sol_transaction(chain_node, monkey
                                     pay_chain.DELEGATE_OPEN_CHANNEL))
     assert pay_chain.anchor_discriminator("delegate_set") + args in raw
     assert struct.pack("<I", 2) + struct.pack("<Q", nakd.STARTER_NODE_SOL) in raw
-    assert row["sol_lamports"] == nakd.STARTER_NODE_SOL
+    assert row["chain_attempts"][0]["sol_lamports"] == nakd.STARTER_NODE_SOL
     assert receipt["signature"] == rpc.sent[0].signature
     assert receipt["escrow"] == rpc.derived["escrow"]
     assert receipt["delegate"] == rpc.delegate_address
@@ -327,7 +326,7 @@ def test_finalized_error_allows_a_new_attempt(chain_node, monkeypatch):
     assert len(row["chain_attempts"]) == 2
 
 
-def test_existing_starter_rows_migrate_to_durable_chain_attempts(tmp_path):
+def test_forgejo_main_pending_ledger_row_migrates_intact_and_still_updates(tmp_path):
     state = tmp_path / "store"
     store = Store(state, b"k" * 32)
     request_id = store.add_request("ab" * 32, "cd" * 32, "newcomer", "invite", "cd" * 32)
@@ -339,15 +338,35 @@ def test_existing_starter_rows_migrate_to_durable_chain_attempts(tmp_path):
     db = sqlite3.connect(state / "net.sqlite")
     db.execute("ALTER TABLE starter_obligations DROP COLUMN chain_attempts")
     db.execute("ALTER TABLE starter_obligations DROP COLUMN chain_created")
+    main_columns = tuple(row[1] for row in db.execute(
+        "PRAGMA table_info(starter_obligations)"))
+    before = db.execute(
+        f"SELECT {','.join(main_columns)} FROM starter_obligations").fetchone()
     db.commit()
     db.close()
 
     migrated = Store(state, b"k" * 32)
+    migrated_columns = tuple(row[1] for row in migrated._db.execute(
+        "PRAGMA table_info(starter_obligations)"))
+    after = migrated._db.execute(
+        f"SELECT {','.join(main_columns)} FROM starter_obligations").fetchone()
+    assert main_columns == (
+        "invite_id", "person", "to_keyid", "amount", "signed_invite", "state", "reason",
+        "created", "updated", "next_attempt", "attempts", "approved", "paid_at", "receipt")
+    assert after == before
+    assert "sol_lamports" not in migrated_columns
+    assert "chain_signature" not in migrated_columns
     row = migrated.starter_rows()[0]
+    assert row["state"] == "pending" and row["signed_invite"] == "signed"
     assert row["chain_attempts"] == [] and row["chain_created"] is None
     attempt = {"signature": "sig", "last_valid_block_height": 7}
     migrated.starter_update("old-row", chain_attempts=[attempt])
     assert migrated.starter_rows()[0]["chain_attempts"] == [attempt]
+    migrated.starter_update(
+        "old-row", state="paid", reason="", updated=11, next_attempt=11,
+        paid_at=11, receipt={"v": 1, "replayed": False})
+    paid = migrated.starter_rows()[0]
+    assert paid["state"] == "paid" and paid["receipt"] == {"v": 1, "replayed": False}
 
 
 def test_expired_larger_cap_renews_with_exactly_signed_amount_spendable(
@@ -409,8 +428,7 @@ def _attempt_node():
         "signed_invite": "signed", "state": "pending", "reason": "",
         "created": 100, "updated": 100, "next_attempt": 0,
         "attempts": 0, "approved": 0, "paid_at": None, "receipt": None,
-        "sol_lamports": 0, "chain_signature": "", "chain_attempts": [],
-        "chain_created": None,
+        "chain_attempts": [], "chain_created": None,
     }
     node = object.__new__(nakd.Node)
     node.store = AttemptStore(row)
