@@ -1316,6 +1316,10 @@ class Node:
                         "sol_lamports": int(recorded.get("sol_lamports") or 0), "ts": chain_now,
                         "existing": True,
                     }
+                if delegate["open_channels"] > 0 or delegate["open_tasks"] > 0:
+                    raise ValueError(
+                        "newcomer has open channels/tasks on an older grant; "
+                        "waiting for them to close")
                 if delegate["disabled"] and delegate["generation"] == escrow["generation"]:
                     raise ValueError("existing starter delegate is disabled and cannot be renewed")
 
@@ -1331,12 +1335,14 @@ class Node:
                     f"inviter escrow lacks {cap / 1_000_000:.6f} USDC; nak pay deposit")
 
             expires_at = chain_now + STARTER_DELEGATE_DAYS * 86400
-            # delegate_set preserves spent within the current escrow generation, but resets it
-            # when adopting a delegate from an older generation.  Authorize exactly this signed
-            # obligation's remaining amount in either case -- never revive a stale larger cap.
-            spent_after = (int(delegate["spent"])
-                           if delegate and delegate["generation"] == escrow["generation"] else 0)
-            set_cap = spent_after + cap
+            # With no open work, same-generation spent is final, so spent + starter makes only the
+            # starter newly spendable.  Open same-generation work is rejected above because a
+            # later refund could reduce spent.  An older generation is also rejected while work is
+            # open; otherwise delegate_set resets spent to zero, so its total cap is starter alone.
+            if delegate and delegate["generation"] == escrow["generation"]:
+                set_cap = int(delegate["spent"]) + cap
+            else:
+                set_cap = cap
             if set_cap > (1 << 64) - 1:
                 raise ValueError("starter delegate cap exceeds u64")
             instructions = pay_chain.delegate_set(

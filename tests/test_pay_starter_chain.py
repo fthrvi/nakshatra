@@ -22,24 +22,28 @@ RECIPIENT = ed25519.Ed25519PrivateKey.from_private_bytes(
     RECIPIENT_SEED).public_key().public_bytes_raw()
 
 
-def _escrow_data(owner: str, vault: str, *, committed: int = 0) -> bytes:
+def _escrow_data(owner: str, vault: str, *, committed: int = 0,
+                 generation: int = 0) -> bytes:
     raw = bytearray(163)
     raw[:8] = hashlib.sha256(b"account:Escrow").digest()[:8]
     raw[8:40] = pay_chain.pubkey_bytes(owner)
     raw[40:72] = pay_chain.pubkey_bytes(vault)
-    struct.pack_into("<QIIQQQ", raw, 72, committed, 0, 0, 0, 0, 0)
+    struct.pack_into("<QIIQQQ", raw, 72, committed, 0, 0, 0, 0, generation)
     raw[113:145] = pay_chain.pubkey_bytes(owner)
     raw[145:147] = b"\x01\x01"
     return bytes(raw)
 
 
 def _delegate_data(escrow: str, *, cap: int, expires: int, spent: int = 0,
-                   flags: int = 1, disabled: bool = False) -> bytes:
+                   flags: int = 1, disabled: bool = False, generation: int = 0,
+                   open_channels: int = 0, open_tasks: int = 0) -> bytes:
     raw = bytearray(pay_chain.DELEGATE_ACCOUNT_SPACE)
     raw[:8] = hashlib.sha256(b"account:Delegate").digest()[:8]
     raw[8:40] = pay_chain.pubkey_bytes(escrow)
     raw[40:72] = RECIPIENT
-    struct.pack_into("<QQQqBII", raw, 72, 0, cap, spent, expires, flags, 0, 0)
+    struct.pack_into(
+        "<QQQqBII", raw, 72, generation, cap, spent, expires, flags,
+        open_channels, open_tasks)
     raw[113] = int(disabled)
     raw[114] = 1
     return bytes(raw)
@@ -87,6 +91,8 @@ class StarterRpc:
     def __init__(self, wallet, *, vault_amount=10, committed=0,
                  wallet_balance=50_000_000, node_balance=0,
                  existing_cap=None, existing_spent=0, existing_expires=0,
+                 escrow_generation=0, delegate_generation=0,
+                 existing_open_channels=0, existing_open_tasks=0,
                  fail_unknown=False, confirmed_only_delegate=False):
         self.wallet = wallet
         self.derived = pay_chain._derived(wallet["address"], PROGRAM)
@@ -99,6 +105,10 @@ class StarterRpc:
         self.delegate_cap = existing_cap
         self.delegate_spent = existing_spent
         self.delegate_expires = existing_expires
+        self.escrow_generation = escrow_generation
+        self.delegate_generation = delegate_generation
+        self.delegate_open_channels = existing_open_channels
+        self.delegate_open_tasks = existing_open_tasks
         self.fail_unknown = fail_unknown
         self.confirmed_only_delegate = confirmed_only_delegate
         self.delegate_finalized = not confirmed_only_delegate
@@ -120,7 +130,8 @@ class StarterRpc:
         self.commitments.append(("account", commitment, address))
         if address == self.derived["escrow"]:
             return {"owner": PROGRAM, "data": _escrow_data(
-                self.wallet["address"], self.derived["vault"], committed=self.committed)}
+                self.wallet["address"], self.derived["vault"], committed=self.committed,
+                generation=self.escrow_generation)}
         if address == self.derived["vault"]:
             return {"owner": pay_chain.TOKEN_PROGRAM_ID,
                     "data": _token_data(self.vault_amount)}
@@ -129,7 +140,10 @@ class StarterRpc:
                 return None
             return {"owner": PROGRAM, "data": _delegate_data(
                 self.derived["escrow"], cap=self.delegate_cap,
-                spent=self.delegate_spent, expires=self.delegate_expires)}
+                spent=self.delegate_spent, expires=self.delegate_expires,
+                generation=self.delegate_generation,
+                open_channels=self.delegate_open_channels,
+                open_tasks=self.delegate_open_tasks)}
         return None
 
     def balance(self, address, *, commitment="confirmed"):
@@ -170,6 +184,9 @@ class StarterRpc:
         offset = transaction.message.index(marker) + len(marker) + 32
         self.delegate_cap, = struct.unpack_from("<Q", transaction.message, offset)
         self.delegate_expires = self.chain_now + nakd.STARTER_DELEGATE_DAYS * 86400
+        if self.delegate_generation < self.escrow_generation:
+            self.delegate_spent = 0
+        self.delegate_generation = self.escrow_generation
         self.delegate_finalized = True
         transfer = struct.pack("<I", 2) + struct.pack("<Q", nakd.STARTER_NODE_SOL)
         if transfer in transaction.message:
@@ -394,7 +411,8 @@ def test_expired_larger_cap_renews_with_exactly_signed_amount_spendable(
     spent = 40_000_000
     rpc = StarterRpc(
         wallet, vault_amount=2_000_000, existing_cap=larger, existing_spent=spent,
-        existing_expires=1_600_000_000, node_balance=nakd.STARTER_NODE_SOL)
+        existing_expires=1_600_000_000, node_balance=nakd.STARTER_NODE_SOL,
+        escrow_generation=7, delegate_generation=7, existing_open_channels=0)
     monkeypatch.setattr(pay_chain, "PayRpc", lambda _url: rpc)
 
     node._chain_starter(row)
@@ -406,6 +424,24 @@ def test_expired_larger_cap_renews_with_exactly_signed_amount_spendable(
     assert pay_chain.anchor_discriminator("delegate_set") + args in rpc.sent[0].message
     assert signed_cap - spent == 1_000_000
     assert struct.pack("<Q", larger) not in rpc.sent[0].message
+
+
+def test_older_generation_delegate_resets_cap_to_only_the_signed_starter(
+        chain_node, monkeypatch):
+    node, wallet, row = chain_node
+    rpc = StarterRpc(
+        wallet, vault_amount=2_000_000, existing_cap=100_000_000,
+        existing_spent=40_000_000, existing_expires=1_600_000_000,
+        node_balance=nakd.STARTER_NODE_SOL, escrow_generation=8,
+        delegate_generation=7)
+    monkeypatch.setattr(pay_chain, "PayRpc", lambda _url: rpc)
+
+    node._chain_starter(row)
+
+    args = (RECIPIENT + struct.pack(
+        "<QqB", 1_000_000, rpc.chain_now + 30 * 86400,
+        pay_chain.DELEGATE_OPEN_CHANNEL))
+    assert pay_chain.anchor_discriminator("delegate_set") + args in rpc.sent[0].message
 
 
 def test_active_delegate_adds_only_the_starter_to_remaining_capacity(
@@ -489,6 +525,34 @@ def _attempt_node():
 
     node.settle = RefuseLedger()
     return node, row
+
+
+def test_expired_same_generation_delegate_with_open_channel_stays_pending(
+        tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("NAK_PAY_MODE", "chain")
+    monkeypatch.setenv("NAK_PAY_RPC", "http://127.0.0.1:8899")
+    monkeypatch.setenv("NAK_PAY_PROGRAM", PROGRAM)
+    wallet = pay_wallet.ensure_wallet(home)
+    node, row = _attempt_node()
+    row["amount"] = 100_000_000
+    node._chain_starter = nakd.Node._chain_starter.__get__(node, nakd.Node)
+    rpc = StarterRpc(
+        wallet, vault_amount=2_000_000, existing_cap=100_000_000,
+        existing_spent=40_000_000, existing_expires=1_600_000_000,
+        node_balance=nakd.STARTER_NODE_SOL, escrow_generation=7,
+        delegate_generation=7, existing_open_channels=1)
+    node._starter_chain_time = rpc.chain_time
+    monkeypatch.setattr(pay_chain, "PayRpc", lambda _url: rpc)
+
+    assert node._attempt_starter(row["invite_id"]) is False
+
+    assert not rpc.sent
+    assert row["state"] == "pending"
+    assert row["reason"] == (
+        "newcomer has open channels/tasks on an older grant; waiting for them to close")
 
 
 def test_attempt_starter_chain_mode_keeps_approval_gates_and_skips_ledger(monkeypatch):
