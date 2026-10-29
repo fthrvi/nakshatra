@@ -1145,6 +1145,16 @@ class Node:
         self.store.starter_update(row["invite_id"], state="pending", reason=str(reason)[:200],
                                   updated=now, next_attempt=min(deadline, now + delay), attempts=attempts)
 
+    @staticmethod
+    def _starter_chain_time() -> int:
+        """Read the finalized time used for all chain-mode obligation scheduling."""
+        from network import pay_chain
+
+        rpc_url = pay_chain.configured_rpc_url(os.environ)
+        if not rpc_url:
+            raise ValueError("NAK_PAY_RPC is required for on-chain starter payment")
+        return pay_chain.PayRpc(rpc_url).chain_time()
+
     def _chain_starter(self, row: dict) -> dict:
         """Grant one inviter-funded OPEN_CHANNEL delegate and optional node SOL float."""
         from network import pay_autochannel, pay_chain
@@ -1359,21 +1369,43 @@ class Node:
             }
 
     def _attempt_starter(self, invite_id: str, now: Optional[int] = None) -> bool:
-        now = int(time.time() if now is None else now)
+        wall_now = int(time.time() if now is None else now)
         with self._starter_lock:
             rows = [r for r in self.store.starter_rows(("pending",)) if r["invite_id"] == invite_id]
             if not rows:
                 return False
             row = rows[0]
+            chain_mode = os.environ.get("NAK_PAY_MODE", "").strip().lower() == "chain"
+            if chain_mode:
+                try:
+                    now = int(self._starter_chain_time())
+                except Exception as exc:  # noqa: BLE001 - RPC failures leave money pending
+                    self.store.starter_update(
+                        invite_id,
+                        reason=f"starter chain time unavailable ({str(exc).strip()})"[:200],
+                        attempts=int(row.get("attempts") or 0) + 1)
+                    return False
+                if row.get("chain_created") is None:
+                    self.store.starter_update(
+                        invite_id, chain_created=now, updated=now, next_attempt=now)
+                    row["chain_created"] = now
+                    row["updated"] = now
+                    row["next_attempt"] = now
+            else:
+                now = wall_now
             if now < int(row["next_attempt"]):
                 return False
-            deadline = int(row["created"]) + STARTER_RETRY_WINDOW_S
+            created = (row.get("chain_created")
+                       if chain_mode else row["created"])
+            deadline = int(created) + STARTER_RETRY_WINDOW_S
+            if chain_mode:
+                # Reuse the unchanged ledger retry helper with the chain epoch for this call only.
+                row = {**row, "created": int(created)}
             if now >= deadline:
                 reason = row.get("reason") or "starter retry window expired"
                 self.store.starter_update(invite_id, state="failed", reason=str(reason)[:200],
                                           updated=now, next_attempt=deadline)
                 return False
-            chain_mode = os.environ.get("NAK_PAY_MODE", "").strip().lower() == "chain"
             if not chain_mode and (os.environ.get("NAKSHATRA_ESCROW", "").strip().lower() != "neuron"
                     or not callable(getattr(self.settle, "starter", None))):
                 self._starter_pending(row, "starter payment disabled (NAKSHATRA_ESCROW is not neuron)",
@@ -1467,9 +1499,11 @@ class Node:
 
     def reconcile_starters(self, now: Optional[int] = None) -> int:
         now = int(time.time() if now is None else now)
+        chain_mode = os.environ.get("NAK_PAY_MODE", "").strip().lower() == "chain"
         paid = 0
         for row in self.store.starter_rows(("pending",)):
-            if now >= int(row["next_attempt"]) and self._attempt_starter(row["invite_id"], now=now):
+            if ((chain_mode or now >= int(row["next_attempt"]))
+                    and self._attempt_starter(row["invite_id"], now=now)):
                 paid += 1
         return paid
 

@@ -410,6 +410,7 @@ def _attempt_node():
         "created": 100, "updated": 100, "next_attempt": 0,
         "attempts": 0, "approved": 0, "paid_at": None, "receipt": None,
         "sol_lamports": 0, "chain_signature": "", "chain_attempts": [],
+        "chain_created": None,
     }
     node = object.__new__(nakd.Node)
     node.store = AttemptStore(row)
@@ -423,6 +424,7 @@ def _attempt_node():
             "code": row["invite_id"], "starter": row["amount"]}}
     node._grant_status = lambda: {"valid": True, "caps": ["nak.pay"]}
     node._signer = lambda _request: {"ok": True, "status": "ok"}
+    node._starter_chain_time = lambda: 200
     node._chain_starter = lambda _row: {
         "ts": 500, "signature": "chain-signature", "escrow": "escrow",
         "delegate": "delegate", "cap": 10_000, "expires_at": 900,
@@ -468,9 +470,34 @@ def test_attempt_starter_chain_mode_every_existing_gate_blocks(monkeypatch, gate
     elif gate == "tampered":
         node._verified_starter_invite = lambda _code: {
             "kind": "consumer", "consumer": {"code": "other", "starter": row["amount"]}}
+    elif gate == "expired":
+        row["chain_created"] = 100
+        node._starter_chain_time = lambda: 100 + nakd.STARTER_RETRY_WINDOW_S + 1
     monkeypatch.setenv("NAK_PAY_MODE", "chain")
 
-    now = row["created"] + nakd.STARTER_RETRY_WINDOW_S + 1 if gate == "expired" else 200
-    assert node._attempt_starter(row["invite_id"], now=now) is False
+    assert node._attempt_starter(row["invite_id"], now=200) is False
 
     assert not paid
+
+
+def test_chain_retry_window_ignores_local_clock_skew_backward(monkeypatch):
+    node, row = _attempt_node()
+    row["chain_created"] = 1_000
+    node._starter_chain_time = lambda: 1_000 + nakd.STARTER_RETRY_WINDOW_S + 1
+    paid = []
+    node._chain_starter = lambda _row: paid.append(True) or {"ts": 1}
+    monkeypatch.setenv("NAK_PAY_MODE", "chain")
+
+    assert node._attempt_starter(row["invite_id"], now=-31_536_000) is False
+    assert row["state"] == "failed"
+    assert not paid
+
+
+def test_chain_retry_window_ignores_local_clock_skew_forward(monkeypatch):
+    node, row = _attempt_node()
+    node._starter_chain_time = lambda: 5_000
+    monkeypatch.setenv("NAK_PAY_MODE", "chain")
+
+    assert node._attempt_starter(row["invite_id"], now=31_536_000) is True
+    assert row["chain_created"] == 5_000
+    assert row["state"] == "paid"
