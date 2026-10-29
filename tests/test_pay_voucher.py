@@ -652,6 +652,7 @@ def test_voucher_silence_bound_counts_credits_before_rounding(
             max_prompt_tokens=1, max_output_tokens=200))
 
     stopped = False
+    first_receipt_tokens = None
     for index in range(1, 150):
         try:
             receipt = _run_step(manager, claim, index, 1)
@@ -662,10 +663,15 @@ def test_voucher_silence_bound_counts_credits_before_rounding(
         if receipt is not None:
             wire = manager.chain_receipt_wire(claim, receipt)
             assert pay.parse_wire(wire)["receipt"]["cumulative_cost"] <= 107
-    assert stopped
+            if first_receipt_tokens is None:
+                first_receipt_tokens = (int(receipt["cumulative_prompt_tokens"])
+                                        + int(receipt["cumulative_generated_tokens"]))
+    assert stopped and first_receipt_tokens is not None
     meter = manager.store.meter(PAYER_HEX, "rounding")
     delivered = int(meter["prompt_tokens"]) + int(meter["generated_tokens"])
-    assert delivered <= 8 + (pay.RATE - 1)
+    # Totals still round to the stored 10 µUSDC, yet a silent payer gets at most one checkpoint
+    # (8 tokens) past the first unanswered receipt.
+    assert delivered - first_receipt_tokens <= 8
 
     manager.release_chain_session(claim)
     store.close()
@@ -1304,3 +1310,32 @@ def test_rpc_ignores_environment_proxies(tmp_path):
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_voucher_in_close_grace_is_kept_but_no_new_work_starts(tmp_path, monkeypatch):
+    import dataclasses
+
+    manager, consumer, claim, worker_vouchers, _ledger = _chain_admission(
+        tmp_path, monkeypatch, session="grace-latch")
+    receipt = None
+    for index in range(1, 18):
+        receipt = _run_step(manager, claim, index, 1)
+        if receipt is not None:
+            break
+    assert receipt is not None
+    consumer.observe(WORKER_HEX, manager.chain_receipt_wire(claim, receipt))
+    consumer.acknowledge_delivery(
+        prompt_tokens=int(receipt["cumulative_prompt_tokens"]),
+        generated_tokens=int(receipt["cumulative_generated_tokens"]))
+    wire = consumer.outgoing(WORKER_HEX)
+    # The payer requests close after the worker sent its receipt: still redeemable until close_at.
+    state = manager.channel_state
+    state.channels[CHANNEL] = dataclasses.replace(
+        state.channels[CHANNEL], status="Closing", close_at=100_000)
+    manager.accept_chain_control(claim, wire)
+    assert worker_vouchers.latest(CHANNEL).total == pay.parse_wire(wire)["total"]
+    with pytest.raises(admission.PaidAdmissionError, match="channel-closing"):
+        manager.require_chain_voucher_before_step(claim, 0, 1)
+    consumer.book.close()
+    manager.store.close()
+    worker_vouchers.close()

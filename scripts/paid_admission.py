@@ -904,6 +904,16 @@ class PaidAdmission:
         if (delivered_credits - covered_credits
                 > checkpoint_credits + (self._pay.RATE - 1)):
             raise PaidAdmissionError("voucher-missing")
+        # Liveness, independent of µUSDC rounding: every receipt sent must be answered by a fresh
+        # voucher (accept_chain_control clears pending_total, even for an equal total) before more
+        # than one checkpoint of further work.
+        if session["pending_total"] is not None:
+            tokens_after_receipt = (
+                int(row["prompt_tokens"]) + int(row["generated_tokens"])
+                + int(prompt_delta) + int(generated_delta)
+                - int(session.get("pending_tokens", 0)))
+            if tokens_after_receipt > 8:
+                raise PaidAdmissionError("voucher-missing")
 
     def chain_receipt_wire(self, claim: dict, receipt: Optional[dict]) -> str:
         if not self.chain_mode or receipt is None:
@@ -917,6 +927,11 @@ class PaidAdmission:
                 f"chain channel reservation lost ({exc})") from exc
         total = self._pay.credits_to_total(
             session["channel_base"], int(receipt["cumulative_cost"]))
+        if session["pending_total"] is None:
+            # Anchor on the OLDEST unanswered receipt; later receipts must not restart the window.
+            session["pending_tokens"] = (
+                int(receipt["cumulative_prompt_tokens"])
+                + int(receipt["cumulative_generated_tokens"]))
         session["pending_total"] = total
         signature = self.store.receipt_signature(receipt["receipt_id"])
         wire = self._pay.receipt_wire(
