@@ -71,7 +71,8 @@ class FakeRpc:
     def __init__(self, *, open_cap=10, vault_amount=100, delegate_cap=100,
                  expires=10_000, flags=1, disabled=False, node_balance=100_000,
                  has_delegate=True, shared_seq=None, shared_sent=None,
-                 shared_lock=None, fail_definite=False, fail_unknown=False):
+                 shared_lock=None, fail_definite=False, fail_unknown=False,
+                 chain_time=1000, chain_time_error=None):
         self.open_cap = open_cap
         self.vault_amount = vault_amount
         self.delegate_cap = delegate_cap
@@ -82,6 +83,8 @@ class FakeRpc:
         self.has_delegate = has_delegate
         self.fail_definite = fail_definite
         self.fail_unknown = fail_unknown
+        self.current_chain_time = chain_time
+        self.chain_time_error = chain_time_error
         self.seq = shared_seq or multiprocessing.Value("q", 0)
         self.sent = shared_sent or multiprocessing.Value("i", 0)
         self.send_lock = shared_lock or multiprocessing.Lock()
@@ -94,6 +97,11 @@ class FakeRpc:
     def ensure_cluster(self):
         self.cluster_checks += 1
         return "local-test"
+
+    def chain_time(self):
+        if self.chain_time_error is not None:
+            raise self.chain_time_error
+        return self.current_chain_time
 
     def account_info(self, address):
         with self.seq.get_lock():
@@ -184,15 +192,16 @@ def _paths(tmp_path):
     }
 
 
-def _ensure(tmp_path, rpc, *, worker=WORKER, required=1, state=None):
+def _ensure(tmp_path, rpc, *, worker=WORKER, required=1, state=None, clock=None):
     paths = _paths(tmp_path)
     book = voucher.PayerChannelBook(paths["book"])
     try:
+        kwargs = {} if clock is None else {"clock": clock}
         return auto.ensure_channel(
             worker, required, owner=OWNER, book=book, state=state or rpc,
             program=PROGRAM, private_key=NODE_SEED, rpc=rpc,
             limits_path=paths["limits"], ledger_path=paths["ledger"],
-            lock_path=paths["lock"], clock=lambda: 1000)
+            lock_path=paths["lock"], **kwargs)
     finally:
         book.close()
 
@@ -235,6 +244,60 @@ def test_per_day_refuses_after_budget_is_reserved(tmp_path):
     rpc = FakeRpc(open_cap=10)
     with pytest.raises(voucher.VoucherError, match="24-hour.*nak pay limits"):
         _ensure(tmp_path, rpc, required=1)
+    assert rpc.sent.value == 0
+
+
+def test_local_clock_jump_does_not_free_per_day_budget(tmp_path):
+    paths = _paths(tmp_path)
+    _limits(paths["limits"], per_tx=10, per_day=10)
+    with auto.OpenLedger(paths["ledger"]) as ledger:
+        ledger.reserve(10, 1000)
+    rpc = FakeRpc(open_cap=10, expires=1_000_000, chain_time=1000)
+
+    with pytest.raises(voucher.VoucherError, match="24-hour"):
+        _ensure(
+            tmp_path, rpc, required=1,
+            clock=lambda: 1000 + 10 * auto.DAY_SECONDS)
+
+    assert rpc.sent.value == 0
+
+
+def test_chain_time_advancing_24_hours_frees_per_day_budget(tmp_path):
+    paths = _paths(tmp_path)
+    _limits(paths["limits"], per_tx=10, per_day=10)
+    with auto.OpenLedger(paths["ledger"]) as ledger:
+        ledger.reserve(10, 1000)
+    rpc = FakeRpc(
+        open_cap=10, expires=1_000_000,
+        chain_time=1000 + auto.DAY_SECONDS)
+
+    assert _ensure(tmp_path, rpc, required=1).cap == 10
+    assert rpc.sent.value == 1
+
+
+def test_chain_time_never_moves_behind_newest_ledger_row(tmp_path):
+    paths = _paths(tmp_path)
+    _limits(paths["limits"], per_tx=10, per_day=10)
+    with auto.OpenLedger(paths["ledger"]) as ledger:
+        ledger.reserve(10, 100_000)
+    rpc = FakeRpc(open_cap=10, expires=1_000_000, chain_time=1000)
+
+    with pytest.raises(voucher.VoucherError, match="24-hour"):
+        _ensure(tmp_path, rpc, required=1)
+
+    assert rpc.sent.value == 0
+
+
+def test_chain_time_read_failure_refuses_to_open(tmp_path):
+    paths = _paths(tmp_path)
+    _limits(paths["limits"])
+    rpc = FakeRpc(
+        open_cap=10,
+        chain_time_error=voucher.VoucherError("finalized chain time unavailable"))
+
+    with pytest.raises(voucher.VoucherError, match="chain time unavailable"):
+        _ensure(tmp_path, rpc, required=1)
+
     assert rpc.sent.value == 0
 
 

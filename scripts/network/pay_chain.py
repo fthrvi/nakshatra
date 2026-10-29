@@ -429,6 +429,17 @@ class PayRpc(JsonRpcChannelState):
         genesis = self.ensure_cluster()
         return "devnet" if genesis == DEVNET_GENESIS_HASH else "local"
 
+    def chain_time(self) -> int:
+        """Return finalized cluster time, never the caller's wall clock."""
+        self._ensure_cluster()
+        slot = self._rpc("getSlot", [{"commitment": "finalized"}])
+        if isinstance(slot, bool) or not isinstance(slot, int) or slot < 0:
+            raise VoucherError("RPC returned an invalid finalized slot")
+        timestamp = self._rpc("getBlockTime", [slot])
+        if isinstance(timestamp, bool) or not isinstance(timestamp, int) or timestamp <= 0:
+            raise VoucherError("RPC returned an invalid finalized block time")
+        return timestamp
+
     def account_info(self, address: object) -> dict | None:
         self._ensure_cluster()
         key = pubkey_text(address, "account address")

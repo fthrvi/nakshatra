@@ -162,6 +162,28 @@ def test_send_and_confirm_fails_immediately_on_transaction_error(monkeypatch):
     assert calls == ["sendTransaction", "getSignatureStatuses"]
 
 
+def test_chain_time_uses_finalized_slot_and_validates_block_time(monkeypatch):
+    rpc = pay_chain.PayRpc("http://127.0.0.1:1")
+    monkeypatch.setattr(rpc, "_ensure_cluster", lambda: None)
+    calls = []
+
+    def fake_rpc(method, params):
+        calls.append((method, params))
+        return 123 if method == "getSlot" else 1_700_000_000
+
+    monkeypatch.setattr(rpc, "_rpc", fake_rpc)
+    assert rpc.chain_time() == 1_700_000_000
+    assert calls == [
+        ("getSlot", [{"commitment": "finalized"}]),
+        ("getBlockTime", [123]),
+    ]
+
+    monkeypatch.setattr(
+        rpc, "_rpc", lambda method, _params: 123 if method == "getSlot" else None)
+    with pytest.raises(pay_chain.VoucherError, match="invalid finalized block time"):
+        rpc.chain_time()
+
+
 def test_all_builders_match_neuron_and_solders_byte_for_byte():
     python = Path("/home/prithvi/.cache/nak-solana/venv-chain/bin/python")
     if not python.exists():

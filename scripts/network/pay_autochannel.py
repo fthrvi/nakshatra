@@ -105,6 +105,14 @@ class OpenLedger:
         ).fetchone()
         return int(row["total"])
 
+    def monotonic_time(self, chain_time: int) -> float:
+        """Keep the accounting window from moving behind any stored row."""
+        if isinstance(chain_time, bool) or not isinstance(chain_time, int) or chain_time <= 0:
+            raise pay_voucher.VoucherError("chain time must be a positive integer")
+        row = self._db.execute("SELECT MAX(opened_at) AS newest FROM opens").fetchone()
+        newest = row["newest"]
+        return max(float(chain_time), float(newest)) if newest is not None else float(chain_time)
+
     def reserve(self, cap: int, now: float) -> int:
         amount = _positive_u64(cap, "channel cap")
         cursor = self._db.execute(
@@ -254,7 +262,9 @@ def ensure_channel(worker_key: str, required_micro_usdc: int, *, owner: str,
         ledger_file = Path(ledger_path or pay_dir / "opens.sqlite")
         with OpenLedger(ledger_file) as ledger:
             for attempt in range(2):
-                now = float(clock())
+                # ``clock`` remains accepted for branch compatibility, but a
+                # local wall clock never participates in channel-open policy.
+                now = ledger.monotonic_time(tx_rpc.chain_time())
                 derived = pay_chain._derived(owner_address, configured_program)
                 escrow_info = _account(
                     tx_rpc, derived["escrow"], owner=configured_program, label="pay escrow")
