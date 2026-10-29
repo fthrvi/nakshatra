@@ -185,6 +185,24 @@ class StarterRpc:
         return transaction.signature
 
 
+class AttemptResolutionRpc:
+    def __init__(self, status, *, finalized_height=100):
+        self.status = status
+        self.finalized_height = finalized_height
+        self.status_calls = []
+
+    def ensure_cluster(self):
+        return "local"
+
+    def signature_status(self, signature):
+        self.status_calls.append(signature)
+        return self.status
+
+    def block_height(self, *, commitment="finalized"):
+        assert commitment == "finalized"
+        return self.finalized_height
+
+
 @pytest.fixture
 def chain_node(tmp_path, monkeypatch):
     home = tmp_path / "home"
@@ -443,7 +461,7 @@ def _attempt_node():
     node._grant_status = lambda: {"valid": True, "caps": ["nak.pay"]}
     node._signer = lambda _request: {"ok": True, "status": "ok"}
     node._starter_chain_time = lambda: 200
-    node._chain_starter = lambda _row: {
+    node._chain_starter = lambda _row, **_kwargs: {
         "ts": 500, "signature": "chain-signature", "escrow": "escrow",
         "delegate": "delegate", "cap": 10_000, "expires_at": 900,
     }
@@ -459,7 +477,7 @@ def _attempt_node():
 def test_attempt_starter_chain_mode_keeps_approval_gates_and_skips_ledger(monkeypatch):
     node, row = _attempt_node()
     calls = []
-    node._chain_starter = lambda item: calls.append(dict(item)) or {
+    node._chain_starter = lambda item, **_kwargs: calls.append(dict(item)) or {
         "ts": 500, "signature": "chain-signature", "escrow": "escrow",
         "delegate": "delegate", "cap": 10_000, "expires_at": 900,
     }
@@ -478,7 +496,7 @@ def test_attempt_starter_chain_mode_keeps_approval_gates_and_skips_ledger(monkey
 def test_attempt_starter_chain_mode_every_existing_gate_blocks(monkeypatch, gate):
     node, row = _attempt_node()
     paid = []
-    node._chain_starter = lambda _row: paid.append(True) or {"ts": 500}
+    node._chain_starter = lambda _row, **_kwargs: paid.append(True) or {"ts": 500}
     if gate == "unapproved":
         node._signer = lambda _request: {"ok": False, "error": "not approved"}
     elif gate == "missing-grant":
@@ -503,7 +521,7 @@ def test_chain_retry_window_ignores_local_clock_skew_backward(monkeypatch):
     row["chain_created"] = 1_000
     node._starter_chain_time = lambda: 1_000 + nakd.STARTER_RETRY_WINDOW_S + 1
     paid = []
-    node._chain_starter = lambda _row: paid.append(True) or {"ts": 1}
+    node._chain_starter = lambda _row, **_kwargs: paid.append(True) or {"ts": 1}
     monkeypatch.setenv("NAK_PAY_MODE", "chain")
 
     assert node._attempt_starter(row["invite_id"], now=-31_536_000) is False
@@ -519,3 +537,62 @@ def test_chain_retry_window_ignores_local_clock_skew_forward(monkeypatch):
     assert node._attempt_starter(row["invite_id"], now=31_536_000) is True
     assert row["chain_created"] == 5_000
     assert row["state"] == "paid"
+
+
+def _attempt_at_deadline(monkeypatch, status, *, finalized_height=100):
+    node, row = _attempt_node()
+    deadline = 100 + nakd.STARTER_RETRY_WINDOW_S
+    signature = pay_chain.b58encode(b"r" * 64)
+    row["chain_created"] = 100
+    row["next_attempt"] = deadline + 1_000
+    row["chain_attempts"] = [{
+        "signature": signature, "blockhash": BLOCKHASH,
+        "last_valid_block_height": 120, "cap_total": 10_000,
+        "sol_lamports": nakd.STARTER_NODE_SOL, "expires_at": deadline + 86400,
+        "escrow": "escrow", "delegate": "delegate",
+    }]
+    node._starter_chain_time = lambda: deadline
+    sent = []
+    node._chain_starter = lambda _row, **_kwargs: sent.append(True) or {"ts": deadline}
+    rpc = AttemptResolutionRpc(status, finalized_height=finalized_height)
+    monkeypatch.setenv("NAK_PAY_MODE", "chain")
+    monkeypatch.setenv("NAK_PAY_RPC", "http://127.0.0.1:8899")
+    monkeypatch.setattr(pay_chain, "PayRpc", lambda _url: rpc)
+    return node, row, rpc, sent, deadline
+
+
+def test_finalized_success_after_deadline_marks_starter_paid(monkeypatch):
+    node, row, rpc, sent, _deadline = _attempt_at_deadline(
+        monkeypatch, {"err": None, "confirmationStatus": "finalized"})
+
+    assert node._attempt_starter(row["invite_id"]) is True
+
+    assert rpc.status_calls == [row["chain_attempts"][0]["signature"]]
+    assert row["state"] == "paid"
+    assert row["receipt"]["signature"] == row["chain_attempts"][0]["signature"]
+    assert not sent
+
+
+def test_unresolved_attempt_at_deadline_stays_pending_without_send(monkeypatch):
+    node, row, rpc, sent, deadline = _attempt_at_deadline(
+        monkeypatch, {"err": None, "confirmationStatus": "confirmed"})
+
+    assert node._attempt_starter(row["invite_id"]) is False
+
+    assert rpc.status_calls == [row["chain_attempts"][0]["signature"]]
+    assert row["state"] == "pending"
+    assert row["next_attempt"] == deadline
+    assert "still unresolved" in row["reason"]
+    assert not sent
+
+
+def test_all_attempts_expired_after_deadline_fail_without_send(monkeypatch):
+    node, row, rpc, sent, deadline = _attempt_at_deadline(
+        monkeypatch, None, finalized_height=121)
+
+    assert node._attempt_starter(row["invite_id"]) is False
+
+    assert rpc.status_calls == [row["chain_attempts"][0]["signature"]]
+    assert row["chain_attempts"][0]["resolution"] == "expired"
+    assert row["state"] == "failed" and row["next_attempt"] == deadline
+    assert not sent

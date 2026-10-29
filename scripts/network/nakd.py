@@ -1155,7 +1155,71 @@ class Node:
             raise ValueError("NAK_PAY_RPC is required for on-chain starter payment")
         return pay_chain.PayRpc(rpc_url).chain_time()
 
-    def _chain_starter(self, row: dict) -> dict:
+    def _resolve_starter_attempts(self, row: dict, rpc, chain_now: int) -> tuple[dict | None, bool]:
+        """Resolve every durable attempt, returning (paid receipt, can_still_land)."""
+        attempts = [dict(item) for item in (row.get("chain_attempts") or [])]
+        attempts_changed = False
+        unresolved = False
+        finalized_height = None
+        for attempt in attempts:
+            if attempt.get("resolution") in {"failed", "expired"}:
+                continue
+            status = rpc.signature_status(attempt["signature"])
+            if status is not None and status.get("confirmationStatus") == "finalized":
+                if status.get("err") is None:
+                    return ({
+                        "v": 1, "kind": "chain-starter",
+                        "signature": attempt["signature"],
+                        "escrow": attempt["escrow"], "delegate": attempt["delegate"],
+                        "cap": int(attempt["cap_total"]),
+                        "expires_at": int(attempt["expires_at"]),
+                        "sol_lamports": int(attempt["sol_lamports"]),
+                        "ts": chain_now, "existing": True,
+                    }, False)
+                attempt["resolution"] = "failed"
+                attempt["error"] = str(status.get("err"))[:200]
+                attempts_changed = True
+                continue
+            if status is not None:
+                unresolved = True
+                continue
+            if finalized_height is None:
+                finalized_height = rpc.block_height(commitment="finalized")
+            if finalized_height <= int(attempt["last_valid_block_height"]):
+                unresolved = True
+            else:
+                attempt["resolution"] = "expired"
+                attempts_changed = True
+        if attempts_changed:
+            self.store.starter_update(
+                row["invite_id"], chain_attempts=attempts, updated=chain_now)
+            row["chain_attempts"] = attempts
+        return None, unresolved
+
+    def _resolve_recorded_starter_attempts(
+            self, row: dict, chain_now: int) -> tuple[dict | None, bool]:
+        if not row.get("chain_attempts"):
+            return None, False
+        from network import pay_chain
+
+        rpc_url = pay_chain.configured_rpc_url(os.environ)
+        if not rpc_url:
+            raise ValueError("NAK_PAY_RPC is required for on-chain starter payment")
+        rpc = pay_chain.PayRpc(rpc_url)
+        rpc.ensure_cluster()
+        return self._resolve_starter_attempts(row, rpc, chain_now)
+
+    def _starter_paid(self, row: dict, receipt: dict, now: int) -> bool:
+        self.store.starter_update(
+            row["invite_id"], state="paid", reason="", updated=now,
+            next_attempt=now, paid_at=int(receipt["ts"]), receipt=receipt,
+            attempts=int(row.get("attempts") or 0) + 1)
+        contact = self.store.contact(row["person"]) or {}
+        name = contact.get("petname") or row["person"][:12]
+        self.log(f"starter: paid {row['amount']} credits to {name}")
+        return True
+
+    def _chain_starter(self, row: dict, *, deadline: Optional[int] = None) -> dict:
         """Grant one inviter-funded OPEN_CHANNEL delegate and optional node SOL float."""
         from network import pay_autochannel, pay_chain
         from network.pay_wallet import load_wallet
@@ -1204,45 +1268,12 @@ class Node:
                 return row["receipt"]
 
             chain_now = rpc.chain_time()
-            attempts = [dict(item) for item in (row.get("chain_attempts") or [])]
-            attempts_changed = False
-            unresolved = False
-            finalized_height = None
-            for attempt in attempts:
-                if attempt.get("resolution") in {"failed", "expired"}:
-                    continue
-                status = rpc.signature_status(attempt["signature"])
-                if status is not None and status.get("confirmationStatus") == "finalized":
-                    if status.get("err") is None:
-                        return {
-                            "v": 1, "kind": "chain-starter",
-                            "signature": attempt["signature"],
-                            "escrow": attempt["escrow"], "delegate": attempt["delegate"],
-                            "cap": int(attempt["cap_total"]),
-                            "expires_at": int(attempt["expires_at"]),
-                            "sol_lamports": int(attempt["sol_lamports"]),
-                            "ts": chain_now, "existing": True,
-                        }
-                    attempt["resolution"] = "failed"
-                    attempt["error"] = str(status.get("err"))[:200]
-                    attempts_changed = True
-                    continue
-                if status is not None:
-                    unresolved = True
-                    continue
-                if finalized_height is None:
-                    finalized_height = rpc.block_height(commitment="finalized")
-                if finalized_height <= int(attempt["last_valid_block_height"]):
-                    unresolved = True
-                else:
-                    attempt["resolution"] = "expired"
-                    attempts_changed = True
-            if attempts_changed:
-                self.store.starter_update(
-                    row["invite_id"], chain_attempts=attempts, updated=chain_now)
-                row["chain_attempts"] = attempts
+            receipt, unresolved = self._resolve_starter_attempts(row, rpc, chain_now)
+            if receipt is not None:
+                return receipt
             if unresolved:
                 raise pay_chain.VoucherError("previous starter transaction still unresolved")
+            attempts = [dict(item) for item in (row.get("chain_attempts") or [])]
 
             escrow_info = rpc.account_info(derived["escrow"], commitment="finalized")
             if escrow_info is None:
@@ -1281,6 +1312,9 @@ class Node:
                     }
                 if delegate["disabled"] and delegate["generation"] == escrow["generation"]:
                     raise ValueError("existing starter delegate is disabled and cannot be renewed")
+
+            if deadline is not None and chain_now >= int(deadline):
+                raise ValueError("starter retry window expired")
 
             vault_info = rpc.account_info(derived["vault"], commitment="finalized")
             if vault_info is None or vault_info["owner"] != pay_chain.TOKEN_PROGRAM_ID:
@@ -1391,18 +1425,34 @@ class Node:
                     row["next_attempt"] = now
             else:
                 now = wall_now
-            if now < int(row["next_attempt"]):
-                return False
             created = (row.get("chain_created")
                        if chain_mode else row["created"])
             deadline = int(created) + STARTER_RETRY_WINDOW_S
             if chain_mode:
                 # Reuse the unchanged ledger retry helper with the chain epoch for this call only.
                 row = {**row, "created": int(created)}
+                try:
+                    receipt, unresolved = self._resolve_recorded_starter_attempts(row, now)
+                except Exception as exc:  # noqa: BLE001 - an unknown status can still land
+                    self.store.starter_update(
+                        invite_id, state="pending",
+                        reason=f"starter attempt status unavailable ({str(exc).strip()})"[:200],
+                        updated=now, next_attempt=min(deadline, now + STARTER_RETRY_MAX_S))
+                    return False
+                if receipt is not None:
+                    return self._starter_paid(row, receipt, now)
+                if unresolved:
+                    self.store.starter_update(
+                        invite_id, state="pending",
+                        reason="previous starter transaction still unresolved",
+                        updated=now, next_attempt=min(deadline, now + STARTER_RETRY_MAX_S))
+                    return False
             if now >= deadline:
                 reason = row.get("reason") or "starter retry window expired"
                 self.store.starter_update(invite_id, state="failed", reason=str(reason)[:200],
                                           updated=now, next_attempt=deadline)
+                return False
+            if now < int(row["next_attempt"]):
                 return False
             if not chain_mode and (os.environ.get("NAKSHATRA_ESCROW", "").strip().lower() != "neuron"
                     or not callable(getattr(self.settle, "starter", None))):
@@ -1470,7 +1520,7 @@ class Node:
                     self.store.starter_update(invite_id, approved=1, updated=now)
                     row["approved"] = 1
             try:
-                receipt = (self._chain_starter(row) if chain_mode else
+                receipt = (self._chain_starter(row, deadline=deadline) if chain_mode else
                            self.settle.starter(invite_id, row["to_keyid"], row["amount"]))
             except SettlementError as exc:
                 reason = getattr(exc, "ledger_error", "") or str(exc)
@@ -1487,13 +1537,7 @@ class Node:
                           f"starter ledger unavailable ({type(exc).__name__})")
                 self._starter_pending(row, reason, now)
                 return False
-            self.store.starter_update(invite_id, state="paid", reason="", updated=now,
-                                      next_attempt=now, paid_at=int(receipt["ts"]), receipt=receipt,
-                                      attempts=int(row.get("attempts") or 0) + 1)
-            contact = self.store.contact(row["person"]) or {}
-            name = contact.get("petname") or row["person"][:12]
-            self.log(f"starter: paid {row['amount']} credits to {name}")
-            return True
+            return self._starter_paid(row, receipt, now)
 
     def reconcile_starters(self, now: Optional[int] = None) -> int:
         now = int(time.time() if now is None else now)
