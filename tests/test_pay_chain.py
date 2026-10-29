@@ -108,21 +108,24 @@ def test_message_order_and_transaction_signature_verifies():
     assert tx.data == b"\x01" + tx.signatures[0] + tx.message
 
 
-def _confirmation_rpc(monkeypatch, statuses):
+def _confirmation_rpc(monkeypatch, statuses, *, finalized_heights=()):
     signature = pay_chain.b58encode(b"s" * 64)
     transaction = pay_chain.SignedTransaction(b"transaction", b"message", (), signature)
     rpc = pay_chain.PayRpc("http://127.0.0.1:1")
     monkeypatch.setattr(rpc, "_ensure_cluster", lambda: None)
     remaining = list(statuses)
+    heights = list(finalized_heights)
     calls = []
 
     def fake_rpc(method, _params):
         calls.append(method)
         if method == "sendTransaction":
             return signature
-        assert method == "getSignatureStatuses"
-        status = remaining.pop(0) if remaining else None
-        return {"value": [status]}
+        if method == "getSignatureStatuses":
+            status = remaining.pop(0) if remaining else None
+            return {"value": [status]}
+        assert method == "getBlockHeight"
+        return heights.pop(0)
 
     now = [0.0]
     monkeypatch.setattr(rpc, "_rpc", fake_rpc)
@@ -151,15 +154,40 @@ def test_send_and_confirm_waits_through_confirmed_for_finalized(monkeypatch):
     assert calls == ["sendTransaction", "getSignatureStatuses", "getSignatureStatuses"]
 
 
-def test_send_and_confirm_fails_immediately_on_transaction_error(monkeypatch):
+def test_send_and_confirm_waits_past_confirmed_error_for_finalized_success(monkeypatch):
     rpc, transaction, calls = _confirmation_rpc(monkeypatch, [
         {"err": {"InstructionError": [0, "Custom"]}, "confirmationStatus": "confirmed"},
         {"err": None, "confirmationStatus": "finalized"},
+    ], finalized_heights=[100])
+
+    assert rpc.send_and_confirm(
+        transaction, timeout=1, last_valid_block_height=120) == transaction.signature
+    assert calls == [
+        "sendTransaction", "getSignatureStatuses", "getBlockHeight",
+        "getSignatureStatuses",
+    ]
+
+
+def test_send_and_confirm_only_treats_finalized_error_as_definite(monkeypatch):
+    rpc, transaction, calls = _confirmation_rpc(monkeypatch, [
+        {"err": {"InstructionError": [0, "Custom"]}, "confirmationStatus": "finalized"},
     ])
 
-    with pytest.raises(pay_chain.VoucherError, match="transaction failed"):
-        rpc.send_and_confirm(transaction, timeout=1)
+    with pytest.raises(pay_chain.TransactionDefiniteFailure, match="transaction failed"):
+        rpc.send_and_confirm(transaction, timeout=1, last_valid_block_height=120)
     assert calls == ["sendTransaction", "getSignatureStatuses"]
+
+
+def test_send_and_confirm_reports_nonfinal_error_as_expired_after_blockhash(
+        monkeypatch):
+    rpc, transaction, calls = _confirmation_rpc(monkeypatch, [
+        {"err": {"InstructionError": [0, "Custom"]}, "confirmationStatus": "processed"},
+    ], finalized_heights=[121])
+
+    with pytest.raises(pay_chain.VoucherError, match="expired before finalization") as caught:
+        rpc.send_and_confirm(transaction, timeout=1, last_valid_block_height=120)
+    assert not isinstance(caught.value, pay_chain.TransactionDefiniteFailure)
+    assert calls == ["sendTransaction", "getSignatureStatuses", "getBlockHeight"]
 
 
 def test_send_and_confirm_rejects_finalized_status_missing_err(monkeypatch):

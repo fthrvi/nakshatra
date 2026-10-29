@@ -1183,9 +1183,6 @@ class Node:
                 attempt["error"] = str(status.get("err"))[:200]
                 attempts_changed = True
                 continue
-            if status is not None:
-                unresolved = True
-                continue
             if finalized_height is None:
                 finalized_height = rpc.block_height(commitment="finalized")
             if finalized_height <= int(attempt["last_valid_block_height"]):
@@ -1387,7 +1384,9 @@ class Node:
             row["chain_attempts"] = attempts
 
             try:
-                signature = rpc.send_and_confirm(transaction)
+                signature = rpc.send_and_confirm(
+                    transaction,
+                    last_valid_block_height=int(blockhash_info["lastValidBlockHeight"]))
             except pay_chain.TransactionDefiniteFailure as exc:
                 attempt["resolution"] = "failed"
                 attempt["error"] = str(exc)[:200]

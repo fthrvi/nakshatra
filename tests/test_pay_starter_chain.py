@@ -176,7 +176,9 @@ class StarterRpc:
         assert space == pay_chain.DELEGATE_ACCOUNT_SPACE
         return 1_000_000
 
-    def send_and_confirm(self, transaction, *, on_sent=None):
+    def send_and_confirm(self, transaction, *, on_sent=None,
+                         last_valid_block_height=None):
+        assert last_valid_block_height == self.next_last_valid_height
         self.sent.append(transaction)
         if on_sent:
             on_sent(transaction.signature)
@@ -358,6 +360,39 @@ def test_finalized_error_allows_a_new_attempt(chain_node, monkeypatch):
 
     assert len(rpc.sent) == 1
     assert row["chain_attempts"][0]["resolution"] == "failed"
+    assert len(row["chain_attempts"]) == 2
+
+
+def test_processed_error_with_valid_blockhash_blocks_replacement(chain_node, monkeypatch):
+    node, wallet, row = chain_node
+    rpc = StarterRpc(wallet, vault_amount=2_000_000)
+    signature = _record_chain_attempt(row)
+    rpc.statuses[signature] = {
+        "err": {"InstructionError": [0, "Custom"]},
+        "confirmationStatus": "processed"}
+    monkeypatch.setattr(pay_chain, "PayRpc", lambda _url: rpc)
+
+    with pytest.raises(pay_voucher.VoucherError, match="still unresolved"):
+        node._chain_starter(row)
+
+    assert not rpc.sent
+    assert "resolution" not in row["chain_attempts"][0]
+
+
+def test_processed_error_after_blockhash_expiry_allows_replacement(chain_node, monkeypatch):
+    node, wallet, row = chain_node
+    rpc = StarterRpc(wallet, vault_amount=2_000_000)
+    signature = _record_chain_attempt(row)
+    rpc.statuses[signature] = {
+        "err": {"InstructionError": [0, "Custom"]},
+        "confirmationStatus": "processed"}
+    rpc.finalized_height = row["chain_attempts"][0]["last_valid_block_height"] + 1
+    monkeypatch.setattr(pay_chain, "PayRpc", lambda _url: rpc)
+
+    node._chain_starter(row)
+
+    assert len(rpc.sent) == 1
+    assert row["chain_attempts"][0]["resolution"] == "expired"
     assert len(row["chain_attempts"]) == 2
 
 

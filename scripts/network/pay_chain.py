@@ -598,8 +598,14 @@ class PayRpc(JsonRpcChannelState):
         return value
 
     def send_and_confirm(self, transaction: SignedTransaction, *, timeout: float = 60.0,
-                         on_sent: Callable[[str], None] | None = None) -> str:
+                         on_sent: Callable[[str], None] | None = None,
+                         last_valid_block_height: int | None = None) -> str:
         self._ensure_cluster()
+        if (last_valid_block_height is not None
+                and (isinstance(last_valid_block_height, bool)
+                     or not isinstance(last_valid_block_height, int)
+                     or last_valid_block_height < 0)):
+            raise ValueError("last_valid_block_height must be a non-negative integer")
         try:
             returned = self._rpc("sendTransaction", [
                 base64.b64encode(transaction.data).decode("ascii"),
@@ -616,18 +622,29 @@ class PayRpc(JsonRpcChannelState):
             on_sent(returned)
         deadline = time.monotonic() + float(timeout)
         last = None
+        finalized_height = None
         while time.monotonic() < deadline:
             last = self.signature_status(returned)
-            if last is not None:
+            if last is not None and last["confirmationStatus"] == "finalized":
                 if last["err"] is not None:
                     raise TransactionDefiniteFailure(
                         f"transaction failed: {last['err']!r}")
-                if last["confirmationStatus"] == "finalized":
-                    return returned
+                return returned
+            if last_valid_block_height is not None:
+                finalized_height = self.block_height(commitment="finalized")
+                if finalized_height > last_valid_block_height:
+                    raise VoucherError(
+                        f"transaction expired before finalization; signature {returned}; "
+                        f"last status={last!r}; finalized block height={finalized_height}; "
+                        f"last valid block height={last_valid_block_height}")
             time.sleep(0.15)
+        validity = (""
+                    if last_valid_block_height is None else
+                    f"; finalized block height={finalized_height}; "
+                    f"last valid block height={last_valid_block_height}")
         raise VoucherError(
             f"transaction final state is unknown; signature {returned}; "
-            f"last status={last!r}")
+            f"last status={last!r}{validity}")
 
 
 _ESCROW_DISC = hashlib.sha256(b"account:Escrow").digest()[:8]
