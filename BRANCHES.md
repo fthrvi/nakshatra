@@ -5,6 +5,7 @@ On create add a row (status=active, owner). On merge flip to `merged→<sha>`.
 
 | branch | sector | description | base | status | owner |
 |---|---|---|---|---|---|
+| pay/ensure-cli | payments | M4c part 1: dependency-free Solana tx builder for nakshatra_pay (escrow init/deposit/withdraw request+execute, delegate set/revoke, channel open/close-request), `nak pay ensure/limits/deposit/withdraw/channels`, one RPC env name. | forgejo/main@36b135c | active | codex for claude/trisul-aa network lane (hub) |
 | pay/onboard-wallet | payments | M4a: onboarding creates a non-custodial Solana pay wallet (~/.nakshatra/pay, 0600, never replaced); `nak pay address/status/export`; wallet custody kinds; JOIN.md step 4. | forgejo/main@5099c12 | merged→1462d2e | codex for claude/trisul-aa network lane (hub) |
 | pay/voucher-admission | payments | M4 part 2: cumulative ed25519 vouchers in paid_admission behind NAK_PAY_MODE=chain (consumer signs, worker verifies against the on-chain channel signer and stops without a voucher); payer channel book. | forgejo/main@5099c12 | merged→2e8a9c3 | codex for claude/trisul-aa network lane (hub) |
 | release/broker-signer | release | Release signing through the approval broker (principal nakshatra-release): broker_signer client, build.py --release-broker (one approval per release), keyroll new side via broker. | forgejo/main@d84ee9f | merged→9ead5ed | codex for claude/trisul-aa network lane (hub) |
