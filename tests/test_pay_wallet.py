@@ -94,7 +94,7 @@ def test_first_join_creates_wallet_and_second_join_keeps_seed_identical():
     assert second["pay_address"] == first["pay_address"]
 
 
-@pytest.mark.parametrize("kind", ["short", "symlink", "public-mode"])
+@pytest.mark.parametrize("kind", ["short", "symlink", "public-mode", "owner-exec-mode"])
 def test_corrupt_seed_refuses_before_any_join_write(kind, tmp_path):
     home = _home()
     pay_dir = home / ".nakshatra" / "pay"
@@ -108,6 +108,9 @@ def test_corrupt_seed_refuses_before_any_join_write(kind, tmp_path):
         outside.write_bytes(b"x" * 32)
         outside.chmod(0o600)
         seed_path.symlink_to(outside)
+    elif kind == "owner-exec-mode":
+        seed_path.write_bytes(b"x" * 32)
+        seed_path.chmod(0o700)
     else:
         seed_path.write_bytes(b"x" * 32)
         seed_path.chmod(0o644)

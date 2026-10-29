@@ -89,10 +89,8 @@ def _read_seed(path: Path) -> bytes:
             raise SystemExit(f"refusing {path}: wallet seed must be a regular file")
         if info.st_uid != os.geteuid():
             raise SystemExit(f"refusing {path}: wallet seed is not owned by this user")
-        if mode & 0o077:
-            raise SystemExit(f"refusing {path}: wallet seed has group/world permissions")
-        if not mode & stat.S_IRUSR:
-            raise SystemExit(f"refusing {path}: wallet seed is not owner-readable")
+        if mode != 0o600:
+            raise SystemExit(f"refusing {path}: wallet seed must be mode 0600 (found {mode:04o})")
         chunks = []
         while True:
             chunk = os.read(fd, 33)
