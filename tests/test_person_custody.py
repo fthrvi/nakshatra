@@ -293,6 +293,9 @@ def _statement(kind, private):
     if kind == "suspend":
         return nakd.person_action_statement(
             "operator-trust", {"person": "ab" * 32}, proof_now)
+    if kind in {"wallet-withdraw", "wallet-delegate", "wallet-close"}:
+        return _canon({"schema": "nakshatra.wallet-action.v1", "kind": kind,
+                       "wallet": "bc" * 32, "issued_at": proof_now})
     raise AssertionError(kind)
 
 
@@ -1069,6 +1072,7 @@ _PRIVATE_CONSTRUCTOR_ALLOWLIST = Counter({
     ("nakshatra_auth.py", "generate_keypair", "ed25519.Ed25519PrivateKey.generate", ""): 1,
     ("nakshatra_auth.py", "public_key_hex_from_private", "ed25519.Ed25519PrivateKey.from_private_bytes", "priv_bytes"): 1,
     ("nakshatra_auth.py", "sign_request", "ed25519.Ed25519PrivateKey.from_private_bytes", "priv_bytes"): 1,
+    ("network/pay_wallet.py", "_wallet_values", "ed25519.Ed25519PrivateKey.from_private_bytes", "seed"): 1,
     ("network/join_setup.py", "_established_identity", "_raw_file_key", "person_path"): 1,
     ("network/join_setup.py", "_established_identity", "agent_files.load_key", ""): 1,
     ("network/join_setup.py", "ensure_identity", "_raw_file_key", "person_path"): 2,

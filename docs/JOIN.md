@@ -105,10 +105,12 @@ The line:
 2. checks that the invite is **signed by your friend** and has not expired;
 3. installs the release named by the invite and **pins that release key**, so later updates must be
    signed by the same key;
-4. makes **your keys**: a node key and a person key (today the person key is a TEST file under
-   `~/.sthambha`; back it up and never share it);
+4. makes **your keys: a node key, a person key, and a pay wallet** (today the person key is a TEST
+   file under `~/.sthambha`; back it up and never share it);
 5. creates one agent with only `nak.msg,nak.task.claim`;
 6. starts `nak-signer` and `nak-net`, enables them after reboot, and asks your friend to connect.
+
+Run `nak pay address` to show the wallet's Solana address. The wallet seed never leaves this device.
 
 Release `0.15.22` was clean-box verified to write, enable, and start both units on the first join.
 

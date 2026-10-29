@@ -745,6 +745,93 @@ def _wallet_command(args) -> None:
         raise SystemExit(f"wallet refused: {exc}") from exc
 
 
+_SOLANA_DEVNET_GENESIS = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1"
+_SOLANA_MAINNET_GENESIS = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2d4"
+
+
+class _NoPayRedirects(HTTPRedirectHandler):
+    """Do not let an explicitly chosen RPC silently redirect to another host."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise HTTPError(req.full_url, code, "pay RPC redirect refused", headers, fp)
+
+
+def _pay_rpc_url(value: str) -> tuple[str, bool]:
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except (TypeError, ValueError) as exc:
+        raise SystemExit(f"NAK_PAY_RPC is not a valid URL: {exc}") from exc
+    if (parsed.scheme not in {"http", "https"} or not parsed.hostname
+            or parsed.username is not None or parsed.password is not None
+            or parsed.fragment or (port is not None and not 1 <= port <= 65535)):
+        raise SystemExit("NAK_PAY_RPC must be an http(s) URL without credentials or a fragment")
+    local = parsed.hostname.lower() in {"localhost", "127.0.0.1", "::1"}
+    return value, local
+
+
+def _pay_rpc_request(opener, url: str, method: str, params: list) -> object:
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+                      separators=(",", ":")).encode()
+    request = Request(url, data=body, headers={"content-type": "application/json"}, method="POST")
+    try:
+        with opener.open(request, timeout=10) as response:
+            reply = json.loads(response.read().decode())
+    except (HTTPError, URLError, OSError, UnicodeError, ValueError) as exc:
+        raise SystemExit(f"pay RPC request {method} failed: {exc}") from exc
+    if not isinstance(reply, dict):
+        raise SystemExit(f"pay RPC request {method} returned a non-object response")
+    if reply.get("error") is not None:
+        raise SystemExit(f"pay RPC request {method} was refused: {_visible_untrusted(reply['error'], 300)}")
+    if "result" not in reply:
+        raise SystemExit(f"pay RPC request {method} returned no result")
+    return reply["result"]
+
+
+def _format_sol(lamports: int) -> str:
+    whole, fraction = divmod(lamports, 1_000_000_000)
+    if not fraction:
+        return str(whole)
+    return f"{whole}.{fraction:09d}".rstrip("0")
+
+
+def _pay_command(args) -> None:
+    from network.pay_wallet import load_wallet
+
+    if args.pay_cmd == "export":
+        if not sys.stdin.isatty():
+            raise SystemExit("nak pay export is interactive-only; run it in a terminal")
+        if input('type "export" to print the private wallet keypair: ').strip() != "export":
+            raise SystemExit("wallet export cancelled; nothing was printed")
+        wallet = load_wallet(Path.home())
+        print(json.dumps(list(wallet["seed"] + wallet["public_key"]), separators=(",", ":")))
+        return
+
+    wallet = load_wallet(Path.home())
+    if args.pay_cmd == "address":
+        print(wallet["address"])
+        return
+
+    print(f"address: {wallet['address']}")
+    print(f"custody: {wallet['custody']}")
+    rpc = os.environ.get("NAK_PAY_RPC", "").strip()
+    if not rpc:
+        print("balance: set NAK_PAY_RPC to a devnet RPC to show balances")
+        return
+    rpc, local = _pay_rpc_url(rpc)
+    opener = build_opener(ProxyHandler({}), _NoPayRedirects())
+    genesis = _pay_rpc_request(opener, rpc, "getGenesisHash", [])
+    if genesis == _SOLANA_MAINNET_GENESIS:
+        raise SystemExit("refusing Solana mainnet RPC: real money is DEVNET-ONLY")
+    if genesis != _SOLANA_DEVNET_GENESIS and not local:
+        raise SystemExit("refusing non-devnet Solana RPC: real money is DEVNET-ONLY")
+    balance = _pay_rpc_request(opener, rpc, "getBalance", [wallet["address"]])
+    if (not isinstance(balance, dict) or isinstance(balance.get("value"), bool)
+            or not isinstance(balance.get("value"), int) or balance["value"] < 0):
+        raise SystemExit("pay RPC getBalance returned an invalid lamport balance")
+    print(f"balance: {_format_sol(balance['value'])} SOL")
+
+
 def _balance_command() -> None:
     from ledger_client import LedgerUnavailable
     try:
@@ -2962,6 +3049,13 @@ def main(argv=None, *, http_post=None, http_get=None) -> int:
     q.add_argument("address")
     q = walsub.add_parser("withdraw", help="request USDC to the bound payout address")
     q.add_argument("usdc", help="USDC amount (at least 1, up to 6 decimal places)")
+    p = sub.add_parser("pay", help="inspect or export this device's non-custodial Solana wallet")
+    paysub = p.add_subparsers(dest="pay_cmd", required=True)
+    paysub.add_parser("address", help="print the Solana pay address")
+    paysub.add_parser("status", help="show the address, custody mode, and optional devnet SOL balance")
+    q = paysub.add_parser("export", help="interactively export the Phantom/Solflare keypair")
+    q.add_argument("--keypair", action="store_true", required=True,
+                   help="print the 64-byte seed + public key as a JSON integer array")
     sub.add_parser("balance", help="show this operator's signed ledger balance in USDC and base units")
     p = sub.add_parser("direct", help="allow/stop direct connections with a contact (reveals your LAN/IPv6)")
     p.add_argument("who"); p.add_argument("onoff", choices=["on", "off"])
@@ -3224,6 +3318,8 @@ def main(argv=None, *, http_post=None, http_get=None) -> int:
         past = "trusted" if trusting else "stopped trusting"
         print(f"{past} suspension operator [UNTRUSTED CONTACT LABEL] "
               f"{_visible_untrusted(result['contact'], 72)} ({result['person'][:16]}…)")
+    elif a.cmd == "pay":
+        _pay_command(a)
     elif a.cmd == "wallet":
         _wallet_command(a)
     elif a.cmd == "balance":

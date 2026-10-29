@@ -34,6 +34,7 @@ if str(_SCRIPTS) not in sys.path:
 from network.person_custody import (  # noqa: E402
     PersonKey, _person_key_path, _raw_file_key, _signing_home, broker_preflight,
     custody_mode)
+from network.pay_wallet import ensure_wallet, preflight_wallet  # noqa: E402
 from network.units import format_amount  # noqa: E402
 
 AGENT = "agent"
@@ -429,7 +430,14 @@ def ensure_identity(home: Path) -> dict:
         raise SystemExit(f"cannot inspect existing identity state; leaving all files untouched: {exc}") from exc
     first_initialisation = not (sthambha_authority_present or net_agent_present or net_store_present)
     if not first_initialisation:
-        return _established_identity(home, state, net, person_path, node_key)
+        done = _established_identity(home, state, net, person_path, node_key)
+        # The established identity above is read-only and must validate completely before the
+        # wallet is added.  Wallet files are a separate, additive state set.
+        done["pay_address"] = ensure_wallet(home)["address"]
+        return done
+    # On first init, reject corrupt pre-existing wallet state before the node/person key steps write.
+    # Actual wallet creation remains the next onboarding step after those two keys.
+    preflight_wallet(home)
     with _signing_home(home):
         custody_act = broker_preflight("grant-issue", f"Create initial grant for agent {agent}")
         broker = custody_act.mode == "broker"
@@ -472,6 +480,7 @@ def ensure_identity(home: Path) -> dict:
         done["person_key"] = "kept"
         _person_priv, person_pub = _raw_file_key(person_path)
         person_key_available = True
+    done["pay_address"] = ensure_wallet(home)["address"]
     try:
         agent_files = S.open_agent_files(state, agent, create=True)
     except (OSError, S.SignerError) as exc:
@@ -658,7 +667,8 @@ def main(argv=None) -> int:
         custody_note = "your person key is a TEST file at ~/.sthambha/person-TEST.key: back it up, and never share it"
     else:
         custody_note = "your person key remains in human custody off this box"
-    print(f"\nyou are {done['person'][:16]}… on node {done['node'][:16]}… — {custody_note}.")
+    print(f"\nyou are {done['person'][:16]}… on node {done['node'][:16]}… — {custody_note}; "
+          f"pay address: {done['pay_address']}")
     return 0
 
 

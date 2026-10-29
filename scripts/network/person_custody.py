@@ -34,6 +34,9 @@ KINDS = {
     "revoke",
     "report",
     "suspend",
+    "wallet-withdraw",
+    "wallet-delegate",
+    "wallet-close",
 }
 PREFLIGHT_ONLY_KINDS = {"resolve"}
 
