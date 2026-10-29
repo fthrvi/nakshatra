@@ -855,3 +855,22 @@ def test_existing_grant_is_not_paid_without_escrow_collateral(chain_node, monkey
     with pytest.raises(ValueError, match="lacks"):
         node._chain_starter(row)
     assert rpc.sent == []
+
+
+def test_invalid_vault_does_not_preempt_the_open_work_fence(chain_node, monkeypatch):
+    node, wallet, row = chain_node
+    rpc = StarterRpc(
+        wallet, vault_amount=2_000_000, existing_cap=100_000_000, existing_spent=40_000_000,
+        existing_expires=1, existing_open_channels=1)
+    real = rpc.account_info
+
+    def no_vault(address, *, commitment="confirmed"):
+        if address == rpc.derived["vault"]:
+            return None
+        return real(address, commitment=commitment)
+
+    monkeypatch.setattr(rpc, "account_info", no_vault)
+    monkeypatch.setattr(pay_chain, "PayRpc", lambda _url: rpc)
+    with pytest.raises(ValueError, match="open channels/tasks"):
+        node._chain_starter(row)
+    assert rpc.sent == []

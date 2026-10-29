@@ -1286,10 +1286,17 @@ class Node:
 
             # Collateral is read before the existing-grant shortcut: "paid" must mean the
             # inviter's escrow could fund the starter now, exactly as the sending path requires.
+            # A missing or invalid vault counts as no collateral here; it is reported below, after
+            # the open-work and deadline guards, so decision order is unchanged.
             vault_info = rpc.account_info(derived["vault"], commitment="finalized")
-            if vault_info is None or vault_info["owner"] != pay_chain.TOKEN_PROGRAM_ID:
-                raise ValueError("inviter escrow vault is missing or invalid")
-            available = max(0, pay_chain.token_amount(vault_info["data"]) - escrow["committed"])
+            vault_amount = None
+            if vault_info is not None and vault_info["owner"] == pay_chain.TOKEN_PROGRAM_ID:
+                try:
+                    vault_amount = pay_chain.token_amount(vault_info["data"])
+                except ValueError:
+                    vault_amount = None
+            vault_valid = vault_amount is not None
+            available = max(0, vault_amount - escrow["committed"]) if vault_valid else 0
 
             delegate_info = rpc.account_info(delegate_address, commitment="finalized")
             delegate = None
@@ -1331,6 +1338,8 @@ class Node:
             if deadline is not None and chain_now >= int(deadline):
                 raise ValueError("starter retry window expired")
 
+            if not vault_valid:
+                raise ValueError("inviter escrow vault is missing or invalid")
             if available < cap:
                 raise ValueError(
                     f"inviter escrow lacks {cap / 1_000_000:.6f} USDC; nak pay deposit")
