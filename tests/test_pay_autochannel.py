@@ -448,3 +448,27 @@ def test_two_processes_open_exactly_one_channel(tmp_path):
     assert [status for status, _value in replies] == ["ok", "ok"]
     assert len({value for _status, value in replies}) == 1
     assert sent.value == 1
+
+
+def test_pay_lock_closes_descriptor_even_if_unlock_fails(tmp_path, monkeypatch):
+    lock = auto.pay_lock(tmp_path / "pay" / "channel-open.lock")
+    real_flock = auto.fcntl.flock
+    closed = []
+    real_close = auto.os.close
+
+    def failing_flock(fd, op):
+        if op == auto.fcntl.LOCK_UN:
+            raise OSError("unlock failed")
+        return real_flock(fd, op)
+
+    def tracking_close(fd):
+        closed.append(fd)
+        return real_close(fd)
+
+    monkeypatch.setattr(auto.fcntl, "flock", failing_flock)
+    monkeypatch.setattr(auto.os, "close", tracking_close)
+    with pytest.raises(OSError, match="unlock failed"):
+        with lock:
+            fd = lock.fd
+    assert fd in closed
+    assert lock.fd == -1

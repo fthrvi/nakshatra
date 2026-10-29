@@ -1074,7 +1074,9 @@ def _pay_ensure_locked() -> None:
             if delegate_info["owner"] != program:
                 raise SystemExit("delegate address exists but is not owned by NAK_PAY_PROGRAM")
             current = chain.decode_delegate(delegate_info["data"])
-        expires_soon = current is None or current["expires_at"] <= int(time.time()) + 7 * 86400
+        # Finalized cluster time, not the local clock: a skewed clock must not stretch the delegate.
+        now = rpc.chain_time()
+        expires_soon = current is None or current["expires_at"] <= now + 7 * 86400
         changed = (escrow_info is None or current is None
                    or (escrow_state is not None and current["generation"] != escrow_state["generation"])
                    or current["cap_total"] != limits["cap_total"]
@@ -1084,7 +1086,7 @@ def _pay_ensure_locked() -> None:
                 raise SystemExit("saved on-chain cap is below the delegate's amount already spent")
             if current is None:
                 rent += rpc.rent_exemption(115)
-            expires_at = int(time.time()) + limits["days"] * 86400
+            expires_at = now + limits["days"] * 86400
             instructions.extend(chain.delegate_set(
                 wallet["address"], node_public, limits["cap_total"], expires_at,
                 chain.DELEGATE_FLAGS_ALL, program))

@@ -178,9 +178,11 @@ class _OpenLock:
 
     def __exit__(self, _type, _value, _traceback) -> None:
         if self.fd >= 0:
-            fcntl.flock(self.fd, fcntl.LOCK_UN)
-            os.close(self.fd)
-            self.fd = -1
+            fd, self.fd = self.fd, -1
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
 
 
 def pay_lock(path: str | Path | None = None) -> _OpenLock:

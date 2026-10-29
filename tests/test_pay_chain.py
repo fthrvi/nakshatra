@@ -275,8 +275,10 @@ def test_decode_escrow_rejects_invalid_pending_option_tag():
 
 class FakeRpc:
     def __init__(self, *, genesis="local-test", balance=100_000_000,
-                 node_balance=0, token_balance=0, send_delay=0):
+                 node_balance=0, token_balance=0, send_delay=0, chain_time=None):
         self.genesis = genesis
+        self.chain_time = int(time.time()) if chain_time is None else chain_time
+        self.sent_raw: list[bytes] = []
         self.balance = balance
         self.node_balance = node_balance
         self.token_balance = token_balance
@@ -296,12 +298,15 @@ class FakeRpc:
                 elif method == "getAccountInfo": result = outer.account(params[0])
                 elif method == "getMinimumBalanceForRentExemption": result = 1_000 + params[0]
                 elif method == "getLatestBlockhash": result = {"context":{"slot":1},"value":{"blockhash":BLOCKHASH,"lastValidBlockHeight":999}}
+                elif method == "getSlot": result = 77
+                elif method == "getBlockTime": result = outer.chain_time
                 elif method == "getFeeForMessage": result = {"context":{"slot":1},"value":5_000}
                 elif method == "getBalance":
                     value = outer.node_balance if params[0] == outer.node else outer.balance
                     result = {"context":{"slot":1},"value":value}
                 elif method == "sendTransaction":
                     raw = base64.b64decode(params[0]); result = pay_chain.b58encode(raw[1:65])
+                    outer.sent_raw.append(raw)
                     if outer.send_delay:
                         time.sleep(outer.send_delay)
                     outer.sent += 1; outer.ready = True
@@ -354,6 +359,22 @@ def test_cli_ensure_is_idempotent_and_limits_are_private(_temp_home, monkeypatch
     assert rpc.sent == 1
     limits = _temp_home / ".nakshatra/pay/limits.json"
     assert stat.S_IMODE(limits.stat().st_mode) == 0o600
+
+
+def test_cli_ensure_sets_delegate_expiry_from_chain_time_not_local_clock(
+        _temp_home, monkeypatch):
+    wallet = _make_keys(_temp_home)
+    node = ed25519.Ed25519PrivateKey.from_private_bytes(bytes(range(101, 133))).public_key().public_bytes_raw()
+    chain_now = 1_000_000
+    rpc = FakeRpc(chain_time=chain_now); rpc.configure(wallet, node)
+    skewed = chain_now + 365 * 86400
+    monkeypatch.setattr(nak.time, "time", lambda: skewed)
+    with rpc as url:
+        monkeypatch.setenv("NAK_PAY_RPC", url)
+        assert nak.main(["pay", "ensure"]) == 0
+    raw = b"".join(rpc.sent_raw)
+    assert struct.pack("<q", chain_now + 30 * 86400) in raw
+    assert struct.pack("<q", skewed + 30 * 86400) not in raw
 
 
 def test_cli_ensure_tops_up_node_and_reports_wallet_shortfall(

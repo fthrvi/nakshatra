@@ -2007,7 +2007,7 @@ def main():
                 model_id=paid["model_id"],
                 max_prompt_tokens=paid["max_prompt_tokens"],
                 max_output_tokens=paid["max_output_tokens"])
-        except Exception as exc:
+        except (Exception, SystemExit) as exc:
             sys.exit(f"[paid] chain voucher admission refused: {exc}")
 
     # ── Speculative decoding setup (slice 1) ──────────────────────────────────
