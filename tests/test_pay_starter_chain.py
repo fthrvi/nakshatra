@@ -574,8 +574,127 @@ def _attempt_at_deadline(monkeypatch, status, *, finalized_height=100):
     rpc = AttemptResolutionRpc(status, finalized_height=finalized_height)
     monkeypatch.setenv("NAK_PAY_MODE", "chain")
     monkeypatch.setenv("NAK_PAY_RPC", "http://127.0.0.1:8899")
+    monkeypatch.setenv("NAK_PAY_PROGRAM", PROGRAM)
     monkeypatch.setattr(pay_chain, "PayRpc", lambda _url: rpc)
     return node, row, rpc, sent, deadline
+
+
+def _record_chain_attempt(row, *, last_valid_block_height=120):
+    signature = pay_chain.b58encode(b"r" * 64)
+    row["chain_created"] = 100
+    row["chain_attempts"] = [{
+        "signature": signature, "blockhash": BLOCKHASH,
+        "last_valid_block_height": last_valid_block_height, "cap_total": 10_000,
+        "sol_lamports": nakd.STARTER_NODE_SOL, "expires_at": 900,
+        "escrow": "escrow", "delegate": "delegate",
+    }]
+    return signature
+
+
+class RecordingLedger:
+    def __init__(self):
+        self.calls = []
+
+    def starter(self, *args):
+        self.calls.append(args)
+        return {"ts": 201, "kind": "ledger-starter"}
+
+
+def _attempt_with_mode_off(monkeypatch, status, *, finalized_height=100, chain_now=200):
+    node, row = _attempt_node()
+    signature = _record_chain_attempt(row)
+    rpc = AttemptResolutionRpc(status, finalized_height=finalized_height)
+    ledger = RecordingLedger()
+    node.settle = ledger
+    node._starter_chain_time = lambda: chain_now
+    monkeypatch.delenv("NAK_PAY_MODE", raising=False)
+    monkeypatch.setenv("NAKSHATRA_ESCROW", "neuron")
+    monkeypatch.setenv("NAK_PAY_RPC", "http://127.0.0.1:8899")
+    monkeypatch.setenv("NAK_PAY_PROGRAM", PROGRAM)
+    monkeypatch.setattr(pay_chain, "PayRpc", lambda _url: rpc)
+    return node, row, rpc, ledger, signature
+
+
+def test_recorded_unresolved_chain_attempt_never_falls_back_to_ledger(monkeypatch):
+    node, row, rpc, ledger, signature = _attempt_with_mode_off(
+        monkeypatch, {"err": None, "confirmationStatus": "confirmed"})
+
+    assert node._attempt_starter(row["invite_id"], now=200) is False
+
+    assert rpc.status_calls == [signature]
+    assert row["state"] == "pending"
+    assert "still unresolved" in row["reason"]
+    assert not ledger.calls
+
+
+def test_recorded_finalized_chain_attempt_pays_with_mode_off(monkeypatch):
+    node, row, rpc, ledger, signature = _attempt_with_mode_off(
+        monkeypatch, {"err": None, "confirmationStatus": "finalized"})
+
+    assert node._attempt_starter(row["invite_id"], now=200) is True
+
+    assert rpc.status_calls == [signature]
+    assert row["state"] == "paid"
+    assert row["receipt"]["signature"] == signature
+    assert not ledger.calls
+
+
+def test_reconcile_resolves_recorded_attempt_before_ledger_retry_time(monkeypatch):
+    node, row, rpc, ledger, signature = _attempt_with_mode_off(
+        monkeypatch, {"err": None, "confirmationStatus": "finalized"})
+    row["next_attempt"] = 9_999
+
+    assert node.reconcile_starters(now=200) == 1
+
+    assert rpc.status_calls == [signature]
+    assert row["state"] == "paid"
+    assert not ledger.calls
+
+
+def test_recorded_chain_attempt_without_config_stays_pending(monkeypatch):
+    node, row = _attempt_node()
+    _record_chain_attempt(row)
+    ledger = RecordingLedger()
+    node.settle = ledger
+    monkeypatch.delenv("NAK_PAY_MODE", raising=False)
+    monkeypatch.setenv("NAKSHATRA_ESCROW", "neuron")
+    monkeypatch.delenv("NAK_PAY_RPC", raising=False)
+    monkeypatch.delenv("NAKSHATRA_PAY_RPC_URL", raising=False)
+    monkeypatch.delenv("NAK_PAY_PROGRAM", raising=False)
+
+    assert node._attempt_starter(row["invite_id"], now=200) is False
+
+    assert row["state"] == "pending"
+    assert row["reason"] == (
+        "chain starter attempts recorded; chain pay config is required to resolve them")
+    assert not ledger.calls
+
+
+def test_resolved_chain_attempt_stays_chain_only_when_mode_is_off(monkeypatch):
+    node, row, rpc, ledger, signature = _attempt_with_mode_off(
+        monkeypatch, None, finalized_height=121)
+
+    assert node._attempt_starter(row["invite_id"], now=200) is False
+
+    assert rpc.status_calls == [signature]
+    assert row["chain_attempts"][0]["resolution"] == "expired"
+    assert row["state"] == "pending"
+    assert "chain mode is off" in row["reason"]
+    assert not ledger.calls
+
+
+def test_resolved_chain_attempt_still_obeys_chain_deadline_with_mode_off(monkeypatch):
+    deadline = 100 + nakd.STARTER_RETRY_WINDOW_S
+    node, row, rpc, ledger, signature = _attempt_with_mode_off(
+        monkeypatch, None, finalized_height=121, chain_now=deadline)
+
+    assert node._attempt_starter(row["invite_id"], now=200) is False
+
+    assert rpc.status_calls == [signature]
+    assert row["chain_attempts"][0]["resolution"] == "expired"
+    assert row["state"] == "failed"
+    assert row["next_attempt"] == deadline
+    assert not ledger.calls
 
 
 def test_finalized_success_after_deadline_marks_starter_paid(monkeypatch):

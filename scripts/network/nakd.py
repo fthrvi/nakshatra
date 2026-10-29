@@ -1414,7 +1414,19 @@ class Node:
                 return False
             row = rows[0]
             chain_mode = os.environ.get("NAK_PAY_MODE", "").strip().lower() == "chain"
-            if chain_mode:
+            recorded_chain_attempts = bool(row.get("chain_attempts"))
+            chain_only = chain_mode or recorded_chain_attempts
+            if recorded_chain_attempts:
+                from network import pay_chain
+
+                if (not pay_chain.configured_rpc_url(os.environ)
+                        or not os.environ.get("NAK_PAY_PROGRAM", "").strip()):
+                    self.store.starter_update(
+                        invite_id, state="pending",
+                        reason=("chain starter attempts recorded; chain pay config is required "
+                                "to resolve them"))
+                    return False
+            if chain_only:
                 try:
                     now = int(self._starter_chain_time())
                 except Exception as exc:  # noqa: BLE001 - RPC failures leave money pending
@@ -1423,7 +1435,7 @@ class Node:
                         reason=f"starter chain time unavailable ({str(exc).strip()})"[:200],
                         attempts=int(row.get("attempts") or 0) + 1)
                     return False
-                if row.get("chain_created") is None:
+                if chain_mode and row.get("chain_created") is None:
                     self.store.starter_update(
                         invite_id, chain_created=now, updated=now, next_attempt=now)
                     row["chain_created"] = now
@@ -1432,10 +1444,10 @@ class Node:
             else:
                 now = wall_now
             created = (row.get("chain_created")
-                       if chain_mode else row["created"])
+                       if chain_only and row.get("chain_created") is not None else row["created"])
             deadline = int(created) + STARTER_RETRY_WINDOW_S
-            if chain_mode:
-                # Reuse the unchanged ledger retry helper with the chain epoch for this call only.
+            if chain_only:
+                # Reuse the retry helper with the finalized chain epoch for this call only.
                 row = {**row, "created": int(created)}
                 try:
                     receipt, unresolved = self._resolve_recorded_starter_attempts(row, now)
@@ -1457,6 +1469,13 @@ class Node:
                 reason = row.get("reason") or "starter retry window expired"
                 self.store.starter_update(invite_id, state="failed", reason=str(reason)[:200],
                                           updated=now, next_attempt=deadline)
+                return False
+            if recorded_chain_attempts and not chain_mode:
+                self.store.starter_update(
+                    invite_id, state="pending",
+                    reason=("chain starter attempts recorded; chain mode is off and no attempt "
+                            "can still land"),
+                    updated=now, next_attempt=min(deadline, now + STARTER_RETRY_MAX_S))
                 return False
             if now < int(row["next_attempt"]):
                 return False
@@ -1550,7 +1569,7 @@ class Node:
         chain_mode = os.environ.get("NAK_PAY_MODE", "").strip().lower() == "chain"
         paid = 0
         for row in self.store.starter_rows(("pending",)):
-            if ((chain_mode or now >= int(row["next_attempt"]))
+            if ((chain_mode or row.get("chain_attempts") or now >= int(row["next_attempt"]))
                     and self._attempt_starter(row["invite_id"], now=now)):
                 paid += 1
         return paid
