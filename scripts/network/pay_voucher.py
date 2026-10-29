@@ -227,6 +227,24 @@ def require_open_channel(account: ChannelAccount, *, now: float | None = None,
         raise ChannelClosingError("channel close deadline is within one checkpoint")
 
 
+def require_redeemable_channel(account: ChannelAccount, *, now: float | None = None,
+                               checkpoint_margin_s: int = CHECKPOINT_MARGIN_S) -> None:
+    """Refuse a voucher the program could not redeem: Open, or Closing before ``close_at``.
+
+    Vouchers for work already delivered stay acceptable during the close grace (the program
+    redeems them until ``close_at``); only new work stops when closing begins.
+    """
+    if account.status == "Open":
+        require_open_channel(account, now=now, checkpoint_margin_s=checkpoint_margin_s)
+        return
+    if account.status != "Closing":
+        raise ChannelClosingError("channel is closed")
+    margin = max(0, int(checkpoint_margin_s))
+    timestamp = time.time() if now is None else float(now)
+    if not account.close_at or account.close_at <= timestamp + margin:
+        raise ChannelClosingError("channel close deadline is within one checkpoint")
+
+
 def _take(data: memoryview, offset: int, size: int) -> tuple[bytes, int]:
     end = offset + size
     if end > len(data):
@@ -849,7 +867,7 @@ class WorkerVoucherStore(_Book):
         if len(signature) != 64:
             raise VoucherError("voucher signature must contain 64 bytes")
         account = state.read_channel(channel, configured)
-        require_open_channel(account, now=now)
+        require_redeemable_channel(account, now=now)
         if total < account.redeemed:
             raise VoucherError("voucher total is below the on-chain redeemed total")
         if total > account.cap:

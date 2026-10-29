@@ -760,10 +760,67 @@ def test_closing_channel_refused_at_admission_and_voucher_accept(
         max_prompt_tokens=1, max_output_tokens=40)
     with pytest.raises(admission.PaidAdmissionError, match="not open"):
         manager.claim(PAYER_HEX, "closing", init)
-    with pytest.raises(pay.VoucherError, match="not open"):
+    with pytest.raises(pay.VoucherError, match="close deadline"):
         vouchers.accept(
             _voucher(total=1), configured_program=PROGRAM, state=state,
             expected_channel=CHANNEL, now=100)
+    store.close()
+    vouchers.close()
+
+
+def test_closing_channel_still_accepts_vouchers_before_close_at(tmp_path, monkeypatch):
+    monkeypatch.setenv("NAK_PAY_MODE", "chain")
+    _install_pay_wallet(Path(os.environ["HOME"]))
+    grace = _channel(status="Closing", close_at=100_000)
+    state = pay.FakeChannelState(
+        {CHANNEL: grace}, {ESCROW: OWNER_B58}, program_id=PROGRAM)
+    vouchers = pay.WorkerVoucherStore(tmp_path / "grace" / "vouchers.sqlite")
+    record = vouchers.accept(
+        _voucher(total=10), configured_program=PROGRAM, state=state,
+        expected_channel=CHANNEL, now=100)
+    assert record.total == 10 and vouchers.latest(CHANNEL).total == 10
+    store = admission.PaidAdmissionStore(tmp_path / "grace" / "paid.sqlite")
+    manager = admission.PaidAdmission(
+        _Ledger(_claim("grace")), store, WORKER_SEED, model_id="model",
+        layer_start=0, layer_end=4, clock=lambda: 100,
+        voucher_store=vouchers, channel_state=state, pay_program=PROGRAM)
+    assert manager.check_ready()
+    init = pay.init_wire(
+        TOKEN, program=PROGRAM, channel=CHANNEL, channel_base=0,
+        hold_id="hold", session_id="grace", model_id="model",
+        max_prompt_tokens=1, max_output_tokens=40)
+    with pytest.raises(admission.PaidAdmissionError, match="not open"):
+        manager.claim(PAYER_HEX, "grace", init)
+    store.close()
+    vouchers.close()
+
+
+@pytest.mark.parametrize(("payer", "admitted"), [
+    (PAYER_HEX, True), (OWNER_HEX, True), (WRONG_HEX, False)])
+def test_admission_binds_authenticated_payer_to_channel_signer(
+        tmp_path, monkeypatch, payer, admitted):
+    monkeypatch.setenv("NAK_PAY_MODE", "chain")
+    _install_pay_wallet(Path(os.environ["HOME"]))
+    state = pay.FakeChannelState(
+        {CHANNEL: _channel()}, {ESCROW: OWNER_B58}, program_id=PROGRAM)
+    vouchers = pay.WorkerVoucherStore(tmp_path / "bind" / "vouchers.sqlite")
+    store = admission.PaidAdmissionStore(tmp_path / "bind" / "paid.sqlite")
+    claim = _claim("bind")
+    claim["payer_keyid"] = payer
+    manager = admission.PaidAdmission(
+        _Ledger(claim), store, WORKER_SEED, model_id="model",
+        layer_start=0, layer_end=4, clock=lambda: 100,
+        voucher_store=vouchers, channel_state=state, pay_program=PROGRAM)
+    assert manager.check_ready()
+    init = pay.init_wire(
+        TOKEN, program=PROGRAM, channel=CHANNEL, channel_base=0,
+        hold_id="hold", session_id="bind", model_id="model",
+        max_prompt_tokens=1, max_output_tokens=40)
+    if admitted:
+        assert manager.claim(payer, "bind", init)
+    else:
+        with pytest.raises(admission.PaidAdmissionError, match="voucher signer or escrow owner"):
+            manager.claim(payer, "bind", init)
     store.close()
     vouchers.close()
 

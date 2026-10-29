@@ -769,6 +769,14 @@ class PaidAdmission:
             if account.worker != self.pay_wallet_address:
                 raise self._pay.VoucherError(
                     "channel worker does not match this worker pay wallet")
+            # The authenticated payer must be able to sign this channel's vouchers; otherwise any
+            # consumer could name someone else's channel and take the unpaid first step.
+            payer_address = self._pay.b58encode(bytes.fromhex(claim["payer_keyid"]))
+            escrow_owner = self.channel_state.read_escrow_owner(
+                account.escrow, self.pay_program)
+            if payer_address not in (account.voucher_signer, escrow_owner):
+                raise self._pay.VoucherError(
+                    "authenticated payer is not this channel's voucher signer or escrow owner")
             latest = self.voucher_store.latest(init["channel"])
             latest_total = latest.total if latest is not None else account.redeemed
             derived_base = max(account.redeemed, latest_total)
@@ -838,6 +846,11 @@ class PaidAdmission:
             pending = session["pending_total"]
             if pending is not None and record.total >= pending:
                 session["pending_total"] = None
+            # A voucher may be accepted during the close grace; it pays for delivered work, but no
+            # further work starts on a channel that has left Open.
+            if self.channel_state.read_channel(
+                    session["channel"], self.pay_program).status != "Open":
+                session["channel_closing"] = True
             for row in self.store.pending():
                 if (row["payer_keyid"] != claim["payer_keyid"]
                         or row["session_id"] != claim["session_id"]):
