@@ -275,11 +275,12 @@ def test_decode_escrow_rejects_invalid_pending_option_tag():
 
 class FakeRpc:
     def __init__(self, *, genesis="local-test", balance=100_000_000,
-                 node_balance=0, token_balance=0):
+                 node_balance=0, token_balance=0, send_delay=0):
         self.genesis = genesis
         self.balance = balance
         self.node_balance = node_balance
         self.token_balance = token_balance
+        self.send_delay = send_delay
         self.methods: list[str] = []
         self.sent = 0
         self.ready = False
@@ -301,6 +302,8 @@ class FakeRpc:
                     result = {"context":{"slot":1},"value":value}
                 elif method == "sendTransaction":
                     raw = base64.b64decode(params[0]); result = pay_chain.b58encode(raw[1:65])
+                    if outer.send_delay:
+                        time.sleep(outer.send_delay)
                     outer.sent += 1; outer.ready = True
                     outer.node_balance = nak.NODE_SOL_TARGET
                 elif method == "getSignatureStatuses": result = {"context":{"slot":1},"value":[{"slot":1,"confirmations":None,"err":None,"confirmationStatus":"finalized"}]}
@@ -377,6 +380,33 @@ def test_cli_ensure_tops_up_node_and_reports_wallet_shortfall(
             nak.main(["pay", "ensure"])
     assert poor.sent == 0
     assert capsys.readouterr().out == ""
+
+
+def test_concurrent_cli_ensure_sends_one_node_top_up(_temp_home):
+    wallet = _make_keys(_temp_home)
+    node = ed25519.Ed25519PrivateKey.from_private_bytes(
+        bytes(range(101, 133))).public_key().public_bytes_raw()
+    rpc = FakeRpc(balance=100_000_000, node_balance=0, send_delay=0.3)
+    rpc.configure(wallet, node)
+    rpc.ready = True
+    command = [sys.executable, str(ROOT / "scripts/network/nak.py"), "pay", "ensure"]
+
+    with rpc as url:
+        env = os.environ.copy()
+        env["NAK_PAY_RPC"] = url
+        processes = [
+            subprocess.Popen(command, env=env, text=True, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE)
+            for _ in range(2)
+        ]
+        replies = [process.communicate(timeout=10) for process in processes]
+
+    assert [(process.returncode, stderr) for process, (_stdout, stderr)
+            in zip(processes, replies)] == [(0, ""), (0, "")]
+    assert rpc.sent == 1
+    assert rpc.node_balance == nak.NODE_SOL_TARGET
+    lock_path = _temp_home / ".nakshatra/pay/channel-open.lock"
+    assert stat.S_IMODE(lock_path.stat().st_mode) == 0o600
 
 
 def test_cli_low_sol_sends_nothing(_temp_home, monkeypatch):

@@ -183,6 +183,12 @@ class _OpenLock:
             self.fd = -1
 
 
+def pay_lock(path: str | Path | None = None) -> _OpenLock:
+    """Return the one host-wide lock shared by opens and CLI ensure."""
+    lock_path = Path(path or Path.home() / ".nakshatra" / "pay" / "channel-open.lock")
+    return _OpenLock(lock_path)
+
+
 def _account(rpc, address: str, *, owner: str, label: str) -> dict:
     info = rpc.account_info(address)
     if info is None:
@@ -231,8 +237,7 @@ def ensure_channel(worker_key: str, required_micro_usdc: int, *, owner: str,
         pass
 
     pay_dir = Path.home() / ".nakshatra" / "pay"
-    open_lock = Path(lock_path or pay_dir / "channel-open.lock")
-    with _OpenLock(open_lock):
+    with pay_lock(lock_path):
         # A different gateway process may have completed an open while this
         # process waited for the host-wide lock.
         try:

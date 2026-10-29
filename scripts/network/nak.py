@@ -1016,6 +1016,18 @@ def _pay_send(rpc, chain, instructions, wallet: dict, *, rent: int = 0) -> str:
 
 
 def _pay_ensure() -> None:
+    from network import pay_autochannel, pay_chain
+
+    try:
+        with pay_autochannel.pay_lock():
+            _pay_ensure_locked()
+    except SystemExit:
+        raise
+    except (ValueError, pay_chain.VoucherError) as exc:
+        raise SystemExit(f"pay ensure refused: {exc}") from exc
+
+
+def _pay_ensure_locked() -> None:
     wallet, _node_seed, node_public = _pay_wallet_and_node()
     chain, rpc, program, mint = _pay_chain_settings()
     limits = _load_pay_limits()
