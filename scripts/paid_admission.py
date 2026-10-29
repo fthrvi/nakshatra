@@ -262,6 +262,22 @@ class SpendLedgerClient:
         return value
 
 
+class ChainLedgerGuard:
+    """Identity-only ledger stand-in; chain mode must never move credits."""
+
+    def __init__(self, worker_keyid: str):
+        self.worker_keyid = worker_keyid
+
+    def probe(self) -> dict:
+        return {"ready": True}
+
+    def claim(self, _claim_token: str, _claim_instance: str) -> dict:
+        raise PaidAdmissionUnavailable("chain mode forbids legacy spend claims")
+
+    def settle(self, _receipt: dict, _signature: str) -> dict:
+        raise PaidAdmissionUnavailable("chain mode forbids legacy spend settlement")
+
+
 class PaidAdmissionStore:
     """Mode-0600 SQLite claim, meter, step journal, and settlement outbox."""
 
@@ -574,6 +590,17 @@ class PaidAdmissionStore:
                 "WHERE receipt_id=? AND state='pending'",
                 (reason[:128], receipt_id))
 
+    def mark_chain_vouched(self, receipt_id: str, voucher_total: int) -> None:
+        """Mark a local meter receipt covered without calling the legacy ledger."""
+        response = _canonical({
+            "kind": "chain-vouched", "voucher_total": int(voucher_total),
+        }).decode("utf-8")
+        with self._lock:
+            self._db.execute(
+                "UPDATE outbox SET state='chain-vouched',attempts=attempts+1,"
+                "last_error='',response_json=? WHERE receipt_id=? AND state='pending'",
+                (response, receipt_id))
+
 
 class PaidAdmission:
     """Online claim, cap enforcement, metering, receipt signing, and outbox."""
@@ -602,13 +629,19 @@ class PaidAdmission:
         self.voucher_store = voucher_store
         self.channel_state = channel_state
         self.pay_program = pay_program
+        self.pay_wallet_address = None
         if self.chain_mode:
             try:
                 from network import pay_voucher
+                from network.pay_wallet import load_wallet
                 self._pay = pay_voucher
                 self.pay_program = pay_program or pay_voucher.configured_program()
                 self.channel_state = channel_state or pay_voucher.configured_state()
                 self.voucher_store = voucher_store or pay_voucher.WorkerVoucherStore()
+                self.pay_wallet_address = load_wallet(Path.home())["address"]
+            except SystemExit as exc:
+                raise PaidAdmissionUnavailable(
+                    f"chain pay wallet is unavailable ({exc})") from exc
             except Exception as exc:
                 raise PaidAdmissionUnavailable(
                     f"chain voucher configuration is unavailable ({exc})") from exc
@@ -621,7 +654,8 @@ class PaidAdmission:
 
     def check_ready(self) -> bool:
         try:
-            self.ledger.probe()
+            if not self.chain_mode:
+                self.ledger.probe()
             self.ready = True
             self.readiness_error = ""
         except Exception as exc:
@@ -639,8 +673,11 @@ class PaidAdmission:
             try:
                 chain_init = self._pay.parse_wire(claim_token)
                 if (chain_init.get("kind") != "init"
-                        or set(chain_init) != {"v", "kind", "claim_token", "program",
-                                               "channel", "channel_base"}):
+                        or set(chain_init) != {
+                            "v", "kind", "claim_token", "program", "channel",
+                            "channel_base", "hold_id", "session_id", "model_id",
+                            "max_prompt_tokens", "max_output_tokens",
+                        }):
                     raise self._pay.VoucherError("invalid chain init envelope")
                 if chain_init["program"] != self.pay_program:
                     raise self._pay.VoucherError(
@@ -666,31 +703,73 @@ class PaidAdmission:
             raise PaidAdmissionError("first chain frame requires channel init")
         if _TOKEN.fullmatch(raw_claim_token) is None:
             raise PaidAdmissionError("spend claim token is invalid")
-        token_digest = hashlib.sha256(raw_claim_token.encode("ascii")).hexdigest()
-        instance = self.store.claim_instance(token_digest)
-        response = self.ledger.claim(raw_claim_token, instance)
+        if self.chain_mode:
+            response = self._chain_claim(
+                payer_keyid, session_id, raw_claim_token, chain_init)
+        else:
+            token_digest = hashlib.sha256(raw_claim_token.encode("ascii")).hexdigest()
+            instance = self.store.claim_instance(token_digest)
+            response = self.ledger.claim(raw_claim_token, instance)
         self._validate_scope(response, payer_keyid, session_id)
         saved = self.store.save_claim(response)
         if self.chain_mode:
             self._admit_chain(saved, chain_init)
         return saved
 
+    def _chain_claim(self, payer_keyid: str, session_id: str,
+                     claim_token: str, init: Mapping[str, object]) -> dict:
+        """Build the durable local meter scope without reserving ledger credits."""
+        if init.get("session_id") != session_id or init.get("model_id") != self.model_id:
+            raise PaidAdmissionError("chain voucher init scope differs from this call")
+        hold_id = init.get("hold_id")
+        if (not isinstance(hold_id, str) or not hold_id
+                or len(hold_id.encode("utf-8")) > _MAX_TEXT_BYTES):
+            raise PaidAdmissionError("chain voucher hold id is invalid")
+        prompt = self._pay._u64(init.get("max_prompt_tokens"), "maximum prompt tokens")
+        output = self._pay._u64(init.get("max_output_tokens"), "maximum output tokens")
+        if prompt + output == 0:
+            raise PaidAdmissionError("chain voucher token caps are empty")
+        layers = self.layer_end - self.layer_start
+        max_cost = (prompt + output) * layers
+        token_digest = hashlib.sha256(claim_token.encode("ascii")).hexdigest()
+        response = {
+            "v": 1, "hold_id": hold_id, "token_sha256": token_digest,
+            "claim_instance": "chain-" + token_digest,
+            "payer_keyid": payer_keyid,
+            "payer_account_at_authorize": "chain:" + payer_keyid,
+            "worker_keyid": self.worker_keyid,
+            "worker_account_at_authorize": self.pay_wallet_address,
+            "billable": True, "session_id": session_id, "model_id": self.model_id,
+            "billing_mode": "greedy-direct-v1", "layer_start": self.layer_start,
+            "layer_end": self.layer_end, "price_multiplier": 1,
+            "max_prompt_tokens": prompt, "max_output_tokens": output,
+            "max_token_layers": max_cost, "max_cost": max_cost,
+            "execution_deadline": (1 << 63) - 2,
+            "settlement_deadline": (1 << 63) - 1,
+            "server_time": int(self.clock()), "claim_response_sha256": "",
+        }
+        response["claim_response_sha256"] = hashlib.sha256(
+            b"nakshatra-chain-meter-v1\0" + _canonical(response)).hexdigest()
+        return response
+
     def _admit_chain(self, claim: dict, init: dict) -> None:
         try:
             account = self.channel_state.read_channel(
                 init["channel"], self.pay_program)
+            if account.worker != self.pay_wallet_address:
+                raise self._pay.VoucherError(
+                    "channel worker does not match this worker pay wallet")
             latest = self.voucher_store.latest(init["channel"])
             latest_total = latest.total if latest is not None else account.redeemed
+            derived_base = max(account.redeemed, latest_total)
             base = self._pay._u64(init["channel_base"], "channel base")
-            if base < max(account.redeemed, latest_total):
+            if base != derived_base:
                 raise self._pay.VoucherError(
-                    "channel base is below redeemed or stored vouchers")
+                    "sender channel base does not match worker-derived base")
             if base > account.cap:
                 raise self._pay.VoucherError("channel base exceeds channel cap")
-            outstanding = max(0, latest_total - account.redeemed)
-            available = account.cap - account.redeemed - outstanding
-            if available < self._pay.required_capacity_micro_usdc(
-                    int(claim["max_cost"])):
+            if (base + self._pay.required_capacity_micro_usdc(
+                    int(claim["max_cost"])) > account.cap):
                 raise self._pay.VoucherError(
                     "channel has insufficient uncommitted capacity")
             self._chain_sessions[(claim["payer_keyid"], claim["session_id"])] = {
@@ -722,6 +801,15 @@ class PaidAdmission:
             pending = session["pending_total"]
             if pending is not None and record.total >= pending:
                 session["pending_total"] = None
+            for row in self.store.pending():
+                if (row["payer_keyid"] != claim["payer_keyid"]
+                        or row["session_id"] != claim["session_id"]):
+                    continue
+                receipt = json.loads(row["receipt_json"])
+                covered = self._pay.credits_to_total(
+                    session["channel_base"], int(receipt["cumulative_cost"]))
+                if record.total >= covered:
+                    self.store.mark_chain_vouched(row["receipt_id"], record.total)
         except Exception as exc:
             raise PaidAdmissionError(f"chain voucher refused ({exc})") from exc
 
@@ -754,6 +842,21 @@ class PaidAdmission:
         session["pending_total"] = total
         signature = self.store.receipt_signature(receipt["receipt_id"])
         return self._pay.receipt_wire(receipt, signature)
+
+    def final_chain_receipt_wire(self, claim: dict,
+                                 termination: str = "normal") -> str:
+        if not self.chain_mode:
+            return ""
+        return self.chain_receipt_wire(claim, self.finalize(claim, termination))
+
+    def require_chain_final_voucher(self, claim: dict) -> None:
+        if not self.chain_mode:
+            return
+        session = self._chain_session(claim)
+        pending = session["pending_total"]
+        latest = self.voucher_store.latest(session["channel"])
+        if pending is not None and (latest is None or latest.total < pending):
+            raise PaidAdmissionError("voucher-missing")
 
     def _validate_scope(self, claim: dict, payer_keyid: str,
                         session_id: str) -> None:
@@ -898,6 +1001,8 @@ class PaidAdmission:
 
     def flush_outbox(self) -> int:
         """Replay every pending receipt; Neuron makes identical retries idempotent."""
+        if self.chain_mode:
+            return 0
         sent = 0
         with self._outbox_lock:
             for row in self.store.pending():

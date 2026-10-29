@@ -105,6 +105,9 @@ _INFO_ATTESTATION_DOMAIN = b"nakshatra-paid-info-v1\0"
 _INFO_CHALLENGE_BYTES = 32
 _PAY_CONTROL_REQUEST = b"nak-pay-control-v1"
 _PAY_CONTROL_OK = b"nak-pay-control-ok"
+_PAY_CONTROL_FINAL_REQUEST = b"nak-pay-final-request-v1"
+_PAY_CONTROL_FINAL_RECEIPT = b"nak-pay-final-receipt-v1"
+_PAY_FINAL_VOUCHER_WAIT_S = 15.0
 
 
 class AuthenticatedKeyId(str):
@@ -595,7 +598,7 @@ def validate_local_dev_fetch_policy(*, local_dev: bool, skip_sha256: bool,
             "localhost, or a literal loopback address")
 
 
-def _iter_with_idle_timeout(it, idle_seconds: float):
+def _iter_with_idle_timeout(it, idle_seconds):
     """Phase A2 — wrap a blocking iterator with a per-step idle deadline.
 
     Each next() yields the iterator's next item, or raises TimeoutError
@@ -622,11 +625,12 @@ def _iter_with_idle_timeout(it, idle_seconds: float):
     threading.Thread(target=pump, daemon=True).start()
 
     while True:
+        timeout = idle_seconds() if callable(idle_seconds) else idle_seconds
         try:
-            item = q.get(timeout=idle_seconds)
+            item = q.get(timeout=timeout)
         except queue.Empty:
             raise TimeoutError(
-                f"no step received in {idle_seconds}s (idle timeout)"
+                f"no step received in {timeout}s (idle timeout)"
             )
         if item is sentinel:
             return
@@ -2946,13 +2950,14 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
         paid_claim = None
         paid_session_lock = None
         paid_termination = "cancelled"
+        final_voucher_waiting = False
         paid_admission = getattr(self, "paid_admission", None)
         fabric_transport_enabled = getattr(
             self, "fabric_transport_enabled", False)
         try:
-            for step in _iter_with_idle_timeout(
-                request_iterator, INFERENCE_STREAM_IDLE_TIMEOUT_S
-            ):
+            for step in _iter_with_idle_timeout(request_iterator, lambda: (
+                    _PAY_FINAL_VOUCHER_WAIT_S if final_voucher_waiting
+                    else INFERENCE_STREAM_IDLE_TIMEOUT_S)):
                 # Phase B (2026-05-20): authenticate the first frame.
                 # Once the first frame's signature is accepted, gRPC
                 # stream identity binds subsequent frames to the same
@@ -3059,16 +3064,32 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                     )
                     return
                 if paid_claim is not None and step.HasField("error"):
-                    if (not paid_admission.chain_mode
-                            or step.error != _PAY_CONTROL_REQUEST):
+                    if not paid_admission.chain_mode:
                         raise _paid.PaidAdmissionError(
                             "invalid paid control frame")
-                    if not step.spend_claim_token:
+                    if step.error == _PAY_CONTROL_FINAL_REQUEST:
+                        final_wire = paid_admission.final_chain_receipt_wire(
+                            paid_claim, "normal")
+                        if not final_wire:
+                            raise _paid.PaidAdmissionError(
+                                "final receipt is unavailable")
+                        final_voucher_waiting = True
+                        yield pb.InferenceStep(
+                            session_id=step.session_id, step_id=step.step_id,
+                            spend_claim_token=final_wire,
+                            error=_PAY_CONTROL_FINAL_RECEIPT)
+                    elif step.error == _PAY_CONTROL_REQUEST:
+                        if not step.spend_claim_token:
+                            raise _paid.PaidAdmissionError(
+                                "voucher control frame has no voucher")
+                        paid_admission.require_chain_final_voucher(paid_claim)
+                        final_voucher_waiting = False
+                        yield pb.InferenceStep(
+                            session_id=step.session_id, step_id=step.step_id,
+                            error=_PAY_CONTROL_OK)
+                    else:
                         raise _paid.PaidAdmissionError(
-                            "voucher control frame has no voucher")
-                    yield pb.InferenceStep(
-                        session_id=step.session_id, step_id=step.step_id,
-                        error=_PAY_CONTROL_OK)
+                            "invalid paid control frame")
                     continue
                 # v0.5 M0.5.2: idempotency cache. If this (session_id, step_id) has
                 # been served before, return the cached response without touching
@@ -5168,12 +5189,15 @@ def main():
         else:
             try:
                 paid_store = _paid.PaidAdmissionStore(args.paid_store)
-                paid_ledger = _paid.SpendLedgerClient(
-                    args.paid_ledger_url,
-                    args.paid_ledger_spki_sha256,
-                    worker_priv,
-                    worker_pub_hex,
-                )
+                if os.environ.get("NAK_PAY_MODE", "") == "chain":
+                    paid_ledger = _paid.ChainLedgerGuard(worker_pub_hex)
+                else:
+                    paid_ledger = _paid.SpendLedgerClient(
+                        args.paid_ledger_url,
+                        args.paid_ledger_spki_sha256,
+                        worker_priv,
+                        worker_pub_hex,
+                    )
                 paid_admission = _paid.PaidAdmission(
                     paid_ledger, paid_store, worker_priv,
                     model_id=args.model_id,

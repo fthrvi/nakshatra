@@ -10,10 +10,13 @@ Paid inference reuses the existing ``InferenceStep.spend_claim_token`` string;
 protobuf and legacy wire bytes do not change.  Values beginning ``nakpay1.``
 are canonical compact JSON (the prefix is outside the JSON):
 
-* first payer -> worker frame::
+* first payer -> worker frame (the legacy token is an opaque correlation value
+  only in chain mode; the worker does not claim it from the credit ledger)::
 
     {"channel":"<base58>","channel_base":<u64>,"claim_token":"<opaque>",
-     "kind":"init","program":"<base58>","v":1}
+     "hold_id":"<scope>","kind":"init","max_output_tokens":<u64>,
+     "max_prompt_tokens":<u64>,"model_id":"<scope>",
+     "program":"<base58>","session_id":"<scope>","v":1}
 
 * checkpoint worker -> payer response::
 
@@ -27,9 +30,11 @@ are canonical compact JSON (the prefix is outside the JSON):
 
 The optional ``signer`` member is accepted for forward compatibility but is
 never trusted.  Verification uses only ``Channel.voucher_signer`` or the
-on-chain ``Escrow.owner``.  A final voucher with no following inference work is
-sent in an ``InferenceStep.error == b\"nak-pay-control-v1\"`` control frame;
-the worker responds with ``b\"nak-pay-control-ok\"`` and performs no compute.
+on-chain ``Escrow.owner``.  At normal completion, the consumer sends
+``nak-pay-final-request-v1``; the worker returns its final receipt as
+``nak-pay-final-receipt-v1`` and waits at most one 15-second checkpoint interval
+for the covering ``nak-pay-control-v1`` voucher.  Control frames perform no
+compute.
 All of these shapes are active only when ``NAK_PAY_MODE`` is exactly ``chain``.
 """
 from __future__ import annotations
@@ -44,6 +49,7 @@ import stat
 import struct
 import threading
 import urllib.request
+import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping, Protocol
@@ -58,6 +64,10 @@ RATE = 100
 WIRE_PREFIX = "nakpay1."
 CONTROL_REQUEST = b"nak-pay-control-v1"
 CONTROL_OK = b"nak-pay-control-ok"
+CONTROL_FINAL_REQUEST = b"nak-pay-final-request-v1"
+CONTROL_FINAL_RECEIPT = b"nak-pay-final-receipt-v1"
+DEVNET_GENESIS_HASH = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG"
+MAINNET_GENESIS_HASH = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d"
 _B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 _B58_INDEX = {char: index for index, char in enumerate(_B58)}
 _CHANNEL_DISCRIMINATOR = hashlib.sha256(b"account:Channel").digest()[:8]
@@ -287,7 +297,7 @@ class FakeChannelState:
 
 
 class JsonRpcChannelState:
-    """Finalized ``getAccountInfo`` reader with strict program-owner checks."""
+    """Devnet/local ``getAccountInfo`` reader with strict owner checks."""
 
     def __init__(self, rpc_url: str, *, timeout: float = 5.0,
                  opener: Callable = urllib.request.urlopen):
@@ -298,26 +308,66 @@ class JsonRpcChannelState:
         self.opener = opener
         self._request_id = 0
         self._lock = threading.Lock()
+        self._cluster_checked = False
 
-    def _account(self, address: str, program_id: str) -> bytes:
-        address = _pubkey_text(address, "account address")
-        program_id = _pubkey_text(program_id, "program id")
+    def _rpc(self, method: str, params: list[object]) -> object:
         with self._lock:
             self._request_id += 1
             request_id = self._request_id
         body = json.dumps({
-            "jsonrpc": "2.0", "id": request_id, "method": "getAccountInfo",
-            "params": [address, {"commitment": "finalized", "encoding": "base64"}],
+            "jsonrpc": "2.0", "id": request_id, "method": method,
+            "params": params,
         }, separators=(",", ":")).encode("ascii")
         request = urllib.request.Request(
             self.rpc_url, data=body, method="POST",
             headers={"Content-Type": "application/json"})
         try:
             with self.opener(request, timeout=self.timeout) as response:
-                result = json.loads(response.read())
-            value = result["result"]["value"]
+                decoded = json.loads(response.read())
+            if (not isinstance(decoded, dict)
+                    or decoded.get("jsonrpc") != "2.0"
+                    or decoded.get("id") != request_id
+                    or set(decoded) != {"jsonrpc", "id", "result"}):
+                raise VoucherError(f"Solana RPC returned malformed {method} response")
+            return decoded["result"]
+        except VoucherError:
+            raise
+        except Exception as exc:
+            raise VoucherError(
+                f"Solana RPC {method} failed ({type(exc).__name__})") from exc
+
+    def _ensure_cluster(self) -> None:
+        with self._lock:
+            if self._cluster_checked:
+                return
+        genesis = self._rpc("getGenesisHash", [])
+        if not isinstance(genesis, str) or not genesis:
+            raise VoucherError("Solana RPC returned malformed getGenesisHash response")
+        host = (urllib.parse.urlsplit(self.rpc_url).hostname or "").lower()
+        local = host == "localhost" or host == "127.0.0.1" or host == "::1"
+        if genesis == MAINNET_GENESIS_HASH:
+            raise VoucherError("Solana mainnet RPC is forbidden for Nakshatra payments")
+        if genesis != DEVNET_GENESIS_HASH and not local:
+            raise VoucherError(
+                "Solana RPC cluster is neither devnet nor a loopback test validator")
+        with self._lock:
+            self._cluster_checked = True
+
+    def _account(self, address: str, program_id: str) -> bytes:
+        self._ensure_cluster()
+        address = _pubkey_text(address, "account address")
+        program_id = _pubkey_text(program_id, "program id")
+        try:
+            result = self._rpc("getAccountInfo", [
+                address, {"commitment": "finalized", "encoding": "base64"},
+            ])
+            if not isinstance(result, dict) or set(result) != {"value"}:
+                raise VoucherError("RPC returned a malformed account result")
+            value = result["value"]
             if value is None:
                 raise VoucherError(f"account does not exist: {address}")
+            if not isinstance(value, dict):
+                raise VoucherError("RPC returned a malformed account value")
             if value["owner"] != program_id:
                 raise VoucherError("account is not owned by the configured program")
             encoded = value["data"]
@@ -609,12 +659,18 @@ def parse_wire(value: str) -> dict:
 
 
 def init_wire(claim_token: str, *, program: str, channel: str,
-              channel_base: int) -> str:
+              channel_base: int, hold_id: str, session_id: str,
+              model_id: str, max_prompt_tokens: int,
+              max_output_tokens: int) -> str:
     return _wire({
         "v": 1, "kind": "init", "claim_token": str(claim_token),
         "program": _pubkey_text(program, "program id"),
         "channel": _pubkey_text(channel, "channel"),
         "channel_base": _u64(channel_base, "channel base"),
+        "hold_id": str(hold_id), "session_id": str(session_id),
+        "model_id": str(model_id),
+        "max_prompt_tokens": _u64(max_prompt_tokens, "maximum prompt tokens"),
+        "max_output_tokens": _u64(max_output_tokens, "maximum output tokens"),
     })
 
 
@@ -651,7 +707,9 @@ class ConsumerVoucherManager:
                  program: str, private_key: bytes, plan: list[Mapping[str, object]],
                  max_cost_by_worker: Mapping[str, int],
                  session_id: str | None = None, hold_id: str | None = None,
-                 model_id: str | None = None):
+                 model_id: str | None = None,
+                 max_prompt_tokens: int | None = None,
+                 max_output_tokens: int | None = None):
         self.book = book
         self.state = state
         self.program = _pubkey_text(program, "program id")
@@ -659,6 +717,8 @@ class ConsumerVoucherManager:
         self.session_id = session_id
         self.hold_id = hold_id
         self.model_id = model_id
+        self.max_prompt_tokens = max_prompt_tokens
+        self.max_output_tokens = max_output_tokens
         self.channels: dict[str, PayerChannel] = {}
         self.plan = {str(stage["worker_keyid"]): dict(stage) for stage in plan}
         self.receipts: dict[str, list[dict]] = {key: [] for key in self.plan}
@@ -678,8 +738,15 @@ class ConsumerVoucherManager:
 
     def first_wire(self, worker_key: str, claim_token: str) -> str:
         channel = self.channels[worker_key]
+        if (self.session_id is None or self.hold_id is None or self.model_id is None
+                or self.max_prompt_tokens is None or self.max_output_tokens is None):
+            raise VoucherError("chain session scope is incomplete")
         return init_wire(claim_token, program=self.program, channel=channel.channel,
-                         channel_base=channel.channel_base)
+                         channel_base=channel.channel_base,
+                         hold_id=self.hold_id, session_id=self.session_id,
+                         model_id=self.model_id,
+                         max_prompt_tokens=self.max_prompt_tokens,
+                         max_output_tokens=self.max_output_tokens)
 
     def outgoing(self, worker_key: str) -> str:
         return self.pending.get(worker_key, "")

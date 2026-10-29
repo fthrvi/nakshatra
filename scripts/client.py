@@ -1993,7 +1993,9 @@ def main():
                 book=book, state=state, program=program, private_key=private_key,
                 plan=paid["plan"], max_cost_by_worker=max_costs,
                 session_id=paid["session_id"], hold_id=paid["hold_id"],
-                model_id=paid["model_id"])
+                model_id=paid["model_id"],
+                max_prompt_tokens=paid["max_prompt_tokens"],
+                max_output_tokens=paid["max_output_tokens"])
         except Exception as exc:
             sys.exit(f"[paid] chain voucher admission refused: {exc}")
 
@@ -2552,27 +2554,48 @@ def main():
             restart_requested = True
             # streams are closed at the top of the next iteration
 
-    # Successful exit from the recovery loop.  A checkpoint on the last
-    # generated token has no following inference request, so return its voucher
-    # in a control-only frame before closing each stream.
+    # Successful exit from the recovery loop.  Ask each worker to commit and
+    # present its true final cumulative receipt while the stream is still open,
+    # then return the covering voucher before closing it.
     if chain_vouchers is not None:
         for idx, (worker, _stub, _info) in enumerate(sorted_stubs):
             worker_key = paid_client.worker_keyid(worker)
-            value = chain_vouchers.outgoing(worker_key)
-            if not value:
-                continue
-            control = pb.InferenceStep(
+            prior_voucher = chain_vouchers.outgoing(worker_key)
+            request = pb.InferenceStep(
                 session_id=session_id,
-                step_id=f"voucher-final-{idx}",
+                step_id=f"voucher-final-request-{idx}",
                 prefix_length=prefix_length,
-                spend_claim_token=value,
-                error=b"nak-pay-control-v1",
+                spend_claim_token=prior_voucher,
+                error=pay_voucher.CONTROL_FINAL_REQUEST,
             )
-            response = streamers[idx].step(control)
-            if not response.HasField("error") or response.error != b"nak-pay-control-ok":
+            response = streamers[idx].step(request)
+            if prior_voucher:
+                chain_vouchers.mark_sent(worker_key, prior_voucher)
+            if (not response.HasField("error")
+                    or response.error != pay_voucher.CONTROL_FINAL_RECEIPT
+                    or not response.spend_claim_token):
                 raise paid_client.PaidAdmissionError(
-                    f"worker {worker_key[:12]} refused final voucher control")
-            chain_vouchers.mark_sent(worker_key, value)
+                    f"worker {worker_key[:12]} did not return a final receipt")
+            chain_vouchers.observe(worker_key, response.spend_claim_token)
+            chain_vouchers.acknowledge_delivery(
+                prompt_tokens=len(tokens), generated_tokens=len(generated))
+            final_voucher = chain_vouchers.outgoing(worker_key)
+            if not final_voucher:
+                raise paid_client.PaidAdmissionError(
+                    f"worker {worker_key[:12]} final receipt produced no voucher")
+            ack = pb.InferenceStep(
+                session_id=session_id,
+                step_id=f"voucher-final-ack-{idx}",
+                prefix_length=prefix_length,
+                spend_claim_token=final_voucher,
+                error=pay_voucher.CONTROL_REQUEST,
+            )
+            acknowledged = streamers[idx].step(ack)
+            if (not acknowledged.HasField("error")
+                    or acknowledged.error != pay_voucher.CONTROL_OK):
+                raise paid_client.PaidAdmissionError(
+                    f"worker {worker_key[:12]} refused the final voucher")
+            chain_vouchers.mark_sent(worker_key, final_voucher)
 
     for s in streamers:
         s.close()
