@@ -526,9 +526,10 @@ def decode_escrow(data: bytes) -> dict:
         raise ValueError("invalid pending withdrawal option")
     rent_payer = b58encode(raw[offset:offset + 32]); offset += 32
     bump, vault_bump = raw[offset:offset + 2]
-    offset += 2
-    if any(raw[offset:]):
-        raise ValueError("Escrow account has nonzero trailing bytes")
+    # Anchor serializes Option::None more narrowly than Option::Some and does
+    # not clear the fixed-size account tail when a pending withdrawal is
+    # executed.  The discriminator, exact account size, and option tag above
+    # remain authoritative; bytes after the active None layout are stale.
     return {"owner": owner, "vault": vault, "committed": committed,
             "open_channels": open_channels, "open_tasks": open_tasks,
             "channel_seq": channel_seq, "task_seq": task_seq, "generation": generation,

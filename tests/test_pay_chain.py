@@ -172,6 +172,29 @@ def _delegate_data(escrow: str, key: str, *, expires: int) -> bytes:
     return bytes(raw)
 
 
+def test_decode_escrow_accepts_stale_some_payload_after_pending_is_cleared():
+    owner = pay_chain.b58encode(bytes(range(32)))
+    vault = pay_chain.b58encode(bytes(range(1, 33)))
+    raw = bytearray(_escrow_data(owner, vault))
+    raw[147:163] = bytes(range(1, 17))
+
+    decoded = pay_chain.decode_escrow(bytes(raw))
+
+    assert decoded["owner"] == owner
+    assert decoded["vault"] == vault
+    assert decoded["pending_withdraw"] is None
+
+
+def test_decode_escrow_rejects_invalid_pending_option_tag():
+    owner = pay_chain.b58encode(bytes(range(32)))
+    vault = pay_chain.b58encode(bytes(range(1, 33)))
+    raw = bytearray(_escrow_data(owner, vault))
+    raw[112] = 2
+
+    with pytest.raises(ValueError, match="invalid pending withdrawal option"):
+        pay_chain.decode_escrow(bytes(raw))
+
+
 class FakeRpc:
     def __init__(self, *, genesis="local-test", balance=100_000_000):
         self.genesis = genesis
