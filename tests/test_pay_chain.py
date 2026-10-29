@@ -184,6 +184,43 @@ def test_chain_time_uses_finalized_slot_and_validates_block_time(monkeypatch):
         rpc.chain_time()
 
 
+def test_rpc_read_helpers_accept_explicit_finalized_commitment(monkeypatch):
+    rpc = pay_chain.PayRpc("http://127.0.0.1:1")
+    payer = pay_chain.b58encode(bytes(range(64, 96)))
+    monkeypatch.setattr(rpc, "_ensure_cluster", lambda: None)
+    calls = []
+
+    def fake_rpc(method, params):
+        calls.append((method, params))
+        if method == "getAccountInfo":
+            return {"context": {"slot": 1}, "value": {
+                "owner": PROGRAM, "data": ["", "base64"], "space": 0}}
+        if method == "getBalance":
+            return {"context": {"slot": 1}, "value": 7}
+        if method == "getLatestBlockhash":
+            return {"context": {"slot": 1}, "value": {
+                "blockhash": BLOCKHASH, "lastValidBlockHeight": 44}}
+        if method == "getBlockHeight":
+            return 33
+        if method == "getSignatureStatuses":
+            return {"value": [{"err": None, "confirmationStatus": "finalized"}]}
+        raise AssertionError(method)
+
+    monkeypatch.setattr(rpc, "_rpc", fake_rpc)
+    assert rpc.account_info(payer, commitment="finalized")["data"] == b""
+    assert rpc.balance(payer, commitment="finalized") == 7
+    assert rpc.latest_blockhash_info(commitment="finalized") == {
+        "blockhash": BLOCKHASH, "lastValidBlockHeight": 44}
+    assert rpc.block_height(commitment="finalized") == 33
+    assert rpc.signature_status(pay_chain.b58encode(b"s" * 64))["err"] is None
+    assert calls[:4] == [
+        ("getAccountInfo", [payer, {"commitment": "finalized", "encoding": "base64"}]),
+        ("getBalance", [payer, {"commitment": "finalized"}]),
+        ("getLatestBlockhash", [{"commitment": "finalized"}]),
+        ("getBlockHeight", [{"commitment": "finalized"}]),
+    ]
+
+
 def test_all_builders_match_neuron_and_solders_byte_for_byte():
     python = Path("/home/prithvi/.cache/nak-solana/venv-chain/bin/python")
     if not python.exists():

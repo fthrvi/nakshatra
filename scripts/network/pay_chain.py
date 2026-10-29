@@ -440,11 +440,11 @@ class PayRpc(JsonRpcChannelState):
             raise VoucherError("RPC returned an invalid finalized block time")
         return timestamp
 
-    def account_info(self, address: object) -> dict | None:
+    def account_info(self, address: object, *, commitment: str = "confirmed") -> dict | None:
         self._ensure_cluster()
         key = pubkey_text(address, "account address")
         result = self._rpc("getAccountInfo", [
-            key, {"commitment": "confirmed", "encoding": "base64"},
+            key, {"commitment": str(commitment), "encoding": "base64"},
         ])
         if not isinstance(result, dict) or not isinstance(result.get("context"), dict):
             raise VoucherError("RPC returned a malformed account result")
@@ -526,34 +526,67 @@ class PayRpc(JsonRpcChannelState):
         return self._delegates_filtered(
             program_id, offset=DELEGATE_ESCROW_OFFSET, value=escrow)
 
-    def balance(self, address: object) -> int:
+    def balance(self, address: object, *, commitment: str = "confirmed") -> int:
         self._ensure_cluster()
-        result = self._rpc("getBalance", [pubkey_text(address), {"commitment": "confirmed"}])
+        result = self._rpc(
+            "getBalance", [pubkey_text(address), {"commitment": str(commitment)}])
         value = result.get("value") if isinstance(result, dict) else None
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise VoucherError("RPC returned an invalid lamport balance")
         return value
 
-    def latest_blockhash(self) -> str:
+    def latest_blockhash_info(self, *, commitment: str = "confirmed") -> dict:
         self._ensure_cluster()
-        result = self._rpc("getLatestBlockhash", [{"commitment": "confirmed"}])
+        result = self._rpc("getLatestBlockhash", [{"commitment": str(commitment)}])
         value = result.get("value") if isinstance(result, dict) else None
         blockhash = value.get("blockhash") if isinstance(value, dict) else None
+        last_valid = value.get("lastValidBlockHeight") if isinstance(value, dict) else None
         if not isinstance(blockhash, str) or len(pubkey_bytes(blockhash, "recent blockhash")) != 32:
             raise VoucherError("RPC returned an invalid recent blockhash")
-        return blockhash
+        if isinstance(last_valid, bool) or not isinstance(last_valid, int) or last_valid < 0:
+            raise VoucherError("RPC returned an invalid lastValidBlockHeight")
+        return {"blockhash": blockhash, "lastValidBlockHeight": last_valid}
 
-    def rent_exemption(self, space: int) -> int:
+    def latest_blockhash(self, *, commitment: str = "confirmed") -> str:
+        return self.latest_blockhash_info(commitment=commitment)["blockhash"]
+
+    def block_height(self, *, commitment: str = "finalized") -> int:
         self._ensure_cluster()
-        result = self._rpc("getMinimumBalanceForRentExemption", [int(space), {"commitment": "confirmed"}])
+        height = self._rpc("getBlockHeight", [{"commitment": str(commitment)}])
+        if isinstance(height, bool) or not isinstance(height, int) or height < 0:
+            raise VoucherError("RPC returned an invalid block height")
+        return height
+
+    def signature_status(self, signature: str) -> dict | None:
+        self._ensure_cluster()
+        result = self._rpc(
+            "getSignatureStatuses", [[str(signature)], {"searchTransactionHistory": True}])
+        values = result.get("value") if isinstance(result, dict) else None
+        if not isinstance(values, list) or len(values) != 1:
+            raise VoucherError("RPC returned malformed signature status")
+        status = values[0]
+        if status is None:
+            return None
+        if not isinstance(status, dict):
+            raise VoucherError("RPC returned malformed signature status")
+        confirmation = status.get("confirmationStatus")
+        if confirmation not in {"processed", "confirmed", "finalized"}:
+            raise VoucherError("RPC returned malformed signature confirmation status")
+        return status
+
+    def rent_exemption(self, space: int, *, commitment: str = "confirmed") -> int:
+        self._ensure_cluster()
+        result = self._rpc("getMinimumBalanceForRentExemption", [
+            int(space), {"commitment": str(commitment)},
+        ])
         if isinstance(result, bool) or not isinstance(result, int) or result < 0:
             raise VoucherError("RPC returned an invalid rent exemption")
         return result
 
-    def fee_for_message(self, message: bytes) -> int:
+    def fee_for_message(self, message: bytes, *, commitment: str = "confirmed") -> int:
         self._ensure_cluster()
         result = self._rpc("getFeeForMessage", [
-            base64.b64encode(message).decode("ascii"), {"commitment": "confirmed"},
+            base64.b64encode(message).decode("ascii"), {"commitment": str(commitment)},
         ])
         value = result.get("value") if isinstance(result, dict) else None
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:

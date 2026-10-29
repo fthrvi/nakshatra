@@ -1184,8 +1184,57 @@ class Node:
             derived["escrow"], node_public, program)[0]
 
         with pay_autochannel.pay_lock():
+            # The process-local starter lock cannot serialize other daemon processes.  Re-read
+            # after taking the host-wide flock and make every chain decision from this row.
+            fresh_rows = [item for item in self.store.starter_rows()
+                          if item["invite_id"] == row["invite_id"]]
+            if fresh_rows:
+                row = fresh_rows[0]
+            if row.get("state") == "paid" and isinstance(row.get("receipt"), dict):
+                return row["receipt"]
+
             chain_now = rpc.chain_time()
-            escrow_info = rpc.account_info(derived["escrow"])
+            attempts = [dict(item) for item in (row.get("chain_attempts") or [])]
+            attempts_changed = False
+            unresolved = False
+            finalized_height = None
+            for attempt in attempts:
+                if attempt.get("resolution") in {"failed", "expired"}:
+                    continue
+                status = rpc.signature_status(attempt["signature"])
+                if status is not None and status.get("confirmationStatus") == "finalized":
+                    if status.get("err") is None:
+                        return {
+                            "v": 1, "kind": "chain-starter",
+                            "signature": attempt["signature"],
+                            "escrow": attempt["escrow"], "delegate": attempt["delegate"],
+                            "cap": int(attempt["cap_total"]),
+                            "expires_at": int(attempt["expires_at"]),
+                            "sol_lamports": int(attempt["sol_lamports"]),
+                            "ts": chain_now, "existing": True,
+                        }
+                    attempt["resolution"] = "failed"
+                    attempt["error"] = str(status.get("err"))[:200]
+                    attempts_changed = True
+                    continue
+                if status is not None:
+                    unresolved = True
+                    continue
+                if finalized_height is None:
+                    finalized_height = rpc.block_height(commitment="finalized")
+                if finalized_height <= int(attempt["last_valid_block_height"]):
+                    unresolved = True
+                else:
+                    attempt["resolution"] = "expired"
+                    attempts_changed = True
+            if attempts_changed:
+                self.store.starter_update(
+                    row["invite_id"], chain_attempts=attempts, updated=chain_now)
+                row["chain_attempts"] = attempts
+            if unresolved:
+                raise pay_chain.VoucherError("previous starter transaction still unresolved")
+
+            escrow_info = rpc.account_info(derived["escrow"], commitment="finalized")
             if escrow_info is None:
                 raise ValueError("inviter escrow does not exist; run `nak pay ensure`")
             if escrow_info["owner"] != program:
@@ -1194,7 +1243,7 @@ class Node:
             if escrow["owner"] != owner or escrow["vault"] != derived["vault"]:
                 raise ValueError("inviter escrow does not match the file-custody wallet")
 
-            delegate_info = rpc.account_info(delegate_address)
+            delegate_info = rpc.account_info(delegate_address, commitment="finalized")
             delegate = None
             if delegate_info is not None:
                 if delegate_info["owner"] != program:
@@ -1221,7 +1270,7 @@ class Node:
                 if delegate["disabled"] and delegate["generation"] == escrow["generation"]:
                     raise ValueError("existing starter delegate is disabled and cannot be renewed")
 
-            vault_info = rpc.account_info(derived["vault"])
+            vault_info = rpc.account_info(derived["vault"], commitment="finalized")
             if vault_info is None or vault_info["owner"] != pay_chain.TOKEN_PROGRAM_ID:
                 raise ValueError("inviter escrow vault is missing or invalid")
             available = max(0, pay_chain.token_amount(vault_info["data"]) - escrow["committed"])
@@ -1241,21 +1290,20 @@ class Node:
             instructions = pay_chain.delegate_set(
                 owner, node_public, set_cap, expires_at,
                 pay_chain.DELEGATE_OPEN_CHANNEL, program)
-            node_balance = rpc.balance(node_address)
+            node_balance = rpc.balance(node_address, commitment="finalized")
             top_up = max(0, STARTER_NODE_SOL - node_balance)
-            # A prior durable intent fences a second transfer after a crash or unknown outcome.
-            if int(row.get("sol_lamports") or 0):
-                top_up = 0
             if top_up:
                 instructions.append(pay_chain.system_transfer(owner, node_address, top_up))
 
-            blockhash = rpc.latest_blockhash()
+            blockhash_info = rpc.latest_blockhash_info(commitment="finalized")
+            blockhash = blockhash_info["blockhash"]
             message = pay_chain.compile_message(instructions, owner, blockhash)
-            fee = rpc.fee_for_message(message.data)
-            delegate_rent = (rpc.rent_exemption(pay_chain.DELEGATE_ACCOUNT_SPACE)
+            fee = rpc.fee_for_message(message.data, commitment="finalized")
+            delegate_rent = (rpc.rent_exemption(
+                pay_chain.DELEGATE_ACCOUNT_SPACE, commitment="finalized")
                              if delegate_info is None else 0)
             needed = delegate_rent + top_up + fee
-            wallet_balance = rpc.balance(owner)
+            wallet_balance = rpc.balance(owner, commitment="finalized")
             if wallet_balance < needed:
                 raise ValueError(
                     f"wallet lacks SOL for starter delegate rent, top-up, and fee "
@@ -1263,18 +1311,36 @@ class Node:
 
             transaction = pay_chain.sign_transaction(
                 instructions, owner, blockhash, {owner: wallet["seed"]})
-            if top_up:
-                self.store.starter_update(
-                    row["invite_id"], sol_lamports=top_up, updated=chain_now)
-                row["sol_lamports"] = top_up
+            attempt = {
+                "signature": transaction.signature,
+                "blockhash": blockhash,
+                "last_valid_block_height": int(blockhash_info["lastValidBlockHeight"]),
+                "cap_total": set_cap,
+                "sol_lamports": top_up,
+                "expires_at": expires_at,
+                "escrow": derived["escrow"],
+                "delegate": delegate_address,
+            }
+            attempts.append(attempt)
+            # The complete signed intent is durable before sendTransaction.  A crash here leaves
+            # an unbroadcast signature that must age past its last valid block height before retry.
+            self.store.starter_update(
+                row["invite_id"], chain_attempts=attempts,
+                sol_lamports=top_up, chain_signature=transaction.signature,
+                updated=chain_now)
+            row["chain_attempts"] = attempts
+            row["sol_lamports"] = top_up
+            row["chain_signature"] = transaction.signature
 
-            def sent(signature: str) -> None:
+            try:
+                signature = rpc.send_and_confirm(transaction)
+            except pay_chain.TransactionDefiniteFailure as exc:
+                attempt["resolution"] = "failed"
+                attempt["error"] = str(exc)[:200]
                 self.store.starter_update(
-                    row["invite_id"], chain_signature=signature, updated=chain_now)
-                row["chain_signature"] = signature
-
-            signature = rpc.send_and_confirm(transaction, on_sent=sent)
-            final_info = rpc.account_info(delegate_address)
+                    row["invite_id"], chain_attempts=attempts, updated=chain_now)
+                raise
+            final_info = rpc.account_info(delegate_address, commitment="finalized")
             if final_info is None or final_info["owner"] != program:
                 raise pay_chain.VoucherError("finalized starter delegate is not visible")
             final = pay_chain.decode_delegate(final_info["data"])
@@ -1288,7 +1354,7 @@ class Node:
                 "v": 1, "kind": "chain-starter", "signature": signature,
                 "escrow": derived["escrow"], "delegate": delegate_address,
                 "cap": final["cap_total"], "expires_at": final["expires_at"],
-                "sol_lamports": row["sol_lamports"], "ts": chain_now,
+                "sol_lamports": top_up, "ts": chain_now,
                 "existing": False,
             }
 

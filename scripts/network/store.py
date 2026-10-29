@@ -56,7 +56,8 @@ CREATE TABLE IF NOT EXISTS starter_obligations (invite_id TEXT PRIMARY KEY, pers
     to_keyid TEXT, amount INTEGER NOT NULL, signed_invite TEXT NOT NULL, state TEXT NOT NULL,
     reason TEXT, created INTEGER NOT NULL, updated INTEGER NOT NULL, next_attempt INTEGER NOT NULL,
     attempts INTEGER NOT NULL DEFAULT 0, approved INTEGER NOT NULL DEFAULT 0, paid_at INTEGER,
-    receipt TEXT, sol_lamports INTEGER NOT NULL DEFAULT 0, chain_signature TEXT NOT NULL DEFAULT '');
+    receipt TEXT, sol_lamports INTEGER NOT NULL DEFAULT 0, chain_signature TEXT NOT NULL DEFAULT '',
+    chain_attempts TEXT NOT NULL DEFAULT '[]', chain_created INTEGER);
 CREATE TABLE IF NOT EXISTS address_state (slot INTEGER PRIMARY KEY CHECK(slot=1), code TEXT NOT NULL,
     aid TEXT NOT NULL, ik TEXT NOT NULL, expires_at INTEGER NOT NULL, created INTEGER NOT NULL,
     enabled INTEGER NOT NULL, install_line TEXT NOT NULL);
@@ -223,7 +224,9 @@ class Store:
         except sqlite3.OperationalError:
             pass
         for column in ("sol_lamports INTEGER NOT NULL DEFAULT 0",
-                       "chain_signature TEXT NOT NULL DEFAULT ''"):
+                       "chain_signature TEXT NOT NULL DEFAULT ''",
+                       "chain_attempts TEXT NOT NULL DEFAULT '[]'",
+                       "chain_created INTEGER"):
             try:
                 self._db.execute(f"ALTER TABLE starter_obligations ADD COLUMN {column}")
             except sqlite3.OperationalError:
@@ -869,7 +872,7 @@ class Store:
     def starter_rows(self, states: Optional[tuple[str, ...]] = None) -> list[dict]:
         columns = ("invite_id", "person", "to_keyid", "amount", "signed_invite", "state", "reason",
                    "created", "updated", "next_attempt", "attempts", "approved", "paid_at", "receipt",
-                   "sol_lamports", "chain_signature")
+                   "sol_lamports", "chain_signature", "chain_attempts", "chain_created")
         sql, args = "SELECT " + ",".join(columns) + " FROM starter_obligations", ()
         if states:
             sql += " WHERE state IN (" + ",".join("?" for _ in states) + ")"
@@ -884,16 +887,27 @@ class Store:
                 row["receipt"] = json.loads(row["receipt"])
             row["approved"] = int(row["approved"] or 0)
             row["sol_lamports"] = int(row["sol_lamports"] or 0)
+            try:
+                row["chain_attempts"] = json.loads(row["chain_attempts"] or "[]")
+            except (TypeError, ValueError) as exc:
+                raise ValueError("invalid stored starter chain attempts") from exc
+            if not isinstance(row["chain_attempts"], list):
+                raise ValueError("invalid stored starter chain attempts")
+            row["chain_created"] = (None if row["chain_created"] is None
+                                    else int(row["chain_created"]))
             rows.append(row)
         return rows
 
     def starter_update(self, invite_id: str, **changes) -> bool:
         allowed = {"state", "reason", "updated", "next_attempt", "attempts", "approved", "paid_at",
-                   "receipt", "sol_lamports", "chain_signature"}
+                   "receipt", "sol_lamports", "chain_signature", "chain_attempts", "chain_created"}
         if not changes or set(changes) - allowed:
             raise ValueError("invalid starter obligation update")
         pk = self._pk((invite_id,))
         values = dict(changes)
+        if "chain_attempts" in values:
+            values["chain_attempts"] = json.dumps(
+                values["chain_attempts"], sort_keys=True, separators=(",", ":"))
         for column in ("reason", "receipt"):
             if column in values:
                 value = values[column]
