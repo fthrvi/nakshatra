@@ -322,6 +322,15 @@ class FakeChannelState:
 
 
 _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # A redirect could move a verified https:// endpoint to plaintext or another host.
+        raise VoucherError("Solana RPC redirects are refused")
+
+
+_RPC_OPENER = urllib.request.build_opener(_RefuseRedirect)
 RPC_RESPONSE_MAX = 1 << 20  # a Channel/Escrow account reply is a few KiB
 
 
@@ -329,7 +338,7 @@ class JsonRpcChannelState:
     """Devnet/local ``getAccountInfo`` reader with strict owner checks."""
 
     def __init__(self, rpc_url: str, *, timeout: float = 5.0,
-                 opener: Callable = urllib.request.urlopen):
+                 opener: Callable = _RPC_OPENER.open):
         if not isinstance(rpc_url, str) or not rpc_url:
             raise VoucherError("Solana RPC URL is required")
         parts = urllib.parse.urlsplit(rpc_url)

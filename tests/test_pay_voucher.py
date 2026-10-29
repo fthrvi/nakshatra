@@ -1174,3 +1174,38 @@ def test_rpc_oversized_response_fails_closed():
     with pytest.raises(pay.VoucherError, match="too large"):
         state.read_channel(CHANNEL, PROGRAM)
     assert body.asked == pay.RPC_RESPONSE_MAX + 1
+
+
+def test_first_step_prefill_longer_than_a_checkpoint_is_admitted(tmp_path, monkeypatch):
+    manager, consumer, claim, worker_vouchers, _ledger = _chain_admission(
+        tmp_path, monkeypatch, session="prefill")
+    # A 100-token prompt on a 4-layer stage is 404 credits before any receipt can exist.
+    manager.require_chain_voucher_before_step(claim, 100, 1)
+    consumer.book.close()
+    manager.store.close()
+    worker_vouchers.close()
+
+
+def test_rpc_refuses_redirects():
+    class Redirect(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            self.send_response(302)
+            self.send_header("Location", "http://198.51.100.7:8899/")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, _format, *_args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Redirect)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        state = pay.JsonRpcChannelState(
+            f"http://127.0.0.1:{server.server_port}", timeout=2)
+        with pytest.raises(pay.VoucherError, match="redirects are refused"):
+            state.read_channel(CHANNEL, PROGRAM)
+    finally:
+        server.shutdown()
+        server.server_close()
