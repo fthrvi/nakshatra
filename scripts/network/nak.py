@@ -1134,29 +1134,91 @@ def _pay_status(wallet: dict) -> None:
         escrow_info = rpc.account_info(d["escrow"])
         if escrow_info is None:
             print("escrow: not initialized")
-            return
-        if escrow_info["owner"] != program:
-            raise SystemExit("escrow address exists but is not owned by NAK_PAY_PROGRAM")
-        escrow = chain.decode_escrow(escrow_info["data"])
-        vault_info = rpc.account_info(escrow["vault"])
-        if vault_info is None:
-            raise SystemExit("escrow exists but its canonical vault is missing")
-        if vault_info["owner"] != chain.TOKEN_PROGRAM_ID:
-            raise SystemExit("escrow vault is not owned by the classic SPL Token program")
-        balance = chain.token_amount(vault_info["data"])
-        print(f"escrow balance: {_pay_amount(balance)} USDC")
-        _warn_unbacked_pay_balance(balance)
-        print(f"escrow committed: {_pay_amount(escrow['committed'])} USDC")
-        delegate_address = chain.delegate_pda(d["escrow"], bytes.fromhex(node_hex), program)[0]
-        delegate_info = rpc.account_info(delegate_address)
-        if delegate_info is None:
-            print("delegate: not configured")
         else:
-            delegate = chain.decode_delegate(delegate_info["data"])
-            print(f"delegate cap: {_pay_amount(delegate['cap_total'])} USDC")
-            print(f"delegate expires: {delegate['expires_at']}")
+            if escrow_info["owner"] != program:
+                raise SystemExit("escrow address exists but is not owned by NAK_PAY_PROGRAM")
+            escrow = chain.decode_escrow(escrow_info["data"])
+            vault_info = rpc.account_info(escrow["vault"])
+            if vault_info is None:
+                raise SystemExit("escrow exists but its canonical vault is missing")
+            if vault_info["owner"] != chain.TOKEN_PROGRAM_ID:
+                raise SystemExit("escrow vault is not owned by the classic SPL Token program")
+            balance = chain.token_amount(vault_info["data"])
+            print(f"escrow balance: {_pay_amount(balance)} USDC")
+            _warn_unbacked_pay_balance(balance)
+            print(f"escrow committed: {_pay_amount(escrow['committed'])} USDC")
+            delegate_address = chain.delegate_pda(d["escrow"], bytes.fromhex(node_hex), program)[0]
+            delegate_info = rpc.account_info(delegate_address)
+            if delegate_info is None:
+                print("delegate: not configured")
+            else:
+                delegate = chain.decode_delegate(delegate_info["data"])
+                print(f"delegate cap: {_pay_amount(delegate['cap_total'])} USDC")
+                print(f"delegate expires: {delegate['expires_at']}")
+
+        node_address = chain.b58encode(bytes.fromhex(node_hex))
+        chain_now = rpc.chain_time()
+        shown = 0
+        for starter in sorted(
+                rpc.delegates_for_key(bytes.fromhex(node_hex), program),
+                key=lambda row: (row["expires_at"], row["address"])):
+            if starter["escrow"] == d["escrow"] or starter["key"] != node_address:
+                continue
+            if (starter["disabled"] or starter["expires_at"] <= chain_now
+                    or not starter["flags"] & chain.DELEGATE_OPEN_CHANNEL):
+                continue
+            source_info = rpc.account_info(starter["escrow"])
+            if source_info is None or source_info["owner"] != program:
+                raise SystemExit("starter delegate names a missing or invalid escrow")
+            source = chain.decode_escrow(source_info["data"])
+            if source["generation"] != starter["generation"]:
+                continue
+            vault_info = rpc.account_info(source["vault"])
+            if vault_info is None or vault_info["owner"] != chain.TOKEN_PROGRAM_ID:
+                raise SystemExit("starter escrow names a missing or invalid vault")
+            remaining = min(
+                max(0, starter["cap_total"] - starter["spent"]),
+                max(0, chain.token_amount(vault_info["data"]) - source["committed"]))
+            if remaining <= 0:
+                continue
+            print(f"starter escrow: {source['owner'][:12]}  remaining "
+                  f"{_pay_amount(remaining)} USDC  expires {starter['expires_at']}")
+            shown += 1
+        if not shown:
+            print("starter escrows: none")
     except (OSError, ValueError, PermissionError, chain.VoucherError) as exc:
         raise SystemExit(f"pay status refused: {exc}") from exc
+
+
+def _pay_starters() -> None:
+    wallet, _node_seed, node_public = _pay_wallet_and_node(signing=False)
+    chain, rpc, program, _mint = _pay_chain_settings()
+    escrow = chain.escrow_pda(wallet["address"], program)[0]
+    rows = rpc.delegates_for_escrow(escrow, program)
+    node_address = chain.b58encode(node_public)
+    shown = 0
+    for row in sorted(rows, key=lambda item: (item["expires_at"], item["key"])):
+        if row["key"] == node_address:
+            continue
+        print(f"{chain.pubkey_bytes(row['key']).hex()}  cap {_pay_amount(row['cap_total'])} USDC  "
+              f"spent {_pay_amount(row['spent'])} USDC  expires {row['expires_at']}  "
+              f"disabled {'yes' if row['disabled'] else 'no'}")
+        shown += 1
+    if not shown:
+        print("no starter delegates")
+
+
+def _pay_revoke(node_key_hex: str, *, allow_self: bool = False) -> None:
+    if (not isinstance(node_key_hex, str) or len(node_key_hex) != 64
+            or any(ch not in "0123456789abcdef" for ch in node_key_hex)):
+        raise SystemExit("node key must be 64 lowercase hex characters")
+    wallet, _node_seed, node_public = _pay_wallet_and_node()
+    target = bytes.fromhex(node_key_hex)
+    if target == node_public and not allow_self:
+        raise SystemExit("refusing to revoke this node's own delegate without --self")
+    chain, rpc, program, _mint = _pay_chain_settings()
+    _pay_send(rpc, chain, chain.delegate_revoke(
+        wallet["address"], target, program), wallet)
 
 
 def _pay_command(args) -> None:
@@ -1190,6 +1252,12 @@ def _pay_command(args) -> None:
         return
     if args.pay_cmd == "status":
         _pay_status(wallet)
+        return
+    if args.pay_cmd == "starters":
+        _pay_starters()
+        return
+    if args.pay_cmd == "revoke":
+        _pay_revoke(args.node_key, allow_self=args.self)
         return
     if args.pay_cmd == "ensure":
         _pay_ensure()
@@ -3491,6 +3559,11 @@ def main(argv=None, *, http_post=None, http_get=None) -> int:
     withdraw.add_argument("--amount", help="USDC amount to request")
     withdraw.add_argument("--execute", action="store_true", help="execute the pending withdrawal")
     paysub.add_parser("channels", help="list the local payer channel book with on-chain state")
+    paysub.add_parser("starters", help="list starter delegates funded by this wallet's escrow")
+    q = paysub.add_parser("revoke", help="revoke one delegate on this wallet's escrow")
+    q.add_argument("node_key", help="delegate node key as 64 lowercase hex characters")
+    q.add_argument("--self", action="store_true",
+                   help="allow revoking this device's own node delegate")
     q = paysub.add_parser("backup", help="interactively print or acknowledge a BIP39 seed backup")
     q.add_argument("--confirm", action="store_true",
                    help="record that the seed phrase has been backed up without printing it")

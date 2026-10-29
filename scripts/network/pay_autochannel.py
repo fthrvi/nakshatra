@@ -272,61 +272,110 @@ def ensure_channel(worker_key: str, required_micro_usdc: int, *, owner: str,
                 # ``clock`` remains accepted for branch compatibility, but a
                 # local wall clock never participates in channel-open policy.
                 now = ledger.monotonic_time(tx_rpc.chain_time())
-                derived = pay_chain._derived(owner_address, configured_program)
-                escrow_info = _account(
-                    tx_rpc, derived["escrow"], owner=configured_program, label="pay escrow")
-                escrow = pay_chain.decode_escrow(escrow_info["data"])
-                if (escrow["owner"] != owner_address
-                        or escrow["vault"] != derived["vault"]):
-                    raise pay_voucher.VoucherError(
-                        "pay escrow does not match the configured owner and vault")
-                delegate_address = pay_chain.delegate_pda(
-                    derived["escrow"], node_public, configured_program)[0]
-                delegate_info = tx_rpc.account_info(delegate_address)
-                if delegate_info is None:
-                    raise pay_voucher.VoucherError(
-                        "node delegate is not configured; run `nak pay ensure`")
-                if delegate_info["owner"] != configured_program:
-                    raise pay_voucher.VoucherError(
-                        "node delegate is owned by an unexpected program")
-                delegate = pay_chain.decode_delegate(delegate_info["data"])
-                if (delegate["escrow"] != derived["escrow"]
-                        or delegate["key"] != node_address
-                        or delegate["generation"] != escrow["generation"]):
-                    raise pay_voucher.VoucherError(
-                        "node delegate does not match the current escrow generation; "
-                        "run `nak pay ensure`")
-                if delegate["disabled"]:
-                    raise pay_voucher.VoucherError(
-                        "node delegate is disabled; run `nak pay ensure`")
-                if now >= delegate["expires_at"]:
-                    raise pay_voucher.VoucherError(
-                        "node delegate is expired; run `nak pay ensure`")
-                if not delegate["flags"] & pay_chain.DELEGATE_OPEN_CHANNEL:
-                    raise pay_voucher.VoucherError(
-                        "node delegate lacks OPEN_CHANNEL; run `nak pay ensure`")
+                local_day = max(0, limits["per_day"] - ledger.total_since(now))
+                own_derived = pay_chain._derived(owner_address, configured_program)
 
-                vault_info = _account(
-                    tx_rpc, derived["vault"], owner=pay_chain.TOKEN_PROGRAM_ID,
-                    label="escrow vault")
-                vault_amount = pay_chain.token_amount(vault_info["data"])
-                candidates = {
-                    "per_tx": limits["per_tx"],
-                    "per_day": max(0, limits["per_day"] - ledger.total_since(now)),
-                    "delegate": max(0, delegate["cap_total"] - delegate["spent"]),
-                    "vault": max(0, vault_amount - escrow["committed"]),
-                }
-                cap = min(candidates.values())
-                if cap < required:
-                    raise pay_voucher.VoucherError(
-                        _limiting_refusal(required, candidates))
+                def source(delegate_address: str, delegate: dict, *, own: bool):
+                    escrow_address = delegate["escrow"]
+                    escrow_info = tx_rpc.account_info(escrow_address)
+                    if escrow_info is None:
+                        raise pay_voucher.VoucherError("delegate names a missing escrow")
+                    if escrow_info["owner"] != configured_program:
+                        raise pay_voucher.VoucherError(
+                            "delegate escrow is owned by an unexpected program")
+                    escrow = pay_chain.decode_escrow(escrow_info["data"])
+                    canonical = pay_chain._derived(escrow["owner"], configured_program)
+                    if canonical["escrow"] != escrow_address or canonical["vault"] != escrow["vault"]:
+                        raise pay_voucher.VoucherError(
+                            "delegate escrow is not canonical for its recorded owner")
+                    if (delegate["key"] != node_address
+                            or delegate["generation"] != escrow["generation"]):
+                        return None, ("node delegate does not match the current escrow generation; "
+                                      "run `nak pay ensure`" if own else "starter generation is stale")
+                    if delegate["disabled"]:
+                        return None, ("node delegate is disabled; run `nak pay ensure`"
+                                      if own else "starter is disabled")
+                    if now >= delegate["expires_at"]:
+                        return None, ("node delegate is expired; run `nak pay ensure`"
+                                      if own else "starter is expired")
+                    if not delegate["flags"] & pay_chain.DELEGATE_OPEN_CHANNEL:
+                        return None, ("node delegate lacks OPEN_CHANNEL; run `nak pay ensure`"
+                                      if own else "starter lacks OPEN_CHANNEL")
+                    vault_info = _account(
+                        tx_rpc, escrow["vault"], owner=pay_chain.TOKEN_PROGRAM_ID,
+                        label="escrow vault")
+                    candidates = {
+                        "per_tx": limits["per_tx"], "per_day": local_day,
+                        "delegate": max(0, delegate["cap_total"] - delegate["spent"]),
+                        "vault": max(
+                            0, pay_chain.token_amount(vault_info["data"]) - escrow["committed"]),
+                    }
+                    cap = min(candidates.values())
+                    if cap < required:
+                        return None, _limiting_refusal(required, candidates)
+                    return {
+                        "owner": escrow["owner"], "escrow": escrow_address,
+                        "delegate": delegate_address, "delegate_state": delegate,
+                        "escrow_state": escrow, "cap": cap,
+                    }, ""
+
+                chosen_source = None
+                own_reason = "pay escrow is not configured; run `nak pay ensure`"
+                own_escrow_info = tx_rpc.account_info(own_derived["escrow"])
+                if own_escrow_info is not None:
+                    if own_escrow_info["owner"] != configured_program:
+                        raise pay_voucher.VoucherError(
+                            "pay escrow is owned by an unexpected program")
+                    own_escrow = pay_chain.decode_escrow(own_escrow_info["data"])
+                    if (own_escrow["owner"] != owner_address
+                            or own_escrow["vault"] != own_derived["vault"]):
+                        raise pay_voucher.VoucherError(
+                            "pay escrow does not match the configured owner and vault")
+                    own_delegate_address = pay_chain.delegate_pda(
+                        own_derived["escrow"], node_public, configured_program)[0]
+                    own_delegate_info = tx_rpc.account_info(own_delegate_address)
+                    if own_delegate_info is None:
+                        own_reason = "node delegate is not configured; run `nak pay ensure`"
+                    elif own_delegate_info["owner"] != configured_program:
+                        raise pay_voucher.VoucherError(
+                            "node delegate is owned by an unexpected program")
+                    else:
+                        own_delegate = pay_chain.decode_delegate(own_delegate_info["data"])
+                        chosen_source, own_reason = source(
+                            own_delegate_address, own_delegate, own=True)
+
+                if chosen_source is None:
+                    lookup = getattr(tx_rpc, "delegates_for_key", None)
+                    starter_delegates = (lookup(node_public, configured_program)
+                                         if callable(lookup) else [])
+                    starter_delegates = sorted(
+                        (item for item in starter_delegates
+                         if item["escrow"] != own_derived["escrow"]),
+                        key=lambda item: (item["expires_at"], item["address"]))
+                    starter_reason = ""
+                    for starter in starter_delegates:
+                        candidate, candidate_reason = source(
+                            starter["address"], starter, own=False)
+                        if candidate is not None:
+                            chosen_source = candidate
+                            break
+                        if not starter_reason:
+                            starter_reason = candidate_reason
+                if chosen_source is None:
+                    raise pay_voucher.VoucherError(starter_reason or own_reason)
+
+                escrow = chosen_source["escrow_state"]
+                escrow_address = chosen_source["escrow"]
+                delegate_address = chosen_source["delegate"]
+                source_owner = chosen_source["owner"]
+                cap = chosen_source["cap"]
 
                 seq = escrow["channel_seq"]
                 generation = escrow["generation"]
                 channel_address = pay_chain.channel_pda(
-                    derived["escrow"], generation, seq, configured_program)[0]
+                    escrow_address, generation, seq, configured_program)[0]
                 instructions = pay_chain.channel_open(
-                    node_address, owner_address, worker_address, cap, generation, seq,
+                    node_address, source_owner, worker_address, cap, generation, seq,
                     configured_program, delegate=delegate_address)
                 blockhash = tx_rpc.latest_blockhash()
                 message = pay_chain.compile_message(
@@ -355,7 +404,7 @@ def ensure_channel(worker_key: str, required_micro_usdc: int, *, owner: str,
                             row, "sent", sent))
                 except pay_chain.TransactionDefiniteFailure:
                     ledger.set_status(reservation, "failed", transaction.signature)
-                    fresh_info = tx_rpc.account_info(derived["escrow"])
+                    fresh_info = tx_rpc.account_info(escrow_address)
                     fresh_seq = (pay_chain.decode_escrow(fresh_info["data"])["channel_seq"]
                                  if fresh_info is not None else seq)
                     if attempt == 0 and fresh_seq != seq:
@@ -365,7 +414,7 @@ def ensure_channel(worker_key: str, required_micro_usdc: int, *, owner: str,
                 # the broadcast outcome is not known.
                 ledger.set_status(reservation, "finalized", signature)
                 account = tx_rpc.read_channel(channel_address, configured_program)
-                if (account.escrow != derived["escrow"]
+                if (account.escrow != escrow_address
                         or account.worker != worker_address
                         or account.cap != cap
                         or account.voucher_signer != node_address

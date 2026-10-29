@@ -875,6 +875,34 @@ def test_admission_binds_authenticated_payer_to_channel_signer(
     vouchers.close()
 
 
+def test_starter_channel_binds_newcomer_voucher_signer_not_inviter_owner(
+        tmp_path, monkeypatch):
+    """An inviter-owned escrow accepts the newcomer authenticated node on its channel."""
+    monkeypatch.setenv("NAK_PAY_MODE", "chain")
+    _install_pay_wallet(Path(os.environ["HOME"]))
+    assert PAYER_B58 != OWNER_B58
+    starter_channel = _channel()
+    assert starter_channel.voucher_signer == PAYER_B58
+    state = pay.FakeChannelState(
+        {CHANNEL: starter_channel}, {ESCROW: OWNER_B58}, program_id=PROGRAM)
+    vouchers = pay.WorkerVoucherStore(tmp_path / "starter-bind" / "vouchers.sqlite")
+    store = admission.PaidAdmissionStore(tmp_path / "starter-bind" / "paid.sqlite")
+    manager = admission.PaidAdmission(
+        _Ledger(_claim("starter-bind")), store, WORKER_SEED, model_id="model",
+        layer_start=0, layer_end=4, clock=lambda: 100,
+        voucher_store=vouchers, channel_state=state, pay_program=PROGRAM)
+    assert manager.check_ready()
+    init = pay.init_wire(
+        TOKEN, program=PROGRAM, channel=CHANNEL, channel_base=0,
+        hold_id="hold", session_id="starter-bind", model_id="model",
+        max_prompt_tokens=1, max_output_tokens=40)
+
+    assert manager.claim(PAYER_HEX, "starter-bind", init)
+
+    store.close()
+    vouchers.close()
+
+
 def test_voucher_refuses_channel_too_near_close_deadline(tmp_path):
     state = pay.FakeChannelState(
         {CHANNEL: _channel(status="Open", close_at=115)},

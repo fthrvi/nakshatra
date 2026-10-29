@@ -178,6 +178,113 @@ class FakeRpc:
         return OWNER
 
 
+STARTER_OWNER_SEED = bytes([46]) * 32
+STARTER_OWNER = pay_chain.b58encode(ed25519.Ed25519PrivateKey.from_private_bytes(
+    STARTER_OWNER_SEED).public_key().public_bytes_raw())
+
+
+class StarterRpc(FakeRpc):
+    def __init__(self, *, starter_cap=100, starter_spent=0, starter_expires=10_000,
+                 starter_flags=1, starter_disabled=False, vault_amount=100,
+                 committed=0, **kwargs):
+        super().__init__(vault_amount=vault_amount, **kwargs)
+        self.starter = pay_chain._derived(STARTER_OWNER, PROGRAM)
+        self.starter_delegate = pay_chain.delegate_pda(
+            self.starter["escrow"], NODE_PUBLIC, PROGRAM)[0]
+        self.starter_cap = starter_cap
+        self.starter_spent = starter_spent
+        self.starter_expires = starter_expires
+        self.starter_flags = starter_flags
+        self.starter_disabled = starter_disabled
+        self.starter_committed = committed
+
+    def _starter_delegate_data(self):
+        return _delegate_data(
+            self.starter["escrow"], cap=self.starter_cap,
+            spent=self.starter_spent, expires=self.starter_expires,
+            flags=self.starter_flags, disabled=self.starter_disabled)
+
+    def delegates_for_key(self, key, program):
+        assert pay_chain.pubkey_text(key) == NODE and program == PROGRAM
+        data = self._starter_delegate_data()
+        return [{"address": self.starter_delegate, **pay_chain.decode_delegate(data)}]
+
+    def account_info(self, address):
+        if address == self.derived["escrow"]:
+            return None
+        with self.seq.get_lock():
+            seq = self.seq.value
+        if address == self.starter["escrow"]:
+            self.last_seq = seq
+            return {"owner": PROGRAM, "data": _escrow_data(
+                STARTER_OWNER, self.starter["vault"],
+                committed=self.starter_committed + seq * self.open_cap, seq=seq)}
+        if address == self.starter["vault"]:
+            return {"owner": pay_chain.TOKEN_PROGRAM_ID,
+                    "data": _token_data(self.vault_amount)}
+        return None
+
+    def read_channel(self, address, program_id):
+        assert program_id == PROGRAM
+        with self.seq.get_lock():
+            count = self.seq.value
+        for seq in range(count):
+            expected = pay_chain.channel_pda(
+                self.starter["escrow"], 0, seq, PROGRAM)[0]
+            if address == expected:
+                return voucher.ChannelAccount(
+                    escrow=self.starter["escrow"], generation=0, seq=seq,
+                    worker=pay_chain.b58encode(WORKER_PUBLIC),
+                    voucher_signer=NODE, delegate=self.starter_delegate,
+                    cap=self.open_cap, redeemed=0, fee_bps_snapshot=300,
+                    status="Open", close_at=0, rent_payer=NODE, bump=1)
+        raise voucher.VoucherError(f"account does not exist: {address}")
+
+
+class MultiStarterRpc(StarterRpc):
+    def __init__(self, **kwargs):
+        super().__init__(starter_expires=9_000, **kwargs)
+        soon_owner = pay_chain.b58encode(bytes([47]) * 32)
+        self.soon = pay_chain._derived(soon_owner, PROGRAM)
+        self.soon_delegate = pay_chain.delegate_pda(
+            self.soon["escrow"], NODE_PUBLIC, PROGRAM)[0]
+
+    def delegates_for_key(self, key, program):
+        later = super().delegates_for_key(key, program)[0]
+        data = _delegate_data(
+            self.soon["escrow"], cap=100, spent=0, expires=2_000)
+        return [later, {"address": self.soon_delegate,
+                        **pay_chain.decode_delegate(data)}]
+
+    def account_info(self, address):
+        if address == self.soon["escrow"]:
+            with self.seq.get_lock():
+                seq = self.seq.value
+            self.last_seq = seq
+            return {"owner": PROGRAM, "data": _escrow_data(
+                self.soon["owner"], self.soon["vault"],
+                committed=seq * self.open_cap, seq=seq)}
+        if address == self.soon["vault"]:
+            return {"owner": pay_chain.TOKEN_PROGRAM_ID,
+                    "data": _token_data(self.vault_amount)}
+        return super().account_info(address)
+
+    def read_channel(self, address, program_id):
+        with self.seq.get_lock():
+            count = self.seq.value
+        for seq in range(count):
+            expected = pay_chain.channel_pda(
+                self.soon["escrow"], 0, seq, PROGRAM)[0]
+            if address == expected:
+                return voucher.ChannelAccount(
+                    escrow=self.soon["escrow"], generation=0, seq=seq,
+                    worker=pay_chain.b58encode(WORKER_PUBLIC),
+                    voucher_signer=NODE, delegate=self.soon_delegate,
+                    cap=self.open_cap, redeemed=0, fee_bps_snapshot=300,
+                    status="Open", close_at=0, rent_payer=NODE, bump=1)
+        return super().read_channel(address, program_id)
+
+
 def _limits(path: Path, *, per_tx=10, per_day=50, cap=100):
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     path.write_text(json.dumps({
@@ -222,6 +329,68 @@ def test_per_tx_refuses_required_over_limit_and_caps_open(tmp_path):
     assert chosen.cap == 10
     assert chosen.cap <= 10
     assert rpc.sent.value == 1
+
+
+def test_no_own_escrow_opens_on_inviter_starter_escrow(tmp_path):
+    paths = _paths(tmp_path)
+    _limits(paths["limits"], per_tx=10, per_day=50)
+    rpc = StarterRpc(open_cap=10)
+
+    chosen = _ensure(tmp_path, rpc, required=5)
+
+    account = rpc.read_channel(chosen.channel, PROGRAM)
+    assert account.escrow == rpc.starter["escrow"]
+    assert account.voucher_signer == NODE
+    assert rpc.sent.value == 1
+
+
+def test_own_escrow_is_preferred_without_starter_lookup(tmp_path):
+    paths = _paths(tmp_path)
+    _limits(paths["limits"], per_tx=10, per_day=50)
+    rpc = FakeRpc(open_cap=10)
+    rpc.delegates_for_key = lambda *_args: pytest.fail("starter lookup must not run")
+
+    chosen = _ensure(tmp_path, rpc, required=5)
+
+    assert rpc.read_channel(chosen.channel, PROGRAM).escrow == rpc.derived["escrow"]
+
+
+def test_starter_expiring_soonest_is_preferred(tmp_path):
+    paths = _paths(tmp_path)
+    _limits(paths["limits"], per_tx=10, per_day=50)
+    rpc = MultiStarterRpc(open_cap=10)
+
+    chosen = _ensure(tmp_path, rpc, required=5)
+
+    assert rpc.read_channel(chosen.channel, PROGRAM).escrow == rpc.soon["escrow"]
+
+
+@pytest.mark.parametrize(("changes", "match"), [
+    ({"starter_expires": 999}, "starter is expired"),
+    ({"starter_disabled": True}, "starter is disabled"),
+    ({"starter_cap": 4}, "delegate's remaining"),
+    ({"vault_amount": 4}, "collateral"),
+])
+def test_unusable_starter_is_skipped(tmp_path, changes, match):
+    paths = _paths(tmp_path)
+    _limits(paths["limits"], per_tx=10, per_day=50)
+    rpc = StarterRpc(open_cap=10, **changes)
+
+    with pytest.raises(voucher.VoucherError, match=match):
+        _ensure(tmp_path, rpc, required=5)
+
+    assert rpc.sent.value == 0
+
+
+def test_local_limits_apply_to_starter_channel_open(tmp_path):
+    paths = _paths(tmp_path)
+    _limits(paths["limits"], per_tx=4, per_day=50)
+    rpc = StarterRpc(open_cap=10)
+
+    with pytest.raises(voucher.VoucherError, match="per-transaction"):
+        _ensure(tmp_path, rpc, required=5)
+
+    assert rpc.sent.value == 0
 
 
 def test_open_ledger_counts_pending_unknown_and_recent_only(tmp_path):

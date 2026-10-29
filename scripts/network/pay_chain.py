@@ -464,6 +464,68 @@ class PayRpc(JsonRpcChannelState):
             raise VoucherError("RPC account data length differs from space")
         return {**value, "data": raw}
 
+    def _delegates_filtered(self, program_id: object, *, offset: int,
+                            value: object) -> list[dict]:
+        """Return strictly validated Delegate accounts matching one pubkey field."""
+        self._ensure_cluster()
+        program = pubkey_text(program_id, "program id")
+        wanted = pubkey_text(value, "delegate filter key")
+        result = self._rpc("getProgramAccounts", [program, {
+            "commitment": "finalized", "encoding": "base64",
+            "filters": [
+                {"dataSize": DELEGATE_ACCOUNT_SPACE},
+                {"memcmp": {"offset": offset, "bytes": wanted}},
+            ],
+        }])
+        if not isinstance(result, list):
+            raise VoucherError("RPC returned a malformed getProgramAccounts result")
+        rows = []
+        seen = set()
+        for item in result:
+            if (not isinstance(item, dict) or set(item) != {"pubkey", "account"}
+                    or not isinstance(item.get("pubkey"), str)
+                    or not isinstance(item.get("account"), dict)):
+                raise VoucherError("RPC returned a malformed Delegate account entry")
+            address = pubkey_text(item["pubkey"], "Delegate account address")
+            account = item["account"]
+            required = {"data", "executable", "lamports", "owner", "rentEpoch", "space"}
+            if (set(account) != required or account.get("owner") != program
+                    or account.get("space") != DELEGATE_ACCOUNT_SPACE
+                    or not isinstance(account.get("executable"), bool)
+                    or account["executable"]
+                    or isinstance(account.get("lamports"), bool)
+                    or not isinstance(account.get("lamports"), int)
+                    or account["lamports"] < 0
+                    or isinstance(account.get("rentEpoch"), bool)
+                    or not isinstance(account.get("rentEpoch"), int)
+                    or account["rentEpoch"] < 0):
+                raise VoucherError("RPC returned an invalid Delegate account entry")
+            encoded = account.get("data")
+            if not isinstance(encoded, list) or len(encoded) != 2 or encoded[1] != "base64":
+                raise VoucherError("RPC returned an unsupported Delegate account encoding")
+            try:
+                raw = base64.b64decode(encoded[0], validate=True)
+                decoded = decode_delegate(raw)
+            except (TypeError, ValueError) as exc:
+                raise VoucherError(f"RPC returned an invalid Delegate account: {exc}") from exc
+            field = "escrow" if offset == DELEGATE_ESCROW_OFFSET else "key"
+            if decoded[field] != wanted:
+                raise VoucherError("RPC returned a Delegate outside the requested filter")
+            expected = delegate_pda(decoded["escrow"], decoded["key"], program)[0]
+            if address != expected or address in seen:
+                raise VoucherError("RPC returned a non-canonical or duplicate Delegate account")
+            seen.add(address)
+            rows.append({"address": address, **decoded})
+        return rows
+
+    def delegates_for_key(self, key: object, program_id: object) -> list[dict]:
+        return self._delegates_filtered(
+            program_id, offset=DELEGATE_KEY_OFFSET, value=key)
+
+    def delegates_for_escrow(self, escrow: object, program_id: object) -> list[dict]:
+        return self._delegates_filtered(
+            program_id, offset=DELEGATE_ESCROW_OFFSET, value=escrow)
+
     def balance(self, address: object) -> int:
         self._ensure_cluster()
         result = self._rpc("getBalance", [pubkey_text(address), {"commitment": "confirmed"}])
@@ -539,6 +601,9 @@ class PayRpc(JsonRpcChannelState):
 
 _ESCROW_DISC = hashlib.sha256(b"account:Escrow").digest()[:8]
 _DELEGATE_DISC = hashlib.sha256(b"account:Delegate").digest()[:8]
+DELEGATE_ACCOUNT_SPACE = 115
+DELEGATE_ESCROW_OFFSET = 8
+DELEGATE_KEY_OFFSET = 40
 
 
 def decode_escrow(data: bytes) -> dict:
@@ -573,7 +638,7 @@ def decode_escrow(data: bytes) -> dict:
 
 def decode_delegate(data: bytes) -> dict:
     raw = bytes(data)
-    if len(raw) != 115 or raw[:8] != _DELEGATE_DISC:
+    if len(raw) != DELEGATE_ACCOUNT_SPACE or raw[:8] != _DELEGATE_DISC:
         raise ValueError("data is not a Delegate account")
     offset = 8
     escrow = b58encode(raw[offset:offset + 32]); offset += 32

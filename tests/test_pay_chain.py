@@ -22,7 +22,7 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from network import nak, pay_autochannel, pay_chain, pay_wallet  # noqa: E402
+from network import nak, nakd, pay_autochannel, pay_chain, pay_wallet  # noqa: E402
 from network import pay_voucher  # noqa: E402
 
 
@@ -250,6 +250,60 @@ def _delegate_data(escrow: str, key: str, *, expires: int) -> bytes:
     return bytes(raw)
 
 
+def _program_account(address: str, owner: str, data: bytes) -> dict:
+    return {"pubkey": address, "account": {
+        "data": [base64.b64encode(data).decode(), "base64"],
+        "executable": False, "lamports": 1, "owner": owner,
+        "rentEpoch": 0, "space": len(data),
+    }}
+
+
+def test_delegate_lookup_filters_by_key_and_validates_canonical_accounts(monkeypatch):
+    key = pay_chain.b58encode(bytes([71]) * 32)
+    escrow = pay_chain.b58encode(bytes([72]) * 32)
+    address = pay_chain.delegate_pda(escrow, key, PROGRAM)[0]
+    data = _delegate_data(escrow, key, expires=1234)
+    rpc = pay_chain.PayRpc("http://127.0.0.1:1")
+    monkeypatch.setattr(rpc, "_ensure_cluster", lambda: None)
+    calls = []
+    monkeypatch.setattr(
+        rpc, "_rpc",
+        lambda method, params: calls.append((method, params)) or [
+            _program_account(address, PROGRAM, data)])
+
+    assert rpc.delegates_for_key(key, PROGRAM) == [{
+        "address": address, **pay_chain.decode_delegate(data)}]
+    assert calls == [("getProgramAccounts", [PROGRAM, {
+        "commitment": "finalized", "encoding": "base64", "filters": [
+            {"dataSize": pay_chain.DELEGATE_ACCOUNT_SPACE},
+            {"memcmp": {"offset": pay_chain.DELEGATE_KEY_OFFSET, "bytes": key}},
+        ],
+    }])]
+
+
+@pytest.mark.parametrize("mutation", ["owner", "size", "discriminator", "address", "filter"])
+def test_delegate_lookup_rejects_malformed_entries(monkeypatch, mutation):
+    key = pay_chain.b58encode(bytes([73]) * 32)
+    other = pay_chain.b58encode(bytes([74]) * 32)
+    escrow = pay_chain.b58encode(bytes([75]) * 32)
+    data = bytearray(_delegate_data(escrow, key, expires=1234))
+    address = pay_chain.delegate_pda(escrow, key, PROGRAM)[0]
+    owner = PROGRAM
+    if mutation == "owner": owner = other
+    if mutation == "size": data.pop()
+    if mutation == "discriminator": data[0] ^= 1
+    if mutation == "address": address = other
+    if mutation == "filter": data[40:72] = pay_chain.pubkey_bytes(other)
+    rpc = pay_chain.PayRpc("http://127.0.0.1:1")
+    monkeypatch.setattr(rpc, "_ensure_cluster", lambda: None)
+    monkeypatch.setattr(
+        rpc, "_rpc", lambda _method, _params: [
+            _program_account(address, owner, bytes(data))])
+
+    with pytest.raises(pay_chain.VoucherError, match="Delegate"):
+        rpc.delegates_for_key(key, PROGRAM)
+
+
 def test_decode_escrow_accepts_stale_some_payload_after_pending_is_cleared():
     owner = pay_chain.b58encode(bytes(range(32)))
     vault = pay_chain.b58encode(bytes(range(1, 33)))
@@ -304,6 +358,7 @@ class FakeRpc:
                 elif method == "getBalance":
                     value = outer.node_balance if params[0] == outer.node else outer.balance
                     result = {"context":{"slot":1},"value":value}
+                elif method == "getProgramAccounts": result = []
                 elif method == "sendTransaction":
                     raw = base64.b64decode(params[0]); result = pay_chain.b58encode(raw[1:65])
                     outer.sent_raw.append(raw)
@@ -453,6 +508,106 @@ def test_cli_mainnet_and_broker_are_refused(_temp_home, monkeypatch):
     (_temp_home / ".nakshatra/pay/custody").write_text("broker\n")
     with pytest.raises(SystemExit, match="broker.*not available yet"):
         nak.main(["pay", "ensure"])
+
+
+def test_cli_starters_lists_only_other_node_delegates(monkeypatch, capsys):
+    owner_seed = bytes([91]) * 32
+    owner = pay_chain.b58encode(ed25519.Ed25519PrivateKey.from_private_bytes(
+        owner_seed).public_key().public_bytes_raw())
+    node = bytes([92]) * 32
+    other = bytes([93]) * 32
+    escrow = pay_chain.escrow_pda(owner, PROGRAM)[0]
+
+    class Rpc:
+        def delegates_for_escrow(self, requested, program):
+            assert requested == escrow and program == PROGRAM
+            base = {"address": pay_chain.b58encode(bytes([94]) * 32),
+                    "escrow": escrow, "generation": 0, "spent": 2,
+                    "expires_at": 1234, "flags": 1, "open_channels": 0,
+                    "open_tasks": 0, "disabled": False, "bump": 1}
+            return [dict(base, key=pay_chain.b58encode(node), cap_total=9),
+                    dict(base, key=pay_chain.b58encode(other), cap_total=10)]
+
+    monkeypatch.setattr(nak, "_pay_wallet_and_node",
+                        lambda **_kwargs: ({"address": owner}, b"", node))
+    monkeypatch.setattr(nak, "_pay_chain_settings",
+                        lambda **_kwargs: (pay_chain, Rpc(), PROGRAM, MINT))
+
+    nak._pay_starters()
+
+    output = capsys.readouterr().out
+    assert other.hex() in output and node.hex() not in output
+    assert "cap 0.00001 USDC" in output and "spent 0.000002 USDC" in output
+
+
+def test_pay_status_shows_usable_starter_when_own_escrow_is_absent(
+        _temp_home, monkeypatch, capsys):
+    wallet = _make_keys(_temp_home)
+    node_seed = (_temp_home / ".nakshatra/keys/worker.ed25519").read_bytes()
+    node_public = ed25519.Ed25519PrivateKey.from_private_bytes(
+        node_seed).public_key().public_bytes_raw()
+    starter_owner = pay_chain.b58encode(bytes([96]) * 32)
+    source = pay_chain._derived(starter_owner, PROGRAM)
+    delegate_address = pay_chain.delegate_pda(
+        source["escrow"], node_public, PROGRAM)[0]
+    delegate_data = _delegate_data(
+        source["escrow"], pay_chain.b58encode(node_public), expires=2_000)
+
+    class Rpc:
+        def __init__(self, _url): pass
+        def ensure_cluster(self): return "local"
+        def balance(self, _address): return 0
+        def chain_time(self): return 1_000
+        def delegates_for_key(self, key, program):
+            assert pay_chain.pubkey_text(key) == pay_chain.b58encode(node_public)
+            assert program == PROGRAM
+            return [{"address": delegate_address,
+                     **pay_chain.decode_delegate(delegate_data)}]
+        def account_info(self, address):
+            if address == pay_chain.escrow_pda(wallet["address"], PROGRAM)[0]:
+                return None
+            if address == source["escrow"]:
+                return {"owner": PROGRAM,
+                        "data": _escrow_data(starter_owner, source["vault"])}
+            if address == source["vault"]:
+                data = bytearray(165)
+                struct.pack_into("<Q", data, 64, 2_000_000)
+                return {"owner": pay_chain.TOKEN_PROGRAM_ID, "data": bytes(data)}
+            return None
+
+    monkeypatch.setenv("NAK_PAY_RPC", "http://127.0.0.1:1")
+    monkeypatch.setattr(pay_chain, "PayRpc", Rpc)
+
+    nak._pay_status(wallet)
+
+    output = capsys.readouterr().out
+    assert "escrow: not initialized" in output
+    assert f"starter escrow: {starter_owner[:12]}" in output
+    assert "remaining 2 USDC" in output
+
+
+def test_cli_revoke_self_guard_and_override(monkeypatch):
+    seed = bytes([95]) * 32
+    public = ed25519.Ed25519PrivateKey.from_private_bytes(
+        seed).public_key().public_bytes_raw()
+    wallet = {"seed": seed, "address": pay_chain.b58encode(public)}
+    sent = []
+    monkeypatch.setattr(nak, "_pay_wallet_and_node",
+                        lambda **_kwargs: (wallet, b"", public))
+    monkeypatch.setattr(nak, "_pay_chain_settings",
+                        lambda **_kwargs: (pay_chain, object(), PROGRAM, MINT))
+    monkeypatch.setattr(nak, "_pay_send",
+                        lambda rpc, chain, instructions, chosen: sent.append(
+                            (rpc, chain, instructions, chosen)))
+
+    with pytest.raises(SystemExit, match="without --self"):
+        nak._pay_revoke(public.hex())
+    assert not sent
+
+    nak._pay_revoke(public.hex(), allow_self=True)
+    assert len(sent) == 1
+    assert sent[0][2][0].data == (
+        pay_chain.anchor_discriminator("delegate_revoke") + public)
 
 
 @pytest.mark.parametrize("argv,match", [
@@ -641,6 +796,62 @@ send(rpc,[pay.config_init({'authority':authority.pubkey(),'config':config,'progr
                     other_worker, 1, owner=wallet["address"], book=book,
                     state=rpc, program=PROGRAM, private_key=node_seed, rpc=rpc)
         assert rpc.account_info(channel.channel) is not None
+
+        # Inviter-funded starter: a second node has no escrow of its own, only
+        # an OPEN_CHANNEL delegate on the inviter escrow and the inviter's SOL float.
+        newcomer_seed = bytes([78]) * 32
+        newcomer_public = ed25519.Ed25519PrivateKey.from_private_bytes(
+            newcomer_seed).public_key().public_bytes_raw()
+        newcomer = pay_chain.b58encode(newcomer_public)
+        newcomer_wallet = pay_chain.b58encode(ed25519.Ed25519PrivateKey.from_private_bytes(
+            bytes([79]) * 32).public_key().public_bytes_raw())
+        expires_at = rpc.chain_time() + 30 * 86400
+        starter_ix = pay_chain.delegate_set(
+            wallet["address"], newcomer_public, 500_000, expires_at,
+            pay_chain.DELEGATE_OPEN_CHANNEL, PROGRAM)
+        starter_ix.append(pay_chain.system_transfer(
+            wallet["address"], newcomer, nakd.STARTER_NODE_SOL))
+        blockhash = rpc.latest_blockhash()
+        starter_tx = pay_chain.sign_transaction(
+            starter_ix, wallet["address"], blockhash,
+            {wallet["address"]: wallet["seed"]})
+        rpc.send_and_confirm(starter_tx)
+        assert rpc.account_info(pay_chain.escrow_pda(newcomer_wallet, PROGRAM)[0]) is None
+
+        starter_dir = tmp_path / "starter-newcomer"
+        starter_dir.mkdir()
+        limits = starter_dir / "limits.json"
+        limits.write_text(json.dumps({
+            "cap_total": 500_000, "days": 30,
+            "per_tx": 100_000, "per_day": 200_000,
+        }))
+        limits.chmod(0o600)
+        starter_worker = ed25519.Ed25519PrivateKey.from_private_bytes(
+            bytes([80]) * 32).public_key().public_bytes_raw().hex()
+        with pay_voucher.PayerChannelBook(starter_dir / "channels.sqlite") as starter_book:
+            starter_channel = pay_autochannel.ensure_channel(
+                starter_worker, 1, owner=newcomer_wallet, book=starter_book,
+                state=rpc, program=PROGRAM, private_key=newcomer_seed, rpc=rpc,
+                limits_path=limits, ledger_path=starter_dir / "opens.sqlite",
+                lock_path=starter_dir / "open.lock")
+        starter_account = rpc.read_channel(starter_channel.channel, PROGRAM)
+        assert starter_account.escrow == escrow_address
+        assert starter_account.voucher_signer == newcomer
+
+        revoke = pay_chain.delegate_revoke(
+            wallet["address"], newcomer_public, PROGRAM)
+        blockhash = rpc.latest_blockhash()
+        rpc.send_and_confirm(pay_chain.sign_transaction(
+            revoke, wallet["address"], blockhash,
+            {wallet["address"]: wallet["seed"]}))
+        with pay_voucher.PayerChannelBook(starter_dir / "channels-2.sqlite") as starter_book:
+            with pytest.raises(pay_voucher.VoucherError, match="starter is disabled"):
+                pay_autochannel.ensure_channel(
+                    (bytes([81]) * 32).hex(), 1, owner=newcomer_wallet,
+                    book=starter_book, state=rpc, program=PROGRAM,
+                    private_key=newcomer_seed, rpc=rpc, limits_path=limits,
+                    ledger_path=starter_dir / "opens-2.sqlite",
+                    lock_path=starter_dir / "open-2.lock")
         assert nak.main(["pay", "withdraw", "--amount", "0.5"]) == 0
         pending = pay_chain.decode_escrow(
             rpc.account_info(escrow_address)["data"])["pending_withdraw"]
