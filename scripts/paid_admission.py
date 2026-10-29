@@ -756,6 +756,7 @@ class PaidAdmission:
         try:
             account = self.channel_state.read_channel(
                 init["channel"], self.pay_program)
+            self._pay.require_open_channel(account, now=self.clock())
             if account.worker != self.pay_wallet_address:
                 raise self._pay.VoucherError(
                     "channel worker does not match this worker pay wallet")
@@ -774,7 +775,7 @@ class PaidAdmission:
                     "channel has insufficient uncommitted capacity")
             self._chain_sessions[(claim["payer_keyid"], claim["session_id"])] = {
                 "channel": init["channel"], "channel_base": base,
-                "pending_total": None,
+                "pending_total": None, "channel_closing": False,
             }
         except Exception as exc:
             raise PaidAdmissionError(f"chain channel admission refused ({exc})") from exc
@@ -797,7 +798,8 @@ class PaidAdmission:
             session = self._chain_session(claim)
             record = self.voucher_store.accept(
                 control, configured_program=self.pay_program,
-                state=self.channel_state, expected_channel=session["channel"])
+                state=self.channel_state, expected_channel=session["channel"],
+                now=self.clock())
             pending = session["pending_total"]
             if pending is not None and record.total >= pending:
                 session["pending_total"] = None
@@ -810,6 +812,10 @@ class PaidAdmission:
                     session["channel_base"], int(receipt["cumulative_cost"]))
                 if record.total >= covered:
                     self.store.mark_chain_vouched(row["receipt_id"], record.total)
+        except self._pay.ChannelClosingError as exc:
+            session = self._chain_session(claim)
+            session["channel_closing"] = True
+            raise PaidAdmissionError("channel-closing") from exc
         except Exception as exc:
             raise PaidAdmissionError(f"chain voucher refused ({exc})") from exc
 
@@ -819,6 +825,8 @@ class PaidAdmission:
         if not self.chain_mode:
             return
         session = self._chain_session(claim)
+        if session["channel_closing"]:
+            raise PaidAdmissionError("channel-closing")
         pending = session["pending_total"]
         if pending is None:
             return
@@ -841,7 +849,19 @@ class PaidAdmission:
             session["channel_base"], int(receipt["cumulative_cost"]))
         session["pending_total"] = total
         signature = self.store.receipt_signature(receipt["receipt_id"])
-        return self._pay.receipt_wire(receipt, signature)
+        wire = self._pay.receipt_wire(receipt, signature)
+        try:
+            account = self.channel_state.read_channel(
+                session["channel"], self.pay_program)
+            self._pay.require_open_channel(account, now=self.clock())
+        except self._pay.ChannelClosingError:
+            # The completed checkpoint and its receipt still reach the payer;
+            # no subsequent checkpoint work may begin.
+            session["channel_closing"] = True
+        except Exception as exc:
+            raise PaidAdmissionError(
+                f"chain channel checkpoint refused ({exc})") from exc
+        return wire
 
     def final_chain_receipt_wire(self, claim: dict,
                                  termination: str = "normal") -> str:

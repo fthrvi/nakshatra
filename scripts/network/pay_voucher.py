@@ -48,6 +48,7 @@ import sqlite3
 import stat
 import struct
 import threading
+import time
 import urllib.request
 import urllib.parse
 from dataclasses import dataclass
@@ -61,6 +62,7 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 VOUCHER_DOMAIN = b"NAK_PAY_VOUCHER1"
 VOUCHER_MESSAGE_LEN = 88
 RATE = 100
+CHECKPOINT_MARGIN_S = 15
 WIRE_PREFIX = "nakpay1."
 CONTROL_REQUEST = b"nak-pay-control-v1"
 CONTROL_OK = b"nak-pay-control-ok"
@@ -77,6 +79,10 @@ _U64_MAX = (1 << 64) - 1
 
 class VoucherError(ValueError):
     """A voucher, channel, or chain control message was refused."""
+
+
+class ChannelClosingError(VoucherError):
+    """The channel cannot safely cover another inference checkpoint."""
 
 
 def _u64(value: object, name: str) -> int:
@@ -200,6 +206,22 @@ class ChannelAccount:
     close_at: int
     rent_payer: str
     bump: int
+
+
+def require_open_channel(account: ChannelAccount, *, now: float | None = None,
+                         checkpoint_margin_s: int = CHECKPOINT_MARGIN_S) -> None:
+    """Refuse work/vouchers that cannot be redeemed after one checkpoint.
+
+    The program permits redemption on ``Closing`` only until ``close_at``.
+    Workers deliberately stop accepting new work as soon as closing begins,
+    and retain one checkpoint of time margin for the final redeem transaction.
+    """
+    if account.status != "Open":
+        raise ChannelClosingError("channel is not open")
+    margin = max(0, int(checkpoint_margin_s))
+    timestamp = time.time() if now is None else float(now)
+    if account.close_at and account.close_at <= timestamp + margin:
+        raise ChannelClosingError("channel close deadline is within one checkpoint")
 
 
 def _take(data: memoryview, offset: int, size: int) -> tuple[bytes, int]:
@@ -516,6 +538,7 @@ class PayerChannelBook(_Book):
             if row.program != configured:
                 raise VoucherError("channel program differs from configured program")
             channel_state = state.read_channel(row.channel, configured)
+            require_open_channel(channel_state)
             if channel_state.cap != row.cap:
                 raise VoucherError("on-chain channel cap differs from pinned channel book")
             effective_last = max(row.last_vouched_total, channel_state.redeemed)
@@ -589,7 +612,8 @@ class WorkerVoucherStore(_Book):
         return VoucherRecord(key, row["program"], int(row["total"]), bytes(row["signature"]))
 
     def accept(self, voucher: Mapping[str, object], *, configured_program: str,
-               state: ChannelState, expected_channel: str | None = None) -> VoucherRecord:
+               state: ChannelState, expected_channel: str | None = None,
+               now: float | None = None) -> VoucherRecord:
         program = _pubkey_text(voucher.get("program"), "program id")
         configured = _pubkey_text(configured_program, "configured program id")
         if program != configured:
@@ -605,6 +629,7 @@ class WorkerVoucherStore(_Book):
         if len(signature) != 64:
             raise VoucherError("voucher signature must contain 64 bytes")
         account = state.read_channel(channel, configured)
+        require_open_channel(account, now=now)
         if total < account.redeemed:
             raise VoucherError("voucher total is below the on-chain redeemed total")
         if total > account.cap:

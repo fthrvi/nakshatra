@@ -3465,7 +3465,8 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
             return
         except _paid.PaidAdmissionError as e:
             paid_termination = (
-                "voucher-missing" if str(e) == "voucher-missing" else "cancelled")
+                str(e) if str(e) in {"voucher-missing", "channel-closing"}
+                else "cancelled")
             context.set_code(grpc.StatusCode.PERMISSION_DENIED)
             context.set_details(str(e))
             return

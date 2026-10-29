@@ -1026,6 +1026,9 @@ class ChainChatBackend(ChatBackend):
         import uuid
         import paid_client
 
+        if os.environ.get("NAK_PAY_MODE", "") == "chain":
+            return self._generate_chain_paid(entry, prompt, max_tokens, options)
+
         hook = self._ledger_hook()
         try:
             hook.require_paid_spend()
@@ -1167,6 +1170,86 @@ class ChainChatBackend(ChatBackend):
             credits_charged=audit["charged"],
             audit_receipt=audit,
         )
+
+    def _generate_chain_paid(self, entry, prompt, max_tokens, options):
+        """Run voucher-paid inference without creating a legacy credit hold."""
+        import secrets
+        import subprocess
+        import tempfile
+        import uuid
+        import paid_client
+
+        del options
+        config_path = None
+        config_owned = False
+        prompt_tokens = 0
+        text = None
+        client_stderr = ""
+        claim_token = secrets.token_urlsafe(32)
+        try:
+            config_path, plan, config_owned = self._paid_chain_config(entry)
+            prompt_tokens = self._paid_prompt_tokens(entry, prompt)
+            session_id = uuid.uuid4().hex
+            envelope = paid_client.make_paid_envelope(
+                claim_token=claim_token,
+                hold_id="chain-" + session_id,
+                session_id=session_id,
+                model_id=entry.name,
+                max_prompt_tokens=prompt_tokens,
+                max_output_tokens=int(max_tokens),
+                plan=plan,
+            )
+
+            token_file = tempfile.TemporaryFile(prefix="nak-paid-token-")
+            progress_read, progress_write = os.pipe()
+            try:
+                os.fchmod(token_file.fileno(), 0o600)
+                token_file.write(json.dumps(
+                    envelope, sort_keys=True, separators=(",", ":")).encode())
+                token_file.flush()
+                token_file.seek(0)
+                token_read = token_file.fileno()
+                try:
+                    out = subprocess.run(
+                        self._cmd(
+                            entry, prompt, max_tokens,
+                            config_path=config_path,
+                            paid_admission_fd=token_read,
+                            paid_progress_fd=progress_write,
+                        ),
+                        capture_output=True, text=True,
+                        timeout=self._timeout, env=self._client_env(),
+                        pass_fds=(token_read, progress_write),
+                    )
+                    client_stderr = out.stderr or ""
+                finally:
+                    os.close(progress_write)
+                progress_write = -1
+                paid_client.parse_invocation_events(
+                    self._read_fd_all(progress_read), plan)
+                progress_read = -1
+                if out.returncode != 0:
+                    raise paid_client.PaidAdmissionError(
+                        f"paid client exited {out.returncode}")
+                text = _parse_client_output(out.stdout)
+            finally:
+                token_file.close()
+                for fd in (progress_read, progress_write):
+                    if isinstance(fd, int) and fd >= 0:
+                        try:
+                            os.close(fd)
+                        except OSError:
+                            pass
+        except Exception as exc:
+            _log_paid_failure(
+                "generation", exc, client_stderr=client_stderr,
+                secrets=(claim_token,))
+            raise CreditGateError("paid generation failed closed", 503) from exc
+        finally:
+            if config_owned and config_path:
+                _quiet_unlink(config_path)
+
+        return GenerationResult(text=text, prompt_eval_count=prompt_tokens)
 
     def generate(self, entry, prompt, max_tokens, options):
         import subprocess, tempfile

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import socket
 import sys
 import threading
@@ -38,6 +39,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 import nakshatra_serve as ns  # noqa: E402
+import paid_client  # noqa: E402
 
 
 # ── Helpers ─────────────────────────────────────────────────────────
@@ -799,6 +801,63 @@ def test_v1_chat_completions_nonstream(tmp_path):
     assert choice["finish_reason"] == "stop"
     assert body["usage"]["total_tokens"] == (
         body["usage"]["prompt_tokens"] + body["usage"]["completion_tokens"])
+
+
+def test_chain_paid_gateway_http_uses_no_legacy_credit_routes(
+        tmp_path, monkeypatch):
+    worker_key = "11" * 32
+    config = tmp_path / "chain-paid.yaml"
+    config.write_text(
+        "workers:\n"
+        "  - id: paid-worker\n"
+        f"    public_key_hex: '{worker_key}'\n"
+        f"    peer_spki_hash: '{'22' * 32}'\n"
+        "    address: 127.0.0.1\n"
+        "    port: 1\n"
+        "    layer_range: [0, 4]\n")
+    entry = ns.ModelEntry(
+        name="chain-paid", tokenizer_gguf="/tokenizer", chain_yaml=str(config))
+
+    class RecordingLedger:
+        def __init__(self):
+            self.calls = []
+
+        def __getattr__(self, name):
+            if name in {
+                    "require_paid_spend", "authorize_spend", "claim_spend",
+                    "settle", "release_spend", "abandon_spend", "spend_status"}:
+                def record(*_args, **_kwargs):
+                    self.calls.append(name)
+                    raise AssertionError(f"chain mode called legacy ledger route {name}")
+                return record
+            raise AttributeError(name)
+
+    ledger = RecordingLedger()
+    backend = ns.ChainChatBackend(paid_admission=True)
+    backend._ledger_hook_cached = ledger
+    backend._paid_prompt_tokens = lambda _entry, _prompt: 3
+
+    def successful_chain_client(cmd, *, pass_fds, **_kwargs):
+        token_fd = int(cmd[cmd.index("--paid-admission-fd") + 1])
+        progress_fd = int(cmd[cmd.index("--paid-progress-fd") + 1])
+        envelope = paid_client.read_paid_envelope(os.dup(token_fd))
+        assert envelope["plan"][0]["worker_keyid"] == worker_key
+        paid_client.write_invocation_event(progress_fd, worker_key)
+        return SimpleNamespace(
+            returncode=0, stdout="[chain] gen:  'voucher paid'\n", stderr="")
+
+    monkeypatch.setenv("NAK_PAY_MODE", "chain")
+    monkeypatch.setattr("subprocess.run", successful_chain_client)
+    with _running_chat({entry.name: entry}, backend) as port:
+        status, body = _post(port, "/api/chat", {
+            "model": entry.name,
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": False,
+        })
+
+    assert status == 200
+    assert body["message"]["content"] == "voucher paid"
+    assert ledger.calls == []
 
 
 def test_enforce_mode_receipt_counts_reach_openai_and_ollama_responses(

@@ -75,11 +75,12 @@ def _install_pay_wallet(home: Path) -> None:
     (pay_dir / "custody").write_text("file\n", encoding="ascii")
 
 
-def _channel(*, signer=PAYER_B58, cap=10_000, redeemed=0) -> pay.ChannelAccount:
+def _channel(*, signer=PAYER_B58, cap=10_000, redeemed=0,
+             status="Open", close_at=0) -> pay.ChannelAccount:
     return pay.ChannelAccount(
         escrow=ESCROW, generation=4, seq=9, worker=PAY_WALLET_B58,
         voucher_signer=signer, delegate=None, cap=cap, redeemed=redeemed,
-        fee_bps_snapshot=300, status="Open", close_at=0,
+        fee_bps_snapshot=300, status=status, close_at=close_at,
         rent_payer=RENT_PAYER, bump=251,
     )
 
@@ -466,6 +467,84 @@ def test_channel_base_at_cap_cannot_admit_ceil_max_cost(tmp_path, monkeypatch):
     with pytest.raises(admission.PaidAdmissionError, match="insufficient"):
         manager.claim(PAYER_HEX, "full", init)
     store.close()
+    vouchers.close()
+
+
+def test_closing_channel_refused_at_admission_and_voucher_accept(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("NAK_PAY_MODE", "chain")
+    _install_pay_wallet(Path(os.environ["HOME"]))
+    closing = _channel(status="Closing", close_at=99)
+    state = pay.FakeChannelState(
+        {CHANNEL: closing}, {ESCROW: OWNER_B58}, program_id=PROGRAM)
+    vouchers = pay.WorkerVoucherStore(tmp_path / "closing" / "vouchers.sqlite")
+    store = admission.PaidAdmissionStore(tmp_path / "closing" / "paid.sqlite")
+    manager = admission.PaidAdmission(
+        _Ledger(_claim("closing")), store, WORKER_SEED, model_id="model",
+        layer_start=0, layer_end=4, clock=lambda: 100,
+        voucher_store=vouchers, channel_state=state, pay_program=PROGRAM)
+    assert manager.check_ready()
+    init = pay.init_wire(
+        TOKEN, program=PROGRAM, channel=CHANNEL, channel_base=0,
+        hold_id="hold", session_id="closing", model_id="model",
+        max_prompt_tokens=1, max_output_tokens=40)
+    with pytest.raises(admission.PaidAdmissionError, match="not open"):
+        manager.claim(PAYER_HEX, "closing", init)
+    with pytest.raises(pay.VoucherError, match="not open"):
+        vouchers.accept(
+            _voucher(total=1), configured_program=PROGRAM, state=state,
+            expected_channel=CHANNEL, now=100)
+    store.close()
+    vouchers.close()
+
+
+def test_voucher_refuses_channel_too_near_close_deadline(tmp_path):
+    state = pay.FakeChannelState(
+        {CHANNEL: _channel(status="Open", close_at=115)},
+        {ESCROW: OWNER_B58}, program_id=PROGRAM)
+    vouchers = pay.WorkerVoucherStore(tmp_path / "deadline" / "vouchers.sqlite")
+    with pytest.raises(pay.VoucherError, match="close deadline"):
+        vouchers.accept(
+            _voucher(total=1), configured_program=PROGRAM, state=state,
+            expected_channel=CHANNEL, now=100)
+
+    state.channels[CHANNEL] = _channel(status="Open", close_at=116)
+    assert vouchers.accept(
+        _voucher(total=1), configured_program=PROGRAM, state=state,
+        expected_channel=CHANNEL, now=100).total == 1
+    vouchers.close()
+
+
+def test_mid_session_close_stops_after_current_checkpoint(
+        tmp_path, monkeypatch):
+    manager, consumer, claim, vouchers, _ledger = _chain_admission(
+        tmp_path, monkeypatch, session="mid-close")
+    first = _run_step(manager, claim, 1, 1)
+    consumer.observe(WORKER_HEX, manager.chain_receipt_wire(claim, first))
+    consumer.acknowledge_delivery(prompt_tokens=1, generated_tokens=1)
+    manager.accept_chain_control(claim, consumer.outgoing(WORKER_HEX))
+
+    manager.channel_state.channels[CHANNEL] = _channel(
+        status="Closing", close_at=200)
+    completed = 0
+    for index in range(2, 20):
+        try:
+            receipt = _run_step(manager, claim, index, 1)
+        except admission.PaidAdmissionError as exc:
+            assert str(exc) == "channel-closing"
+            break
+        completed += 1
+        if receipt is not None:
+            manager.chain_receipt_wire(claim, receipt)
+    else:
+        pytest.fail("worker did not stop after the channel close request")
+
+    assert completed <= 8
+    final = manager.finalize(claim, "channel-closing")
+    assert final is not None
+    assert final["termination"] == "channel-closing"
+    consumer.book.close()
+    manager.store.close()
     vouchers.close()
 
 
