@@ -1141,7 +1141,7 @@ def _pay_command(args) -> None:
         return
 
     if args.pay_cmd == "export":
-        if not sys.stdin.isatty():
+        if not sys.stdin.isatty() or not sys.stdout.isatty():
             raise SystemExit("nak pay export is interactive-only; run it in a terminal")
         if input('type "export" to print the private wallet keypair: ').strip() != "export":
             raise SystemExit("wallet export cancelled; nothing was printed")

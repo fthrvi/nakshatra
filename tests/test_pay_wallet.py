@@ -171,14 +171,13 @@ def test_nak_pay_address_and_status_are_offline(capsys):
     assert "balance: set NAK_PAY_RPC to a devnet RPC to show balances" in output
 
 
-def test_nak_pay_export_refuses_without_a_tty(monkeypatch, capsys):
+@pytest.mark.parametrize(("stdin_tty", "stdout_tty"), [(False, True), (True, False)])
+def test_nak_pay_export_refuses_without_input_and_output_ttys(
+        stdin_tty, stdout_tty, monkeypatch, capsys):
     pay_wallet.ensure_wallet(_home())
-
-    class NotATerminal:
-        def isatty(self):
-            return False
-
-    monkeypatch.setattr(sys, "stdin", NotATerminal())
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: stdin_tty)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: stdout_tty)
+    monkeypatch.setattr("builtins.input", lambda _prompt: "export")
     with pytest.raises(SystemExit, match="interactive-only"):
         nak.main(["pay", "export", "--keypair"])
     assert capsys.readouterr().out == ""
@@ -193,6 +192,7 @@ def test_nak_pay_export_prints_the_standard_64_byte_keypair_after_confirmation(
             return True
 
     monkeypatch.setattr(sys, "stdin", Terminal())
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
     monkeypatch.setattr("builtins.input", lambda _prompt: "export")
     assert nak.main(["pay", "export", "--keypair"]) == 0
     exported = bytes(json.loads(capsys.readouterr().out))
