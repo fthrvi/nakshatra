@@ -1084,6 +1084,7 @@ _PRIVATE_CONSTRUCTOR_ALLOWLIST = Counter({
     ("network/nakd.py", "_own_custody_statement", "ed25519.Ed25519PrivateKey.from_private_bytes", "self._key"): 1,
     ("network/nakd.py", "node_sign_stage", "ed25519.Ed25519PrivateKey.from_private_bytes", "self._key"): 1,
     ("network/nakd.py", "report", "ed25519.Ed25519PrivateKey.from_private_bytes", "self._key"): 1,
+    ("network/pay_voucher.py", "_private_key", "ed25519.Ed25519PrivateKey.from_private_bytes", "raw"): 1,
     ("packaging/nakshatra_package.py", "sign", "ed25519.Ed25519PrivateKey.from_private_bytes", "priv_bytes"): 1,
     ("packaging/test_package_tool.py", "test_certify_refuses_invalid_package", "ed25519.Ed25519PrivateKey.generate", ""): 1,
     ("packaging/test_package_tool.py", "test_certify_signs_a_valid_package", "ed25519.Ed25519PrivateKey.generate", ""): 1,

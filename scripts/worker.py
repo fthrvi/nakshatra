@@ -103,6 +103,8 @@ _CONSUMER_INFERENCE_GRPC_METHODS = frozenset({
 })
 _INFO_ATTESTATION_DOMAIN = b"nakshatra-paid-info-v1\0"
 _INFO_CHALLENGE_BYTES = 32
+_PAY_CONTROL_REQUEST = b"nak-pay-control-v1"
+_PAY_CONTROL_OK = b"nak-pay-control-ok"
 
 
 class AuthenticatedKeyId(str):
@@ -2544,6 +2546,9 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                     raise _paid.PaidAdmissionError(
                         "paid Forward must be stateless, cold, direct, greedy, "
                         "and outside the fabric transport")
+                if paid_admission.chain_mode:
+                    raise _paid.PaidAdmissionError(
+                        "chain vouchers require the bidirectional Inference stream")
                 n_tokens = int(request.n_tokens)
                 if n_tokens <= 0:
                     raise _paid.PaidAdmissionError(
@@ -3028,9 +3033,14 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                     )
                     return
                 elif paid_claim is not None:
-                    if step.spend_claim_token:
+                    if (step.spend_claim_token
+                            and not paid_admission.chain_mode):
                         raise _paid.PaidAdmissionError(
                             "spend_claim_token is allowed only on the first paid frame")
+                    if (step.spend_claim_token
+                            and paid_admission.chain_mode):
+                        paid_admission.accept_chain_control(
+                            paid_claim, step.spend_claim_token)
                     if (step.chain or step.next_server.address or step.pushed
                             or step.all_logits
                             or self.fabric_first_worker_bridge is not None
@@ -3048,6 +3058,18 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                         error=b"invalid step_id",
                     )
                     return
+                if paid_claim is not None and step.HasField("error"):
+                    if (not paid_admission.chain_mode
+                            or step.error != _PAY_CONTROL_REQUEST):
+                        raise _paid.PaidAdmissionError(
+                            "invalid paid control frame")
+                    if not step.spend_claim_token:
+                        raise _paid.PaidAdmissionError(
+                            "voucher control frame has no voucher")
+                    yield pb.InferenceStep(
+                        session_id=step.session_id, step_id=step.step_id,
+                        error=_PAY_CONTROL_OK)
+                    continue
                 # v0.5 M0.5.2: idempotency cache. If this (session_id, step_id) has
                 # been served before, return the cached response without touching
                 # the daemon. Note: a cache hit advances first_step too — the
@@ -3140,6 +3162,8 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                             "KV_RESIDENCY_LOST: durable paid step requires cold replay")
                         yield self._kv_lost_step(step)
                         return
+                    paid_admission.require_chain_voucher_before_step(
+                        paid_claim, paid_prompt_delta, paid_generated_delta)
                     paid_meter = paid_admission.store.meter(
                         paid_claim["payer_keyid"], paid_claim["session_id"])
                     if (int(paid_meter["receipt_sequence"]) > 0
@@ -3271,11 +3295,13 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                 if paid_claim is not None:
                     # The usage journal and signed outbox entry are durable
                     # before any successful paid response can escape.
-                    paid_admission.commit_step(
+                    checkpoint_receipt = paid_admission.commit_step(
                         paid_claim, step.step_id, request_sha256,
                         paid_prompt_delta, paid_generated_delta,
                         stream_kv_epoch)
                     paid_admission.flush_outbox()
+                    out.spend_claim_token = paid_admission.chain_receipt_wire(
+                        paid_claim, checkpoint_receipt)
                 # 2026-09-12 participation binding — see SignParticipation's docstring.
                 # Records that THIS worker served THIS session (every mode), and — only for
                 # a real accepted final token — the exact id, so `_participation_evidence`
@@ -3417,7 +3443,8 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
             context.set_details(str(e))
             return
         except _paid.PaidAdmissionError as e:
-            paid_termination = "cancelled"
+            paid_termination = (
+                "voucher-missing" if str(e) == "voucher-missing" else "cancelled")
             context.set_code(grpc.StatusCode.PERMISSION_DENIED)
             context.set_details(str(e))
             return

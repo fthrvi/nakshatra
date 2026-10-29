@@ -449,7 +449,7 @@ class InferenceStream:
 def call_inference_step(streamer, payload, n_tokens, has_token_ids,
                          session_id, step_idx, prefix_length, timing=None,
                          next_server=None, chain=None, all_logits=False,
-                         spend_claim_token=""):
+                         spend_claim_token="", control_callback=None):
     """v0.5 M0.5.1 streaming equivalent of call_forward. Returns raw bytes
     matching Forward's return shape (hidden state OR int32 token id), so
     chain-walk code consumes the result identically.
@@ -495,6 +495,8 @@ def call_inference_step(streamer, payload, n_tokens, has_token_ids,
     resp = streamer.step(step)
     if timing is not None:
         timing.setdefault(streamer.worker_id, []).append(time.time() - t0)
+    if control_callback is not None and resp.spend_claim_token:
+        control_callback(resp.spend_claim_token)
 
     if resp.HasField("error"):
         err_str = resp.error.decode("utf-8", "replace")
@@ -1969,6 +1971,32 @@ def main():
         if args.max_tokens != paid["max_output_tokens"]:
             sys.exit("[paid] output cap differs from authorization")
 
+    chain_vouchers = None
+    if paid is not None and os.environ.get("NAK_PAY_MODE", "") == "chain":
+        try:
+            from network import pay_voucher
+            program = pay_voucher.configured_program()
+            state = pay_voucher.configured_state()
+            key_path = Path.home() / ".nakshatra" / "keys" / "worker.ed25519"
+            private_key = key_path.read_bytes()
+            if len(private_key) != 32:
+                raise pay_voucher.VoucherError(
+                    "consumer worker.ed25519 must contain a 32-byte seed")
+            book = pay_voucher.PayerChannelBook()
+            max_costs = {
+                stage["worker_keyid"]: (
+                    paid["max_prompt_tokens"] + paid["max_output_tokens"]
+                ) * (stage["layer_end"] - stage["layer_start"])
+                for stage in paid["plan"]
+            }
+            chain_vouchers = pay_voucher.ConsumerVoucherManager(
+                book=book, state=state, program=program, private_key=private_key,
+                plan=paid["plan"], max_cost_by_worker=max_costs,
+                session_id=paid["session_id"], hold_id=paid["hold_id"],
+                model_id=paid["model_id"])
+        except Exception as exc:
+            sys.exit(f"[paid] chain voucher admission refused: {exc}")
+
     # ── Speculative decoding setup (slice 1) ──────────────────────────────────
     # Engages only when explicitly enabled, a draft model is given, we're in unary
     # Forward mode, and EVERY worker advertises the "speculative" capability. Any
@@ -2102,6 +2130,8 @@ def main():
                                        chain=chain)
         if args.use_streaming:
             spend_claim_token = ""
+            voucher_to_ack = ""
+            worker_key = None
             if paid is not None:
                 worker_key = paid_client.worker_keyid(w)
                 if worker_key not in paid_invoked:
@@ -2111,11 +2141,29 @@ def main():
                     paid_client.write_invocation_event(
                         args.paid_progress_fd, worker_key)
                     paid_invoked.add(worker_key)
-                    spend_claim_token = paid["claim_token"]
-            return call_inference_step(streamers[idx], payload, n, has_tok,
-                                       session_id=session_id, step_idx=step,
-                                       prefix_length=prefix_length, timing=timing,
-                                       spend_claim_token=spend_claim_token)
+                    spend_claim_token = (
+                        chain_vouchers.first_wire(worker_key, paid["claim_token"])
+                        if chain_vouchers is not None else paid["claim_token"])
+                elif chain_vouchers is not None:
+                    voucher_to_ack = chain_vouchers.outgoing(worker_key)
+                    spend_claim_token = voucher_to_ack
+
+            def _observe(value):
+                try:
+                    chain_vouchers.observe(worker_key, value)
+                except Exception as exc:
+                    raise paid_client.PaidAdmissionError(
+                        f"worker checkpoint receipt refused: {exc}") from exc
+
+            result = call_inference_step(
+                streamers[idx], payload, n, has_tok,
+                session_id=session_id, step_idx=step,
+                prefix_length=prefix_length, timing=timing,
+                spend_claim_token=spend_claim_token,
+                control_callback=(_observe if chain_vouchers is not None else None))
+            if voucher_to_ack:
+                chain_vouchers.mark_sent(worker_key, voucher_to_ack)
+            return result
         return call_forward(stub_tup[1], payload, n, has_token_ids=has_tok,
                             worker_id=w["id"],
                             keep_kv=keep_kv, start_pos=prefix_length, timing=timing,
@@ -2411,6 +2459,15 @@ def main():
                     generated.append(next_id)
                 prefix_length += n_step
 
+                if chain_vouchers is not None:
+                    try:
+                        chain_vouchers.acknowledge_delivery(
+                            prompt_tokens=len(tokens),
+                            generated_tokens=len(generated))
+                    except Exception as exc:
+                        raise paid_client.PaidAdmissionError(
+                            f"worker checkpoint receipt refused: {exc}") from exc
+
                 if next_id in LLAMA3_EOS_IDS:
                     print(f"[chain] step {step+1}: EOS {next_id} — stopping")
                     break
@@ -2495,9 +2552,32 @@ def main():
             restart_requested = True
             # streams are closed at the top of the next iteration
 
-    # Successful exit from the recovery loop
+    # Successful exit from the recovery loop.  A checkpoint on the last
+    # generated token has no following inference request, so return its voucher
+    # in a control-only frame before closing each stream.
+    if chain_vouchers is not None:
+        for idx, (worker, _stub, _info) in enumerate(sorted_stubs):
+            worker_key = paid_client.worker_keyid(worker)
+            value = chain_vouchers.outgoing(worker_key)
+            if not value:
+                continue
+            control = pb.InferenceStep(
+                session_id=session_id,
+                step_id=f"voucher-final-{idx}",
+                prefix_length=prefix_length,
+                spend_claim_token=value,
+                error=b"nak-pay-control-v1",
+            )
+            response = streamers[idx].step(control)
+            if not response.HasField("error") or response.error != b"nak-pay-control-ok":
+                raise paid_client.PaidAdmissionError(
+                    f"worker {worker_key[:12]} refused final voucher control")
+            chain_vouchers.mark_sent(worker_key, value)
+
     for s in streamers:
         s.close()
+    if chain_vouchers is not None:
+        chain_vouchers.book.close()
 
     elapsed = time.time() - t0
     full = llama.detokenize(tokens + generated).decode("utf-8", errors="replace")
