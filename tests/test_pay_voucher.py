@@ -377,22 +377,25 @@ def test_fake_paid_session_voucher_chain_and_missing_bound(tmp_path, monkeypatch
     manager.accept_chain_control(claim, final_wire)
     assert worker_vouchers.latest(CHANNEL).total == receipt_totals[-1]
 
-    # A consumer that stops after the first checkpoint can make the worker do
-    # fewer than one additional 8-token checkpoint, never an unbounded stream.
+    # Silence is bounded in credits even while every rounded voucher total is
+    # still zero: one 8-token checkpoint plus RATE-1 rounding credits.
     stopped, consumer2, claim2, store2, _ledger2 = _chain_admission(
         tmp_path, monkeypatch, session="stopped")
     first = _run_step(stopped, claim2, 1, 1)
     assert first is not None
     stopped.chain_receipt_wire(claim2, first)
     completed_without_voucher = 0
-    for index in range(2, 20):
+    for index in range(2, 60):
         try:
             _run_step(stopped, claim2, index, 1)
         except admission.PaidAdmissionError as exc:
             assert str(exc) == "voucher-missing"
             break
         completed_without_voucher += 1
-    assert completed_without_voucher <= 8
+    meter = stopped.store.meter(PAYER_HEX, "stopped")
+    delivered = (
+        int(meter["prompt_tokens"]) + int(meter["generated_tokens"])) * 4
+    assert delivered <= 8 * 4 + (pay.RATE - 1)
 
     consumer.book.close()
     manager.store.close()
@@ -400,6 +403,106 @@ def test_fake_paid_session_voucher_chain_and_missing_bound(tmp_path, monkeypatch
     stopped.store.close()
     consumer2.book.close()
     store2.close()
+
+
+def test_worker_reserves_one_session_per_channel_and_advances_base(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("NAK_PAY_MODE", "chain")
+    _install_pay_wallet(Path(os.environ["HOME"]))
+    state = _state(cap=1000, redeemed=10)
+    vouchers = pay.WorkerVoucherStore(tmp_path / "shared" / "vouchers.sqlite")
+
+    def manager_for(session):
+        store = admission.PaidAdmissionStore(tmp_path / session / "paid.sqlite")
+        manager = admission.PaidAdmission(
+            _Ledger(_claim(session, layer_end=100)), store, WORKER_SEED,
+            model_id="model", layer_start=0, layer_end=100, clock=lambda: 100,
+            voucher_store=vouchers, channel_state=state, pay_program=PROGRAM)
+        assert manager.check_ready()
+        return manager
+
+    def init_for(session, base):
+        return pay.init_wire(
+            TOKEN, program=PROGRAM, channel=CHANNEL, channel_base=base,
+            hold_id="hold", session_id=session, model_id="model",
+            max_prompt_tokens=1, max_output_tokens=40)
+
+    first = manager_for("reservation-a")
+    claim_a = first.claim(PAYER_HEX, "reservation-a", init_for("reservation-a", 10))
+    second = manager_for("reservation-b")
+    with pytest.raises(admission.PaidAdmissionError, match="channel busy"):
+        second.claim(PAYER_HEX, "reservation-b", init_for("reservation-b", 10))
+    with pytest.raises(pay.VoucherError, match="not held by this session"):
+        vouchers.accept(
+            _voucher(total=11), configured_program=PROGRAM, state=state,
+            expected_channel=CHANNEL,
+            reservation_id=f"{PAYER_HEX}:reservation-b")
+    assert vouchers.latest(CHANNEL) is None
+
+    # One 100-layer prefill+decode checkpoint is 200 credits, so A's final
+    # cumulative voucher advances the channel base from 10 to 12.
+    receipt = _run_step(first, claim_a, 1, 1)
+    assert receipt is not None and receipt["cumulative_cost"] == 200
+    first.chain_receipt_wire(claim_a, receipt)
+    first.accept_chain_control(
+        claim_a, pay.voucher_wire(
+            program=PROGRAM, channel=CHANNEL, total=12,
+            signature=pay.sign_voucher(PAYER_SEED, PROGRAM, CHANNEL, 12)))
+    first.release_chain_session(claim_a)
+
+    with pytest.raises(admission.PaidAdmissionError,
+                       match="does not match worker-derived base"):
+        second.claim(PAYER_HEX, "reservation-b", init_for("reservation-b", 10))
+    claim_b = second.claim(
+        PAYER_HEX, "reservation-b", init_for("reservation-b", 12))
+    assert second._chain_session(claim_b)["channel_base"] == 12
+
+    second.release_chain_session(claim_b)
+    first.store.close()
+    second.store.close()
+    vouchers.close()
+
+
+def test_voucher_silence_bound_counts_credits_before_rounding(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("NAK_PAY_MODE", "chain")
+    _install_pay_wallet(Path(os.environ["HOME"]))
+    state = _state(cap=1000, redeemed=10)
+    vouchers = pay.WorkerVoucherStore(tmp_path / "rounding" / "vouchers.sqlite")
+    vouchers.accept(
+        _voucher(total=10), configured_program=PROGRAM, state=state,
+        expected_channel=CHANNEL)
+    store = admission.PaidAdmissionStore(tmp_path / "rounding" / "paid.sqlite")
+    manager = admission.PaidAdmission(
+        _Ledger(_claim("rounding", layer_end=1)), store, WORKER_SEED,
+        model_id="model", layer_start=0, layer_end=1, clock=lambda: 100,
+        voucher_store=vouchers, channel_state=state, pay_program=PROGRAM)
+    assert manager.check_ready()
+    claim = manager.claim(
+        PAYER_HEX, "rounding", pay.init_wire(
+            TOKEN, program=PROGRAM, channel=CHANNEL, channel_base=10,
+            hold_id="hold", session_id="rounding", model_id="model",
+            max_prompt_tokens=1, max_output_tokens=200))
+
+    stopped = False
+    for index in range(1, 150):
+        try:
+            receipt = _run_step(manager, claim, index, 1)
+        except admission.PaidAdmissionError as exc:
+            assert str(exc) == "voucher-missing"
+            stopped = True
+            break
+        if receipt is not None:
+            wire = manager.chain_receipt_wire(claim, receipt)
+            assert pay.parse_wire(wire)["receipt"]["cumulative_cost"] <= 107
+    assert stopped
+    meter = manager.store.meter(PAYER_HEX, "rounding")
+    delivered = int(meter["prompt_tokens"]) + int(meter["generated_tokens"])
+    assert delivered <= 8 + (pay.RATE - 1)
+
+    manager.release_chain_session(claim)
+    store.close()
+    vouchers.close()
 
 
 def test_chain_mode_never_calls_credit_moving_ledger_routes(tmp_path, monkeypatch):
@@ -646,11 +749,40 @@ def test_final_partial_receipt_is_vouched_before_stream_close(tmp_path, monkeypa
     requests.put(sentinel)
     with pytest.raises(StopIteration):
         next(responses)
+    assert vouchers._db.execute(
+        "SELECT count(*) FROM reservations").fetchone()[0] == 0
 
     latest = vouchers.latest(CHANNEL)
     assert latest is not None
     assert latest.total == pay.credits_to_total(
         0, final_control["receipt"]["cumulative_cost"])
+    consumer.book.close()
+    manager.store.close()
+    vouchers.close()
+
+
+def test_worker_error_releases_channel_reservation(tmp_path, monkeypatch):
+    manager, consumer, _claim_value, vouchers, _ledger = _chain_admission(
+        tmp_path, monkeypatch, session="release-error")
+    servicer = worker.WorkerServicer(
+        _Daemon(), "solo", 0, 4, "model", paid_admission=manager,
+        refuse_unregistered_peers=False, refuse_unpinned_peers=False)
+    servicer._check_grpc_auth = lambda *_args, **_kwargs: (
+        worker.AuthenticatedKeyId(PAYER_HEX, worker._wgrpcauth.ROLE_CONSUMER))
+    first = pb.InferenceStep(
+        session_id="release-error", step_id="step-1", prefix_length=0,
+        spend_claim_token=consumer.first_wire(WORKER_HEX, TOKEN))
+    first.token_ids.ids.append(1)
+    malformed = pb.InferenceStep(
+        session_id="release-error", step_id="step-2", prefix_length=1,
+        spend_claim_token="not-a-voucher")
+    malformed.token_ids.ids.append(1)
+
+    responses = list(servicer.Inference(iter((first, malformed)), _Context()))
+    assert len(responses) == 1
+    assert vouchers._db.execute(
+        "SELECT count(*) FROM reservations").fetchone()[0] == 0
+
     consumer.book.close()
     manager.store.close()
     vouchers.close()
@@ -699,9 +831,14 @@ def _rpc_server(genesis, account_data):
             if request["method"] == "getGenesisHash":
                 result = genesis
             else:
-                result = {"value": {
+                result = {"context": {"apiVersion": "2.0.15", "slot": 341197053},
+                          "value": {
                     "owner": PROGRAM,
                     "data": [base64.b64encode(account_data).decode("ascii"), "base64"],
+                    "lamports": 2039280,
+                    "executable": False,
+                    "rentEpoch": 18446744073709551615,
+                    "space": len(account_data),
                 }}
             body = json.dumps({"jsonrpc": "2.0", "id": request["id"],
                                "result": result}).encode()
@@ -750,6 +887,19 @@ def test_malformed_rpc_genesis_fails_closed():
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_rpc_rejects_legacy_value_only_account_wrapper():
+    class LegacyShape(pay.JsonRpcChannelState):
+        def _ensure_cluster(self):
+            pass
+
+        def _rpc(self, method, params):
+            del method, params
+            return {"value": None}
+
+    with pytest.raises(pay.VoucherError, match="malformed account result"):
+        LegacyShape("http://127.0.0.1:1").read_channel(CHANNEL, PROGRAM)
 
 
 def test_unset_mode_preserves_legacy_wire_bytes(tmp_path, monkeypatch):

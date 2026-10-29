@@ -3512,8 +3512,12 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                         # leak receipt or payer material into daemon logs.
                         pass
             finally:
-                if paid_session_lock is not None:
-                    paid_session_lock.release()
+                try:
+                    if paid_claim is not None:
+                        paid_admission.release_chain_session(paid_claim)
+                finally:
+                    if paid_session_lock is not None:
+                        paid_session_lock.release()
             # worker/kv-session-ownership-gate: release on EVERY exit path —
             # normal completion, an early `return` above, the idle-timeout or
             # generic-exception handlers, or the client dropping the stream.

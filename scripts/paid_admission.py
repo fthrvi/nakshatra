@@ -753,7 +753,15 @@ class PaidAdmission:
         return response
 
     def _admit_chain(self, claim: dict, init: dict) -> None:
+        reservation_id = (
+            f"{claim['payer_keyid']}:{claim['session_id']}")
+        reserved = False
         try:
+            # Acquire before deriving the base. This serializes the latest
+            # stored voucher with admission across threads and processes.
+            self.voucher_store.acquire_reservation(
+                init["channel"], reservation_id)
+            reserved = True
             account = self.channel_state.read_channel(
                 init["channel"], self.pay_program)
             self._pay.require_open_channel(account, now=self.clock())
@@ -776,8 +784,12 @@ class PaidAdmission:
             self._chain_sessions[(claim["payer_keyid"], claim["session_id"])] = {
                 "channel": init["channel"], "channel_base": base,
                 "pending_total": None, "channel_closing": False,
+                "reservation_id": reservation_id,
             }
         except Exception as exc:
+            if reserved:
+                self.voucher_store.release_reservation(
+                    init["channel"], reservation_id)
             raise PaidAdmissionError(f"chain channel admission refused ({exc})") from exc
 
     def _chain_session(self, claim: Mapping[str, object]) -> dict:
@@ -786,6 +798,22 @@ class PaidAdmission:
                                          str(claim["session_id"]))]
         except KeyError as exc:
             raise PaidAdmissionError("chain session has no admitted channel") from exc
+
+    def release_chain_session(self, claim: Mapping[str, object]) -> None:
+        """Release this process's durable channel reservation on every exit."""
+        if not self.chain_mode:
+            return
+        key = (str(claim["payer_keyid"]), str(claim["session_id"]))
+        session = self._chain_sessions.get(key)
+        if session is None:
+            return
+        try:
+            self.voucher_store.release_reservation(
+                session["channel"], session["reservation_id"])
+        except Exception as exc:
+            raise PaidAdmissionError(
+                f"chain channel reservation release failed ({exc})") from exc
+        self._chain_sessions.pop(key, None)
 
     def accept_chain_control(self, claim: dict, value: str) -> None:
         """Verify and durably store a voucher before this method returns."""
@@ -799,7 +827,7 @@ class PaidAdmission:
             record = self.voucher_store.accept(
                 control, configured_program=self.pay_program,
                 state=self.channel_state, expected_channel=session["channel"],
-                now=self.clock())
+                now=self.clock(), reservation_id=session["reservation_id"])
             pending = session["pending_total"]
             if pending is not None and record.total >= pending:
                 session["pending_total"] = None
@@ -825,26 +853,41 @@ class PaidAdmission:
         if not self.chain_mode:
             return
         session = self._chain_session(claim)
+        try:
+            self.voucher_store.assert_reservation(
+                session["channel"], session["reservation_id"])
+        except Exception as exc:
+            raise PaidAdmissionError(
+                f"chain channel reservation lost ({exc})") from exc
         if session["channel_closing"]:
             raise PaidAdmissionError("channel-closing")
-        pending = session["pending_total"]
-        if pending is None:
-            return
         row = self.store.meter(claim["payer_keyid"], claim["session_id"])
-        next_checkpoint = (
-            prompt_delta > 0
-            or int(row["generated_tokens"]) + generated_delta
-            - int(row["last_checkpoint_generated_tokens"]) >= 8
-            or int(self.clock()) - int(row["last_checkpoint_at"]) >= 15
-        )
         latest = self.voucher_store.latest(session["channel"])
-        if next_checkpoint and (latest is None or latest.total < pending):
+        accepted_total = (
+            latest.total if latest is not None else session["channel_base"])
+        covered_credits = max(
+            0, accepted_total - session["channel_base"]) * self._pay.RATE
+        layers = int(claim["layer_end"]) - int(claim["layer_start"])
+        multiplier = int(claim["price_multiplier"]) if claim["billable"] else 0
+        delivered_credits = (
+            int(row["prompt_tokens"]) + int(row["generated_tokens"])
+            + int(prompt_delta) + int(generated_delta)
+        ) * layers * multiplier
+        checkpoint_credits = 8 * layers * multiplier
+        if (delivered_credits - covered_credits
+                > checkpoint_credits + (self._pay.RATE - 1)):
             raise PaidAdmissionError("voucher-missing")
 
     def chain_receipt_wire(self, claim: dict, receipt: Optional[dict]) -> str:
         if not self.chain_mode or receipt is None:
             return ""
         session = self._chain_session(claim)
+        try:
+            self.voucher_store.assert_reservation(
+                session["channel"], session["reservation_id"])
+        except Exception as exc:
+            raise PaidAdmissionError(
+                f"chain channel reservation lost ({exc})") from exc
         total = self._pay.credits_to_total(
             session["channel_base"], int(receipt["cumulative_cost"]))
         session["pending_total"] = total

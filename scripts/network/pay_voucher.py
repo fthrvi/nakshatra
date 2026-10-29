@@ -383,19 +383,47 @@ class JsonRpcChannelState:
             result = self._rpc("getAccountInfo", [
                 address, {"commitment": "finalized", "encoding": "base64"},
             ])
-            if not isinstance(result, dict) or set(result) != {"value"}:
+            if (not isinstance(result, dict)
+                    or set(result) != {"context", "value"}
+                    or not isinstance(result["context"], dict)):
                 raise VoucherError("RPC returned a malformed account result")
+            context = result["context"]
+            if (set(context) not in ({"slot"}, {"apiVersion", "slot"})
+                    or isinstance(context.get("slot"), bool)
+                    or not isinstance(context.get("slot"), int)
+                    or context["slot"] < 0
+                    or ("apiVersion" in context
+                        and (not isinstance(context["apiVersion"], str)
+                             or not context["apiVersion"]))):
+                raise VoucherError("RPC returned a malformed account context")
             value = result["value"]
             if value is None:
                 raise VoucherError(f"account does not exist: {address}")
-            if not isinstance(value, dict):
+            if (not isinstance(value, dict)
+                    or set(value) != {
+                        "data", "executable", "lamports", "owner",
+                        "rentEpoch", "space",
+                    }
+                    or not isinstance(value["executable"], bool)
+                    or isinstance(value["lamports"], bool)
+                    or not isinstance(value["lamports"], int)
+                    or value["lamports"] < 0
+                    or isinstance(value["rentEpoch"], bool)
+                    or not isinstance(value["rentEpoch"], int)
+                    or value["rentEpoch"] < 0
+                    or isinstance(value["space"], bool)
+                    or not isinstance(value["space"], int)
+                    or value["space"] < 0):
                 raise VoucherError("RPC returned a malformed account value")
             if value["owner"] != program_id:
                 raise VoucherError("account is not owned by the configured program")
             encoded = value["data"]
             if not isinstance(encoded, list) or len(encoded) != 2 or encoded[1] != "base64":
                 raise VoucherError("RPC returned an unsupported account encoding")
-            return base64.b64decode(encoded[0], validate=True)
+            raw = base64.b64decode(encoded[0], validate=True)
+            if len(raw) != value["space"]:
+                raise VoucherError("RPC account data length differs from space")
+            return raw
         except VoucherError:
             raise
         except Exception as exc:
@@ -591,6 +619,32 @@ class VoucherRecord:
     signature: bytes
 
 
+def _process_start_time(pid: int) -> str | None:
+    """Return Linux's non-recycled process start tick, or None if it is gone."""
+    try:
+        raw = Path(f"/proc/{int(pid)}/stat").read_text(encoding="ascii")
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise VoucherError("cannot verify voucher reservation process") from exc
+    try:
+        # comm is parenthesized and may contain spaces; starttime is field 22,
+        # which is tail index 19 after fields 1 and 2 are removed.
+        tail = raw[raw.rindex(")") + 2:].split()
+        start = tail[19]
+        if not start.isdigit():
+            raise ValueError
+        return start
+    except (IndexError, ValueError) as exc:
+        raise VoucherError("cannot parse voucher reservation process") from exc
+
+
+def _reservation_id(value: object) -> str:
+    if not isinstance(value, str) or not value or len(value.encode("utf-8")) > 512:
+        raise VoucherError("voucher reservation id is invalid")
+    return value
+
+
 class WorkerVoucherStore(_Book):
     """Latest verified voucher per channel, committed before work resumes."""
 
@@ -601,6 +655,74 @@ class WorkerVoucherStore(_Book):
             "channel TEXT PRIMARY KEY, program TEXT NOT NULL, total TEXT NOT NULL, "
             "signature BLOB NOT NULL)"
         )
+        self._db.execute(
+            "CREATE TABLE IF NOT EXISTS reservations("
+            "channel TEXT PRIMARY KEY, reservation_id TEXT NOT NULL, "
+            "pid INTEGER NOT NULL, process_start TEXT NOT NULL, "
+            "acquired_at INTEGER NOT NULL)"
+        )
+        self._secure()
+
+    def acquire_reservation(self, channel: str, reservation_id: str) -> None:
+        """Persist exclusive ownership, reclaiming only a dead process's row."""
+        key = _pubkey_text(channel, "channel")
+        owner = _reservation_id(reservation_id)
+        pid = os.getpid()
+        process_start = _process_start_time(pid)
+        if process_start is None:
+            raise VoucherError("cannot identify voucher reservation process")
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._db.execute(
+                    "SELECT * FROM reservations WHERE channel=?", (key,)).fetchone()
+                if row is not None:
+                    same_owner = (
+                        row["reservation_id"] == owner
+                        and int(row["pid"]) == pid
+                        and row["process_start"] == process_start)
+                    if not same_owner:
+                        live_start = _process_start_time(int(row["pid"]))
+                        if live_start == row["process_start"]:
+                            raise VoucherError("channel busy")
+                        self._db.execute(
+                            "DELETE FROM reservations WHERE channel=?", (key,))
+                self._db.execute(
+                    "INSERT OR REPLACE INTO reservations("
+                    "channel,reservation_id,pid,process_start,acquired_at) "
+                    "VALUES(?,?,?,?,?)",
+                    (key, owner, pid, process_start, int(time.time())))
+                self._db.execute("COMMIT")
+            except Exception:
+                self._db.execute("ROLLBACK")
+                raise
+        self._secure()
+
+    def _assert_reservation_row(self, channel: str, reservation_id: str) -> None:
+        row = self._db.execute(
+            "SELECT * FROM reservations WHERE channel=?", (channel,)).fetchone()
+        process_start = _process_start_time(os.getpid())
+        if (row is None
+                or row["reservation_id"] != reservation_id
+                or int(row["pid"]) != os.getpid()
+                or row["process_start"] != process_start):
+            raise VoucherError("channel reservation is not held by this session")
+
+    def assert_reservation(self, channel: str, reservation_id: str) -> None:
+        key = _pubkey_text(channel, "channel")
+        owner = _reservation_id(reservation_id)
+        with self._lock:
+            self._assert_reservation_row(key, owner)
+
+    def release_reservation(self, channel: str, reservation_id: str) -> None:
+        key = _pubkey_text(channel, "channel")
+        owner = _reservation_id(reservation_id)
+        process_start = _process_start_time(os.getpid())
+        with self._lock:
+            self._db.execute(
+                "DELETE FROM reservations WHERE channel=? AND reservation_id=? "
+                "AND pid=? AND process_start=?",
+                (key, owner, os.getpid(), process_start))
         self._secure()
 
     def latest(self, channel: str) -> VoucherRecord | None:
@@ -613,7 +735,8 @@ class WorkerVoucherStore(_Book):
 
     def accept(self, voucher: Mapping[str, object], *, configured_program: str,
                state: ChannelState, expected_channel: str | None = None,
-               now: float | None = None) -> VoucherRecord:
+               now: float | None = None,
+               reservation_id: str | None = None) -> VoucherRecord:
         program = _pubkey_text(voucher.get("program"), "program id")
         configured = _pubkey_text(configured_program, "configured program id")
         if program != configured:
@@ -642,6 +765,9 @@ class WorkerVoucherStore(_Book):
         with self._lock:
             self._db.execute("BEGIN IMMEDIATE")
             try:
+                if reservation_id is not None:
+                    self._assert_reservation_row(
+                        channel, _reservation_id(reservation_id))
                 previous = self._db.execute(
                     "SELECT * FROM vouchers WHERE channel=?", (channel,)).fetchone()
                 if previous is not None:
