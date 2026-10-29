@@ -1208,7 +1208,7 @@ class Node:
                     and not delegate["disabled"]
                     and delegate["expires_at"] > chain_now
                     and bool(delegate["flags"] & pay_chain.DELEGATE_OPEN_CHANNEL)
-                    and delegate["cap_total"] >= cap
+                    and max(0, delegate["cap_total"] - delegate["spent"]) >= cap
                 )
                 if usable:
                     return {
@@ -1230,8 +1230,14 @@ class Node:
                     f"inviter escrow lacks {cap / 1_000_000:.6f} USDC; nak pay deposit")
 
             expires_at = chain_now + STARTER_DELEGATE_DAYS * 86400
-            set_cap = max(cap, int((delegate or {}).get("cap_total", 0)),
-                          int((delegate or {}).get("spent", 0)))
+            # delegate_set preserves spent within the current escrow generation, but resets it
+            # when adopting a delegate from an older generation.  Authorize exactly this signed
+            # obligation's remaining amount in either case -- never revive a stale larger cap.
+            spent_after = (int(delegate["spent"])
+                           if delegate and delegate["generation"] == escrow["generation"] else 0)
+            set_cap = spent_after + cap
+            if set_cap > (1 << 64) - 1:
+                raise ValueError("starter delegate cap exceeds u64")
             instructions = pay_chain.delegate_set(
                 owner, node_public, set_cap, expires_at,
                 pay_chain.DELEGATE_OPEN_CHANNEL, program)

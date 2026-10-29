@@ -31,13 +31,13 @@ def _escrow_data(owner: str, vault: str, *, committed: int = 0) -> bytes:
     return bytes(raw)
 
 
-def _delegate_data(escrow: str, *, cap: int, expires: int,
+def _delegate_data(escrow: str, *, cap: int, expires: int, spent: int = 0,
                    flags: int = 1, disabled: bool = False) -> bytes:
     raw = bytearray(pay_chain.DELEGATE_ACCOUNT_SPACE)
     raw[:8] = hashlib.sha256(b"account:Delegate").digest()[:8]
     raw[8:40] = pay_chain.pubkey_bytes(escrow)
     raw[40:72] = RECIPIENT
-    struct.pack_into("<QQQqBII", raw, 72, 0, cap, 0, expires, flags, 0, 0)
+    struct.pack_into("<QQQqBII", raw, 72, 0, cap, spent, expires, flags, 0, 0)
     raw[113] = int(disabled)
     raw[114] = 1
     return bytes(raw)
@@ -81,7 +81,8 @@ class AttemptStore(StarterStore):
 class StarterRpc:
     def __init__(self, wallet, *, vault_amount=10, committed=0,
                  wallet_balance=50_000_000, node_balance=0,
-                 existing_cap=None, existing_expires=0, fail_unknown=False):
+                 existing_cap=None, existing_spent=0, existing_expires=0,
+                 fail_unknown=False):
         self.wallet = wallet
         self.derived = pay_chain._derived(wallet["address"], PROGRAM)
         self.delegate_address = pay_chain.delegate_pda(
@@ -91,6 +92,7 @@ class StarterRpc:
         self.wallet_balance = wallet_balance
         self.node_balance = node_balance
         self.delegate_cap = existing_cap
+        self.delegate_spent = existing_spent
         self.delegate_expires = existing_expires
         self.fail_unknown = fail_unknown
         self.sent = []
@@ -112,7 +114,7 @@ class StarterRpc:
         if address == self.delegate_address and self.delegate_cap is not None:
             return {"owner": PROGRAM, "data": _delegate_data(
                 self.derived["escrow"], cap=self.delegate_cap,
-                expires=self.delegate_expires)}
+                spent=self.delegate_spent, expires=self.delegate_expires)}
         return None
 
     def balance(self, address):
@@ -135,7 +137,9 @@ class StarterRpc:
         self.sent.append(transaction)
         if on_sent:
             on_sent(transaction.signature)
-        self.delegate_cap = max(self.delegate_cap or 0, 1_000_000)
+        marker = pay_chain.anchor_discriminator("delegate_set")
+        offset = transaction.message.index(marker) + len(marker) + 32
+        self.delegate_cap, = struct.unpack_from("<Q", transaction.message, offset)
         self.delegate_expires = self.chain_now + nakd.STARTER_DELEGATE_DAYS * 86400
         if self.fail_unknown:
             self.fail_unknown = False
@@ -209,18 +213,25 @@ def test_crash_after_sol_intent_never_builds_second_top_up(chain_node, monkeypat
     assert struct.pack("<I", 2) + struct.pack("<Q", nakd.STARTER_NODE_SOL) not in rpc.sent[0].message
 
 
-def test_existing_larger_expired_cap_is_not_lowered(chain_node, monkeypatch):
+def test_expired_larger_cap_renews_with_exactly_signed_amount_spendable(
+        chain_node, monkeypatch):
     node, wallet, row = chain_node
-    larger = 2_000_000
+    larger = 100_000_000
+    spent = 40_000_000
     rpc = StarterRpc(
-        wallet, vault_amount=3_000_000, existing_cap=larger,
+        wallet, vault_amount=2_000_000, existing_cap=larger, existing_spent=spent,
         existing_expires=1_600_000_000, node_balance=nakd.STARTER_NODE_SOL)
     monkeypatch.setattr(pay_chain, "PayRpc", lambda _url: rpc)
 
     node._chain_starter(row)
 
-    assert struct.pack("<Q", larger) in rpc.sent[0].message
-    assert rpc.delegate_cap == larger
+    signed_cap = spent + 1_000_000
+    args = (RECIPIENT + struct.pack(
+        "<QqB", signed_cap, rpc.chain_now + 30 * 86400,
+        pay_chain.DELEGATE_OPEN_CHANNEL))
+    assert pay_chain.anchor_discriminator("delegate_set") + args in rpc.sent[0].message
+    assert signed_cap - spent == 1_000_000
+    assert struct.pack("<Q", larger) not in rpc.sent[0].message
 
 
 @pytest.mark.parametrize(("changes", "match"), [
