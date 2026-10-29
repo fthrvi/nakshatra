@@ -880,9 +880,13 @@ class PaidAdmission:
             int(row["prompt_tokens"]) + int(row["generated_tokens"])
             + int(prompt_delta) + int(generated_delta)
         ) * layers * multiplier
-        # Unpaid work may be one step: a normal 8-token checkpoint, or this step's prefill when the
-        # prompt is longer (the first voucher can only follow the first receipt; max_cost bounds it).
-        step_tokens = max(8, int(prompt_delta) + int(generated_delta))
+        # Unpaid work may be one step: a normal 8-token checkpoint, except the session's FIRST step,
+        # whose prefill may be longer because no voucher can exist before the first receipt
+        # (max_cost bounds it). Every later step gets only the 8-token checkpoint.
+        first_step = int(row["prompt_tokens"]) + int(row["generated_tokens"]) == 0
+        step_tokens = 8
+        if first_step:
+            step_tokens = max(8, int(prompt_delta) + int(generated_delta))
         checkpoint_credits = step_tokens * layers * multiplier
         if (delivered_credits - covered_credits
                 > checkpoint_credits + (self._pay.RATE - 1)):

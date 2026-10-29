@@ -9,6 +9,7 @@ import queue
 import sqlite3
 import stat
 import struct
+import subprocess
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1206,6 +1207,43 @@ def test_rpc_refuses_redirects():
             f"http://127.0.0.1:{server.server_port}", timeout=2)
         with pytest.raises(pay.VoucherError, match="redirects are refused"):
             state.read_channel(CHANNEL, PROGRAM)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_later_large_step_without_voucher_is_refused(tmp_path, monkeypatch):
+    manager, consumer, claim, worker_vouchers, _ledger = _chain_admission(
+        tmp_path, monkeypatch, session="later-large")
+    first = _run_step(manager, claim, 1, 1)
+    assert first is not None or manager.store.meter(PAYER_HEX, "later-large")["generated_tokens"]
+    with pytest.raises(admission.PaidAdmissionError, match="voucher-missing"):
+        manager.require_chain_voucher_before_step(claim, 100, 1)
+    consumer.book.close()
+    manager.store.close()
+    worker_vouchers.close()
+
+
+def test_rpc_ignores_environment_proxies(tmp_path):
+    # The opener is built at import time, so import it in a fresh process whose environment names a
+    # proxy that would refuse the connection.
+    server, calls = _rpc_server(DEVNET_GENESIS, _channel_fixture())
+    scripts = Path(pay.__file__).resolve().parents[1]
+    env = {k: v for k, v in os.environ.items()
+           if k.lower() not in {"no_proxy", "http_proxy", "https_proxy", "all_proxy"}}
+    env.update({"http_proxy": "http://127.0.0.1:9", "HTTP_PROXY": "http://127.0.0.1:9",
+                "PYTHONPATH": str(scripts)})
+    code = (
+        "import sys; from network import pay_voucher as p; "
+        f"s = p.JsonRpcChannelState('http://localhost:{server.server_port}', timeout=2); "
+        f"print(s.read_channel({CHANNEL!r}, {PROGRAM!r}).cap)"
+    )
+    try:
+        out = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True,
+                             text=True, timeout=30)
+        assert out.returncode == 0, out.stderr
+        assert out.stdout.strip() == "10000"
+        assert calls[0] == "getGenesisHash"
     finally:
         server.shutdown()
         server.server_close()

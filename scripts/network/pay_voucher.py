@@ -330,7 +330,9 @@ class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
         raise VoucherError("Solana RPC redirects are refused")
 
 
-_RPC_OPENER = urllib.request.build_opener(_RefuseRedirect)
+# An empty ProxyHandler ignores http_proxy/https_proxy: the https/loopback rule is about the endpoint
+# actually reached, so no environment proxy may sit in between.
+_RPC_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _RefuseRedirect)
 RPC_RESPONSE_MAX = 1 << 20  # a Channel/Escrow account reply is a few KiB
 
 
