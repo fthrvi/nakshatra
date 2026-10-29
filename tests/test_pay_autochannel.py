@@ -7,6 +7,7 @@ import os
 import stat
 import struct
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -72,7 +73,8 @@ class FakeRpc:
                  expires=10_000, flags=1, disabled=False, node_balance=100_000,
                  has_delegate=True, shared_seq=None, shared_sent=None,
                  shared_lock=None, fail_definite=False, fail_unknown=False,
-                 chain_time=1000, chain_time_error=None):
+                 chain_time=1000, chain_time_error=None,
+                 channel_changes=None):
         self.open_cap = open_cap
         self.vault_amount = vault_amount
         self.delegate_cap = delegate_cap
@@ -85,6 +87,7 @@ class FakeRpc:
         self.fail_unknown = fail_unknown
         self.current_chain_time = chain_time
         self.chain_time_error = chain_time_error
+        self.channel_changes = dict(channel_changes or {})
         self.seq = shared_seq or multiprocessing.Value("q", 0)
         self.sent = shared_sent or multiprocessing.Value("i", 0)
         self.send_lock = shared_lock or multiprocessing.Lock()
@@ -161,12 +164,13 @@ class FakeRpc:
             expected = pay_chain.channel_pda(
                 self.derived["escrow"], 0, seq, PROGRAM)[0]
             if address == expected:
-                return voucher.ChannelAccount(
+                account = voucher.ChannelAccount(
                     escrow=self.derived["escrow"], generation=0, seq=seq,
                     worker=pay_chain.b58encode(WORKER_PUBLIC),
                     voucher_signer=NODE, delegate=self.delegate,
                     cap=self.open_cap, redeemed=0, fee_bps_snapshot=300,
                     status="Open", close_at=0, rent_payer=NODE, bump=1)
+                return replace(account, **self.channel_changes)
         raise voucher.VoucherError(f"account does not exist: {address}")
 
     def read_escrow_owner(self, escrow, program_id):
@@ -375,6 +379,36 @@ def test_clear_preflight_refusals(tmp_path, changes, match):
     with pytest.raises(voucher.VoucherError, match=match):
         _ensure(tmp_path, rpc, required=1)
     assert rpc.sent.value == 0
+
+
+@pytest.mark.parametrize(("field", "value"), [
+    ("escrow", pay_chain.b58encode(bytes([60]) * 32)),
+    ("worker", pay_chain.b58encode(bytes([61]) * 32)),
+    ("cap", 9),
+    ("voucher_signer", pay_chain.b58encode(bytes([62]) * 32)),
+    ("delegate", pay_chain.b58encode(bytes([63]) * 32)),
+    ("status", "Closing"),
+])
+def test_post_open_verification_rejects_each_mutated_field(
+        tmp_path, field, value):
+    paths = _paths(tmp_path)
+    _limits(paths["limits"])
+    rpc = FakeRpc(open_cap=10, channel_changes={field: value})
+
+    with voucher.PayerChannelBook(paths["book"]) as book:
+        with pytest.raises(
+                voucher.VoucherError,
+                match="finalized channel does not match the requested open"):
+            auto.ensure_channel(
+                WORKER, 1, owner=OWNER, book=book, state=rpc,
+                program=PROGRAM, private_key=NODE_SEED, rpc=rpc,
+                limits_path=paths["limits"], ledger_path=paths["ledger"],
+                lock_path=paths["lock"])
+        assert book.list_channels() == []
+
+    assert rpc.sent.value == 1
+    with auto.OpenLedger(paths["ledger"]) as ledger:
+        assert ledger.total_since(rpc.current_chain_time) == 10
 
 
 def _concurrent_open_target(root: str, rpc: FakeRpc, start, result):
