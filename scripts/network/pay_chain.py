@@ -394,6 +394,18 @@ class TransactionDefiniteFailure(VoucherError):
     """The RPC proved that a transaction was rejected or failed on chain."""
 
 
+def validate_signature_status(status: object) -> dict | None:
+    """Validate the status fields whose absence would change payment meaning."""
+    if status is None:
+        return None
+    if not isinstance(status, dict) or "err" not in status:
+        raise VoucherError("RPC returned malformed signature status")
+    confirmation = status.get("confirmationStatus")
+    if confirmation not in {"processed", "confirmed", "finalized"}:
+        raise VoucherError("RPC returned malformed signature confirmation status")
+    return status
+
+
 def sign_transaction(instructions: Sequence[Instruction], fee_payer: object,
                      recent_blockhash: object, signer_seeds: Mapping[object, bytes]) -> SignedTransaction:
     message = compile_message(instructions, fee_payer, recent_blockhash)
@@ -564,15 +576,7 @@ class PayRpc(JsonRpcChannelState):
         values = result.get("value") if isinstance(result, dict) else None
         if not isinstance(values, list) or len(values) != 1:
             raise VoucherError("RPC returned malformed signature status")
-        status = values[0]
-        if status is None:
-            return None
-        if not isinstance(status, dict):
-            raise VoucherError("RPC returned malformed signature status")
-        confirmation = status.get("confirmationStatus")
-        if confirmation not in {"processed", "confirmed", "finalized"}:
-            raise VoucherError("RPC returned malformed signature confirmation status")
-        return status
+        return validate_signature_status(values[0])
 
     def rent_exemption(self, space: int, *, commitment: str = "confirmed") -> int:
         self._ensure_cluster()
@@ -613,18 +617,12 @@ class PayRpc(JsonRpcChannelState):
         deadline = time.monotonic() + float(timeout)
         last = None
         while time.monotonic() < deadline:
-            result = self._rpc("getSignatureStatuses", [[returned], {"searchTransactionHistory": True}])
-            values = result.get("value") if isinstance(result, dict) else None
-            if not isinstance(values, list) or len(values) != 1:
-                raise VoucherError("RPC returned malformed signature status")
-            last = values[0]
+            last = self.signature_status(returned)
             if last is not None:
-                if not isinstance(last, dict):
-                    raise VoucherError("RPC returned malformed signature status")
-                if last.get("err") is not None:
+                if last["err"] is not None:
                     raise TransactionDefiniteFailure(
                         f"transaction failed: {last['err']!r}")
-                if last.get("confirmationStatus") == "finalized":
+                if last["confirmationStatus"] == "finalized":
                     return returned
             time.sleep(0.15)
         raise VoucherError(

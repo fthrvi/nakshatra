@@ -162,6 +162,27 @@ def test_send_and_confirm_fails_immediately_on_transaction_error(monkeypatch):
     assert calls == ["sendTransaction", "getSignatureStatuses"]
 
 
+def test_send_and_confirm_rejects_finalized_status_missing_err(monkeypatch):
+    rpc, transaction, calls = _confirmation_rpc(monkeypatch, [
+        {"confirmationStatus": "finalized"},
+    ])
+
+    with pytest.raises(pay_chain.VoucherError, match="malformed signature status"):
+        rpc.send_and_confirm(transaction, timeout=1)
+    assert calls == ["sendTransaction", "getSignatureStatuses"]
+
+
+def test_signature_status_rejects_missing_err(monkeypatch):
+    rpc = pay_chain.PayRpc("http://127.0.0.1:1")
+    monkeypatch.setattr(rpc, "_ensure_cluster", lambda: None)
+    monkeypatch.setattr(
+        rpc, "_rpc", lambda _method, _params: {
+            "value": [{"confirmationStatus": "finalized"}]})
+
+    with pytest.raises(pay_chain.VoucherError, match="malformed signature status"):
+        rpc.signature_status(pay_chain.b58encode(b"s" * 64))
+
+
 def test_chain_time_uses_finalized_slot_and_validates_block_time(monkeypatch):
     rpc = pay_chain.PayRpc("http://127.0.0.1:1")
     monkeypatch.setattr(rpc, "_ensure_cluster", lambda: None)

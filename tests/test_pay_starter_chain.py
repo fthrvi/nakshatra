@@ -596,3 +596,15 @@ def test_all_attempts_expired_after_deadline_fail_without_send(monkeypatch):
     assert row["chain_attempts"][0]["resolution"] == "expired"
     assert row["state"] == "failed" and row["next_attempt"] == deadline
     assert not sent
+
+
+def test_missing_err_status_is_refused_without_marking_starter_paid(monkeypatch):
+    node, row, rpc, sent, _deadline = _attempt_at_deadline(
+        monkeypatch, {"confirmationStatus": "finalized"})
+
+    assert node._attempt_starter(row["invite_id"]) is False
+
+    assert rpc.status_calls == [row["chain_attempts"][0]["signature"]]
+    assert row["state"] == "pending" and row["receipt"] is None
+    assert "malformed signature status" in row["reason"]
+    assert not sent

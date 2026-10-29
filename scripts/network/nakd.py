@@ -1157,6 +1157,8 @@ class Node:
 
     def _resolve_starter_attempts(self, row: dict, rpc, chain_now: int) -> tuple[dict | None, bool]:
         """Resolve every durable attempt, returning (paid receipt, can_still_land)."""
+        from network import pay_chain
+
         attempts = [dict(item) for item in (row.get("chain_attempts") or [])]
         attempts_changed = False
         unresolved = False
@@ -1164,7 +1166,8 @@ class Node:
         for attempt in attempts:
             if attempt.get("resolution") in {"failed", "expired"}:
                 continue
-            status = rpc.signature_status(attempt["signature"])
+            status = pay_chain.validate_signature_status(
+                rpc.signature_status(attempt["signature"]))
             if status is not None and status.get("confirmationStatus") == "finalized":
                 if status.get("err") is None:
                     return ({
