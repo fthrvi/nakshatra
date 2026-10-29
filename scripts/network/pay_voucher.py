@@ -88,6 +88,10 @@ class ChannelClosingError(VoucherError):
     """The channel cannot safely cover another inference checkpoint."""
 
 
+class NoUsableChannel(VoucherError):
+    """No pinned open channel has enough uncommitted capacity."""
+
+
 def _u64(value: object, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= _U64_MAX:
         raise VoucherError(f"{name} must be a u64")
@@ -563,16 +567,49 @@ class PayerChannelBook(_Book):
         super().__init__(path or Path.home() / ".nakshatra" / "pay" / "channels.sqlite")
         self._db.execute(
             "CREATE TABLE IF NOT EXISTS channels("
-            "program TEXT NOT NULL, channel TEXT PRIMARY KEY, worker_key TEXT NOT NULL UNIQUE, "
+            "program TEXT NOT NULL, channel TEXT PRIMARY KEY, worker_key TEXT NOT NULL, "
             "cap TEXT NOT NULL, channel_base TEXT NOT NULL, max_signed_total TEXT NOT NULL)"
         )
-        columns = {
-            row[1] for row in self._db.execute("PRAGMA table_info(channels)")
-        }
-        if "max_signed_total" not in columns and "last_vouched_total" in columns:
-            self._db.execute(
-                "ALTER TABLE channels RENAME COLUMN last_vouched_total TO max_signed_total")
+        self._migrate_schema()
         self._secure()
+
+    def _migrate_schema(self) -> None:
+        """Remove the legacy worker UNIQUE constraint without losing any rows."""
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            columns = {
+                row[1] for row in self._db.execute("PRAGMA table_info(channels)")
+            }
+            if "max_signed_total" not in columns and "last_vouched_total" in columns:
+                self._db.execute(
+                    "ALTER TABLE channels RENAME COLUMN last_vouched_total "
+                    "TO max_signed_total")
+            worker_unique = False
+            for index in self._db.execute("PRAGMA index_list(channels)"):
+                if not bool(index[2]):
+                    continue
+                names = [row[2] for row in self._db.execute(
+                    f"PRAGMA index_info({index[1]!r})")]
+                if names == ["worker_key"]:
+                    worker_unique = True
+                    break
+            if worker_unique:
+                self._db.execute("ALTER TABLE channels RENAME TO channels_unique_legacy")
+                self._db.execute(
+                    "CREATE TABLE channels("
+                    "program TEXT NOT NULL, channel TEXT PRIMARY KEY, "
+                    "worker_key TEXT NOT NULL, cap TEXT NOT NULL, "
+                    "channel_base TEXT NOT NULL, max_signed_total TEXT NOT NULL)"
+                )
+                self._db.execute(
+                    "INSERT INTO channels(program,channel,worker_key,cap,channel_base,"
+                    "max_signed_total) SELECT program,channel,worker_key,cap,channel_base,"
+                    "max_signed_total FROM channels_unique_legacy")
+                self._db.execute("DROP TABLE channels_unique_legacy")
+            self._db.execute("COMMIT")
+        except Exception:
+            self._db.execute("ROLLBACK")
+            raise
 
     @staticmethod
     def _row(row: sqlite3.Row) -> PayerChannel:
@@ -618,14 +655,25 @@ class PayerChannelBook(_Book):
                 self._db.execute("ROLLBACK")
                 raise
         self._secure()
-        return self.for_worker(values[2])
+        return self.for_channel(values[1])
+
+    def for_channel(self, channel: str) -> PayerChannel:
+        key = _pubkey_text(channel, "channel")
+        row = self._db.execute(
+            "SELECT * FROM channels WHERE channel=?", (key,)).fetchone()
+        if row is None:
+            raise VoucherError("payer has no such channel")
+        return self._row(row)
 
     def for_worker(self, worker_key: str) -> PayerChannel:
-        row = self._db.execute(
-            "SELECT * FROM channels WHERE worker_key=?", (str(worker_key).lower(),)).fetchone()
-        if row is None:
+        rows = self._db.execute(
+            "SELECT * FROM channels WHERE worker_key=? ORDER BY channel",
+            (str(worker_key).lower(),)).fetchall()
+        if not rows:
             raise VoucherError("payer has no channel for worker")
-        return self._row(row)
+        if len(rows) != 1:
+            raise VoucherError("payer has multiple channels for worker; choose by channel")
+        return self._row(rows[0])
 
     def list_channels(self) -> list[PayerChannel]:
         """Return the payer's channel pins without exposing the sqlite handle."""
@@ -633,29 +681,57 @@ class PayerChannelBook(_Book):
             "SELECT * FROM channels ORDER BY worker_key,channel")]
 
     def begin_session(self, worker_key: str, *, program: str, state: ChannelState,
-                      max_cost_credits: int) -> PayerChannel:
+                      max_cost_credits: int | None = None,
+                      required_micro_usdc: int | None = None,
+                      channel: str | None = None) -> PayerChannel:
         configured = _pubkey_text(program, "program id")
+        if (max_cost_credits is None) == (required_micro_usdc is None):
+            raise VoucherError(
+                "exactly one required capacity form must be supplied")
+        required = (_u64(required_micro_usdc, "required capacity")
+                    if required_micro_usdc is not None
+                    else required_capacity_micro_usdc(max_cost_credits))
+        worker = str(worker_key).lower()
+        preferred = None if channel is None else _pubkey_text(channel, "channel")
         with self._lock:
-            row = self.for_worker(worker_key)
-            if row.program != configured:
-                raise VoucherError("channel program differs from configured program")
-            channel_state = state.read_channel(row.channel, configured)
-            require_open_channel(channel_state)
-            if channel_state.cap != row.cap:
-                raise VoucherError("on-chain channel cap differs from pinned channel book")
-            if row.max_signed_total < channel_state.redeemed:
-                raise VoucherError(
-                    "payer signing ceiling is below the on-chain redeemed total")
-            available = channel_state.cap - row.max_signed_total
-            if available < required_capacity_micro_usdc(max_cost_credits):
-                raise VoucherError("channel has insufficient uncommitted capacity")
-            self._db.execute(
-                "UPDATE channels SET channel_base=? WHERE channel=?",
-                (str(channel_state.redeemed), row.channel))
-            row = PayerChannel(row.program, row.channel, row.worker_key, row.cap,
-                               channel_state.redeemed, row.max_signed_total)
+            rows = self._db.execute(
+                "SELECT * FROM channels WHERE worker_key=? ORDER BY channel",
+                (worker,)).fetchall()
+            for stored in rows:
+                row = self._row(stored)
+                if row.program != configured:
+                    continue
+                if preferred is not None and row.channel != preferred:
+                    continue
+                try:
+                    channel_state = state.read_channel(row.channel, configured)
+                except VoucherError as exc:
+                    if (str(exc) == "channel account does not exist"
+                            or str(exc).startswith("account does not exist:")):
+                        continue
+                    raise
+                try:
+                    require_open_channel(channel_state)
+                except ChannelClosingError:
+                    continue
+                if channel_state.cap != row.cap:
+                    raise VoucherError(
+                        "on-chain channel cap differs from pinned channel book")
+                if row.max_signed_total < channel_state.redeemed:
+                    raise VoucherError(
+                        "payer signing ceiling is below the on-chain redeemed total")
+                if channel_state.cap - row.max_signed_total < required:
+                    continue
+                self._db.execute(
+                    "UPDATE channels SET channel_base=? WHERE channel=?",
+                    (str(channel_state.redeemed), row.channel))
+                row = PayerChannel(row.program, row.channel, row.worker_key, row.cap,
+                                   channel_state.redeemed, row.max_signed_total)
+                self._secure()
+                return row
         self._secure()
-        return row
+        raise NoUsableChannel(
+            "payer has no usable channel for worker (missing, closing, or insufficient capacity)")
 
     def adopt_session_base(self, channel: str, base: int, *,
                            on_chain_redeemed: int) -> PayerChannel:
@@ -1004,6 +1080,7 @@ class ConsumerVoucherManager:
     def __init__(self, *, book: PayerChannelBook, state: ChannelState,
                  program: str, private_key: bytes, plan: list[Mapping[str, object]],
                  max_cost_by_worker: Mapping[str, int],
+                 channels_by_worker: Mapping[str, PayerChannel] | None = None,
                  session_id: str | None = None, hold_id: str | None = None,
                  model_id: str | None = None,
                  max_prompt_tokens: int | None = None,
@@ -1026,9 +1103,14 @@ class ConsumerVoucherManager:
         self.pending: dict[str, str] = {}
         self.sent: dict[str, str] = {}
         for worker_key in self.plan:
+            selected = (None if channels_by_worker is None
+                        else channels_by_worker.get(worker_key))
+            if channels_by_worker is not None and selected is None:
+                raise VoucherError("chosen payer channel is missing for worker")
             self.channels[worker_key] = book.begin_session(
                 worker_key, program=self.program, state=state,
-                max_cost_credits=int(max_cost_by_worker[worker_key]))
+                max_cost_credits=int(max_cost_by_worker[worker_key]),
+                channel=None if selected is None else selected.channel)
             account = state.read_channel(
                 self.channels[worker_key].channel, self.program)
             owner = state.read_escrow_owner(account.escrow, self.program)

@@ -47,6 +47,9 @@ def _addr(byte: int) -> str:
 
 PROGRAM = _addr(1)
 CHANNEL = _addr(2)
+CHANNEL2 = _addr(12)
+CHANNEL3 = _addr(13)
+CHANNEL4 = _addr(14)
 ESCROW = _addr(3)
 WORKER_WALLET = _addr(4)
 RENT_PAYER = _addr(5)
@@ -202,27 +205,68 @@ def test_payer_book_keeps_ceiling_while_allowing_safe_resign(tmp_path):
     book.close()
 
 
-def test_payer_book_migrates_legacy_total_to_signing_ceiling(tmp_path):
+@pytest.mark.parametrize("ceiling_column", ["max_signed_total", "last_vouched_total"])
+def test_payer_book_migrates_legacy_unique_schema_without_losing_rows(
+        tmp_path, ceiling_column):
     path = tmp_path / "legacy" / "channels.sqlite"
     path.parent.mkdir(mode=0o700)
     db = sqlite3.connect(path)
     db.execute(
         "CREATE TABLE channels(program TEXT NOT NULL, channel TEXT PRIMARY KEY,"
         "worker_key TEXT NOT NULL UNIQUE, cap TEXT NOT NULL,"
-        "channel_base TEXT NOT NULL, last_vouched_total TEXT NOT NULL)")
-    db.execute(
-        "INSERT INTO channels VALUES(?,?,?,?,?,?)",
-        (PROGRAM, CHANNEL, WORKER_HEX, "1000", "10", "12"))
+        f"channel_base TEXT NOT NULL, {ceiling_column} TEXT NOT NULL)")
+    db.executemany(
+        "INSERT INTO channels VALUES(?,?,?,?,?,?)", [
+            (PROGRAM, CHANNEL, WORKER_HEX, "1000", "10", "12"),
+            (PROGRAM, CHANNEL2, WRONG_HEX, "2000", "20", "22"),
+        ])
     db.commit()
     db.close()
 
     book = pay.PayerChannelBook(path)
     row = book.for_worker(WORKER_HEX)
     assert (row.channel_base, row.max_signed_total) == (10, 12)
+    assert len(book.list_channels()) == 2
+    # The migration really removed UNIQUE(worker_key), rather than merely
+    # hiding it from the API.
+    book.put(program=PROGRAM, channel=CHANNEL3, worker_key=WORKER_HEX, cap=3000)
+    assert len(book.list_channels()) == 3
+    with pytest.raises(pay.VoucherError, match="multiple channels"):
+        book.for_worker(WORKER_HEX)
     columns = {entry[1] for entry in book._db.execute(
         "PRAGMA table_info(channels)")}
     assert "max_signed_total" in columns
     assert "last_vouched_total" not in columns
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    book.close()
+
+
+def test_payer_book_selects_open_capacity_and_keeps_unusable_rows(tmp_path):
+    book = pay.PayerChannelBook(tmp_path / "many" / "channels.sqlite")
+    for channel, cap, ceiling in (
+            (CHANNEL, 10, 0), (CHANNEL2, 10, 10),
+            (CHANNEL3, 10, 1), (CHANNEL4, 10, 0)):
+        book.put(program=PROGRAM, channel=channel, worker_key=WORKER_HEX,
+                 cap=cap, max_signed_total=ceiling)
+    state = pay.FakeChannelState({
+        CHANNEL: _channel(cap=10, status="Closing", close_at=1000),
+        CHANNEL2: _channel(cap=10),
+        CHANNEL3: _channel(cap=10, redeemed=1),
+    }, {ESCROW: OWNER_B58}, program_id=PROGRAM)
+
+    chosen = book.begin_session(
+        WORKER_HEX, program=PROGRAM, state=state, required_micro_usdc=2)
+    assert chosen.channel == CHANNEL3
+    assert chosen.channel_base == 1
+    assert len(book.list_channels()) == 4
+
+    state.channels[CHANNEL3] = _channel(
+        cap=10, redeemed=1, status="Closing", close_at=1000)
+    with pytest.raises(pay.NoUsableChannel, match="no usable channel"):
+        book.begin_session(
+            WORKER_HEX, program=PROGRAM, state=state,
+            required_micro_usdc=2)
+    assert len(book.list_channels()) == 4
     book.close()
 
 
