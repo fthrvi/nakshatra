@@ -843,3 +843,15 @@ def test_missing_err_status_is_refused_without_marking_starter_paid(monkeypatch)
     assert row["state"] == "pending" and row["receipt"] is None
     assert "malformed signature status" in row["reason"]
     assert not sent
+
+
+def test_existing_grant_is_not_paid_without_escrow_collateral(chain_node, monkeypatch):
+    node, wallet, row = chain_node
+    rpc = StarterRpc(
+        wallet, vault_amount=0, existing_cap=1_000_000,
+        existing_expires=1_800_000_000)
+    monkeypatch.setattr(pay_chain, "PayRpc", lambda _url: rpc)
+
+    with pytest.raises(ValueError, match="lacks"):
+        node._chain_starter(row)
+    assert rpc.sent == []

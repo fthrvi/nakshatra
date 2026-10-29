@@ -1284,6 +1284,13 @@ class Node:
             if escrow["owner"] != owner or escrow["vault"] != derived["vault"]:
                 raise ValueError("inviter escrow does not match the file-custody wallet")
 
+            # Collateral is read before the existing-grant shortcut: "paid" must mean the
+            # inviter's escrow could fund the starter now, exactly as the sending path requires.
+            vault_info = rpc.account_info(derived["vault"], commitment="finalized")
+            if vault_info is None or vault_info["owner"] != pay_chain.TOKEN_PROGRAM_ID:
+                raise ValueError("inviter escrow vault is missing or invalid")
+            available = max(0, pay_chain.token_amount(vault_info["data"]) - escrow["committed"])
+
             delegate_info = rpc.account_info(delegate_address, commitment="finalized")
             delegate = None
             if delegate_info is not None:
@@ -1302,6 +1309,7 @@ class Node:
                     and delegate["expires_at"] > chain_now
                     and bool(delegate["flags"] & pay_chain.DELEGATE_OPEN_CHANNEL)
                     and max(0, delegate["cap_total"] - delegate["spent"]) >= cap
+                    and available >= cap
                 )
                 if usable:
                     recorded = attempts[-1] if attempts else {}
@@ -1323,10 +1331,6 @@ class Node:
             if deadline is not None and chain_now >= int(deadline):
                 raise ValueError("starter retry window expired")
 
-            vault_info = rpc.account_info(derived["vault"], commitment="finalized")
-            if vault_info is None or vault_info["owner"] != pay_chain.TOKEN_PROGRAM_ID:
-                raise ValueError("inviter escrow vault is missing or invalid")
-            available = max(0, pay_chain.token_amount(vault_info["data"]) - escrow["committed"])
             if available < cap:
                 raise ValueError(
                     f"inviter escrow lacks {cap / 1_000_000:.6f} USDC; nak pay deposit")
