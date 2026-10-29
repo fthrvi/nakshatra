@@ -22,7 +22,7 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from network import nak, pay_chain, pay_wallet  # noqa: E402
+from network import nak, pay_autochannel, pay_chain, pay_wallet  # noqa: E402
 from network import pay_voucher  # noqa: E402
 
 
@@ -280,7 +280,7 @@ class FakeRpc:
                 elif method == "sendTransaction":
                     raw = base64.b64decode(params[0]); result = pay_chain.b58encode(raw[1:65])
                     outer.sent += 1; outer.ready = True
-                    outer.node_balance = nak._NODE_SOL_TARGET
+                    outer.node_balance = nak.NODE_SOL_TARGET
                 elif method == "getSignatureStatuses": result = {"context":{"slot":1},"value":[{"slot":1,"confirmations":None,"err":None,"confirmationStatus":"finalized"}]}
                 else: raise AssertionError(method)
                 body = json.dumps({"jsonrpc":"2.0","id":request["id"],"result":result}).encode()
@@ -341,8 +341,9 @@ def test_cli_ensure_tops_up_node_and_reports_wallet_shortfall(
     with rpc as url:
         monkeypatch.setenv("NAK_PAY_RPC", url)
         assert nak.main(["pay", "ensure"]) == 0
-    assert rpc.node_balance == nak._NODE_SOL_TARGET
+    assert rpc.node_balance == nak.NODE_SOL_TARGET
     assert rpc.sent == 1
+    capsys.readouterr()
 
     poor = FakeRpc(balance=1, node_balance=0)
     poor.configure(wallet, node)
@@ -521,7 +522,7 @@ ata=Instruction(Pubkey.from_string(os.environ['ATA_PROGRAM']),b'\x01',[
  AccountMeta(mint.pubkey(),False,False),AccountMeta(pay.SYSTEM_PROGRAM_ID,False,False),AccountMeta(pay.TOKEN_PROGRAM_ID,False,False)])
 send(rpc,[ata],authority); mint_to(rpc,authority,mint.pubkey(),source,2_000_000)
 fee_wallet=Keypair(); create_token(rpc,authority,fee_wallet,mint.pubkey(),authority.pubkey())
-send(rpc,[transfer(TransferParams(from_pubkey=authority.pubkey(),to_pubkey=owner,lamports=100_000_000)),transfer(TransferParams(from_pubkey=authority.pubkey(),to_pubkey=node,lamports=100_000_000))],authority)
+send(rpc,[transfer(TransferParams(from_pubkey=authority.pubkey(),to_pubkey=owner,lamports=100_000_000))],authority)
 config=pay.config_pda()[0]; fee_vault=pay.fee_vault_pda(config)[0]
 send(rpc,[pay.config_init({'authority':authority.pubkey(),'config':config,'program_data':pay.program_data_pda()[0],'mint':mint.pubkey(),'fee_wallet':fee_wallet.pubkey(),'fee_vault':fee_vault,'token_program':pay.TOKEN_PROGRAM_ID,'system_program':pay.SYSTEM_PROGRAM_ID,'event_authority':pay.event_authority_pda()[0],'program':pay.PROGRAM_ID},300)],authority)
 '''
@@ -541,19 +542,32 @@ send(rpc,[pay.config_init({'authority':authority.pubkey(),'config':config,'progr
         monkeypatch.setenv("NAK_PAY_MINT", mint)
         assert nak.main(["pay", "ensure"]) == 0
         assert nak.main(["pay", "deposit", "--amount", "2"]) == 0
+        assert nak.main([
+            "pay", "limits", "--cap", "5", "--days", "30",
+            "--per-tx", "1", "--per-day", "1",
+        ]) == 0
         escrow_address = pay_chain.escrow_pda(wallet["address"], PROGRAM)[0]
         escrow = pay_chain.decode_escrow(rpc.account_info(escrow_address)["data"])
         delegate = pay_chain.delegate_pda(escrow_address, node_public, PROGRAM)[0]
         assert rpc.account_info(delegate) is not None
-        channel_address = pay_chain.channel_pda(
-            escrow_address, escrow["generation"], escrow["channel_seq"], PROGRAM)[0]
-        open_ix = pay_chain.channel_open(
-            node, wallet["address"], authority, 1_000_000,
-            escrow["generation"], escrow["channel_seq"], PROGRAM, delegate=delegate)
-        blockhash = rpc.latest_blockhash()
-        tx = pay_chain.sign_transaction(open_ix, node, blockhash, {node: node_seed})
-        rpc.send_and_confirm(tx)
-        assert rpc.account_info(channel_address) is not None
+        assert rpc.balance(node) >= nak.NODE_SOL_MIN
+        worker_key = ed25519.Ed25519PrivateKey.from_private_bytes(
+            authority_seed).public_key().public_bytes_raw().hex()
+        with pay_voucher.PayerChannelBook() as book:
+            channel = pay_autochannel.ensure_channel(
+                worker_key, 1, owner=wallet["address"], book=book, state=rpc,
+                program=PROGRAM, private_key=node_seed, rpc=rpc)
+            reused = pay_autochannel.ensure_channel(
+                worker_key, 1, owner=wallet["address"], book=book, state=rpc,
+                program=PROGRAM, private_key=node_seed, rpc=rpc)
+            assert reused.channel == channel.channel
+            other_worker = ed25519.Ed25519PrivateKey.from_private_bytes(
+                bytes([77]) * 32).public_key().public_bytes_raw().hex()
+            with pytest.raises(pay_voucher.VoucherError, match="24-hour"):
+                pay_autochannel.ensure_channel(
+                    other_worker, 1, owner=wallet["address"], book=book,
+                    state=rpc, program=PROGRAM, private_key=node_seed, rpc=rpc)
+        assert rpc.account_info(channel.channel) is not None
         assert nak.main(["pay", "withdraw", "--amount", "0.5"]) == 0
         pending = pay_chain.decode_escrow(
             rpc.account_info(escrow_address)["data"])["pending_withdraw"]

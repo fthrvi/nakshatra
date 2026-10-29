@@ -817,8 +817,8 @@ _PAY_DEFAULTS = {
     "per_tx": 1_000_000,
     "per_day": 5_000_000,
 }
-_NODE_SOL_MIN = 10_000_000
-_NODE_SOL_TARGET = 30_000_000
+NODE_SOL_MIN = 10_000_000
+NODE_SOL_TARGET = 30_000_000
 
 
 def _pay_usdc(value: str, name: str) -> int:
@@ -1033,8 +1033,8 @@ def _pay_ensure() -> None:
         instructions = []
         rent = 0
         node_balance = rpc.balance(node_address)
-        if node_balance < _NODE_SOL_MIN:
-            node_top_up = _NODE_SOL_TARGET - node_balance
+        if node_balance < NODE_SOL_MIN:
+            node_top_up = NODE_SOL_TARGET - node_balance
             instructions.append(chain.system_transfer(
                 wallet["address"], node_address, node_top_up))
             # The transfer is in this transaction, so include it in the

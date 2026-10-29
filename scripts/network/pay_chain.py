@@ -10,7 +10,7 @@ import hashlib
 import struct
 import time
 from dataclasses import dataclass
-from typing import Iterable, Mapping, Sequence
+from typing import Callable, Iterable, Mapping, Sequence
 
 from network.pay_voucher import (
     DEVNET_GENESIS_HASH,
@@ -390,6 +390,10 @@ class SignedTransaction:
     signature: str
 
 
+class TransactionDefiniteFailure(VoucherError):
+    """The RPC proved that a transaction was rejected or failed on chain."""
+
+
 def sign_transaction(instructions: Sequence[Instruction], fee_payer: object,
                      recent_blockhash: object, signer_seeds: Mapping[object, bytes]) -> SignedTransaction:
     message = compile_message(instructions, fee_payer, recent_blockhash)
@@ -483,15 +487,23 @@ class PayRpc(JsonRpcChannelState):
             raise VoucherError("RPC returned an invalid transaction fee")
         return value
 
-    def send_and_confirm(self, transaction: SignedTransaction, *, timeout: float = 60.0) -> str:
+    def send_and_confirm(self, transaction: SignedTransaction, *, timeout: float = 60.0,
+                         on_sent: Callable[[str], None] | None = None) -> str:
         self._ensure_cluster()
-        returned = self._rpc("sendTransaction", [
-            base64.b64encode(transaction.data).decode("ascii"),
-            {"encoding": "base64", "preflightCommitment": "confirmed",
-             "skipPreflight": False, "maxRetries": 0},
-        ])
+        try:
+            returned = self._rpc("sendTransaction", [
+                base64.b64encode(transaction.data).decode("ascii"),
+                {"encoding": "base64", "preflightCommitment": "confirmed",
+                 "skipPreflight": False, "maxRetries": 0},
+            ])
+        except VoucherError as exc:
+            if "Solana RPC sendTransaction was refused" in str(exc):
+                raise TransactionDefiniteFailure(str(exc)) from exc
+            raise
         if returned != transaction.signature:
             raise VoucherError("RPC returned a different transaction signature")
+        if on_sent is not None:
+            on_sent(returned)
         deadline = time.monotonic() + float(timeout)
         last = None
         while time.monotonic() < deadline:
@@ -504,7 +516,8 @@ class PayRpc(JsonRpcChannelState):
                 if not isinstance(last, dict):
                     raise VoucherError("RPC returned malformed signature status")
                 if last.get("err") is not None:
-                    raise VoucherError(f"transaction failed: {last['err']!r}")
+                    raise TransactionDefiniteFailure(
+                        f"transaction failed: {last['err']!r}")
                 if last.get("confirmationStatus") == "finalized":
                     return returned
             time.sleep(0.15)
