@@ -29,6 +29,7 @@ ASSOCIATED_TOKEN_PROGRAM_ID = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
 # The deployed program currently defines OPEN_CHANNEL and OPEN_TASK.  Its
 # DELEGATE_FLAGS_ALL is therefore 0b11 (the older design prose named four).
 DELEGATE_FLAGS_ALL = 0x03
+DELEGATE_OPEN_CHANNEL = 0x01
 
 _PDA_MARKER = b"ProgramDerivedAddress"
 _P = 2**255 - 19
@@ -212,6 +213,13 @@ def ata_create_idempotent(payer: object, owner: object, mint: object) -> Instruc
     return Instruction(ASSOCIATED_TOKEN_PROGRAM_ID, b"\x01", (
         _meta(payer, True, True), _meta(ata, False, True), _meta(owner), _meta(mint),
         _meta(SYSTEM_PROGRAM_ID), _meta(TOKEN_PROGRAM_ID),
+    ))
+
+
+def system_transfer(source: object, destination: object, lamports: int) -> Instruction:
+    """Build SystemInstruction::Transfer (instruction index 2)."""
+    return Instruction(SYSTEM_PROGRAM_ID, struct.pack("<I", 2) + _u64(lamports), (
+        _meta(source, True, True), _meta(destination, False, True),
     ))
 
 

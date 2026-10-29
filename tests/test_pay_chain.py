@@ -172,6 +172,7 @@ from python.chain import program_client as n
 from solders.hash import Hash
 from solders.message import Message
 from solders.pubkey import Pubkey
+from solders.system_program import TransferParams,transfer
 P=str(n.PROGRAM_ID); owner=c.b58encode(bytes(range(32))); mint=c.b58encode(bytes(range(1,33)))
 key=c.b58encode(bytes(range(2,34))); worker=c.b58encode(bytes(range(3,35))); bh=c.b58encode(bytes(range(4,36)))
 d=c._derived(owner,P); base={'event_authority':d['event'],'program':P}; source=c.associated_token_address(owner,mint)[0]
@@ -181,6 +182,7 @@ assert c.escrow_pda(owner,P) == (str(n.escrow_pda(owner)[0]),n.escrow_pda(owner)
 ata_ref=Pubkey.find_program_address([bytes(Pubkey.from_string(owner)),bytes(n.TOKEN_PROGRAM_ID),bytes(Pubkey.from_string(mint))],Pubkey.from_string(c.ASSOCIATED_TOKEN_PROGRAM_ID))
 assert c.associated_token_address(owner,mint) == (str(ata_ref[0]),ata_ref[1])
 cases=[
+([c.system_transfer(owner,key,123)],transfer(TransferParams(from_pubkey=Pubkey.from_string(owner),to_pubkey=Pubkey.from_string(key),lamports=123))),
 (c.escrow_init(owner,mint,P),n.escrow_init({'owner':owner,'config':d['config'],'owner_state':d['owner_state'],'mint':mint,'escrow':d['escrow'],'vault':d['vault'],**base})),
 (c.escrow_deposit(owner,mint,10,P),n.escrow_deposit({'owner':owner,'config':d['config'],'mint':mint,'escrow':d['escrow'],'source':source,'vault':d['vault'],'token_program':n.TOKEN_PROGRAM_ID,**base},10)),
 (c.escrow_withdraw_request(owner,10,P),n.escrow_withdraw_request({'owner':owner,'config':d['config'],'escrow':d['escrow'],'vault':d['vault'],**base},10)),
@@ -250,9 +252,11 @@ def test_decode_escrow_rejects_invalid_pending_option_tag():
 
 
 class FakeRpc:
-    def __init__(self, *, genesis="local-test", balance=100_000_000, token_balance=0):
+    def __init__(self, *, genesis="local-test", balance=100_000_000,
+                 node_balance=0, token_balance=0):
         self.genesis = genesis
         self.balance = balance
+        self.node_balance = node_balance
         self.token_balance = token_balance
         self.methods: list[str] = []
         self.sent = 0
@@ -270,10 +274,13 @@ class FakeRpc:
                 elif method == "getMinimumBalanceForRentExemption": result = 1_000 + params[0]
                 elif method == "getLatestBlockhash": result = {"context":{"slot":1},"value":{"blockhash":BLOCKHASH,"lastValidBlockHeight":999}}
                 elif method == "getFeeForMessage": result = {"context":{"slot":1},"value":5_000}
-                elif method == "getBalance": result = {"context":{"slot":1},"value":outer.balance}
+                elif method == "getBalance":
+                    value = outer.node_balance if params[0] == outer.node else outer.balance
+                    result = {"context":{"slot":1},"value":value}
                 elif method == "sendTransaction":
                     raw = base64.b64decode(params[0]); result = pay_chain.b58encode(raw[1:65])
                     outer.sent += 1; outer.ready = True
+                    outer.node_balance = nak._NODE_SOL_TARGET
                 elif method == "getSignatureStatuses": result = {"context":{"slot":1},"value":[{"slot":1,"confirmations":None,"err":None,"confirmationStatus":"finalized"}]}
                 else: raise AssertionError(method)
                 body = json.dumps({"jsonrpc":"2.0","id":request["id"],"result":result}).encode()
@@ -322,6 +329,31 @@ def test_cli_ensure_is_idempotent_and_limits_are_private(_temp_home, monkeypatch
     assert rpc.sent == 1
     limits = _temp_home / ".nakshatra/pay/limits.json"
     assert stat.S_IMODE(limits.stat().st_mode) == 0o600
+
+
+def test_cli_ensure_tops_up_node_and_reports_wallet_shortfall(
+        _temp_home, monkeypatch, capsys):
+    wallet = _make_keys(_temp_home)
+    node = ed25519.Ed25519PrivateKey.from_private_bytes(
+        bytes(range(101, 133))).public_key().public_bytes_raw()
+    rpc = FakeRpc(balance=100_000_000, node_balance=9_000_000)
+    rpc.configure(wallet, node)
+    with rpc as url:
+        monkeypatch.setenv("NAK_PAY_RPC", url)
+        assert nak.main(["pay", "ensure"]) == 0
+    assert rpc.node_balance == nak._NODE_SOL_TARGET
+    assert rpc.sent == 1
+
+    poor = FakeRpc(balance=1, node_balance=0)
+    poor.configure(wallet, node)
+    with poor as url:
+        monkeypatch.setenv("NAK_PAY_RPC", url)
+        with pytest.raises(
+                SystemExit,
+                match=rf"wallet {wallet['address']}.*shortfall.*nothing was sent"):
+            nak.main(["pay", "ensure"])
+    assert poor.sent == 0
+    assert capsys.readouterr().out == ""
 
 
 def test_cli_low_sol_sends_nothing(_temp_home, monkeypatch):
@@ -386,7 +418,9 @@ def test_cli_status_warns_above_20_usdc_until_backup_is_confirmed(
     with rpc as url:
         monkeypatch.setenv("NAK_PAY_RPC", url)
         assert nak.main(["pay", "status"]) == 0
-        assert "run `nak pay backup --confirm`" in capsys.readouterr().err
+        captured = capsys.readouterr()
+        assert "node balance: 0 SOL" in captured.out
+        assert "run `nak pay backup --confirm`" in captured.err
 
         monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
         monkeypatch.setattr(sys.stdout, "isatty", lambda: True)

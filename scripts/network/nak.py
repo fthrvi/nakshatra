@@ -817,6 +817,8 @@ _PAY_DEFAULTS = {
     "per_tx": 1_000_000,
     "per_day": 5_000_000,
 }
+_NODE_SOL_MIN = 10_000_000
+_NODE_SOL_TARGET = 30_000_000
 
 
 def _pay_usdc(value: str, name: str) -> int:
@@ -993,9 +995,11 @@ def _pay_send(rpc, chain, instructions, wallet: dict, *, rent: int = 0) -> str:
         balance = rpc.balance(wallet["address"])
         needed = int(rent) + fee
         if balance < needed:
+            shortfall = needed - balance
             raise SystemExit(
                 f"wallet {wallet['address']} has too little SOL: needs "
-                f"{_format_sol(needed)} SOL, has {_format_sol(balance)} SOL; nothing was sent")
+                f"{_format_sol(needed)} SOL, has {_format_sol(balance)} SOL, "
+                f"shortfall {_format_sol(shortfall)} SOL; nothing was sent")
         tx = chain.sign_transaction(
             instructions, wallet["address"], blockhash,
             {wallet["address"]: wallet["seed"]})
@@ -1019,6 +1023,7 @@ def _pay_ensure() -> None:
     if not path.exists():
         _save_pay_limits(limits)
     d = chain._derived(wallet["address"], program)
+    node_address = chain.b58encode(node_public)
     delegate_address = chain.delegate_pda(d["escrow"], node_public, program)[0]
     try:
         escrow_info = rpc.account_info(d["escrow"])
@@ -1027,6 +1032,14 @@ def _pay_ensure() -> None:
         vault_info = rpc.account_info(d["vault"])
         instructions = []
         rent = 0
+        node_balance = rpc.balance(node_address)
+        if node_balance < _NODE_SOL_MIN:
+            node_top_up = _NODE_SOL_TARGET - node_balance
+            instructions.append(chain.system_transfer(
+                wallet["address"], node_address, node_top_up))
+            # The transfer is in this transaction, so include it in the
+            # wallet's pre-send affordability check with account rent.
+            rent += node_top_up
         escrow_state = None
         if escrow_info is None:
             instructions.extend(chain.escrow_init(wallet["address"], mint, program))
@@ -1086,6 +1099,14 @@ def _pay_status(wallet: dict) -> None:
         rpc = chain.PayRpc(rpc_url)
         rpc.ensure_cluster()
         print(f"balance: {_format_sol(rpc.balance(wallet['address']))} SOL")
+        node_hex = None
+        try:
+            _node_seed, node_hex = __import__("nakshatra_auth").load_worker_key(
+                Path.home() / ".nakshatra" / "keys" / "worker.ed25519")
+            node_address = chain.b58encode(bytes.fromhex(node_hex))
+            print(f"node balance: {_format_sol(rpc.balance(node_address))} SOL")
+        except (OSError, ValueError, PermissionError) as exc:
+            print(f"node balance: unavailable ({exc})")
         program_value = os.environ.get("NAK_PAY_PROGRAM", "").strip()
         mint_value = os.environ.get("NAK_PAY_MINT", "").strip()
         if not program_value or not mint_value:
@@ -1093,8 +1114,8 @@ def _pay_status(wallet: dict) -> None:
             return
         program = chain.configured_pubkey(os.environ, "NAK_PAY_PROGRAM")
         chain.configured_pubkey(os.environ, "NAK_PAY_MINT")
-        _node_seed, node_hex = __import__("nakshatra_auth").load_worker_key(
-            Path.home() / ".nakshatra" / "keys" / "worker.ed25519")
+        if node_hex is None:
+            raise SystemExit("cannot show delegate without a valid node worker key")
         d = chain._derived(wallet["address"], program)
         escrow_info = rpc.account_info(d["escrow"])
         if escrow_info is None:
