@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import importlib.util
 import json
@@ -484,7 +485,8 @@ def _claim(session="session", *, layer_end=4) -> dict:
 
 
 def _chain_admission(tmp_path, monkeypatch, *, session="session", cap=1000,
-                     redeemed=0, channel_worker=PAY_WALLET_B58, layers=4):
+                     redeemed=0, channel_worker=PAY_WALLET_B58, layers=4,
+                     host_now=100, chain_time=lambda: 100):
     monkeypatch.setenv("NAK_PAY_MODE", "chain")
     _install_pay_wallet(Path(os.environ["HOME"]))
     account = _channel(cap=cap, redeemed=redeemed)
@@ -501,7 +503,8 @@ def _chain_admission(tmp_path, monkeypatch, *, session="session", cap=1000,
     ledger = _Ledger(_claim(session, layer_end=layers))
     manager = admission.PaidAdmission(
         ledger, store, WORKER_SEED, model_id="model",
-        layer_start=0, layer_end=layers, clock=lambda: 100,
+        layer_start=0, layer_end=layers, clock=lambda: host_now,
+        chain_time=chain_time,
         voucher_store=vouchers, channel_state=state, pay_program=PROGRAM)
     assert manager.check_ready()
     book = pay.PayerChannelBook(tmp_path / session / "payer-channels.sqlite")
@@ -1385,8 +1388,6 @@ def test_rpc_ignores_environment_proxies(tmp_path):
 
 
 def test_voucher_in_close_grace_is_kept_but_no_new_work_starts(tmp_path, monkeypatch):
-    import dataclasses
-
     manager, consumer, claim, worker_vouchers, _ledger = _chain_admission(
         tmp_path, monkeypatch, session="grace-latch")
     receipt = None
@@ -1411,3 +1412,55 @@ def test_voucher_in_close_grace_is_kept_but_no_new_work_starts(tmp_path, monkeyp
     consumer.book.close()
     manager.store.close()
     worker_vouchers.close()
+
+
+@pytest.mark.parametrize("chain_source", [
+    lambda: 1_000,
+    lambda: (_ for _ in ()).throw(pay.VoucherError("chain time unavailable")),
+])
+def test_closing_voucher_uses_chain_time_and_persists_when_time_unavailable(
+        tmp_path, monkeypatch, chain_source):
+    manager, consumer, claim, worker_vouchers, _ledger = _chain_admission(
+        tmp_path, monkeypatch, session="skewed-close", host_now=3_000,
+        chain_time=chain_source)
+    receipt = None
+    for index in range(1, 18):
+        receipt = _run_step(manager, claim, index, 1)
+        if receipt is not None:
+            break
+    assert receipt is not None
+    consumer.observe(WORKER_HEX, manager.chain_receipt_wire(claim, receipt))
+    consumer.acknowledge_delivery(
+        prompt_tokens=int(receipt["cumulative_prompt_tokens"]),
+        generated_tokens=int(receipt["cumulative_generated_tokens"]))
+    wire = consumer.outgoing(WORKER_HEX)
+    manager.channel_state.channels[CHANNEL] = dataclasses.replace(
+        manager.channel_state.channels[CHANNEL], status="Closing", close_at=2_000)
+
+    manager.accept_chain_control(claim, wire)
+
+    # Mutation checked: using the skewed host clock (3_000) rejects the voucher
+    # even though finalized chain time is 1_000.  On an RPC miss, refusing the
+    # write also loses the worker's durable evidence for already-delivered work.
+    assert worker_vouchers.latest(CHANNEL).total == pay.parse_wire(wire)["total"]
+    with pytest.raises(admission.PaidAdmissionError, match="channel-closing"):
+        manager.require_chain_voucher_before_step(claim, 0, 1)
+    consumer.book.close()
+    manager.store.close()
+    worker_vouchers.close()
+
+
+def test_finalized_chain_time_source_caches_for_thirty_seconds():
+    monotonic = [10.0]
+    reads = []
+    source = admission._CachedChainTime(
+        lambda: reads.append(1) or 1_000,
+        monotonic=lambda: monotonic[0])
+
+    assert source() == 1_000
+    monotonic[0] = 39.9
+    assert source() == 1_000
+    assert len(reads) == 1
+    monotonic[0] = 40.0
+    assert source() == 1_000
+    assert len(reads) == 2

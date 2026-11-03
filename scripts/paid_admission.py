@@ -58,6 +58,7 @@ PAID_CAPABILITIES = (
 _HEX64 = re.compile(r"[0-9a-f]{64}")
 _TOKEN = re.compile(r"[A-Za-z0-9_-]{43}")
 _MAX_TEXT_BYTES = 256
+CHAIN_TIME_CACHE_S = 30.0
 
 
 class PaidAdmissionError(RuntimeError):
@@ -74,6 +75,31 @@ class PaidAdmissionConflict(PaidAdmissionError):
 
 class PaidExecutionDeadline(PaidAdmissionError):
     """A paid step started or completed outside its execution window."""
+
+
+class _CachedChainTime:
+    """Short-lived finalized chain time; local monotonic time only ages the cache."""
+
+    def __init__(self, source: Callable[[], int], *, ttl_s: float = CHAIN_TIME_CACHE_S,
+                 monotonic: Callable[[], float] = time.monotonic):
+        self.source = source
+        self.ttl_s = float(ttl_s)
+        self.monotonic = monotonic
+        self._lock = threading.Lock()
+        self._value: int | None = None
+        self._read_at = 0.0
+
+    def __call__(self) -> int:
+        with self._lock:
+            now = self.monotonic()
+            if self._value is not None and now - self._read_at < self.ttl_s:
+                return self._value
+            value = self.source()
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise PaidAdmissionUnavailable("finalized chain time is invalid")
+            self._value = value
+            self._read_at = now
+            return value
 
 
 def _canonical(value: object) -> bytes:
@@ -608,6 +634,7 @@ class PaidAdmission:
     def __init__(self, ledger: SpendLedgerClient, store: PaidAdmissionStore,
                  private_key: bytes, *, model_id: str, layer_start: int,
                  layer_end: int, clock: Callable[[], float] = time.time,
+                 chain_time: Callable[[], int] | None = None,
                  voucher_store=None, channel_state=None,
                  pay_program: Optional[str] = None):
         self.ledger = ledger
@@ -618,6 +645,8 @@ class PaidAdmission:
         self.layer_start = int(layer_start)
         self.layer_end = int(layer_end)
         self.clock = clock
+        self.chain_time = _CachedChainTime(
+            chain_time or self._configured_chain_time)
         self.ready = False
         self.readiness_error = "not probed"
         self._outbox_lock = threading.Lock()
@@ -645,6 +674,16 @@ class PaidAdmission:
             except Exception as exc:
                 raise PaidAdmissionUnavailable(
                     f"chain voucher configuration is unavailable ({exc})") from exc
+
+    @staticmethod
+    def _configured_chain_time() -> int:
+        from network import pay_chain
+
+        rpc_url = pay_chain.configured_rpc_url(os.environ)
+        if not rpc_url:
+            raise PaidAdmissionUnavailable(
+                "NAK_PAY_RPC is required for finalized chain time")
+        return pay_chain.PayRpc(rpc_url).chain_time()
 
     def session_lock(self, claim: Mapping[str, object]) -> threading.RLock:
         """Return the in-process lock serializing one durable paid session."""
@@ -765,7 +804,12 @@ class PaidAdmission:
             reserved = True
             account = self.channel_state.read_channel(
                 init["channel"], self.pay_program)
-            self._pay.require_open_channel(account, now=self.clock())
+            # Status alone rejects Closing.  A nonzero deadline on an Open
+            # account is checked only against finalized chain time.
+            if account.status != "Open":
+                self._pay.require_open_channel(account, now=0)
+            deadline_now = self.chain_time() if account.close_at else None
+            self._pay.require_open_channel(account, now=deadline_now)
             if account.worker != self.pay_wallet_address:
                 raise self._pay.VoucherError(
                     "channel worker does not match this worker pay wallet")
@@ -842,7 +886,9 @@ class PaidAdmission:
             record = self.voucher_store.accept(
                 control, configured_program=self.pay_program,
                 state=self.channel_state, expected_channel=session["channel"],
-                now=self.clock(), reservation_id=session["reservation_id"])
+                deadline_time=self.chain_time,
+                persist_if_deadline_unavailable=True,
+                reservation_id=session["reservation_id"])
             pending = session["pending_total"]
             if pending is not None and record.total >= pending:
                 session["pending_total"] = None

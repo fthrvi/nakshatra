@@ -1008,6 +1008,8 @@ class WorkerVoucherStore(_Book):
     def accept(self, voucher: Mapping[str, object], *, configured_program: str,
                state: ChannelState, expected_channel: str | None = None,
                now: float | None = None,
+               deadline_time: Callable[[], int] | None = None,
+               persist_if_deadline_unavailable: bool = False,
                reservation_id: str | None = None) -> VoucherRecord:
         program = _pubkey_text(voucher.get("program"), "program id")
         configured = _pubkey_text(configured_program, "configured program id")
@@ -1024,7 +1026,23 @@ class WorkerVoucherStore(_Book):
         if len(signature) != 64:
             raise VoucherError("voucher signature must contain 64 bytes")
         account = state.read_channel(channel, configured)
-        require_redeemable_channel(account, now=now)
+        deadline_unavailable = False
+        deadline_now = now
+        if account.close_at and deadline_time is not None:
+            try:
+                deadline_now = deadline_time()
+            except Exception:
+                if not persist_if_deadline_unavailable:
+                    raise
+                deadline_unavailable = True
+        if deadline_unavailable:
+            # Keeping a payer-signed voucher cannot move money and preserves
+            # evidence for the worker/operator.  The admission layer latches a
+            # Closing channel before any further work can start.
+            if account.status not in {"Open", "Closing"}:
+                raise ChannelClosingError("channel is closed")
+        else:
+            require_redeemable_channel(account, now=deadline_now)
         if total < account.redeemed:
             raise VoucherError("voucher total is below the on-chain redeemed total")
         if total > account.cap:
