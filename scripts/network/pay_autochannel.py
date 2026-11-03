@@ -425,7 +425,7 @@ def ensure_channel(worker_key: str, required_micro_usdc: int, *, owner: str,
                 channel_book.put(
                     program=configured_program, channel=channel_address,
                     worker_key=worker_key, cap=cap, channel_base=0,
-                    max_signed_total=0)
+                    max_signed_total=0, last_voucher_at=int(now))
                 chosen = channel_book.begin_session(
                     worker_key, program=configured_program, state=tx_rpc,
                     required_micro_usdc=required, channel=channel_address)

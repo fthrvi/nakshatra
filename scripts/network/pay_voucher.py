@@ -635,11 +635,15 @@ class PayerChannelBook(_Book):
                             int(row["close_at"]), int(row["last_voucher_at"]))
 
     def put(self, *, program: str, channel: str, worker_key: str, cap: int,
-            channel_base: int = 0, max_signed_total: int = 0) -> PayerChannel:
+            channel_base: int = 0, max_signed_total: int = 0,
+            last_voucher_at: int = 0) -> PayerChannel:
         base = _u64(channel_base, "channel base")
         ceiling = _u64(max_signed_total, "maximum signed total")
         if base > ceiling:
             raise VoucherError("channel base cannot exceed the payer signing ceiling")
+        if (isinstance(last_voucher_at, bool) or not isinstance(last_voucher_at, int)
+                or last_voucher_at < 0):
+            raise VoucherError("last voucher chain time must be a non-negative integer")
         values = (
             _pubkey_text(program, "program id"), _pubkey_text(channel, "channel"),
             str(worker_key).lower(), str(_u64(cap, "channel cap")),
@@ -655,7 +659,8 @@ class PayerChannelBook(_Book):
                 if existing is None:
                     self._db.execute(
                         "INSERT INTO channels(program,channel,worker_key,cap,channel_base,"
-                        "max_signed_total) VALUES(?,?,?,?,?,?)", values)
+                        "max_signed_total,last_voucher_at) VALUES(?,?,?,?,?,?,?)",
+                        (*values, last_voucher_at))
                 else:
                     if (existing["program"] != values[0]
                             or existing["worker_key"] != values[2]

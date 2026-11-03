@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import os
 import sqlite3
-import stat
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -20,7 +19,6 @@ from network.pay_wallet import load_wallet
 DEFAULT_THRESHOLD = 1_000_000
 DEFAULT_MAX_AGE_S = 24 * 60 * 60
 DEFAULT_SAFETY_MARGIN_S = 600
-CHANNEL_ACCOUNT_SPACE = 213
 
 
 def _positive(value: int, name: str, *, allow_zero: bool = False) -> int:
@@ -101,6 +99,12 @@ class AttemptBook:
         return [dict(row) for row in self._db.execute(
             "SELECT * FROM attempts WHERE channel=? AND resolution IS NULL ORDER BY id",
             (key,))]
+
+    def succeeded(self, channel: str, kind: str) -> bool:
+        key = pay_chain.pubkey_text(channel, "channel")
+        return self._db.execute(
+            "SELECT 1 FROM attempts WHERE channel=? AND kind=? "
+            "AND resolution='succeeded' LIMIT 1", (key, kind)).fetchone() is not None
 
     def resolve(self, attempt_id: int, resolution: str, chain_now: int,
                 error: str = "") -> None:
@@ -468,7 +472,14 @@ def finalize_payer_channels(*, book: pay_voucher.PayerChannelBook | None = None,
                 if resolve_attempts(attempts, rpc, row.channel, chain_now, log):
                     result["skipped"] += 1
                     continue
-                state = rpc.read_channel(row.channel, configured_program)
+                try:
+                    state = rpc.read_channel(row.channel, configured_program)
+                except pay_voucher.VoucherError as exc:
+                    if attempts.succeeded(row.channel, "finalize"):
+                        payer_book.mark_closed(row.channel)
+                        log(f"finalize already succeeded for {row.channel}; channel is closed")
+                        continue
+                    raise
                 if state.status != "Closing":
                     result["skipped"] += 1
                     continue
