@@ -402,6 +402,41 @@ def test_close_request_uses_node_authority_and_marks_book_before_send(tmp_path):
         assert book.for_channel(CHANNEL).close_at == rpc.now + 86_400
 
 
+def test_close_request_uses_local_owner_wallet_for_old_delegate_channel(tmp_path):
+    worker_hex = pay_chain.pubkey_bytes(WALLET["address"]).hex()
+    with pay_voucher.PayerChannelBook(tmp_path / "channels.sqlite") as book:
+        book.put(program=PROGRAM, channel=CHANNEL, worker_key=worker_hex,
+                 cap=5_000_000, max_signed_total=10)
+
+        class OwnerWalletRpc(PayerRpc):
+            def __init__(self):
+                super().__init__(tmp_path / "redeems.sqlite", book)
+                assert SIGNER not in {self.node, WALLET["address"]}
+                self.state = pay_voucher.ChannelAccount(
+                    ESCROW, 4, 7, WALLET["address"], SIGNER, None, 5_000_000,
+                    10, 300, "Open", 0, self.node, 1)
+
+            def read_escrow_owner(self, escrow, program):
+                assert (escrow, program) == (ESCROW, PROGRAM)
+                return WALLET["address"]
+
+            def balance(self, address, *, commitment):
+                assert address == WALLET["address"] and commitment == "finalized"
+                return 1_000_000
+
+        rpc = OwnerWalletRpc()
+        result = pay_redeemer.request_close(
+            channels=[CHANNEL], book=book, rpc=rpc, program=PROGRAM, wallet=WALLET,
+            node_seed=rpc.node_seed, node_public=pay_voucher.public_key_bytes(rpc.node_seed),
+            attempts_path=tmp_path / "redeems.sqlite",
+            lock_path=tmp_path / "redeem.lock")
+
+        # Mutation checked: requiring voucher_signer == owner rejects the
+        # escrow owner's wallet when an old delegate opened the channel.
+        assert result["sent"] == 1 and rpc.sent == 1
+        assert book.for_channel(CHANNEL).status == "Closing"
+
+
 def test_payer_finalize_uses_chain_deadline_and_marks_closed(tmp_path):
     worker_hex = pay_chain.pubkey_bytes(WALLET["address"]).hex()
     with pay_voucher.PayerChannelBook(tmp_path / "channels.sqlite") as book:

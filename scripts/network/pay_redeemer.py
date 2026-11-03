@@ -456,7 +456,7 @@ def request_close(*, channels: Iterable[str], book: pay_voucher.PayerChannelBook
                 continue
             if state.voucher_signer == node_address:
                 signer, seed = node_address, bytes(node_seed)
-            elif state.voucher_signer == owner and owner == wallet["address"]:
+            elif owner == wallet["address"]:
                 signer, seed = wallet["address"], wallet["seed"]
             else:
                 raise pay_voucher.VoucherError(
