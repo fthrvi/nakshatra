@@ -155,14 +155,18 @@ def resolve_attempts(book: AttemptBook, rpc, channel: str, chain_now: int,
                 book.resolve(attempt["id"], "failed", chain_now, str(status["err"]))
                 log(f"{attempt['kind']} failed at finalized for {channel}: {status['err']}")
             continue
+        if status is not None:
+            # Processed/confirmed is an observation that the signature was
+            # seen.  Neither a success nor an error is final until the rooted
+            # fork says so, and blockhash expiry cannot erase that observation.
+            unresolved = True
+            continue
         if height is None:
             height = rpc.block_height(commitment="finalized")
         if height > int(attempt["last_valid_block_height"]):
             book.resolve(attempt["id"], "expired", chain_now)
             log(f"{attempt['kind']} expired before finalization for {channel}")
         else:
-            # A processed/confirmed error is deliberately not final.  It can
-            # disappear before the fork finalizes, just like a null status.
             unresolved = True
     return unresolved
 

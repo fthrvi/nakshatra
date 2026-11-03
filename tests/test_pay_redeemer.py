@@ -161,21 +161,27 @@ def test_daily_due_uses_finalized_chain_time_not_local_clock(tmp_path, monkeypat
     assert second.sent == 1
 
 
-def test_nonfinalized_error_remains_unresolved_and_blocks_resend(tmp_path):
+@pytest.mark.parametrize("error", [
+    None,
+    {"InstructionError": [1, "Custom"]},
+])
+def test_nonfinalized_status_survives_blockhash_expiry_and_blocks_resend(
+        tmp_path, error):
     path = tmp_path / "redeems.sqlite"
     with pay_redeemer.AttemptBook(path) as book:
         book.note_voucher(CHANNEL, 1_000)
         book.record(channel=CHANNEL, kind="redeem", signature="old-signature",
                     blockhash=BLOCKHASH, last_valid_block_height=100,
                     chain_now=1_000, total=2_000_000)
-    rpc = Rpc(path, now=2_000, height=100, status={
-        "err": {"InstructionError": [1, "Custom"]},
+    rpc = Rpc(path, now=2_000, height=101, status={
+        "err": error,
         "confirmationStatus": "confirmed"})
 
     result = run(tmp_path, rpc)
 
-    # Mutation checked: treating a confirmed error as final sends a replacement
-    # while the old signature can still finalize on the rooted fork.
+    # Mutation checked: expiring a confirmed success or error merely because
+    # finalized height passed lastValidBlockHeight sends a replacement while
+    # the observed signature can still finalize on the rooted fork.
     assert rpc.sent == 0 and result["skipped"] == 1
     with pay_redeemer.AttemptBook(path) as book:
         assert len(book.unresolved(CHANNEL)) == 1
