@@ -51,18 +51,22 @@ def channel_state(*, redeemed=0, status="Open", close_at=0):
 
 class Rpc:
     def __init__(self, attempt_path: Path, *, now=1_000_000, state=None,
-                 status=None, height=10, ata=True):
+                 status=None, height=10, ata=True, chain_times=None):
         self.attempt_path = attempt_path
         self.now = now
         self.state = state or channel_state()
         self.status = status
         self.height = height
         self.ata = ata
+        self.chain_times = list(chain_times or [])
+        self.chain_time_calls = 0
         self.sent = 0
         self.instructions_seen = []
 
     def ensure_cluster(self): return "local"
-    def chain_time(self): return self.now
+    def chain_time(self):
+        self.chain_time_calls += 1
+        return self.chain_times.pop(0) if self.chain_times else self.now
     def read_channel(self, channel, program):
         assert (channel, program) == (CHANNEL, PROGRAM)
         return self.state
@@ -138,6 +142,23 @@ def test_redeem_after_close_at_is_never_sent(tmp_path):
     # broadcasts a transaction the program must reject after the grace elapsed.
     assert rpc.sent == 0 and result["skipped"] == 1
     assert any("UNREDEEMABLE" in message for message in messages)
+
+
+def test_closing_redeem_rereads_chain_time_and_refuses_at_safety_margin(tmp_path):
+    rpc = Rpc(
+        tmp_path / "redeems.sqlite", now=49_000,
+        state=channel_state(status="Closing", close_at=50_000),
+        chain_times=[49_000, 49_400])
+    messages = []
+
+    result = run(tmp_path, rpc, log=messages.append)
+
+    # Mutation checked: using the once-per-cycle 49_000 timestamp, or merely
+    # logging the 600-second margin without enforcing it, broadcasts here.
+    assert rpc.chain_time_calls == 2
+    assert rpc.sent == 0 and result["skipped"] == 1
+    assert any("SAFETY MARGIN" in message and "nothing was sent" in message
+               for message in messages)
 
 
 def test_daily_due_uses_finalized_chain_time_not_local_clock(tmp_path, monkeypatch):

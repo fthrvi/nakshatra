@@ -195,6 +195,7 @@ def _prepare_and_send(*, rpc, book: AttemptBook, channel: str, kind: str,
                       instructions: list[pay_chain.Instruction], payer: str,
                       seed: bytes, chain_now: int, rent: int = 0, total: int = 0,
                       dry_run: bool = False,
+                      before_send: Callable[[], int | None] | None = None,
                       on_recorded: Callable[[], None] | None = None,
                       log: Callable[[str], None] = print) -> bool:
     blockhash_info = rpc.latest_blockhash_info(commitment="finalized")
@@ -207,6 +208,11 @@ def _prepare_and_send(*, rpc, book: AttemptBook, channel: str, kind: str,
         log(f"skip {kind} {channel}: wallet lacks SOL (needs {needed} lamports, "
             f"has {balance}); nothing was sent")
         return False
+    if before_send is not None:
+        refreshed = before_send()
+        if refreshed is None:
+            return False
+        chain_now = refreshed
     if dry_run:
         log(f"dry-run {kind} {channel}: {len(instructions)} instruction(s), "
             f"{needed} lamports required; nothing was sent")
@@ -234,6 +240,23 @@ def _prepare_and_send(*, rpc, book: AttemptBook, channel: str, kind: str,
     # send_and_confirm returns only for finalized success.  Resolve through the
     # same status path so tests and alternate RPC implementations share rules.
     return not resolve_attempts(book, rpc, channel, chain_now, log)
+
+
+def _redeem_before_margin(*, channel: str,
+                          state: pay_voucher.ChannelAccount, chain_now: int,
+                          safety_margin_s: int,
+                          log: Callable[[str], None]) -> bool:
+    if (state.status == "Closing"
+            and chain_now >= state.close_at - safety_margin_s):
+        condition = ("UNREDEEMABLE"
+                     if chain_now >= state.close_at
+                     else "INSIDE THE CLOSE SAFETY MARGIN")
+        log(f"WARNING: voucher {channel} is {condition}: "
+            f"finalized chain time {chain_now}, close_at {state.close_at}, "
+            f"margin {safety_margin_s}s; OPERATOR ACTION REQUIRED; voucher retained "
+            "and nothing was sent")
+        return False
+    return True
 
 
 def _cooperative_finalize(*, rpc, book: AttemptBook, voucher: pay_voucher.VoucherRecord,
@@ -325,9 +348,9 @@ def run_redeemer(*, store: pay_voucher.WorkerVoucherStore | None = None,
                             dry_run=dry_run, log=log):
                         result["finalized"] += 1
                     continue
-                if state.status == "Closing" and chain_now >= state.close_at:
-                    log(f"WARNING: voucher {voucher.channel} is UNREDEEMABLE: chain time "
-                        f"{chain_now} reached close_at {state.close_at}; nothing was sent")
+                if not _redeem_before_margin(
+                        channel=voucher.channel, state=state, chain_now=chain_now,
+                        safety_margin_s=safety_margin_s, log=log):
                     result["skipped"] += 1
                     continue
                 unredeemed = voucher.total - state.redeemed
@@ -337,8 +360,7 @@ def run_redeemer(*, store: pay_voucher.WorkerVoucherStore | None = None,
                 if state.status == "Closing":
                     due = True
                     remaining = state.close_at - chain_now
-                    label = "inside safety margin" if remaining <= safety_margin_s else "urgent"
-                    log(f"Closing channel {voucher.channel}: {label}, {remaining}s remain")
+                    log(f"Closing channel {voucher.channel}: urgent, {remaining}s remain")
                 if not due:
                     result["skipped"] += 1
                     continue
@@ -356,11 +378,27 @@ def run_redeemer(*, store: pay_voucher.WorkerVoucherStore | None = None,
                     instructions.insert(0, pay_chain.ata_create_idempotent(
                         worker_wallet["address"], state.worker, configured_mint))
                     rent = rpc.rent_exemption(165, commitment="finalized")
+                margin_refused = False
+
+                def before_redeem_send() -> int | None:
+                    nonlocal margin_refused
+                    fresh_chain_now = rpc.chain_time()
+                    if not _redeem_before_margin(
+                            channel=voucher.channel, state=state,
+                            chain_now=fresh_chain_now,
+                            safety_margin_s=safety_margin_s, log=log):
+                        margin_refused = True
+                        return None
+                    return fresh_chain_now
+
                 sent = _prepare_and_send(
                     rpc=rpc, book=attempts, channel=voucher.channel, kind="redeem",
                     instructions=instructions, payer=worker_wallet["address"],
                     seed=worker_wallet["seed"], chain_now=chain_now, rent=rent,
-                    total=voucher.total, dry_run=dry_run, log=log)
+                    total=voucher.total, dry_run=dry_run,
+                    before_send=before_redeem_send, log=log)
+                if margin_refused:
+                    result["skipped"] += 1
                 if sent:
                     result["would_send" if dry_run else "sent"] += 1
                     try:
