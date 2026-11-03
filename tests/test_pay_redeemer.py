@@ -11,7 +11,7 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from network import pay_chain, pay_redeemer, pay_voucher  # noqa: E402
+from network import nakd, pay_chain, pay_redeemer, pay_voucher  # noqa: E402
 
 
 PROGRAM = "GLWqQsSqUsDkPvkc8rxcoQUyro7ZQd5denht21NtdTTo"
@@ -206,3 +206,106 @@ def test_locally_closing_channel_is_not_selected_for_new_work(tmp_path):
                                required_micro_usdc=1)
     # Mutation checked: removing the local status check in begin_session selects
     # a channel after close was sent but before finalized RPC reflects Closing.
+
+
+class PayerRpc:
+    def __init__(self, path: Path, payer_book: pay_voucher.PayerChannelBook,
+                 *, now=2_000_000, closing=False):
+        self.path = path
+        self.book = payer_book
+        self.now = now
+        self.sent = 0
+        self.node_seed = bytes([71]) * 32
+        self.node = pay_chain.b58encode(pay_voucher.public_key_bytes(self.node_seed))
+        self.state = pay_voucher.ChannelAccount(
+            ESCROW, 4, 7, WALLET["address"], self.node, None, 5_000_000,
+            10, 300, "Closing" if closing else "Open",
+            now - 1 if closing else 0, self.node, 1)
+        self.status = None
+
+    def ensure_cluster(self): return "local"
+    def chain_time(self): return self.now
+    def read_channel(self, channel, program):
+        assert (channel, program) == (CHANNEL, PROGRAM)
+        return self.state
+    def read_escrow_owner(self, escrow, program):
+        assert (escrow, program) == (ESCROW, PROGRAM)
+        return OWNER
+    def signature_status(self, _signature): return self.status
+    def block_height(self, *, commitment): return 10
+    def latest_blockhash_info(self, *, commitment):
+        return {"blockhash": BLOCKHASH, "lastValidBlockHeight": 100}
+    def fee_for_message(self, _message, *, commitment): return 5_000
+    def balance(self, address, *, commitment):
+        assert address == self.node
+        return 1_000_000
+    def send_and_confirm(self, transaction, *, last_valid_block_height):
+        with sqlite3.connect(self.path) as db:
+            assert db.execute(
+                "SELECT 1 FROM attempts WHERE signature=?",
+                (transaction.signature,)).fetchone() == (1,)
+        # Mutation checked: moving payer-book Closing after broadcast exposes
+        # this channel to ensure_channel during the ambiguous send window.
+        if self.state.status == "Open":
+            assert self.book.for_channel(CHANNEL).status == "Closing"
+            self.state = pay_voucher.ChannelAccount(
+                self.state.escrow, self.state.generation, self.state.seq,
+                self.state.worker, self.state.voucher_signer, self.state.delegate,
+                self.state.cap, self.state.redeemed, self.state.fee_bps_snapshot,
+                "Closing", self.now + 86_400, self.state.rent_payer, self.state.bump)
+        self.sent += 1
+        self.status = {"err": None, "confirmationStatus": "finalized"}
+        return transaction.signature
+
+
+def test_close_request_uses_node_authority_and_marks_book_before_send(tmp_path):
+    worker_hex = pay_chain.pubkey_bytes(WALLET["address"]).hex()
+    with pay_voucher.PayerChannelBook(tmp_path / "channels.sqlite") as book:
+        book.put(program=PROGRAM, channel=CHANNEL, worker_key=worker_hex,
+                 cap=5_000_000, max_signed_total=10)
+        rpc = PayerRpc(tmp_path / "redeems.sqlite", book)
+
+        result = pay_redeemer.request_close(
+            channels=[CHANNEL], book=book, rpc=rpc, program=PROGRAM, wallet=WALLET,
+            node_seed=rpc.node_seed, node_public=pay_voucher.public_key_bytes(rpc.node_seed),
+            attempts_path=tmp_path / "redeems.sqlite",
+            lock_path=tmp_path / "redeem.lock")
+
+        assert result["sent"] == 1
+        assert book.for_channel(CHANNEL).status == "Closing"
+        assert book.for_channel(CHANNEL).close_at == rpc.now + 86_400
+
+
+def test_payer_finalize_uses_chain_deadline_and_marks_closed(tmp_path):
+    worker_hex = pay_chain.pubkey_bytes(WALLET["address"]).hex()
+    with pay_voucher.PayerChannelBook(tmp_path / "channels.sqlite") as book:
+        book.put(program=PROGRAM, channel=CHANNEL, worker_key=worker_hex,
+                 cap=5_000_000, max_signed_total=10)
+        book.mark_closing(CHANNEL, 1_999_999)
+        rpc = PayerRpc(tmp_path / "redeems.sqlite", book, closing=True)
+
+        result = pay_redeemer.finalize_payer_channels(
+            book=book, rpc=rpc, program=PROGRAM, node_seed=rpc.node_seed,
+            all_channels=False, attempts_path=tmp_path / "redeems.sqlite",
+            lock_path=tmp_path / "redeem.lock")
+
+        assert result["sent"] == 1
+        assert book.for_channel(CHANNEL).status == "Closed"
+
+
+def test_nakd_pay_cycle_contains_all_failures(monkeypatch):
+    messages = []
+    node = object.__new__(nakd.Node)
+    node._key = bytes([81]) * 32
+    node.log = messages.append
+    monkeypatch.setattr(
+        pay_redeemer, "run_redeemer",
+        lambda **_kwargs: (_ for _ in ()).throw(SystemExit("redeem boom")))
+    monkeypatch.setattr(
+        pay_redeemer, "finalize_payer_channels",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("finalize boom")))
+
+    node._pay_maintenance_cycle()
+
+    assert any("redeem cycle failed" in row for row in messages)
+    assert any("finalize cycle failed" in row for row in messages)

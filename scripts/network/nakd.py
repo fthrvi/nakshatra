@@ -106,6 +106,7 @@ _STATUS_DEFERRED = object()
 GRANT_WARN_S = 7 * 86400
 STARTER_RETRY_S = (60, 300, 1800)
 STARTER_RETRY_MAX_S = 3600
+PAY_MAINTENANCE_S = 10 * 60
 STARTER_RETRY_WINDOW_S = 7 * 86400
 STARTER_RATE = 100
 STARTER_DELEGATE_DAYS = 30
@@ -430,10 +431,35 @@ class Node:
             self._ensure_session(c["person"])
         self._spawn("sweeper", self._sweep_loop)
         self._spawn("starter-reconcile", self.reconcile_starters)
+        if os.environ.get("NAK_PAY_REDEEM", "").strip().lower() == "on":
+            self._spawn("pay-redeemer", self._pay_maintenance_loop)
         self._rearm_approvals()
         if self.direct_port:
             self._spawn("direct-listener", self._listen_loop)
         return self
+
+    def _pay_maintenance_cycle(self) -> None:
+        """Best-effort worker redeem plus payer reclaim; never escape nakd."""
+        from network import pay_redeemer
+
+        try:
+            result = pay_redeemer.run_redeemer(log=lambda line: self.log(f"pay: {line}"))
+            self.log(f"pay: redeem cycle {result}")
+        except BaseException as exc:  # daemon boundary: even SystemExit must not kill nakd
+            self.log(f"WARNING: pay redeem cycle failed: {type(exc).__name__}: {exc}")
+        try:
+            result = pay_redeemer.finalize_payer_channels(
+                node_seed=self._key, all_channels=False,
+                log=lambda line: self.log(f"pay: {line}"))
+            self.log(f"pay: finalize cycle {result}")
+        except BaseException as exc:  # same fail-contained daemon boundary
+            self.log(f"WARNING: pay finalize cycle failed: {type(exc).__name__}: {exc}")
+
+    def _pay_maintenance_loop(self) -> None:
+        while not self._stop.is_set():
+            self._pay_maintenance_cycle()
+            if self._stop.wait(PAY_MAINTENANCE_S):
+                return
 
     def stop(self) -> None:
         self._stop.set()

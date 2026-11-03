@@ -1281,9 +1281,69 @@ def _pay_command(args) -> None:
             try:
                 state = rpc.read_channel(row.channel, row.program)
                 print(f"{row.worker_key}  {row.channel}  cap {_pay_amount(state.cap)} USDC  "
-                      f"redeemed {_pay_amount(state.redeemed)} USDC  {state.status.lower()}")
+                      f"redeemed {_pay_amount(state.redeemed)} USDC  "
+                      f"latest {_pay_amount(row.max_signed_total)} USDC  "
+                      f"unredeemed {_pay_amount(max(0, row.max_signed_total - state.redeemed))} "
+                      f"USDC  {state.status.lower()}  close_at {state.close_at}")
             except chain.VoucherError as exc:
                 print(f"{row.worker_key}  {row.channel}  unavailable: {exc}")
+        return
+
+    if args.pay_cmd == "redeem":
+        from network import pay_redeemer
+        try:
+            result = pay_redeemer.run_redeemer(
+                channel=args.channel, dry_run=args.dry_run)
+        except (OSError, ValueError, pay_redeemer.pay_voucher.VoucherError, SystemExit) as exc:
+            raise SystemExit(f"pay redeem refused: {exc}") from exc
+        print("redeem cycle: " + "  ".join(
+            f"{name} {value}" for name, value in result.items()))
+        return
+
+    if args.pay_cmd == "close":
+        from network import pay_redeemer, pay_voucher
+        wallet, node_seed, node_public = _pay_wallet_and_node()
+        chain, rpc, program, _mint = _pay_chain_settings()
+        try:
+            with pay_voucher.PayerChannelBook() as book:
+                if args.channel and args.idle is not None:
+                    raise SystemExit("choose a channel or --idle DAYS, not both")
+                if args.channel:
+                    selected = [args.channel]
+                else:
+                    days = 7 if args.idle is None else args.idle
+                    if days <= 0:
+                        raise SystemExit("--idle DAYS must be positive")
+                    now = rpc.chain_time()
+                    selected = [
+                        row.channel for row in book.list_channels()
+                        if (row.status == "Open" and row.last_voucher_at > 0
+                            and now - row.last_voucher_at >= days * 86400)
+                    ]
+                if not selected:
+                    print("no payer channels are eligible to close")
+                    return
+                result = pay_redeemer.request_close(
+                    channels=selected, book=book, rpc=rpc, program=program,
+                    wallet=wallet, node_seed=node_seed, node_public=node_public)
+        except SystemExit:
+            raise
+        except (OSError, ValueError, chain.VoucherError) as exc:
+            raise SystemExit(f"pay close refused: {exc}") from exc
+        print("close cycle: " + "  ".join(
+            f"{name} {value}" for name, value in result.items()))
+        return
+
+    if args.pay_cmd == "finalize":
+        from network import pay_redeemer
+        _wallet, node_seed, _node_public = _pay_wallet_and_node()
+        try:
+            result = pay_redeemer.finalize_payer_channels(
+                node_seed=node_seed, all_channels=args.all)
+        except (OSError, ValueError, pay_redeemer.pay_voucher.VoucherError, SystemExit) as exc:
+            raise SystemExit(f"pay finalize refused: {exc}") from exc
+        print("finalize cycle: " + "  ".join(
+            f"{name} {value}" for name, value in result.items()))
         return
 
     if args.pay_cmd in {"deposit", "withdraw"}:
@@ -3559,6 +3619,17 @@ def main(argv=None, *, http_post=None, http_get=None) -> int:
     withdraw.add_argument("--amount", help="USDC amount to request")
     withdraw.add_argument("--execute", action="store_true", help="execute the pending withdrawal")
     paysub.add_parser("channels", help="list the local payer channel book with on-chain state")
+    q = paysub.add_parser("redeem", help="redeem this worker's latest finalized vouchers")
+    q.add_argument("--channel", help="redeem only this channel address")
+    q.add_argument("--dry-run", action="store_true",
+                   help="print eligible transactions without signing or sending")
+    q = paysub.add_parser("close", help="request close for a payer channel")
+    q.add_argument("channel", nargs="?", help="channel address to close")
+    q.add_argument("--idle", nargs="?", const=7, type=int, metavar="DAYS",
+                   help="close channels idle for DAYS of chain time (default: 7)")
+    q = paysub.add_parser("finalize", help="reclaim elapsed Closing payer channels")
+    q.add_argument("--all", action="store_true",
+                   help="inspect every local channel, including stale local status")
     paysub.add_parser("starters", help="list starter delegates funded by this wallet's escrow")
     q = paysub.add_parser("revoke", help="revoke one delegate on this wallet's escrow")
     q.add_argument("node_key", help="delegate node key as 64 lowercase hex characters")
