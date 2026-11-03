@@ -290,6 +290,23 @@ def test_locally_closing_channel_is_not_selected_for_new_work(tmp_path):
     # a channel after close was sent but before finalized RPC reflects Closing.
 
 
+def test_begin_session_persists_on_chain_closing_state(tmp_path):
+    worker_hex = pay_chain.pubkey_bytes(WALLET["address"]).hex()
+    state = pay_voucher.FakeChannelState(
+        {CHANNEL: channel_state(status="Closing", close_at=12_345)},
+        {ESCROW: OWNER}, program_id=PROGRAM)
+    with pay_voucher.PayerChannelBook(tmp_path / "channels.sqlite") as book:
+        book.put(program=PROGRAM, channel=CHANNEL, worker_key=worker_hex,
+                 cap=5_000_000)
+        with pytest.raises(pay_voucher.NoUsableChannel):
+            book.begin_session(worker_hex, program=PROGRAM, state=state,
+                               required_micro_usdc=1)
+        # Mutation checked: merely skipping the authoritative Closing account
+        # leaves the payer row Open forever and hides it from daemon reclaim.
+        row = book.for_channel(CHANNEL)
+        assert row.status == "Closing" and row.close_at == 12_345
+
+
 class PayerRpc:
     def __init__(self, path: Path, payer_book: pay_voucher.PayerChannelBook,
                  *, now=2_000_000, closing=False):
@@ -372,6 +389,24 @@ def test_payer_finalize_uses_chain_deadline_and_marks_closed(tmp_path):
             lock_path=tmp_path / "redeem.lock")
 
         assert result["sent"] == 1
+        assert book.for_channel(CHANNEL).status == "Closed"
+
+
+def test_daemon_finalize_reconciles_locally_open_channel_from_chain(tmp_path):
+    worker_hex = pay_chain.pubkey_bytes(WALLET["address"]).hex()
+    with pay_voucher.PayerChannelBook(tmp_path / "channels.sqlite") as book:
+        book.put(program=PROGRAM, channel=CHANNEL, worker_key=worker_hex,
+                 cap=5_000_000, max_signed_total=10)
+        rpc = PayerRpc(tmp_path / "redeems.sqlite", book, closing=True)
+
+        result = pay_redeemer.finalize_payer_channels(
+            book=book, rpc=rpc, program=PROGRAM, node_seed=rpc.node_seed,
+            all_channels=False, attempts_path=tmp_path / "redeems.sqlite",
+            lock_path=tmp_path / "redeem.lock")
+
+        # Mutation checked: filtering local Open rows before finalized account
+        # reads makes the normal daemon path examine zero channels forever.
+        assert result["examined"] == 1 and result["sent"] == 1
         assert book.for_channel(CHANNEL).status == "Closed"
 
 

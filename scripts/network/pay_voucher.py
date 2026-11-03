@@ -737,6 +737,11 @@ class PayerChannelBook(_Book):
                 try:
                     require_open_channel(channel_state)
                 except ChannelClosingError:
+                    if channel_state.status == "Closing":
+                        self._db.execute(
+                            "UPDATE channels SET status='Closing',close_at=? "
+                            "WHERE channel=?",
+                            (channel_state.close_at, row.channel))
                     continue
                 if channel_state.cap != row.cap:
                     raise VoucherError(

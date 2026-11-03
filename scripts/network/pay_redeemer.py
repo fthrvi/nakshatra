@@ -515,7 +515,7 @@ def finalize_payer_channels(*, book: pay_voucher.PayerChannelBook | None = None,
             for row in rows:
                 if wanted is not None and row.channel != wanted:
                     continue
-                if wanted is None and not all_channels and row.status != "Closing":
+                if row.status == "Closed":
                     continue
                 result["examined"] += 1
                 if resolve_attempts(attempts, rpc, row.channel, chain_now, log):
@@ -532,6 +532,8 @@ def finalize_payer_channels(*, book: pay_voucher.PayerChannelBook | None = None,
                 if state.status != "Closing":
                     result["skipped"] += 1
                     continue
+                if row.status != "Closing" or row.close_at != state.close_at:
+                    payer_book.mark_closing(row.channel, state.close_at)
                 if chain_now < state.close_at:
                     log(f"skip finalize {row.channel}: close_at {state.close_at} has not elapsed")
                     result["skipped"] += 1
