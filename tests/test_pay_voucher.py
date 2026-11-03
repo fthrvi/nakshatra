@@ -908,15 +908,20 @@ def test_starter_channel_binds_newcomer_voucher_signer_not_inviter_owner(
 
 def test_voucher_refuses_channel_too_near_close_deadline(tmp_path):
     state = pay.FakeChannelState(
-        {CHANNEL: _channel(status="Open", close_at=115)},
+        {CHANNEL: _channel(
+            status="Open", close_at=100 + pay.ACCEPT_MARGIN)},
         {ESCROW: OWNER_B58}, program_id=PROGRAM)
     vouchers = pay.WorkerVoucherStore(tmp_path / "deadline" / "vouchers.sqlite")
     with pytest.raises(pay.VoucherError, match="close deadline"):
         vouchers.accept(
             _voucher(total=1), configured_program=PROGRAM, state=state,
             expected_channel=CHANNEL, now=100)
+    # Deadline refusal affects admission, not evidence retention: a signed
+    # voucher cannot move money until the redeemer separately broadcasts it.
+    assert vouchers.latest(CHANNEL).total == 1
 
-    state.channels[CHANNEL] = _channel(status="Open", close_at=116)
+    state.channels[CHANNEL] = _channel(
+        status="Open", close_at=101 + pay.ACCEPT_MARGIN)
     assert vouchers.accept(
         _voucher(total=1), configured_program=PROGRAM, state=state,
         expected_channel=CHANNEL, now=100).total == 1
@@ -951,6 +956,30 @@ def test_mid_session_close_stops_after_current_checkpoint(
     final = manager.finalize(claim, "channel-closing")
     assert final is not None
     assert final["termination"] == "channel-closing"
+    consumer.book.close()
+    manager.store.close()
+    vouchers.close()
+
+
+def test_streaming_step_uses_aged_chain_cache_at_accept_boundary(
+        tmp_path, monkeypatch):
+    close_at = 50_000
+    fetched = close_at - pay.ACCEPT_MARGIN - 1
+    manager, consumer, claim, vouchers, _ledger = _chain_admission(
+        tmp_path, monkeypatch, session="stream-deadline",
+        chain_time=lambda: fetched)
+    monotonic = [10.0]
+    manager.chain_time.monotonic = lambda: monotonic[0]
+    manager.channel_state.channels[CHANNEL] = _channel(
+        status="Open", close_at=close_at)
+
+    manager.require_chain_voucher_before_step(claim, 0, 1)
+    monotonic[0] = 10.1
+    with pytest.raises(admission.PaidAdmissionError, match="channel-closing"):
+        manager.require_chain_voucher_before_step(claim, 0, 1)
+
+    # Mutation checked: omitting the per-step finalized deadline check lets the
+    # second streaming step start after the acceptance boundary.
     consumer.book.close()
     manager.store.close()
     vouchers.close()
@@ -1450,17 +1479,36 @@ def test_closing_voucher_uses_chain_time_and_persists_when_time_unavailable(
     worker_vouchers.close()
 
 
-def test_finalized_chain_time_source_caches_for_thirty_seconds():
+def test_finalized_chain_time_cache_ages_value_and_crosses_accept_boundary():
     monotonic = [10.0]
     reads = []
+    close_at = 50_000
     source = admission._CachedChainTime(
-        lambda: reads.append(1) or 1_000,
+        lambda: reads.append(1) or close_at - pay.ACCEPT_MARGIN - 1,
+        monotonic=lambda: monotonic[0])
+
+    account = _channel(status="Closing", close_at=close_at)
+    pay.require_redeemable_channel(account, now=source())
+    monotonic[0] = 10.1
+    with pytest.raises(pay.ChannelClosingError, match="close deadline"):
+        pay.require_redeemable_channel(account, now=source())
+    # Mutation checked: returning the raw cached chain timestamp admits the
+    # second voucher even though monotonic elapsed time crossed the boundary.
+    assert len(reads) == 1
+
+
+def test_finalized_chain_time_source_refreshes_after_thirty_seconds():
+    monotonic = [10.0]
+    values = iter((1_000, 1_030))
+    reads = []
+    source = admission._CachedChainTime(
+        lambda: reads.append(1) or next(values),
         monotonic=lambda: monotonic[0])
 
     assert source() == 1_000
     monotonic[0] = 39.9
-    assert source() == 1_000
+    assert source() == 1_030
     assert len(reads) == 1
     monotonic[0] = 40.0
-    assert source() == 1_000
+    assert source() == 1_030
     assert len(reads) == 2

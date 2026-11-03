@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import sqlite3
@@ -93,7 +94,8 @@ class _CachedChainTime:
         with self._lock:
             now = self.monotonic()
             if self._value is not None and now - self._read_at < self.ttl_s:
-                return self._value
+                elapsed = max(0.0, now - self._read_at)
+                return self._value + math.ceil(elapsed)
             value = self.source()
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise PaidAdmissionUnavailable("finalized chain time is invalid")
@@ -913,12 +915,29 @@ class PaidAdmission:
         except Exception as exc:
             raise PaidAdmissionError(f"chain voucher refused ({exc})") from exc
 
+    def _require_chain_open_for_work(self, session: dict) -> None:
+        account = self.channel_state.read_channel(
+            session["channel"], self.pay_program)
+        # Avoid a chain-time fetch when finalized state already says Closing.
+        if account.status != "Open":
+            self._pay.require_open_channel(account, now=0)
+        deadline_now = self.chain_time() if account.close_at else None
+        self._pay.require_open_channel(account, now=deadline_now)
+
     def require_chain_voucher_before_step(self, claim: dict,
                                           prompt_delta: int,
                                           generated_delta: int) -> None:
         if not self.chain_mode:
             return
         session = self._chain_session(claim)
+        try:
+            self._require_chain_open_for_work(session)
+        except self._pay.ChannelClosingError as exc:
+            session["channel_closing"] = True
+            raise PaidAdmissionError("channel-closing") from exc
+        except Exception as exc:
+            raise PaidAdmissionError(
+                f"chain channel work refused ({exc})") from exc
         try:
             self.voucher_store.assert_reservation(
                 session["channel"], session["reservation_id"])
@@ -985,7 +1004,8 @@ class PaidAdmission:
         try:
             account = self.channel_state.read_channel(
                 session["channel"], self.pay_program)
-            self._pay.require_open_channel(account, now=self.clock())
+            deadline_now = self.chain_time() if account.close_at else None
+            self._pay.require_open_channel(account, now=deadline_now)
         except self._pay.ChannelClosingError:
             # The completed checkpoint and its receipt still reach the payer;
             # no subsequent checkpoint work may begin.

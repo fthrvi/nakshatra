@@ -13,12 +13,12 @@ from typing import Callable, Iterable
 
 from network import pay_chain, pay_voucher
 from network.pay_autochannel import _OpenLock
+from network.pay_voucher import REDEEM_MARGIN
 from network.pay_wallet import load_wallet
 
 
 DEFAULT_THRESHOLD = 1_000_000
 DEFAULT_MAX_AGE_S = 24 * 60 * 60
-DEFAULT_SAFETY_MARGIN_S = 600
 
 
 def _positive(value: int, name: str, *, allow_zero: bool = False) -> int:
@@ -244,16 +244,15 @@ def _prepare_and_send(*, rpc, book: AttemptBook, channel: str, kind: str,
 
 def _redeem_before_margin(*, channel: str,
                           state: pay_voucher.ChannelAccount, chain_now: int,
-                          safety_margin_s: int,
                           log: Callable[[str], None]) -> bool:
     if (state.status == "Closing"
-            and chain_now >= state.close_at - safety_margin_s):
+            and chain_now >= state.close_at - REDEEM_MARGIN):
         condition = ("UNREDEEMABLE"
                      if chain_now >= state.close_at
                      else "INSIDE THE CLOSE SAFETY MARGIN")
         log(f"WARNING: voucher {channel} is {condition}: "
             f"finalized chain time {chain_now}, close_at {state.close_at}, "
-            f"margin {safety_margin_s}s; OPERATOR ACTION REQUIRED; voucher retained "
+            f"margin {REDEEM_MARGIN}s; OPERATOR ACTION REQUIRED; voucher retained "
             "and nothing was sent")
         return False
     return True
@@ -286,14 +285,12 @@ def run_redeemer(*, store: pay_voucher.WorkerVoucherStore | None = None,
                  mint: str | None = None, channel: str | None = None,
                  threshold: int = DEFAULT_THRESHOLD,
                  max_age_s: int = DEFAULT_MAX_AGE_S,
-                 safety_margin_s: int = DEFAULT_SAFETY_MARGIN_S,
                  dry_run: bool = False, attempts_path: str | Path | None = None,
                  lock_path: str | Path | None = None,
                  log: Callable[[str], None] = print) -> dict[str, int]:
     """Run one locked worker redemption cycle."""
     threshold = _positive(threshold, "redeem threshold")
     max_age_s = _positive(max_age_s, "maximum redeem age")
-    safety_margin_s = _positive(safety_margin_s, "close safety margin", allow_zero=True)
     wanted = None if channel is None else pay_chain.pubkey_text(channel, "channel")
     owned_store = store is None
     vouchers = store or pay_voucher.WorkerVoucherStore()
@@ -356,7 +353,7 @@ def run_redeemer(*, store: pay_voucher.WorkerVoucherStore | None = None,
                     continue
                 if not _redeem_before_margin(
                         channel=voucher.channel, state=state, chain_now=chain_now,
-                        safety_margin_s=safety_margin_s, log=log):
+                        log=log):
                     result["skipped"] += 1
                     continue
                 unredeemed = voucher.total - state.redeemed
@@ -391,8 +388,7 @@ def run_redeemer(*, store: pay_voucher.WorkerVoucherStore | None = None,
                     fresh_chain_now = rpc.chain_time()
                     if not _redeem_before_margin(
                             channel=voucher.channel, state=state,
-                            chain_now=fresh_chain_now,
-                            safety_margin_s=safety_margin_s, log=log):
+                            chain_now=fresh_chain_now, log=log):
                         margin_refused = True
                         return None
                     return fresh_chain_now

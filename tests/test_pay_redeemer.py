@@ -163,6 +163,28 @@ def test_closing_redeem_rereads_chain_time_and_refuses_at_safety_margin(tmp_path
                for message in messages)
 
 
+def test_voucher_accept_deadline_never_overruns_redeemer_refusal():
+    state = channel_state(status="Closing", close_at=50_000)
+    assert pay_voucher.ACCEPT_MARGIN == pay_voucher.REDEEM_MARGIN + 120
+    for chain_now in (
+            50_000 - pay_voucher.ACCEPT_MARGIN - 1,
+            50_000 - pay_voucher.ACCEPT_MARGIN,
+            50_000 - pay_voucher.REDEEM_MARGIN - 1,
+            50_000 - pay_voucher.REDEEM_MARGIN,
+            50_000):
+        try:
+            pay_voucher.require_redeemable_channel(state, now=chain_now)
+            accepted_as_redeemable = True
+        except pay_voucher.ChannelClosingError:
+            accepted_as_redeemable = False
+        redeemer_would_send = pay_redeemer._redeem_before_margin(
+            channel=CHANNEL, state=state, chain_now=chain_now,
+            log=lambda _line: None)
+        # Mutation checked: restoring the old 15-second accept margin makes a
+        # voucher acceptable at times when the redeemer already refuses it.
+        assert not accepted_as_redeemable or redeemer_would_send
+
+
 def test_daily_due_uses_finalized_chain_time_not_local_clock(tmp_path, monkeypatch):
     path = tmp_path / "redeems.sqlite"
     first = Rpc(path, now=1_000_000, state=channel_state())

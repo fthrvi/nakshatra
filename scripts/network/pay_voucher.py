@@ -65,7 +65,8 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 VOUCHER_DOMAIN = b"NAK_PAY_VOUCHER1"
 VOUCHER_MESSAGE_LEN = 88
 RATE = 100
-CHECKPOINT_MARGIN_S = 15
+REDEEM_MARGIN = 600
+ACCEPT_MARGIN = REDEEM_MARGIN + 120
 WIRE_PREFIX = "nakpay1."
 CONTROL_REQUEST = b"nak-pay-control-v1"
 CONTROL_OK = b"nak-pay-control-ok"
@@ -216,37 +217,40 @@ class ChannelAccount:
 
 
 def require_open_channel(account: ChannelAccount, *, now: float | None = None,
-                         checkpoint_margin_s: int = CHECKPOINT_MARGIN_S) -> None:
-    """Refuse work/vouchers that cannot be redeemed after one checkpoint.
+                         accept_margin_s: int = ACCEPT_MARGIN) -> None:
+    """Refuse new work once the conservative voucher-accept deadline is reached.
 
     The program permits redemption on ``Closing`` only until ``close_at``.
-    Workers deliberately stop accepting new work as soon as closing begins,
-    and retain one checkpoint of time margin for the final redeem transaction.
+    Workers stop new work as soon as closing begins and, for any nonzero
+    deadline, retain the redeem margin plus time for the final voucher exchange.
     """
     if account.status != "Open":
         raise ChannelClosingError("channel is not open")
-    margin = max(0, int(checkpoint_margin_s))
-    timestamp = time.time() if now is None else float(now)
-    if account.close_at and account.close_at <= timestamp + margin:
-        raise ChannelClosingError("channel close deadline is within one checkpoint")
+    margin = max(0, int(accept_margin_s))
+    if account.close_at:
+        if now is None:
+            raise VoucherError("finalized chain time is required for channel deadline")
+        if account.close_at <= float(now) + margin:
+            raise ChannelClosingError("channel close deadline is inside the acceptance margin")
 
 
 def require_redeemable_channel(account: ChannelAccount, *, now: float | None = None,
-                               checkpoint_margin_s: int = CHECKPOINT_MARGIN_S) -> None:
-    """Refuse a voucher the program could not redeem: Open, or Closing before ``close_at``.
+                               accept_margin_s: int = ACCEPT_MARGIN) -> None:
+    """Refuse treating a voucher as redeemable inside the acceptance margin.
 
-    Vouchers for work already delivered stay acceptable during the close grace (the program
-    redeems them until ``close_at``); only new work stops when closing begins.
+    A valid voucher may still be persisted as evidence for delivered work; this
+    predicate only decides whether admission may rely on a future redemption.
     """
     if account.status == "Open":
-        require_open_channel(account, now=now, checkpoint_margin_s=checkpoint_margin_s)
+        require_open_channel(account, now=now, accept_margin_s=accept_margin_s)
         return
     if account.status != "Closing":
         raise ChannelClosingError("channel is closed")
-    margin = max(0, int(checkpoint_margin_s))
-    timestamp = time.time() if now is None else float(now)
-    if not account.close_at or account.close_at <= timestamp + margin:
-        raise ChannelClosingError("channel close deadline is within one checkpoint")
+    margin = max(0, int(accept_margin_s))
+    if now is None:
+        raise VoucherError("finalized chain time is required for channel deadline")
+    if not account.close_at or account.close_at <= float(now) + margin:
+        raise ChannelClosingError("channel close deadline is inside the acceptance margin")
 
 
 def _take(data: memoryview, offset: int, size: int) -> tuple[bytes, int]:
@@ -735,7 +739,10 @@ class PayerChannelBook(_Book):
                         continue
                     raise
                 try:
-                    require_open_channel(channel_state)
+                    # Payer selection is status-only.  On-chain Open accounts
+                    # have close_at=0; worker admission owns the chain-time
+                    # deadline and must never substitute a host clock here.
+                    require_open_channel(channel_state, now=0)
                 except ChannelClosingError:
                     if channel_state.status == "Closing":
                         self._db.execute(
@@ -1063,6 +1070,7 @@ class WorkerVoucherStore(_Book):
             raise VoucherError("voucher signature must contain 64 bytes")
         account = state.read_channel(channel, configured)
         deadline_unavailable = False
+        deadline_error = None
         deadline_now = now
         if account.close_at and deadline_time is not None:
             try:
@@ -1078,7 +1086,13 @@ class WorkerVoucherStore(_Book):
             if account.status not in {"Open", "Closing"}:
                 raise ChannelClosingError("channel is closed")
         else:
-            require_redeemable_channel(account, now=deadline_now)
+            try:
+                require_redeemable_channel(account, now=deadline_now)
+            except ChannelClosingError as exc:
+                # A signature over an otherwise valid cumulative voucher is
+                # harmless to retain.  Persist it below, then tell admission it
+                # is too late to rely on this voucher for more work.
+                deadline_error = exc
         if total < account.redeemed:
             raise VoucherError("voucher total is below the on-chain redeemed total")
         if total > account.cap:
@@ -1115,6 +1129,8 @@ class WorkerVoucherStore(_Book):
                 self._db.execute("ROLLBACK")
                 raise
         self._secure()
+        if deadline_error is not None:
+            raise deadline_error
         return self.latest(channel)  # type: ignore[return-value]
 
 
