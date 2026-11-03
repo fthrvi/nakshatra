@@ -155,10 +155,13 @@ def test_closing_redeem_rereads_chain_time_and_refuses_at_safety_margin(tmp_path
 
     result = run(tmp_path, rpc, log=messages.append)
 
-    # Mutation checked: using the once-per-cycle 49_000 timestamp, or merely
-    # logging the 600-second margin without enforcing it, broadcasts here.
+    # Mutation checked: checking before signing/durable SQLite only broadcasts
+    # here after those operations cross the 600-second refusal point.
     assert rpc.chain_time_calls == 2
     assert rpc.sent == 0 and result["skipped"] == 1
+    with pay_redeemer.AttemptBook(tmp_path / "redeems.sqlite") as book:
+        attempts = book.unresolved(CHANNEL)
+        assert len(attempts) == 1 and attempts[0]["kind"] == "redeem"
     assert any("SAFETY MARGIN" in message and "nothing was sent" in message
                for message in messages)
 

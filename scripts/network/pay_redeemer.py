@@ -208,12 +208,9 @@ def _prepare_and_send(*, rpc, book: AttemptBook, channel: str, kind: str,
         log(f"skip {kind} {channel}: wallet lacks SOL (needs {needed} lamports, "
             f"has {balance}); nothing was sent")
         return False
-    if before_send is not None:
-        refreshed = before_send()
-        if refreshed is None:
-            return False
-        chain_now = refreshed
     if dry_run:
+        if before_send is not None and before_send() is None:
+            return False
         log(f"dry-run {kind} {channel}: {len(instructions)} instruction(s), "
             f"{needed} lamports required; nothing was sent")
         return True
@@ -228,6 +225,14 @@ def _prepare_and_send(*, rpc, book: AttemptBook, channel: str, kind: str,
         chain_now=chain_now, total=total)
     if on_recorded is not None:
         on_recorded()
+    # Recheck any time-sensitive send only after signing and the durable write.
+    # If the fence closed during either operation, the never-broadcast attempt
+    # remains unresolved until finalized block-height expiry proves it inert.
+    if before_send is not None:
+        refreshed = before_send()
+        if refreshed is None:
+            return False
+        chain_now = refreshed
     try:
         rpc.send_and_confirm(
             transaction,
