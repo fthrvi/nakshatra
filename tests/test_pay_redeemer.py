@@ -437,6 +437,57 @@ def test_close_request_uses_local_owner_wallet_for_old_delegate_channel(tmp_path
         assert book.for_channel(CHANNEL).status == "Closing"
 
 
+def test_close_request_finalized_failure_restores_open_without_daemon(
+        tmp_path, monkeypatch):
+    monkeypatch.delenv("NAK_PAY_REDEEM", raising=False)
+    worker_hex = pay_chain.pubkey_bytes(WALLET["address"]).hex()
+    attempts_path = tmp_path / "redeems.sqlite"
+    with pay_voucher.PayerChannelBook(tmp_path / "channels.sqlite") as book:
+        book.put(program=PROGRAM, channel=CHANNEL, worker_key=worker_hex,
+                 cap=5_000_000, max_signed_total=10)
+
+        class FailedCloseRpc(PayerRpc):
+            def __init__(self):
+                super().__init__(attempts_path, book)
+                self.channel_reads = 0
+
+            def read_channel(self, channel, program):
+                self.channel_reads += 1
+                return super().read_channel(channel, program)
+
+            def send_and_confirm(self, transaction, *, last_valid_block_height):
+                with sqlite3.connect(self.path) as db:
+                    assert db.execute(
+                        "SELECT 1 FROM attempts WHERE signature=?",
+                        (transaction.signature,)).fetchone() == (1,)
+                assert self.book.for_channel(CHANNEL).status == "Closing"
+                self.sent += 1
+                self.status = {
+                    "err": {"InstructionError": [0, "Custom"]},
+                    "confirmationStatus": "finalized",
+                }
+                raise pay_chain.TransactionDefiniteFailure(
+                    "transaction failed at finalized")
+
+        rpc = FailedCloseRpc()
+        result = pay_redeemer.request_close(
+            channels=[CHANNEL], book=book, rpc=rpc, program=PROGRAM, wallet=WALLET,
+            node_seed=rpc.node_seed, node_public=pay_voucher.public_key_bytes(rpc.node_seed),
+            attempts_path=attempts_path, lock_path=tmp_path / "redeem.lock")
+
+        # Mutation checked: consulting the pre-callback row skips the finalized
+        # Open reread and strands this channel Closing until a daemon cycle.
+        restored = book.for_channel(CHANNEL)
+        assert result["sent"] == 0 and result["skipped"] == 1
+        assert rpc.sent == 1 and rpc.channel_reads == 2
+        assert restored.status == "Open" and restored.close_at == 0
+        with pay_redeemer.AttemptBook(attempts_path) as attempts:
+            assert attempts.unresolved(CHANNEL) == []
+        assert book.begin_session(
+            worker_hex, program=PROGRAM, state=rpc,
+            required_micro_usdc=1).channel == CHANNEL
+
+
 def test_payer_finalize_uses_chain_deadline_and_marks_closed(tmp_path):
     worker_hex = pay_chain.pubkey_bytes(WALLET["address"]).hex()
     with pay_voucher.PayerChannelBook(tmp_path / "channels.sqlite") as book:

@@ -447,7 +447,8 @@ def request_close(*, channels: Iterable[str], book: pay_voucher.PayerChannelBook
             if resolve_attempts(attempts, rpc, key, chain_now, log):
                 result["skipped"] += 1
                 continue
-            row = book.for_channel(key)
+            # Validate the payer pin before reading or signing for the account.
+            book.for_channel(key)
             state = rpc.read_channel(key, program)
             owner = rpc.read_escrow_owner(state.escrow, program)
             if state.status == "Closing":
@@ -463,11 +464,12 @@ def request_close(*, channels: Iterable[str], book: pay_voucher.PayerChannelBook
                     f"no local close authority for channel {key}")
             instructions = pay_chain.channel_close_request(
                 signer, owner, state.generation, state.seq, program)
-            if _prepare_and_send(
+            sent = _prepare_and_send(
                     rpc=rpc, book=attempts, channel=key, kind="close",
                     instructions=instructions, payer=signer, seed=seed,
                     chain_now=chain_now, dry_run=dry_run,
-                    on_recorded=lambda key=key: book.mark_closing(key, 0), log=log):
+                    on_recorded=lambda key=key: book.mark_closing(key, 0), log=log)
+            if sent:
                 result["would_send" if dry_run else "sent"] += 1
                 if not dry_run:
                     fresh = rpc.read_channel(key, program)
@@ -475,7 +477,16 @@ def request_close(*, channels: Iterable[str], book: pay_voucher.PayerChannelBook
                         raise pay_voucher.VoucherError(
                             "finalized close request did not produce a future close_at")
                     book.mark_closing(key, fresh.close_at)
-            elif row.status == "Closing":
+            elif book.for_channel(key).status == "Closing":
+                # on_recorded may have changed the row after initial validation.
+                # Reconcile immediately once the durable attempt is proven
+                # inert; ambiguous attempts must remain Closing and fail shut.
+                if not resolve_attempts(attempts, rpc, key, chain_now, log):
+                    fresh = rpc.read_channel(key, program)
+                    if fresh.status == "Open":
+                        book.mark_open(key)
+                        log(f"close attempt did not land for {key}; "
+                            "restored local channel to Open")
                 result["skipped"] += 1
     return result
 
