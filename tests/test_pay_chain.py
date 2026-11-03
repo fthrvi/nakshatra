@@ -79,6 +79,72 @@ def test_discriminators_and_compact_u16():
     assert pay_chain.compact_u16(0xFFFF) == b"\xff\xff\x03"
 
 
+def test_channel_redeem_exact_ed25519_layout_and_rust_account_metas():
+    by = pay_chain.b58encode(bytes([41]) * 32)
+    owner = pay_chain.b58encode(bytes([42]) * 32)
+    worker = pay_chain.b58encode(bytes([43]) * 32)
+    signer_seed = bytes([44]) * 32
+    signer_key = ed25519.Ed25519PrivateKey.from_private_bytes(signer_seed)
+    signer = pay_chain.b58encode(signer_key.public_key().public_bytes_raw())
+    escrow = pay_chain.escrow_pda(owner, PROGRAM)[0]
+    channel = pay_chain.channel_pda(escrow, 7, 11, PROGRAM)[0]
+    message = pay_voucher.voucher_message(PROGRAM, channel, 1_234_567)
+    signature = signer_key.sign(message)
+
+    ed_ix, redeem_ix = pay_chain.channel_redeem(
+        by, owner, 7, 11, worker, 1_234_567, signer, signature, PROGRAM, MINT)
+
+    # Rust source contract: instructions.rs:928-953 and tests/m2.rs:235-260.
+    assert ed_ix.program_id == pay_chain.ED25519_PROGRAM_ID
+    assert ed_ix.accounts == ()
+    assert len(ed_ix.data) == 16 + 32 + 64 + 88
+    assert ed_ix.data[:2] == b"\x01\x00"
+    assert struct.unpack("<7H", ed_ix.data[2:16]) == (
+        48, 0xFFFF, 16, 0xFFFF, 112, 88, 0xFFFF)
+    assert ed_ix.data[16:48] == pay_chain.pubkey_bytes(signer)
+    assert ed_ix.data[48:112] == signature
+    assert ed_ix.data[112:] == message
+    ed25519.Ed25519PublicKey.from_public_bytes(ed_ix.data[16:48]).verify(
+        ed_ix.data[48:112], ed_ix.data[112:])
+
+    d = pay_chain._derived(owner, PROGRAM)
+    expected = [
+        (by, True, False), (d["config"], False, False), (MINT, False, False),
+        (d["escrow"], False, True), (channel, False, True),
+        (d["vault"], False, True),
+        (pay_chain.associated_token_address(worker, MINT)[0], False, True),
+        (pay_chain.fee_vault_pda(PROGRAM)[0], False, True),
+        (pay_chain.INSTRUCTIONS_SYSVAR_ID, False, False),
+        (pay_chain.TOKEN_PROGRAM_ID, False, False), (d["event"], False, False),
+        (PROGRAM, False, False),
+    ]
+    assert [(a.pubkey, a.is_signer, a.is_writable) for a in redeem_ix.accounts] == expected
+    assert redeem_ix.data == pay_chain.anchor_discriminator("channel_redeem") + struct.pack(
+        "<Q", 1_234_567)
+
+
+@pytest.mark.parametrize("delegate", [None, pay_chain.b58encode(bytes([47]) * 32)])
+def test_channel_close_finalize_matches_rust_account_order(delegate):
+    executor = pay_chain.b58encode(bytes([45]) * 32)
+    owner = pay_chain.b58encode(bytes([46]) * 32)
+    rent_payer = pay_chain.b58encode(bytes([48]) * 32)
+    d = pay_chain._derived(owner, PROGRAM)
+    channel = pay_chain.channel_pda(d["escrow"], 3, 9, PROGRAM)[0]
+
+    ix = pay_chain.channel_close_finalize(
+        executor, owner, 3, 9, rent_payer, delegate, PROGRAM)[0]
+
+    # Rust source contract: instructions.rs:1093-1108 (#[event_cpi] included).
+    optional = PROGRAM if delegate is None else delegate
+    assert [(a.pubkey, a.is_signer, a.is_writable) for a in ix.accounts] == [
+        (executor, True, False), (d["config"], False, False),
+        (d["escrow"], False, True), (optional, False, True),
+        (rent_payer, False, True), (channel, False, True),
+        (d["event"], False, False), (PROGRAM, False, False),
+    ]
+    assert ix.data == pay_chain.anchor_discriminator("channel_close_finalize")
+
+
 def test_rpc_environment_name_precedence_and_deprecated_alias(monkeypatch):
     monkeypatch.setenv("NAK_PAY_RPC", "http://127.0.0.1:1111")
     monkeypatch.setenv("NAKSHATRA_PAY_RPC_URL", "http://127.0.0.1:2222")

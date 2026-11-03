@@ -20,12 +20,15 @@ from network.pay_voucher import (
     _private_key,
     b58decode,
     b58encode,
+    voucher_message,
 )
 
 
 SYSTEM_PROGRAM_ID = "11111111111111111111111111111111"
 TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 ASSOCIATED_TOKEN_PROGRAM_ID = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+ED25519_PROGRAM_ID = "Ed25519SigVerify111111111111111111111111111"
+INSTRUCTIONS_SYSVAR_ID = "Sysvar1nstructions1111111111111111111111111"
 # The deployed program currently defines OPEN_CHANNEL and OPEN_TASK.  Its
 # DELEGATE_FLAGS_ALL is therefore 0b11 (the older design prose named four).
 DELEGATE_FLAGS_ALL = 0x03
@@ -121,6 +124,11 @@ def escrow_pda(owner: object, program_id: object) -> tuple[str, int]:
 
 def vault_pda(escrow: object, program_id: object) -> tuple[str, int]:
     return find_program_address([b"vault", pubkey_bytes(escrow)], program_id)
+
+
+def fee_vault_pda(program_id: object) -> tuple[str, int]:
+    config = config_pda(program_id)[0]
+    return find_program_address([b"fee_vault", pubkey_bytes(config)], program_id)
 
 
 def delegate_pda(escrow: object, key: object, program_id: object) -> tuple[str, int]:
@@ -313,6 +321,70 @@ def channel_close_request(signer: object, owner: object, generation: int, seq: i
     return [_program_instruction("channel_close_request", d["program"], (
         _meta(signer, True), _meta(d["config"]), _meta(d["escrow"]),
         _meta(channel, False, True), _meta(d["event"]), _meta(d["program"]),
+    ))]
+
+
+def channel_redeem(by: object, owner: object, generation: int, seq: int,
+                   worker: object, cumulative_total: int,
+                   voucher_signer_pubkey: object, signature: bytes,
+                   program_id: object, mint: object) -> list[Instruction]:
+    """Build the exact ed25519-precompile + ``channel_redeem`` pair.
+
+    The precompile offsets intentionally self-index with ``u16::MAX``.  The
+    on-chain program loads the immediately preceding instruction, refuses
+    accounts on it, and reconstructs the fixed 88-byte message itself.
+    """
+    d = _derived(owner, program_id)
+    channel = channel_pda(d["escrow"], generation, seq, d["program"])[0]
+    signer = pubkey_bytes(voucher_signer_pubkey, "voucher signer")
+    raw_signature = bytes(signature)
+    if len(raw_signature) != 64:
+        raise ValueError("voucher signature must contain exactly 64 bytes")
+    message = voucher_message(d["program"], channel, cumulative_total)
+    if len(message) != 88:  # fail closed if the shared wire contract changes
+        raise ValueError("voucher message must contain exactly 88 bytes")
+
+    # Solana's fixed one-signature helper layout: 16-byte header, public key,
+    # signature, then message.  Every instruction-index field is "this ix".
+    public_key_offset = 16
+    signature_offset = public_key_offset + 32
+    message_offset = signature_offset + 64
+    ed_data = bytearray((1, 0))
+    for value in (
+            signature_offset, 0xFFFF, public_key_offset, 0xFFFF,
+            message_offset, len(message), 0xFFFF):
+        ed_data.extend(struct.pack("<H", value))
+    ed_data.extend(signer)
+    ed_data.extend(raw_signature)
+    ed_data.extend(message)
+    ed_instruction = Instruction(ED25519_PROGRAM_ID, bytes(ed_data), ())
+
+    worker_token = associated_token_address(worker, mint)[0]
+    redeem_instruction = _program_instruction("channel_redeem", d["program"], (
+        _meta(by, True), _meta(d["config"]), _meta(mint),
+        _meta(d["escrow"], False, True), _meta(channel, False, True),
+        _meta(d["vault"], False, True), _meta(worker_token, False, True),
+        _meta(fee_vault_pda(d["program"])[0], False, True),
+        _meta(INSTRUCTIONS_SYSVAR_ID), _meta(TOKEN_PROGRAM_ID),
+        _meta(d["event"]), _meta(d["program"]),
+    ), _u64(cumulative_total))
+    return [ed_instruction, redeem_instruction]
+
+
+def channel_close_finalize(executor: object, owner: object, generation: int, seq: int,
+                           rent_payer: object, delegate_pda_or_none: object | None,
+                           program_id: object) -> list[Instruction]:
+    """Build the permissionless/worker-cooperative channel finalizer."""
+    d = _derived(owner, program_id)
+    channel = channel_pda(d["escrow"], generation, seq, d["program"])[0]
+    # Anchor optional accounts encode None as the program id at the same index.
+    delegate = (d["program"] if delegate_pda_or_none is None else
+                pubkey_text(delegate_pda_or_none, "delegate account"))
+    return [_program_instruction("channel_close_finalize", d["program"], (
+        _meta(executor, True), _meta(d["config"]),
+        _meta(d["escrow"], False, True), _meta(delegate, False, True),
+        _meta(rent_payer, False, True), _meta(channel, False, True),
+        _meta(d["event"]), _meta(d["program"]),
     ))]
 
 
