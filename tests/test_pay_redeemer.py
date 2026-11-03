@@ -1,6 +1,7 @@
 """Money-path invariants for worker redemption and channel reclaim."""
 from __future__ import annotations
 
+import base64
 import sqlite3
 import sys
 from pathlib import Path
@@ -218,6 +219,60 @@ def test_dry_run_never_records_or_sends(tmp_path):
     with pay_redeemer.AttemptBook(tmp_path / "redeems.sqlite") as book:
         assert book.unresolved(CHANNEL) == []
     assert any("dry-run" in message and "nothing was sent" in message for message in messages)
+
+
+def _worker_store(tmp_path, *, total, redeemed):
+    state = pay_voucher.FakeChannelState(
+        {CHANNEL: channel_state(
+            redeemed=redeemed, status="Closing", close_at=50_000)},
+        {ESCROW: OWNER}, program_id=PROGRAM)
+    store = pay_voucher.WorkerVoucherStore(tmp_path / "vouchers.sqlite")
+    signature = ed25519.Ed25519PrivateKey.from_private_bytes(SIGNER_SEED).sign(
+        pay_voucher.voucher_message(PROGRAM, CHANNEL, total))
+    store.accept({
+        "program": PROGRAM, "channel": CHANNEL, "total": total,
+        "signature": base64.b64encode(signature).decode("ascii"),
+    }, configured_program=PROGRAM, state=state, now=1_000)
+    return store
+
+
+def test_cooperative_finalize_waits_for_active_worker_reservation(tmp_path):
+    store = _worker_store(tmp_path, total=100, redeemed=100)
+    store.acquire_reservation(CHANNEL, "payer:active-session")
+    rpc = Rpc(
+        tmp_path / "redeems.sqlite", now=1_000,
+        state=channel_state(redeemed=100, status="Closing", close_at=50_000))
+    try:
+        result = pay_redeemer.run_redeemer(
+            store=store, rpc=rpc, wallet=WALLET, program=PROGRAM, mint=MINT,
+            attempts_path=tmp_path / "redeems.sqlite",
+            lock_path=tmp_path / "redeem.lock")
+        # Mutation checked: finalizing solely because redeemed == latest drops
+        # the channel while this session can still deliver its next checkpoint.
+        assert rpc.sent == 0 and result["finalized"] == 0
+    finally:
+        store.release_reservation(CHANNEL, "payer:active-session")
+        store.close()
+
+
+def test_cooperative_finalize_rereads_latest_voucher_before_send(tmp_path):
+    store = _worker_store(tmp_path, total=110, redeemed=100)
+    old_signature = ed25519.Ed25519PrivateKey.from_private_bytes(SIGNER_SEED).sign(
+        pay_voucher.voucher_message(PROGRAM, CHANNEL, 100))
+    old = pay_voucher.VoucherRecord(CHANNEL, PROGRAM, 100, old_signature)
+    state = channel_state(redeemed=100, status="Closing", close_at=50_000)
+    rpc = Rpc(tmp_path / "redeems.sqlite", now=1_000, state=state)
+    try:
+        with pay_redeemer.AttemptBook(tmp_path / "redeems.sqlite") as attempts:
+            finalized = pay_redeemer._cooperative_finalize(
+                rpc=rpc, book=attempts, store=store, voucher=old,
+                channel=state, owner=OWNER, wallet=WALLET, chain_now=1_000,
+                dry_run=False, log=lambda _line: None)
+        # Mutation checked: trusting the stale all_latest snapshot finalizes
+        # despite the store already holding an unredeemed newer voucher.
+        assert finalized is False and rpc.sent == 0
+    finally:
+        store.close()
 
 
 def test_locally_closing_channel_is_not_selected_for_new_work(tmp_path):

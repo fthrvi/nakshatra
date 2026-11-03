@@ -1005,6 +1005,37 @@ class WorkerVoucherStore(_Book):
                               bytes(row["signature"]))
                 for row in self._db.execute("SELECT * FROM vouchers ORDER BY channel")]
 
+    @staticmethod
+    def _reservation_is_active(row: sqlite3.Row) -> bool:
+        """Fail closed when a reservation's liveness cannot be disproved."""
+        if not row["boot_id"]:
+            return True
+        try:
+            boot_id = _boot_id()
+            if row["boot_id"] != boot_id:
+                return False
+            return _process_start_time(int(row["pid"])) == row["process_start"]
+        except VoucherError:
+            return True
+
+    def cooperative_finalize_safe(self, channel: str, redeemed: int) -> bool:
+        """Atomically fence live sessions and vouchers newer than chain state."""
+        key = _pubkey_text(channel, "channel")
+        amount = _u64(redeemed, "on-chain redeemed total")
+        with self._lock:
+            reservation = self._db.execute(
+                "SELECT * FROM reservations WHERE channel=?", (key,)).fetchone()
+            if reservation is not None:
+                if self._reservation_is_active(reservation):
+                    return False
+                self._db.execute(
+                    "DELETE FROM reservations WHERE channel=?", (key,))
+            latest = self._db.execute(
+                "SELECT total FROM vouchers WHERE channel=?", (key,)).fetchone()
+            safe = latest is not None and int(latest["total"]) <= amount
+        self._secure()
+        return safe
+
     def accept(self, voucher: Mapping[str, object], *, configured_program: str,
                state: ChannelState, expected_channel: str | None = None,
                now: float | None = None,

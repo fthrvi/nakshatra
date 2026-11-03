@@ -260,10 +260,15 @@ def _redeem_before_margin(*, channel: str,
 
 
 def _cooperative_finalize(*, rpc, book: AttemptBook, voucher: pay_voucher.VoucherRecord,
+                          store: pay_voucher.WorkerVoucherStore,
                           channel: pay_voucher.ChannelAccount, owner: str, wallet: dict,
                           chain_now: int, dry_run: bool,
                           log: Callable[[str], None]) -> bool:
     if channel.status != "Closing" or channel.redeemed != voucher.total:
+        return False
+    if not store.cooperative_finalize_safe(voucher.channel, channel.redeemed):
+        log(f"skip cooperative finalize {voucher.channel}: an active session or "
+            "a newer stored voucher still needs the channel")
         return False
     if resolve_attempts(book, rpc, voucher.channel, chain_now, log):
         return False
@@ -343,7 +348,8 @@ def run_redeemer(*, store: pay_voucher.WorkerVoucherStore | None = None,
                     continue
                 if voucher.total <= state.redeemed:
                     if _cooperative_finalize(
-                            rpc=rpc, book=attempts, voucher=voucher, channel=state,
+                            rpc=rpc, book=attempts, store=vouchers,
+                            voucher=voucher, channel=state,
                             owner=owner, wallet=worker_wallet, chain_now=chain_now,
                             dry_run=dry_run, log=log):
                         result["finalized"] += 1
@@ -406,7 +412,8 @@ def run_redeemer(*, store: pay_voucher.WorkerVoucherStore | None = None,
                     except pay_voucher.VoucherError:
                         fresh = state
                     if _cooperative_finalize(
-                            rpc=rpc, book=attempts, voucher=voucher, channel=fresh,
+                            rpc=rpc, book=attempts, store=vouchers,
+                            voucher=voucher, channel=fresh,
                             owner=owner, wallet=worker_wallet, chain_now=chain_now,
                             dry_run=dry_run, log=log):
                         result["finalized"] += 1
