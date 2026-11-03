@@ -440,7 +440,12 @@ class Node:
 
     def _pay_maintenance_cycle(self) -> None:
         """Best-effort worker redeem plus payer reclaim; never escape nakd."""
-        from network import pay_redeemer
+        try:
+            from network import pay_redeemer
+        except BaseException as exc:
+            self.log(f"WARNING: payment modules unavailable: "
+                     f"{type(exc).__name__}: {exc}")
+            return
 
         try:
             result = pay_redeemer.run_redeemer(log=lambda line: self.log(f"pay: {line}"))
@@ -457,7 +462,13 @@ class Node:
 
     def _pay_maintenance_loop(self) -> None:
         while not self._stop.is_set():
-            self._pay_maintenance_cycle()
+            try:
+                self._pay_maintenance_cycle()
+            except BaseException as exc:
+                # Last-resort thread boundary.  Payment modules are optional
+                # and no import/runtime failure may disable later cycles.
+                self.log(f"WARNING: pay maintenance loop recovered from "
+                         f"{type(exc).__name__}: {exc}")
             if self._stop.wait(PAY_MAINTENANCE_S):
                 return
 

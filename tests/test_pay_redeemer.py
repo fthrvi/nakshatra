@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import builtins
 import sqlite3
 import sys
 from pathlib import Path
@@ -426,3 +427,58 @@ def test_nakd_pay_cycle_contains_all_failures(monkeypatch):
 
     assert any("redeem cycle failed" in row for row in messages)
     assert any("finalize cycle failed" in row for row in messages)
+
+
+def test_nakd_pay_cycle_contains_payment_import_failure(monkeypatch):
+    messages = []
+    node = object.__new__(nakd.Node)
+    node._key = bytes([81]) * 32
+    node.log = messages.append
+    real_import = builtins.__import__
+
+    def fail_pay_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "network" and "pay_redeemer" in fromlist:
+            raise SystemExit("damaged payment install")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", fail_pay_import)
+
+    node._pay_maintenance_cycle()
+
+    # Mutation checked: leaving the import above containment lets SystemExit
+    # escape and permanently kills the maintenance thread.
+    assert any("payment modules unavailable" in row
+               and "SystemExit" in row for row in messages)
+
+
+def test_nakd_pay_loop_survives_unexpected_cycle_exception():
+    messages = []
+    calls = []
+
+    class TwoCycles:
+        def __init__(self):
+            self.checks = 0
+
+        def is_set(self):
+            self.checks += 1
+            return self.checks > 2
+
+        def wait(self, _seconds):
+            return False
+
+    node = object.__new__(nakd.Node)
+    node._stop = TwoCycles()
+    node.log = messages.append
+
+    def cycle():
+        calls.append(1)
+        if len(calls) == 1:
+            raise SystemExit("unexpected cycle escape")
+
+    node._pay_maintenance_cycle = cycle
+    node._pay_maintenance_loop()
+
+    # Mutation checked: omitting the loop's outer BaseException guard stops
+    # after the first escaped payment exception instead of running cycle two.
+    assert len(calls) == 2
+    assert any("maintenance loop recovered" in row for row in messages)
