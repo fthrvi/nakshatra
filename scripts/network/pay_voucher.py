@@ -558,6 +558,9 @@ class PayerChannel:
     cap: int
     channel_base: int
     max_signed_total: int
+    status: str = "Open"
+    close_at: int = 0
+    last_voucher_at: int = 0
 
 
 class PayerChannelBook(_Book):
@@ -584,6 +587,16 @@ class PayerChannelBook(_Book):
                 self._db.execute(
                     "ALTER TABLE channels RENAME COLUMN last_vouched_total "
                     "TO max_signed_total")
+                columns.discard("last_vouched_total")
+                columns.add("max_signed_total")
+            for name, declaration in (
+                    ("status", "TEXT NOT NULL DEFAULT 'Open'"),
+                    ("close_at", "INTEGER NOT NULL DEFAULT 0"),
+                    ("last_voucher_at", "INTEGER NOT NULL DEFAULT 0")):
+                if name not in columns:
+                    self._db.execute(
+                        f"ALTER TABLE channels ADD COLUMN {name} {declaration}")
+                    columns.add(name)
             worker_unique = False
             for index in self._db.execute("PRAGMA index_list(channels)"):
                 if not bool(index[2]):
@@ -599,12 +612,15 @@ class PayerChannelBook(_Book):
                     "CREATE TABLE channels("
                     "program TEXT NOT NULL, channel TEXT PRIMARY KEY, "
                     "worker_key TEXT NOT NULL, cap TEXT NOT NULL, "
-                    "channel_base TEXT NOT NULL, max_signed_total TEXT NOT NULL)"
+                    "channel_base TEXT NOT NULL, max_signed_total TEXT NOT NULL, "
+                    "status TEXT NOT NULL DEFAULT 'Open', close_at INTEGER NOT NULL DEFAULT 0, "
+                    "last_voucher_at INTEGER NOT NULL DEFAULT 0)"
                 )
                 self._db.execute(
                     "INSERT INTO channels(program,channel,worker_key,cap,channel_base,"
-                    "max_signed_total) SELECT program,channel,worker_key,cap,channel_base,"
-                    "max_signed_total FROM channels_unique_legacy")
+                    "max_signed_total,status,close_at,last_voucher_at) "
+                    "SELECT program,channel,worker_key,cap,channel_base,max_signed_total,"
+                    "status,close_at,last_voucher_at FROM channels_unique_legacy")
                 self._db.execute("DROP TABLE channels_unique_legacy")
             self._db.execute("COMMIT")
         except Exception:
@@ -615,7 +631,8 @@ class PayerChannelBook(_Book):
     def _row(row: sqlite3.Row) -> PayerChannel:
         return PayerChannel(row["program"], row["channel"], row["worker_key"],
                             int(row["cap"]), int(row["channel_base"]),
-                            int(row["max_signed_total"]))
+                            int(row["max_signed_total"]), row["status"],
+                            int(row["close_at"]), int(row["last_voucher_at"]))
 
     def put(self, *, program: str, channel: str, worker_key: str, cap: int,
             channel_base: int = 0, max_signed_total: int = 0) -> PayerChannel:
@@ -699,6 +716,8 @@ class PayerChannelBook(_Book):
                 (worker,)).fetchall()
             for stored in rows:
                 row = self._row(stored)
+                if row.status != "Open":
+                    continue
                 if row.program != configured:
                     continue
                 if preferred is not None and row.channel != preferred:
@@ -726,7 +745,8 @@ class PayerChannelBook(_Book):
                     "UPDATE channels SET channel_base=? WHERE channel=?",
                     (str(channel_state.redeemed), row.channel))
                 row = PayerChannel(row.program, row.channel, row.worker_key, row.cap,
-                                   channel_state.redeemed, row.max_signed_total)
+                                   channel_state.redeemed, row.max_signed_total,
+                                   row.status, row.close_at, row.last_voucher_at)
                 self._secure()
                 return row
         self._secure()
@@ -763,7 +783,7 @@ class PayerChannelBook(_Book):
         return self._row(self._db.execute(
             "SELECT * FROM channels WHERE channel=?", (key,)).fetchone())
 
-    def record(self, channel: str, total: int) -> PayerChannel:
+    def record(self, channel: str, total: int, *, chain_time: int | None = None) -> PayerChannel:
         key = _pubkey_text(channel, "channel")
         amount = _u64(total, "voucher total")
         with self._lock:
@@ -778,10 +798,16 @@ class PayerChannelBook(_Book):
                     raise VoucherError("voucher total is below the session base")
                 if amount > int(row["cap"]):
                     raise VoucherError("voucher total exceeds channel cap")
+                timestamp = int(row["last_voucher_at"])
+                if chain_time is not None:
+                    if (isinstance(chain_time, bool) or not isinstance(chain_time, int)
+                            or chain_time <= 0):
+                        raise VoucherError("voucher chain time must be a positive integer")
+                    timestamp = max(timestamp, chain_time)
                 if amount > current:
                     self._db.execute(
-                        "UPDATE channels SET max_signed_total=? WHERE channel=?",
-                        (str(amount), key))
+                        "UPDATE channels SET max_signed_total=?,last_voucher_at=? "
+                        "WHERE channel=?", (str(amount), timestamp, key))
                 self._db.execute("COMMIT")
             except Exception:
                 self._db.execute("ROLLBACK")
@@ -790,6 +816,29 @@ class PayerChannelBook(_Book):
         updated = self._db.execute(
             "SELECT * FROM channels WHERE channel=?", (key,)).fetchone()
         return self._row(updated)
+
+    def mark_closing(self, channel: str, close_at: int) -> PayerChannel:
+        key = _pubkey_text(channel, "channel")
+        if isinstance(close_at, bool) or not isinstance(close_at, int) or close_at < 0:
+            raise VoucherError("channel close time must be a non-negative integer")
+        with self._lock:
+            cursor = self._db.execute(
+                "UPDATE channels SET status='Closing',close_at=? WHERE channel=?",
+                (close_at, key))
+            if cursor.rowcount != 1:
+                raise VoucherError("unknown payer channel")
+        self._secure()
+        return self.for_channel(key)
+
+    def mark_closed(self, channel: str) -> PayerChannel:
+        key = _pubkey_text(channel, "channel")
+        with self._lock:
+            cursor = self._db.execute(
+                "UPDATE channels SET status='Closed' WHERE channel=?", (key,))
+            if cursor.rowcount != 1:
+                raise VoucherError("unknown payer channel")
+        self._secure()
+        return self.for_channel(key)
 
 
 @dataclass(frozen=True)
@@ -945,6 +994,12 @@ class WorkerVoucherStore(_Book):
             return None
         return VoucherRecord(key, row["program"], int(row["total"]), bytes(row["signature"]))
 
+    def all_latest(self) -> list[VoucherRecord]:
+        """Return one latest verified voucher for every worker channel."""
+        return [VoucherRecord(row["channel"], row["program"], int(row["total"]),
+                              bytes(row["signature"]))
+                for row in self._db.execute("SELECT * FROM vouchers ORDER BY channel")]
+
     def accept(self, voucher: Mapping[str, object], *, configured_program: str,
                state: ChannelState, expected_channel: str | None = None,
                now: float | None = None,
@@ -1081,6 +1136,7 @@ class ConsumerVoucherManager:
                  program: str, private_key: bytes, plan: list[Mapping[str, object]],
                  max_cost_by_worker: Mapping[str, int],
                  channels_by_worker: Mapping[str, PayerChannel] | None = None,
+                 chain_time: Callable[[], int] | None = None,
                  session_id: str | None = None, hold_id: str | None = None,
                  model_id: str | None = None,
                  max_prompt_tokens: int | None = None,
@@ -1089,6 +1145,7 @@ class ConsumerVoucherManager:
         self.state = state
         self.program = _pubkey_text(program, "program id")
         self.private_key = bytes(private_key)
+        self.chain_time = chain_time
         self.session_id = session_id
         self.hold_id = hold_id
         self.model_id = model_id
@@ -1205,7 +1262,8 @@ class ConsumerVoucherManager:
                 # Expand the durable exposure ceiling before producing a
                 # signature.  A crash after this write may safely re-sign any
                 # total at or below the ceiling in a later session.
-                self.book.record(channel.channel, total)
+                chain_now = None if self.chain_time is None else self.chain_time()
+                self.book.record(channel.channel, total, chain_time=chain_now)
                 signature = sign_voucher(
                     self.private_key, self.program, channel.channel, total)
                 self.pending[worker_key] = voucher_wire(

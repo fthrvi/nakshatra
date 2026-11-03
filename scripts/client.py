@@ -1974,10 +1974,12 @@ def main():
     chain_vouchers = None
     if paid is not None and os.environ.get("NAK_PAY_MODE", "") == "chain":
         try:
-            from network import pay_autochannel, pay_voucher
+            from network import pay_autochannel, pay_chain, pay_voucher
             from network.pay_wallet import load_wallet
             program = pay_voucher.configured_program()
             state = pay_voucher.configured_state()
+            chain_clock = pay_chain.PayRpc(
+                pay_chain.configured_rpc_url(os.environ)).chain_time
             key_path = Path.home() / ".nakshatra" / "keys" / "worker.ed25519"
             private_key = key_path.read_bytes()
             if len(private_key) != 32:
@@ -2001,6 +2003,7 @@ def main():
             }
             chain_vouchers = pay_voucher.ConsumerVoucherManager(
                 book=book, state=state, program=program, private_key=private_key,
+                chain_time=chain_clock,
                 plan=paid["plan"], max_cost_by_worker=max_costs,
                 channels_by_worker=chosen_channels,
                 session_id=paid["session_id"], hold_id=paid["hold_id"],

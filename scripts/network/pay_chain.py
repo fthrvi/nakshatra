@@ -372,14 +372,14 @@ def channel_redeem(by: object, owner: object, generation: int, seq: int,
 
 
 def channel_close_finalize(executor: object, owner: object, generation: int, seq: int,
-                           rent_payer: object, delegate_pda_or_none: object | None,
+                           rent_payer: object, delegate_pda_or_None: object | None,
                            program_id: object) -> list[Instruction]:
     """Build the permissionless/worker-cooperative channel finalizer."""
     d = _derived(owner, program_id)
     channel = channel_pda(d["escrow"], generation, seq, d["program"])[0]
     # Anchor optional accounts encode None as the program id at the same index.
-    delegate = (d["program"] if delegate_pda_or_none is None else
-                pubkey_text(delegate_pda_or_none, "delegate account"))
+    delegate = (d["program"] if delegate_pda_or_None is None else
+                pubkey_text(delegate_pda_or_None, "delegate account"))
     return [_program_instruction("channel_close_finalize", d["program"], (
         _meta(executor, True), _meta(d["config"]),
         _meta(d["escrow"], False, True), _meta(delegate, False, True),

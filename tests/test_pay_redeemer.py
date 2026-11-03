@@ -1,0 +1,208 @@
+"""Money-path invariants for worker redemption and channel reclaim."""
+from __future__ import annotations
+
+import sqlite3
+import sys
+from pathlib import Path
+
+import pytest
+from cryptography.hazmat.primitives.asymmetric import ed25519
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "scripts"))
+
+from network import pay_chain, pay_redeemer, pay_voucher  # noqa: E402
+
+
+PROGRAM = "GLWqQsSqUsDkPvkc8rxcoQUyro7ZQd5denht21NtdTTo"
+MINT = pay_chain.b58encode(bytes(range(1, 33)))
+BLOCKHASH = pay_chain.b58encode(bytes(range(32, 64)))
+OWNER = pay_chain.b58encode(bytes([61]) * 32)
+WALLET_SEED = bytes([62]) * 32
+WALLET = {
+    "seed": WALLET_SEED,
+    "public_key": ed25519.Ed25519PrivateKey.from_private_bytes(
+        WALLET_SEED).public_key().public_bytes_raw(),
+    "custody": "file",
+}
+WALLET["address"] = pay_chain.b58encode(WALLET["public_key"])
+ESCROW = pay_chain.escrow_pda(OWNER, PROGRAM)[0]
+CHANNEL = pay_chain.channel_pda(ESCROW, 4, 7, PROGRAM)[0]
+SIGNER_SEED = bytes([63]) * 32
+SIGNER = pay_chain.b58encode(ed25519.Ed25519PrivateKey.from_private_bytes(
+    SIGNER_SEED).public_key().public_bytes_raw())
+
+
+class VoucherStore:
+    def __init__(self, total=2_000_000):
+        signature = ed25519.Ed25519PrivateKey.from_private_bytes(SIGNER_SEED).sign(
+            pay_voucher.voucher_message(PROGRAM, CHANNEL, total))
+        self.row = pay_voucher.VoucherRecord(CHANNEL, PROGRAM, total, signature)
+
+    def all_latest(self):
+        return [self.row]
+
+
+def channel_state(*, redeemed=0, status="Open", close_at=0):
+    return pay_voucher.ChannelAccount(
+        ESCROW, 4, 7, WALLET["address"], SIGNER, None, 5_000_000,
+        redeemed, 300, status, close_at, SIGNER, 1)
+
+
+class Rpc:
+    def __init__(self, attempt_path: Path, *, now=1_000_000, state=None,
+                 status=None, height=10, ata=True):
+        self.attempt_path = attempt_path
+        self.now = now
+        self.state = state or channel_state()
+        self.status = status
+        self.height = height
+        self.ata = ata
+        self.sent = 0
+        self.instructions_seen = []
+
+    def ensure_cluster(self): return "local"
+    def chain_time(self): return self.now
+    def read_channel(self, channel, program):
+        assert (channel, program) == (CHANNEL, PROGRAM)
+        return self.state
+    def read_escrow_owner(self, escrow, program):
+        assert (escrow, program) == (ESCROW, PROGRAM)
+        return OWNER
+    def signature_status(self, _signature):
+        return self.status
+    def block_height(self, *, commitment):
+        assert commitment == "finalized"
+        return self.height
+    def account_info(self, _address, *, commitment):
+        assert commitment == "finalized"
+        return ({"owner": pay_chain.TOKEN_PROGRAM_ID, "data": bytes(165)}
+                if self.ata else None)
+    def latest_blockhash_info(self, *, commitment):
+        assert commitment == "finalized"
+        return {"blockhash": BLOCKHASH, "lastValidBlockHeight": 100}
+    def fee_for_message(self, _message, *, commitment):
+        assert commitment == "finalized"
+        return 5_000
+    def balance(self, address, *, commitment):
+        assert address == WALLET["address"] and commitment == "finalized"
+        return 1_000_000
+    def rent_exemption(self, space, *, commitment):
+        assert (space, commitment) == (165, "finalized")
+        return 200_000
+    def send_and_confirm(self, transaction, *, last_valid_block_height):
+        assert last_valid_block_height == 100
+        # Mutation checked: moving AttemptBook.record below broadcast makes this
+        # fail because the signed intent is absent at the first send boundary.
+        db = sqlite3.connect(self.attempt_path)
+        try:
+            row = db.execute(
+                "SELECT signature FROM attempts WHERE signature=?",
+                (transaction.signature,)).fetchone()
+        finally:
+            db.close()
+        assert row == (transaction.signature,)
+        self.sent += 1
+        self.status = {"err": None, "confirmationStatus": "finalized"}
+        self.state = channel_state(redeemed=2_000_000)
+        return transaction.signature
+
+
+def run(tmp_path, rpc, **kwargs):
+    return pay_redeemer.run_redeemer(
+        store=VoucherStore(), rpc=rpc, wallet=WALLET, program=PROGRAM, mint=MINT,
+        attempts_path=tmp_path / "redeems.sqlite",
+        lock_path=tmp_path / "redeem.lock", **kwargs)
+
+
+def test_redeem_records_signed_attempt_before_broadcast(tmp_path):
+    rpc = Rpc(tmp_path / "redeems.sqlite")
+
+    result = run(tmp_path, rpc)
+
+    assert rpc.sent == 1
+    assert result["sent"] == 1
+    with pay_redeemer.AttemptBook(tmp_path / "redeems.sqlite") as book:
+        assert book.unresolved(CHANNEL) == []
+        assert book.timing(CHANNEL) == (rpc.now, rpc.now)
+
+
+def test_redeem_after_close_at_is_never_sent(tmp_path):
+    rpc = Rpc(tmp_path / "redeems.sqlite", now=50_000,
+              state=channel_state(status="Closing", close_at=50_000))
+    messages = []
+
+    result = run(tmp_path, rpc, log=messages.append)
+
+    # Mutation checked: changing >= close_at to > (or deleting the guard)
+    # broadcasts a transaction the program must reject after the grace elapsed.
+    assert rpc.sent == 0 and result["skipped"] == 1
+    assert any("UNREDEEMABLE" in message for message in messages)
+
+
+def test_daily_due_uses_finalized_chain_time_not_local_clock(tmp_path, monkeypatch):
+    path = tmp_path / "redeems.sqlite"
+    first = Rpc(path, now=1_000_000, state=channel_state())
+    first_store = VoucherStore(total=10)
+    pay_redeemer.run_redeemer(
+        store=first_store, rpc=first, wallet=WALLET, program=PROGRAM, mint=MINT,
+        attempts_path=path, lock_path=tmp_path / "redeem.lock")
+    assert first.sent == 0
+    monkeypatch.setattr(pay_redeemer, "DEFAULT_MAX_AGE_S", 1)  # local module state is irrelevant
+    monkeypatch.setattr("time.time", lambda: -10**12)
+    second = Rpc(path, now=1_000_000 + 86_400, state=channel_state())
+
+    pay_redeemer.run_redeemer(
+        store=first_store, rpc=second, wallet=WALLET, program=PROGRAM, mint=MINT,
+        attempts_path=path, lock_path=tmp_path / "redeem.lock")
+
+    # Mutation checked: replacing rpc.chain_time() with time.time() leaves this
+    # small voucher unsent despite a full finalized-chain day passing.
+    assert second.sent == 1
+
+
+def test_nonfinalized_error_remains_unresolved_and_blocks_resend(tmp_path):
+    path = tmp_path / "redeems.sqlite"
+    with pay_redeemer.AttemptBook(path) as book:
+        book.note_voucher(CHANNEL, 1_000)
+        book.record(channel=CHANNEL, kind="redeem", signature="old-signature",
+                    blockhash=BLOCKHASH, last_valid_block_height=100,
+                    chain_now=1_000, total=2_000_000)
+    rpc = Rpc(path, now=2_000, height=100, status={
+        "err": {"InstructionError": [1, "Custom"]},
+        "confirmationStatus": "confirmed"})
+
+    result = run(tmp_path, rpc)
+
+    # Mutation checked: treating a confirmed error as final sends a replacement
+    # while the old signature can still finalize on the rooted fork.
+    assert rpc.sent == 0 and result["skipped"] == 1
+    with pay_redeemer.AttemptBook(path) as book:
+        assert len(book.unresolved(CHANNEL)) == 1
+
+
+def test_dry_run_never_records_or_sends(tmp_path):
+    rpc = Rpc(tmp_path / "redeems.sqlite")
+    messages = []
+
+    result = run(tmp_path, rpc, dry_run=True, log=messages.append)
+
+    assert rpc.sent == 0 and result["sent"] == 0 and result["would_send"] == 1
+    with pay_redeemer.AttemptBook(tmp_path / "redeems.sqlite") as book:
+        assert book.unresolved(CHANNEL) == []
+    assert any("dry-run" in message and "nothing was sent" in message for message in messages)
+
+
+def test_locally_closing_channel_is_not_selected_for_new_work(tmp_path):
+    worker_hex = pay_chain.pubkey_bytes(WALLET["address"]).hex()
+    state = pay_voucher.FakeChannelState(
+        {CHANNEL: channel_state(status="Open")}, {ESCROW: OWNER}, program_id=PROGRAM)
+    with pay_voucher.PayerChannelBook(tmp_path / "channels.sqlite") as book:
+        book.put(program=PROGRAM, channel=CHANNEL, worker_key=worker_hex,
+                 cap=5_000_000)
+        book.mark_closing(CHANNEL, 2_000_000)
+        with pytest.raises(pay_voucher.NoUsableChannel):
+            book.begin_session(worker_hex, program=PROGRAM, state=state,
+                               required_micro_usdc=1)
+    # Mutation checked: removing the local status check in begin_session selects
+    # a channel after close was sent but before finalized RPC reflects Closing.
