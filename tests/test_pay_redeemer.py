@@ -30,6 +30,7 @@ WALLET = {
 WALLET["address"] = pay_chain.b58encode(WALLET["public_key"])
 ESCROW = pay_chain.escrow_pda(OWNER, PROGRAM)[0]
 CHANNEL = pay_chain.channel_pda(ESCROW, 4, 7, PROGRAM)[0]
+CHANNEL2 = pay_chain.channel_pda(ESCROW, 4, 8, PROGRAM)[0]
 SIGNER_SEED = bytes([63]) * 32
 SIGNER = pay_chain.b58encode(ed25519.Ed25519PrivateKey.from_private_bytes(
     SIGNER_SEED).public_key().public_bytes_raw())
@@ -434,6 +435,107 @@ def test_daemon_finalize_reconciles_locally_open_channel_from_chain(tmp_path):
         # reads makes the normal daemon path examine zero channels forever.
         assert result["examined"] == 1 and result["sent"] == 1
         assert book.for_channel(CHANNEL).status == "Closed"
+
+
+def test_missing_finalized_channel_is_closed_and_next_row_still_finalizes(tmp_path):
+    worker_hex = pay_chain.pubkey_bytes(WALLET["address"]).hex()
+    with pay_voucher.PayerChannelBook(tmp_path / "channels.sqlite") as book:
+        for channel in (CHANNEL, CHANNEL2):
+            book.put(program=PROGRAM, channel=channel, worker_key=worker_hex,
+                     cap=5_000_000, max_signed_total=10)
+            book.mark_closing(channel, 1_999_999)
+
+        class MissingThenClosingRpc(PayerRpc):
+            def __init__(self):
+                super().__init__(tmp_path / "redeems.sqlite", book, closing=True)
+                self.second = pay_voucher.ChannelAccount(
+                    ESCROW, 4, 8, WALLET["address"], self.node, None, 5_000_000,
+                    10, 300, "Closing", self.now - 1, self.node, 1)
+
+            def read_channel(self, channel, program):
+                assert program == PROGRAM
+                if channel == CHANNEL:
+                    raise pay_voucher.VoucherError("channel account does not exist")
+                assert channel == CHANNEL2
+                return self.second
+
+        rpc = MissingThenClosingRpc()
+        result = pay_redeemer.finalize_payer_channels(
+            book=book, rpc=rpc, program=PROGRAM, node_seed=rpc.node_seed,
+            all_channels=True, attempts_path=tmp_path / "redeems.sqlite",
+            lock_path=tmp_path / "redeem.lock")
+
+        # Mutation checked: requiring a locally successful finalize raises on
+        # the first absent account and strands the later elapsed channel.
+        assert result["examined"] == 2 and result["sent"] == 1
+        assert book.for_channel(CHANNEL).status == "Closed"
+        assert book.for_channel(CHANNEL2).status == "Closed"
+
+
+def test_finalize_row_error_is_logged_and_does_not_abort_next_row(tmp_path):
+    worker_hex = pay_chain.pubkey_bytes(WALLET["address"]).hex()
+    messages = []
+    with pay_voucher.PayerChannelBook(tmp_path / "channels.sqlite") as book:
+        for channel in (CHANNEL, CHANNEL2):
+            book.put(program=PROGRAM, channel=channel, worker_key=worker_hex,
+                     cap=5_000_000, max_signed_total=10)
+            book.mark_closing(channel, 1_999_999)
+
+        class BrokenThenClosingRpc(PayerRpc):
+            def __init__(self):
+                super().__init__(tmp_path / "redeems.sqlite", book, closing=True)
+                self.second = pay_voucher.ChannelAccount(
+                    ESCROW, 4, 8, WALLET["address"], self.node, None, 5_000_000,
+                    10, 300, "Closing", self.now - 1, self.node, 1)
+
+            def read_channel(self, channel, program):
+                if channel == CHANNEL:
+                    raise pay_voucher.VoucherError("malformed finalized channel")
+                return self.second
+
+        rpc = BrokenThenClosingRpc()
+        result = pay_redeemer.finalize_payer_channels(
+            book=book, rpc=rpc, program=PROGRAM, node_seed=rpc.node_seed,
+            all_channels=True, attempts_path=tmp_path / "redeems.sqlite",
+            lock_path=tmp_path / "redeem.lock", log=messages.append)
+
+        assert result["examined"] == 2 and result["sent"] == 1
+        assert book.for_channel(CHANNEL).status == "Closing"
+        assert book.for_channel(CHANNEL2).status == "Closed"
+        assert any(CHANNEL in message and "malformed finalized channel" in message
+                   for message in messages)
+
+
+def test_failed_finalized_close_restores_open_and_selectable_channel(tmp_path):
+    worker_hex = pay_chain.pubkey_bytes(WALLET["address"]).hex()
+    attempts_path = tmp_path / "redeems.sqlite"
+    with pay_voucher.PayerChannelBook(tmp_path / "channels.sqlite") as book:
+        book.put(program=PROGRAM, channel=CHANNEL, worker_key=worker_hex,
+                 cap=5_000_000, max_signed_total=10)
+        book.mark_closing(CHANNEL, 0)
+        with pay_redeemer.AttemptBook(attempts_path) as attempts:
+            attempts.record(
+                channel=CHANNEL, kind="close", signature="failed-close",
+                blockhash=BLOCKHASH, last_valid_block_height=100,
+                chain_now=1_999_000)
+        rpc = PayerRpc(attempts_path, book, closing=False)
+        rpc.status = {
+            "err": {"InstructionError": [0, "Custom"]},
+            "confirmationStatus": "finalized",
+        }
+
+        result = pay_redeemer.finalize_payer_channels(
+            book=book, rpc=rpc, program=PROGRAM, node_seed=rpc.node_seed,
+            attempts_path=attempts_path, lock_path=tmp_path / "redeem.lock")
+
+        # Mutation checked: leaving the local row Closing after the finalized
+        # failure keeps begin_session and the next idle-close sweep blind to it.
+        restored = book.for_channel(CHANNEL)
+        assert result["skipped"] == 1
+        assert restored.status == "Open" and restored.close_at == 0
+        assert book.begin_session(
+            worker_hex, program=PROGRAM, state=rpc,
+            required_micro_usdc=1).channel == CHANNEL
 
 
 def test_nakd_pay_cycle_contains_all_failures(monkeypatch):

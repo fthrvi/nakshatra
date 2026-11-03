@@ -100,12 +100,6 @@ class AttemptBook:
             "SELECT * FROM attempts WHERE channel=? AND resolution IS NULL ORDER BY id",
             (key,))]
 
-    def succeeded(self, channel: str, kind: str) -> bool:
-        key = pay_chain.pubkey_text(channel, "channel")
-        return self._db.execute(
-            "SELECT 1 FROM attempts WHERE channel=? AND kind=? "
-            "AND resolution='succeeded' LIMIT 1", (key, kind)).fetchone() is not None
-
     def resolve(self, attempt_id: int, resolution: str, chain_now: int,
                 error: str = "") -> None:
         if resolution not in {"succeeded", "failed", "expired"}:
@@ -179,6 +173,12 @@ def _account_exists(rpc, address: str, *, owner: str) -> bool:
         raise pay_voucher.VoucherError(
             f"account {address} is owned by an unexpected program")
     return True
+
+
+def _missing_channel_account(exc: Exception) -> bool:
+    message = str(exc)
+    return (message == "channel account does not exist"
+            or message.startswith("account does not exist:"))
 
 
 def _signer_for(voucher: pay_voucher.VoucherRecord, channel: pay_voucher.ChannelAccount,
@@ -519,37 +519,50 @@ def finalize_payer_channels(*, book: pay_voucher.PayerChannelBook | None = None,
                 if row.status == "Closed":
                     continue
                 result["examined"] += 1
-                if resolve_attempts(attempts, rpc, row.channel, chain_now, log):
-                    result["skipped"] += 1
-                    continue
                 try:
-                    state = rpc.read_channel(row.channel, configured_program)
-                except pay_voucher.VoucherError as exc:
-                    if attempts.succeeded(row.channel, "finalize"):
-                        payer_book.mark_closed(row.channel)
-                        log(f"finalize already succeeded for {row.channel}; channel is closed")
+                    if resolve_attempts(attempts, rpc, row.channel, chain_now, log):
+                        result["skipped"] += 1
                         continue
-                    raise
-                if state.status != "Closing":
+                    try:
+                        state = rpc.read_channel(row.channel, configured_program)
+                    except pay_voucher.VoucherError as exc:
+                        if _missing_channel_account(exc):
+                            payer_book.mark_closed(row.channel)
+                            log(f"finalized channel account is absent for {row.channel}; "
+                                "marked closed locally")
+                            continue
+                        raise
+                    if state.status == "Open":
+                        if row.status == "Closing":
+                            payer_book.mark_open(row.channel)
+                            log(f"close attempt did not land for {row.channel}; "
+                                "restored local channel to Open")
+                        result["skipped"] += 1
+                        continue
+                    if state.status != "Closing":
+                        result["skipped"] += 1
+                        continue
+                    if row.status != "Closing" or row.close_at != state.close_at:
+                        payer_book.mark_closing(row.channel, state.close_at)
+                    if chain_now < state.close_at:
+                        log(f"skip finalize {row.channel}: close_at "
+                            f"{state.close_at} has not elapsed")
+                        result["skipped"] += 1
+                        continue
+                    owner = rpc.read_escrow_owner(state.escrow, configured_program)
+                    instructions = pay_chain.channel_close_finalize(
+                        node_address, owner, state.generation, state.seq,
+                        state.rent_payer, state.delegate, configured_program)
+                    if _prepare_and_send(
+                            rpc=rpc, book=attempts, channel=row.channel, kind="finalize",
+                            instructions=instructions, payer=node_address, seed=node_seed,
+                            chain_now=chain_now, dry_run=dry_run, log=log):
+                        result["would_send" if dry_run else "sent"] += 1
+                        if not dry_run:
+                            payer_book.mark_closed(row.channel)
+                except Exception as exc:
                     result["skipped"] += 1
-                    continue
-                if row.status != "Closing" or row.close_at != state.close_at:
-                    payer_book.mark_closing(row.channel, state.close_at)
-                if chain_now < state.close_at:
-                    log(f"skip finalize {row.channel}: close_at {state.close_at} has not elapsed")
-                    result["skipped"] += 1
-                    continue
-                owner = rpc.read_escrow_owner(state.escrow, configured_program)
-                instructions = pay_chain.channel_close_finalize(
-                    node_address, owner, state.generation, state.seq,
-                    state.rent_payer, state.delegate, configured_program)
-                if _prepare_and_send(
-                        rpc=rpc, book=attempts, channel=row.channel, kind="finalize",
-                        instructions=instructions, payer=node_address, seed=node_seed,
-                        chain_now=chain_now, dry_run=dry_run, log=log):
-                    result["would_send" if dry_run else "sent"] += 1
-                    if not dry_run:
-                        payer_book.mark_closed(row.channel)
+                    log(f"skip finalize {row.channel}: row failed ({exc})")
     finally:
         if owned_book:
             payer_book.close()

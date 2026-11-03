@@ -847,6 +847,16 @@ class PayerChannelBook(_Book):
         self._secure()
         return self.for_channel(key)
 
+    def mark_open(self, channel: str) -> PayerChannel:
+        key = _pubkey_text(channel, "channel")
+        with self._lock:
+            cursor = self._db.execute(
+                "UPDATE channels SET status='Open',close_at=0 WHERE channel=?", (key,))
+            if cursor.rowcount != 1:
+                raise VoucherError("unknown payer channel")
+        self._secure()
+        return self.for_channel(key)
+
     def mark_closed(self, channel: str) -> PayerChannel:
         key = _pubkey_text(channel, "channel")
         with self._lock:
