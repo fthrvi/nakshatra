@@ -448,7 +448,8 @@ class Node:
             return
 
         try:
-            result = pay_redeemer.run_redeemer(log=lambda line: self.log(f"pay: {line}"))
+            result = pay_redeemer.run_redeemer(
+                node_seed=self._key, log=lambda line: self.log(f"pay: {line}"))
             self.log(f"pay: redeem cycle {result}")
         except BaseException as exc:  # daemon boundary: even SystemExit must not kill nakd
             self.log(f"WARNING: pay redeem cycle failed: {type(exc).__name__}: {exc}")

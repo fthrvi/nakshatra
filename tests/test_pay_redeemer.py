@@ -13,7 +13,7 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from network import nakd, pay_chain, pay_redeemer, pay_voucher  # noqa: E402
+from network import nak, nakd, pay_chain, pay_redeemer, pay_voucher  # noqa: E402
 
 
 PROGRAM = "GLWqQsSqUsDkPvkc8rxcoQUyro7ZQd5denht21NtdTTo"
@@ -120,6 +120,21 @@ def run(tmp_path, rpc, **kwargs):
         store=VoucherStore(), rpc=rpc, wallet=WALLET, program=PROGRAM, mint=MINT,
         attempts_path=tmp_path / "redeems.sqlite",
         lock_path=tmp_path / "redeem.lock", **kwargs)
+
+
+def broker_home(tmp_path, monkeypatch, *, node_seed=bytes([71]) * 32):
+    home = tmp_path / "broker-home"
+    pay_dir = home / ".nakshatra" / "pay"
+    pay_dir.mkdir(parents=True, mode=0o700)
+    pay_dir.chmod(0o700)
+    (pay_dir / "wallet.pub").write_text(WALLET["address"] + "\n", encoding="ascii")
+    (pay_dir / "custody").write_text("broker\n", encoding="ascii")
+    key_path = home / ".nakshatra" / "keys" / "worker.ed25519"
+    key_path.parent.mkdir(parents=True, mode=0o700)
+    key_path.write_bytes(node_seed)
+    key_path.chmod(0o600)
+    monkeypatch.setenv("HOME", str(home))
+    return home, node_seed
 
 
 def test_redeem_records_signed_attempt_before_broadcast(tmp_path):
@@ -245,6 +260,77 @@ def test_daily_due_uses_finalized_chain_time_not_local_clock(tmp_path, monkeypat
     assert second.sent == 1
 
 
+def test_broker_redeem_uses_node_for_fee_payer_by_and_worker_ata(
+        tmp_path, monkeypatch):
+    node_seed = bytes([72]) * 32
+    node_address = pay_chain.b58encode(pay_voucher.public_key_bytes(node_seed))
+    home, _ = broker_home(tmp_path, monkeypatch, node_seed=node_seed)
+    assert not (home / ".nakshatra/pay/wallet.ed25519").exists()
+    seen = {}
+    real_redeem = pay_chain.channel_redeem
+    real_ata = pay_chain.ata_create_idempotent
+
+    def capture_redeem(by, *args, **kwargs):
+        seen["by"] = by
+        return real_redeem(by, *args, **kwargs)
+
+    def capture_ata(payer, owner, mint):
+        seen["ata"] = (payer, owner, mint)
+        return real_ata(payer, owner, mint)
+
+    monkeypatch.setattr(pay_chain, "channel_redeem", capture_redeem)
+    monkeypatch.setattr(pay_chain, "ata_create_idempotent", capture_ata)
+
+    class BrokerRpc(Rpc):
+        def balance(self, address, *, commitment):
+            assert address == node_address and commitment == "finalized"
+            return 1_000_000
+
+    rpc = BrokerRpc(tmp_path / "redeems.sqlite", ata=False)
+
+    result = pay_redeemer.run_redeemer(
+        store=VoucherStore(), rpc=rpc, node_seed=node_seed,
+        program=PROGRAM, mint=MINT, attempts_path=tmp_path / "redeems.sqlite",
+        lock_path=tmp_path / "redeem.lock")
+
+    # Mutation checked: requiring the broker wallet seed rejects before this
+    # permissionless redeem, while using it as payer/by cannot sign without it.
+    assert result["sent"] == 1 and rpc.sent == 1
+    assert seen == {
+        "by": node_address,
+        "ata": (node_address, WALLET["address"], MINT),
+    }
+
+
+def test_broker_redeem_without_ata_or_node_sol_points_to_pay_ensure(
+        tmp_path):
+    node_seed = bytes([73]) * 32
+    node_address = pay_chain.b58encode(pay_voucher.public_key_bytes(node_seed))
+
+    class PoorBrokerRpc(Rpc):
+        def balance(self, address, *, commitment):
+            assert address == node_address and commitment == "finalized"
+            return 5_000
+
+    rpc = PoorBrokerRpc(tmp_path / "redeems.sqlite", ata=False)
+    broker_wallet = {key: WALLET[key] for key in ("public_key", "address")}
+    broker_wallet["custody"] = "broker"
+    messages = []
+
+    result = pay_redeemer.run_redeemer(
+        store=VoucherStore(), rpc=rpc, wallet=broker_wallet, node_seed=node_seed,
+        program=PROGRAM, mint=MINT, attempts_path=tmp_path / "redeems.sqlite",
+        lock_path=tmp_path / "redeem.lock", log=messages.append)
+
+    # Mutation checked: blindly adding ATA creation either attempts an
+    # unaffordable transaction or gives no actionable way to fund its payer.
+    assert rpc.sent == 0 and result["skipped"] == 1
+    assert any("node key" in row and "nak pay ensure" in row
+               and "nothing was sent" in row for row in messages)
+    with pay_redeemer.AttemptBook(tmp_path / "redeems.sqlite") as attempts:
+        assert attempts.unresolved(CHANNEL) == []
+
+
 @pytest.mark.parametrize("error", [
     None,
     {"InstructionError": [1, "Custom"]},
@@ -328,7 +414,7 @@ def test_cooperative_finalize_rereads_latest_voucher_before_send(tmp_path):
         with pay_redeemer.AttemptBook(tmp_path / "redeems.sqlite") as attempts:
             finalized = pay_redeemer._cooperative_finalize(
                 rpc=rpc, book=attempts, store=store, voucher=old,
-                channel=state, owner=OWNER, wallet=WALLET, chain_now=1_000,
+                channel=state, owner=OWNER, executor=WALLET, chain_now=1_000,
                 dry_run=False, log=lambda _line: None)
         # Mutation checked: trusting the stale all_latest snapshot finalizes
         # despite the store already holding an unredeemed newer voucher.
@@ -435,6 +521,55 @@ def test_close_request_uses_node_authority_and_marks_book_before_send(tmp_path):
         assert result["sent"] == 1
         assert book.for_channel(CHANNEL).status == "Closing"
         assert book.for_channel(CHANNEL).close_at == rpc.now + 86_400
+
+
+def test_broker_close_uses_node_when_it_is_voucher_signer(tmp_path):
+    worker_hex = pay_chain.pubkey_bytes(WALLET["address"]).hex()
+    broker_wallet = {key: WALLET[key] for key in ("public_key", "address")}
+    broker_wallet["custody"] = "broker"
+    with pay_voucher.PayerChannelBook(tmp_path / "channels.sqlite") as book:
+        book.put(program=PROGRAM, channel=CHANNEL, worker_key=worker_hex,
+                 cap=5_000_000, max_signed_total=10)
+        rpc = PayerRpc(tmp_path / "redeems.sqlite", book)
+
+        result = pay_redeemer.request_close(
+            channels=[CHANNEL], book=book, rpc=rpc, program=PROGRAM,
+            wallet=broker_wallet, node_seed=rpc.node_seed,
+            node_public=pay_voucher.public_key_bytes(rpc.node_seed),
+            attempts_path=tmp_path / "redeems.sqlite",
+            lock_path=tmp_path / "redeem.lock")
+
+        # Mutation checked: a blanket broker-custody refusal hides the node's
+        # existing voucher-signer authority and sends nothing.
+        assert result["sent"] == 1 and rpc.sent == 1
+
+
+def test_broker_close_owner_authority_explains_wallet_approval_boundary(tmp_path):
+    worker_hex = pay_chain.pubkey_bytes(WALLET["address"]).hex()
+    broker_wallet = {key: WALLET[key] for key in ("public_key", "address")}
+    broker_wallet["custody"] = "broker"
+    with pay_voucher.PayerChannelBook(tmp_path / "channels.sqlite") as book:
+        book.put(program=PROGRAM, channel=CHANNEL, worker_key=worker_hex,
+                 cap=5_000_000, max_signed_total=10)
+        rpc = PayerRpc(tmp_path / "redeems.sqlite", book)
+        rpc.state = pay_voucher.ChannelAccount(
+            ESCROW, 4, 7, WALLET["address"], SIGNER, None, 5_000_000,
+            10, 300, "Open", 0, rpc.node, 1)
+        rpc.read_escrow_owner = lambda escrow, program: WALLET["address"]
+
+        with pytest.raises(
+                pay_voucher.VoucherError,
+                match=r"needs wallet approval \(broker custody; arrives in M4c 2c\)"):
+            pay_redeemer.request_close(
+                channels=[CHANNEL], book=book, rpc=rpc, program=PROGRAM,
+                wallet=broker_wallet, node_seed=rpc.node_seed,
+                node_public=pay_voucher.public_key_bytes(rpc.node_seed),
+                attempts_path=tmp_path / "redeems.sqlite",
+                lock_path=tmp_path / "redeem.lock")
+
+        # Mutation checked: falling through to wallet["seed"] crashes or signs
+        # without the broker approval capability that M4c 2c will provide.
+        assert rpc.sent == 0
 
 
 def test_close_request_uses_local_owner_wallet_for_old_delegate_channel(tmp_path):
@@ -661,20 +796,82 @@ def test_failed_finalized_close_restores_open_and_selectable_channel(tmp_path):
 
 def test_nakd_pay_cycle_contains_all_failures(monkeypatch):
     messages = []
+    seen = {}
     node = object.__new__(nakd.Node)
     node._key = bytes([81]) * 32
     node.log = messages.append
-    monkeypatch.setattr(
-        pay_redeemer, "run_redeemer",
-        lambda **_kwargs: (_ for _ in ()).throw(SystemExit("redeem boom")))
+
+    def fail_redeem(**kwargs):
+        seen["node_seed"] = kwargs.get("node_seed")
+        raise SystemExit("redeem boom")
+
+    monkeypatch.setattr(pay_redeemer, "run_redeemer", fail_redeem)
     monkeypatch.setattr(
         pay_redeemer, "finalize_payer_channels",
         lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("finalize boom")))
 
     node._pay_maintenance_cycle()
 
+    # Mutation checked: making nakd's redeemer rediscover a broker wallet seed
+    # blocks the cycle on a correctly seedless broker-custody configuration.
+    assert seen["node_seed"] == node._key
     assert any("redeem cycle failed" in row for row in messages)
     assert any("finalize cycle failed" in row for row in messages)
+
+
+def test_broker_cli_channels_close_and_finalize_without_wallet_seed(
+        tmp_path, monkeypatch, capsys):
+    home, node_seed = broker_home(tmp_path, monkeypatch)
+    assert not (home / ".nakshatra/pay/wallet.ed25519").exists()
+    worker_hex = pay_chain.pubkey_bytes(WALLET["address"]).hex()
+    with pay_voucher.PayerChannelBook() as book:
+        book.put(program=PROGRAM, channel=CHANNEL, worker_key=worker_hex,
+                 cap=5_000_000, max_signed_total=10)
+
+    class CliRpc(PayerRpc):
+        def __init__(self):
+            with pay_voucher.PayerChannelBook() as current:
+                super().__init__(
+                    home / ".nakshatra/pay/redeems.sqlite", current,
+                    closing=False)
+            self.node_seed = node_seed
+            self.node = pay_chain.b58encode(pay_voucher.public_key_bytes(node_seed))
+            self.state = pay_voucher.ChannelAccount(
+                ESCROW, 4, 7, WALLET["address"], self.node, None, 5_000_000,
+                10, 300, "Open", 0, self.node, 1)
+
+        def send_and_confirm(self, transaction, *, last_valid_block_height):
+            with pay_voucher.PayerChannelBook() as current:
+                self.book = current
+                return super().send_and_confirm(
+                    transaction, last_valid_block_height=last_valid_block_height)
+
+    rpc = CliRpc()
+    monkeypatch.setattr(
+        nak, "_pay_chain_settings", lambda: (pay_chain, rpc, PROGRAM, MINT))
+
+    nak.main(["pay", "channels"])
+    channels_output = capsys.readouterr().out
+    assert CHANNEL in channels_output and "redeemed 0.00001 USDC" in channels_output
+
+    nak.main(["pay", "close", CHANNEL])
+    close_output = capsys.readouterr().out
+    assert "close cycle:" in close_output and "sent 1" in close_output
+
+    finalized = {}
+
+    def capture_finalize(**kwargs):
+        finalized.update(kwargs)
+        return {"examined": 0, "sent": 0, "would_send": 0, "skipped": 0}
+
+    monkeypatch.setattr(pay_redeemer, "finalize_payer_channels", capture_finalize)
+    nak.main(["pay", "finalize"])
+    finalize_output = capsys.readouterr().out
+
+    # Mutation checked: the former unconditional load_wallet() rejected all
+    # three commands before their node-key/read-only permissionless paths.
+    assert finalized["node_seed"] == node_seed
+    assert "finalize cycle:" in finalize_output
 
 
 def test_nakd_pay_cycle_contains_payment_import_failure(monkeypatch):

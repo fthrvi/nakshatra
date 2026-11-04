@@ -14,7 +14,7 @@ from typing import Callable, Iterable
 from network import pay_chain, pay_voucher
 from network.pay_autochannel import _OpenLock
 from network.pay_voucher import REDEEM_MARGIN
-from network.pay_wallet import load_wallet
+from network.pay_wallet import load_wallet_identity
 
 
 DEFAULT_THRESHOLD = 1_000_000
@@ -197,6 +197,8 @@ def _prepare_and_send(*, rpc, book: AttemptBook, channel: str, kind: str,
                       dry_run: bool = False,
                       before_send: Callable[[], int | None] | None = None,
                       on_recorded: Callable[[], None] | None = None,
+                      balance_label: str = "wallet",
+                      low_balance_hint: str = "",
                       log: Callable[[str], None] = print) -> bool:
     blockhash_info = rpc.latest_blockhash_info(commitment="finalized")
     message = pay_chain.compile_message(
@@ -205,8 +207,9 @@ def _prepare_and_send(*, rpc, book: AttemptBook, channel: str, kind: str,
     balance = rpc.balance(payer, commitment="finalized")
     needed = int(rent) + fee
     if balance < needed:
-        log(f"skip {kind} {channel}: wallet lacks SOL (needs {needed} lamports, "
-            f"has {balance}); nothing was sent")
+        hint = f"; {low_balance_hint}" if low_balance_hint else ""
+        log(f"skip {kind} {channel}: {balance_label} lacks SOL (needs {needed} lamports, "
+            f"has {balance}){hint}; nothing was sent")
         return False
     if dry_run:
         if before_send is not None and before_send() is None:
@@ -283,7 +286,7 @@ def _redeem_eligible(*, channel: str, state: pay_voucher.ChannelAccount,
 
 def _cooperative_finalize(*, rpc, book: AttemptBook, voucher: pay_voucher.VoucherRecord,
                           store: pay_voucher.WorkerVoucherStore,
-                          channel: pay_voucher.ChannelAccount, owner: str, wallet: dict,
+                          channel: pay_voucher.ChannelAccount, owner: str, executor: dict,
                           chain_now: int, dry_run: bool,
                           log: Callable[[str], None]) -> bool:
     if channel.status != "Closing" or channel.redeemed != voucher.total:
@@ -292,20 +295,28 @@ def _cooperative_finalize(*, rpc, book: AttemptBook, voucher: pay_voucher.Vouche
         log(f"skip cooperative finalize {voucher.channel}: an active session or "
             "a newer stored voucher still needs the channel")
         return False
+    if executor["address"] != channel.worker:
+        # A node key may redeem permissionlessly, but it cannot exercise the
+        # program's worker-only early-finalize exception.  The node-key payer
+        # finalizer will close this channel once close_at elapses.
+        log(f"skip cooperative finalize {voucher.channel}: broker-custody node key "
+            "is not the channel worker; permissionless finalize will run after close_at")
+        return False
     if resolve_attempts(book, rpc, voucher.channel, chain_now, log):
         return False
     instructions = pay_chain.channel_close_finalize(
-        wallet["address"], owner, channel.generation, channel.seq,
+        executor["address"], owner, channel.generation, channel.seq,
         channel.rent_payer, channel.delegate, voucher.program)
     return _prepare_and_send(
         rpc=rpc, book=book, channel=voucher.channel, kind="finalize",
-        instructions=instructions, payer=wallet["address"], seed=wallet["seed"],
+        instructions=instructions, payer=executor["address"], seed=executor["seed"],
         chain_now=chain_now, dry_run=dry_run, log=log)
 
 
 def run_redeemer(*, store: pay_voucher.WorkerVoucherStore | None = None,
                  rpc=None, wallet: dict | None = None, program: str | None = None,
                  mint: str | None = None, channel: str | None = None,
+                 node_seed: bytes | None = None,
                  threshold: int = DEFAULT_THRESHOLD,
                  max_age_s: int = DEFAULT_MAX_AGE_S,
                  dry_run: bool = False, attempts_path: str | Path | None = None,
@@ -333,10 +344,22 @@ def run_redeemer(*, store: pay_voucher.WorkerVoucherStore | None = None,
             configured_mint = (pay_chain.configured_pubkey(
                 os.environ, "NAK_PAY_MINT") if mint is None else
                 pay_chain.pubkey_text(mint, "mint"))
-            worker_wallet = wallet or load_wallet(Path.home())
-            if worker_wallet["custody"] != "file":
-                raise pay_voucher.VoucherError(
-                    "worker redeemer requires file-custody pay wallet")
+            worker_wallet = wallet or load_wallet_identity(Path.home())
+            if worker_wallet["custody"] == "file":
+                fee_payer = {
+                    "address": worker_wallet["address"],
+                    "seed": worker_wallet["seed"],
+                }
+            else:
+                if node_seed is None:
+                    from nakshatra_auth import load_worker_key
+                    node_seed, _node_hex = load_worker_key(
+                        Path.home() / ".nakshatra" / "keys" / "worker.ed25519")
+                node_seed = bytes(node_seed)
+                fee_payer = {
+                    "address": pay_chain.b58encode(pay_voucher.public_key_bytes(node_seed)),
+                    "seed": node_seed,
+                }
             chain_now = rpc.chain_time()
             for voucher in vouchers.all_latest():
                 if wanted is not None and voucher.channel != wanted:
@@ -370,7 +393,7 @@ def run_redeemer(*, store: pay_voucher.WorkerVoucherStore | None = None,
                     if _cooperative_finalize(
                             rpc=rpc, book=attempts, store=vouchers,
                             voucher=voucher, channel=state,
-                            owner=owner, wallet=worker_wallet, chain_now=chain_now,
+                            owner=owner, executor=fee_payer, chain_now=chain_now,
                             dry_run=dry_run, log=log):
                         result["finalized"] += 1
                     continue
@@ -392,7 +415,7 @@ def run_redeemer(*, store: pay_voucher.WorkerVoucherStore | None = None,
                     continue
                 signer = _signer_for(voucher, state, owner)
                 instructions = pay_chain.channel_redeem(
-                    worker_wallet["address"], owner, state.generation, state.seq,
+                    fee_payer["address"], owner, state.generation, state.seq,
                     state.worker, voucher.total, signer, voucher.signature,
                     configured_program, configured_mint)
                 worker_ata = pay_chain.associated_token_address(
@@ -402,35 +425,38 @@ def run_redeemer(*, store: pay_voucher.WorkerVoucherStore | None = None,
                 rent = 0
                 if ata_missing:
                     instructions.insert(0, pay_chain.ata_create_idempotent(
-                        worker_wallet["address"], state.worker, configured_mint))
+                        fee_payer["address"], state.worker, configured_mint))
                     rent = rpc.rent_exemption(165, commitment="finalized")
-                eligibility_refused = False
-
                 def before_redeem_send() -> int | None:
-                    nonlocal eligibility_refused
-                    fresh_chain_now = rpc.chain_time()
                     try:
                         fresh_state = rpc.read_channel(
                             voucher.channel, configured_program)
                     except pay_voucher.VoucherError as exc:
                         log(f"WARNING: voucher {voucher.channel} finalized channel "
                             f"recheck failed ({exc}); voucher retained and nothing was sent")
-                        eligibility_refused = True
                         return None
+                    # Read time after the account so the deadline observation
+                    # cannot precede the finalized state being judged.
+                    fresh_chain_now = rpc.chain_time()
                     if not _redeem_eligible(
                             channel=voucher.channel, state=fresh_state,
                             total=voucher.total, chain_now=fresh_chain_now, log=log):
-                        eligibility_refused = True
                         return None
                     return fresh_chain_now
 
                 sent = _prepare_and_send(
                     rpc=rpc, book=attempts, channel=voucher.channel, kind="redeem",
-                    instructions=instructions, payer=worker_wallet["address"],
-                    seed=worker_wallet["seed"], chain_now=chain_now, rent=rent,
+                    instructions=instructions, payer=fee_payer["address"],
+                    seed=fee_payer["seed"], chain_now=chain_now, rent=rent,
                     total=voucher.total, dry_run=dry_run,
-                    before_send=before_redeem_send, log=log)
-                if eligibility_refused:
+                    before_send=before_redeem_send,
+                    balance_label=(
+                        "wallet" if worker_wallet["custody"] == "file" else "node key"),
+                    low_balance_hint=(
+                        "run `nak pay ensure` to fund the node key and retry ATA creation"
+                        if worker_wallet["custody"] != "file" and ata_missing else ""),
+                    log=log)
+                if not sent:
                     result["skipped"] += 1
                 if sent:
                     result["would_send" if dry_run else "sent"] += 1
@@ -441,7 +467,7 @@ def run_redeemer(*, store: pay_voucher.WorkerVoucherStore | None = None,
                     if _cooperative_finalize(
                             rpc=rpc, book=attempts, store=vouchers,
                             voucher=voucher, channel=fresh,
-                            owner=owner, wallet=worker_wallet, chain_now=chain_now,
+                            owner=owner, executor=fee_payer, chain_now=chain_now,
                             dry_run=dry_run, log=log):
                         result["finalized"] += 1
     finally:
@@ -484,6 +510,9 @@ def request_close(*, channels: Iterable[str], book: pay_voucher.PayerChannelBook
             if state.voucher_signer == node_address:
                 signer, seed = node_address, bytes(node_seed)
             elif owner == wallet["address"]:
+                if wallet.get("custody") != "file" or "seed" not in wallet:
+                    raise pay_voucher.VoucherError(
+                        "needs wallet approval (broker custody; arrives in M4c 2c)")
                 signer, seed = wallet["address"], wallet["seed"]
             else:
                 raise pay_voucher.VoucherError(

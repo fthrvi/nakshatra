@@ -972,19 +972,25 @@ def _pay_chain_settings(*, require_rpc: bool = True):
 
 
 def _pay_wallet_and_node(*, signing: bool = True):
-    from network.pay_wallet import load_wallet
-    from nakshatra_auth import load_worker_key
+    from network.pay_wallet import load_wallet_identity
 
-    wallet = load_wallet(Path.home())
+    wallet = load_wallet_identity(Path.home())
     if signing and wallet["custody"] == "broker":
         raise SystemExit(
             "wallet custody is broker; on-chain wallet signing is not available yet")
+    node_seed, node_public = _pay_node_key()
+    return wallet, node_seed, node_public
+
+
+def _pay_node_key() -> tuple[bytes, bytes]:
+    from nakshatra_auth import load_worker_key
+
     try:
         node_seed, node_hex = load_worker_key(
             Path.home() / ".nakshatra" / "keys" / "worker.ed25519")
     except (OSError, ValueError, PermissionError) as exc:
         raise SystemExit(f"cannot load the node worker key: {exc}") from exc
-    return wallet, node_seed, bytes.fromhex(node_hex)
+    return node_seed, bytes.fromhex(node_hex)
 
 
 def _pay_send(rpc, chain, instructions, wallet: dict, *, rent: int = 0) -> str:
@@ -1222,7 +1228,7 @@ def _pay_revoke(node_key_hex: str, *, allow_self: bool = False) -> None:
 
 
 def _pay_command(args) -> None:
-    from network.pay_wallet import bip39_mnemonic, load_wallet
+    from network.pay_wallet import bip39_mnemonic, load_wallet, load_wallet_identity
 
     if args.pay_cmd == "backup":
         if not sys.stdin.isatty() or not sys.stdout.isatty():
@@ -1246,7 +1252,8 @@ def _pay_command(args) -> None:
         print(json.dumps(list(wallet["seed"] + wallet["public_key"]), separators=(",", ":")))
         return
 
-    wallet = load_wallet(Path.home())
+    wallet = (None if args.pay_cmd in {"channels", "redeem", "finalize"}
+              else load_wallet_identity(Path.home()))
     if args.pay_cmd == "address":
         print(wallet["address"])
         return
@@ -1302,7 +1309,7 @@ def _pay_command(args) -> None:
 
     if args.pay_cmd == "close":
         from network import pay_redeemer, pay_voucher
-        wallet, node_seed, node_public = _pay_wallet_and_node()
+        wallet, node_seed, node_public = _pay_wallet_and_node(signing=False)
         chain, rpc, program, _mint = _pay_chain_settings()
         try:
             with pay_voucher.PayerChannelBook() as book:
@@ -1336,7 +1343,7 @@ def _pay_command(args) -> None:
 
     if args.pay_cmd == "finalize":
         from network import pay_redeemer
-        _wallet, node_seed, _node_public = _pay_wallet_and_node()
+        node_seed, _node_public = _pay_node_key()
         try:
             result = pay_redeemer.finalize_payer_channels(
                 node_seed=node_seed, all_channels=args.all)

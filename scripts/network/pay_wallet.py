@@ -140,7 +140,7 @@ def _wallet_values(seed: bytes) -> tuple[bytes, str]:
     return public_key, base58_encode(public_key)
 
 
-def _read_public(path: Path, expected: str) -> None:
+def _read_public_value(path: Path) -> tuple[bytes, str]:
     try:
         info = path.lstat()
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
@@ -151,7 +151,14 @@ def _read_public(path: Path, expected: str) -> None:
         raise
     except (OSError, UnicodeError, ValueError) as exc:
         raise SystemExit(f"refusing invalid wallet address file {path}: {exc}") from exc
-    if len(decoded) != 32 or stored != expected:
+    if len(decoded) != 32 or base58_encode(decoded) != stored:
+        raise SystemExit(f"refusing invalid wallet address file {path}")
+    return decoded, stored
+
+
+def _read_public(path: Path, expected: str) -> None:
+    _decoded, stored = _read_public_value(path)
+    if stored != expected:
         raise SystemExit(f"refusing {path}: wallet address does not match wallet.ed25519")
 
 
@@ -277,3 +284,33 @@ def load_wallet(home: Path) -> dict:
         raise SystemExit(f"pay wallet custody marker is missing at {custody_path}; re-run the signed join setup")
     custody = _read_custody(custody_path)
     return {"seed": seed, "public_key": public_key, "address": address, "custody": custody}
+
+
+def load_wallet_identity(home: Path) -> dict:
+    """Load public wallet identity without requiring a broker-custody seed file.
+
+    File custody delegates to :func:`load_wallet` so signing callers retain all
+    existing seed and public-key consistency checks.  Broker custody exposes
+    only the public identity; permissionless node-key paths must never depend
+    on, or accidentally use, the wallet seed.
+    """
+    home = Path(home)
+    pay_dir, seed_path, public_path, custody_path = _paths(home)
+    _check_pay_dir(pay_dir)
+    if not _path_present(custody_path):
+        raise SystemExit(
+            f"pay wallet custody marker is missing at {custody_path}; "
+            "re-run the signed join setup")
+    custody = _read_custody(custody_path)
+    if custody == "file":
+        return load_wallet(home)
+    if not _path_present(public_path):
+        raise SystemExit(
+            f"pay wallet address is missing at {public_path}; re-run the signed join setup")
+    public_key, address = _read_public_value(public_path)
+    if _path_present(seed_path):
+        seed = _read_seed(seed_path)
+        _derived_public, derived_address = _wallet_values(seed)
+        if derived_address != address:
+            raise SystemExit(f"refusing {public_path}: wallet address does not match wallet.ed25519")
+    return {"public_key": public_key, "address": address, "custody": custody}
