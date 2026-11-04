@@ -75,6 +75,23 @@ def _escrow_data(*, generation: int = 7, pending: tuple[int, int] | None = None)
     return bytes(raw)
 
 
+def _config_data(*, mint: str = MINT, withdraw_delay_s: int = 21_600) -> bytes:
+    """Encode the canonical fixed-size Anchor Config account."""
+    config_bump = pay_chain.config_pda(PROGRAM)[1]
+    fee_vault_bump = pay_chain.fee_vault_pda(PROGRAM)[1]
+    raw = (
+        hashlib.sha256(b"account:Config").digest()[:8]
+        + pay_chain.pubkey_bytes(AUTHORITY)
+        + pay_chain.pubkey_bytes(mint)
+        + pay_chain.pubkey_bytes(AUTHORITY)
+        + struct.pack("<Hqqq", 300, withdraw_delay_s, 86_400, 172_800)
+        + b"\0"  # pending: None
+        + b"\0"  # pending_authority: None
+        + bytes((config_bump, fee_vault_bump))
+    )
+    return raw.ljust(208, b"\0")
+
+
 def _delegate_data(key: str, *, generation: int = 7, cap: int = 500_000,
                    spent: int = 0, expires: int = CHAIN_TIME + 1000,
                    flags: int = 1, open_channels: int = 0,
@@ -110,7 +127,7 @@ def base_policy() -> wallet_policy.WalletPolicy:
 
 def base_view(*, pending: tuple[int, int] | None = None,
               extra_accounts: tuple[wallet_policy.AccountView, ...] = ()) -> wallet_policy.ClusterView:
-    escrow = pay_chain.escrow_pda(WALLET, PROGRAM)[0]
+    derived = pay_chain._derived(WALLET, PROGRAM)
     return wallet_policy.ClusterView(
         genesis_hash=wallet_policy.DEVNET_GENESIS_HASH, chain_time=CHAIN_TIME,
         valid_recent_blockhashes=(BLOCKHASH,), network_fee_lamports=5000,
@@ -118,9 +135,13 @@ def base_view(*, pending: tuple[int, int] | None = None,
         programdata_address=PROGRAMDATA, programdata_owner=LOADER,
         program_sha256=PROGRAM_HASH, upgrade_authority=AUTHORITY,
         delegate_rent_exempt_lamports=1_691_280,
-        ata_rent_exempt_lamports=2_039_280, withdraw_delay_seconds=86_400,
+        ata_rent_exempt_lamports=2_039_280, withdraw_delay_seconds=21_600,
         accounts=(wallet_policy.AccountView(
-            escrow, PROGRAM, 1_691_280, _escrow_data(pending=pending)), *extra_accounts))
+            derived["config"], PROGRAM, 2_344_320, _config_data()),
+            wallet_policy.AccountView(
+                derived["escrow"], PROGRAM, 1_691_280,
+                _escrow_data(pending=pending)),
+            *extra_accounts))
 
 
 def _compile(instructions: list[pay_chain.Instruction]) -> bytes:
@@ -446,8 +467,8 @@ def hostile_fixtures() -> list[dict[str, object]]:
 
     starter_state("starter_newer_generation", generation=8)
     starter_state("starter_same_generation_disabled", disabled=True)
-    starter_state("starter_open_channel", open_channels=1)
-    starter_state("starter_open_task", open_tasks=1)
+    starter_state("starter_older_generation_open_channel", generation=6, open_channels=1)
+    starter_state("starter_older_generation_open_task", generation=6, open_tasks=1)
 
     result = []
     for name, golden, raw, item_policy, view, approved, code in cases:

@@ -16,6 +16,8 @@ SYSTEM_PROGRAM_ID: Final = "11111111111111111111111111111111"
 TOKEN_PROGRAM_ID: Final = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 ASSOCIATED_TOKEN_PROGRAM_ID: Final = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
 UPGRADEABLE_LOADER_ID: Final = "BPFLoaderUpgradeab1e11111111111111111111111"
+ED25519_PROGRAM_ID: Final = "Ed25519SigVerify111111111111111111111111111"
+INSTRUCTIONS_SYSVAR_ID: Final = "Sysvar1nstructions1111111111111111111111111"
 DEVNET_GENESIS_HASH: Final = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG"
 NAKSHATRA_PAY_PROGRAM_ID: Final = "GLWqQsSqUsDkPvkc8rxcoQUyro7ZQd5denht21NtdTTo"
 DEVNET_USDC_MINT: Final = "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU"
@@ -40,6 +42,7 @@ WITHDRAW_REQUEST_DISCRIMINATOR: Final = bytes.fromhex("f6f379c6f277d27a")
 WITHDRAW_EXECUTE_DISCRIMINATOR: Final = bytes.fromhex("ac5dcf14503aa8f1")
 DELEGATE_ACCOUNT_SPACE: Final = 115
 ATA_ACCOUNT_SPACE: Final = 165
+CONFIG_ACCOUNT_SPACE: Final = 208
 DELEGATE_FLAGS_SELF: Final = 0x03
 DELEGATE_FLAG_OPEN_CHANNEL: Final = 0x01
 
@@ -51,12 +54,50 @@ _B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 _B58_INDEX = {char: index for index, char in enumerate(_B58_ALPHABET)}
 _ESCROW_DISC = hashlib.sha256(b"account:Escrow").digest()[:8]
 _DELEGATE_DISC = hashlib.sha256(b"account:Delegate").digest()[:8]
+_CONFIG_DISC = hashlib.sha256(b"account:Config").digest()[:8]
+
+# A recipient or state role must never alias an executable/runtime account.
+# Keep this broader than the currently allowed instruction programs so a role
+# cannot become privileged if a builder adds one of these accounts later.
+_PROTECTED_RUNTIME_IDS: Final = frozenset({
+    SYSTEM_PROGRAM_ID, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID,
+    UPGRADEABLE_LOADER_ID, ED25519_PROGRAM_ID, INSTRUCTIONS_SYSVAR_ID,
+    "ComputeBudget111111111111111111111111111111",
+    "KeccakSecp256k11111111111111111111111111111",
+    "Secp256r1SigVerify1111111111111111111111111",
+    "AddressLookupTab1e1111111111111111111111111",
+    "NativeLoader1111111111111111111111111111111",
+    "BPFLoader1111111111111111111111111111111111",
+    "BPFLoader2111111111111111111111111111111111",
+    "LoaderV411111111111111111111111111111111111",
+    "Config1111111111111111111111111111111111111",
+    "Feature111111111111111111111111111111111111",
+    "1nc1nerator11111111111111111111111111111111",
+    "Stake11111111111111111111111111111111111111",
+    "StakeConfig11111111111111111111111111111111",
+    "Vote111111111111111111111111111111111111111",
+    "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+    "ZkTokenProof1111111111111111111111111111111",
+    "ZkE1Gama1Proof11111111111111111111111111111",
+    "Sysvar1111111111111111111111111111111111111",
+    "SysvarC1ock11111111111111111111111111111111",
+    "SysvarEpochRewards1111111111111111111111111",
+    "SysvarEpochSchedu1e111111111111111111111111",
+    "SysvarFees111111111111111111111111111111111",
+    "SysvarRecentB1ockHashes11111111111111111111",
+    "SysvarRent111111111111111111111111111111111",
+    "SysvarRewards111111111111111111111111111111",
+    "SysvarS1otHashes111111111111111111111111111",
+    "SysvarS1otHistory11111111111111111111111111",
+    "SysvarStakeHistory1111111111111111111111111",
+    "SysvarLastRestartS1ot1111111111111111111111",
+})
 
 
 REFUSAL_CODES: Final = frozenset({
     "account_index", "account_order", "account_template", "ata_state",
     "blockhash", "cap_ceiling", "cluster_state", "delegate_state",
-    "duplicate_account", "escrow_state", "expiry_ceiling", "fee_ceiling",
+    "config_state", "duplicate_account", "escrow_state", "expiry_ceiling", "fee_ceiling",
     "fee_payer", "header", "instruction_template", "malformed_message",
     "mint", "noncanonical_shortvec", "policy", "privilege_template",
     "program_hash", "program_state", "programdata", "rent_ceiling",
@@ -110,13 +151,18 @@ class ApprovedWithdrawRequest:
     has no broker approval and execution is deliberately refused.
 
     This tuple is NOT unique on its own: two equal-amount requests landing in
-    the same Unix second produce the same pending state. It is safe only
-    because the broker endpoint MUST serialize wallet approvals (at most one
-    outstanding approval per principal, unification-lane F4): a second
-    withdraw request cannot be signed until the first is reconciled. Even
-    if that is violated, the executed amount equals an amount the broker
-    already approved; it can never exceed one. The broker step must test
-    that serialization explicitly.
+    the same Unix second produce the same pending state. The broker journal
+    record that supplies it MUST also retain the originating message digest,
+    transaction signature, and escrow generation. Records may be created only
+    from reconciled, byte-ceiling-checked withdrawal requests, and a competing
+    signed attempt must prevent approval until it is reconciled. Wallet import
+    must refuse a pending withdrawal because it has no broker provenance.
+
+    Current closed templates cannot recreate an escrow, so generation is
+    journal evidence rather than part of this lookup tuple. If recreation is
+    ever admitted, bind escrow generation in this type and in the lookup before
+    signing any execute. The broker must also prohibit competing signed attempts
+    rather than treating an equal tuple as proof of origin.
     """
 
     escrow_id: str
@@ -322,6 +368,8 @@ def _derive(policy: WalletPolicy) -> dict[str, str]:
     escrow = _find_program_address((b"escrow", _pubkey(config), wallet), program)
     return {
         "config": config,
+        "fee_vault": _find_program_address(
+            (b"fee_vault", _pubkey(config)), program),
         "escrow": escrow,
         "vault": _find_program_address((b"vault", _pubkey(escrow)), program),
         "event": _find_program_address((b"__event_authority",), program),
@@ -469,6 +517,53 @@ def _decode_escrow(data: bytes) -> dict[str, object]:
             "bump": bump, "vault_bump": vault_bump}
 
 
+def _decode_config(data: bytes) -> dict[str, object]:
+    """Decode Config's fixed allocation using its variable Borsh prefix."""
+    raw = bytes(data)
+    if len(raw) != CONFIG_ACCOUNT_SPACE or raw[:8] != _CONFIG_DISC:
+        _refuse("config_state")
+    offset = 8
+    authority = _b58encode(raw[offset:offset + 32]); offset += 32
+    mint = _b58encode(raw[offset:offset + 32]); offset += 32
+    fee_wallet = _b58encode(raw[offset:offset + 32]); offset += 32
+    fee_bps, withdraw_delay_s, close_grace_s, config_delay_s = struct.unpack_from(
+        "<Hqqq", raw, offset)
+    offset += 26
+
+    pending = None
+    tag = raw[offset]; offset += 1
+    if tag == 1:
+        if offset + 42 > len(raw):
+            _refuse("config_state")
+        pending_fee_bps, = struct.unpack_from("<H", raw, offset); offset += 2
+        pending_fee_wallet = _b58encode(raw[offset:offset + 32]); offset += 32
+        effective_at, = struct.unpack_from("<q", raw, offset); offset += 8
+        pending = (pending_fee_bps, pending_fee_wallet, effective_at)
+    elif tag != 0:
+        _refuse("config_state")
+
+    pending_authority = None
+    if offset >= len(raw):
+        _refuse("config_state")
+    tag = raw[offset]; offset += 1
+    if tag == 1:
+        if offset + 32 > len(raw):
+            _refuse("config_state")
+        pending_authority = _b58encode(raw[offset:offset + 32]); offset += 32
+    elif tag != 0:
+        _refuse("config_state")
+    if offset + 2 > len(raw):
+        _refuse("config_state")
+    bump, fee_vault_bump = raw[offset:offset + 2]
+    return {
+        "authority": authority, "mint": mint, "fee_wallet": fee_wallet,
+        "fee_bps": fee_bps, "withdraw_delay_s": withdraw_delay_s,
+        "close_grace_s": close_grace_s, "config_delay_s": config_delay_s,
+        "pending": pending, "pending_authority": pending_authority,
+        "bump": bump, "fee_vault_bump": fee_vault_bump,
+    }
+
+
 def _decode_delegate(data: bytes) -> dict[str, object]:
     raw = bytes(data)
     if len(raw) != DELEGATE_ACCOUNT_SPACE or raw[:8] != _DELEGATE_DISC:
@@ -488,6 +583,19 @@ def _decode_delegate(data: bytes) -> dict[str, object]:
             "cap_total": cap_total, "spent": spent, "expires_at": expires_at,
             "flags": flags, "open_channels": open_channels,
             "open_tasks": open_tasks, "disabled": bool(disabled), "bump": bump}
+
+
+def _decode_spl_token_account(data: bytes) -> dict[str, object]:
+    """Mirror classic SPL Token ``Account::unpack`` for fields we consume."""
+    raw = bytes(data)
+    if len(raw) != ATA_ACCOUNT_SPACE:
+        _refuse("ata_state")
+    # Classic SPL Account layout has three COption tags. Pack::unpack accepts
+    # only 0/1 and rejects an uninitialized or unknown account-state byte.
+    if any(struct.unpack_from("<I", raw, offset)[0] not in (0, 1)
+           for offset in (72, 109, 129)) or raw[108] not in (1, 2):
+        _refuse("ata_state")
+    return {"mint": _b58encode(raw[:32]), "owner": _b58encode(raw[32:64])}
 
 
 def _validate_policy(policy: WalletPolicy, view: ClusterView) -> dict[str, str]:
@@ -543,13 +651,38 @@ def _validate_policy(policy: WalletPolicy, view: ClusterView) -> dict[str, str]:
             or not I64_MIN <= view.chain_time <= I64_MAX):
         _refuse("cluster_state")
     for value in (view.network_fee_lamports, view.delegate_rent_exempt_lamports,
-                  view.ata_rent_exempt_lamports, view.withdraw_delay_seconds):
+                  view.ata_rent_exempt_lamports):
         if (isinstance(value, bool) or not isinstance(value, int)
                 or not 0 <= value <= U64_MAX):
             _refuse("cluster_state")
+    if (isinstance(view.withdraw_delay_seconds, bool)
+            or not isinstance(view.withdraw_delay_seconds, int)
+            or not I64_MIN <= view.withdraw_delay_seconds <= I64_MAX):
+        _refuse("cluster_state")
     if view.network_fee_lamports > policy.max_network_fee_lamports:
         _refuse("fee_ceiling")
     return derived
+
+
+def _existing_config(policy: WalletPolicy, view: ClusterView,
+                     derived: dict[str, str],
+                     accounts: dict[str, AccountView]) -> dict[str, object]:
+    account = accounts.get(derived["config"])
+    if account is None or account.owner != policy.program_id:
+        _refuse("config_state")
+    config = _decode_config(account.data)
+    _address, config_bump = _find_program_address_with_bump(
+        (b"config",), policy.program_id)
+    _fee_vault, fee_vault_bump = _find_program_address_with_bump(
+        (b"fee_vault", _pubkey(derived["config"])), policy.program_id)
+    if (config["bump"] != config_bump
+            or config["fee_vault_bump"] != fee_vault_bump):
+        _refuse("config_state")
+    if config["mint"] != DEVNET_USDC_MINT or config["mint"] != policy.mint_id:
+        _refuse("mint")
+    if config["withdraw_delay_s"] != view.withdraw_delay_seconds:
+        _refuse("config_state")
+    return config
 
 
 def _existing_escrow(policy: WalletPolicy, view: ClusterView,
@@ -570,36 +703,35 @@ def _existing_escrow(policy: WalletPolicy, view: ClusterView,
     return escrow
 
 
-def _creation_state(address: str, expected_owner: str, size: int, rent_minimum: int,
+def _creation_state(address: str, expected_owner: str, rent_minimum: int,
                     rent_ceiling: int, accounts: dict[str, AccountView],
-                    kind: str) -> tuple[int, dict[str, object] | None]:
+                    kind: str) -> tuple[int, int, dict[str, object] | None]:
     account = accounts.get(address)
     state = None
+    actual_shortfall = rent_minimum
     if account is None:
         pass
     elif account.owner == expected_owner:
         if kind == "delegate":
             state = _decode_delegate(account.data)
         else:
-            raw = account.data
-            if (len(raw) != size or raw[108] not in (1, 2)):
-                _refuse("ata_state")
-            state = {"mint": _b58encode(raw[:32]), "owner": _b58encode(raw[32:64])}
+            state = _decode_spl_token_account(account.data)
+        actual_shortfall = 0
     elif account.owner == SYSTEM_PROGRAM_ID and account.data == b"":
-        pass
+        actual_shortfall = max(0, rent_minimum - account.lamports)
     else:
         _refuse("delegate_state" if kind == "delegate" else "ata_state")
     if account is not None and (isinstance(account.lamports, bool)
                                 or not isinstance(account.lamports, int)
                                 or account.lamports < 0):
         _refuse("cluster_state")
-    # Both accepted instructions can create the account.  Existing state and
-    # PDA dust can disappear before the signed message lands, so approval must
-    # disclose and bound the full rent-exempt minimum, never today's shortfall.
+    # Both accepted instructions can create the account. Existing state and
+    # PDA dust can disappear before the signed message lands, so show today's
+    # actual debit separately while bounding the full worst-case minimum.
     worst_case_rent = rent_minimum
     if worst_case_rent > rent_ceiling:
         _refuse("rent_ceiling")
-    return worst_case_rent, state
+    return actual_shortfall, worst_case_rent, state
 
 
 def _expected_instructions(message: _Message, policy: WalletPolicy,
@@ -713,6 +845,44 @@ def _expected_instructions(message: _Message, policy: WalletPolicy,
     return operation, tuple(expected), details
 
 
+def _validate_role_separation(policy: WalletPolicy, derived: dict[str, str],
+                              operation: str, details: dict[str, object]) -> None:
+    """Reject semantic-role aliases before Solana privilege aggregation."""
+    roles: list[tuple[str, str]]
+    if operation in {"self_delegate", "starter_grant"}:
+        roles = [
+            ("wallet", policy.wallet_id), ("node", policy.node_id),
+            ("config", derived["config"]),
+            ("escrow", derived["escrow"]), ("event", derived["event"]),
+            ("delegate", str(details["delegate"])),
+        ]
+        if operation == "starter_grant":
+            roles.append(("recipient", str(details["delegate_key"])))
+    elif operation == "self_top_up":
+        roles = [("wallet", policy.wallet_id), ("node", policy.node_id)]
+    elif operation == "withdraw_request":
+        roles = [
+            ("wallet", policy.wallet_id), ("node", policy.node_id),
+            ("config", derived["config"]),
+            ("escrow", derived["escrow"]), ("vault", derived["vault"]),
+            ("event", derived["event"]),
+        ]
+    else:
+        roles = [
+            ("wallet", policy.wallet_id), ("node", policy.node_id),
+            ("config", derived["config"]),
+            ("mint", policy.mint_id), ("escrow", derived["escrow"]),
+            ("vault", derived["vault"]), ("destination_ata", derived["ata"]),
+            ("event", derived["event"]),
+        ]
+    protected = _PROTECTED_RUNTIME_IDS | {policy.program_id}
+    if any(address in protected for _name, address in roles):
+        _refuse("account_template")
+    addresses = [address for _name, address in roles]
+    if len(set(addresses)) != len(addresses):
+        _refuse("account_template")
+
+
 def _validate_compilation(message: _Message, policy: WalletPolicy,
                           expected: tuple[_ExpectedInstruction, ...]) -> None:
     if message.keys[0] != policy.wallet_id:
@@ -779,8 +949,10 @@ def decode_and_check(
     if message.blockhash not in cluster_view.valid_recent_blockhashes:
         _refuse("blockhash")
     accounts = _account_map(cluster_view)
+    _existing_config(policy, cluster_view, derived, accounts)
     escrow = _existing_escrow(policy, cluster_view, derived, accounts)
     operation, expected, details = _expected_instructions(message, policy, derived)
+    _validate_role_separation(policy, derived, operation, details)
     _validate_compilation(message, policy, expected)
 
     fields: list[PlanField] = [
@@ -812,17 +984,21 @@ def decode_and_check(
                 _refuse("instruction_template")
             if cap > policy.max_starter_cap_total_micro_usdc:
                 _refuse("starter_cap_ceiling")
+            # F1 is byte-only: RPC ``spent`` may never make an encoded cap
+            # acceptable under an independently tightened remaining ceiling.
+            if cap > policy.max_starter_micro_usdc:
+                _refuse("starter_remaining_ceiling")
             ttl = policy.max_starter_ttl_s
         if expiry <= cluster_view.chain_time or expiry - cluster_view.chain_time > ttl:
             _refuse("expiry_ceiling")
         delegate = str(details["delegate"])
-        rent, state = _creation_state(
-            delegate, policy.program_id, DELEGATE_ACCOUNT_SPACE,
-            cluster_view.delegate_rent_exempt_lamports,
+        rent_shortfall, rent_worst_case, state = _creation_state(
+            delegate, policy.program_id, cluster_view.delegate_rent_exempt_lamports,
             policy.max_delegate_rent_lamports, accounts, "delegate")
         remaining = cap
         pre_spent = 0
         pre_cap = 0
+        older_generation_reset = False
         if state is not None:
             if state["escrow"] != derived["escrow"] or state["key"] != key:
                 _refuse("delegate_state")
@@ -833,31 +1009,41 @@ def decode_and_check(
                 _refuse("delegate_state")
             generation = int(state["generation"])
             escrow_generation = int(escrow["generation"])
-            if generation > escrow_generation:
+            pre_spent = int(state["spent"])
+            pre_cap = int(state["cap_total"])
+            if (int(state["flags"]) & ~DELEGATE_FLAGS_SELF
+                    or pre_spent > pre_cap or generation > escrow_generation):
                 _refuse("delegate_state")
-            if not is_self:
+            # Mirrors nakshatra_pay instructions.rs:641-688: same-generation
+            # state must be enabled and preserve spent; an older generation
+            # resets spent only after proving it has no open work. The encoded
+            # cap must cover the effective spent in either transition.
+            if generation == escrow_generation:
+                if bool(state["disabled"]) or cap < pre_spent:
+                    _refuse("delegate_state")
+                remaining = cap - pre_spent
+            else:
                 if int(state["open_channels"]) != 0 or int(state["open_tasks"]) != 0:
                     _refuse("delegate_state")
-                if generation == escrow_generation:
-                    if bool(state["disabled"]):
-                        _refuse("delegate_state")
-                    pre_spent = int(state["spent"])
-                    pre_cap = int(state["cap_total"])
-                    if cap < pre_spent:
-                        _refuse("delegate_state")
-                    remaining = cap - pre_spent
+                older_generation_reset = True
         if not is_self and remaining > policy.max_starter_micro_usdc:
             _refuse("starter_remaining_ceiling")
         fields.extend((
             PlanField("delegate", delegate), PlanField("delegate_key", key),
             PlanField("cap_total_micro_usdc", cap),
             PlanField("cap_total_usdc", _money(cap)), PlanField("expires_at", expiry),
-            PlanField("flags", flags), PlanField("delegate_rent_worst_case_lamports", rent),
+            PlanField("flags", flags),
+            PlanField("delegate_rent_shortfall_lamports", rent_shortfall),
+            PlanField("delegate_rent_worst_case_lamports", rent_worst_case),
             PlanField("delegate_rent_ceiling_lamports", policy.max_delegate_rent_lamports),
         ))
-        if not is_self:
+        if is_self:
+            fields.append(PlanField("cap_total_ceiling_micro_usdc",
+                                    policy.max_delegate_micro_usdc))
+        else:
             fields.extend((PlanField("pre_cap_total_micro_usdc", pre_cap),
                            PlanField("pre_spent_micro_usdc", pre_spent),
+                           PlanField("older_generation_reset", older_generation_reset),
                            PlanField("resulting_remaining_micro_usdc", remaining),
                            PlanField("starter_cap_total_ceiling_micro_usdc",
                                      policy.max_starter_cap_total_micro_usdc),
@@ -882,13 +1068,16 @@ def decode_and_check(
             _refuse("withdraw_ceiling")
         if escrow["pending"] is not None:
             _refuse("withdraw_state")
+        earliest_execute_time = (cluster_view.chain_time
+                                 + cluster_view.withdraw_delay_seconds)
+        if not I64_MIN <= earliest_execute_time <= I64_MAX:
+            _refuse("cluster_state")
         fields.extend((PlanField("vault", derived["vault"]),
                        PlanField("amount_micro_usdc", amount),
                        PlanField("amount_usdc", _money(amount)),
                        PlanField("withdraw_ceiling_micro_usdc",
                                  policy.max_withdraw_micro_usdc),
-                       PlanField("earliest_execute_time",
-                                 cluster_view.chain_time + cluster_view.withdraw_delay_seconds)))
+                       PlanField("earliest_execute_time", earliest_execute_time)))
 
     if operation == "withdraw_execute":
         pending = escrow["pending"]
@@ -919,9 +1108,9 @@ def decode_and_check(
             _refuse("withdraw_provenance")
         if cluster_view.chain_time < int(withdraw_at):
             _refuse("withdraw_state")
-        rent, state = _creation_state(
-            derived["ata"], TOKEN_PROGRAM_ID, ATA_ACCOUNT_SPACE,
-            cluster_view.ata_rent_exempt_lamports, policy.max_ata_rent_lamports,
+        rent_shortfall, rent_worst_case, state = _creation_state(
+            derived["ata"], TOKEN_PROGRAM_ID, cluster_view.ata_rent_exempt_lamports,
+            policy.max_ata_rent_lamports,
             accounts, "ata")
         if state is not None and (state["mint"] != policy.mint_id
                                   or state["owner"] != policy.wallet_id):
@@ -931,8 +1120,11 @@ def decode_and_check(
                        PlanField("destination_ata", derived["ata"]),
                        PlanField("pending_amount_micro_usdc", int(amount)),
                        PlanField("pending_amount_usdc", _money(int(amount))),
+                       PlanField("withdraw_ceiling_micro_usdc",
+                                 policy.max_withdraw_micro_usdc),
                        PlanField("withdraw_at", int(withdraw_at)),
-                       PlanField("ata_rent_worst_case_lamports", rent),
+                       PlanField("ata_rent_shortfall_lamports", rent_shortfall),
+                       PlanField("ata_rent_worst_case_lamports", rent_worst_case),
                        PlanField("ata_rent_ceiling_lamports", policy.max_ata_rent_lamports)))
 
     plan_instructions = tuple(PlanInstruction(

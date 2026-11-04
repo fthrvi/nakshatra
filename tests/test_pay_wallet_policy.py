@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import importlib.util
 import json
 import os
+import struct
 import subprocess
 import sys
 from dataclasses import FrozenInstanceError, replace
@@ -192,6 +194,209 @@ def _decode(raw: bytes, view: policy_module.ClusterView,
         raw, wallet_policy or fixture_generator.base_policy(), view, approved)
 
 
+def _delegate_view(key: str, **state: object) -> policy_module.ClusterView:
+    wallet_policy = fixture_generator.base_policy()
+    derived = policy_module._derive(wallet_policy)
+    address = pay_chain.delegate_pda(
+        derived["escrow"], key, fixture_generator.PROGRAM)[0]
+    account = policy_module.AccountView(
+        address, fixture_generator.PROGRAM, 1_691_280,
+        fixture_generator._delegate_data(key, **state))
+    return fixture_generator._replace_account(fixture_generator.base_view(), account)
+
+
+def _fields(plan: policy_module.ApprovalPlan) -> dict[str, str | int | bool]:
+    return {field.name: field.value for field in plan.rendered_fields}
+
+
+def test_p1_config_mint_must_be_pinned_before_usdc_rendering():
+    raw, view = fixture_generator.golden_messages()["self_delegate"]
+    derived = policy_module._derive(fixture_generator.base_policy())
+    config = (
+        hashlib.sha256(b"account:Config").digest()[:8]
+        + pay_chain.pubkey_bytes(fixture_generator.AUTHORITY)
+        + pay_chain.pubkey_bytes(fixture_generator.WRONG_DESTINATION)
+        + pay_chain.pubkey_bytes(fixture_generator.AUTHORITY)
+        + struct.pack("<Hqqq", 300, 21_600, 86_400, 172_800)
+        + b"\0\0"
+        + bytes((pay_chain.config_pda(fixture_generator.PROGRAM)[1],
+                 pay_chain.fee_vault_pda(fixture_generator.PROGRAM)[1]))
+    ).ljust(208, b"\0")
+    changed = fixture_generator._replace_account(view, policy_module.AccountView(
+        derived["config"], fixture_generator.PROGRAM, 5_000_000, config))
+    with pytest.raises(policy_module.PolicyRefusal) as refused:
+        _decode(raw, changed)
+    assert refused.value.code == "mint"
+
+
+def test_p1_config_account_must_have_canonical_owner_layout_and_bumps():
+    raw, view = fixture_generator.golden_messages()["self_delegate"]
+    derived = policy_module._derive(fixture_generator.base_policy())
+    original = next(account for account in view.accounts
+                    if account.address == derived["config"])
+    bad_tag = bytearray(original.data)
+    bad_tag[130] = 2
+    bad_bump = bytearray(original.data)
+    bad_bump[132] ^= 1
+    cases = (
+        fixture_generator._replace_account(view, replace(
+            original, owner=pay_chain.SYSTEM_PROGRAM_ID)),
+        fixture_generator._replace_account(view, replace(original, data=bytes(bad_tag))),
+        fixture_generator._replace_account(view, replace(original, data=bytes(bad_bump))),
+        replace(view, accounts=tuple(
+            account for account in view.accounts if account.address != derived["config"])),
+    )
+    for changed in cases:
+        with pytest.raises(policy_module.PolicyRefusal) as refused:
+            _decode(raw, changed)
+        assert refused.value.code == "config_state"
+
+
+def test_p1_starter_cap_is_byte_bounded_by_both_ceilings():
+    raw, _view = fixture_generator.golden_messages()["starter_delegate"]
+    tight = replace(fixture_generator.base_policy(), max_starter_micro_usdc=1)
+    view = _delegate_view(
+        fixture_generator.STARTER, generation=7, cap=1_000_000, spent=999_999)
+    with pytest.raises(policy_module.PolicyRefusal) as refused:
+        _decode(raw, view, tight)
+    assert refused.value.code == "starter_remaining_ceiling"
+
+
+@pytest.mark.parametrize(
+    "recipient",
+    [fixture_generator.PROGRAM, pay_chain.SYSTEM_PROGRAM_ID,
+     pay_chain.TOKEN_PROGRAM_ID, pay_chain.ASSOCIATED_TOKEN_PROGRAM_ID,
+     pay_chain.ED25519_PROGRAM_ID, pay_chain.INSTRUCTIONS_SYSVAR_ID,
+     pay_chain.escrow_pda(fixture_generator.WALLET, fixture_generator.PROGRAM)[0]],
+    ids=["payment-program", "system-program", "token-program", "ata-program",
+         "ed25519-program", "instructions-sysvar", "escrow-role"],
+)
+def test_p2_transfer_recipient_cannot_alias_protected_or_role_account(recipient: str):
+    raw = fixture_generator._compile([
+        *pay_chain.delegate_set(
+            fixture_generator.WALLET, recipient, 1,
+            fixture_generator.CHAIN_TIME + 1, pay_chain.DELEGATE_OPEN_CHANNEL,
+            fixture_generator.PROGRAM),
+        pay_chain.system_transfer(fixture_generator.WALLET, recipient, 1),
+    ])
+    with pytest.raises(policy_module.PolicyRefusal) as refused:
+        _decode(raw, fixture_generator.base_view())
+    assert refused.value.code == "account_template"
+
+
+@pytest.mark.parametrize("offset", [72, 109, 129], ids=["delegate", "is-native", "close-authority"])
+def test_p2_classic_spl_account_rejects_invalid_coption_tags(offset: int):
+    raw, view = fixture_generator.golden_messages()["withdraw_execute"]
+    derived = policy_module._derive(fixture_generator.base_policy())
+    data = bytearray(fixture_generator._ata_data())
+    struct.pack_into("<I", data, offset, 2)
+    changed = fixture_generator._replace_account(view, policy_module.AccountView(
+        derived["ata"], pay_chain.TOKEN_PROGRAM_ID, 2_039_280, bytes(data)))
+    with pytest.raises(policy_module.PolicyRefusal) as refused:
+        _decode(raw, changed, approved=fixture_generator.approved_withdraw_requests(changed))
+    assert refused.value.code == "ata_state"
+
+
+@pytest.mark.parametrize("state", [0, 3], ids=["uninitialized", "unknown"])
+def test_p2_classic_spl_account_requires_initialized_state(state: int):
+    raw, view = fixture_generator.golden_messages()["withdraw_execute"]
+    derived = policy_module._derive(fixture_generator.base_policy())
+    data = bytearray(fixture_generator._ata_data())
+    data[108] = state
+    changed = fixture_generator._replace_account(view, policy_module.AccountView(
+        derived["ata"], pay_chain.TOKEN_PROGRAM_ID, 2_039_280, bytes(data)))
+    with pytest.raises(policy_module.PolicyRefusal) as refused:
+        _decode(raw, changed, approved=fixture_generator.approved_withdraw_requests(changed))
+    assert refused.value.code == "ata_state"
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        {"generation": 6, "open_channels": 1},
+        {"generation": 6, "open_tasks": 1},
+        {"generation": 7, "disabled": True},
+        {"generation": 7, "cap": 6_000_000, "spent": 6_000_000},
+        {"generation": 7, "cap": 4_000_000, "spent": 4_500_000},
+        {"generation": 7, "flags": 255},
+    ],
+    ids=["older-open-channel", "older-open-task", "same-disabled",
+         "encoded-cap-below-spent", "spent-above-pre-cap", "unknown-flags"],
+)
+def test_p2_self_delegate_enforces_program_transition_preconditions(
+        state: dict[str, object]):
+    raw, _view = fixture_generator.golden_messages()["self_delegate"]
+    with pytest.raises(policy_module.PolicyRefusal) as refused:
+        _decode(raw, _delegate_view(fixture_generator.NODE, **state))
+    assert refused.value.code == "delegate_state"
+
+
+@pytest.mark.parametrize(
+    "change",
+    [{"withdraw_delay_seconds": policy_module.U64_MAX},
+     {"chain_time": policy_module.I64_MAX}],
+    ids=["delay-not-i64", "checked-add-overflow"],
+)
+def test_p2_withdraw_time_is_checked_i64_arithmetic(change: dict[str, int]):
+    raw, view = fixture_generator.golden_messages()["withdraw_request"]
+    with pytest.raises(policy_module.PolicyRefusal) as refused:
+        _decode(raw, replace(view, **change))
+    assert refused.value.code == "cluster_state"
+
+
+def test_p3_older_starter_displays_real_prestate_and_reset():
+    raw, _view = fixture_generator.golden_messages()["starter_delegate"]
+    plan = _decode(raw, _delegate_view(
+        fixture_generator.STARTER, generation=6, cap=1_000_000, spent=999_999))
+    fields = _fields(plan)
+    assert fields["pre_cap_total_micro_usdc"] == 1_000_000
+    assert fields["pre_spent_micro_usdc"] == 999_999
+    assert fields["older_generation_reset"] is True
+    assert fields["resulting_remaining_micro_usdc"] == 1_000_000
+
+
+def test_p3_rent_displays_actual_shortfall_and_worst_case():
+    raw, view = fixture_generator.golden_messages()["withdraw_execute"]
+    derived = policy_module._derive(fixture_generator.base_policy())
+    initialized = fixture_generator._replace_account(view, policy_module.AccountView(
+        derived["ata"], pay_chain.TOKEN_PROGRAM_ID, 2_039_280,
+        fixture_generator._ata_data()))
+    fields = _fields(_decode(
+        raw, initialized,
+        approved=fixture_generator.approved_withdraw_requests(initialized)))
+    assert fields["ata_rent_shortfall_lamports"] == 0
+    assert fields["ata_rent_worst_case_lamports"] == 2_039_280
+
+    dusted = fixture_generator._replace_account(view, policy_module.AccountView(
+        derived["ata"], pay_chain.SYSTEM_PROGRAM_ID, 1_000_000, b""))
+    fields = _fields(_decode(
+        raw, dusted, approved=fixture_generator.approved_withdraw_requests(dusted)))
+    assert fields["ata_rent_shortfall_lamports"] == 1_039_280
+    assert fields["ata_rent_worst_case_lamports"] == 2_039_280
+
+
+def test_p3_self_and_execute_plans_display_applicable_money_ceilings():
+    raw, view = fixture_generator.golden_messages()["self_delegate"]
+    assert _fields(_decode(raw, view))["cap_total_ceiling_micro_usdc"] == 5_000_000
+    raw, view = fixture_generator.golden_messages()["withdraw_execute"]
+    assert _fields(_decode(
+        raw, view,
+        approved=fixture_generator.approved_withdraw_requests(view))
+    )["withdraw_ceiling_micro_usdc"] == 5_000_000
+
+
+def test_withdraw_provenance_contract_is_documented():
+    contract = policy_module.ApprovedWithdrawRequest.__doc__ or ""
+    for phrase in ("message digest", "signature", "escrow generation",
+                   "reconciled", "competing signed attempts", "pending withdrawal"):
+        assert phrase in contract
+    note = (ROOT / "docs" / "design" / "2026-11-04-broker-pay-wallet.md").read_text(
+        encoding="utf-8")
+    for phrase in ("originating message digest", "transaction signature",
+                   "escrow generation", "competing signed attempts"):
+        assert phrase in note
+
+
 @pytest.mark.parametrize(
     "lamports",
     [0, 400_000, 1_691_280, 9_000_000],
@@ -297,7 +502,7 @@ def test_starter_state_can_only_tighten(generation: int, spent: int,
         delegate, fixture_generator.PROGRAM, 1,
         fixture_generator._delegate_data(
             fixture_generator.STARTER, generation=generation,
-            spent=spent, disabled=disabled))
+            cap=max(500_000, spent), spent=spent, disabled=disabled))
     plan = _decode(raw, fixture_generator._replace_account(view, account))
     fields = {field.name: field.value for field in plan.rendered_fields}
     assert fields["resulting_remaining_micro_usdc"] == remaining
@@ -318,7 +523,10 @@ def test_program_loader_state_fails_closed(change: dict[str, object], code: str)
 
 def test_existing_escrow_is_required_even_for_transfer_only():
     raw, view = fixture_generator.golden_messages()["self_top_up"]
-    missing = replace(view, accounts=())
+    escrow = pay_chain.escrow_pda(
+        fixture_generator.WALLET, fixture_generator.PROGRAM)[0]
+    missing = replace(view, accounts=tuple(
+        account for account in view.accounts if account.address != escrow))
     with pytest.raises(policy_module.PolicyRefusal) as refused:
         _decode(raw, missing)
     assert refused.value.code == "escrow_state"

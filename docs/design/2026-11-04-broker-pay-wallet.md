@@ -176,12 +176,12 @@ fields below are little-endian.
 
 | Allowed instruction | Exact data | Required ordered accounts and signers | Approval fields | Ceiling |
 |---|---|---|---|---|
-| `nakshatra_pay.delegate_set` (self ensure) | `8b10e667fea614a5` + delegate key (32) + `cap_total:u64` + `expires_at:i64` + `flags:u8` | wallet **signer,writable**; canonical config; canonical wallet escrow; canonical delegate PDA **writable**; System Program; canonical event authority; program id | wallet, own node delegate, cap in micro-USDC and USDC, expiry, flags, escrow, actual delegate rent shortfall, optional SOL top-up, message digest | absolute encoded `cap_total` `NAK_WALLET_MAX_DELEGATE_MICRO_USDC`; expiry horizon `NAK_WALLET_MAX_DELEGATE_TTL_S`; rent and optional transfer ceilings below |
-| `nakshatra_pay.delegate_set` (starter grant) | same discriminator/layout; `flags` must equal `OPEN_CHANNEL=1` | same account layout; delegate PDA must be derived from escrow and the decoded recipient node key | inviter wallet, recipient node, pre-state spent/cap, resulting remaining capacity and total cap, expiry, actual delegate rent shortfall, optional SOL top-up, escrow, digest | absolute encoded `cap_total` `NAK_WALLET_MAX_STARTER_CAP_TOTAL_MICRO_USDC`; resulting remaining capacity `NAK_WALLET_MAX_STARTER_MICRO_USDC`; expiry horizon `NAK_WALLET_MAX_STARTER_TTL_S`; rent and transfer ceilings below |
+| `nakshatra_pay.delegate_set` (self ensure) | `8b10e667fea614a5` + delegate key (32) + `cap_total:u64` + `expires_at:i64` + `flags:u8` | wallet **signer,writable**; canonical config; canonical wallet escrow; canonical delegate PDA **writable**; System Program; canonical event authority; program id | wallet, own node delegate, cap in micro-USDC and USDC, cap ceiling, expiry, flags, escrow, actual and worst-case delegate rent, optional SOL top-up, message digest | absolute encoded `cap_total` `NAK_WALLET_MAX_DELEGATE_MICRO_USDC`; expiry horizon `NAK_WALLET_MAX_DELEGATE_TTL_S`; rent and optional transfer ceilings below |
+| `nakshatra_pay.delegate_set` (starter grant) | same discriminator/layout; `flags` must equal `OPEN_CHANNEL=1` | same account layout; delegate PDA must be derived from escrow and the decoded recipient node key | inviter wallet, recipient node, real pre-state spent/cap, explicit older-generation reset disclosure, resulting remaining capacity and total cap, expiry, actual and worst-case delegate rent, optional SOL top-up, escrow, digest | absolute encoded `cap_total` must be no greater than either `NAK_WALLET_MAX_STARTER_CAP_TOTAL_MICRO_USDC` or `NAK_WALLET_MAX_STARTER_MICRO_USDC`; expiry horizon `NAK_WALLET_MAX_STARTER_TTL_S`; rent and transfer ceilings below |
 | `nakshatra_pay.escrow_withdraw_request` | `f6f379c6f277d27a` + `amount:u64` | wallet **signer**; canonical config; canonical wallet escrow **writable**; canonical vault; event authority; program id | wallet, amount in micro-USDC and USDC, escrow, vault, earliest execute time from trusted chain state, digest | `NAK_WALLET_MAX_WITHDRAW_MICRO_USDC` |
-| `nakshatra_pay.escrow_withdraw_execute` | `ac5dcf14503aa8f1` only | wallet **signer**; canonical config; pinned mint; canonical escrow, vault and wallet ATA **writable**; classic Token Program; event authority; program id | wallet, pending amount and unlock time from trusted devnet state, escrow, vault, destination ATA, digest | pending amount must be at or below `NAK_WALLET_MAX_WITHDRAW_MICRO_USDC` |
+| `nakshatra_pay.escrow_withdraw_execute` | `ac5dcf14503aa8f1` only | wallet **signer**; canonical config; pinned mint; canonical escrow, vault and wallet ATA **writable**; classic Token Program; event authority; program id | wallet, pending amount, withdrawal ceiling and unlock time from trusted devnet state, escrow, vault, destination ATA, digest | pending amount must be at or below `NAK_WALLET_MAX_WITHDRAW_MICRO_USDC` |
 | System Program transfer | program `11111111111111111111111111111111`; data `2:u32` + `lamports:u64` | wallet **signer,writable**; decoded delegate node **writable** | destination node, lamports and SOL, whether self top-up or starter top-up | `NAK_WALLET_MAX_SELF_SOL_LAMPORTS` or `NAK_WALLET_MAX_STARTER_SOL_LAMPORTS` |
-| Associated Token Account create-idempotent | program `ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL`; data exactly `01` | wallet **signer,writable** payer; canonical wallet ATA **writable**; wallet owner; pinned mint; System Program; classic Token Program | wallet, mint, canonical ATA, actual zero-or-create rent shortfall | `NAK_WALLET_MAX_ATA_RENT_LAMPORTS`; allowed once only in the execute template |
+| Associated Token Account create-idempotent | program `ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL`; data exactly `01` | wallet **signer,writable** payer; canonical wallet ATA **writable**; wallet owner; pinned mint; System Program; classic Token Program | wallet, mint, canonical ATA, actual zero-or-create shortfall and worst-case rent | `NAK_WALLET_MAX_ATA_RENT_LAMPORTS`; allowed once only in the execute template |
 
 The account order and argument layouts above match the current Python builders
 (`scripts/network/pay_chain.py:219-231,257-290`) and the program account constraints
@@ -201,10 +201,12 @@ matches the existing client quote path (`scripts/network/pay_chain.py:662-670`;
 wallet rent (`/home/prithvi/neuron/programs/nakshatra_pay/programs/nakshatra_pay/src/instructions.rs:619-632`;
 `scripts/network/pay_chain.py:724`). For both the delegate PDA and wallet ATA, the broker recognizes
 three states: absent; correctly initialized under the expected program; or system-owned with zero
-data and any pre-funded lamports (a dusted, still-uninitialized account). It renders zero for an
-initialized account. Otherwise it renders and ceilings the actual shortfall
+data and any pre-funded lamports (a dusted, still-uninitialized account). It renders the actual
+shortfall as zero for an initialized account and otherwise as
 `max(0, getMinimumBalanceForRentExemption(size) - current_lamports)`, using size 115 for the delegate
-and 165 for the ATA; dust is therefore credited rather than refused or treated as zero. Any other
+and 165 for the ATA; dust is therefore credited rather than refused or treated as zero. Separately,
+it always renders and ceilings the full rent-exempt minimum as worst-case rent because current state
+or dust can disappear before signing. Any other
 owner/data shape is refused. This matches Anchor's fund-then-allocate/assign path and the associated
 token program's equivalent PDA creation path
 (`/home/prithvi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/anchor-syn-1.2.0/src/codegen/accounts/constraints.rs:1778-1815`;
@@ -260,22 +262,31 @@ absolutely ceiling-checked from its message bytes. The execute independently ref
 pending amount exceeds the same ceiling. All starter pre-state is likewise read from the trusted
 devnet view before showing and again before signing. Caller claims are never used.
 
-For a starter update, an existing delegate must have `open_channels == 0` and `open_tasks == 0`.
-Its generation must equal the escrow generation or be strictly older, never newer; a same-generation
-delegate must not be disabled, while an older-generation delegate is eligible only because
-`delegate_set` resets its spent and disabled state. The ceiling bounds **resulting remaining
-capacity**, not merely the increase: for the same generation the broker requires
-`cap_total - spent <= NAK_WALLET_MAX_STARTER_MICRO_USDC`; for an absent or older-generation delegate
-it requires `cap_total <=` that ceiling after reset. The message must encode exactly `spent + desired
-remaining` for the same generation and exactly `desired remaining` otherwise. Requiring no open work
-prevents a later channel-finalize refund from lowering `spent` and expanding authority beyond the
-approved remaining-capacity bound. These are the current starter construction predicates
-(`scripts/network/nakd.py:1362-1418`); channel finalize does reduce `spent`
+Before any amount is labelled USDC, the broker decodes the canonical 208-byte Anchor `Config`
+account at the derived Config PDA, requires its program owner and both stored PDA bumps, and requires
+`Config.mint` to equal the pinned devnet USDC mint. The trusted withdrawal-delay quote must equal the
+Config's signed `i64` delay. `chain_time` and the delay are each validated as `i64`, and their sum is
+checked for `i64` overflow exactly as the program does.
+
+For a delegate update, its generation must equal the escrow generation or be strictly older, never
+newer. A same-generation delegate must not be disabled and the encoded cap must be at least its
+spent amount. An older-generation delegate is eligible for the program's spent/disabled reset only
+when `open_channels == 0` and `open_tasks == 0`; the approval shows the real pre-state and discloses
+that reset separately. Any stored `spent > cap_total` or unknown flag bits are malformed state and
+refused. These checks mirror the program transition
+(`/home/prithvi/neuron/programs/nakshatra_pay/programs/nakshatra_pay/src/instructions.rs:641-688`).
+
+For a starter grant, F1 is enforced from message bytes alone: encoded `cap_total` must be at or below
+`min(NAK_WALLET_MAX_STARTER_CAP_TOTAL_MICRO_USDC, NAK_WALLET_MAX_STARTER_MICRO_USDC)` regardless of
+RPC `spent`. Trusted state may only add refusals. The renderer still shows the post-transition
+remaining capacity (`cap_total - spent` for the same generation, `cap_total` after an older-generation
+reset), but state subtraction can never make over-ceiling bytes acceptable. This replaces the former
+state-adjusted construction rule and prevents a false high `spent` from widening actual
+authority. The current starter construction lives in `scripts/network/nakd.py:1362-1418`; channel
+finalize does reduce `spent`
 (`/home/prithvi/neuron/programs/nakshatra_pay/programs/nakshatra_pay/src/instructions.rs:1166-1173`).
-Independently, the encoded `cap_total` must always be at or below
-`NAK_WALLET_MAX_STARTER_CAP_TOTAL_MICRO_USDC`; a lying RPC value such as
-`spent = cap_total - 1` therefore cannot widen authority. Self `delegate_set` similarly applies
-`NAK_WALLET_MAX_DELEGATE_MICRO_USDC` to the encoded absolute `cap_total`, not merely an increase.
+Self `delegate_set` similarly applies `NAK_WALLET_MAX_DELEGATE_MICRO_USDC` to the encoded absolute
+`cap_total`, not merely an increase.
 
 ### 4.3 Cluster binding and refusals
 
@@ -331,6 +342,9 @@ Refuse before approval and again before signing on any of the following:
   writable flags different from the template;
 - a non-canonical config, escrow, vault, delegate, event authority, or ATA; a System transfer whose
   source is not the wallet or destination is not the decoded self/starter node;
+- any semantic role account that aliases another role or a protected runtime id (payment program,
+  System, classic Token, ATA, ed25519, loaders, Compute Budget, or sysvars), checked before privilege
+  aggregation;
 - delegate flags, expiry, cap, starter resulting remaining capacity, withdrawal amount, pending
   execute amount, SOL transfer, network fee, delegate rent, or ATA rent above its broker-environment
   ceiling;
@@ -376,6 +390,12 @@ post-import shape. The comment in `tests/test_pay_redeemer.py:903` is not a call
   blockhash, and `lastValidBlockHeight` before broadcast. Deposit and revoke stay explicitly
   unsupported in broker mode. This record is required because `send_and_confirm` can report an
   unknown final state after broadcast (`scripts/network/pay_chain.py:695-719`).
+- Every approved-withdraw journal record must carry the originating message digest, transaction signature,
+  and escrow generation. Such records come only from reconciled, byte-ceiling-checked
+  withdrawal requests; competing signed attempts keep the logical act unresolved and block another
+  approval. Wallet import refuses while the escrow has a pending withdrawal. Current closed templates
+  do not recreate escrows; if recreation is ever added, the execute lookup must bind escrow generation
+  explicitly rather than relying on `(escrow, amount, withdraw_at)` alone.
 - Change `scripts/network/nakd.py:NakDaemon._chain_starter` as above and retain its pre-broadcast
   durable-attempt boundary (`scripts/network/nakd.py:1427-1469`), extending the record with the message
   digest. Before **any** new approval request for the same logical starter, ensure, or withdrawal act,

@@ -3,6 +3,12 @@
   "cluster_view": {
     "accounts": [
       {
+        "address": "8Q1BNKohnutkCsWhPSKVydM5LBNbzVom8Zss5hNsa7r8",
+        "data_hex": "9b0caae01efacc820beef5a9e679e6a3e134fe27837bff32c7cb5f5d44ea09bcb0e542bad6a4c0cc3b442cb3912157f13a933d0134282d032b5ffecd01a2dbf1b7790608df002ea70beef5a9e679e6a3e134fe27837bff32c7cb5f5d44ea09bcb0e542bad6a4c0cc2c016054000000000000805101000000000000a30200000000000000fdfe0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "lamports": 2344320,
+        "owner": "GLWqQsSqUsDkPvkc8rxcoQUyro7ZQd5denht21NtdTTo"
+      },
+      {
         "address": "F7NB38wC4KNaUjP3frSeSWvpfc5jirvjukTgqW969a1x",
         "data_hex": "1fd57bbbba16da9b66be7e332c7a453332bd9d0a7f7db055f5c5ef1a06ada66d98b39fb6810c473acc443d2224b0747df9128abe0cb84ce79c17846026f8e50572422f50f90f6e5d000000000000000000000000000000000300000000000000040000000000000007000000000000000066be7e332c7a453332bd9d0a7f7db055f5c5ef1a06ada66d98b39fb6810c473afffe00000000000000000000000000000000",
         "lamports": 1691280,
@@ -23,7 +29,7 @@
     "valid_recent_blockhashes": [
       "3ARMH9zfVCnU2TKiphU4xcEyWdA45fc1sjKEtYMdf3gr"
     ],
-    "withdraw_delay_seconds": 86400
+    "withdraw_delay_seconds": 21600
   },
   "expected_plan": {
     "instructions": [
@@ -140,6 +146,10 @@
         "value": 1
       },
       {
+        "name": "delegate_rent_shortfall_lamports",
+        "value": 1691280
+      },
+      {
         "name": "delegate_rent_worst_case_lamports",
         "value": 1691280
       },
@@ -154,6 +164,10 @@
       {
         "name": "pre_spent_micro_usdc",
         "value": 0
+      },
+      {
+        "name": "older_generation_reset",
+        "value": false
       },
       {
         "name": "resulting_remaining_micro_usdc",
