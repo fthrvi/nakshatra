@@ -1244,6 +1244,12 @@ class Node:
                 attempt["error"] = str(status.get("err"))[:200]
                 attempts_changed = True
                 continue
+            if status is not None:
+                # Processed/confirmed proves the signature was observed.  It
+                # may still finalize on the rooted fork, so blockhash expiry
+                # cannot authorize a replacement transaction.
+                unresolved = True
+                continue
             if finalized_height is None:
                 finalized_height = rpc.block_height(commitment="finalized")
             if finalized_height <= int(attempt["last_valid_block_height"]):

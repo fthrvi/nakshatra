@@ -379,7 +379,26 @@ def test_processed_error_with_valid_blockhash_blocks_replacement(chain_node, mon
     assert "resolution" not in row["chain_attempts"][0]
 
 
-def test_processed_error_after_blockhash_expiry_allows_replacement(chain_node, monkeypatch):
+def test_confirmed_attempt_after_blockhash_expiry_blocks_replacement(
+        chain_node, monkeypatch):
+    node, wallet, row = chain_node
+    rpc = StarterRpc(wallet, vault_amount=2_000_000)
+    signature = _record_chain_attempt(row)
+    rpc.statuses[signature] = {
+        "err": None,
+        "confirmationStatus": "confirmed"}
+    rpc.finalized_height = row["chain_attempts"][0]["last_valid_block_height"] + 1
+    monkeypatch.setattr(pay_chain, "PayRpc", lambda _url: rpc)
+
+    with pytest.raises(pay_voucher.VoucherError, match="still unresolved"):
+        node._chain_starter(row)
+
+    assert not rpc.sent
+    assert "resolution" not in row["chain_attempts"][0]
+    assert len(row["chain_attempts"]) == 1
+
+
+def test_processed_error_after_blockhash_expiry_blocks_replacement(chain_node, monkeypatch):
     node, wallet, row = chain_node
     rpc = StarterRpc(wallet, vault_amount=2_000_000)
     signature = _record_chain_attempt(row)
@@ -389,11 +408,12 @@ def test_processed_error_after_blockhash_expiry_allows_replacement(chain_node, m
     rpc.finalized_height = row["chain_attempts"][0]["last_valid_block_height"] + 1
     monkeypatch.setattr(pay_chain, "PayRpc", lambda _url: rpc)
 
-    node._chain_starter(row)
+    with pytest.raises(pay_voucher.VoucherError, match="still unresolved"):
+        node._chain_starter(row)
 
-    assert len(rpc.sent) == 1
-    assert row["chain_attempts"][0]["resolution"] == "expired"
-    assert len(row["chain_attempts"]) == 2
+    assert not rpc.sent
+    assert "resolution" not in row["chain_attempts"][0]
+    assert len(row["chain_attempts"]) == 1
 
 
 def test_forgejo_main_pending_ledger_row_migrates_intact_and_still_updates(tmp_path):

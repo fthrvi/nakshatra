@@ -5,6 +5,7 @@ On create add a row (status=active, owner). On merge flip to `merged→<sha>`.
 
 | branch | sector | description | base | status | owner |
 |---|---|---|---|---|---|
+| pay/starter-attempt-fence | payments | Fence starter-attempt replacement while an on-chain signature remains observed but non-final. | forgejo/main@fbdd3ce | active | codex for claude/trisul-aa network lane (hub) |
 | test/starter-reason-flake | network | Preserve the specific pending starter reason when reconcile observes a separate escrow prerequisite. | forgejo/main@aef5c91 | merged→ec0a457 | codex for claude/trisul-aa network lane (hub) |
 | pay/redeemer | pay | M5: worker-node redeemer (ed25519 voucher + channel_redeem, durable attempts, threshold/24h/closing-urgent), cooperative finalize, payer close-request/finalize to reclaim rent and collateral. | forgejo/main@dcf7cdd | merged→7abca10 | claude/trisul-aa network lane (hub) |
 | pay/chain-starter | payments | M4c part 2b: inviter `--starter` becomes an on-chain delegate (newcomer node key) on the inviter's escrow plus a small SOL float, from the existing nakd starter obligation; newcomer discovers starter escrows on-chain; `nak pay starters` / `nak pay revoke`. | forgejo/main@de753d4 | merged→c0ae9cd | codex for claude/trisul-aa network lane (hub) |
