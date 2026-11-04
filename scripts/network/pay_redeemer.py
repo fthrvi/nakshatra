@@ -263,6 +263,24 @@ def _redeem_before_margin(*, channel: str,
     return True
 
 
+def _redeem_eligible(*, channel: str, state: pay_voucher.ChannelAccount,
+                     total: int, chain_now: int,
+                     log: Callable[[str], None]) -> bool:
+    """Apply the complete finalized-state broadcast eligibility rule."""
+    if state.status not in {"Open", "Closing"}:
+        log(f"WARNING: voucher {channel} has ineligible channel status "
+            f"{state.status!r}; voucher retained and nothing was sent")
+        return False
+    if not _redeem_before_margin(
+            channel=channel, state=state, chain_now=chain_now, log=log):
+        return False
+    if total <= state.redeemed:
+        log(f"skip redeem {channel}: latest voucher total {total} is not above "
+            f"finalized on-chain redeemed {state.redeemed}; nothing was sent")
+        return False
+    return True
+
+
 def _cooperative_finalize(*, rpc, book: AttemptBook, voucher: pay_voucher.VoucherRecord,
                           store: pay_voucher.WorkerVoucherStore,
                           channel: pay_voucher.ChannelAccount, owner: str, wallet: dict,
@@ -386,15 +404,23 @@ def run_redeemer(*, store: pay_voucher.WorkerVoucherStore | None = None,
                     instructions.insert(0, pay_chain.ata_create_idempotent(
                         worker_wallet["address"], state.worker, configured_mint))
                     rent = rpc.rent_exemption(165, commitment="finalized")
-                margin_refused = False
+                eligibility_refused = False
 
                 def before_redeem_send() -> int | None:
-                    nonlocal margin_refused
+                    nonlocal eligibility_refused
                     fresh_chain_now = rpc.chain_time()
-                    if not _redeem_before_margin(
-                            channel=voucher.channel, state=state,
-                            chain_now=fresh_chain_now, log=log):
-                        margin_refused = True
+                    try:
+                        fresh_state = rpc.read_channel(
+                            voucher.channel, configured_program)
+                    except pay_voucher.VoucherError as exc:
+                        log(f"WARNING: voucher {voucher.channel} finalized channel "
+                            f"recheck failed ({exc}); voucher retained and nothing was sent")
+                        eligibility_refused = True
+                        return None
+                    if not _redeem_eligible(
+                            channel=voucher.channel, state=fresh_state,
+                            total=voucher.total, chain_now=fresh_chain_now, log=log):
+                        eligibility_refused = True
                         return None
                     return fresh_chain_now
 
@@ -404,7 +430,7 @@ def run_redeemer(*, store: pay_voucher.WorkerVoucherStore | None = None,
                     seed=worker_wallet["seed"], chain_now=chain_now, rent=rent,
                     total=voucher.total, dry_run=dry_run,
                     before_send=before_redeem_send, log=log)
-                if margin_refused:
+                if eligibility_refused:
                     result["skipped"] += 1
                 if sent:
                     result["would_send" if dry_run else "sent"] += 1

@@ -167,6 +167,41 @@ def test_closing_redeem_rereads_chain_time_and_refuses_at_safety_margin(tmp_path
                for message in messages)
 
 
+@pytest.mark.parametrize("fresh_state,chain_times,message", [
+    (channel_state(status="Closing", close_at=50_000), [49_000, 49_400],
+     "SAFETY MARGIN"),
+    (channel_state(redeemed=2_000_000), [49_000, 49_001],
+     "not above finalized on-chain redeemed"),
+])
+def test_redeem_rereads_full_finalized_eligibility_before_broadcast(
+        tmp_path, fresh_state, chain_times, message):
+    class ChangedChannelRpc(Rpc):
+        def __init__(self):
+            super().__init__(
+                tmp_path / "redeems.sqlite", state=channel_state(),
+                chain_times=chain_times)
+            self.channel_reads = 0
+
+        def read_channel(self, channel, program):
+            self.channel_reads += 1
+            assert (channel, program) == (CHANNEL, PROGRAM)
+            return channel_state() if self.channel_reads == 1 else fresh_state
+
+    rpc = ChangedChannelRpc()
+    messages = []
+
+    result = run(tmp_path, rpc, log=messages.append)
+
+    # Mutation checked: reusing the initial Open/unredeemed account snapshot in
+    # the post-durability fence broadcasts after either finalized fact changed.
+    assert rpc.channel_reads == 2 and rpc.chain_time_calls == 2
+    assert rpc.sent == 0 and result["skipped"] == 1
+    with pay_redeemer.AttemptBook(tmp_path / "redeems.sqlite") as book:
+        attempts = book.unresolved(CHANNEL)
+        assert len(attempts) == 1 and attempts[0]["kind"] == "redeem"
+    assert any(message in row and "nothing was sent" in row for row in messages)
+
+
 def test_voucher_accept_deadline_never_overruns_redeemer_refusal():
     state = channel_state(status="Closing", close_at=50_000)
     assert pay_voucher.ACCEPT_MARGIN == pay_voucher.REDEEM_MARGIN + 120
