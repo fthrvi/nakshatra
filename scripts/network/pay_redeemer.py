@@ -313,6 +313,12 @@ def _cooperative_finalize(*, rpc, book: AttemptBook, voucher: pay_voucher.Vouche
         chain_now=chain_now, dry_run=dry_run, log=log)
 
 
+def redeem_order(records) -> list:
+    """Closing channels (close_at > 0) by earliest close_at, then the rest."""
+    return sorted(records, key=lambda v: (
+        int(v.close_at) <= 0, max(int(v.close_at), 0), v.channel))
+
+
 def run_redeemer(*, store: pay_voucher.WorkerVoucherStore | None = None,
                  rpc=None, wallet: dict | None = None, program: str | None = None,
                  mint: str | None = None, channel: str | None = None,
@@ -361,7 +367,10 @@ def run_redeemer(*, store: pay_voucher.WorkerVoucherStore | None = None,
                     "seed": node_seed,
                 }
             chain_now = rpc.chain_time()
-            for voucher in vouchers.all_latest():
+            # Known-Closing channels first, earliest deadline first: an earlier
+            # send may block for up to a poll, and a Closing voucher reached
+            # too late is unredeemable once the margin passes.
+            for voucher in redeem_order(vouchers.all_latest()):
                 if wanted is not None and voucher.channel != wanted:
                     continue
                 result["examined"] += 1

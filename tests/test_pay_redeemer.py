@@ -1023,3 +1023,35 @@ def test_nakd_pay_loop_survives_unexpected_cycle_exception():
     # after the first escaped payment exception instead of running cycle two.
     assert len(calls) == 2
     assert any("maintenance loop recovered" in row for row in messages)
+
+
+def test_closing_vouchers_are_redeemed_before_open_ones(tmp_path):
+    # Mutation checked: iterating all_latest() in store (channel) order reads
+    # the Open CHANNEL2 first and fails the assertion below.
+    def record(channel, close_at):
+        sig = ed25519.Ed25519PrivateKey.from_private_bytes(SIGNER_SEED).sign(
+            pay_voucher.voucher_message(PROGRAM, channel, 2_000_000))
+        return pay_voucher.VoucherRecord(channel, PROGRAM, 2_000_000, sig,
+                                         close_at=close_at)
+
+    class TwoStore:
+        def all_latest(self):
+            return [record(CHANNEL2, 0), record(CHANNEL, 1_000_900)]
+
+    class OrderRpc(Rpc):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self.read_order = []
+        def read_channel(self, channel, program):
+            self.read_order.append(channel)
+            raise pay_voucher.VoucherError("stop after recording order")
+
+    rpc = OrderRpc(tmp_path / "redeems.sqlite")
+    pay_redeemer.run_redeemer(
+        store=TwoStore(), rpc=rpc, wallet=WALLET, program=PROGRAM, mint=MINT,
+        attempts_path=tmp_path / "redeems.sqlite",
+        lock_path=tmp_path / "redeem.lock", log=lambda _m: None)
+    assert rpc.read_order == [CHANNEL, CHANNEL2]
+    assert [r.channel for r in pay_redeemer.redeem_order(
+        [record(CHANNEL2, 0), record(CHANNEL, 5), record(CHANNEL, 3)])] == [
+            CHANNEL, CHANNEL, CHANNEL2]
