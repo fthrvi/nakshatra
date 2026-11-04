@@ -39,6 +39,11 @@ def _view(value: dict[str, object]) -> policy_module.ClusterView:
     return policy_module.ClusterView(**fields)
 
 
+def _approved(value: list[dict[str, object]]) -> frozenset[
+        policy_module.ApprovedWithdrawRequest]:
+    return frozenset(policy_module.ApprovedWithdrawRequest(**item) for item in value)
+
+
 def _load(path: Path) -> object:
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -52,7 +57,8 @@ def test_frozen_golden_message_decodes_to_exact_plan(path: Path):
     fixture = _load(path)
     raw = bytes.fromhex(fixture["raw_message_hex"])
     plan = policy_module.decode_and_check(
-        raw, _policy(fixture["policy"]), _view(fixture["cluster_view"]))
+        raw, _policy(fixture["policy"]), _view(fixture["cluster_view"]),
+        _approved(fixture["approved_withdraw_requests"]))
     assert plan.raw_message is raw
     assert plan.to_dict() == fixture["expected_plan"]
     assert plan.message_sha256 == fixture["expected_plan"]["message_sha256"]
@@ -69,6 +75,13 @@ def test_frozen_goldens_still_match_real_pay_builders():
 
 def test_frozen_hostiles_still_match_one_mutation_generator():
     assert HOSTILE == fixture_generator.hostile_fixtures()
+    goldens = fixture_generator.golden_fixtures()
+    inputs = ("raw_message_hex", "policy", "cluster_view",
+              "approved_withdraw_requests")
+    for hostile in HOSTILE:
+        golden = goldens[hostile["golden"]]
+        changed = [name for name in inputs if hostile[name] != golden[name]]
+        assert len(changed) == 1, (hostile["name"], changed)
 
 
 @pytest.mark.parametrize("fixture", HOSTILE, ids=lambda fixture: fixture["name"])
@@ -76,7 +89,8 @@ def test_hostile_fixture_is_refused_with_closed_code(fixture: dict[str, object])
     with pytest.raises(policy_module.PolicyRefusal) as refused:
         policy_module.decode_and_check(
             bytes.fromhex(fixture["raw_message_hex"]),
-            _policy(fixture["policy"]), _view(fixture["cluster_view"]))
+            _policy(fixture["policy"]), _view(fixture["cluster_view"]),
+            _approved(fixture["approved_withdraw_requests"]))
     assert refused.value.code == fixture["expected_code"]
     assert refused.value.code in policy_module.REFUSAL_CODES
     assert str(refused.value) == refused.value.code
@@ -105,6 +119,48 @@ def test_q3_defaults_match_current_self_and_starter_builders():
     assert wallet_policy.max_withdraw_micro_usdc == 5_000_000
 
 
+def test_hard_maxima_are_the_reviewed_q3_values_and_fit_u64():
+    expected = {
+        "NAK_WALLET_MAX_DELEGATE_MICRO_USDC": 5_000_000,
+        "NAK_WALLET_MAX_DELEGATE_TTL_S": 30 * 86400,
+        "NAK_WALLET_MAX_STARTER_CAP_TOTAL_MICRO_USDC": 1_000_000,
+        "NAK_WALLET_MAX_STARTER_MICRO_USDC": 1_000_000,
+        "NAK_WALLET_MAX_STARTER_TTL_S": 30 * 86400,
+        "NAK_WALLET_MAX_WITHDRAW_MICRO_USDC": 5_000_000,
+        "NAK_WALLET_MAX_NETWORK_FEE_LAMPORTS": 10_000,
+        "NAK_WALLET_MAX_DELEGATE_RENT_LAMPORTS": 1_700_000,
+        "NAK_WALLET_MAX_ATA_RENT_LAMPORTS": 2_040_000,
+        "NAK_WALLET_MAX_SELF_SOL_LAMPORTS": 30_000_000,
+        "NAK_WALLET_MAX_STARTER_SOL_LAMPORTS": 10_000_000,
+    }
+    assert policy_module.U64_MAX == 2**64 - 1
+    for name, value in expected.items():
+        assert getattr(policy_module, name) == value
+        assert 0 < value <= policy_module.U64_MAX
+
+
+@pytest.mark.parametrize("field,hard_max", [
+    ("max_delegate_micro_usdc", policy_module.NAK_WALLET_MAX_DELEGATE_MICRO_USDC),
+    ("max_delegate_ttl_s", policy_module.NAK_WALLET_MAX_DELEGATE_TTL_S),
+    ("max_starter_cap_total_micro_usdc",
+     policy_module.NAK_WALLET_MAX_STARTER_CAP_TOTAL_MICRO_USDC),
+    ("max_starter_micro_usdc", policy_module.NAK_WALLET_MAX_STARTER_MICRO_USDC),
+    ("max_starter_ttl_s", policy_module.NAK_WALLET_MAX_STARTER_TTL_S),
+    ("max_withdraw_micro_usdc", policy_module.NAK_WALLET_MAX_WITHDRAW_MICRO_USDC),
+    ("max_network_fee_lamports", policy_module.NAK_WALLET_MAX_NETWORK_FEE_LAMPORTS),
+    ("max_delegate_rent_lamports", policy_module.NAK_WALLET_MAX_DELEGATE_RENT_LAMPORTS),
+    ("max_ata_rent_lamports", policy_module.NAK_WALLET_MAX_ATA_RENT_LAMPORTS),
+    ("max_self_sol_lamports", policy_module.NAK_WALLET_MAX_SELF_SOL_LAMPORTS),
+    ("max_starter_sol_lamports", policy_module.NAK_WALLET_MAX_STARTER_SOL_LAMPORTS),
+])
+def test_policy_can_only_tighten_hard_maxima(field: str, hard_max: int):
+    raw, view = fixture_generator.golden_messages()["self_delegate"]
+    widened = replace(fixture_generator.base_policy(), **{field: hard_max + 1})
+    with pytest.raises(policy_module.PolicyRefusal) as refused:
+        _decode(raw, view, widened)
+    assert refused.value.code == "policy"
+
+
 def test_pda_and_ata_derivation_matches_pay_chain_vectors():
     wallet_policy = fixture_generator.base_policy()
     derived = policy_module._derive(wallet_policy)
@@ -129,17 +185,18 @@ def test_pda_and_ata_derivation_matches_pay_chain_vectors():
 
 
 def _decode(raw: bytes, view: policy_module.ClusterView,
-            wallet_policy: policy_module.WalletPolicy | None = None
+            wallet_policy: policy_module.WalletPolicy | None = None,
+            approved: frozenset[policy_module.ApprovedWithdrawRequest] = frozenset(),
             ) -> policy_module.ApprovalPlan:
     return policy_module.decode_and_check(
-        raw, wallet_policy or fixture_generator.base_policy(), view)
+        raw, wallet_policy or fixture_generator.base_policy(), view, approved)
 
 
 @pytest.mark.parametrize(
-    "lamports,expected_shortfall",
-    [(0, 1_691_280), (400_000, 1_291_280), (1_691_280, 0), (9_000_000, 0)],
+    "lamports",
+    [0, 400_000, 1_691_280, 9_000_000],
 )
-def test_dusted_delegate_pda_credits_prefunding(lamports: int, expected_shortfall: int):
+def test_dusted_delegate_pda_still_renders_worst_case_rent(lamports: int):
     raw, view = fixture_generator.golden_messages()["self_delegate"]
     derived = pay_chain._derived(fixture_generator.WALLET, fixture_generator.PROGRAM)
     delegate = pay_chain.delegate_pda(
@@ -148,10 +205,10 @@ def test_dusted_delegate_pda_credits_prefunding(lamports: int, expected_shortfal
         delegate, pay_chain.SYSTEM_PROGRAM_ID, lamports, b"")
     plan = _decode(raw, fixture_generator._replace_account(view, account))
     fields = {field.name: field.value for field in plan.rendered_fields}
-    assert fields["delegate_rent_shortfall_lamports"] == expected_shortfall
+    assert fields["delegate_rent_worst_case_lamports"] == 1_691_280
 
 
-def test_initialized_delegate_has_zero_rent_shortfall():
+def test_permissionless_closable_stale_delegate_renders_worst_case_rent():
     raw, view = fixture_generator.golden_messages()["self_delegate"]
     derived = pay_chain._derived(fixture_generator.WALLET, fixture_generator.PROGRAM)
     delegate = pay_chain.delegate_pda(
@@ -159,37 +216,70 @@ def test_initialized_delegate_has_zero_rent_shortfall():
     account = policy_module.AccountView(
         delegate, fixture_generator.PROGRAM, 1,
         fixture_generator._delegate_data(
-            fixture_generator.NODE, flags=pay_chain.DELEGATE_FLAGS_ALL))
+            fixture_generator.NODE, generation=6, flags=pay_chain.DELEGATE_FLAGS_ALL))
     plan = _decode(raw, fixture_generator._replace_account(view, account))
     fields = {field.name: field.value for field in plan.rendered_fields}
-    assert fields["delegate_rent_shortfall_lamports"] == 0
+    assert fields["delegate_rent_worst_case_lamports"] == 1_691_280
 
 
 @pytest.mark.parametrize(
-    "lamports,expected_shortfall",
-    [(0, 2_039_280), (1_000_000, 1_039_280), (2_039_280, 0), (9_000_000, 0)],
+    "lamports",
+    [0, 1_000_000, 2_039_280, 9_000_000],
 )
-def test_dusted_ata_credits_prefunding(lamports: int, expected_shortfall: int):
+def test_dusted_ata_still_renders_worst_case_rent(lamports: int):
     raw, view = fixture_generator.golden_messages()["withdraw_execute"]
     ata = pay_chain.associated_token_address(
         fixture_generator.WALLET, fixture_generator.MINT)[0]
     account = policy_module.AccountView(
         ata, pay_chain.SYSTEM_PROGRAM_ID, lamports, b"")
-    plan = _decode(raw, fixture_generator._replace_account(view, account))
+    changed_view = fixture_generator._replace_account(view, account)
+    plan = _decode(raw, changed_view, approved=
+                   fixture_generator.approved_withdraw_requests(changed_view))
     fields = {field.name: field.value for field in plan.rendered_fields}
-    assert fields["ata_rent_shortfall_lamports"] == expected_shortfall
+    assert fields["ata_rent_worst_case_lamports"] == 2_039_280
 
 
-def test_initialized_canonical_ata_has_zero_rent_shortfall():
+def test_initialized_canonical_ata_still_renders_worst_case_rent():
     raw, view = fixture_generator.golden_messages()["withdraw_execute"]
     ata = pay_chain.associated_token_address(
         fixture_generator.WALLET, fixture_generator.MINT)[0]
     account = policy_module.AccountView(
         ata, pay_chain.TOKEN_PROGRAM_ID, 1,
         fixture_generator._ata_data())
-    plan = _decode(raw, fixture_generator._replace_account(view, account))
+    changed_view = fixture_generator._replace_account(view, account)
+    plan = _decode(raw, changed_view, approved=
+                   fixture_generator.approved_withdraw_requests(changed_view))
     fields = {field.name: field.value for field in plan.rendered_fields}
-    assert fields["ata_rent_shortfall_lamports"] == 0
+    assert fields["ata_rent_worst_case_lamports"] == 2_039_280
+
+
+def test_withdraw_execute_requires_exact_durable_provenance():
+    raw, view = fixture_generator.golden_messages()["withdraw_execute"]
+    exact = fixture_generator.approved_withdraw_requests(view)
+    assert _decode(raw, view, approved=exact).operation == "withdraw_execute"
+    approved = next(iter(exact))
+    mismatches = (
+        replace(approved, escrow_id=fixture_generator.WRONG_DESTINATION),
+        replace(approved, amount_micro_usdc=approved.amount_micro_usdc + 1),
+        replace(approved, withdraw_at=approved.withdraw_at + 1),
+    )
+    for mismatch in mismatches:
+        with pytest.raises(policy_module.PolicyRefusal) as refused:
+            _decode(raw, view, approved=frozenset((mismatch,)))
+        assert refused.value.code == "withdraw_provenance"
+
+
+def test_required_isolated_hostile_fixtures_are_frozen():
+    names = {fixture["name"] for fixture in HOSTILE}
+    assert {
+        "wrong_fee_payer", "duplicate_keys", "instruction_index_aliasing",
+        "readonly_signed_account", "anchor_trailing_argument_bytes",
+        "ata_create_non_idempotent", "token_2022_program",
+        "system_transfer_with_seed", "system_allocate", "system_assign",
+        "hard_ceiling_widening", "execute_without_provenance",
+        "self_reversed_instruction_order", "starter_reversed_instruction_order",
+        "wrong_policy_mint",
+    } <= names
 
 
 @pytest.mark.parametrize(

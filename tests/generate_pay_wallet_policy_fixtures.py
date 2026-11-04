@@ -48,6 +48,7 @@ STARTER = _address(13)
 AUTHORITY = _address(14)
 UNKNOWN_PROGRAM = _address(15)
 WRONG_DESTINATION = _address(16)
+TOKEN_2022_PROGRAM = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
 PROGRAMDATA = pay_chain.find_program_address(
     [pay_chain.pubkey_bytes(PROGRAM)], LOADER)[0]
 PROGRAM_HASH = hashlib.sha256(b"throwaway reviewed nakshatra_pay program").hexdigest()
@@ -126,6 +127,22 @@ def _compile(instructions: list[pay_chain.Instruction]) -> bytes:
     return pay_chain.compile_message(instructions, WALLET, BLOCKHASH).data
 
 
+def approved_withdraw_requests(
+        view: wallet_policy.ClusterView,
+) -> frozenset[wallet_policy.ApprovedWithdrawRequest]:
+    """Model the broker's durable approvals for the fixture's current pending state."""
+    escrow_id = pay_chain.escrow_pda(WALLET, PROGRAM)[0]
+    account = next((item for item in view.accounts if item.address == escrow_id), None)
+    if account is None:
+        return frozenset()
+    pending = wallet_policy._decode_escrow(account.data)["pending"]
+    if pending is None:
+        return frozenset()
+    amount, withdraw_at = pending
+    return frozenset((wallet_policy.ApprovedWithdrawRequest(
+        escrow_id, int(amount), int(withdraw_at)),))
+
+
 def golden_messages() -> dict[str, tuple[bytes, wallet_policy.ClusterView]]:
     # Exact constructor calls/order from nak._pay_ensure_locked,
     # nakd.NakDaemon._chain_starter, and nak's withdraw branch.  The self cap
@@ -136,6 +153,11 @@ def golden_messages() -> dict[str, tuple[bytes, wallet_policy.ClusterView]]:
     starter_set = pay_chain.delegate_set(
         WALLET, STARTER, 1_000_000, CHAIN_TIME + STARTER_DAYS * 86400,
         pay_chain.DELEGATE_OPEN_CHANNEL, PROGRAM)
+    starter_address = pay_chain.delegate_pda(
+        pay_chain.escrow_pda(WALLET, PROGRAM)[0], STARTER, PROGRAM)[0]
+    starter_existing = _replace_account(base_view(), wallet_policy.AccountView(
+        starter_address, PROGRAM, 1_691_280,
+        _delegate_data(STARTER, cap=1_000_001, spent=1_000_000)))
     return {
         "self_delegate": (_compile(self_set), base_view()),
         "self_transfer_delegate": (_compile([
@@ -143,6 +165,7 @@ def golden_messages() -> dict[str, tuple[bytes, wallet_policy.ClusterView]]:
         "self_top_up": (_compile([
             pay_chain.system_transfer(WALLET, NODE, SELF_TOP_UP)]), base_view()),
         "starter_delegate": (_compile(starter_set), base_view()),
+        "starter_existing_state": (_compile(starter_set), starter_existing),
         "starter_top_up": (_compile([
             *starter_set, pay_chain.system_transfer(WALLET, STARTER, STARTER_TOP_UP)]), base_view()),
         "withdraw_request": (_compile(
@@ -171,10 +194,15 @@ def golden_fixtures() -> dict[str, dict[str, object]]:
     policy = base_policy()
     result = {}
     for name, (message, view) in golden_messages().items():
+        approved = approved_withdraw_requests(view)
         result[name] = {
             "name": name, "raw_message_hex": message.hex(),
             "policy": _serialize_policy(policy), "cluster_view": _serialize_view(view),
-            "expected_plan": wallet_policy.decode_and_check(message, policy, view).to_dict(),
+            "approved_withdraw_requests": [asdict(item) for item in sorted(
+                approved, key=lambda item: (
+                    item.escrow_id, item.amount_micro_usdc, item.withdraw_at))],
+            "expected_plan": wallet_policy.decode_and_check(
+                message, policy, view, approved).to_dict(),
         }
     return result
 
@@ -183,6 +211,47 @@ def _replace_account(view: wallet_policy.ClusterView, account: wallet_policy.Acc
                      ) -> wallet_policy.ClusterView:
     return replace(view, accounts=tuple(
         item for item in view.accounts if item.address != account.address) + (account,))
+
+
+def _message_offsets(raw: bytes) -> tuple[int, list[tuple[int, list[int]]]]:
+    """Return the key-table start and compact-u8 instruction index offsets."""
+    if raw[3] & 0x80:
+        raise ValueError("fixture unexpectedly needs multi-byte shortvec parsing")
+    key_count = raw[3]
+    key_start = 4
+    offset = key_start + key_count * 32 + 32
+    instruction_count = raw[offset]
+    offset += 1
+    instructions = []
+    for _unused in range(instruction_count):
+        program_offset = offset
+        offset += 1
+        account_count = raw[offset]
+        offset += 1
+        account_offsets = list(range(offset, offset + account_count))
+        offset += account_count
+        data_count = raw[offset]
+        offset += 1 + data_count
+        instructions.append((program_offset, account_offsets))
+    if offset != len(raw):
+        raise ValueError("fixture unexpectedly needs multi-byte shortvec parsing")
+    return key_start, instructions
+
+
+def _swap_message_keys(raw: bytes, left: int, right: int) -> bytes:
+    """Change only the fee payer/key position while preserving ix account identities."""
+    changed = bytearray(raw)
+    key_start, instructions = _message_offsets(raw)
+    left_slice = slice(key_start + 32 * left, key_start + 32 * (left + 1))
+    right_slice = slice(key_start + 32 * right, key_start + 32 * (right + 1))
+    changed[left_slice], changed[right_slice] = changed[right_slice], changed[left_slice]
+    for program_offset, account_offsets in instructions:
+        for offset in (program_offset, *account_offsets):
+            if changed[offset] == left:
+                changed[offset] = right
+            elif changed[offset] == right:
+                changed[offset] = left
+    return bytes(changed)
 
 
 def hostile_fixtures() -> list[dict[str, object]]:
@@ -199,12 +268,17 @@ def hostile_fixtures() -> list[dict[str, object]]:
         WALLET, STARTER, 1_000_000, CHAIN_TIME + STARTER_DAYS * 86400,
         pay_chain.DELEGATE_OPEN_CHANNEL, PROGRAM)[0]
 
-    cases: list[tuple[str, bytes, wallet_policy.WalletPolicy,
-                      wallet_policy.ClusterView, str]] = []
+    cases: list[tuple[str, str, bytes, wallet_policy.WalletPolicy,
+                      wallet_policy.ClusterView,
+                      frozenset[wallet_policy.ApprovedWithdrawRequest], str]] = []
 
     def add(name: str, raw: bytes = self_raw, *, p: wallet_policy.WalletPolicy = policy,
-            view: wallet_policy.ClusterView = normal, code: str) -> None:
-        cases.append((name, raw, p, view, code))
+            view: wallet_policy.ClusterView = normal,
+            approved: frozenset[wallet_policy.ApprovedWithdrawRequest] | None = None,
+            golden: str = "self_delegate", code: str) -> None:
+        cases.append((name, golden, raw, p, view,
+                      approved_withdraw_requests(view) if approved is None else approved,
+                      code))
 
     add("extra_instruction", _compile([self_ix, self_ix]), code="instruction_template")
     unknown = pay_chain.Instruction(UNKNOWN_PROGRAM, self_ix.data, self_ix.accounts)
@@ -216,28 +290,61 @@ def hostile_fixtures() -> list[dict[str, object]]:
     add("swapped_instruction_accounts", _compile([swapped]), code="account_template")
     writable = bytearray(self_raw); writable[2] -= 1
     add("writable_bit_change", bytes(writable), code="privilege_template")
-    wrong_payer = bytearray(self_raw)
-    wrong_payer[4:36], wrong_payer[36:68] = wrong_payer[36:68], wrong_payer[4:36]
-    add("wrong_fee_payer", bytes(wrong_payer), code="fee_payer")
+    add("wrong_fee_payer", _swap_message_keys(self_raw, 0, 1), code="fee_payer")
     extra_signer = bytearray(self_raw); extra_signer[0] = 2
     add("extra_signer", bytes(extra_signer), code="signer_set")
+    readonly_signer = bytearray(self_raw)
+    readonly_signer[0] = 2
+    readonly_signer[1] = 1
+    add("readonly_signed_account", bytes(readonly_signer), code="signer_set")
+    duplicate = bytearray(self_raw)
+    key_start, self_offsets = _message_offsets(self_raw)
+    duplicate[key_start + 32:key_start + 64] = duplicate[key_start:key_start + 32]
+    add("duplicate_keys", bytes(duplicate), code="duplicate_account")
+    aliased = bytearray(self_raw)
+    first_accounts = self_offsets[0][1]
+    aliased[first_accounts[1]] = aliased[first_accounts[0]]
+    add("instruction_index_aliasing", bytes(aliased), code="account_template")
+    trailing_anchor_arg = replace(self_ix, data=self_ix.data + b"\0")
+    add("anchor_trailing_argument_bytes", _compile([trailing_anchor_arg]),
+        code="unknown_instruction")
     wrong_delegate = replace(self_ix, accounts=(
         *self_ix.accounts[:3], pay_chain.AccountMeta(WRONG_DESTINATION, False, True),
         *self_ix.accounts[4:]))
     add("wrong_delegate_pda", _compile([wrong_delegate]), code="account_order")
     execute_ixs = pay_chain.escrow_withdraw_execute(WALLET, MINT, PROGRAM)
+    ata_non_idempotent = replace(execute_ixs[0], data=b"")
+    add("ata_create_non_idempotent", _compile([ata_non_idempotent, execute_ixs[1]]),
+        view=execute_view, golden="withdraw_execute", code="unknown_instruction")
+    token_2022_ixs = [replace(instruction, accounts=tuple(
+        replace(account, pubkey=TOKEN_2022_PROGRAM)
+        if account.pubkey == pay_chain.TOKEN_PROGRAM_ID else account
+        for account in instruction.accounts)) for instruction in execute_ixs]
+    add("token_2022_program", _compile(token_2022_ixs), view=execute_view,
+        golden="withdraw_execute", code="account_order")
     wrong_ata_ix = replace(execute_ixs[0], accounts=(
         execute_ixs[0].accounts[0], pay_chain.AccountMeta(WRONG_DESTINATION, False, True),
         *execute_ixs[0].accounts[2:]))
     add("wrong_ata", _compile([wrong_ata_ix, execute_ixs[1]]), view=execute_view,
-        code="account_order")
+        golden="withdraw_execute", code="account_order")
     wrong_mint = replace(execute_ixs[1], accounts=(
         *execute_ixs[1].accounts[:2], pay_chain.AccountMeta(WRONG_DESTINATION),
         *execute_ixs[1].accounts[3:]))
     add("wrong_mint", _compile([execute_ixs[0], wrong_mint]), view=execute_view,
-        code="account_order")
+        golden="withdraw_execute", code="account_order")
     transfer_wrong = _compile([pay_chain.system_transfer(WALLET, WRONG_DESTINATION, 1)])
-    add("transfer_wrong_destination", transfer_wrong, code="account_order")
+    add("transfer_wrong_destination", transfer_wrong, golden="self_top_up",
+        code="account_order")
+    transfer = pay_chain.system_transfer(WALLET, NODE, SELF_TOP_UP)
+    add("system_transfer_with_seed", _compile([replace(
+        transfer, data=struct.pack("<I", 11) + b"\0" * 84)]),
+        golden="self_top_up", code="unknown_instruction")
+    add("system_allocate", _compile([replace(
+        transfer, data=struct.pack("<IQ", 8, 1))]), golden="self_top_up",
+        code="unknown_instruction")
+    add("system_assign", _compile([replace(
+        transfer, data=struct.pack("<I", 1) + pay_chain.pubkey_bytes(PROGRAM))]),
+        golden="self_top_up", code="unknown_instruction")
     noncanonical = self_raw[:3] + bytes([self_raw[3] | 0x80, 0]) + self_raw[4:]
     add("noncanonical_shortvec", noncanonical, code="noncanonical_shortvec")
     add("trailing_byte", self_raw + b"\0", code="trailing_bytes")
@@ -258,15 +365,20 @@ def hostile_fixtures() -> list[dict[str, object]]:
     add("expiry_over_ceiling", over_expiry, code="expiry_ceiling")
     add("starter_remaining_over_ceiling", starter_raw,
         p=replace(policy, max_starter_micro_usdc=999_999),
-        code="starter_remaining_ceiling")
+        golden="starter_delegate", code="starter_remaining_ceiling")
     over_withdraw = _compile(pay_chain.escrow_withdraw_request(
         WALLET, 5_000_001, PROGRAM))
-    add("withdraw_over_ceiling", over_withdraw, code="withdraw_ceiling")
+    add("withdraw_over_ceiling", over_withdraw, golden="withdraw_request",
+        code="withdraw_ceiling")
     add("pending_execute_over_ceiling", execute_raw,
-        view=base_view(pending=(5_000_001, CHAIN_TIME - 1)), code="withdraw_ceiling")
+        view=base_view(pending=(5_000_001, CHAIN_TIME - 1)),
+        approved=approved_withdraw_requests(execute_view), golden="withdraw_execute",
+        code="withdraw_ceiling")
+    add("execute_without_provenance", execute_raw, view=execute_view,
+        approved=frozenset(), golden="withdraw_execute", code="withdraw_provenance")
     over_sol = _compile([pay_chain.system_transfer(
         WALLET, NODE, policy.max_self_sol_lamports + 1)])
-    add("sol_over_ceiling", over_sol, code="sol_ceiling")
+    add("sol_over_ceiling", over_sol, golden="self_top_up", code="sol_ceiling")
     add("network_fee_over_ceiling", view=replace(
         normal, network_fee_lamports=policy.max_network_fee_lamports + 1),
         code="fee_ceiling")
@@ -275,13 +387,24 @@ def hostile_fixtures() -> list[dict[str, object]]:
         code="rent_ceiling")
     add("ata_rent_over_ceiling", execute_raw, view=replace(
         execute_view, ata_rent_exempt_lamports=policy.max_ata_rent_lamports + 1),
-        code="rent_ceiling")
+        golden="withdraw_execute", code="rent_ceiling")
     add("programdata_address_mismatch", view=replace(
         normal, programdata_address=WRONG_DESTINATION), code="programdata")
     add("program_hash_mismatch", view=replace(
         normal, program_sha256="00" * 32), code="program_hash")
     add("upgrade_authority_mismatch", view=replace(
         normal, upgrade_authority=WRONG_DESTINATION), code="upgrade_authority")
+    add("hard_ceiling_widening", p=replace(
+        policy, max_delegate_micro_usdc=
+        wallet_policy.NAK_WALLET_MAX_DELEGATE_MICRO_USDC + 1), code="policy")
+    add("wrong_policy_mint", p=replace(policy, mint_id=WRONG_DESTINATION), code="mint")
+
+    self_transfer = pay_chain.system_transfer(WALLET, NODE, SELF_TOP_UP)
+    add("self_reversed_instruction_order", _compile([self_ix, self_transfer]),
+        golden="self_transfer_delegate", code="instruction_template")
+    starter_transfer = pay_chain.system_transfer(WALLET, STARTER, STARTER_TOP_UP)
+    add("starter_reversed_instruction_order", _compile([starter_transfer, starter_ix]),
+        golden="starter_top_up", code="instruction_template")
 
     # F1: a view claiming almost all of an over-ceiling cap was spent must not widen policy.
     f1_raw = _compile(pay_chain.delegate_set(
@@ -293,7 +416,7 @@ def hostile_fixtures() -> list[dict[str, object]]:
         starter_address, PROGRAM, 1_691_280,
         _delegate_data(STARTER, cap=1_000_001, spent=1_000_000))
     add("f1_spent_cap_minus_one", f1_raw, view=_replace_account(normal, f1_account),
-        code="starter_cap_ceiling")
+        golden="starter_existing_state", code="starter_cap_ceiling")
 
     delegate_address = pay_chain.delegate_pda(
         pay_chain.escrow_pda(WALLET, PROGRAM)[0], NODE, PROGRAM)[0]
@@ -308,16 +431,18 @@ def hostile_fixtures() -> list[dict[str, object]]:
     ata = pay_chain.associated_token_address(WALLET, MINT)[0]
     ata_bad = wallet_policy.AccountView(ata, pay_chain.SYSTEM_PROGRAM_ID, 1, b"x")
     add("dusted_ata_nonzero_data", execute_raw,
-        view=_replace_account(execute_view, ata_bad), code="ata_state")
+        view=_replace_account(execute_view, ata_bad), golden="withdraw_execute",
+        code="ata_state")
     ata_wrong = wallet_policy.AccountView(ata, PROGRAM, 0, b"")
     add("ata_wrong_owner", execute_raw, view=_replace_account(execute_view, ata_wrong),
-        code="ata_state")
+        golden="withdraw_execute", code="ata_state")
 
     # Starter state only tightens the byte-level ceiling.
     def starter_state(name: str, **kwargs: object) -> None:
         account = wallet_policy.AccountView(
             starter_address, PROGRAM, 1_691_280, _delegate_data(STARTER, **kwargs))
-        add(name, starter_raw, view=_replace_account(normal, account), code="delegate_state")
+        add(name, starter_raw, view=_replace_account(normal, account),
+            golden="starter_delegate", code="delegate_state")
 
     starter_state("starter_newer_generation", generation=8)
     starter_state("starter_same_generation_disabled", disabled=True)
@@ -325,11 +450,15 @@ def hostile_fixtures() -> list[dict[str, object]]:
     starter_state("starter_open_task", open_tasks=1)
 
     result = []
-    for name, raw, item_policy, view, code in cases:
+    for name, golden, raw, item_policy, view, approved, code in cases:
         result.append({
-            "name": name, "raw_message_hex": raw.hex(),
+            "name": name, "golden": golden, "raw_message_hex": raw.hex(),
             "policy": _serialize_policy(item_policy),
-            "cluster_view": _serialize_view(view), "expected_code": code,
+            "cluster_view": _serialize_view(view),
+            "approved_withdraw_requests": [asdict(item) for item in sorted(
+                approved, key=lambda item: (
+                    item.escrow_id, item.amount_micro_usdc, item.withdraw_at))],
+            "expected_code": code,
         })
     return result
 

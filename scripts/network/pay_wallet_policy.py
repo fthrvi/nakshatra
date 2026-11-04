@@ -20,6 +20,21 @@ DEVNET_GENESIS_HASH: Final = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG"
 NAKSHATRA_PAY_PROGRAM_ID: Final = "GLWqQsSqUsDkPvkc8rxcoQUyro7ZQd5denht21NtdTTo"
 DEVNET_USDC_MINT: Final = "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU"
 
+U64_MAX: Final = 2**64 - 1
+I64_MIN: Final = -(2**63)
+I64_MAX: Final = 2**63 - 1
+NAK_WALLET_MAX_DELEGATE_MICRO_USDC: Final = 5_000_000
+NAK_WALLET_MAX_DELEGATE_TTL_S: Final = 30 * 86400
+NAK_WALLET_MAX_STARTER_CAP_TOTAL_MICRO_USDC: Final = 1_000_000
+NAK_WALLET_MAX_STARTER_MICRO_USDC: Final = 1_000_000
+NAK_WALLET_MAX_STARTER_TTL_S: Final = 30 * 86400
+NAK_WALLET_MAX_WITHDRAW_MICRO_USDC: Final = 5_000_000
+NAK_WALLET_MAX_NETWORK_FEE_LAMPORTS: Final = 10_000
+NAK_WALLET_MAX_DELEGATE_RENT_LAMPORTS: Final = 1_700_000
+NAK_WALLET_MAX_ATA_RENT_LAMPORTS: Final = 2_040_000
+NAK_WALLET_MAX_SELF_SOL_LAMPORTS: Final = 30_000_000
+NAK_WALLET_MAX_STARTER_SOL_LAMPORTS: Final = 10_000_000
+
 DELEGATE_SET_DISCRIMINATOR: Final = bytes.fromhex("8b10e667fea614a5")
 WITHDRAW_REQUEST_DISCRIMINATOR: Final = bytes.fromhex("f6f379c6f277d27a")
 WITHDRAW_EXECUTE_DISCRIMINATOR: Final = bytes.fromhex("ac5dcf14503aa8f1")
@@ -48,7 +63,7 @@ REFUSAL_CODES: Final = frozenset({
     "signer_set", "sol_ceiling", "starter_cap_ceiling",
     "starter_remaining_ceiling", "trailing_bytes", "unknown_instruction",
     "unknown_program", "upgrade_authority", "versioned_message",
-    "withdraw_ceiling", "withdraw_state", "wrong_genesis",
+    "withdraw_ceiling", "withdraw_provenance", "withdraw_state", "wrong_genesis",
 })
 
 
@@ -72,17 +87,32 @@ class WalletPolicy:
     program_id: str = NAKSHATRA_PAY_PROGRAM_ID
     mint_id: str = DEVNET_USDC_MINT
     genesis_hash: str = DEVNET_GENESIS_HASH
-    max_delegate_micro_usdc: int = 5_000_000
-    max_delegate_ttl_s: int = 30 * 86400
-    max_starter_cap_total_micro_usdc: int = 1_000_000
-    max_starter_micro_usdc: int = 1_000_000
-    max_starter_ttl_s: int = 30 * 86400
-    max_withdraw_micro_usdc: int = 5_000_000
-    max_network_fee_lamports: int = 10_000
-    max_delegate_rent_lamports: int = 1_700_000
-    max_ata_rent_lamports: int = 2_040_000
-    max_self_sol_lamports: int = 30_000_000
-    max_starter_sol_lamports: int = 10_000_000
+    max_delegate_micro_usdc: int = NAK_WALLET_MAX_DELEGATE_MICRO_USDC
+    max_delegate_ttl_s: int = NAK_WALLET_MAX_DELEGATE_TTL_S
+    max_starter_cap_total_micro_usdc: int = NAK_WALLET_MAX_STARTER_CAP_TOTAL_MICRO_USDC
+    max_starter_micro_usdc: int = NAK_WALLET_MAX_STARTER_MICRO_USDC
+    max_starter_ttl_s: int = NAK_WALLET_MAX_STARTER_TTL_S
+    max_withdraw_micro_usdc: int = NAK_WALLET_MAX_WITHDRAW_MICRO_USDC
+    max_network_fee_lamports: int = NAK_WALLET_MAX_NETWORK_FEE_LAMPORTS
+    max_delegate_rent_lamports: int = NAK_WALLET_MAX_DELEGATE_RENT_LAMPORTS
+    max_ata_rent_lamports: int = NAK_WALLET_MAX_ATA_RENT_LAMPORTS
+    max_self_sol_lamports: int = NAK_WALLET_MAX_SELF_SOL_LAMPORTS
+    max_starter_sol_lamports: int = NAK_WALLET_MAX_STARTER_SOL_LAMPORTS
+
+
+@dataclass(frozen=True)
+class ApprovedWithdrawRequest:
+    """A broker-durable approval for the exact pending state on one escrow.
+
+    ``Escrow::pending_withdraw`` exposes no sequence, so the strongest identity
+    available on chain is ``(escrow_id, amount_micro_usdc, withdraw_at)``.
+    Wallet import must require no pending withdrawal: a request predating import
+    has no broker approval and execution is deliberately refused.
+    """
+
+    escrow_id: str
+    amount_micro_usdc: int
+    withdraw_at: int
 
 
 @dataclass(frozen=True)
@@ -395,7 +425,7 @@ def _account_map(view: ClusterView) -> dict[str, AccountView]:
         except (KeyError, TypeError, ValueError):
             _refuse("cluster_state")
         if (isinstance(account.lamports, bool) or not isinstance(account.lamports, int)
-                or account.lamports < 0):
+                or not 0 <= account.lamports <= U64_MAX):
             _refuse("cluster_state")
         if account.address in result:
             _refuse("cluster_state")
@@ -460,20 +490,32 @@ def _validate_policy(policy: WalletPolicy, view: ClusterView) -> dict[str, str]:
                 or any(char not in "0123456789abcdef" for char in policy.program_sha256)):
             raise ValueError("invalid hash")
         ceilings = (
-            policy.max_delegate_micro_usdc, policy.max_delegate_ttl_s,
-            policy.max_starter_cap_total_micro_usdc, policy.max_starter_micro_usdc,
-            policy.max_starter_ttl_s, policy.max_withdraw_micro_usdc,
-            policy.max_network_fee_lamports, policy.max_delegate_rent_lamports,
-            policy.max_ata_rent_lamports, policy.max_self_sol_lamports,
-            policy.max_starter_sol_lamports,
+            (policy.max_delegate_micro_usdc, NAK_WALLET_MAX_DELEGATE_MICRO_USDC),
+            (policy.max_delegate_ttl_s, NAK_WALLET_MAX_DELEGATE_TTL_S),
+            (policy.max_starter_cap_total_micro_usdc,
+             NAK_WALLET_MAX_STARTER_CAP_TOTAL_MICRO_USDC),
+            (policy.max_starter_micro_usdc, NAK_WALLET_MAX_STARTER_MICRO_USDC),
+            (policy.max_starter_ttl_s, NAK_WALLET_MAX_STARTER_TTL_S),
+            (policy.max_withdraw_micro_usdc, NAK_WALLET_MAX_WITHDRAW_MICRO_USDC),
+            (policy.max_network_fee_lamports, NAK_WALLET_MAX_NETWORK_FEE_LAMPORTS),
+            (policy.max_delegate_rent_lamports, NAK_WALLET_MAX_DELEGATE_RENT_LAMPORTS),
+            (policy.max_ata_rent_lamports, NAK_WALLET_MAX_ATA_RENT_LAMPORTS),
+            (policy.max_self_sol_lamports, NAK_WALLET_MAX_SELF_SOL_LAMPORTS),
+            (policy.max_starter_sol_lamports, NAK_WALLET_MAX_STARTER_SOL_LAMPORTS),
         )
-        if any(isinstance(value, bool) or not isinstance(value, int) or value <= 0
-               for value in ceilings):
+        if any(isinstance(value, bool) or not isinstance(value, int)
+               or value <= 0 or value > hard_max or value > U64_MAX
+               for value, hard_max in ceilings):
             raise ValueError("invalid ceiling")
-        derived = _derive(policy)
     except (KeyError, TypeError, ValueError):
         _refuse("policy")
     if policy.program_id != NAKSHATRA_PAY_PROGRAM_ID:
+        _refuse("policy")
+    if policy.mint_id != DEVNET_USDC_MINT:
+        _refuse("mint")
+    try:
+        derived = _derive(policy)
+    except (KeyError, TypeError, ValueError):
         _refuse("policy")
     if policy.genesis_hash != DEVNET_GENESIS_HASH or view.genesis_hash != policy.genesis_hash:
         _refuse("wrong_genesis")
@@ -488,10 +530,13 @@ def _validate_policy(policy: WalletPolicy, view: ClusterView) -> dict[str, str]:
         _refuse("program_hash")
     if view.upgrade_authority != policy.upgrade_authority:
         _refuse("upgrade_authority")
-    for value in (view.chain_time, view.network_fee_lamports,
-                  view.delegate_rent_exempt_lamports,
+    if (isinstance(view.chain_time, bool) or not isinstance(view.chain_time, int)
+            or not I64_MIN <= view.chain_time <= I64_MAX):
+        _refuse("cluster_state")
+    for value in (view.network_fee_lamports, view.delegate_rent_exempt_lamports,
                   view.ata_rent_exempt_lamports, view.withdraw_delay_seconds):
-        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        if (isinstance(value, bool) or not isinstance(value, int)
+                or not 0 <= value <= U64_MAX):
             _refuse("cluster_state")
     if view.network_fee_lamports > policy.max_network_fee_lamports:
         _refuse("fee_ceiling")
@@ -522,7 +567,7 @@ def _creation_state(address: str, expected_owner: str, size: int, rent_minimum: 
     account = accounts.get(address)
     state = None
     if account is None:
-        shortfall = rent_minimum
+        pass
     elif account.owner == expected_owner:
         if kind == "delegate":
             state = _decode_delegate(account.data)
@@ -531,18 +576,21 @@ def _creation_state(address: str, expected_owner: str, size: int, rent_minimum: 
             if (len(raw) != size or raw[108] not in (1, 2)):
                 _refuse("ata_state")
             state = {"mint": _b58encode(raw[:32]), "owner": _b58encode(raw[32:64])}
-        shortfall = 0
     elif account.owner == SYSTEM_PROGRAM_ID and account.data == b"":
-        shortfall = max(0, rent_minimum - account.lamports)
+        pass
     else:
         _refuse("delegate_state" if kind == "delegate" else "ata_state")
     if account is not None and (isinstance(account.lamports, bool)
                                 or not isinstance(account.lamports, int)
                                 or account.lamports < 0):
         _refuse("cluster_state")
-    if shortfall > rent_ceiling:
+    # Both accepted instructions can create the account.  Existing state and
+    # PDA dust can disappear before the signed message lands, so approval must
+    # disclose and bound the full rent-exempt minimum, never today's shortfall.
+    worst_case_rent = rent_minimum
+    if worst_case_rent > rent_ceiling:
         _refuse("rent_ceiling")
-    return shortfall, state
+    return worst_case_rent, state
 
 
 def _expected_instructions(message: _Message, policy: WalletPolicy,
@@ -582,14 +630,6 @@ def _expected_instructions(message: _Message, policy: WalletPolicy,
             _refuse("unknown_program")
 
     names = tuple(item[0] for item in decoded)
-    allowed = {
-        ("delegate_set",), ("system_transfer", "delegate_set"),
-        ("system_transfer",), ("delegate_set", "system_transfer"),
-        ("withdraw_request",), ("ata_create_idempotent", "withdraw_execute"),
-    }
-    if names not in allowed:
-        _refuse("instruction_template")
-
     delegate_item = next((item for item in decoded if item[0] == "delegate_set"), None)
     key = str(delegate_item[1]["delegate_key"]) if delegate_item else ""
     if names == ("withdraw_request",):
@@ -600,6 +640,20 @@ def _expected_instructions(message: _Message, policy: WalletPolicy,
         operation = "self_delegate" if key == policy.node_id else "starter_grant"
     else:
         operation = "self_top_up"
+
+    allowed_by_operation = {
+        "self_delegate": {
+            ("delegate_set",), ("system_transfer", "delegate_set"),
+        },
+        "starter_grant": {
+            ("delegate_set",), ("delegate_set", "system_transfer"),
+        },
+        "self_top_up": {("system_transfer",)},
+        "withdraw_request": {("withdraw_request",)},
+        "withdraw_execute": {("ata_create_idempotent", "withdraw_execute")},
+    }
+    if names not in allowed_by_operation[operation]:
+        _refuse("instruction_template")
 
     if operation == "self_top_up":
         destination = policy.node_id
@@ -696,13 +750,18 @@ def _sol(value: int) -> str:
     return f"{value // 1_000_000_000}.{value % 1_000_000_000:09d}"
 
 
-def decode_and_check(raw_message: bytes, policy: WalletPolicy,
-                     cluster_view: ClusterView) -> ApprovalPlan:
+def decode_and_check(
+        raw_message: bytes, policy: WalletPolicy, cluster_view: ClusterView,
+        approved_withdraw_requests: frozenset[ApprovedWithdrawRequest] = frozenset(),
+) -> ApprovalPlan:
     """Decode one exact legacy message and return its immutable approval plan.
 
     All expected policy failures raise :class:`PolicyRefusal` with a code from
     :data:`REFUSAL_CODES`.  The returned ``raw_message`` is the original bytes,
-    never a reconstruction.
+    never a reconstruction.  Withdraw execution additionally requires an exact
+    match in ``approved_withdraw_requests``, supplied from the broker's durable
+    store.  Wallet import must require no pending withdrawal; an older pending
+    request cannot acquire provenance merely by appearing in an RPC view.
     """
     if not isinstance(policy, WalletPolicy) or not isinstance(cluster_view, ClusterView):
         _refuse("policy")
@@ -784,7 +843,7 @@ def decode_and_check(raw_message: bytes, policy: WalletPolicy,
             PlanField("delegate", delegate), PlanField("delegate_key", key),
             PlanField("cap_total_micro_usdc", cap),
             PlanField("cap_total_usdc", _money(cap)), PlanField("expires_at", expiry),
-            PlanField("flags", flags), PlanField("delegate_rent_shortfall_lamports", rent),
+            PlanField("flags", flags), PlanField("delegate_rent_worst_case_lamports", rent),
             PlanField("delegate_rent_ceiling_lamports", policy.max_delegate_rent_lamports),
         ))
         if not is_self:
@@ -829,6 +888,26 @@ def decode_and_check(raw_message: bytes, policy: WalletPolicy,
         amount, withdraw_at = pending
         if int(amount) > policy.max_withdraw_micro_usdc:
             _refuse("withdraw_ceiling")
+        if not isinstance(approved_withdraw_requests, frozenset):
+            _refuse("withdraw_provenance")
+        for approved in approved_withdraw_requests:
+            if not isinstance(approved, ApprovedWithdrawRequest):
+                _refuse("withdraw_provenance")
+            try:
+                _pubkey(approved.escrow_id)
+            except (KeyError, TypeError, ValueError):
+                _refuse("withdraw_provenance")
+            if (isinstance(approved.amount_micro_usdc, bool)
+                    or not isinstance(approved.amount_micro_usdc, int)
+                    or not 0 <= approved.amount_micro_usdc <= U64_MAX
+                    or isinstance(approved.withdraw_at, bool)
+                    or not isinstance(approved.withdraw_at, int)
+                    or not I64_MIN <= approved.withdraw_at <= I64_MAX):
+                _refuse("withdraw_provenance")
+        approved_pending = ApprovedWithdrawRequest(
+            derived["escrow"], int(amount), int(withdraw_at))
+        if approved_pending not in approved_withdraw_requests:
+            _refuse("withdraw_provenance")
         if cluster_view.chain_time < int(withdraw_at):
             _refuse("withdraw_state")
         rent, state = _creation_state(
@@ -844,7 +923,7 @@ def decode_and_check(raw_message: bytes, policy: WalletPolicy,
                        PlanField("pending_amount_micro_usdc", int(amount)),
                        PlanField("pending_amount_usdc", _money(int(amount))),
                        PlanField("withdraw_at", int(withdraw_at)),
-                       PlanField("ata_rent_shortfall_lamports", rent),
+                       PlanField("ata_rent_worst_case_lamports", rent),
                        PlanField("ata_rent_ceiling_lamports", policy.max_ata_rent_lamports)))
 
     plan_instructions = tuple(PlanInstruction(

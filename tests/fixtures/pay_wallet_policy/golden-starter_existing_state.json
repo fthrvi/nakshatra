@@ -1,0 +1,185 @@
+{
+  "approved_withdraw_requests": [],
+  "cluster_view": {
+    "accounts": [
+      {
+        "address": "F7NB38wC4KNaUjP3frSeSWvpfc5jirvjukTgqW969a1x",
+        "data_hex": "1fd57bbbba16da9b66be7e332c7a453332bd9d0a7f7db055f5c5ef1a06ada66d98b39fb6810c473acc443d2224b0747df9128abe0cb84ce79c17846026f8e50572422f50f90f6e5d000000000000000000000000000000000300000000000000040000000000000007000000000000000066be7e332c7a453332bd9d0a7f7db055f5c5ef1a06ada66d98b39fb6810c473afffe00000000000000000000000000000000",
+        "lamports": 1691280,
+        "owner": "GLWqQsSqUsDkPvkc8rxcoQUyro7ZQd5denht21NtdTTo"
+      },
+      {
+        "address": "CVZ71ewD6r5QXMhKqTMEpAwSNf7AGWsxaRpBWV1FCp7T",
+        "data_hex": "5c91a66f0b2626f7d1a50ad1f524dbe37bf3a24a88a9e5d4bf3f24e0fbebbcaa0126732a0f0df5ab91a28a0b74381593a4d9469579208926afc8ad82c8839b7644359b9eba9a4b3a070000000000000041420f000000000040420f0000000000e89735770000000001000000000000000000ff",
+        "lamports": 1691280,
+        "owner": "GLWqQsSqUsDkPvkc8rxcoQUyro7ZQd5denht21NtdTTo"
+      }
+    ],
+    "ata_rent_exempt_lamports": 2039280,
+    "chain_time": 2000000000,
+    "delegate_rent_exempt_lamports": 1691280,
+    "genesis_hash": "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG",
+    "network_fee_lamports": 5000,
+    "program_executable": true,
+    "program_owner": "BPFLoaderUpgradeab1e11111111111111111111111",
+    "program_sha256": "8ee0882be85b67e509bfa38681ab93652f9e1acb52987be23f723caa4c560f67",
+    "programdata_address": "97gxB89oiTezhWHdyhovCei33k9Bkn9ZqppamVKenF1d",
+    "programdata_owner": "BPFLoaderUpgradeab1e11111111111111111111111",
+    "upgrade_authority": "oapfTk8FG2np1vSoGANkbijWiQApHZMFAytSdCoass9",
+    "valid_recent_blockhashes": [
+      "3ARMH9zfVCnU2TKiphU4xcEyWdA45fc1sjKEtYMdf3gr"
+    ],
+    "withdraw_delay_seconds": 86400
+  },
+  "expected_plan": {
+    "instructions": [
+      {
+        "accounts": [
+          {
+            "pubkey": "7v54NWdBtkjuAFJrLGsS2SXnuk8nKam81mZJeeYxVFi9",
+            "signer": true,
+            "writable": true
+          },
+          {
+            "pubkey": "8Q1BNKohnutkCsWhPSKVydM5LBNbzVom8Zss5hNsa7r8",
+            "signer": false,
+            "writable": false
+          },
+          {
+            "pubkey": "F7NB38wC4KNaUjP3frSeSWvpfc5jirvjukTgqW969a1x",
+            "signer": false,
+            "writable": false
+          },
+          {
+            "pubkey": "CVZ71ewD6r5QXMhKqTMEpAwSNf7AGWsxaRpBWV1FCp7T",
+            "signer": false,
+            "writable": true
+          },
+          {
+            "pubkey": "11111111111111111111111111111111",
+            "signer": false,
+            "writable": false
+          },
+          {
+            "pubkey": "H1orCw5goBsLUNn5JxPvQWgZvP7jNbx6pgxVWRFLKWXP",
+            "signer": false,
+            "writable": false
+          },
+          {
+            "pubkey": "GLWqQsSqUsDkPvkc8rxcoQUyro7ZQd5denht21NtdTTo",
+            "signer": false,
+            "writable": false
+          }
+        ],
+        "data_hex": "8b10e667fea614a591a28a0b74381593a4d9469579208926afc8ad82c8839b7644359b9eba9a4b3a40420f000000000000215d770000000001",
+        "name": "delegate_set",
+        "program_id": "GLWqQsSqUsDkPvkc8rxcoQUyro7ZQd5denht21NtdTTo"
+      }
+    ],
+    "message_sha256": "338773a7ddb8ae0b0f2ade452e4dcbb82d1ac68b5f94fb13d7b973f02e37121b",
+    "operation": "starter_grant",
+    "recent_blockhash": "3ARMH9zfVCnU2TKiphU4xcEyWdA45fc1sjKEtYMdf3gr",
+    "rendered_fields": [
+      {
+        "name": "wallet",
+        "value": "7v54NWdBtkjuAFJrLGsS2SXnuk8nKam81mZJeeYxVFi9"
+      },
+      {
+        "name": "node",
+        "value": "mBKqcnGotbsSb5vNrdyhzZ5EhqZdids9QYiTRckvi7v"
+      },
+      {
+        "name": "escrow",
+        "value": "F7NB38wC4KNaUjP3frSeSWvpfc5jirvjukTgqW969a1x"
+      },
+      {
+        "name": "network_fee_lamports",
+        "value": 5000
+      },
+      {
+        "name": "network_fee_sol",
+        "value": "0.000005000"
+      },
+      {
+        "name": "network_fee_ceiling_lamports",
+        "value": 10000
+      },
+      {
+        "name": "delegate",
+        "value": "CVZ71ewD6r5QXMhKqTMEpAwSNf7AGWsxaRpBWV1FCp7T"
+      },
+      {
+        "name": "delegate_key",
+        "value": "AoVsGaj8MSJ6xwKxfFxo9iZWH3enC8RRTXKH2fx2F8os"
+      },
+      {
+        "name": "cap_total_micro_usdc",
+        "value": 1000000
+      },
+      {
+        "name": "cap_total_usdc",
+        "value": "1.000000"
+      },
+      {
+        "name": "expires_at",
+        "value": 2002592000
+      },
+      {
+        "name": "flags",
+        "value": 1
+      },
+      {
+        "name": "delegate_rent_worst_case_lamports",
+        "value": 1691280
+      },
+      {
+        "name": "delegate_rent_ceiling_lamports",
+        "value": 1700000
+      },
+      {
+        "name": "pre_cap_total_micro_usdc",
+        "value": 1000001
+      },
+      {
+        "name": "pre_spent_micro_usdc",
+        "value": 1000000
+      },
+      {
+        "name": "resulting_remaining_micro_usdc",
+        "value": 0
+      },
+      {
+        "name": "starter_cap_total_ceiling_micro_usdc",
+        "value": 1000000
+      },
+      {
+        "name": "starter_remaining_ceiling_micro_usdc",
+        "value": 1000000
+      }
+    ],
+    "wallet_id": "7v54NWdBtkjuAFJrLGsS2SXnuk8nKam81mZJeeYxVFi9"
+  },
+  "name": "starter_existing_state",
+  "policy": {
+    "genesis_hash": "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG",
+    "max_ata_rent_lamports": 2040000,
+    "max_delegate_micro_usdc": 5000000,
+    "max_delegate_rent_lamports": 1700000,
+    "max_delegate_ttl_s": 2592000,
+    "max_network_fee_lamports": 10000,
+    "max_self_sol_lamports": 30000000,
+    "max_starter_cap_total_micro_usdc": 1000000,
+    "max_starter_micro_usdc": 1000000,
+    "max_starter_sol_lamports": 10000000,
+    "max_starter_ttl_s": 2592000,
+    "max_withdraw_micro_usdc": 5000000,
+    "mint_id": "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU",
+    "node_id": "mBKqcnGotbsSb5vNrdyhzZ5EhqZdids9QYiTRckvi7v",
+    "program_id": "GLWqQsSqUsDkPvkc8rxcoQUyro7ZQd5denht21NtdTTo",
+    "program_sha256": "8ee0882be85b67e509bfa38681ab93652f9e1acb52987be23f723caa4c560f67",
+    "programdata_address": "97gxB89oiTezhWHdyhovCei33k9Bkn9ZqppamVKenF1d",
+    "upgrade_authority": "oapfTk8FG2np1vSoGANkbijWiQApHZMFAytSdCoass9",
+    "wallet_id": "7v54NWdBtkjuAFJrLGsS2SXnuk8nKam81mZJeeYxVFi9"
+  },
+  "raw_message_hex": "0100050766be7e332c7a453332bd9d0a7f7db055f5c5ef1a06ada66d98b39fb6810c473aaac11e5931dd57349a5103fc265a3f1c4bcb073f98a35155fbc180beac1dc92a00000000000000000000000000000000000000000000000000000000000000006de65e84849946992944cc92148a1e8c8540640f4e12798531d61288249d4e61d1a50ad1f524dbe37bf3a24a88a9e5d4bf3f24e0fbebbcaa0126732a0f0df5abe3df12cd9ef9cb21d51e0c7e1906505119897b65a196a9d66a733964d4a0132aedeff662fa1089d084bea4fb58cc5aa74b1b251d7a5f741183944ed338499e36202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f01050700030401020605398b10e667fea614a591a28a0b74381593a4d9469579208926afc8ad82c8839b7644359b9eba9a4b3a40420f000000000000215d770000000001"
+}
