@@ -1,6 +1,6 @@
 # Broker-held Solana pay wallet (M4c part 2c)
 
-Status: design for unification-lane review. Devnet only.
+Status: unification-lane reviewed; send to build for rollout step 3 only. Devnet only.
 
 This note replaces the earlier idea that `custody=broker` merely gated a key that stayed on the
 node. The wallet key moves into the existing approval broker as a third Ed25519 principal. There is
@@ -33,7 +33,7 @@ node key id already known at install time. Its broker-owned wallet record pins:
 - the principal and node public key;
 - `wallet_id`, equal to the base58 wallet public key in `wallet.pub`;
 - the wallet Ed25519 public key;
-- the devnet genesis hash, deployed `nakshatra_pay` program id, its upgradeable-loader ProgramData
+- the devnet genesis hash, configured `nakshatra_pay` program id, its upgradeable-loader ProgramData
   address, reviewed program-byte SHA-256, expected multisig upgrade-authority address, the classic SPL
   mint, and all ceiling values from the root-owned broker environment.
 
@@ -46,19 +46,25 @@ person-key import, which prepares one principal addition before touching authori
 rollback record (`/home/prithvi/trisul@forgejo/main:infra/pillar-agent/deploy/prithvi-broker/install.sh:1352-1405`).
 The wallet import does the following:
 
-1. Refuse unless the staged package digest, broker pre-state, source ownership/mode, `wallet.pub`,
+1. Inventory `wallet.ed25519` copies by SHA-256 only (never file content) across the known Syncthing
+   roots, `backup-sources.tsv` targets, memory-sync roots, and git history, and report the count to
+   Biswa in his install step.
+2. Refuse unless the staged package digest, broker pre-state, source ownership/mode, `wallet.pub`,
    `custody=file`, node id, and broker policy are all valid. Derive the public key inside the trusted
    import helper and require a byte-for-byte match with `wallet.pub`; never print seed bytes.
-2. Refuse a different pre-existing broker wallet key or registry row. An identical already-imported
+3. Refuse a different pre-existing broker wallet key or registry row. An identical already-imported
    key is an idempotent resume, not a rotation.
-3. Copy the existing raw 32-byte `wallet.ed25519` into broker-owned key storage, install the
+4. Copy the existing raw 32-byte `wallet.ed25519` into broker-owned key storage, install the
    `nakshatra-wallet:<node>` principal credential and wallet policy, and self-test a fixed harmless
    message entirely inside the sealed import transaction.
-4. Start the candidate broker and verify the public key, principal, decoder, and rollback path before
+5. Start the candidate broker and verify the public key, principal, decoder, and rollback path before
    retiring the source. No live Solana transaction is signed or sent during import.
-5. Only after verification, atomically replace the custody marker with `broker`, remove the node
-   user's seed file, and verify it is no longer readable through every installer-declared source.
-   A failure before that boundary restores `custody=file` and the original source. A failure after it
+6. Only after broker verification, atomically replace the custody marker with `broker`, move the node
+   user's seed to a root-owned retired path, set it to mode `000`, and verify it is no longer readable
+   through any installer-declared active source. Do not delete it. This follows the existing
+   broker-key retirement pattern
+   (`/home/prithvi/trisul@forgejo/main:infra/pillar-agent/deploy/prithvi-broker/README.md:292-305`). A
+   failure before that boundary restores `custody=file` and the original source. A failure after it
    leaves the broker stopped or restores the complete old state; it never leaves two active copies.
 
 After success, the wallet key material visible to the node is exactly `wallet.pub` plus
@@ -101,6 +107,11 @@ broker requires the field and returns the existing request only when the same pr
 same request fingerprint
 (`/home/prithvi/trisul@forgejo/main:infra/pillar-agent/pillar_signer_broker.py:1167-1174,1228-1261`).
 Thus a lost enqueue response is recovered without creating a second approval.
+
+The broker permits at most one outstanding wallet approval per principal. It refuses a second
+enqueue while the first is pending, approved but unconsumed, or linked to an unreconciled signed
+attempt, and rate-limits enqueue attempts per principal. Idempotent recovery with the same key and
+fingerprint returns the existing request and does not count as a second approval.
 
 `review.description` is a fixed label and is never displayed as transaction meaning. The approval
 screen is rendered from the decoded `exact_content.message_b64` and server-side wallet policy only.
@@ -157,7 +168,7 @@ signer is refused.
 
 ### 4.2 Pinned program and exact allowlist
 
-The deployed program id is `GLWqQsSqUsDkPvkc8rxcoQUyro7ZQd5denht21NtdTTo`
+The configured program id is `GLWqQsSqUsDkPvkc8rxcoQUyro7ZQd5denht21NtdTTo`
 (`/home/prithvi/neuron/programs/nakshatra_pay/programs/nakshatra_pay/src/lib.rs:13`). Anchor instruction
 data is discriminator plus the exact arguments; the program itself refuses trailing argument bytes
 (`/home/prithvi/neuron/programs/nakshatra_pay/programs/nakshatra_pay/src/lib.rs:18-85`). All integer
@@ -165,8 +176,8 @@ fields below are little-endian.
 
 | Allowed instruction | Exact data | Required ordered accounts and signers | Approval fields | Ceiling |
 |---|---|---|---|---|
-| `nakshatra_pay.delegate_set` (self ensure) | `8b10e667fea614a5` + delegate key (32) + `cap_total:u64` + `expires_at:i64` + `flags:u8` | wallet **signer,writable**; canonical config; canonical wallet escrow; canonical delegate PDA **writable**; System Program; canonical event authority; program id | wallet, own node delegate, cap in micro-USDC and USDC, expiry, flags, escrow, actual delegate rent shortfall, optional SOL top-up, message digest | `NAK_WALLET_MAX_DELEGATE_MICRO_USDC`; expiry horizon `NAK_WALLET_MAX_DELEGATE_TTL_S`; rent and optional transfer ceilings below |
-| `nakshatra_pay.delegate_set` (starter grant) | same discriminator/layout; `flags` must equal `OPEN_CHANNEL=1` | same account layout; delegate PDA must be derived from escrow and the decoded recipient node key | inviter wallet, recipient node, pre-state spent/cap, resulting remaining capacity and total cap, expiry, actual delegate rent shortfall, optional SOL top-up, escrow, digest | resulting remaining capacity `NAK_WALLET_MAX_STARTER_MICRO_USDC`; expiry horizon `NAK_WALLET_MAX_STARTER_TTL_S`; rent and transfer ceilings below |
+| `nakshatra_pay.delegate_set` (self ensure) | `8b10e667fea614a5` + delegate key (32) + `cap_total:u64` + `expires_at:i64` + `flags:u8` | wallet **signer,writable**; canonical config; canonical wallet escrow; canonical delegate PDA **writable**; System Program; canonical event authority; program id | wallet, own node delegate, cap in micro-USDC and USDC, expiry, flags, escrow, actual delegate rent shortfall, optional SOL top-up, message digest | absolute encoded `cap_total` `NAK_WALLET_MAX_DELEGATE_MICRO_USDC`; expiry horizon `NAK_WALLET_MAX_DELEGATE_TTL_S`; rent and optional transfer ceilings below |
+| `nakshatra_pay.delegate_set` (starter grant) | same discriminator/layout; `flags` must equal `OPEN_CHANNEL=1` | same account layout; delegate PDA must be derived from escrow and the decoded recipient node key | inviter wallet, recipient node, pre-state spent/cap, resulting remaining capacity and total cap, expiry, actual delegate rent shortfall, optional SOL top-up, escrow, digest | absolute encoded `cap_total` `NAK_WALLET_MAX_STARTER_CAP_TOTAL_MICRO_USDC`; resulting remaining capacity `NAK_WALLET_MAX_STARTER_MICRO_USDC`; expiry horizon `NAK_WALLET_MAX_STARTER_TTL_S`; rent and transfer ceilings below |
 | `nakshatra_pay.escrow_withdraw_request` | `f6f379c6f277d27a` + `amount:u64` | wallet **signer**; canonical config; canonical wallet escrow **writable**; canonical vault; event authority; program id | wallet, amount in micro-USDC and USDC, escrow, vault, earliest execute time from trusted chain state, digest | `NAK_WALLET_MAX_WITHDRAW_MICRO_USDC` |
 | `nakshatra_pay.escrow_withdraw_execute` | `ac5dcf14503aa8f1` only | wallet **signer**; canonical config; pinned mint; canonical escrow, vault and wallet ATA **writable**; classic Token Program; event authority; program id | wallet, pending amount and unlock time from trusted devnet state, escrow, vault, destination ATA, digest | pending amount must be at or below `NAK_WALLET_MAX_WITHDRAW_MICRO_USDC` |
 | System Program transfer | program `11111111111111111111111111111111`; data `2:u32` + `lamports:u64` | wallet **signer,writable**; decoded delegate node **writable** | destination node, lamports and SOL, whether self top-up or starter top-up | `NAK_WALLET_MAX_SELF_SOL_LAMPORTS` or `NAK_WALLET_MAX_STARTER_SOL_LAMPORTS` |
@@ -211,7 +222,9 @@ delegate key. The current starter builder uses exactly that order
 principal's own node followed by a self-form `delegate_set`; a transfer alone is allowed when the
 delegate needs no renewal. Current ensure can create the escrow too
 (`scripts/network/nak.py:1036-1102`), but `escrow_init` is intentionally not in this allowlist; import
-therefore requires the escrow to exist until question 1 below is resolved.
+requires the escrow to exist. `escrow_init`, deposit, revoke, escrow close, and legacy
+wallet-authority channel close remain outside the allowlist and fail closed; this review does not
+widen it.
 
 Withdraw request is exactly one instruction. Withdraw execute is exactly ATA create-idempotent then
 execute, matching the current builder (`scripts/network/pay_chain.py:266-276`). No current payment
@@ -221,10 +234,31 @@ is refused in this revision. If a builder later emits it, its exact opcode, byte
 unit-price ceiling, position, and multiplicity must be reviewed and added before deployment.
 
 Root-owned `broker.env` must provide every ceiling explicitly; zero or missing values prevent the
-wallet principal from loading. The renderer shows each decoded or quoted debit and its ceiling. A
-withdrawal execute's pending amount and all starter pre-state are state-derived, so the outer
-validator reads the canonical accounts from the trusted devnet view before showing and again before
-signing. Caller claims are never used.
+wallet principal from loading. These are the reviewed devnet defaults; Biswa may tighten them at
+install but may not raise them without another review.
+
+| `broker.env` ceiling | Reviewed devnet default |
+|---|---:|
+| `NAK_WALLET_MAX_DELEGATE_MICRO_USDC` | `5_000_000` micro-USDC absolute `cap_total` |
+| `NAK_WALLET_MAX_DELEGATE_TTL_S` | `2_592_000` (30 days) |
+| `NAK_WALLET_MAX_STARTER_CAP_TOTAL_MICRO_USDC` | `1_000_000` micro-USDC absolute `cap_total` |
+| `NAK_WALLET_MAX_STARTER_MICRO_USDC` | `1_000_000` micro-USDC resulting remaining capacity |
+| `NAK_WALLET_MAX_STARTER_TTL_S` | `2_592_000` (30 days) |
+| `NAK_WALLET_MAX_WITHDRAW_MICRO_USDC` | `5_000_000` micro-USDC |
+| `NAK_WALLET_MAX_NETWORK_FEE_LAMPORTS` | `10_000` lamports |
+| `NAK_WALLET_MAX_DELEGATE_RENT_LAMPORTS` | `1_700_000` lamports (115-byte minimum currently `1_691_280`) |
+| `NAK_WALLET_MAX_ATA_RENT_LAMPORTS` | `2_040_000` lamports (165-byte minimum currently `2_039_280`) |
+| `NAK_WALLET_MAX_SELF_SOL_LAMPORTS` | `30_000_000` lamports |
+| `NAK_WALLET_MAX_STARTER_SOL_LAMPORTS` | `10_000_000` lamports |
+
+The renderer shows each decoded or quoted debit and its ceiling. Every ceiling for an amount encoded
+in the message is enforced from those bytes alone: self and starter `cap_total`, withdrawal-request
+amount, and SOL transfers cannot be made acceptable by RPC state. RPC-derived state may only tighten
+a decision, never loosen it. A withdrawal execute carries no amount, so its displayed pending amount
+is necessarily state-derived; it is acceptable only because the originating withdrawal request was
+absolutely ceiling-checked from its message bytes. The execute independently refuses if the current
+pending amount exceeds the same ceiling. All starter pre-state is likewise read from the trusted
+devnet view before showing and again before signing. Caller claims are never used.
 
 For a starter update, an existing delegate must have `open_channels == 0` and `open_tasks == 0`.
 Its generation must equal the escrow generation or be strictly older, never newer; a same-generation
@@ -238,8 +272,19 @@ prevents a later channel-finalize refund from lowering `spent` and expanding aut
 approved remaining-capacity bound. These are the current starter construction predicates
 (`scripts/network/nakd.py:1362-1418`); channel finalize does reduce `spent`
 (`/home/prithvi/neuron/programs/nakshatra_pay/programs/nakshatra_pay/src/instructions.rs:1166-1173`).
+Independently, the encoded `cap_total` must always be at or below
+`NAK_WALLET_MAX_STARTER_CAP_TOTAL_MICRO_USDC`; a lying RPC value such as
+`spent = cap_total - 1` therefore cannot widen authority. Self `delegate_set` similarly applies
+`NAK_WALLET_MAX_DELEGATE_MICRO_USDC` to the encoded absolute `cap_total`, not merely an increase.
 
 ### 4.3 Cluster binding and refusals
+
+A read-only lead check on 2026-11-04 found no account for
+`GLWqQsSqUsDkPvkc8rxcoQUyro7ZQd5denht21NtdTTo` on devnet: the program is not deployed, so it has no
+current ProgramData or upgrade authority to report. Deployment under the required 48-hour
+time-locked multisig, including the exact authority address, remains Biswa's decision and is a
+prerequisite for rollout step 4 and the M6 live drill
+(`docs/design/2026-10-26-noncustodial-payments.md:307`).
 
 A legacy Solana message contains a recent blockhash but no genesis hash. To keep the wire request to
 raw message plus wallet id without trusting caller metadata, the broker uses its root-owned devnet
@@ -259,6 +304,13 @@ RPC calls. The only accepted genesis is devnet
 `EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG`. Current client code already refuses mainnet and
 accepts only devnet or a loopback test validator (`scripts/network/pay_voucher.py:76-77,433-450`);
 the production broker is stricter and never accepts the loopback exception.
+
+The broker may use a separately configured TLS devnet RPC only with the genesis, ProgramData
+address, deployed code hash, and upgrade authority pinned in root-owned `broker.env`. RPC responses
+have strict byte-size and deadline limits. The network-facing component fetches the bounded state,
+closes the connection, and only then hands immutable bytes to the decoder; the key-holding signing
+path has no live RPC client. RPC failures log only closed error codes, never response bodies or
+unbounded remote text.
 
 An authorized upgrade can still occur after the final broker read while a signed transaction remains
 valid. That residual window is only the recent-blockhash lifetime, approximately 60--90 seconds,
@@ -282,7 +334,8 @@ Refuse before approval and again before signing on any of the following:
 - delegate flags, expiry, cap, starter resulting remaining capacity, withdrawal amount, pending
   execute amount, SOL transfer, network fee, delegate rent, or ATA rent above its broker-environment
   ceiling;
-- missing, malformed, stale, wrong-owner, wrong-generation, or internally inconsistent devnet state;
+- missing, malformed, stale, wrong-owner, wrong-generation, internally inconsistent, oversized, or
+  late devnet state;
 - a caller-supplied description or decoded field, approval TTL outside the fixed bound, digest
   mismatch, consumed request, expired approval, or custody/principal change during the act.
 
@@ -392,18 +445,21 @@ expiry, starter remaining capacity, withdrawal, pending execute, SOL amount, net
 rent shortfall, ProgramData address/hash, and upgrade authority. Rent cases cover absent, initialized,
 and system-owned zero-data accounts with zero, partial, exact, and over-ceiling prefunding; other
 owners or nonzero data refuse. Starter cases cover both generations, disabled state, and nonzero open
-channels/tasks. Include duplicate-signature replay:
-the first approved request signs once; a second sign call for that request is refused, and the same
-message under a new request still needs a new approval.
+channels/tasks, plus a hostile RPC view reporting `spent = cap_total - 1` while encoded `cap_total`
+exceeds the absolute ceiling. Include duplicate-signature replay: the first approved request signs
+once; a second sign call for that request is refused, and the same message under a new request still
+needs a new approval.
 
 Client tests use a local fake transport, never the real endpoint. They cover wrong principal,
 stable-key recovery after a lost enqueue response, same-key/different-content conflict, decline,
 expiry, consumed-with-lost-response, changed echoed message, changed digest, wrong wallet signature,
 custody change, setup rerun plus rv5#3 with `wallet.pub` and no seed, and expired transaction rebuild
-requiring a second approval. CLI and starter tests kill the process after the pre-broadcast journal,
-prove all four attempt fields survive, and refuse a new approval until reconciliation; the expiry
-race fixture makes status appear between the first read and the over-height re-read. Existing
-person/release tests demonstrate the same fail-closed cases
+requiring a second approval. Broker tests refuse concurrent outstanding requests, enforce the
+per-principal enqueue rate limit, reject oversized and late RPC responses before the decoder or
+signer, and assert that logs contain only closed error codes. CLI and starter tests kill the process
+after the pre-broadcast journal, prove all four attempt fields survive, and refuse a new approval
+until reconciliation; the expiry race fixture makes status appear between the first read and the
+over-height re-read. Existing person/release tests demonstrate the same fail-closed cases
 (`tests/test_person_custody.py:421-480,531-577`; `tests/test_release_broker.py:180-286`).
 
 Finally run the sealed, network-disabled rehearsal:
@@ -413,61 +469,65 @@ rehearsal/run.sh <reviewed-package> --mode import-nak-wallet
 ```
 
 It proves real uid/mode boundaries, import, public-key match, principal registration, source
-retirement, idempotent rerun, failure rollback, and decoder self-test. It does not make a Solana
-transaction and does not touch the live broker.
+retirement to a root-owned mode-`000` path, SHA-256-only copy inventory and reported count,
+idempotent rerun, failure rollback, and decoder self-test. It does not make a Solana transaction and
+does not touch the live broker.
 
 ## 8. Rollout and ownership
 
 1. **This lane:** land this document only.
-2. **Unification lane:** review the closed templates, cluster/state boundary, ceilings, installer
-   transaction, and the three open questions below. No operational change yet.
+2. **Unification lane:** review complete. Round 3 sends only step 3 to build; no operational change.
 3. **Implementation lane:** add the pure decoder and golden/hostile fixtures first. Review that diff
    independently before adding the broker endpoint or clients.
 4. **Broker/unification lane:** add the dynamic wallet principal, root-owned wallet policy, one-shot
-   endpoint, import transaction, environment ceilings, and rollback tests. Keep the service unchanged
-   until the sealed rehearsal passes.
+   endpoint, import transaction, environment ceilings, and rollback tests. This step is gated on
+   Biswa choosing deployment under the 48-hour time-locked multisig and the lane reporting the
+   resulting ProgramData upgrade authority, code hash, and exact multisig address. Keep the service
+   unchanged until the sealed rehearsal passes.
 5. **Nakshatra lane:** first land `pay/starter-attempt-fence` on main; then add the custody client,
    compile-once/assemble seam, rv5#3 plus setup-rerun wallet fixes, the shared durable attempt journal
    and reconciler for every broker-wallet send, CLI and starter wiring, and fake-transport tests. No
    test contacts the live approval service or Buzz.
 6. **Rehearsal owner:** run `rehearsal/run.sh --mode import-nak-wallet` with throwaway material in the
-   sealed container; archive the PASS and reviewed package manifest.
-7. **Biswa:** on his Mac, independently compute the reviewed package's manifest digest from the
-   pinned commit. On the hub, compare that digest and perform only the documented `sudo` install/import
-   invocation. A later reviewed program upgrade requires a separate documented Biswa step to update
-   the pinned program hash in root-owned `broker.env`; no daemon or caller advances that trust pin.
-   He does not otherwise edit policy, move key files by hand, run tests against the live service, or
-   approve a rehearsal transaction.
+   sealed container; archive the PASS and reviewed package manifest. The M6 live drill remains
+   blocked until the deployment gate in step 4 is satisfied.
+7. **Biswa:** decide whether and when to deploy the program under the 48-hour time-locked multisig.
+   On his Mac, independently compute the reviewed package's manifest digest from the pinned commit.
+   On the hub, compare that digest, receive the SHA-256-only wallet-copy count, and perform only the
+   documented `sudo` install/import invocation. A later reviewed program upgrade requires a separate
+   documented Biswa step to update the pinned program hash in root-owned `broker.env`; no daemon or
+   caller advances that trust pin. He does not otherwise edit policy, move key files by hand, run
+   tests against the live service, or approve a rehearsal transaction.
 8. **Post-import verification by the unification lane:** as the unprivileged node user, confirm
-   `wallet.pub`, `custody=broker`, absence of the seed, correct public projection, and a healthy
-   authenticated principal. A live devnet approval is a separately scheduled acceptance drill, not
-   part of Biswa's install work. Rollout stops before any withdrawal or mainnet action.
+   `wallet.pub`, `custody=broker`, absence of the seed from active user-readable paths, correct public
+   projection, and a healthy authenticated principal. A live devnet approval is a separately
+   scheduled acceptance drill, not part of Biswa's install work. Rollout stops before any withdrawal
+   or mainnet action.
 
-Order is fixed: design note, unification review, pure decoder plus fixtures, sealed rehearsal, then
-Biswa's independent digest and install. No mainnet enablement is bundled with this work.
+Order is fixed: design note, unification review, pure decoder plus fixtures, Biswa's deployment
+decision and the authority report, broker/client build, sealed rehearsal, then Biswa's independent
+digest and install. No mainnet enablement is bundled with this work.
 
-## 9. Open questions for the unification lane
+## 9. Resolved answers and remaining decision
 
-1. **First escrow and excluded owner actions.** Current `nak pay ensure` can place `escrow_init` in
-   the same message before `delegate_set`, while the agreed allowlist does not include it
-   (`scripts/network/nak.py:1051-1098`). This note gates import on an existing escrow and leaves
-   deposit, revoke, escrow close, and legacy wallet-authority channel close unsupported. Confirm that
-   prerequisite, or commission separate exact templates; do not widen the generic program allowlist.
-2. **Trusted devnet state and upgrade authority.** Genesis/blockhash binding, ProgramData/code/upgrade
-   authority, network fee, rent, starter state, and withdrawal execute amount cannot all be proven
-   from legacy message bytes alone. Confirm that the broker may use a separately configured TLS
-   devnet RPC with pinned genesis/program checks, or name an equivalent broker-trusted state feed.
-   This note has not established whether the current devnet deployment's upgrade authority is already
-   the intended 48-hour time-locked Squads multisig; confirm its exact address and timelock before
-   enabling broker signing. Caller-supplied cluster, quote, or account state is not acceptable.
-3. **Reviewed ceiling values.** Agree the explicit broker-environment values for self delegate cap and
-   lifetime, starter resulting remaining capacity and lifetime, withdrawal amount, network fee,
-   delegate/ATA rent, and self/starter SOL top-ups. Current code
-   defaults self delegation to 5 USDC and 30 days
-   (`scripts/network/pay_autochannel.py:18-22`), targets 0.03 SOL for self top-up
-   (`scripts/network/nak.py:820-821,1053-1060`), and targets 0.01 SOL plus 30 days for a starter
-   (`scripts/network/nakd.py:111-113,1408-1425`); these are evidence for defaults, not permission to
-   omit hard ceilings.
+1. **Existing escrow required.** Import requires an existing escrow. `escrow_init`, deposit, revoke,
+   escrow close, and legacy wallet-authority channel close stay outside this allowlist and fail
+   closed. The current ensure path can emit `escrow_init` before `delegate_set`
+   (`scripts/network/nak.py:1051-1098`), so that path must not use broker custody unless the escrow
+   already exists.
+2. **Trusted devnet state approved with strict pins.** The broker may use its separately configured
+   TLS devnet RPC with genesis, ProgramData, code hash, and upgrade authority pinned in root-owned
+   `broker.env`; RPC state may tighten but never loosen a message-byte check. The 2026-11-04 read-only
+   check found that the configured program has no devnet account, deployment, ProgramData, or upgrade
+   authority. Before step 4, the lane must report the authority created by deployment.
+3. **Ceilings resolved.** The reviewed values are the `broker.env` table in section 4.2. They align
+   with the existing 5-USDC/30-day self default, 0.03-SOL self target, and 0.01-SOL/30-day starter
+   target (`scripts/network/pay_autochannel.py:18-22`; `scripts/network/nak.py:820-821,1053-1060`;
+   `scripts/network/nakd.py:111-113,1408-1425`), while adding hard absolute ceilings.
+
+The only remaining decision is Biswa's: whether and when to deploy the program, and which exact
+48-hour time-locked multisig will hold upgrade authority. That deployment is required before rollout
+step 4 or the M6 live drill; until then, only step 3 is authorized.
 
 ## 10. Review log
 
@@ -485,3 +545,8 @@ Biswa's independent digest and install. No mainnet enablement is bundled with th
 10. **Round 2:** added system-owned zero-data dusted PDA/ATA state and ceilings on actual rent shortfall.
 11. **Round 2:** required a pre-broadcast attempt record and race-safe reconciliation before any
     replacement approval for starter, ensure, or withdrawal sends.
+12. **Round 3 (unification lane):** added message-byte absolute caps and RPC-only-tightens policy,
+    linked withdrawal execute to its ceiling-checked request, made seed retirement mode-`000` with a
+    SHA-256-only copy inventory, serialized and rate-limited approvals, isolated bounded RPC from the
+    signer, resolved Q1/Q3, and recorded the Q2 fact and deployment/multisig gate. Verdict:
+    send-to-build for rollout step 3 only.
