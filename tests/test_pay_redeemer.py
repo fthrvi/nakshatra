@@ -456,6 +456,37 @@ def test_begin_session_persists_on_chain_closing_state(tmp_path):
         assert row.status == "Closing" and row.close_at == 12_345
 
 
+def test_begin_session_retries_when_channel_closes_between_read_and_update(
+        tmp_path):
+    worker_hex = pay_chain.pubkey_bytes(WALLET["address"]).hex()
+    first, second = sorted((CHANNEL, CHANNEL2))
+    with pay_voucher.PayerChannelBook(tmp_path / "channels.sqlite") as book:
+        for key in (first, second):
+            book.put(program=PROGRAM, channel=key, worker_key=worker_hex,
+                     cap=5_000_000, max_signed_total=100)
+
+        class InterleavedClosingState:
+            def read_channel(self, channel, program):
+                assert program == PROGRAM
+                if channel == first:
+                    # Process B's durable Closing write lands after process A
+                    # read its candidate row but before A updates channel_base.
+                    book.mark_closing(first, 12_345)
+                    return channel_state(redeemed=7)
+                assert channel == second
+                return channel_state(redeemed=3)
+
+        chosen = book.begin_session(
+            worker_hex, program=PROGRAM, state=InterleavedClosingState(),
+            required_micro_usdc=1)
+
+        # Mutation checked: dropping status='Open' from the channel_base UPDATE
+        # returns the stale first candidate instead of retrying the next one.
+        assert chosen.channel == second and chosen.channel_base == 3
+        assert book.for_channel(first).status == "Closing"
+        assert book.for_channel(first).channel_base == 0
+
+
 class PayerRpc:
     def __init__(self, path: Path, payer_book: pay_voucher.PayerChannelBook,
                  *, now=2_000_000, closing=False):

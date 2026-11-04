@@ -720,54 +720,66 @@ class PayerChannelBook(_Book):
                     else required_capacity_micro_usdc(max_cost_credits))
         worker = str(worker_key).lower()
         preferred = None if channel is None else _pubkey_text(channel, "channel")
+        chosen = None
         with self._lock:
-            rows = self._db.execute(
-                "SELECT * FROM channels WHERE worker_key=? ORDER BY channel",
-                (worker,)).fetchall()
-            for stored in rows:
-                row = self._row(stored)
-                if row.status != "Open":
-                    continue
-                if row.program != configured:
-                    continue
-                if preferred is not None and row.channel != preferred:
-                    continue
-                try:
-                    channel_state = state.read_channel(row.channel, configured)
-                except VoucherError as exc:
-                    if (str(exc) == "channel account does not exist"
-                            or str(exc).startswith("account does not exist:")):
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                rows = self._db.execute(
+                    "SELECT * FROM channels WHERE worker_key=? ORDER BY channel",
+                    (worker,)).fetchall()
+                for stored in rows:
+                    row = self._row(stored)
+                    if row.status != "Open":
                         continue
-                    raise
-                try:
-                    # Payer selection is status-only.  On-chain Open accounts
-                    # have close_at=0; worker admission owns the chain-time
-                    # deadline and must never substitute a host clock here.
-                    require_open_channel(channel_state, now=0)
-                except ChannelClosingError:
-                    if channel_state.status == "Closing":
-                        self._db.execute(
-                            "UPDATE channels SET status='Closing',close_at=? "
-                            "WHERE channel=?",
-                            (channel_state.close_at, row.channel))
-                    continue
-                if channel_state.cap != row.cap:
-                    raise VoucherError(
-                        "on-chain channel cap differs from pinned channel book")
-                if row.max_signed_total < channel_state.redeemed:
-                    raise VoucherError(
-                        "payer signing ceiling is below the on-chain redeemed total")
-                if channel_state.cap - row.max_signed_total < required:
-                    continue
-                self._db.execute(
-                    "UPDATE channels SET channel_base=? WHERE channel=?",
-                    (str(channel_state.redeemed), row.channel))
-                row = PayerChannel(row.program, row.channel, row.worker_key, row.cap,
-                                   channel_state.redeemed, row.max_signed_total,
-                                   row.status, row.close_at, row.last_voucher_at)
-                self._secure()
-                return row
+                    if row.program != configured:
+                        continue
+                    if preferred is not None and row.channel != preferred:
+                        continue
+                    try:
+                        channel_state = state.read_channel(row.channel, configured)
+                    except VoucherError as exc:
+                        if (str(exc) == "channel account does not exist"
+                                or str(exc).startswith("account does not exist:")):
+                            continue
+                        raise
+                    try:
+                        # Payer selection is status-only.  On-chain Open accounts
+                        # have close_at=0; worker admission owns the chain-time
+                        # deadline and must never substitute a host clock here.
+                        require_open_channel(channel_state, now=0)
+                    except ChannelClosingError:
+                        if channel_state.status == "Closing":
+                            self._db.execute(
+                                "UPDATE channels SET status='Closing',close_at=? "
+                                "WHERE channel=?",
+                                (channel_state.close_at, row.channel))
+                        continue
+                    if channel_state.cap != row.cap:
+                        raise VoucherError(
+                            "on-chain channel cap differs from pinned channel book")
+                    if row.max_signed_total < channel_state.redeemed:
+                        raise VoucherError(
+                            "payer signing ceiling is below the on-chain redeemed total")
+                    if channel_state.cap - row.max_signed_total < required:
+                        continue
+                    cursor = self._db.execute(
+                        "UPDATE channels SET channel_base=? "
+                        "WHERE channel=? AND status='Open'",
+                        (str(channel_state.redeemed), row.channel))
+                    if cursor.rowcount != 1:
+                        continue
+                    chosen = PayerChannel(
+                        row.program, row.channel, row.worker_key, row.cap,
+                        channel_state.redeemed, row.max_signed_total,
+                        row.status, row.close_at, row.last_voucher_at)
+                    break
+                self._db.execute("COMMIT")
+            except Exception:
+                self._db.execute("ROLLBACK")
+                raise
         self._secure()
+        if chosen is not None:
+            return chosen
         raise NoUsableChannel(
             "payer has no usable channel for worker (missing, closing, or insufficient capacity)")
 
