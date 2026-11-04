@@ -33,8 +33,10 @@ node key id already known at install time. Its broker-owned wallet record pins:
 - the principal and node public key;
 - `wallet_id`, equal to the base58 wallet public key in `wallet.pub`;
 - the wallet Ed25519 public key;
-- the devnet genesis hash, deployed `nakshatra_pay` program id, classic SPL mint, and all ceiling
-  values from the root-owned broker environment.
+- the devnet genesis hash, deployed `nakshatra_pay` program id, its upgradeable-loader ProgramData
+  address and program-byte SHA-256, the classic SPL mint, and all ceiling values from the root-owned
+  broker environment. Broker signing additionally requires the ProgramData upgrade authority to be
+  `None` (immutable deployment).
 
 The dynamic principal must authenticate as itself before enqueue, as the release client currently
 checks `nakshatra-release` before asking for an approval (`release/broker_signer.py:162-183`). It must
@@ -80,6 +82,7 @@ The client first calls `/principal/v1`, then uses the existing enqueue/result fl
 ```json
 {
   "what": "nakshatra.wallet.v1",
+  "idempotency_key": "<stable per-human-act key>",
   "tier": "high",
   "review": {"description": "Solana payment transaction"},
   "exact_content": {
@@ -90,6 +93,13 @@ The client first calls `/principal/v1`, then uses the existing enqueue/result fl
   "ttl": 60
 }
 ```
+
+The client creates and durably records `idempotency_key` with the exact act before its first enqueue,
+then reuses it for every uncertain enqueue retry. A changed message or a deliberately new approval is
+a new act and gets a new key. The broker requires the field and returns the existing request only when
+the same principal/key names the same request fingerprint
+(`/home/prithvi/trisul@forgejo/main:infra/pillar-agent/pillar_signer_broker.py:1167-1174,1228-1261`).
+Thus a lost enqueue response is recovered without creating a second approval.
 
 `review.description` is a fixed label and is never displayed as transaction meaning. The approval
 screen is rendered from the decoded `exact_content.message_b64` and server-side wallet policy only.
@@ -154,18 +164,36 @@ fields below are little-endian.
 
 | Allowed instruction | Exact data | Required ordered accounts and signers | Approval fields | Ceiling |
 |---|---|---|---|---|
-| `nakshatra_pay.delegate_set` (self ensure) | `8b10e667fea614a5` + delegate key (32) + `cap_total:u64` + `expires_at:i64` + `flags:u8` | wallet **signer,writable**; canonical config; canonical wallet escrow; canonical delegate PDA **writable**; System Program; canonical event authority; program id | wallet, own node delegate, cap in micro-USDC and USDC, expiry, flags, escrow, optional SOL top-up, message digest | `NAK_WALLET_MAX_DELEGATE_MICRO_USDC`; expiry horizon `NAK_WALLET_MAX_DELEGATE_TTL_S`; optional transfer ceiling below |
-| `nakshatra_pay.delegate_set` (starter grant) | same discriminator/layout; `flags` must equal `OPEN_CHANNEL=1` | same account layout; delegate PDA must be derived from escrow and the decoded recipient node key | inviter wallet, recipient node, newly granted remaining capacity, resulting total cap, expiry, optional SOL top-up, escrow, digest | grant delta `NAK_WALLET_MAX_STARTER_MICRO_USDC`; expiry horizon `NAK_WALLET_MAX_STARTER_TTL_S`; transfer ceiling below |
+| `nakshatra_pay.delegate_set` (self ensure) | `8b10e667fea614a5` + delegate key (32) + `cap_total:u64` + `expires_at:i64` + `flags:u8` | wallet **signer,writable**; canonical config; canonical wallet escrow; canonical delegate PDA **writable**; System Program; canonical event authority; program id | wallet, own node delegate, cap in micro-USDC and USDC, expiry, flags, escrow, exact delegate rent, optional SOL top-up, message digest | `NAK_WALLET_MAX_DELEGATE_MICRO_USDC`; expiry horizon `NAK_WALLET_MAX_DELEGATE_TTL_S`; rent and optional transfer ceilings below |
+| `nakshatra_pay.delegate_set` (starter grant) | same discriminator/layout; `flags` must equal `OPEN_CHANNEL=1` | same account layout; delegate PDA must be derived from escrow and the decoded recipient node key | inviter wallet, recipient node, pre-state spent/cap, resulting remaining capacity and total cap, expiry, exact delegate rent, optional SOL top-up, escrow, digest | resulting remaining capacity `NAK_WALLET_MAX_STARTER_MICRO_USDC`; expiry horizon `NAK_WALLET_MAX_STARTER_TTL_S`; rent and transfer ceilings below |
 | `nakshatra_pay.escrow_withdraw_request` | `f6f379c6f277d27a` + `amount:u64` | wallet **signer**; canonical config; canonical wallet escrow **writable**; canonical vault; event authority; program id | wallet, amount in micro-USDC and USDC, escrow, vault, earliest execute time from trusted chain state, digest | `NAK_WALLET_MAX_WITHDRAW_MICRO_USDC` |
 | `nakshatra_pay.escrow_withdraw_execute` | `ac5dcf14503aa8f1` only | wallet **signer**; canonical config; pinned mint; canonical escrow, vault and wallet ATA **writable**; classic Token Program; event authority; program id | wallet, pending amount and unlock time from trusted devnet state, escrow, vault, destination ATA, digest | pending amount must be at or below `NAK_WALLET_MAX_WITHDRAW_MICRO_USDC` |
 | System Program transfer | program `11111111111111111111111111111111`; data `2:u32` + `lamports:u64` | wallet **signer,writable**; decoded delegate node **writable** | destination node, lamports and SOL, whether self top-up or starter top-up | `NAK_WALLET_MAX_SELF_SOL_LAMPORTS` or `NAK_WALLET_MAX_STARTER_SOL_LAMPORTS` |
-| Associated Token Account create-idempotent | program `ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL`; data exactly `01` | wallet **signer,writable** payer; canonical wallet ATA **writable**; wallet owner; pinned mint; System Program; classic Token Program | wallet, mint, canonical ATA, possible rent charge | no token amount; allowed once only in the execute template |
+| Associated Token Account create-idempotent | program `ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL`; data exactly `01` | wallet **signer,writable** payer; canonical wallet ATA **writable**; wallet owner; pinned mint; System Program; classic Token Program | wallet, mint, canonical ATA, exact zero-or-create rent | `NAK_WALLET_MAX_ATA_RENT_LAMPORTS`; allowed once only in the execute template |
 
 The account order and argument layouts above match the current Python builders
 (`scripts/network/pay_chain.py:219-231,257-290`) and the program account constraints
 (`/home/prithvi/neuron/programs/nakshatra_pay/programs/nakshatra_pay/src/instructions.rs:418-537,619-698`).
 The decoder independently derives every PDA and ATA; it never trusts an account label from the
 caller.
+
+Every template also renders the exact network fee in lamports and SOL. The broker calls
+`getFeeForMessage` for the exact message through its own pinned devnet RPC and refuses a quote above
+`NAK_WALLET_MAX_NETWORK_FEE_LAMPORTS` from root-owned `broker.env`; the wallet is the fee payer, so
+this debit exists even when an instruction fails. It stores the displayed quote and, immediately
+before signing, repeats the quote and requires it to be unchanged and still below the ceiling. This
+matches the existing client quote path (`scripts/network/pay_chain.py:662-670`;
+`scripts/network/nak.py:996-1012`).
+
+`delegate_set` is `init_if_needed, payer = owner`, so an absent 115-byte delegate PDA charges the
+wallet rent (`/home/prithvi/neuron/programs/nakshatra_pay/programs/nakshatra_pay/src/instructions.rs:619-632`;
+`scripts/network/pay_chain.py:724`). The broker obtains the exact finalized
+`getMinimumBalanceForRentExemption(115)` quote and requires it not exceed
+`NAK_WALLET_MAX_DELEGATE_RENT_LAMPORTS`; an existing canonical PDA renders zero. Likewise an absent
+wallet ATA renders the exact `getMinimumBalanceForRentExemption(165)` quote and an existing ATA
+renders zero. Immediately before signing the broker repeats the existence and rent checks and refuses
+any change. Current clients already include these debits in affordability checks
+(`scripts/network/nak.py:1091-1102,1371-1379`; `scripts/network/nakd.py:1427-1439`).
 
 “Starter grant” is not a fourth on-chain discriminator. It is the closed template consisting of a
 starter-form `delegate_set`, optionally followed by one System transfer to that same decoded
@@ -183,56 +211,87 @@ program id in `pay_chain.py` (`scripts/network/pay_chain.py:27-35,219-388`). The
 is refused in this revision. If a builder later emits it, its exact opcode, byte length, unit limit,
 unit-price ceiling, position, and multiplicity must be reviewed and added before deployment.
 
-The broker environment must provide every ceiling explicitly; zero or missing values prevent the
-wallet principal from loading. The renderer shows the decoded amount and its ceiling. A starter's
-grant delta and a withdrawal execute's pending amount are state-derived, so the outer validator must
-read the canonical accounts from the trusted devnet view before showing or signing them. Caller
-claims are never used.
+Root-owned `broker.env` must provide every ceiling explicitly; zero or missing values prevent the
+wallet principal from loading. The renderer shows each decoded or quoted debit and its ceiling. A
+withdrawal execute's pending amount and all starter pre-state are state-derived, so the outer
+validator reads the canonical accounts from the trusted devnet view before showing and again before
+signing. Caller claims are never used.
+
+For a starter update, an existing delegate must have `open_channels == 0` and `open_tasks == 0`.
+Its generation must equal the escrow generation or be strictly older, never newer; a same-generation
+delegate must not be disabled, while an older-generation delegate is eligible only because
+`delegate_set` resets its spent and disabled state. The ceiling bounds **resulting remaining
+capacity**, not merely the increase: for the same generation the broker requires
+`cap_total - spent <= NAK_WALLET_MAX_STARTER_MICRO_USDC`; for an absent or older-generation delegate
+it requires `cap_total <=` that ceiling after reset. The message must encode exactly `spent + desired
+remaining` for the same generation and exactly `desired remaining` otherwise. Requiring no open work
+prevents a later channel-finalize refund from lowering `spent` and expanding authority beyond the
+approved remaining-capacity bound. These are the current starter construction predicates
+(`scripts/network/nakd.py:1362-1418`); channel finalize does reduce `spent`
+(`/home/prithvi/neuron/programs/nakshatra_pay/programs/nakshatra_pay/src/instructions.rs:1166-1173`).
 
 ### 4.3 Cluster binding and refusals
 
 A legacy Solana message contains a recent blockhash but no genesis hash. To keep the wire request to
 raw message plus wallet id without trusting caller metadata, the broker uses its root-owned devnet
 RPC configuration to obtain `getGenesisHash`, validate that the decoded recent blockhash is still
-valid on that cluster, read any state needed by the plan, and pin the program account to the reviewed
-executable. The pure module receives this as an injected immutable `cluster_view`; unit tests never
-make RPC calls. The only accepted genesis is devnet
+valid on that cluster, and read any state needed by the plan. At approval and immediately before
+signing it also requires the program account to be executable and owned by the BPF Upgradeable Loader,
+decodes its ProgramData address, requires it to equal both the loader-derived address and broker
+policy, and requires the ProgramData account to have the same loader owner. The SHA-256 of the
+deployed program bytes (excluding ProgramData metadata) must also match policy. Finally it requires
+`upgrade_authority_address == None`; this program's own config initialization confirms that
+it is deployed through ProgramData and otherwise has an upgrade authority
+(`/home/prithvi/neuron/programs/nakshatra_pay/programs/nakshatra_pay/src/instructions.rs:20-33`).
+The pure module receives these facts as an injected immutable `cluster_view`; unit tests never make
+RPC calls. The only accepted genesis is devnet
 `EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG`. Current client code already refuses mainnet and
 accepts only devnet or a loopback test validator (`scripts/network/pay_voucher.py:76-77,433-450`);
 the production broker is stricter and never accepts the loopback exception.
 
+ProgramData address plus code hash alone still has a time-of-check/time-of-use risk: an authorized
+upgrade could occur after the final broker check while the signed transaction's blockhash remains
+valid. This design fences that entire validity window by requiring the deployed program to be
+immutable before broker signing is enabled. If its upgrade authority is not `None`, implementation
+stops; short approval/blockhash lifetimes and the immediate pre-sign recheck are defense in depth, not
+a substitute for immutability.
+
 Refuse before approval and again before signing on any of the following:
 
-- a wallet id, node id, public key, program, mint, genesis, executable owner, or recent blockhash
-  outside the pinned policy;
+- a wallet id, node id, public key, program, mint, genesis, loader owner, ProgramData address,
+  program-byte hash, immutability state, or recent blockhash outside the pinned policy;
 - an unknown program, unknown instruction, extra instruction, missing instruction, wrong order,
   duplicate instruction, trailing bytes, versioned message, or Compute Budget instruction;
 - a fee payer other than the wallet; required signers other than exactly the wallet; signer or
   writable flags different from the template;
 - a non-canonical config, escrow, vault, delegate, event authority, or ATA; a System transfer whose
   source is not the wallet or destination is not the decoded self/starter node;
-- delegate flags, expiry, cap, starter grant delta, withdrawal amount, pending execute amount, or SOL
-  transfer above its broker-environment ceiling;
+- delegate flags, expiry, cap, starter resulting remaining capacity, withdrawal amount, pending
+  execute amount, SOL transfer, network fee, delegate rent, or ATA rent above its broker-environment
+  ceiling;
 - missing, malformed, stale, wrong-owner, wrong-generation, or internally inconsistent devnet state;
 - a caller-supplied description or decoded field, approval TTL outside the fixed bound, digest
   mismatch, consumed request, expired approval, or custody/principal change during the act.
 
 ## 5. Client call sites and rv5#3
 
-### 5.1 Every current `load_wallet()` caller
+### 5.1 Wallet load and setup paths
 
 | Caller | What it actually needs | Change |
 |---|---|---|
-| `scripts/paid_admission.py:PaidAdmission.__init__` | Wallet address only, to identify the worker's payee wallet in chain admission (`scripts/paid_admission.py:633-675`). The worker node key signs its receipts and redeemer transactions. | Replace `load_wallet` with `load_wallet_identity`. This is rv5#3 and must work with only `wallet.pub`. |
+| `scripts/paid_admission.py:PaidAdmission.__init__` | Wallet address only, to identify the worker's payee wallet in chain admission (`scripts/paid_admission.py:633-675`). The worker node key signs receipts; redeemer fee-payer custody is separate. | Replace `load_wallet` with `load_wallet_identity`. This is rv5#3 and must work with only `wallet.pub`. |
 | `scripts/client.py:main` chain-voucher setup | Wallet address only, passed as escrow owner to `ensure_channel`; the node key is loaded separately and opens the channel/signs vouchers (`scripts/client.py:1974-2012`; `scripts/network/pay_autochannel.py:252-267,377-396`). | Replace `load_wallet` with `load_wallet_identity`. This is the other rv5#3 call site. No wallet approval occurs on the normal paid-session path. |
 | `scripts/network/nakd.py:NakDaemon._chain_starter` | Wallet public identity and a real wallet signature over `delegate_set` plus optional SOL transfer (`scripts/network/nakd.py:1283-1319,1408-1443`). | Load public identity, build/compile as today, and route the raw message through `wallet_sign`; never request or receive a seed. |
 | `scripts/network/nak.py:_pay_command` `backup` | The seed, to derive and print the mnemonic (`scripts/network/nak.py:1230-1244`). | Keep `load_wallet`; broker custody refuses because export of broker key material is not supported. |
 | `scripts/network/nak.py:_pay_command` `export` | The seed and public key, to print the keypair (`scripts/network/nak.py:1246-1253`). | Keep `load_wallet`; broker custody refuses. |
 | `scripts/network/pay_wallet.py:load_wallet_identity` | In file custody, full validation and the seed for existing file-signing callers (`scripts/network/pay_wallet.py:289-306`). | Keep this internal delegation. Broker custody continues on the public-only branch. |
+| `scripts/network/pay_wallet.py:preflight_wallet` | Setup preflight currently treats `wallet.pub`/`custody` without a seed as incomplete (`scripts/network/pay_wallet.py:180-193`). | Treat a valid `wallet.pub` plus `custody=broker` and no seed as complete; keep refusing partial, mismatched, or file-custody state without a seed. |
+| `scripts/network/pay_wallet.py:ensure_wallet` | Every setup rerun calls preflight and currently creates a new seed whenever none exists (`scripts/network/pay_wallet.py:220-268`). | After broker-state preflight, return the public identity without creating or rewriting any wallet file. Add setup-rerun tests for this exact shape. |
 | `tests/test_pay_wallet.py:test_established_identity_adds_wallet_without_touching_identity_files` | Test assertion that a file wallet reloads (`tests/test_pay_wallet.py:126-135`). | Keep; add separate public-only and no-seed broker-custody tests. |
 
-This is the complete repository call set found by `rg '\bload_wallet\s*\('`. The comment in
-`tests/test_pay_redeemer.py:903` is not a call.
+The `load_wallet` rows are the complete repository call set found by
+`rg '\bload_wallet\s*\('`; the two setup functions are included because they must also accept the
+post-import shape. The comment in `tests/test_pay_redeemer.py:903` is not a call.
 
 ### 5.2 Other signing boundaries that change or stay closed
 
@@ -248,11 +307,16 @@ This is the complete repository call set found by `rg '\bload_wallet\s*\('`. The
   for only the approved ensure/withdraw templates; it currently reads `wallet["seed"]` directly
   (`scripts/network/nak.py:996-1012`). Deposit and revoke stay explicitly unsupported in broker mode.
 - Change `scripts/network/nakd.py:NakDaemon._chain_starter` as above. Preserve its durable attempt
-  write before broadcast and blockhash-expiry reconciliation
-  (`scripts/network/nakd.py:1427-1469`); the broker signature is not permission to silently rebuild.
+  write before broadcast (`scripts/network/nakd.py:1427-1469`). Branch
+  `pay/starter-attempt-fence` must be on main before broker signing is wired in: current
+  `_resolve_starter_attempts` can mark an observed `processed`/`confirmed` attempt expired solely from
+  block height (`scripts/network/nakd.py:1219-1258`). The broker signature is not permission to
+  silently rebuild.
 - `scripts/network/pay_autochannel.py:ensure_channel`, voucher signing in
-  `scripts/network/pay_voucher.py`, and the normal worker redeemer remain node-key paths. They do not
-  call the wallet broker. The channel builder makes the node the signer and fee payer
+  `scripts/network/pay_voucher.py`, and broker-custody worker redemption remain node-key paths. The
+  redeemer chooses the node key as fee payer/signer only under broker custody; under file custody it
+  uses the wallet as fee payer/signer (`scripts/network/pay_redeemer.py:353-368`). Neither case calls
+  the wallet broker. The channel builder makes the node the signer and fee payer
   (`scripts/network/pay_autochannel.py:373-396`).
 - `scripts/network/pay_redeemer.py:request_close` normally uses the node voucher signer. Its fallback
   for an owner-opened legacy channel genuinely needs the wallet seed and already refuses broker
@@ -269,10 +333,11 @@ This is the complete repository call set found by `rg '\bload_wallet\s*\('`. The
   deadline. If the broker says consumed but the signature was lost, require a new human approval.
 - **TTL expires before signing:** discard the request. Rebuild with a fresh blockhash and ask again.
 - **Transaction expires after approval/signing:** first use finalized status and block height to prove
-  the old signature cannot still land. Then rebuild a new message and re-approve. Never re-sign or
-  re-broadcast a replacement silently. Current redeemer and starter paths already retain signed
-  attempts until finalized failure or blockhash expiry
-  (`scripts/network/pay_redeemer.py:136-165,194-250`; `scripts/network/nakd.py:1219-1258`).
+  the old signature cannot still land. Any observed `processed`/`confirmed` status remains unresolved
+  until finalized, regardless of block height; only an unseen signature past its last valid height is
+  expired. Then rebuild a new message and re-approve. The redeemer already applies this fence
+  (`scripts/network/pay_redeemer.py:136-165`); `pay/starter-attempt-fence` must bring the starter path
+  to the same rule on main before broker signing is connected.
 - **Broadcast outcome unknown:** keep the exact signed attempt unresolved and do not approve a
   competing replacement while it can land.
 - **Decoder, state, ceiling, cluster, digest, echo, or signature mismatch:** fail closed before local
@@ -302,13 +367,16 @@ Hostile fixtures mutate one property at a time: extra instruction, unknown progr
 with unknown opcode, swapped account, writable/signer-bit change, wrong fee payer, extra signer,
 wrong PDA/ATA/mint/program, System transfer to a different destination, non-canonical short-vector,
 trailing byte, versioned message, mainnet genesis, invalid/stale devnet blockhash, over-ceiling cap,
-expiry, starter delta, withdrawal, pending execute, and SOL amount. Include duplicate-signature replay:
+expiry, starter remaining capacity, withdrawal, pending execute, SOL amount, network fee, delegate/ATA
+rent, ProgramData address/hash, and upgrade authority. Starter cases cover both generations, disabled
+state, and nonzero open channels/tasks. Include duplicate-signature replay:
 the first approved request signs once; a second sign call for that request is refused, and the same
 message under a new request still needs a new approval.
 
 Client tests use a local fake transport, never the real endpoint. They cover wrong principal,
-decline, expiry, consumed-with-lost-response, changed echoed message, changed digest, wrong wallet
-signature, custody change, rv5#3 with `wallet.pub` and no seed, and expired transaction rebuild
+stable-key recovery after a lost enqueue response, same-key/different-content conflict, decline,
+expiry, consumed-with-lost-response, changed echoed message, changed digest, wrong wallet signature,
+custody change, setup rerun plus rv5#3 with `wallet.pub` and no seed, and expired transaction rebuild
 requiring a second approval. Existing person/release tests demonstrate the same fail-closed cases
 (`tests/test_person_custody.py:421-480,531-577`; `tests/test_release_broker.py:180-286`).
 
@@ -332,8 +400,9 @@ transaction and does not touch the live broker.
 4. **Broker/unification lane:** add the dynamic wallet principal, root-owned wallet policy, one-shot
    endpoint, import transaction, environment ceilings, and rollback tests. Keep the service unchanged
    until the sealed rehearsal passes.
-5. **Nakshatra lane:** add the custody client, compile-once/assemble seam, rv5#3 loader fixes, CLI and
-   starter wiring, and fake-transport tests. No test contacts the live approval service or Buzz.
+5. **Nakshatra lane:** first land `pay/starter-attempt-fence` on main; then add the custody client,
+   compile-once/assemble seam, rv5#3 plus setup-rerun wallet fixes, CLI and starter wiring, and
+   fake-transport tests. No test contacts the live approval service or Buzz.
 6. **Rehearsal owner:** run `rehearsal/run.sh --mode import-nak-wallet` with throwaway material in the
    sealed container; archive the PASS and reviewed package manifest.
 7. **Biswa:** on his Mac, independently compute the reviewed package's manifest digest from the
@@ -355,14 +424,27 @@ Biswa's independent digest and install. No mainnet enablement is bundled with th
    (`scripts/network/nak.py:1051-1098`). This note gates import on an existing escrow and leaves
    deposit, revoke, escrow close, and legacy wallet-authority channel close unsupported. Confirm that
    prerequisite, or commission separate exact templates; do not widen the generic program allowlist.
-2. **Trusted devnet state provider.** Genesis/blockhash binding, starter grant delta, and withdrawal
-   execute amount cannot be proven from legacy message bytes alone. Confirm that the broker may use a
-   separately configured TLS devnet RPC with pinned genesis/program checks, or name an equivalent
-   broker-trusted state feed. Caller-supplied cluster or account state is not acceptable.
+2. **Trusted devnet state provider.** Genesis/blockhash binding, ProgramData/code/immutability,
+   network fee, rent, starter state, and withdrawal execute amount cannot all be proven from legacy
+   message bytes alone. Confirm that the broker may use a separately configured TLS devnet RPC with
+   pinned genesis/program checks, or name an equivalent broker-trusted state feed. Caller-supplied
+   cluster, quote, or account state is not acceptable.
 3. **Reviewed ceiling values.** Agree the explicit broker-environment values for self delegate cap and
-   lifetime, starter grant and lifetime, withdrawal amount, and self/starter SOL top-ups. Current code
+   lifetime, starter resulting remaining capacity and lifetime, withdrawal amount, network fee,
+   delegate/ATA rent, and self/starter SOL top-ups. Current code
    defaults self delegation to 5 USDC and 30 days
    (`scripts/network/pay_autochannel.py:18-22`), targets 0.03 SOL for self top-up
    (`scripts/network/nak.py:820-821,1053-1060`), and targets 0.01 SOL plus 30 days for a starter
    (`scripts/network/nakd.py:111-113,1408-1425`); these are evidence for defaults, not permission to
    omit hard ceilings.
+
+## 10. Review log
+
+1. Added the broker-required stable per-act `idempotency_key` and uncertain-enqueue recovery rule.
+2. Added broker-trusted `getFeeForMessage` quoting, rendering, recheck, and a hard environment ceiling.
+3. Added exact 115-byte delegate and 165-byte ATA rent quotes plus explicit rent ceilings.
+4. Pinned ProgramData and program-byte hash and required an immutable deployment to fence upgrades.
+5. Added starter generation/disabled/open-work predicates and bounded resulting remaining capacity.
+6. Made `pay/starter-attempt-fence` on main a prerequisite instead of claiming current retry safety.
+7. Added `preflight_wallet` and `ensure_wallet` to the broker-custody setup-rerun changes.
+8. Corrected redeemer custody: node-key payer only in broker custody; wallet payer in file custody.
