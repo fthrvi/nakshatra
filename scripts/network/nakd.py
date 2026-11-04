@@ -1229,6 +1229,19 @@ class Node:
                 continue
             status = pay_chain.validate_signature_status(
                 rpc.signature_status(attempt["signature"]))
+            if status is None:
+                if finalized_height is None:
+                    finalized_height = rpc.block_height(commitment="finalized")
+                if finalized_height > int(attempt["last_valid_block_height"]):
+                    # A transaction can finalize between the status and height
+                    # reads.  Search history again after crossing lastValid;
+                    # only two consecutive misses prove this attempt expired.
+                    status = pay_chain.validate_signature_status(
+                        rpc.signature_status(attempt["signature"]))
+                    if status is None:
+                        attempt["resolution"] = "expired"
+                        attempts_changed = True
+                        continue
             if status is not None and status.get("confirmationStatus") == "finalized":
                 if status.get("err") is None:
                     return ({
@@ -1250,13 +1263,7 @@ class Node:
                 # cannot authorize a replacement transaction.
                 unresolved = True
                 continue
-            if finalized_height is None:
-                finalized_height = rpc.block_height(commitment="finalized")
-            if finalized_height <= int(attempt["last_valid_block_height"]):
-                unresolved = True
-            else:
-                attempt["resolution"] = "expired"
-                attempts_changed = True
+            unresolved = True
         if attempts_changed:
             self.store.starter_update(
                 row["invite_id"], chain_attempts=attempts, updated=chain_now)

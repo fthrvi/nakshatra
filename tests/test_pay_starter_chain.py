@@ -416,6 +416,36 @@ def test_processed_error_after_blockhash_expiry_blocks_replacement(chain_node, m
     assert len(row["chain_attempts"]) == 1
 
 
+def test_attempt_finalizing_between_status_and_height_is_paid_without_replacement(
+        chain_node, monkeypatch):
+    node, wallet, row = chain_node
+    rpc = StarterRpc(wallet, vault_amount=2_000_000)
+    signature = _record_chain_attempt(row)
+    statuses = iter([
+        None,
+        {"err": None, "confirmationStatus": "finalized"},
+    ])
+    status_calls = []
+
+    def signature_status(actual):
+        status_calls.append(actual)
+        return next(statuses)
+
+    rpc.signature_status = signature_status
+    rpc.finalized_height = row["chain_attempts"][0]["last_valid_block_height"] + 1
+    monkeypatch.setattr(pay_chain, "PayRpc", lambda _url: rpc)
+
+    receipt = node._chain_starter(row)
+
+    assert receipt["signature"] == signature
+    assert receipt["existing"] is True
+    assert status_calls == [signature, signature]
+    assert not rpc.sent
+    assert rpc.blockhash_counter == 0
+    assert len(row["chain_attempts"]) == 1
+    assert row["chain_attempts"][0].get("resolution") != "expired"
+
+
 def test_forgejo_main_pending_ledger_row_migrates_intact_and_still_updates(tmp_path):
     state = tmp_path / "store"
     store = Store(state, b"k" * 32)
@@ -795,7 +825,7 @@ def test_resolved_chain_attempt_stays_chain_only_when_mode_is_off(monkeypatch):
 
     assert node._attempt_starter(row["invite_id"], now=200) is False
 
-    assert rpc.status_calls == [signature]
+    assert rpc.status_calls == [signature, signature]
     assert row["chain_attempts"][0]["resolution"] == "expired"
     assert row["state"] == "pending"
     assert "chain mode is off" in row["reason"]
@@ -809,7 +839,7 @@ def test_resolved_chain_attempt_still_obeys_chain_deadline_with_mode_off(monkeyp
 
     assert node._attempt_starter(row["invite_id"], now=200) is False
 
-    assert rpc.status_calls == [signature]
+    assert rpc.status_calls == [signature, signature]
     assert row["chain_attempts"][0]["resolution"] == "expired"
     assert row["state"] == "failed"
     assert row["next_attempt"] == deadline
@@ -847,7 +877,7 @@ def test_all_attempts_expired_after_deadline_fail_without_send(monkeypatch):
 
     assert node._attempt_starter(row["invite_id"]) is False
 
-    assert rpc.status_calls == [row["chain_attempts"][0]["signature"]]
+    assert rpc.status_calls == [row["chain_attempts"][0]["signature"]] * 2
     assert row["chain_attempts"][0]["resolution"] == "expired"
     assert row["state"] == "failed" and row["next_attempt"] == deadline
     assert not sent

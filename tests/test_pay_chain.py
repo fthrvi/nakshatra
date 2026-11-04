@@ -244,6 +244,21 @@ def test_send_and_confirm_only_treats_finalized_error_as_definite(monkeypatch):
     assert calls == ["sendTransaction", "getSignatureStatuses"]
 
 
+def test_send_and_confirm_rechecks_status_after_expiry_height(monkeypatch):
+    rpc, transaction, calls = _confirmation_rpc(monkeypatch, [
+        None,
+        {"err": None, "confirmationStatus": "finalized"},
+    ], finalized_heights=[121])
+
+    assert rpc.send_and_confirm(
+        transaction, timeout=1, last_valid_block_height=120) == transaction.signature
+    assert calls == [
+        "sendTransaction", "getSignatureStatuses", "getBlockHeight",
+        "getSignatureStatuses",
+    ]
+    assert calls.count("sendTransaction") == 1
+
+
 def test_send_and_confirm_reports_nonfinal_error_as_expired_after_blockhash(
         monkeypatch):
     rpc, transaction, calls = _confirmation_rpc(monkeypatch, [
@@ -253,7 +268,10 @@ def test_send_and_confirm_reports_nonfinal_error_as_expired_after_blockhash(
     with pytest.raises(pay_chain.VoucherError, match="expired before finalization") as caught:
         rpc.send_and_confirm(transaction, timeout=1, last_valid_block_height=120)
     assert not isinstance(caught.value, pay_chain.TransactionDefiniteFailure)
-    assert calls == ["sendTransaction", "getSignatureStatuses", "getBlockHeight"]
+    assert calls == [
+        "sendTransaction", "getSignatureStatuses", "getBlockHeight",
+        "getSignatureStatuses",
+    ]
 
 
 def test_send_and_confirm_rejects_finalized_status_missing_err(monkeypatch):

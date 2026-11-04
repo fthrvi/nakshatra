@@ -141,6 +141,19 @@ def resolve_attempts(book: AttemptBook, rpc, channel: str, chain_now: int,
     for attempt in book.unresolved(channel):
         status = pay_chain.validate_signature_status(
             rpc.signature_status(attempt["signature"]))
+        if status is None:
+            if height is None:
+                height = rpc.block_height(commitment="finalized")
+            if height > int(attempt["last_valid_block_height"]):
+                # The signature may have finalized between the first status
+                # read and the finalized-height read.  Only expire it after a
+                # history-searching second status read also misses it.
+                status = pay_chain.validate_signature_status(
+                    rpc.signature_status(attempt["signature"]))
+                if status is None:
+                    book.resolve(attempt["id"], "expired", chain_now)
+                    log(f"{attempt['kind']} expired before finalization for {channel}")
+                    continue
         if status is not None and status["confirmationStatus"] == "finalized":
             if status["err"] is None:
                 book.resolve(attempt["id"], "succeeded", chain_now)
@@ -155,13 +168,7 @@ def resolve_attempts(book: AttemptBook, rpc, channel: str, chain_now: int,
             # fork says so, and blockhash expiry cannot erase that observation.
             unresolved = True
             continue
-        if height is None:
-            height = rpc.block_height(commitment="finalized")
-        if height > int(attempt["last_valid_block_height"]):
-            book.resolve(attempt["id"], "expired", chain_now)
-            log(f"{attempt['kind']} expired before finalization for {channel}")
-        else:
-            unresolved = True
+        unresolved = True
     return unresolved
 
 

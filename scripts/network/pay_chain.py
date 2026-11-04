@@ -697,18 +697,25 @@ class PayRpc(JsonRpcChannelState):
         finalized_height = None
         while time.monotonic() < deadline:
             last = self.signature_status(returned)
+            if (last_valid_block_height is not None
+                    and not (last is not None
+                             and last["confirmationStatus"] == "finalized")):
+                finalized_height = self.block_height(commitment="finalized")
+                if finalized_height > last_valid_block_height:
+                    # The transaction can finalize between the status and
+                    # height reads.  Search history once more before declaring
+                    # its blockhash expired.
+                    last = self.signature_status(returned)
+                    if last is None:
+                        raise VoucherError(
+                            f"transaction expired before finalization; signature {returned}; "
+                            f"last status={last!r}; finalized block height={finalized_height}; "
+                            f"last valid block height={last_valid_block_height}")
             if last is not None and last["confirmationStatus"] == "finalized":
                 if last["err"] is not None:
                     raise TransactionDefiniteFailure(
                         f"transaction failed: {last['err']!r}")
                 return returned
-            if last_valid_block_height is not None:
-                finalized_height = self.block_height(commitment="finalized")
-                if finalized_height > last_valid_block_height:
-                    raise VoucherError(
-                        f"transaction expired before finalization; signature {returned}; "
-                        f"last status={last!r}; finalized block height={finalized_height}; "
-                        f"last valid block height={last_valid_block_height}")
             time.sleep(0.15)
         validity = (""
                     if last_valid_block_height is None else

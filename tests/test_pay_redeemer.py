@@ -358,6 +358,40 @@ def test_nonfinalized_status_survives_blockhash_expiry_and_blocks_resend(
         assert len(book.unresolved(CHANNEL)) == 1
 
 
+def test_attempt_finalizing_between_status_and_height_is_succeeded(tmp_path):
+    path = tmp_path / "redeems.sqlite"
+    with pay_redeemer.AttemptBook(path) as book:
+        book.note_voucher(CHANNEL, 1_000)
+        book.record(channel=CHANNEL, kind="redeem", signature="old-signature",
+                    blockhash=BLOCKHASH, last_valid_block_height=100,
+                    chain_now=1_000, total=2_000_000)
+
+    class FinalizingRpc(Rpc):
+        def __init__(self):
+            super().__init__(path, now=2_000, height=101)
+            self.statuses = [
+                None,
+                {"err": None, "confirmationStatus": "finalized"},
+            ]
+            self.status_calls = 0
+
+        def signature_status(self, _signature):
+            self.status_calls += 1
+            return self.statuses.pop(0)
+
+    rpc = FinalizingRpc()
+    with pay_redeemer.AttemptBook(path) as book:
+        assert pay_redeemer.resolve_attempts(book, rpc, CHANNEL, 2_000, lambda _row: None) is False
+    with sqlite3.connect(path) as db:
+        assert db.execute(
+            "SELECT resolution FROM attempts WHERE signature='old-signature'"
+        ).fetchone() == ("succeeded",)
+
+    assert rpc.status_calls == 2
+    assert rpc.sent == 0
+    assert rpc.instructions_seen == []
+
+
 def test_dry_run_never_records_or_sends(tmp_path):
     rpc = Rpc(tmp_path / "redeems.sqlite")
     messages = []
