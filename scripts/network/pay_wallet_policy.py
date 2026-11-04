@@ -108,6 +108,15 @@ class ApprovedWithdrawRequest:
     available on chain is ``(escrow_id, amount_micro_usdc, withdraw_at)``.
     Wallet import must require no pending withdrawal: a request predating import
     has no broker approval and execution is deliberately refused.
+
+    This tuple is NOT unique on its own: two equal-amount requests landing in
+    the same Unix second produce the same pending state. It is safe only
+    because the broker endpoint MUST serialize wallet approvals (at most one
+    outstanding approval per principal, unification-lane F4): a second
+    withdraw request cannot be signed until the first is reconciled. Even
+    if that is violated, the executed amount equals an amount the broker
+    already approved; it can never exceed one. The broker step must test
+    that serialization explicitly.
     """
 
     escrow_id: str
