@@ -219,7 +219,8 @@ def test_redeem_rereads_full_finalized_eligibility_before_broadcast(
 
 def test_voucher_accept_deadline_never_overruns_redeemer_refusal():
     state = channel_state(status="Closing", close_at=50_000)
-    assert pay_voucher.ACCEPT_MARGIN == pay_voucher.REDEEM_MARGIN + 120
+    assert pay_voucher.ACCEPT_MARGIN == (
+        pay_voucher.REDEEM_MARGIN + pay_voucher.CLOSING_POLL_S + 120)
     for chain_now in (
             50_000 - pay_voucher.ACCEPT_MARGIN - 1,
             50_000 - pay_voucher.ACCEPT_MARGIN,
@@ -896,6 +897,69 @@ def test_nakd_pay_cycle_contains_payment_import_failure(monkeypatch):
                and "SystemExit" in row for row in messages)
 
 
+def test_nakd_closing_voucher_is_redeemed_by_next_poll_before_margin(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    close_at = 50_000
+    clock = {"now": close_at - pay_voucher.ACCEPT_MARGIN - 2}
+    attempts_path = tmp_path / ".nakshatra/pay/redeems.sqlite"
+    rpc = Rpc(
+        attempts_path, now=clock["now"],
+        state=channel_state(status="Closing", close_at=close_at))
+    sent_at = []
+
+    class LoopDriver:
+        accepted = False
+
+        def is_set(self):
+            return rpc.sent == 1
+
+        def wait(self, seconds):
+            assert seconds == pay_voucher.CLOSING_POLL_S
+            clock["now"] += 1
+            total = 2_000_000
+            signature = ed25519.Ed25519PrivateKey.from_private_bytes(
+                SIGNER_SEED).sign(
+                    pay_voucher.voucher_message(PROGRAM, CHANNEL, total))
+            with pay_voucher.WorkerVoucherStore() as vouchers:
+                record = vouchers.accept({
+                    "program": PROGRAM, "channel": CHANNEL, "total": total,
+                    "signature": base64.b64encode(signature).decode("ascii"),
+                }, configured_program=PROGRAM, state=rpc,
+                    now=clock["now"])
+                assert clock["now"] == close_at - pay_voucher.ACCEPT_MARGIN - 1
+                assert record.close_at == close_at and record.redeemed == 0
+            self.accepted = True
+            clock["now"] += seconds - 1
+            return False
+
+    driver = LoopDriver()
+    node = object.__new__(nakd.Node)
+    node._stop = driver
+    node.log = lambda _line: None
+
+    def cycle():
+        if not driver.accepted:
+            return
+        rpc.now = clock["now"]
+        result = pay_redeemer.run_redeemer(
+            rpc=rpc, wallet=WALLET, program=PROGRAM, mint=MINT,
+            attempts_path=attempts_path,
+            lock_path=tmp_path / ".nakshatra/pay/redeem.lock",
+            log=lambda _line: None)
+        if result["sent"]:
+            sent_at.append(clock["now"])
+
+    node._pay_maintenance_cycle = cycle
+    node._pay_maintenance_loop()
+
+    # Mutation checked: a fixed 600-second wait, or failing to persist the
+    # Closing observation, leaves this voucher beyond the redeem margin.
+    assert sent_at == [close_at - pay_voucher.ACCEPT_MARGIN - 2
+                       + pay_voucher.CLOSING_POLL_S]
+    assert sent_at[0] < close_at - pay_voucher.REDEEM_MARGIN
+
+
 def test_nakd_pay_loop_survives_unexpected_cycle_exception():
     messages = []
     calls = []
@@ -906,7 +970,7 @@ def test_nakd_pay_loop_survives_unexpected_cycle_exception():
 
         def is_set(self):
             self.checks += 1
-            return self.checks > 2
+            return self.checks > 3
 
         def wait(self, _seconds):
             return False
@@ -914,6 +978,7 @@ def test_nakd_pay_loop_survives_unexpected_cycle_exception():
     node = object.__new__(nakd.Node)
     node._stop = TwoCycles()
     node.log = messages.append
+    node._closing_redeem_pending = lambda: True
 
     def cycle():
         calls.append(1)

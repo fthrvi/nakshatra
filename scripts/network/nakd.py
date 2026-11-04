@@ -461,7 +461,24 @@ class Node:
         except BaseException as exc:  # same fail-contained daemon boundary
             self.log(f"WARNING: pay finalize cycle failed: {type(exc).__name__}: {exc}")
 
+    def _closing_redeem_pending(self) -> bool:
+        """Read only local voucher facts; failure keeps the normal cadence."""
+        try:
+            from network.pay_voucher import WorkerVoucherStore
+            with WorkerVoucherStore() as vouchers:
+                return vouchers.has_unredeemed_closing()
+        except BaseException as exc:
+            self.log(f"WARNING: pay closing-poll check failed: "
+                     f"{type(exc).__name__}: {exc}")
+            return False
+
     def _pay_maintenance_loop(self) -> None:
+        try:
+            from network.pay_voucher import CLOSING_POLL_S
+        except BaseException as exc:
+            self.log(f"WARNING: pay closing-poll interval unavailable: "
+                     f"{type(exc).__name__}: {exc}")
+            CLOSING_POLL_S = PAY_MAINTENANCE_S
         while not self._stop.is_set():
             try:
                 self._pay_maintenance_cycle()
@@ -470,8 +487,14 @@ class Node:
                 # and no import/runtime failure may disable later cycles.
                 self.log(f"WARNING: pay maintenance loop recovered from "
                          f"{type(exc).__name__}: {exc}")
-            if self._stop.wait(PAY_MAINTENANCE_S):
-                return
+            remaining = PAY_MAINTENANCE_S
+            while remaining > 0 and not self._stop.is_set():
+                interval = min(CLOSING_POLL_S, remaining)
+                if self._stop.wait(interval):
+                    return
+                remaining -= interval
+                if self._closing_redeem_pending():
+                    break
 
     def stop(self) -> None:
         self._stop.set()

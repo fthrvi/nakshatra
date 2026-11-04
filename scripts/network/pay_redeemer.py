@@ -389,6 +389,9 @@ def run_redeemer(*, store: pay_voucher.WorkerVoucherStore | None = None,
                     log(f"skip {voucher.channel}: channel worker is not this pay wallet")
                     result["skipped"] += 1
                     continue
+                note_chain_state = getattr(vouchers, "note_chain_state", None)
+                if callable(note_chain_state):
+                    note_chain_state(voucher.channel, state)
                 if voucher.total <= state.redeemed:
                     if _cooperative_finalize(
                             rpc=rpc, book=attempts, store=vouchers,
@@ -438,6 +441,8 @@ def run_redeemer(*, store: pay_voucher.WorkerVoucherStore | None = None,
                     # Read time after the account so the deadline observation
                     # cannot precede the finalized state being judged.
                     fresh_chain_now = rpc.chain_time()
+                    if callable(note_chain_state):
+                        note_chain_state(voucher.channel, fresh_state)
                     if not _redeem_eligible(
                             channel=voucher.channel, state=fresh_state,
                             total=voucher.total, chain_now=fresh_chain_now, log=log):
@@ -464,6 +469,8 @@ def run_redeemer(*, store: pay_voucher.WorkerVoucherStore | None = None,
                         fresh = rpc.read_channel(voucher.channel, configured_program)
                     except pay_voucher.VoucherError:
                         fresh = state
+                    if callable(note_chain_state):
+                        note_chain_state(voucher.channel, fresh)
                     if _cooperative_finalize(
                             rpc=rpc, book=attempts, store=vouchers,
                             voucher=voucher, channel=fresh,

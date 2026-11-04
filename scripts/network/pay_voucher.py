@@ -66,7 +66,8 @@ VOUCHER_DOMAIN = b"NAK_PAY_VOUCHER1"
 VOUCHER_MESSAGE_LEN = 88
 RATE = 100
 REDEEM_MARGIN = 600
-ACCEPT_MARGIN = REDEEM_MARGIN + 120
+CLOSING_POLL_S = 60
+ACCEPT_MARGIN = REDEEM_MARGIN + CLOSING_POLL_S + 120
 WIRE_PREFIX = "nakpay1."
 CONTROL_REQUEST = b"nak-pay-control-v1"
 CONTROL_OK = b"nak-pay-control-ok"
@@ -874,6 +875,8 @@ class VoucherRecord:
     program: str
     total: int
     signature: bytes
+    close_at: int = 0
+    redeemed: int = 0
 
 
 def _process_start_time(pid: int) -> str | None:
@@ -924,8 +927,24 @@ class WorkerVoucherStore(_Book):
         self._db.execute(
             "CREATE TABLE IF NOT EXISTS vouchers("
             "channel TEXT PRIMARY KEY, program TEXT NOT NULL, total TEXT NOT NULL, "
-            "signature BLOB NOT NULL)"
+            "signature BLOB NOT NULL, close_at INTEGER NOT NULL DEFAULT 0, "
+            "redeemed TEXT NOT NULL DEFAULT '0')"
         )
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            voucher_columns = {
+                row[1] for row in self._db.execute("PRAGMA table_info(vouchers)")
+            }
+            for name, declaration in (
+                    ("close_at", "INTEGER NOT NULL DEFAULT 0"),
+                    ("redeemed", "TEXT NOT NULL DEFAULT '0'")):
+                if name not in voucher_columns:
+                    self._db.execute(
+                        f"ALTER TABLE vouchers ADD COLUMN {name} {declaration}")
+            self._db.execute("COMMIT")
+        except Exception:
+            self._db.execute("ROLLBACK")
+            raise
         self._db.execute(
             "CREATE TABLE IF NOT EXISTS reservations("
             "channel TEXT PRIMARY KEY, reservation_id TEXT NOT NULL, "
@@ -1019,13 +1038,42 @@ class WorkerVoucherStore(_Book):
             "SELECT * FROM vouchers WHERE channel=?", (key,)).fetchone()
         if row is None:
             return None
-        return VoucherRecord(key, row["program"], int(row["total"]), bytes(row["signature"]))
+        return VoucherRecord(
+            key, row["program"], int(row["total"]), bytes(row["signature"]),
+            int(row["close_at"]), int(row["redeemed"]))
 
     def all_latest(self) -> list[VoucherRecord]:
         """Return one latest verified voucher for every worker channel."""
-        return [VoucherRecord(row["channel"], row["program"], int(row["total"]),
-                              bytes(row["signature"]))
+        return [VoucherRecord(
+                    row["channel"], row["program"], int(row["total"]),
+                    bytes(row["signature"]), int(row["close_at"]),
+                    int(row["redeemed"]))
                 for row in self._db.execute("SELECT * FROM vouchers ORDER BY channel")]
+
+    def has_unredeemed_closing(self) -> bool:
+        """Whether local finalized knowledge requires the closing fast poll."""
+        rows = self._db.execute(
+            "SELECT total,redeemed,close_at FROM vouchers WHERE close_at > 0"
+        ).fetchall()
+        return any(int(row["total"]) > int(row["redeemed"]) for row in rows)
+
+    def note_chain_state(self, channel: str, account: ChannelAccount) -> None:
+        """Advance the last finalized Closing/redeemed facts for one voucher."""
+        key = _pubkey_text(channel, "channel")
+        with self._lock:
+            row = self._db.execute(
+                "SELECT close_at,redeemed FROM vouchers WHERE channel=?", (key,)
+            ).fetchone()
+            if row is None:
+                return
+            close_at = int(row["close_at"])
+            if account.status == "Closing":
+                close_at = max(close_at, int(account.close_at))
+            redeemed = max(int(row["redeemed"]), int(account.redeemed))
+            self._db.execute(
+                "UPDATE vouchers SET close_at=?,redeemed=? WHERE channel=?",
+                (close_at, str(redeemed), key))
+        self._secure()
 
     @staticmethod
     def _reservation_is_active(row: sqlite3.Row) -> bool:
@@ -1107,6 +1155,7 @@ class WorkerVoucherStore(_Book):
             raise VoucherError("voucher total is below the on-chain redeemed total")
         if total > account.cap:
             raise VoucherError("voucher total exceeds channel cap")
+        close_at = account.close_at if account.status == "Closing" else 0
         owner = state.read_escrow_owner(account.escrow, configured)
         # Deliberately ignore voucher.get("signer"): sender assertions have no authority.
         if not any(verify_voucher(signer, signature, configured, channel, total)
@@ -1126,14 +1175,24 @@ class WorkerVoucherStore(_Book):
                     old_total = int(previous["total"])
                     if total < old_total:
                         raise VoucherError("voucher total is below the stored total")
+                    known_close_at = max(int(previous["close_at"]), close_at)
+                    known_redeemed = max(int(previous["redeemed"]), account.redeemed)
                     if total > old_total:
                         self._db.execute(
-                            "UPDATE vouchers SET total=?,signature=? WHERE channel=?",
-                            (str(total), signature, channel))
+                            "UPDATE vouchers SET total=?,signature=?,close_at=?,redeemed=? "
+                            "WHERE channel=?",
+                            (str(total), signature, known_close_at,
+                             str(known_redeemed), channel))
+                    else:
+                        self._db.execute(
+                            "UPDATE vouchers SET close_at=?,redeemed=? WHERE channel=?",
+                            (known_close_at, str(known_redeemed), channel))
                 else:
                     self._db.execute(
-                        "INSERT INTO vouchers(channel,program,total,signature) VALUES(?,?,?,?)",
-                        (channel, configured, str(total), signature))
+                        "INSERT INTO vouchers(channel,program,total,signature,close_at,redeemed) "
+                        "VALUES(?,?,?,?,?,?)",
+                        (channel, configured, str(total), signature, close_at,
+                         str(account.redeemed)))
                 self._db.execute("COMMIT")
             except Exception:
                 self._db.execute("ROLLBACK")
