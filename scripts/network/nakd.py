@@ -1558,13 +1558,15 @@ class Node:
                 return False
             if now < int(row["next_attempt"]):
                 return False
+            # This obligation cannot be paid by any backend until the recipient publishes a key.
+            # Keep that specific, still-true reason ahead of broader operator configuration errors.
+            if not row.get("to_keyid"):
+                self._starter_pending(row, "recipient ledger key unknown", now)
+                return False
             if not chain_mode and (os.environ.get("NAKSHATRA_ESCROW", "").strip().lower() != "neuron"
                     or not callable(getattr(self.settle, "starter", None))):
                 self._starter_pending(row, "starter payment disabled (NAKSHATRA_ESCROW is not neuron)",
                                       now, attempted=False)
-                return False
-            if not row.get("to_keyid"):
-                self._starter_pending(row, "recipient ledger key unknown", now)
                 return False
             contact = self.store.contact(row["person"]) or {}
             if (contact.get("node") != row["to_keyid"]

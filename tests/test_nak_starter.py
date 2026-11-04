@@ -213,7 +213,9 @@ def test_signature_tamper_is_failed_without_calling_ledger(net, monkeypatch):
     assert final["state"] == "failed" and "signature" in final["reason"] and not ledger.calls
 
 
-def test_old_contact_request_without_ledger_key_connects_but_stays_pending(net):
+def test_old_contact_request_without_ledger_key_connects_but_stays_pending(net, monkeypatch):
+    monkeypatch.delenv("NAKSHATRA_ESCROW", raising=False)
+    monkeypatch.delenv("NAK_PAY_MODE", raising=False)
     inviter = net("inviter", caps=("nak.msg", "nak.pay"), constraints=PAY)
     consumer = net("consumer")
     code = _consumer_invite(inviter, invite_id="old_node")
@@ -224,6 +226,7 @@ def test_old_contact_request_without_ledger_key_connects_but_stays_pending(net):
     assert inviter.node._take_request(
         {"t": "env", "env": env, "body": body}, "invite", inv["nonce"])["t"] == "ack"
     _human_accept(inviter, inviter.node.store.requests()[0]["id"], "old")
+    inviter.node.reconcile_starters()
     starter = inviter.node.starter_status()["starters"][0]
     assert starter["state"] == "pending" and starter["to_keyid"] is None
     assert starter["reason"] == "recipient ledger key unknown"
