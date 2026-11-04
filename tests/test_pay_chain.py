@@ -228,9 +228,9 @@ def test_send_and_confirm_waits_past_confirmed_error_for_finalized_success(monke
 
     assert rpc.send_and_confirm(
         transaction, timeout=1, last_valid_block_height=120) == transaction.signature
+    # Once a status is observed, no expiry height check is needed or made.
     assert calls == [
-        "sendTransaction", "getSignatureStatuses", "getBlockHeight",
-        "getSignatureStatuses",
+        "sendTransaction", "getSignatureStatuses", "getSignatureStatuses",
     ]
 
 
@@ -259,19 +259,19 @@ def test_send_and_confirm_rechecks_status_after_expiry_height(monkeypatch):
     assert calls.count("sendTransaction") == 1
 
 
-def test_send_and_confirm_reports_nonfinal_error_as_expired_after_blockhash(
-        monkeypatch):
+def test_send_and_confirm_never_expires_an_observed_nonfinal_status(monkeypatch):
+    # processed (with an error) is an observation; a later miss after lastValid must
+    # not turn it into a definite "expired" that would let a caller resend.
     rpc, transaction, calls = _confirmation_rpc(monkeypatch, [
         {"err": {"InstructionError": [0, "Custom"]}, "confirmationStatus": "processed"},
     ], finalized_heights=[121])
 
-    with pytest.raises(pay_chain.VoucherError, match="expired before finalization") as caught:
+    with pytest.raises(pay_chain.VoucherError, match="final state is unknown") as caught:
         rpc.send_and_confirm(transaction, timeout=1, last_valid_block_height=120)
     assert not isinstance(caught.value, pay_chain.TransactionDefiniteFailure)
-    assert calls == [
-        "sendTransaction", "getSignatureStatuses", "getBlockHeight",
-        "getSignatureStatuses",
-    ]
+    assert "expired" not in str(caught.value)
+    assert calls.count("sendTransaction") == 1
+    assert "getBlockHeight" not in calls
 
 
 def test_send_and_confirm_rejects_finalized_status_missing_err(monkeypatch):
