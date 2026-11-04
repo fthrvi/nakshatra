@@ -1,0 +1,117 @@
+{
+  "cluster_view": {
+    "accounts": [
+      {
+        "address": "F7NB38wC4KNaUjP3frSeSWvpfc5jirvjukTgqW969a1x",
+        "data_hex": "1fd57bbbba16da9b66be7e332c7a453332bd9d0a7f7db055f5c5ef1a06ada66d98b39fb6810c473acc443d2224b0747df9128abe0cb84ce79c17846026f8e50572422f50f90f6e5d000000000000000000000000000000000300000000000000040000000000000007000000000000000066be7e332c7a453332bd9d0a7f7db055f5c5ef1a06ada66d98b39fb6810c473afffe00000000000000000000000000000000",
+        "lamports": 1691280,
+        "owner": "GLWqQsSqUsDkPvkc8rxcoQUyro7ZQd5denht21NtdTTo"
+      }
+    ],
+    "ata_rent_exempt_lamports": 2039280,
+    "chain_time": 2000000000,
+    "delegate_rent_exempt_lamports": 1691280,
+    "genesis_hash": "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG",
+    "network_fee_lamports": 5000,
+    "program_executable": true,
+    "program_owner": "BPFLoaderUpgradeab1e11111111111111111111111",
+    "program_sha256": "8ee0882be85b67e509bfa38681ab93652f9e1acb52987be23f723caa4c560f67",
+    "programdata_address": "97gxB89oiTezhWHdyhovCei33k9Bkn9ZqppamVKenF1d",
+    "programdata_owner": "BPFLoaderUpgradeab1e11111111111111111111111",
+    "upgrade_authority": "oapfTk8FG2np1vSoGANkbijWiQApHZMFAytSdCoass9",
+    "valid_recent_blockhashes": [
+      "3ARMH9zfVCnU2TKiphU4xcEyWdA45fc1sjKEtYMdf3gr"
+    ],
+    "withdraw_delay_seconds": 86400
+  },
+  "expected_plan": {
+    "instructions": [
+      {
+        "accounts": [
+          {
+            "pubkey": "7v54NWdBtkjuAFJrLGsS2SXnuk8nKam81mZJeeYxVFi9",
+            "signer": true,
+            "writable": true
+          },
+          {
+            "pubkey": "mBKqcnGotbsSb5vNrdyhzZ5EhqZdids9QYiTRckvi7v",
+            "signer": false,
+            "writable": true
+          }
+        ],
+        "data_hex": "0200000080c3c90100000000",
+        "name": "system_transfer",
+        "program_id": "11111111111111111111111111111111"
+      }
+    ],
+    "message_sha256": "1fe4f7012983745ffa4646ef1bb67b845133705aec67019d85addfd95e804af3",
+    "operation": "self_top_up",
+    "recent_blockhash": "3ARMH9zfVCnU2TKiphU4xcEyWdA45fc1sjKEtYMdf3gr",
+    "rendered_fields": [
+      {
+        "name": "wallet",
+        "value": "7v54NWdBtkjuAFJrLGsS2SXnuk8nKam81mZJeeYxVFi9"
+      },
+      {
+        "name": "node",
+        "value": "mBKqcnGotbsSb5vNrdyhzZ5EhqZdids9QYiTRckvi7v"
+      },
+      {
+        "name": "escrow",
+        "value": "F7NB38wC4KNaUjP3frSeSWvpfc5jirvjukTgqW969a1x"
+      },
+      {
+        "name": "network_fee_lamports",
+        "value": 5000
+      },
+      {
+        "name": "network_fee_sol",
+        "value": "0.000005000"
+      },
+      {
+        "name": "network_fee_ceiling_lamports",
+        "value": 10000
+      },
+      {
+        "name": "sol_destination",
+        "value": "mBKqcnGotbsSb5vNrdyhzZ5EhqZdids9QYiTRckvi7v"
+      },
+      {
+        "name": "sol_lamports",
+        "value": 30000000
+      },
+      {
+        "name": "sol_amount",
+        "value": "0.030000000"
+      },
+      {
+        "name": "sol_ceiling_lamports",
+        "value": 30000000
+      }
+    ],
+    "wallet_id": "7v54NWdBtkjuAFJrLGsS2SXnuk8nKam81mZJeeYxVFi9"
+  },
+  "name": "self_top_up",
+  "policy": {
+    "genesis_hash": "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG",
+    "max_ata_rent_lamports": 2040000,
+    "max_delegate_micro_usdc": 5000000,
+    "max_delegate_rent_lamports": 1700000,
+    "max_delegate_ttl_s": 2592000,
+    "max_network_fee_lamports": 10000,
+    "max_self_sol_lamports": 30000000,
+    "max_starter_cap_total_micro_usdc": 1000000,
+    "max_starter_micro_usdc": 1000000,
+    "max_starter_sol_lamports": 10000000,
+    "max_starter_ttl_s": 2592000,
+    "max_withdraw_micro_usdc": 5000000,
+    "mint_id": "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU",
+    "node_id": "mBKqcnGotbsSb5vNrdyhzZ5EhqZdids9QYiTRckvi7v",
+    "program_id": "GLWqQsSqUsDkPvkc8rxcoQUyro7ZQd5denht21NtdTTo",
+    "program_sha256": "8ee0882be85b67e509bfa38681ab93652f9e1acb52987be23f723caa4c560f67",
+    "programdata_address": "97gxB89oiTezhWHdyhovCei33k9Bkn9ZqppamVKenF1d",
+    "upgrade_authority": "oapfTk8FG2np1vSoGANkbijWiQApHZMFAytSdCoass9",
+    "wallet_id": "7v54NWdBtkjuAFJrLGsS2SXnuk8nKam81mZJeeYxVFi9"
+  },
+  "raw_message_hex": "0100010366be7e332c7a453332bd9d0a7f7db055f5c5ef1a06ada66d98b39fb6810c473a0b513ad9b4924015ca0902ed079044d3ac5dbec2306f06948c10da8eb6e39f2d0000000000000000000000000000000000000000000000000000000000000000202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f01020200010c0200000080c3c90100000000"
+}

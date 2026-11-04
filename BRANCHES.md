@@ -5,6 +5,7 @@ On create add a row (status=active, owner). On merge flip to `merged→<sha>`.
 
 | branch | sector | description | base | status | owner |
 |---|---|---|---|---|---|
+| pay/broker-wallet-decoder | payments | M4c 2c step 3: pure stdlib decoder/policy for the broker-held pay wallet + golden/hostile fixtures; no broker wiring | forgejo/docs/pay-broker-wallet@0ece6ec | active | codex for claude/trisul-aa network lane (hub) |
 | test/starter-reason-flake | network | Preserve the specific pending starter reason when reconcile observes a separate escrow prerequisite. | forgejo/main@aef5c91 | merged→ec0a457 | codex for claude/trisul-aa network lane (hub) |
 | docs/pay-broker-wallet | payments | M4c part 2c design: import the Solana pay wallet into the approval broker, strictly decode approved devnet messages, and keep public-only paid-session paths working. | forgejo/main@aef5c91 | active | codex for claude/trisul-aa network lane (hub) |
 | pay/redeemer | pay | M5: worker-node redeemer (ed25519 voucher + channel_redeem, durable attempts, threshold/24h/closing-urgent), cooperative finalize, payer close-request/finalize to reclaim rent and collateral. | forgejo/main@dcf7cdd | merged→7abca10 | claude/trisul-aa network lane (hub) |
