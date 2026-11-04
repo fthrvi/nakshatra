@@ -284,6 +284,64 @@ def test_p2_transfer_recipient_cannot_alias_protected_or_role_account(recipient:
     assert refused.value.code == "account_template"
 
 
+def test_p2_self_top_up_node_cannot_alias_escrow():
+    wallet_policy = fixture_generator.base_policy()
+    escrow = policy_module._derive(wallet_policy)["escrow"]
+    wallet_policy = replace(wallet_policy, node_id=escrow)
+    raw = fixture_generator._compile([
+        pay_chain.system_transfer(fixture_generator.WALLET, escrow, 1)])
+    with pytest.raises(policy_module.PolicyRefusal) as refused:
+        _decode(raw, fixture_generator.base_view(), wallet_policy)
+    assert refused.value.code == "account_template"
+
+
+@pytest.mark.parametrize(
+    "role",
+    ["vault", "ata", "mint", "fee_vault"],
+)
+def test_p2_starter_recipient_cannot_alias_canonical_role(role: str):
+    wallet_policy = fixture_generator.base_policy()
+    derived = policy_module._derive(wallet_policy)
+    recipient = wallet_policy.mint_id if role == "mint" else derived[role]
+    raw = fixture_generator._compile(pay_chain.delegate_set(
+        fixture_generator.WALLET, recipient, 1,
+        fixture_generator.CHAIN_TIME + 1, pay_chain.DELEGATE_OPEN_CHANNEL,
+        fixture_generator.PROGRAM))
+    with pytest.raises(policy_module.PolicyRefusal) as refused:
+        _decode(raw, fixture_generator.base_view(), wallet_policy)
+    assert refused.value.code == "account_template"
+
+
+@pytest.mark.parametrize(
+    "golden,expected_extra_roles",
+    [
+        ("self_delegate", {"delegate_pda"}),
+        ("starter_delegate", {"delegate_pda", "recipient"}),
+        ("self_top_up", set()),
+        ("withdraw_request", set()),
+        ("withdraw_execute", set()),
+    ],
+    ids=["self-delegate", "starter-grant", "self-top-up",
+         "withdraw-request", "withdraw-execute"],
+)
+def test_p2_every_template_checks_the_complete_role_set(
+        monkeypatch: pytest.MonkeyPatch, golden: str,
+        expected_extra_roles: set[str]):
+    captured: list[dict[str, str]] = []
+    monkeypatch.setattr(
+        policy_module, "_validate_role_separation",
+        lambda roles: captured.append(dict(roles)))
+    raw, view = fixture_generator.golden_messages()[golden]
+    approved = (fixture_generator.approved_withdraw_requests(view)
+                if golden == "withdraw_execute" else frozenset())
+    _decode(raw, view, approved=approved)
+    assert len(captured) == 1
+    assert set(captured[0]) == {
+        "wallet", "node", "config", "escrow", "vault", "ata", "mint",
+        "fee_vault", "event_authority", *expected_extra_roles,
+    }
+
+
 @pytest.mark.parametrize("offset", [72, 109, 129], ids=["delegate", "is-native", "close-authority"])
 def test_p2_classic_spl_account_rejects_invalid_coption_tags(offset: int):
     raw, view = fixture_generator.golden_messages()["withdraw_execute"]
@@ -353,6 +411,17 @@ def test_p3_older_starter_displays_real_prestate_and_reset():
     assert fields["pre_spent_micro_usdc"] == 999_999
     assert fields["older_generation_reset"] is True
     assert fields["resulting_remaining_micro_usdc"] == 1_000_000
+
+
+def test_p3_older_self_delegate_displays_real_prestate_and_reset():
+    raw, _view = fixture_generator.golden_messages()["self_delegate"]
+    plan = _decode(raw, _delegate_view(
+        fixture_generator.NODE, generation=6, cap=1_000_000,
+        spent=999_999, disabled=True))
+    fields = _fields(plan)
+    assert fields["pre_cap_total_micro_usdc"] == 1_000_000
+    assert fields["pre_spent_micro_usdc"] == 999_999
+    assert fields["older_generation_reset"] is True
 
 
 def test_p3_rent_displays_actual_shortfall_and_worst_case():

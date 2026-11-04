@@ -176,7 +176,7 @@ fields below are little-endian.
 
 | Allowed instruction | Exact data | Required ordered accounts and signers | Approval fields | Ceiling |
 |---|---|---|---|---|
-| `nakshatra_pay.delegate_set` (self ensure) | `8b10e667fea614a5` + delegate key (32) + `cap_total:u64` + `expires_at:i64` + `flags:u8` | wallet **signer,writable**; canonical config; canonical wallet escrow; canonical delegate PDA **writable**; System Program; canonical event authority; program id | wallet, own node delegate, cap in micro-USDC and USDC, cap ceiling, expiry, flags, escrow, actual and worst-case delegate rent, optional SOL top-up, message digest | absolute encoded `cap_total` `NAK_WALLET_MAX_DELEGATE_MICRO_USDC`; expiry horizon `NAK_WALLET_MAX_DELEGATE_TTL_S`; rent and optional transfer ceilings below |
+| `nakshatra_pay.delegate_set` (self ensure) | `8b10e667fea614a5` + delegate key (32) + `cap_total:u64` + `expires_at:i64` + `flags:u8` | wallet **signer,writable**; canonical config; canonical wallet escrow; canonical delegate PDA **writable**; System Program; canonical event authority; program id | wallet, own node delegate, real pre-state spent/cap, explicit older-generation reset disclosure, cap in micro-USDC and USDC, cap ceiling, expiry, flags, escrow, actual and worst-case delegate rent, optional SOL top-up, message digest | absolute encoded `cap_total` `NAK_WALLET_MAX_DELEGATE_MICRO_USDC`; expiry horizon `NAK_WALLET_MAX_DELEGATE_TTL_S`; rent and optional transfer ceilings below |
 | `nakshatra_pay.delegate_set` (starter grant) | same discriminator/layout; `flags` must equal `OPEN_CHANNEL=1` | same account layout; delegate PDA must be derived from escrow and the decoded recipient node key | inviter wallet, recipient node, real pre-state spent/cap, explicit older-generation reset disclosure, resulting remaining capacity and total cap, expiry, actual and worst-case delegate rent, optional SOL top-up, escrow, digest | absolute encoded `cap_total` must be no greater than either `NAK_WALLET_MAX_STARTER_CAP_TOTAL_MICRO_USDC` or `NAK_WALLET_MAX_STARTER_MICRO_USDC`; expiry horizon `NAK_WALLET_MAX_STARTER_TTL_S`; rent and transfer ceilings below |
 | `nakshatra_pay.escrow_withdraw_request` | `f6f379c6f277d27a` + `amount:u64` | wallet **signer**; canonical config; canonical wallet escrow **writable**; canonical vault; event authority; program id | wallet, amount in micro-USDC and USDC, escrow, vault, earliest execute time from trusted chain state, digest | `NAK_WALLET_MAX_WITHDRAW_MICRO_USDC` |
 | `nakshatra_pay.escrow_withdraw_execute` | `ac5dcf14503aa8f1` only | wallet **signer**; canonical config; pinned mint; canonical escrow, vault and wallet ATA **writable**; classic Token Program; event authority; program id | wallet, pending amount, withdrawal ceiling and unlock time from trusted devnet state, escrow, vault, destination ATA, digest | pending amount must be at or below `NAK_WALLET_MAX_WITHDRAW_MICRO_USDC` |
@@ -343,8 +343,9 @@ Refuse before approval and again before signing on any of the following:
 - a non-canonical config, escrow, vault, delegate, event authority, or ATA; a System transfer whose
   source is not the wallet or destination is not the decoded self/starter node;
 - any semantic role account that aliases another role or a protected runtime id (payment program,
-  System, classic Token, ATA, ed25519, loaders, Compute Budget, or sysvars), checked before privilege
-  aggregation;
+  System, classic Token, ATA, ed25519, loaders, Compute Budget, or sysvars), checked uniformly before
+  privilege aggregation for every template across the wallet, node or recipient, config, escrow,
+  vault, ATA, mint, fee vault, delegate PDA, and event-authority roles the plan derives or displays;
 - delegate flags, expiry, cap, starter resulting remaining capacity, withdrawal amount, pending
   execute amount, SOL transfer, network fee, delegate rent, or ATA rent above its broker-environment
   ceiling;

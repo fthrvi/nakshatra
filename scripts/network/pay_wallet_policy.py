@@ -845,40 +845,12 @@ def _expected_instructions(message: _Message, policy: WalletPolicy,
     return operation, tuple(expected), details
 
 
-def _validate_role_separation(policy: WalletPolicy, derived: dict[str, str],
-                              operation: str, details: dict[str, object]) -> None:
+def _validate_role_separation(roles: dict[str, str]) -> None:
     """Reject semantic-role aliases before Solana privilege aggregation."""
-    roles: list[tuple[str, str]]
-    if operation in {"self_delegate", "starter_grant"}:
-        roles = [
-            ("wallet", policy.wallet_id), ("node", policy.node_id),
-            ("config", derived["config"]),
-            ("escrow", derived["escrow"]), ("event", derived["event"]),
-            ("delegate", str(details["delegate"])),
-        ]
-        if operation == "starter_grant":
-            roles.append(("recipient", str(details["delegate_key"])))
-    elif operation == "self_top_up":
-        roles = [("wallet", policy.wallet_id), ("node", policy.node_id)]
-    elif operation == "withdraw_request":
-        roles = [
-            ("wallet", policy.wallet_id), ("node", policy.node_id),
-            ("config", derived["config"]),
-            ("escrow", derived["escrow"]), ("vault", derived["vault"]),
-            ("event", derived["event"]),
-        ]
-    else:
-        roles = [
-            ("wallet", policy.wallet_id), ("node", policy.node_id),
-            ("config", derived["config"]),
-            ("mint", policy.mint_id), ("escrow", derived["escrow"]),
-            ("vault", derived["vault"]), ("destination_ata", derived["ata"]),
-            ("event", derived["event"]),
-        ]
-    protected = _PROTECTED_RUNTIME_IDS | {policy.program_id}
-    if any(address in protected for _name, address in roles):
+    protected = _PROTECTED_RUNTIME_IDS | {NAKSHATRA_PAY_PROGRAM_ID}
+    if any(address in protected for address in roles.values()):
         _refuse("account_template")
-    addresses = [address for _name, address in roles]
+    addresses = list(roles.values())
     if len(set(addresses)) != len(addresses):
         _refuse("account_template")
 
@@ -952,7 +924,22 @@ def decode_and_check(
     _existing_config(policy, cluster_view, derived, accounts)
     escrow = _existing_escrow(policy, cluster_view, derived, accounts)
     operation, expected, details = _expected_instructions(message, policy, derived)
-    _validate_role_separation(policy, derived, operation, details)
+    roles = {
+        "wallet": policy.wallet_id,
+        "node": policy.node_id,
+        "config": derived["config"],
+        "escrow": derived["escrow"],
+        "vault": derived["vault"],
+        "ata": derived["ata"],
+        "mint": policy.mint_id,
+        "fee_vault": derived["fee_vault"],
+        "event_authority": derived["event"],
+    }
+    if details["delegate"]:
+        roles["delegate_pda"] = str(details["delegate"])
+    if operation == "starter_grant":
+        roles["recipient"] = str(details["delegate_key"])
+    _validate_role_separation(roles)
     _validate_compilation(message, policy, expected)
 
     fields: list[PlanField] = [
@@ -1037,14 +1024,14 @@ def decode_and_check(
             PlanField("delegate_rent_worst_case_lamports", rent_worst_case),
             PlanField("delegate_rent_ceiling_lamports", policy.max_delegate_rent_lamports),
         ))
+        fields.extend((PlanField("pre_cap_total_micro_usdc", pre_cap),
+                       PlanField("pre_spent_micro_usdc", pre_spent),
+                       PlanField("older_generation_reset", older_generation_reset)))
         if is_self:
             fields.append(PlanField("cap_total_ceiling_micro_usdc",
                                     policy.max_delegate_micro_usdc))
         else:
-            fields.extend((PlanField("pre_cap_total_micro_usdc", pre_cap),
-                           PlanField("pre_spent_micro_usdc", pre_spent),
-                           PlanField("older_generation_reset", older_generation_reset),
-                           PlanField("resulting_remaining_micro_usdc", remaining),
+            fields.extend((PlanField("resulting_remaining_micro_usdc", remaining),
                            PlanField("starter_cap_total_ceiling_micro_usdc",
                                      policy.max_starter_cap_total_micro_usdc),
                            PlanField("starter_remaining_ceiling_micro_usdc",

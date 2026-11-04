@@ -158,6 +158,18 @@
         "value": 1700000
       },
       {
+        "name": "pre_cap_total_micro_usdc",
+        "value": 0
+      },
+      {
+        "name": "pre_spent_micro_usdc",
+        "value": 0
+      },
+      {
+        "name": "older_generation_reset",
+        "value": false
+      },
+      {
         "name": "cap_total_ceiling_micro_usdc",
         "value": 5000000
       },
