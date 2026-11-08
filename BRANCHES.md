@@ -5,6 +5,7 @@ On create add a row (status=active, owner). On merge flip to `merged→<sha>`.
 
 | branch | sector | description | base | status | owner |
 |---|---|---|---|---|---|
+| pay/broker-wallet-client | payments | M4c 2c step 5: pay_wallet_custody file-or-broker boundary, compile-once/assemble seam, rv5#3 + setup-rerun broker-custody fixes, durable attempt journal/reconciler for broker sends, CLI+starter wiring, fake-transport tests only. | forgejo/main@7af5f24 | active | codex for claude/trisul-aa network lane (hub) |
 | pay/broker-wallet-decoder | payments | M4c 2c step 3: pure stdlib decoder/policy for the broker-held pay wallet + golden/hostile fixtures; no broker wiring | forgejo/docs/pay-broker-wallet@0ece6ec | merged→68841c5 | codex for claude/trisul-aa network lane (hub) |
 | pay/starter-attempt-fence | payments | Fence starter and redeemer durable-attempt replacement across non-final observations and the status/height finalization race. | forgejo/main@fbdd3ce | merged→276b29d | codex for claude/trisul-aa network lane (hub) |
 | test/starter-reason-flake | network | Preserve the specific pending starter reason when reconcile observes a separate escrow prerequisite. | forgejo/main@aef5c91 | merged→ec0a457 | codex for claude/trisul-aa network lane (hub) |
