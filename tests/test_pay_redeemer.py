@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import base64
 import builtins
+import fcntl
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -13,7 +15,8 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from network import nak, nakd, pay_chain, pay_redeemer, pay_voucher  # noqa: E402
+from network import (nak, nakd, pay_chain, pay_redeemer, pay_voucher,  # noqa: E402
+                     pay_wallet, pay_wallet_custody)
 
 
 PROGRAM = "GLWqQsSqUsDkPvkc8rxcoQUyro7ZQd5denht21NtdTTo"
@@ -34,6 +37,36 @@ CHANNEL2 = pay_chain.channel_pda(ESCROW, 4, 8, PROGRAM)[0]
 SIGNER_SEED = bytes([63]) * 32
 SIGNER = pay_chain.b58encode(ed25519.Ed25519PrivateKey.from_private_bytes(
     SIGNER_SEED).public_key().public_bytes_raw())
+
+
+@pytest.fixture(autouse=True)
+def file_wallet_home(tmp_path, monkeypatch):
+    """Give low-level money-path tests the same on-disk identity production uses."""
+    home = tmp_path / "file-wallet-home"
+    pay_dir = home / ".nakshatra" / "pay"
+    pay_dir.mkdir(parents=True, mode=0o700)
+    pay_dir.chmod(0o700)
+    seed_path = pay_dir / "wallet.ed25519"
+    seed_path.write_bytes(WALLET_SEED)
+    seed_path.chmod(0o600)
+    (pay_dir / "wallet.pub").write_text(WALLET["address"] + "\n", encoding="ascii")
+    (pay_dir / "custody").write_text("file\n", encoding="ascii")
+    monkeypatch.setenv("HOME", str(home))
+    return home
+
+
+def _custody_lock_available(home: Path) -> bool:
+    path = home / ".nakshatra" / "pay" / "custody.lock"
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return True
+    finally:
+        os.close(fd)
 
 
 class VoucherStore:
@@ -97,7 +130,7 @@ class Rpc:
     def rent_exemption(self, space, *, commitment):
         assert (space, commitment) == (165, "finalized")
         return 200_000
-    def send_and_confirm(self, transaction, *, last_valid_block_height):
+    def send_and_confirm(self, transaction, *, last_valid_block_height, on_sent=None):
         assert last_valid_block_height == 100
         # Mutation checked: moving AttemptBook.record below broadcast makes this
         # fail because the signed intent is absent at the first send boundary.
@@ -110,6 +143,8 @@ class Rpc:
             db.close()
         assert row == (transaction.signature,)
         self.sent += 1
+        if on_sent is not None:
+            on_sent(transaction.signature)
         self.status = {"err": None, "confirmationStatus": "finalized"}
         self.state = channel_state(redeemed=2_000_000)
         return transaction.signature
@@ -147,6 +182,63 @@ def test_redeem_records_signed_attempt_before_broadcast(tmp_path):
     with pay_redeemer.AttemptBook(tmp_path / "redeems.sqlite") as book:
         assert book.unresolved(CHANNEL) == []
         assert book.timing(CHANNEL) == (rpc.now, rpc.now)
+
+
+def test_file_redeem_holds_custody_lock_until_broadcast_and_keeps_transaction_bytes(
+        tmp_path, file_wallet_home):
+    voucher_store = VoucherStore()
+
+    class LockAwareRpc(Rpc):
+        transaction = None
+
+        def send_and_confirm(self, transaction, *, last_valid_block_height, on_sent=None):
+            assert not _custody_lock_available(file_wallet_home)
+            self.transaction = transaction
+            assert on_sent is not None
+            on_sent(transaction.signature)
+            assert _custody_lock_available(file_wallet_home)
+            return super().send_and_confirm(
+                transaction, last_valid_block_height=last_valid_block_height)
+
+    rpc = LockAwareRpc(tmp_path / "redeems.sqlite")
+    result = pay_redeemer.run_redeemer(
+        store=voucher_store, rpc=rpc, wallet=WALLET, program=PROGRAM, mint=MINT,
+        attempts_path=tmp_path / "redeems.sqlite",
+        lock_path=tmp_path / "redeem.lock")
+
+    expected_instructions = pay_chain.channel_redeem(
+        WALLET["address"], OWNER, 4, 7, WALLET["address"],
+        voucher_store.row.total, SIGNER, voucher_store.row.signature, PROGRAM, MINT)
+    expected = pay_chain.sign_transaction(
+        expected_instructions, WALLET["address"], BLOCKHASH,
+        {WALLET["address"]: WALLET_SEED})
+    assert result["sent"] == 1
+    assert rpc.transaction.data == expected.data
+
+
+def test_file_redeem_refuses_custody_import_after_initial_wallet_load(
+        tmp_path, file_wallet_home):
+    class ImportingRpc(Rpc):
+        imported = False
+
+        def read_channel(self, channel, program):
+            state = super().read_channel(channel, program)
+            if not self.imported:
+                self.imported = True
+                with pay_wallet_custody.custody_lock(home=file_wallet_home):
+                    (file_wallet_home / ".nakshatra/pay/custody").write_text(
+                        "broker\n", encoding="ascii")
+                    (file_wallet_home / ".nakshatra/pay/wallet.ed25519").unlink()
+            return state
+
+    rpc = ImportingRpc(tmp_path / "redeems.sqlite")
+    with pytest.raises(SystemExit, match="custody mode changed.*nothing was signed"):
+        pay_redeemer.run_redeemer(
+            store=VoucherStore(), rpc=rpc, program=PROGRAM, mint=MINT,
+            attempts_path=tmp_path / "redeems.sqlite",
+            lock_path=tmp_path / "redeem.lock")
+
+    assert rpc.sent == 0
 
 
 def test_redeem_after_close_at_is_never_sent(tmp_path):
@@ -450,6 +542,7 @@ def test_cooperative_finalize_rereads_latest_voucher_before_send(tmp_path):
             finalized = pay_redeemer._cooperative_finalize(
                 rpc=rpc, book=attempts, store=store, voucher=old,
                 channel=state, owner=OWNER, executor=WALLET, chain_now=1_000,
+                file_wallet_id=WALLET["address"],
                 dry_run=False, log=lambda _line: None)
         # Mutation checked: trusting the stale all_latest snapshot finalizes
         # despite the store already holding an unredeemed newer voucher.
@@ -552,7 +645,7 @@ class PayerRpc:
     def balance(self, address, *, commitment):
         assert address == self.node
         return 1_000_000
-    def send_and_confirm(self, transaction, *, last_valid_block_height):
+    def send_and_confirm(self, transaction, *, last_valid_block_height, on_sent=None):
         with sqlite3.connect(self.path) as db:
             assert db.execute(
                 "SELECT 1 FROM attempts WHERE signature=?",
@@ -567,6 +660,8 @@ class PayerRpc:
                 self.state.cap, self.state.redeemed, self.state.fee_bps_snapshot,
                 "Closing", self.now + 86_400, self.state.rent_payer, self.state.bump)
         self.sent += 1
+        if on_sent is not None:
+            on_sent(transaction.signature)
         self.status = {"err": None, "confirmationStatus": "finalized"}
         return transaction.signature
 
@@ -673,6 +768,53 @@ def test_close_request_uses_local_owner_wallet_for_old_delegate_channel(tmp_path
         assert book.for_channel(CHANNEL).status == "Closing"
 
 
+def test_legacy_owner_close_refuses_custody_import_after_wallet_load(
+        tmp_path, file_wallet_home):
+    worker_hex = pay_chain.pubkey_bytes(WALLET["address"]).hex()
+    wallet = pay_wallet.load_wallet_identity(file_wallet_home)
+    with pay_voucher.PayerChannelBook(tmp_path / "channels.sqlite") as book:
+        book.put(program=PROGRAM, channel=CHANNEL, worker_key=worker_hex,
+                 cap=5_000_000, max_signed_total=10)
+
+        class ImportingOwnerRpc(PayerRpc):
+            imported = False
+
+            def __init__(self):
+                super().__init__(tmp_path / "redeems.sqlite", book)
+                self.state = pay_voucher.ChannelAccount(
+                    ESCROW, 4, 7, WALLET["address"], SIGNER, None, 5_000_000,
+                    10, 300, "Open", 0, self.node, 1)
+
+            def read_channel(self, channel, program):
+                state = super().read_channel(channel, program)
+                if not self.imported:
+                    self.imported = True
+                    with pay_wallet_custody.custody_lock(home=file_wallet_home):
+                        (file_wallet_home / ".nakshatra/pay/custody").write_text(
+                            "broker\n", encoding="ascii")
+                        (file_wallet_home / ".nakshatra/pay/wallet.ed25519").unlink()
+                return state
+
+            def read_escrow_owner(self, escrow, program):
+                assert (escrow, program) == (ESCROW, PROGRAM)
+                return WALLET["address"]
+
+            def balance(self, address, *, commitment):
+                assert address == WALLET["address"] and commitment == "finalized"
+                return 1_000_000
+
+        rpc = ImportingOwnerRpc()
+        with pytest.raises(SystemExit, match="custody mode changed.*nothing was signed"):
+            pay_redeemer.request_close(
+                channels=[CHANNEL], book=book, rpc=rpc, program=PROGRAM, wallet=wallet,
+                node_seed=rpc.node_seed,
+                node_public=pay_voucher.public_key_bytes(rpc.node_seed),
+                attempts_path=tmp_path / "redeems.sqlite",
+                lock_path=tmp_path / "redeem.lock")
+
+        assert rpc.sent == 0
+
+
 def test_close_request_finalized_failure_restores_open_without_daemon(
         tmp_path, monkeypatch):
     monkeypatch.delenv("NAK_PAY_REDEEM", raising=False)
@@ -691,13 +833,15 @@ def test_close_request_finalized_failure_restores_open_without_daemon(
                 self.channel_reads += 1
                 return super().read_channel(channel, program)
 
-            def send_and_confirm(self, transaction, *, last_valid_block_height):
+            def send_and_confirm(self, transaction, *, last_valid_block_height, on_sent=None):
                 with sqlite3.connect(self.path) as db:
                     assert db.execute(
                         "SELECT 1 FROM attempts WHERE signature=?",
                         (transaction.signature,)).fetchone() == (1,)
                 assert self.book.for_channel(CHANNEL).status == "Closing"
                 self.sent += 1
+                if on_sent is not None:
+                    on_sent(transaction.signature)
                 self.status = {
                     "err": {"InstructionError": [0, "Custom"]},
                     "confirmationStatus": "finalized",
@@ -906,11 +1050,12 @@ def test_broker_cli_channels_close_and_finalize_without_wallet_seed(
                 ESCROW, 4, 7, WALLET["address"], self.node, None, 5_000_000,
                 10, 300, "Open", 0, self.node, 1)
 
-        def send_and_confirm(self, transaction, *, last_valid_block_height):
+        def send_and_confirm(self, transaction, *, last_valid_block_height, on_sent=None):
             with pay_voucher.PayerChannelBook() as current:
                 self.book = current
                 return super().send_and_confirm(
-                    transaction, last_valid_block_height=last_valid_block_height)
+                    transaction, last_valid_block_height=last_valid_block_height,
+                    on_sent=on_sent)
 
     rpc = CliRpc()
     monkeypatch.setattr(
@@ -963,8 +1108,7 @@ def test_nakd_pay_cycle_contains_payment_import_failure(monkeypatch):
 
 
 def test_nakd_closing_voucher_is_redeemed_by_next_poll_before_margin(
-        tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path))
+        tmp_path, monkeypatch, file_wallet_home):
     close_at = 50_000
     clock = {"now": close_at - pay_voucher.ACCEPT_MARGIN - 2}
     attempts_path = tmp_path / ".nakshatra/pay/redeems.sqlite"

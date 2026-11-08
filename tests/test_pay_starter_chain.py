@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import sqlite3
 import struct
@@ -364,6 +365,29 @@ def test_finalized_error_allows_a_new_attempt(chain_node, monkeypatch):
     assert len(row["chain_attempts"]) == 2
 
 
+def test_finalized_rpc_error_is_replaced_with_closed_code_before_persistence(
+        chain_node):
+    node, wallet, row = chain_node
+    rpc = StarterRpc(wallet, vault_amount=2_000_000)
+    signature = _record_chain_attempt(row)
+    secret = "Bearer SECRET-TOKEN"
+    rpc.statuses[signature] = {
+        "err": {"rpc_body": secret},
+        "confirmationStatus": "finalized",
+    }
+    logs = []
+    node.log = logs.append
+
+    receipt, unresolved = node._resolve_starter_attempts(row, rpc, rpc.chain_now)
+
+    assert receipt is None and unresolved is False
+    assert row["chain_attempts"][0]["resolution"] == "failed"
+    assert row["chain_attempts"][0]["error"] == "finalized-error"
+    persisted = json.dumps(node.store.updates, sort_keys=True)
+    assert secret not in persisted
+    assert all(secret not in line for line in logs)
+
+
 def test_processed_error_with_valid_blockhash_blocks_replacement(chain_node, monkeypatch):
     node, wallet, row = chain_node
     rpc = StarterRpc(wallet, vault_amount=2_000_000)
@@ -704,6 +728,40 @@ def test_attempt_starter_chain_mode_keeps_approval_gates_and_skips_ledger(monkey
     assert row["receipt"]["signature"] == "chain-signature"
 
 
+@pytest.mark.parametrize(("stage", "closed_reason"), [
+    ("chain-time", "chain-time-unavailable"),
+    ("attempt-status", "attempt-status-unavailable"),
+    ("chain-send", "chain-send-unavailable"),
+])
+def test_chain_rpc_exceptions_persist_only_closed_reason_codes(
+        monkeypatch, stage, closed_reason):
+    node, row = _attempt_node()
+    secret = "Bearer SECRET-TOKEN"
+    logs = []
+    node.log = logs.append
+    monkeypatch.setenv("NAK_PAY_MODE", "chain")
+    monkeypatch.setenv("NAK_PAY_RPC", "http://127.0.0.1:8899")
+    monkeypatch.setenv("NAK_PAY_PROGRAM", PROGRAM)
+
+    if stage == "chain-time":
+        node._starter_chain_time = lambda: (_ for _ in ()).throw(
+            pay_voucher.VoucherError(secret))
+    elif stage == "attempt-status":
+        row["chain_attempts"] = [{"signature": "recorded"}]
+        node._resolve_recorded_starter_attempts = lambda *_args: (
+            (_ for _ in ()).throw(pay_voucher.VoucherError(secret)))
+    else:
+        node._chain_starter = lambda *_args, **_kwargs: (
+            (_ for _ in ()).throw(ValueError(secret)))
+
+    assert node._attempt_starter(row["invite_id"], now=200) is False
+
+    assert row["reason"] == closed_reason
+    persisted = json.dumps(node.store.updates, sort_keys=True)
+    assert secret not in persisted
+    assert all(secret not in line for line in logs)
+
+
 @pytest.mark.parametrize("gate", [
     "unapproved", "missing-grant", "unauthenticated", "tampered", "expired",
 ])
@@ -939,7 +997,7 @@ def test_missing_err_status_is_refused_without_marking_starter_paid(monkeypatch)
 
     assert rpc.status_calls == [row["chain_attempts"][0]["signature"]]
     assert row["state"] == "pending" and row["receipt"] is None
-    assert "malformed signature status" in row["reason"]
+    assert row["reason"] == "attempt-status-unavailable"
     assert not sent
 
 

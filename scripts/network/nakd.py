@@ -150,6 +150,10 @@ REPORT_HOLD_ID_RE = _re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 from network.dlp import outbound_problem  # noqa: E402
 
 
+class _StarterRefusal(ValueError):
+    """A locally constructed, safe-to-persist starter policy refusal."""
+
+
 def _http_post_json(url: str, body: dict) -> dict:
     """Small report-only HTTP client. Operator HTTP stays in the interactive CLI."""
     request = Request(url, data=json.dumps(body, separators=(",", ":")).encode(),
@@ -1255,7 +1259,7 @@ class Node:
                         "ts": chain_now, "existing": True,
                     }, False)
                 attempt["resolution"] = "failed"
-                attempt["error"] = str(status.get("err"))[:200]
+                attempt["error"] = "finalized-error"
                 attempts_changed = True
                 continue
             if status is not None:
@@ -1301,27 +1305,27 @@ class Node:
 
         credits = int(row["amount"])
         if credits <= 0 or credits % STARTER_RATE:
-            raise ValueError(
+            raise _StarterRefusal(
                 f"starter {credits} credits is not a whole number of micro-USDC")
         cap = credits // STARTER_RATE
         try:
             node_public = bytes.fromhex(row["to_keyid"])
         except (TypeError, ValueError) as exc:
-            raise ValueError("starter recipient node key is not 32-byte hex") from exc
+            raise _StarterRefusal("starter recipient node key is not 32-byte hex") from exc
         if len(node_public) != 32:
-            raise ValueError("starter recipient node key is not 32-byte hex")
+            raise _StarterRefusal("starter recipient node key is not 32-byte hex")
 
         try:
             wallet = load_wallet_identity(Path.home())
         except SystemExit as exc:
-            raise ValueError(str(exc)) from exc
+            raise _StarterRefusal(str(exc)) from exc
         rpc_url = pay_chain.configured_rpc_url(os.environ)
         if not rpc_url:
-            raise ValueError("NAK_PAY_RPC is required for on-chain starter payment")
+            raise _StarterRefusal("NAK_PAY_RPC is required for on-chain starter payment")
         try:
             program = pay_chain.configured_pubkey(os.environ, "NAK_PAY_PROGRAM")
         except SystemExit as exc:
-            raise ValueError(str(exc)) from exc
+            raise _StarterRefusal(str(exc)) from exc
         rpc = pay_chain.PayRpc(rpc_url)
         rpc.ensure_cluster()  # mainnet is refused before blockhash lookup or signing
         owner = wallet["address"]
@@ -1350,12 +1354,12 @@ class Node:
 
             escrow_info = rpc.account_info(derived["escrow"], commitment="finalized")
             if escrow_info is None:
-                raise ValueError("inviter escrow does not exist; run `nak pay ensure`")
+                raise _StarterRefusal("inviter escrow does not exist; run `nak pay ensure`")
             if escrow_info["owner"] != program:
-                raise ValueError("inviter escrow is owned by an unexpected program")
+                raise _StarterRefusal("inviter escrow is owned by an unexpected program")
             escrow = pay_chain.decode_escrow(escrow_info["data"])
             if escrow["owner"] != owner or escrow["vault"] != derived["vault"]:
-                raise ValueError("inviter escrow does not match the configured wallet")
+                raise _StarterRefusal("inviter escrow does not match the configured wallet")
 
             # Collateral is read before the existing-grant shortcut: "paid" must mean the
             # inviter's escrow could fund the starter now, exactly as the sending path requires.
@@ -1375,11 +1379,11 @@ class Node:
             delegate = None
             if delegate_info is not None:
                 if delegate_info["owner"] != program:
-                    raise ValueError("starter delegate is owned by an unexpected program")
+                    raise _StarterRefusal("starter delegate is owned by an unexpected program")
                 delegate = pay_chain.decode_delegate(delegate_info["data"])
                 if (delegate["escrow"] != derived["escrow"]
                         or delegate["key"] != node_address):
-                    raise ValueError("starter delegate account does not match the obligation")
+                    raise _StarterRefusal("starter delegate account does not match the obligation")
                 # The obligation promises `cap` spendable from now: sufficient remaining capacity
                 # pays it; otherwise only `cap` becomes newly spendable via spent + cap.  A lost
                 # broadcast cannot replay here because every chain attempt is recorded before send.
@@ -1402,19 +1406,20 @@ class Node:
                         "existing": True,
                     }
                 if delegate["open_channels"] > 0 or delegate["open_tasks"] > 0:
-                    raise ValueError(
+                    raise _StarterRefusal(
                         "newcomer has open channels/tasks on an older grant; "
                         "waiting for them to close")
                 if delegate["disabled"] and delegate["generation"] == escrow["generation"]:
-                    raise ValueError("existing starter delegate is disabled and cannot be renewed")
+                    raise _StarterRefusal(
+                        "existing starter delegate is disabled and cannot be renewed")
 
             if deadline is not None and chain_now >= int(deadline):
-                raise ValueError("starter retry window expired")
+                raise _StarterRefusal("starter retry window expired")
 
             if not vault_valid:
-                raise ValueError("inviter escrow vault is missing or invalid")
+                raise _StarterRefusal("inviter escrow vault is missing or invalid")
             if available < cap:
-                raise ValueError(
+                raise _StarterRefusal(
                     f"inviter escrow lacks {cap / 1_000_000:.6f} USDC; nak pay deposit")
 
             expires_at = chain_now + STARTER_DELEGATE_DAYS * 86400
@@ -1427,7 +1432,7 @@ class Node:
             else:
                 set_cap = cap
             if set_cap > (1 << 64) - 1:
-                raise ValueError("starter delegate cap exceeds u64")
+                raise _StarterRefusal("starter delegate cap exceeds u64")
             instructions = pay_chain.delegate_set(
                 owner, node_public, set_cap, expires_at,
                 pay_chain.DELEGATE_OPEN_CHANNEL, program)
@@ -1446,7 +1451,7 @@ class Node:
             needed = delegate_rent + top_up + fee
             wallet_balance = rpc.balance(owner, commitment="finalized")
             if wallet_balance < needed:
-                raise ValueError(
+                raise _StarterRefusal(
                     f"wallet lacks SOL for starter delegate rent, top-up, and fee "
                     f"(needs {needed} lamports, has {wallet_balance})")
 
@@ -1580,7 +1585,7 @@ class Node:
                 except Exception as exc:  # noqa: BLE001 - RPC failures leave money pending
                     self.store.starter_update(
                         invite_id,
-                        reason=f"starter chain time unavailable ({str(exc).strip()})"[:200],
+                        reason="chain-time-unavailable",
                         attempts=int(row.get("attempts") or 0) + 1)
                     return False
                 if chain_mode and row.get("chain_created") is None:
@@ -1602,7 +1607,7 @@ class Node:
                 except Exception as exc:  # noqa: BLE001 - an unknown status can still land
                     self.store.starter_update(
                         invite_id, state="pending",
-                        reason=f"starter attempt status unavailable ({str(exc).strip()})"[:200],
+                        reason="attempt-status-unavailable",
                         updated=now, next_attempt=min(deadline, now + STARTER_RETRY_MAX_S))
                     return False
                 if receipt is not None:
@@ -1698,7 +1703,8 @@ class Node:
                 receipt = (self._chain_starter(row, deadline=deadline) if chain_mode else
                            self.settle.starter(invite_id, row["to_keyid"], row["amount"]))
             except SettlementError as exc:
-                reason = getattr(exc, "ledger_error", "") or str(exc)
+                reason = ("chain-settlement-unavailable" if chain_mode else
+                          getattr(exc, "ledger_error", "") or str(exc))
                 if exc.status in {409, 422}:
                     self.store.starter_update(invite_id, state="failed", reason=reason[:200],
                                               updated=now, next_attempt=now,
@@ -1706,9 +1712,13 @@ class Node:
                 else:
                     self._starter_pending(row, reason, now)
                 return False
+            except _StarterRefusal as exc:
+                reason = (str(exc) if chain_mode else
+                          f"starter ledger unavailable ({type(exc).__name__})")
+                self._starter_pending(row, reason, now)
+                return False
             except Exception as exc:  # noqa: BLE001 - transport/chain adapters fail closed and retry
-                detail = str(exc).strip()
-                reason = (detail if chain_mode and detail else
+                reason = ("chain-send-unavailable" if chain_mode else
                           f"starter ledger unavailable ({type(exc).__name__})")
                 self._starter_pending(row, reason, now)
                 return False

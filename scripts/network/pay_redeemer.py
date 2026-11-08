@@ -11,7 +11,7 @@ import sqlite3
 from pathlib import Path
 from typing import Callable, Iterable
 
-from network import pay_chain, pay_voucher
+from network import pay_chain, pay_voucher, pay_wallet_custody
 from network.pay_autochannel import _OpenLock
 from network.pay_voucher import REDEEM_MARGIN
 from network.pay_wallet import load_wallet_identity
@@ -200,58 +200,95 @@ def _signer_for(voucher: pay_voucher.VoucherRecord, channel: pay_voucher.Channel
 
 def _prepare_and_send(*, rpc, book: AttemptBook, channel: str, kind: str,
                       instructions: list[pay_chain.Instruction], payer: str,
-                      seed: bytes, chain_now: int, rent: int = 0, total: int = 0,
+                      seed: bytes | None, chain_now: int, rent: int = 0, total: int = 0,
                       dry_run: bool = False,
                       before_send: Callable[[], int | None] | None = None,
                       on_recorded: Callable[[], None] | None = None,
+                      file_wallet_id: str | None = None,
                       balance_label: str = "wallet",
                       low_balance_hint: str = "",
                       log: Callable[[str], None] = print) -> bool:
-    blockhash_info = rpc.latest_blockhash_info(commitment="finalized")
-    message = pay_chain.compile_message(
-        instructions, payer, blockhash_info["blockhash"])
-    fee = rpc.fee_for_message(message.data, commitment="finalized")
-    balance = rpc.balance(payer, commitment="finalized")
-    needed = int(rent) + fee
-    if balance < needed:
-        hint = f"; {low_balance_hint}" if low_balance_hint else ""
-        log(f"skip {kind} {channel}: {balance_label} lacks SOL (needs {needed} lamports, "
-            f"has {balance}){hint}; nothing was sent")
-        return False
-    if dry_run:
-        if before_send is not None and before_send() is None:
-            return False
-        log(f"dry-run {kind} {channel}: {len(instructions)} instruction(s), "
-            f"{needed} lamports required; nothing was sent")
-        return True
-    transaction = pay_chain.sign_transaction(
-        instructions, payer, blockhash_info["blockhash"], {payer: seed})
-    # Durability boundary: the exact signed intent is committed before the
-    # first possible sendTransaction call.
-    book.record(
-        channel=channel, kind=kind, signature=transaction.signature,
-        blockhash=blockhash_info["blockhash"],
-        last_valid_block_height=blockhash_info["lastValidBlockHeight"],
-        chain_now=chain_now, total=total)
-    if on_recorded is not None:
-        on_recorded()
-    # Recheck any time-sensitive send only after signing and the durable write.
-    # If the fence closed during either operation, the never-broadcast attempt
-    # remains unresolved until finalized block-height expiry proves it inert.
-    if before_send is not None:
-        refreshed = before_send()
-        if refreshed is None:
-            return False
-        chain_now = refreshed
+    custody_lock = None
+    custody_locked = False
+
+    def release_custody_lock(_signature: str | None = None) -> None:
+        nonlocal custody_locked
+        if custody_locked:
+            custody_locked = False
+            custody_lock.__exit__(None, None, None)
+
     try:
-        rpc.send_and_confirm(
-            transaction,
-            last_valid_block_height=blockhash_info["lastValidBlockHeight"])
-    except (pay_chain.VoucherError, ValueError) as exc:
-        # Even preflight/transport errors stay unresolved until a finalized
-        # status or finalized block-height expiry proves the outcome.
-        log(f"{kind} outcome unresolved for {channel}: {exc}")
-        return False
+        if file_wallet_id is not None:
+            # Select the file identity and seed only after serializing with the
+            # custody importer.  The caller may have used the public address to
+            # inspect chain state, but no cached private material crosses this
+            # boundary.
+            custody_lock = pay_wallet_custody.custody_lock()
+            custody_lock.__enter__()
+            custody_locked = True
+            identity = pay_wallet_custody.assert_wallet_act(file_wallet_id, "file")
+            payer = identity["address"]
+            seed = identity["seed"]
+        if seed is None:
+            raise pay_voucher.VoucherError("transaction signer seed is unavailable")
+
+        blockhash_info = rpc.latest_blockhash_info(commitment="finalized")
+        message = pay_chain.compile_message(
+            instructions, payer, blockhash_info["blockhash"])
+        fee = rpc.fee_for_message(message.data, commitment="finalized")
+        balance = rpc.balance(payer, commitment="finalized")
+        needed = int(rent) + fee
+        if balance < needed:
+            hint = f"; {low_balance_hint}" if low_balance_hint else ""
+            log(f"skip {kind} {channel}: {balance_label} lacks SOL (needs {needed} lamports, "
+                f"has {balance}){hint}; nothing was sent")
+            return False
+        if dry_run:
+            if before_send is not None and before_send() is None:
+                return False
+            log(f"dry-run {kind} {channel}: {len(instructions)} instruction(s), "
+                f"{needed} lamports required; nothing was sent")
+            return True
+        transaction = pay_chain.sign_transaction(
+            instructions, payer, blockhash_info["blockhash"], {payer: seed})
+        # Durability boundary: the exact signed intent is committed before the
+        # first possible sendTransaction call.
+        book.record(
+            channel=channel, kind=kind, signature=transaction.signature,
+            blockhash=blockhash_info["blockhash"],
+            last_valid_block_height=blockhash_info["lastValidBlockHeight"],
+            chain_now=chain_now, total=total)
+        if on_recorded is not None:
+            on_recorded()
+        # Recheck any time-sensitive send only after signing and the durable write.
+        # If the fence closed during either operation, the never-broadcast attempt
+        # remains unresolved until finalized block-height expiry proves it inert.
+        if before_send is not None:
+            refreshed = before_send()
+            if refreshed is None:
+                return False
+            chain_now = refreshed
+        if file_wallet_id is not None:
+            # This must remain the immediately preceding wallet-state operation
+            # to broadcast.  on_sent releases the lock after sendTransaction and
+            # before confirmation polling.
+            pay_wallet_custody.assert_wallet_act(file_wallet_id, "file")
+        try:
+            send_options = {
+                "last_valid_block_height": blockhash_info["lastValidBlockHeight"],
+            }
+            if file_wallet_id is not None:
+                send_options["on_sent"] = release_custody_lock
+            rpc.send_and_confirm(transaction, **send_options)
+        except (pay_chain.VoucherError, ValueError) as exc:
+            # Even preflight/transport errors stay unresolved until a finalized
+            # status or finalized block-height expiry proves the outcome.
+            log(f"{kind} outcome unresolved for {channel}: {exc}")
+            return False
+    finally:
+        # Pre-broadcast refusals and fake RPCs that do not invoke on_sent still
+        # release deterministically.  Real PayRpc releases at the broadcast edge.
+        release_custody_lock()
     # send_and_confirm returns only for finalized success.  Resolve through the
     # same status path so tests and alternate RPC implementations share rules.
     return not resolve_attempts(book, rpc, channel, chain_now, log)
@@ -294,6 +331,7 @@ def _redeem_eligible(*, channel: str, state: pay_voucher.ChannelAccount,
 def _cooperative_finalize(*, rpc, book: AttemptBook, voucher: pay_voucher.VoucherRecord,
                           store: pay_voucher.WorkerVoucherStore,
                           channel: pay_voucher.ChannelAccount, owner: str, executor: dict,
+                          file_wallet_id: str | None,
                           chain_now: int, dry_run: bool,
                           log: Callable[[str], None]) -> bool:
     if channel.status != "Closing" or channel.redeemed != voucher.total:
@@ -317,7 +355,7 @@ def _cooperative_finalize(*, rpc, book: AttemptBook, voucher: pay_voucher.Vouche
     return _prepare_and_send(
         rpc=rpc, book=book, channel=voucher.channel, kind="finalize",
         instructions=instructions, payer=executor["address"], seed=executor["seed"],
-        chain_now=chain_now, dry_run=dry_run, log=log)
+        file_wallet_id=file_wallet_id, chain_now=chain_now, dry_run=dry_run, log=log)
 
 
 def redeem_order(records) -> list:
@@ -361,8 +399,9 @@ def run_redeemer(*, store: pay_voucher.WorkerVoucherStore | None = None,
             if worker_wallet["custody"] == "file":
                 fee_payer = {
                     "address": worker_wallet["address"],
-                    "seed": worker_wallet["seed"],
+                    "seed": None,
                 }
+                file_wallet_id = worker_wallet["address"]
             else:
                 if node_seed is None:
                     from nakshatra_auth import load_worker_key
@@ -373,6 +412,7 @@ def run_redeemer(*, store: pay_voucher.WorkerVoucherStore | None = None,
                     "address": pay_chain.b58encode(pay_voucher.public_key_bytes(node_seed)),
                     "seed": node_seed,
                 }
+                file_wallet_id = None
             chain_now = rpc.chain_time()
             # Known-Closing channels first, earliest deadline first: an earlier
             # send may block for up to a poll, and a Closing voucher reached
@@ -413,6 +453,7 @@ def run_redeemer(*, store: pay_voucher.WorkerVoucherStore | None = None,
                             rpc=rpc, book=attempts, store=vouchers,
                             voucher=voucher, channel=state,
                             owner=owner, executor=fee_payer, chain_now=chain_now,
+                            file_wallet_id=file_wallet_id,
                             dry_run=dry_run, log=log):
                         result["finalized"] += 1
                     continue
@@ -471,6 +512,7 @@ def run_redeemer(*, store: pay_voucher.WorkerVoucherStore | None = None,
                     seed=fee_payer["seed"], chain_now=chain_now, rent=rent,
                     total=voucher.total, dry_run=dry_run,
                     before_send=before_redeem_send,
+                    file_wallet_id=file_wallet_id,
                     balance_label=(
                         "wallet" if worker_wallet["custody"] == "file" else "node key"),
                     low_balance_hint=(
@@ -491,6 +533,7 @@ def run_redeemer(*, store: pay_voucher.WorkerVoucherStore | None = None,
                             rpc=rpc, book=attempts, store=vouchers,
                             voucher=voucher, channel=fresh,
                             owner=owner, executor=fee_payer, chain_now=chain_now,
+                            file_wallet_id=file_wallet_id,
                             dry_run=dry_run, log=log):
                         result["finalized"] += 1
     finally:
@@ -531,12 +574,12 @@ def request_close(*, channels: Iterable[str], book: pay_voucher.PayerChannelBook
                 result["skipped"] += 1
                 continue
             if state.voucher_signer == node_address:
-                signer, seed = node_address, bytes(node_seed)
+                signer, seed, file_wallet_id = node_address, bytes(node_seed), None
             elif owner == wallet["address"]:
                 if wallet.get("custody") != "file" or "seed" not in wallet:
                     raise pay_voucher.VoucherError(
                         "needs wallet approval (broker custody; arrives in M4c 2c)")
-                signer, seed = wallet["address"], wallet["seed"]
+                signer, seed, file_wallet_id = wallet["address"], None, wallet["address"]
             else:
                 raise pay_voucher.VoucherError(
                     f"no local close authority for channel {key}")
@@ -546,6 +589,7 @@ def request_close(*, channels: Iterable[str], book: pay_voucher.PayerChannelBook
                     rpc=rpc, book=attempts, channel=key, kind="close",
                     instructions=instructions, payer=signer, seed=seed,
                     chain_now=chain_now, dry_run=dry_run,
+                    file_wallet_id=file_wallet_id,
                     on_recorded=lambda key=key: book.mark_closing(key, 0), log=log)
             if sent:
                 result["would_send" if dry_run else "sent"] += 1
