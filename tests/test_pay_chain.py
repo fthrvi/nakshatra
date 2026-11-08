@@ -156,6 +156,30 @@ def test_rpc_environment_name_precedence_and_deprecated_alias(monkeypatch):
     assert pay_voucher.configured_state().rpc_url == "http://127.0.0.1:2222"
 
 
+def test_rpc_refusal_does_not_reflect_remote_message():
+    secret = "Bearer SECRET-TOKEN"
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        @staticmethod
+        def read(_limit=-1):
+            return json.dumps({
+                "jsonrpc": "2.0", "id": 1,
+                "error": {"code": -32002, "message": secret},
+            }).encode("utf-8")
+
+    rpc = pay_chain.PayRpc(
+        "http://127.0.0.1:1", opener=lambda _request, timeout: Response())
+    with pytest.raises(pay_chain.VoucherError, match=r"was refused \(-32002\)") as caught:
+        rpc._rpc("sendTransaction", [])
+    assert secret not in str(caught.value)
+
+
 def test_message_order_and_transaction_signature_verifies():
     seed = bytes(range(32))
     private = ed25519.Ed25519PrivateKey.from_private_bytes(seed)

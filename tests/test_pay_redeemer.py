@@ -484,6 +484,46 @@ def test_attempt_finalizing_between_status_and_height_is_succeeded(tmp_path):
     assert rpc.instructions_seen == []
 
 
+def test_finalized_attempt_error_uses_only_closed_code_in_journal_and_logs(tmp_path):
+    path = tmp_path / "redeems.sqlite"
+    secret = "Bearer SECRET-TOKEN"
+    messages = []
+    with pay_redeemer.AttemptBook(path) as book:
+        book.record(channel=CHANNEL, kind="redeem", signature="failed-signature",
+                    blockhash=BLOCKHASH, last_valid_block_height=100,
+                    chain_now=1_000, total=2_000_000)
+
+        class FailedRpc:
+            @staticmethod
+            def signature_status(_signature):
+                return {
+                    "err": {"rpc_body": secret},
+                    "confirmationStatus": "finalized",
+                }
+
+        assert pay_redeemer.resolve_attempts(
+            book, FailedRpc(), CHANNEL, 2_000, messages.append) is False
+
+    with sqlite3.connect(path) as db:
+        assert db.execute(
+            "SELECT resolution,error FROM attempts WHERE signature='failed-signature'"
+        ).fetchone() == ("failed", "finalized-error")
+    assert all(secret.encode() not in candidate.read_bytes()
+               for candidate in tmp_path.glob("redeems.sqlite*"))
+    assert all(secret not in message for message in messages)
+    assert any(message.endswith(": finalized-error") for message in messages)
+
+
+def test_attempt_book_rejects_non_closed_error_code(tmp_path):
+    with pay_redeemer.AttemptBook(tmp_path / "redeems.sqlite") as book:
+        attempt_id = book.record(
+            channel=CHANNEL, kind="redeem", signature="failed-signature",
+            blockhash=BLOCKHASH, last_valid_block_height=100,
+            chain_now=1_000, total=2_000_000)
+        with pytest.raises(ValueError, match="closed code"):
+            book.resolve(attempt_id, "failed", 2_000, "Bearer SECRET-TOKEN")
+
+
 def test_dry_run_never_records_or_sends(tmp_path):
     rpc = Rpc(tmp_path / "redeems.sqlite")
     messages = []

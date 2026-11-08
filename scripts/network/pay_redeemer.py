@@ -19,6 +19,9 @@ from network.pay_wallet import load_wallet_identity
 
 DEFAULT_THRESHOLD = 1_000_000
 DEFAULT_MAX_AGE_S = 24 * 60 * 60
+_ATTEMPT_ERROR_CODES = {
+    "", "finalized-error", "rpc-unavailable", "send-refused", "status-unknown",
+}
 
 
 def _positive(value: int, name: str, *, allow_zero: bool = False) -> int:
@@ -104,6 +107,8 @@ class AttemptBook:
                 error: str = "") -> None:
         if resolution not in {"succeeded", "failed", "expired"}:
             raise ValueError("invalid payment attempt resolution")
+        if error not in _ATTEMPT_ERROR_CODES:
+            raise ValueError("payment attempt error must be a closed code")
         row = self._db.execute(
             "SELECT channel,kind FROM attempts WHERE id=?", (int(attempt_id),)).fetchone()
         if row is None:
@@ -159,8 +164,8 @@ def resolve_attempts(book: AttemptBook, rpc, channel: str, chain_now: int,
                 book.resolve(attempt["id"], "succeeded", chain_now)
                 log(f"{attempt['kind']} finalized for {channel}: {attempt['signature']}")
             else:
-                book.resolve(attempt["id"], "failed", chain_now, str(status["err"]))
-                log(f"{attempt['kind']} failed at finalized for {channel}: {status['err']}")
+                book.resolve(attempt["id"], "failed", chain_now, "finalized-error")
+                log(f"{attempt['kind']} failed at finalized for {channel}: finalized-error")
             continue
         if status is not None:
             # Processed/confirmed is an observation that the signature was

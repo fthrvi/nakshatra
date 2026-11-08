@@ -416,8 +416,10 @@ class JsonRpcChannelState:
                 message = error.get("message")
                 if isinstance(code, bool) or not isinstance(code, int) or not isinstance(message, str):
                     raise VoucherError(f"Solana RPC returned malformed {method} error")
-                safe = "".join(ch for ch in message if ch.isprintable())[:500]
-                raise VoucherError(f"Solana RPC {method} was refused ({code}): {safe}")
+                # The message is remote-controlled and may contain reflected
+                # authorization headers or upstream response bodies.  The
+                # numeric JSON-RPC code is sufficient for local diagnostics.
+                raise VoucherError(f"Solana RPC {method} was refused ({code})")
             if (not isinstance(decoded, dict)
                     or decoded.get("jsonrpc") != "2.0"
                     or decoded.get("id") != request_id
