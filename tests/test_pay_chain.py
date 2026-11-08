@@ -22,7 +22,8 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from network import nak, nakd, pay_autochannel, pay_chain, pay_wallet  # noqa: E402
+from network import (nak, nakd, pay_autochannel, pay_chain, pay_wallet,
+                     pay_wallet_custody)  # noqa: E402
 from network import pay_voucher  # noqa: E402
 
 
@@ -666,7 +667,7 @@ def test_cli_low_sol_sends_nothing(_temp_home, monkeypatch):
     assert rpc.sent == 0
 
 
-def test_cli_mainnet_and_broker_are_refused(_temp_home, monkeypatch):
+def test_cli_mainnet_and_broker_escrow_init_are_refused(_temp_home, monkeypatch):
     wallet = _make_keys(_temp_home)
     node = ed25519.Ed25519PrivateKey.from_private_bytes(bytes(range(101, 133))).public_key().public_bytes_raw()
     rpc = FakeRpc(genesis=pay_chain.MAINNET_GENESIS_HASH); rpc.configure(wallet, node)
@@ -676,8 +677,76 @@ def test_cli_mainnet_and_broker_are_refused(_temp_home, monkeypatch):
             nak.main(["pay", "ensure"])
     assert rpc.sent == 0
     (_temp_home / ".nakshatra/pay/custody").write_text("broker\n")
-    with pytest.raises(SystemExit, match="broker.*not available yet"):
-        nak.main(["pay", "ensure"])
+    devnet = FakeRpc(); devnet.configure(wallet, node)
+    with devnet as url:
+        monkeypatch.setenv("NAK_PAY_RPC", url)
+        with pytest.raises(SystemExit, match="broker custody refuses escrow initialization"):
+            nak.main(["pay", "ensure"])
+    assert devnet.sent == 0
+
+
+def test_cli_broker_existing_escrow_ensure_signs_compiled_message(
+        _temp_home, monkeypatch):
+    wallet = _make_keys(_temp_home)
+    private = ed25519.Ed25519PrivateKey.from_private_bytes(wallet["seed"])
+    node = ed25519.Ed25519PrivateKey.from_private_bytes(
+        bytes(range(101, 133))).public_key().public_bytes_raw()
+    (_temp_home / ".nakshatra/pay/wallet.ed25519").unlink()
+    (_temp_home / ".nakshatra/pay/custody").write_text("broker\n")
+    rpc = FakeRpc(node_balance=0); rpc.configure(wallet, node); rpc.ready = True
+    signed = []
+
+    def sign(message, wallet_id, *, idempotency_key):
+        assert wallet_id == wallet["address"]
+        signed.append((message, idempotency_key))
+        return private.sign(message)
+
+    monkeypatch.setattr(pay_wallet_custody, "wallet_sign", sign)
+    with rpc as url:
+        monkeypatch.setenv("NAK_PAY_RPC", url)
+        assert nak.main(["pay", "ensure"]) == 0
+    assert rpc.sent == 1
+    assert len(signed) == 1
+    assert signed[0][0] == rpc.sent_raw[0][65:]
+
+
+@pytest.mark.parametrize(("argv", "match"), [
+    (["pay", "deposit", "--amount", "1"], "broker custody refuses escrow deposit"),
+    (["pay", "revoke", "00" * 32], "broker custody refuses delegate revoke"),
+])
+def test_cli_broker_refuses_unapproved_wallet_templates(
+        _temp_home, argv, match):
+    _make_keys(_temp_home)
+    (_temp_home / ".nakshatra/pay/custody").write_text("broker\n")
+
+    with pytest.raises(SystemExit, match=match):
+        nak.main(argv)
+
+
+def test_cli_broker_withdraw_execute_requires_finalized_request_journal(
+        _temp_home, monkeypatch):
+    wallet = _make_keys(_temp_home)
+    private = ed25519.Ed25519PrivateKey.from_private_bytes(wallet["seed"])
+    node = ed25519.Ed25519PrivateKey.from_private_bytes(
+        bytes(range(101, 133))).public_key().public_bytes_raw()
+    (_temp_home / ".nakshatra/pay/wallet.ed25519").unlink()
+    (_temp_home / ".nakshatra/pay/custody").write_text("broker\n")
+    rpc = FakeRpc(node_balance=nak.NODE_SOL_TARGET); rpc.configure(wallet, node); rpc.ready = True
+    approvals = []
+
+    def sign(message, _wallet_id, *, idempotency_key):
+        approvals.append(idempotency_key)
+        return private.sign(message)
+
+    monkeypatch.setattr(pay_wallet_custody, "wallet_sign", sign)
+    with rpc as url:
+        monkeypatch.setenv("NAK_PAY_RPC", url)
+        with pytest.raises(SystemExit, match="reconciled finalized withdraw-request"):
+            nak.main(["pay", "withdraw", "--execute"])
+        assert approvals == []
+        assert nak.main(["pay", "withdraw", "--amount", "0.5"]) == 0
+        assert nak.main(["pay", "withdraw", "--execute"]) == 0
+    assert len(approvals) == 2
 
 
 def test_cli_starters_lists_only_other_node_delegates(monkeypatch, capsys):

@@ -454,6 +454,17 @@ def test_file_custody_signature_and_compile_once_assembly_match_sign_transaction
     assert assembled == reference
 
 
+def test_pinned_custody_refuses_backend_change_before_sign():
+    home = _home()
+    wallet = pay_wallet.ensure_wallet(home)
+
+    with pay_wallet_custody.pinned_custody("broker"):
+        with pytest.raises(SystemExit, match="changed from broker to file"):
+            pay_wallet_custody.wallet_sign(
+                b"message", wallet["address"],
+                idempotency_key="wallet:pinned-change", home=home)
+
+
 def test_logs_and_exceptions_never_contain_seed_or_bearer_token(caplog):
     private = ed25519.Ed25519PrivateKey.generate()
     with FakeBroker(private, corrupt="signature") as broker:

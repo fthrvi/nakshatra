@@ -10,6 +10,8 @@ import re
 import time
 import urllib.error
 import urllib.parse
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -36,6 +38,8 @@ _NODE_ID_RE = re.compile(r"[0-9a-f]{64}\Z")
 _REQUEST_ID_RE = re.compile(r"[0-9a-f]{16}\Z")
 _DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
 _SIGNATURE_RE = re.compile(r"[0-9a-f]{128}\Z")
+_EXPECTED_CUSTODY: ContextVar[str | None] = ContextVar(
+    "pay_wallet_expected_custody", default=None)
 
 
 @dataclass(frozen=True)
@@ -150,6 +154,32 @@ def _read_current_identity(act: _WalletAct) -> dict:
     if identity.get("address") != act.wallet_id:
         raise SystemExit("wallet identity changed during this act; nothing was signed")
     return identity
+
+
+def assert_wallet_act(wallet_id: str, expected_custody: str,
+                      *, home: Path | None = None) -> dict:
+    """Refuse an identity or custody change without loading broker configuration."""
+    selected_home = Path.home() if home is None else Path(home)
+    identity = pay_wallet.load_wallet_identity(selected_home)
+    if identity.get("address") != wallet_id:
+        raise SystemExit("wallet identity changed during this act; nothing was signed")
+    if identity.get("custody") != expected_custody:
+        raise SystemExit(
+            f"wallet custody mode changed from {expected_custody} to "
+            f"{identity.get('custody')} during this act; nothing was signed")
+    return identity
+
+
+@contextmanager
+def pinned_custody(expected_custody: str):
+    """Carry the caller's preflight custody through the unchanged signing API."""
+    if expected_custody not in {"file", "broker"}:
+        raise SystemExit("wallet custody mode is invalid; nothing was signed")
+    token = _EXPECTED_CUSTODY.set(expected_custody)
+    try:
+        yield
+    finally:
+        _EXPECTED_CUSTODY.reset(token)
 
 
 def _preflight(wallet_id: str, *, home: Path, net_dir: Path | None,
@@ -336,6 +366,11 @@ def wallet_sign(raw_message: bytes, wallet_id: str, *, idempotency_key: str,
     selected_home = Path.home() if home is None else Path(home)
     act = _preflight(
         wallet_id, home=selected_home, net_dir=net_dir, signer_dir=signer_dir)
+    expected_custody = _EXPECTED_CUSTODY.get()
+    if expected_custody is not None and act.mode != expected_custody:
+        raise SystemExit(
+            f"wallet custody mode changed from {expected_custody} to {act.mode} "
+            "during this act; nothing was signed")
     _read_current_identity(act)
     if act.mode == "broker":
         return _broker_sign(raw_message, idempotency_key, act)

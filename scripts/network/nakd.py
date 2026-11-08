@@ -27,6 +27,7 @@ labelled source=nakshatra trust=external, and never triggers any action here.
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import json
 import math
@@ -1296,7 +1297,7 @@ class Node:
     def _chain_starter(self, row: dict, *, deadline: Optional[int] = None) -> dict:
         """Grant one inviter-funded OPEN_CHANNEL delegate and optional node SOL float."""
         from network import pay_autochannel, pay_chain
-        from network.pay_wallet import load_wallet
+        from network.pay_wallet import load_wallet_identity
 
         credits = int(row["amount"])
         if credits <= 0 or credits % STARTER_RATE:
@@ -1311,11 +1312,9 @@ class Node:
             raise ValueError("starter recipient node key is not 32-byte hex")
 
         try:
-            wallet = load_wallet(Path.home())
+            wallet = load_wallet_identity(Path.home())
         except SystemExit as exc:
             raise ValueError(str(exc)) from exc
-        if wallet["custody"] != "file":
-            raise ValueError("starter needs file-custody wallet (broker custody comes later)")
         rpc_url = pay_chain.configured_rpc_url(os.environ)
         if not rpc_url:
             raise ValueError("NAK_PAY_RPC is required for on-chain starter payment")
@@ -1356,7 +1355,7 @@ class Node:
                 raise ValueError("inviter escrow is owned by an unexpected program")
             escrow = pay_chain.decode_escrow(escrow_info["data"])
             if escrow["owner"] != owner or escrow["vault"] != derived["vault"]:
-                raise ValueError("inviter escrow does not match the file-custody wallet")
+                raise ValueError("inviter escrow does not match the configured wallet")
 
             # Collateral is read before the existing-grant shortcut: "paid" must mean the
             # inviter's escrow could fund the starter now, exactly as the sending path requires.
@@ -1451,35 +1450,89 @@ class Node:
                     f"wallet lacks SOL for starter delegate rent, top-up, and fee "
                     f"(needs {needed} lamports, has {wallet_balance})")
 
-            transaction = pay_chain.sign_transaction(
-                instructions, owner, blockhash, {owner: wallet["seed"]})
-            attempt = {
-                "signature": transaction.signature,
-                "blockhash": blockhash,
-                "last_valid_block_height": int(blockhash_info["lastValidBlockHeight"]),
-                "cap_total": set_cap,
-                "sol_lamports": top_up,
-                "expires_at": expires_at,
-                "escrow": derived["escrow"],
-                "delegate": delegate_address,
-            }
-            attempts.append(attempt)
-            # The complete signed intent is durable before sendTransaction.  A crash here leaves
-            # an unbroadcast signature that must age past its last valid block height before retry.
-            self.store.starter_update(
-                row["invite_id"], chain_attempts=attempts, updated=chain_now)
-            row["chain_attempts"] = attempts
+            message_digest = hashlib.sha256(message.data).hexdigest()
+            idempotency_key = f"wallet:starter-grant:{secrets.token_hex(16)}"
+            wallet_journal = None
+            with contextlib.ExitStack() as signing:
+                if wallet["custody"] == "broker":
+                    from network import pay_wallet_attempts, pay_wallet_custody
 
-            try:
-                signature = rpc.send_and_confirm(
-                    transaction,
-                    last_valid_block_height=int(blockhash_info["lastValidBlockHeight"]))
-            except pay_chain.TransactionDefiniteFailure as exc:
-                attempt["resolution"] = "failed"
-                attempt["error"] = str(exc)[:200]
+                    signing.enter_context(pay_wallet_attempts.attempt_lock())
+                    wallet_journal = signing.enter_context(
+                        pay_wallet_attempts.AttemptJournal())
+                    intent = pay_wallet_attempts.instruction_digest(instructions)
+                    scope = pay_wallet_attempts.operation_scope(
+                        "starter-grant", derived["escrow"],
+                        int(escrow["generation"]), act_id=row["invite_id"])
+                    logical = pay_wallet_attempts.logical_key(scope, intent)
+                    reconciled = wallet_journal.reconcile(
+                        scope, rpc, resumable_logical_key=logical)
+                    if reconciled.unresolved:
+                        raise pay_chain.VoucherError(
+                            "previous starter wallet transaction still unresolved")
+                    approval = wallet_journal.prepare(
+                        scope=scope, logical=logical, operation="starter-grant",
+                        wallet_id=owner, custody=wallet["custody"], message=message.data,
+                        blockhash=blockhash,
+                        last_valid_block_height=int(blockhash_info["lastValidBlockHeight"]),
+                        escrow=derived["escrow"], generation=int(escrow["generation"]),
+                        created=chain_now)
+                    idempotency_key = approval.idempotency_key
+                    message_digest = approval.message_sha256
+                    with pay_wallet_custody.pinned_custody(wallet["custody"]):
+                        signature_bytes = pay_wallet_custody.wallet_sign(
+                            approval.message, owner, idempotency_key=idempotency_key)
+                    pay_wallet_custody.assert_wallet_act(owner, wallet["custody"])
+                    transaction = pay_chain.assemble_transaction(
+                        approval.message, signature_bytes)
+                    last_valid_block_height = approval.last_valid_block_height
+                    recorded_blockhash = approval.blockhash
+                    wallet_journal.record_signed(approval.id, transaction.signature)
+                else:
+                    from network.pay_wallet_custody import assert_wallet_act
+
+                    assert_wallet_act(owner, wallet["custody"])
+                    transaction = pay_chain.sign_transaction(
+                        instructions, owner, blockhash, {owner: wallet["seed"]})
+                    assert_wallet_act(owner, wallet["custody"])
+                    last_valid_block_height = int(blockhash_info["lastValidBlockHeight"])
+                    recorded_blockhash = blockhash
+
+                attempt = {
+                    "signature": transaction.signature,
+                    "message_sha256": message_digest,
+                    "idempotency_key": idempotency_key,
+                    "operation": "starter-grant",
+                    "blockhash": recorded_blockhash,
+                    "last_valid_block_height": last_valid_block_height,
+                    "cap_total": set_cap,
+                    "sol_lamports": top_up,
+                    "expires_at": expires_at,
+                    "escrow": derived["escrow"],
+                    "generation": int(escrow["generation"]),
+                    "delegate": delegate_address,
+                }
+                attempts.append(attempt)
+                # The complete signed intent is durable before sendTransaction.  A crash here
+                # leaves an unbroadcast signature fenced by the status/height/status resolver.
                 self.store.starter_update(
                     row["invite_id"], chain_attempts=attempts, updated=chain_now)
-                raise
+                row["chain_attempts"] = attempts
+
+                try:
+                    signature = rpc.send_and_confirm(
+                        transaction, last_valid_block_height=last_valid_block_height)
+                except pay_chain.TransactionDefiniteFailure as exc:
+                    attempt["resolution"] = "failed"
+                    attempt["error"] = str(exc)[:200]
+                    self.store.starter_update(
+                        row["invite_id"], chain_attempts=attempts, updated=chain_now)
+                    if wallet_journal is not None:
+                        wallet_journal.resolve_signature(
+                            transaction.signature, "failed", str(exc))
+                    raise
+                if wallet_journal is not None:
+                    wallet_journal.resolve_signature(transaction.signature, "succeeded")
             final_info = rpc.account_info(delegate_address, commitment="finalized")
             if final_info is None or final_info["owner"] != program:
                 raise pay_chain.VoucherError("finalized starter delegate is not visible")

@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 from cryptography.hazmat.primitives.asymmetric import ed25519
 
-from network import nakd, pay_chain, pay_wallet, pay_voucher
+from network import nakd, pay_chain, pay_wallet, pay_wallet_custody, pay_voucher
 from network.store import Store
 
 
@@ -561,12 +561,32 @@ def test_chain_starter_preflight_refusals(chain_node, monkeypatch, changes, matc
     assert not rpc.sent
 
 
-def test_chain_starter_refuses_broker_custody(chain_node):
-    node, _wallet, row = chain_node
-    (Path(os.environ["HOME"]) / ".nakshatra/pay/custody").write_text("broker\n")
+def test_chain_starter_broker_custody_signs_compiled_message_and_journals(
+        chain_node, monkeypatch):
+    node, wallet, row = chain_node
+    home = Path(os.environ["HOME"])
+    private = ed25519.Ed25519PrivateKey.from_private_bytes(wallet["seed"])
+    (home / ".nakshatra/pay/wallet.ed25519").unlink()
+    (home / ".nakshatra/pay/custody").write_text("broker\n")
+    rpc = StarterRpc(wallet, vault_amount=2_000_000)
+    monkeypatch.setattr(pay_chain, "PayRpc", lambda _url: rpc)
+    calls = []
 
-    with pytest.raises(ValueError, match="file-custody wallet"):
-        node._chain_starter(row)
+    def sign(message, wallet_id, *, idempotency_key):
+        calls.append((message, wallet_id, idempotency_key))
+        return private.sign(message)
+
+    monkeypatch.setattr(pay_wallet_custody, "wallet_sign", sign)
+
+    receipt = node._chain_starter(row)
+
+    assert receipt["signature"] == rpc.sent[0].signature
+    assert len(calls) == 1
+    assert calls[0][0] == rpc.sent[0].message
+    assert calls[0][1] == wallet["address"]
+    assert calls[0][2] == row["chain_attempts"][0]["idempotency_key"]
+    assert row["chain_attempts"][0]["message_sha256"] == hashlib.sha256(
+        rpc.sent[0].message).hexdigest()
 
 
 def test_chain_starter_refuses_fractional_micro_usdc(chain_node):
