@@ -182,15 +182,25 @@ def preflight_wallet(home: Path) -> None:
     pay_dir, seed_path, public_path, custody_path = _paths(home)
     _check_pay_dir(pay_dir)
     if not _path_present(seed_path):
-        if _path_present(public_path) or _path_present(custody_path):
-            raise SystemExit(f"refusing incomplete pay wallet at {pay_dir}: wallet.ed25519 is missing")
-        return
+        public_present = _path_present(public_path)
+        custody_present = _path_present(custody_path)
+        if not public_present and not custody_present:
+            return
+        if public_present and custody_present:
+            custody = _read_custody(custody_path)
+            if custody == "broker":
+                _read_public_value(public_path)
+                return
+        raise SystemExit(f"refusing incomplete pay wallet at {pay_dir}: wallet.ed25519 is missing")
     seed = _read_seed(seed_path)
     _public_key, address = _wallet_values(seed)
     if _path_present(public_path):
         _read_public(public_path, address)
     if _path_present(custody_path):
-        _read_custody(custody_path)
+        custody = _read_custody(custody_path)
+        if custody == "broker" and not _path_present(public_path):
+            raise SystemExit(
+                f"refusing incomplete pay wallet at {pay_dir}: wallet.pub is missing")
 
 
 def _write_new(path: Path, data: bytes, mode: int) -> None:
@@ -224,6 +234,10 @@ def ensure_wallet(home: Path) -> dict:
 
     # A corrupt existing seed must stop the operation before mkdir, chmod, or any other write.
     preflight_wallet(home)
+    if _path_present(custody_path) and _read_custody(custody_path) == "broker":
+        # A completed broker import deliberately leaves no node-readable seed.  Setup reruns
+        # validate and project that identity; they must never manufacture or rewrite key state.
+        return load_wallet_identity(home)
     if not _path_present(pay_dir):
         pay_dir.mkdir(parents=True, mode=0o700)
         os.chmod(pay_dir, 0o700)
@@ -273,6 +287,12 @@ def load_wallet(home: Path) -> dict:
     home = Path(home)
     pay_dir, seed_path, public_path, custody_path = _paths(home)
     _check_pay_dir(pay_dir)
+    if not _path_present(custody_path):
+        raise SystemExit(f"pay wallet custody marker is missing at {custody_path}; re-run the signed join setup")
+    custody = _read_custody(custody_path)
+    if custody == "broker":
+        raise SystemExit(
+            "pay wallet uses broker custody; file-custody wallet seed export is unavailable")
     if not _path_present(seed_path):
         raise SystemExit(f"pay wallet is missing at {seed_path}; run the signed join setup first")
     seed = _read_seed(seed_path)
@@ -280,9 +300,6 @@ def load_wallet(home: Path) -> dict:
     if not _path_present(public_path):
         raise SystemExit(f"pay wallet address is missing at {public_path}; re-run the signed join setup")
     _read_public(public_path, address)
-    if not _path_present(custody_path):
-        raise SystemExit(f"pay wallet custody marker is missing at {custody_path}; re-run the signed join setup")
-    custody = _read_custody(custody_path)
     return {"seed": seed, "public_key": public_key, "address": address, "custody": custody}
 
 

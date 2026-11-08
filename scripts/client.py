@@ -1975,7 +1975,7 @@ def main():
     if paid is not None and os.environ.get("NAK_PAY_MODE", "") == "chain":
         try:
             from network import pay_autochannel, pay_chain, pay_voucher
-            from network.pay_wallet import load_wallet
+            from network.pay_wallet import load_wallet_identity
             program = pay_voucher.configured_program()
             state = pay_voucher.configured_state()
             chain_clock = pay_chain.PayRpc(
@@ -1992,7 +1992,7 @@ def main():
                 ) * (stage["layer_end"] - stage["layer_start"])
                 for stage in paid["plan"]
             }
-            owner = load_wallet(Path.home())["address"]
+            owner = load_wallet_identity(Path.home())["address"]
             chosen_channels = {
                 worker_key: pay_autochannel.ensure_channel(
                     worker_key,

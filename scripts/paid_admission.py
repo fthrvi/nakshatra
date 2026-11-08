@@ -664,12 +664,12 @@ class PaidAdmission:
         if self.chain_mode:
             try:
                 from network import pay_voucher
-                from network.pay_wallet import load_wallet
+                from network.pay_wallet import load_wallet_identity
                 self._pay = pay_voucher
                 self.pay_program = pay_program or pay_voucher.configured_program()
                 self.channel_state = channel_state or pay_voucher.configured_state()
                 self.voucher_store = voucher_store or pay_voucher.WorkerVoucherStore()
-                self.pay_wallet_address = load_wallet(Path.home())["address"]
+                self.pay_wallet_address = load_wallet_identity(Path.home())["address"]
             except SystemExit as exc:
                 raise PaidAdmissionUnavailable(
                     f"chain pay wallet is unavailable ({exc})") from exc

@@ -462,6 +462,21 @@ class SignedTransaction:
     signature: str
 
 
+def assemble_transaction(message: bytes, signature: bytes) -> SignedTransaction:
+    """Assemble one externally signed legacy message without compiling it again."""
+    raw_message = bytes(message)
+    raw_signature = bytes(signature)
+    if len(raw_signature) != 64:
+        raise ValueError("transaction signature must contain 64 bytes")
+    if not raw_message:
+        raise ValueError("compiled transaction message must not be empty")
+    if raw_message[0] != 1:
+        raise ValueError("compiled transaction message must require exactly one signature")
+    raw = compact_u16(1) + raw_signature + raw_message
+    return SignedTransaction(
+        raw, raw_message, (raw_signature,), b58encode(raw_signature))
+
+
 class TransactionDefiniteFailure(VoucherError):
     """The RPC proved that a transaction was rejected or failed on chain."""
 
