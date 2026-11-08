@@ -24,6 +24,32 @@ _ATTEMPT_ERROR_CODES = {
 }
 
 
+def payment_error_code(exc: BaseException) -> str:
+    """Collapse payment/RPC failures to the durable diagnostic vocabulary."""
+    failures = []
+    current: BaseException | None = exc
+    seen = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        detail = str(current).strip()
+        if detail in _ATTEMPT_ERROR_CODES and detail:
+            return detail
+        failures.append((current, detail.lower()))
+        current = current.__cause__ or current.__context__
+
+    combined = " ".join(detail for _failure, detail in failures)
+    if any(isinstance(failure, pay_chain.TransactionDefiniteFailure)
+           for failure, _detail in failures):
+        return "finalized-error" if "finalized" in combined else "send-refused"
+    if "sendtransaction" in combined and "refused" in combined:
+        return "send-refused"
+    if ("getsignaturestatuses" in combined
+            or "signature status" in combined
+            or "final state is unknown" in combined):
+        return "status-unknown"
+    return "rpc-unavailable"
+
+
 def _positive(value: int, name: str, *, allow_zero: bool = False) -> int:
     minimum = 0 if allow_zero else 1
     if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
@@ -288,7 +314,7 @@ def _prepare_and_send(*, rpc, book: AttemptBook, channel: str, kind: str,
         except (pay_chain.VoucherError, ValueError) as exc:
             # Even preflight/transport errors stay unresolved until a finalized
             # status or finalized block-height expiry proves the outcome.
-            log(f"{kind} outcome unresolved for {channel}: {exc}")
+            log(f"{kind} outcome unresolved for {channel}: {payment_error_code(exc)}")
             return False
     finally:
         # Pre-broadcast refusals and fake RPCs that do not invoke on_sent still
@@ -439,7 +465,8 @@ def run_redeemer(*, store: pay_voucher.WorkerVoucherStore | None = None,
                     state = rpc.read_channel(voucher.channel, configured_program)
                     owner = rpc.read_escrow_owner(state.escrow, configured_program)
                 except pay_voucher.VoucherError as exc:
-                    log(f"skip {voucher.channel}: finalized channel unavailable ({exc})")
+                    log(f"skip {voucher.channel}: finalized channel unavailable "
+                        f"({payment_error_code(exc)})")
                     result["skipped"] += 1
                     continue
                 expected = pay_chain.channel_pda(
@@ -498,7 +525,8 @@ def run_redeemer(*, store: pay_voucher.WorkerVoucherStore | None = None,
                             voucher.channel, configured_program)
                     except pay_voucher.VoucherError as exc:
                         log(f"WARNING: voucher {voucher.channel} finalized channel "
-                            f"recheck failed ({exc}); voucher retained and nothing was sent")
+                            f"recheck failed ({payment_error_code(exc)}); voucher retained "
+                            "and nothing was sent")
                         return None
                     # Read time after the account so the deadline observation
                     # cannot precede the finalized state being judged.
@@ -700,7 +728,8 @@ def finalize_payer_channels(*, book: pay_voucher.PayerChannelBook | None = None,
                             payer_book.mark_closed(row.channel)
                 except Exception as exc:
                     result["skipped"] += 1
-                    log(f"skip finalize {row.channel}: row failed ({exc})")
+                    log(f"skip finalize {row.channel}: row failed "
+                        f"({payment_error_code(exc)})")
     finally:
         if owned_book:
             payer_book.close()

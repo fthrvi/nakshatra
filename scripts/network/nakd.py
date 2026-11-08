@@ -457,14 +457,16 @@ class Node:
                 node_seed=self._key, log=lambda line: self.log(f"pay: {line}"))
             self.log(f"pay: redeem cycle {result}")
         except BaseException as exc:  # daemon boundary: even SystemExit must not kill nakd
-            self.log(f"WARNING: pay redeem cycle failed: {type(exc).__name__}: {exc}")
+            self.log(f"WARNING: pay redeem cycle failed: "
+                     f"{pay_redeemer.payment_error_code(exc)}")
         try:
             result = pay_redeemer.finalize_payer_channels(
                 node_seed=self._key, all_channels=False,
                 log=lambda line: self.log(f"pay: {line}"))
             self.log(f"pay: finalize cycle {result}")
         except BaseException as exc:  # same fail-contained daemon boundary
-            self.log(f"WARNING: pay finalize cycle failed: {type(exc).__name__}: {exc}")
+            self.log(f"WARNING: pay finalize cycle failed: "
+                     f"{pay_redeemer.payment_error_code(exc)}")
 
     def _closing_redeem_pending(self) -> bool:
         """Read only local voucher facts; failure keeps the normal cadence."""

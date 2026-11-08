@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import builtins
 import fcntl
+import json
 import os
 import sqlite3
 import sys
@@ -524,6 +525,61 @@ def test_attempt_book_rejects_non_closed_error_code(tmp_path):
             book.resolve(attempt_id, "failed", 2_000, "Bearer SECRET-TOKEN")
 
 
+@pytest.mark.parametrize(("failure", "expected"), [
+    ("refused", "send-refused"),
+    ("timeout", "rpc-unavailable"),
+])
+def test_rpc_send_failures_log_and_persist_only_closed_codes(
+        tmp_path, failure, expected):
+    secret = "Bearer SECRET-RPC-MESSAGE"
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        @staticmethod
+        def read(_limit=-1):
+            return json.dumps({
+                "jsonrpc": "2.0", "id": 1,
+                "error": {"code": -32002, "message": secret},
+            }).encode("utf-8")
+
+    def opener(_request, timeout):
+        del timeout
+        if failure == "timeout":
+            raise TimeoutError(secret)
+        return Response()
+
+    transport = pay_chain.PayRpc("http://127.0.0.1:1", opener=opener)
+
+    class FailingRpc(Rpc):
+        def send_and_confirm(self, _transaction, **_kwargs):
+            self.sent += 1
+            transport._rpc("sendTransaction", [])
+
+    path = tmp_path / "redeems.sqlite"
+    rpc = FailingRpc(path)
+    messages = []
+
+    result = run(tmp_path, rpc, log=messages.append)
+
+    assert result == {"examined": 1, "sent": 0, "would_send": 0,
+                      "finalized": 0, "skipped": 1}
+    details = [message.rsplit(": ", 1)[-1] for message in messages
+               if "outcome unresolved" in message]
+    assert details == [expected]
+    with sqlite3.connect(path) as db:
+        persisted = [row[0] for row in db.execute("SELECT error FROM attempts")]
+    assert persisted and all(code in pay_redeemer._ATTEMPT_ERROR_CODES
+                             for code in persisted)
+    assert all(secret not in message for message in messages)
+    assert all(secret.encode() not in candidate.read_bytes()
+               for candidate in tmp_path.glob("redeems.sqlite*"))
+
+
 def test_dry_run_never_records_or_sends(tmp_path):
     rpc = Rpc(tmp_path / "redeems.sqlite")
     messages = []
@@ -1008,7 +1064,9 @@ def test_finalize_row_error_is_logged_and_does_not_abort_next_row(tmp_path):
         assert result["examined"] == 2 and result["sent"] == 1
         assert book.for_channel(CHANNEL).status == "Closing"
         assert book.for_channel(CHANNEL2).status == "Closed"
-        assert any(CHANNEL in message and "malformed finalized channel" in message
+        assert any(message == f"skip finalize {CHANNEL}: row failed (rpc-unavailable)"
+                   for message in messages)
+        assert all("malformed finalized channel" not in message
                    for message in messages)
 
 
@@ -1065,8 +1123,10 @@ def test_nakd_pay_cycle_contains_all_failures(monkeypatch):
     # Mutation checked: making nakd's redeemer rediscover a broker wallet seed
     # blocks the cycle on a correctly seedless broker-custody configuration.
     assert seen["node_seed"] == node._key
-    assert any("redeem cycle failed" in row for row in messages)
-    assert any("finalize cycle failed" in row for row in messages)
+    assert "WARNING: pay redeem cycle failed: rpc-unavailable" in messages
+    assert "WARNING: pay finalize cycle failed: rpc-unavailable" in messages
+    assert all("redeem boom" not in row and "finalize boom" not in row
+               for row in messages)
 
 
 def test_broker_cli_channels_close_and_finalize_without_wallet_seed(
