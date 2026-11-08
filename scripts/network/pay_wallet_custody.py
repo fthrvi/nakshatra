@@ -26,6 +26,11 @@ _BROKER_POLL_S = 1
 _BROKER_RETRY_INITIAL_S = 0.1
 _BROKER_RETRY_MAX_S = 1.0
 _NOT_APPROVED = "wallet signing was not approved; nothing was signed"
+_INVALID_BROKER_DATA = "wallet broker returned invalid data; nothing was signed"
+_UNCERTAIN_ENQUEUE = (
+    "wallet approval enqueue remained uncertain; retry this exact act with the "
+    "same idempotency_key; nothing was signed"
+)
 _IDEMPOTENCY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{7,127}\Z")
 _NODE_ID_RE = re.compile(r"[0-9a-f]{64}\Z")
 _REQUEST_ID_RE = re.compile(r"[0-9a-f]{16}\Z")
@@ -129,8 +134,8 @@ def _broker_json(config: broker_transport.BrokerConfig, method: str, path: str,
         config, method, path, body, opener=broker_transport.BROKER_OPENER,
         timeout=timeout, error_info=_broker_error_info,
         unavailable_message="wallet broker is unavailable; nothing was signed",
-        invalid_message="wallet broker returned invalid data; nothing was signed",
-        non_object_message="wallet broker returned invalid data; nothing was signed",
+        invalid_message=_INVALID_BROKER_DATA,
+        non_object_message=_INVALID_BROKER_DATA,
         retry_transient=retry_transient)
 
 
@@ -205,28 +210,31 @@ def _broker_json_until(config: broker_transport.BrokerConfig, method: str, path:
 
 
 def _enqueue_until(config: broker_transport.BrokerConfig, body: dict, *,
-                   deadline: float, act: _WalletAct) -> dict:
+                   deadline: float, act: _WalletAct) -> str:
     """Recover a possibly accepted enqueue using only the caller's stable key."""
     delay = _BROKER_RETRY_INITIAL_S
     while True:
         _read_current_identity(act)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise SystemExit(
-                "wallet approval enqueue remained uncertain; retry this exact act with the "
-                "same idempotency_key; nothing was signed")
+            raise SystemExit(_UNCERTAIN_ENQUEUE)
         try:
-            return _broker_json(
+            acknowledgement = _broker_json(
                 config, "POST", "/enqueue/v1", body,
                 timeout=min(_BROKER_TIMEOUT_S, remaining), retry_transient=True)
+            request_id = acknowledgement.get("request_id")
+            if isinstance(request_id, str) and _REQUEST_ID_RE.fullmatch(request_id) is not None:
+                return request_id
         except broker_transport.BrokerTransient:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise SystemExit(
-                    "wallet approval enqueue remained uncertain; retry this exact act with the "
-                    "same idempotency_key; nothing was signed") from None
-            time.sleep(min(delay, remaining))
-            delay = min(_BROKER_RETRY_MAX_S, max(delay * 2, _BROKER_RETRY_INITIAL_S))
+            pass
+        except SystemExit as exc:
+            if str(exc) != _INVALID_BROKER_DATA:
+                raise
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise SystemExit(_UNCERTAIN_ENQUEUE) from None
+        time.sleep(min(delay, remaining))
+        delay = min(_BROKER_RETRY_MAX_S, max(delay * 2, _BROKER_RETRY_INITIAL_S))
 
 
 def _broker_sign(raw_message: bytes, idempotency_key: str, act: _WalletAct) -> bytes:
@@ -246,10 +254,7 @@ def _broker_sign(raw_message: bytes, idempotency_key: str, act: _WalletAct) -> b
         "ttl": _TTL_S,
     }
     deadline = time.monotonic() + _TTL_S
-    enqueued = _enqueue_until(act.config, enqueue_body, deadline=deadline, act=act)
-    request_id = enqueued.get("request_id")
-    if not isinstance(request_id, str) or _REQUEST_ID_RE.fullmatch(request_id) is None:
-        raise SystemExit("wallet broker returned an invalid request id; nothing was signed")
+    request_id = _enqueue_until(act.config, enqueue_body, deadline=deadline, act=act)
 
     result_path = "/result/v1?" + urllib.parse.urlencode({"request_id": request_id})
     while True:

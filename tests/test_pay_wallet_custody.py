@@ -54,7 +54,7 @@ def _home() -> Path:
 
 class FakeBroker:
     def __init__(self, private: ed25519.Ed25519PrivateKey, *, status="approved",
-                 corrupt="", lost_enqueue=False, lost_sign=False):
+                 corrupt="", lost_enqueue=False, lost_sign=False, enqueue_acks=None):
         self.private = private
         self.wallet_id = pay_wallet.base58_encode(private.public_key().public_bytes_raw())
         self.principal = f"nakshatra-wallet:{NODE_ID}"
@@ -64,6 +64,8 @@ class FakeBroker:
         self.lost_sign = lost_sign
         self.enqueues: list[dict] = []
         self.enqueue_attempts: list[dict] = []
+        self.enqueue_attempt_bytes: list[bytes] = []
+        self.enqueue_acks = list(enqueue_acks or [])
         self.sign_bodies: list[dict] = []
         self.by_key: dict[str, tuple[bytes, str]] = {}
         self.signed = False
@@ -84,6 +86,7 @@ class FakeBroker:
         if method == "POST" and path == "/enqueue/v1":
             canonical = json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
             self.enqueue_attempts.append(body)
+            self.enqueue_attempt_bytes.append(json.dumps(body, separators=(",", ":")).encode())
             prior = self.by_key.get(body["idempotency_key"])
             if prior is not None and prior[0] != canonical:
                 raise SystemExit(
@@ -99,6 +102,11 @@ class FakeBroker:
                 self.lost_enqueue = False
                 raise broker_transport.BrokerTransient(
                     "wallet broker is unavailable; nothing was signed")
+            if self.enqueue_acks:
+                acknowledgement = self.enqueue_acks.pop(0)
+                if acknowledgement == "malformed-json":
+                    raise SystemExit(pay_wallet_custody._INVALID_BROKER_DATA)
+                return acknowledgement
             return {"request_id": request_id}
         if method == "GET" and path.startswith("/result/v1?request_id="):
             request_id = path.rsplit("=", 1)[1]
@@ -212,6 +220,40 @@ def test_lost_enqueue_response_recovers_with_the_same_stable_key_and_content(mon
         assert len(broker.enqueues) == 1
         assert len(broker.enqueue_attempts) == 2
         assert broker.enqueue_attempts[0] == broker.enqueue_attempts[1]
+
+
+@pytest.mark.parametrize("first_ack", [
+    {},
+    "malformed-json",
+    {"request_id": "not-a-request-id"},
+])
+def test_unusable_enqueue_ack_recovers_with_byte_identical_body_and_key(
+        monkeypatch, first_ack):
+    private = ed25519.Ed25519PrivateKey.generate()
+    monkeypatch.setattr(pay_wallet_custody, "_BROKER_RETRY_INITIAL_S", 0)
+    key = "wallet:stable-ack"
+    with FakeBroker(private, enqueue_acks=[first_ack]) as broker:
+        assert _sign(broker, key=key) == private.sign(b"compiled-solana-message")
+        assert len(broker.enqueue_attempt_bytes) == 2
+        assert broker.enqueue_attempt_bytes[0] == broker.enqueue_attempt_bytes[1]
+        assert [body["idempotency_key"] for body in broker.enqueue_attempts] == [key, key]
+
+
+def test_always_malformed_enqueue_ack_fails_uncertain_within_original_bound(
+        monkeypatch):
+    private = ed25519.Ed25519PrivateKey.generate()
+    now = iter([0.0, 0.0, 0.25, 0.5, 0.75, 1.0])
+    monkeypatch.setattr(pay_wallet_custody, "_TTL_S", 1)
+    monkeypatch.setattr(pay_wallet_custody, "_BROKER_RETRY_INITIAL_S", 0)
+    monkeypatch.setattr(pay_wallet_custody.time, "monotonic", lambda: next(now))
+    key = "wallet:always-malformed"
+    with FakeBroker(private, enqueue_acks=["malformed-json"] * 10) as broker:
+        with pytest.raises(SystemExit, match="enqueue remained uncertain.*same idempotency_key"):
+            _sign(broker, key=key)
+        assert 1 < len(broker.enqueue_attempt_bytes) < 10
+        assert len(set(broker.enqueue_attempt_bytes)) == 1
+        assert {body["idempotency_key"] for body in broker.enqueue_attempts} == {key}
+        assert len(broker.by_key) == 1
 
 
 def test_same_key_with_different_content_is_a_closed_conflict():
