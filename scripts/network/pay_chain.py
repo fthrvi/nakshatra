@@ -732,16 +732,18 @@ class PayRpc(JsonRpcChannelState):
             if last is not None and last["confirmationStatus"] == "finalized":
                 if last["err"] is not None:
                     raise TransactionDefiniteFailure(
-                        f"transaction failed: {last['err']!r}")
+                        "transaction failed at finalized status")
                 return returned
             time.sleep(0.15)
         validity = (""
                     if last_valid_block_height is None else
                     f"; finalized block height={finalized_height}; "
                     f"last valid block height={last_valid_block_height}")
+        last_state = ("absent" if last is None else
+                      str(last.get("confirmationStatus", "invalid")))
         raise VoucherError(
             f"transaction final state is unknown; signature {returned}; "
-            f"last status={last!r}{validity}")
+            f"last status={last_state}{validity}")
 
 
 _ESCROW_DISC = hashlib.sha256(b"account:Escrow").digest()[:8]

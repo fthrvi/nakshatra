@@ -1454,8 +1454,12 @@ class Node:
             idempotency_key = f"wallet:starter-grant:{secrets.token_hex(16)}"
             wallet_journal = None
             with contextlib.ExitStack() as signing:
+                from network import pay_wallet_custody
+
+                signing.enter_context(pay_wallet_custody.custody_lock())
+                pay_wallet_custody.assert_wallet_act(owner, wallet["custody"])
                 if wallet["custody"] == "broker":
-                    from network import pay_wallet_attempts, pay_wallet_custody
+                    from network import pay_wallet_attempts
 
                     signing.enter_context(pay_wallet_attempts.attempt_lock())
                     wallet_journal = signing.enter_context(
@@ -1489,12 +1493,8 @@ class Node:
                     recorded_blockhash = approval.blockhash
                     wallet_journal.record_signed(approval.id, transaction.signature)
                 else:
-                    from network.pay_wallet_custody import assert_wallet_act
-
-                    assert_wallet_act(owner, wallet["custody"])
                     transaction = pay_chain.sign_transaction(
                         instructions, owner, blockhash, {owner: wallet["seed"]})
-                    assert_wallet_act(owner, wallet["custody"])
                     last_valid_block_height = int(blockhash_info["lastValidBlockHeight"])
                     recorded_blockhash = blockhash
 
@@ -1519,17 +1519,20 @@ class Node:
                     row["invite_id"], chain_attempts=attempts, updated=chain_now)
                 row["chain_attempts"] = attempts
 
+                # All durable attempt stores are complete.  Re-read custody and
+                # wallet.pub as the immediately preceding operation to broadcast.
+                pay_wallet_custody.assert_wallet_act(owner, wallet["custody"])
                 try:
                     signature = rpc.send_and_confirm(
                         transaction, last_valid_block_height=last_valid_block_height)
                 except pay_chain.TransactionDefiniteFailure as exc:
                     attempt["resolution"] = "failed"
-                    attempt["error"] = str(exc)[:200]
+                    attempt["error"] = "send-refused"
                     self.store.starter_update(
                         row["invite_id"], chain_attempts=attempts, updated=chain_now)
                     if wallet_journal is not None:
                         wallet_journal.resolve_signature(
-                            transaction.signature, "failed", str(exc))
+                            transaction.signature, "failed", "send-refused")
                     raise
                 if wallet_journal is not None:
                     wallet_journal.resolve_signature(transaction.signature, "succeeded")

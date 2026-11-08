@@ -5,6 +5,10 @@ complete transaction identity is committed before ``sendTransaction``.  A
 replacement approval is fenced until every older signature is finalized or is
 proved expired by the same status/height/status rule used by the redeemer and
 starter paths.
+
+The step-4 custody importer must hold
+``pay_wallet_custody.custody_lock()`` before changing custody or wallet
+identity.  Wallet acts hold it across journal writes and broadcast.
 """
 from __future__ import annotations
 
@@ -21,6 +25,7 @@ from network.pay_autochannel import _OpenLock
 
 
 _OPERATIONS = {"ensure", "starter-grant", "withdraw-request", "withdraw-execute"}
+_ERROR_CODES = {"", "finalized-error", "send-refused", "rpc-unavailable", "status-unknown"}
 
 
 def _text(value: object, name: str) -> str:
@@ -99,8 +104,29 @@ class AttemptJournal:
             "last_valid_block_height INTEGER NOT NULL, signature TEXT UNIQUE, "
             "escrow TEXT NOT NULL, generation INTEGER NOT NULL, "
             "withdrawal_message_digest TEXT NOT NULL DEFAULT '', "
+            "withdrawal_act_id TEXT NOT NULL DEFAULT '', "
+            "withdrawal_amount INTEGER, withdrawal_at INTEGER, "
+            "withdrawal_consumed_by TEXT NOT NULL DEFAULT '', "
             "resolution TEXT, error TEXT NOT NULL DEFAULT '', created INTEGER NOT NULL DEFAULT 0)"
         )
+        columns = {row[1] for row in self._db.execute("PRAGMA table_info(attempts)")}
+        for name, declaration in (
+                ("withdrawal_act_id", "TEXT NOT NULL DEFAULT ''"),
+                ("withdrawal_amount", "INTEGER"),
+                ("withdrawal_at", "INTEGER"),
+                ("withdrawal_consumed_by", "TEXT NOT NULL DEFAULT ''")):
+            if name not in columns:
+                self._db.execute(f"ALTER TABLE attempts ADD COLUMN {name} {declaration}")
+        self._db.execute(
+            "CREATE TABLE IF NOT EXISTS withdrawal_cycles("
+            "act_id TEXT PRIMARY KEY, escrow TEXT NOT NULL, generation INTEGER NOT NULL, "
+            "amount INTEGER NOT NULL, request_attempt_id INTEGER, "
+            "state TEXT NOT NULL, execute_logical_key TEXT NOT NULL DEFAULT '', "
+            "created INTEGER NOT NULL DEFAULT 0)"
+        )
+        self._db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS withdrawal_one_active "
+            "ON withdrawal_cycles(escrow) WHERE state!='consumed'")
         self._db.execute(
             "CREATE INDEX IF NOT EXISTS attempts_scope ON attempts(operation_scope,id)")
         self._secure()
@@ -114,7 +140,8 @@ class AttemptJournal:
     def prepare(self, *, scope: str, logical: str, operation: str, wallet_id: str,
                 custody: str, message: bytes, blockhash: str,
                 last_valid_block_height: int, escrow: str, generation: int,
-                created: int = 0) -> PreparedApproval:
+                created: int = 0, withdrawal_act_id: str = "",
+                withdrawal_amount: int | None = None) -> PreparedApproval:
         """Commit a stable key and exact broker content before first enqueue."""
         if operation not in _OPERATIONS:
             raise ValueError("invalid broker wallet operation")
@@ -135,6 +162,12 @@ class AttemptJournal:
             raise ValueError("last valid block height must be non-negative")
         if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
             raise ValueError("escrow generation must be non-negative")
+        if operation.startswith("withdraw-"):
+            _text(withdrawal_act_id, "withdrawal act id")
+        if operation == "withdraw-request":
+            if (isinstance(withdrawal_amount, bool) or not isinstance(withdrawal_amount, int)
+                    or not 0 < withdrawal_amount < 2**64):
+                raise ValueError("withdrawal amount must be a positive u64")
         existing = self._db.execute(
             "SELECT * FROM attempts WHERE logical_key=? AND resolution IS NULL "
             "ORDER BY id DESC LIMIT 1", (logical,)).fetchone()
@@ -148,13 +181,26 @@ class AttemptJournal:
         cursor = self._db.execute(
             "INSERT INTO attempts(operation_scope,logical_key,operation,wallet_id,custody,"
             "idempotency_key,message,message_sha256,blockhash,last_valid_block_height,"
-            "escrow,generation,withdrawal_message_digest,created) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "escrow,generation,withdrawal_message_digest,withdrawal_act_id,"
+            "withdrawal_amount,created) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (scope, logical, operation, wallet, custody, idempotency_key,
              sqlite3.Binary(raw), digest, str(blockhash), int(last_valid_block_height),
-             escrow_key, int(generation), withdrawal_digest, int(created)))
+             escrow_key, int(generation), withdrawal_digest, withdrawal_act_id,
+             withdrawal_amount, int(created)))
         row = self._db.execute(
             "SELECT * FROM attempts WHERE id=?", (cursor.lastrowid,)).fetchone()
+        if operation == "withdraw-request":
+            cycle = self._db.execute(
+                "SELECT * FROM withdrawal_cycles WHERE act_id=?", (withdrawal_act_id,)).fetchone()
+            if (cycle is None or cycle["escrow"] != escrow_key
+                    or int(cycle["generation"]) != int(generation)
+                    or int(cycle["amount"]) != withdrawal_amount):
+                self._db.execute("DELETE FROM attempts WHERE id=?", (cursor.lastrowid,))
+                raise pay_voucher.VoucherError("withdrawal act does not match its request")
+            self._db.execute(
+                "UPDATE withdrawal_cycles SET request_attempt_id=COALESCE(request_attempt_id,?) "
+                "WHERE act_id=?", (cursor.lastrowid, withdrawal_act_id))
         self._secure()
         return self._prepared(row)
 
@@ -187,9 +233,11 @@ class AttemptJournal:
     def resolve_signature(self, signature: str, resolution: str, error: str = "") -> None:
         if resolution not in {"succeeded", "failed", "expired"}:
             raise ValueError("invalid broker wallet resolution")
+        if error not in _ERROR_CODES:
+            raise ValueError("broker wallet error must be a closed code")
         self._db.execute(
             "UPDATE attempts SET resolution=?,error=? WHERE signature=? AND resolution IS NULL",
-            (resolution, str(error)[:500], str(signature)))
+            (resolution, error, str(signature)))
         self._secure()
 
     def _rows(self, *, scope: str | None = None, operation: str | None = None,
@@ -241,7 +289,7 @@ class AttemptJournal:
                 if status["err"] is None:
                     self.resolve_signature(signature, "succeeded")
                 else:
-                    self.resolve_signature(signature, "failed", str(status["err"]))
+                    self.resolve_signature(signature, "failed", "finalized-error")
                 continue
             unresolved = True
         self._secure()
@@ -249,22 +297,157 @@ class AttemptJournal:
                           if row["resolution"] == "succeeded")
         return ReconcileResult(unresolved, succeeded)
 
-    def require_finalized_withdraw_request(self, rpc, escrow: str, generation: int) -> dict:
-        """Return finalized request provenance for an execute, or refuse it."""
-        prefix = operation_scope("withdraw-request", escrow, generation)
-        result = self.reconcile(prefix, rpc)
-        if result.unresolved:
+    def begin_withdraw_request(self, rpc, escrow: str, generation: int,
+                               amount: int, *, created: int = 0) -> str:
+        """Create or resume the one unfinished withdrawal act for an escrow."""
+        escrow_key = pay_chain.pubkey_text(escrow, "escrow")
+        if (isinstance(amount, bool) or not isinstance(amount, int) or not 0 < amount < 2**64):
+            raise ValueError("withdrawal amount must be a positive u64")
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            active = self._db.execute(
+                "SELECT * FROM withdrawal_cycles WHERE escrow=? AND state!='consumed'",
+                (escrow_key,)).fetchone()
+            if active is not None:
+                if active["state"] == "requesting" and int(active["amount"]) == amount:
+                    self._db.execute("COMMIT")
+                    return str(active["act_id"])
+                raise pay_voucher.VoucherError(
+                    "another withdrawal cycle for this escrow is still active")
+
+            info = rpc.account_info(escrow_key, commitment="finalized")
+            if info is None:
+                raise pay_voucher.VoucherError("wallet escrow is missing")
+            state = pay_chain.decode_escrow(info["data"])
+            if int(state["generation"]) != int(generation):
+                raise pay_voucher.VoucherError("escrow generation changed during withdrawal")
+            if state["pending_withdraw"] is not None:
+                raise pay_voucher.VoucherError(
+                    "escrow already has a pending withdrawal without an active broker act")
+            act_id = secrets.token_hex(16)
+            self._db.execute(
+                "INSERT INTO withdrawal_cycles(act_id,escrow,generation,amount,state,created) "
+                "VALUES(?,?,?,?,?,?)",
+                (act_id, escrow_key, int(generation), amount, "requesting", int(created)))
+            self._db.execute("COMMIT")
+            self._secure()
+            return act_id
+        except BaseException:
+            if self._db.in_transaction:
+                self._db.execute("ROLLBACK")
+            raise
+
+    def bind_finalized_withdraw_request(self, rpc, attempt_id: int) -> dict:
+        """Bind a finalized request row to the exact finalized pending tuple."""
+        row = self._db.execute(
+            "SELECT * FROM attempts WHERE id=?", (int(attempt_id),)).fetchone()
+        if (row is None or row["operation"] != "withdraw-request"
+                or row["resolution"] != "succeeded" or row["signature"] is None
+                or not row["withdrawal_act_id"]
+                or row["withdrawal_message_digest"] != row["message_sha256"]):
             raise pay_voucher.VoucherError(
-                "previous withdraw-request transaction is still unresolved")
-        candidates = [row for row in self._rows(
-            operation="withdraw-request", escrow=pay_chain.pubkey_text(escrow),
-            generation=int(generation)) if row["resolution"] == "succeeded"
-            and row["withdrawal_message_digest"] == row["message_sha256"]]
-        if not candidates:
+                "withdraw request is not reconciled finalized provenance")
+        info = rpc.account_info(row["escrow"], commitment="finalized")
+        if info is None:
+            raise pay_voucher.VoucherError("wallet escrow disappeared after withdraw request")
+        state = pay_chain.decode_escrow(info["data"])
+        pending = state["pending_withdraw"]
+        if (int(state["generation"]) != int(row["generation"]) or pending is None
+                or int(pending["amount"]) != int(row["withdrawal_amount"])):
             raise pay_voucher.VoucherError(
-                "withdraw execute requires a reconciled finalized withdraw-request "
-                "for this escrow generation")
-        return candidates[-1]
+                "finalized pending withdrawal does not match the approved request")
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            self._db.execute(
+                "UPDATE attempts SET withdrawal_at=? WHERE id=?",
+                (int(pending["withdraw_at"]), int(attempt_id)))
+            cursor = self._db.execute(
+                "UPDATE withdrawal_cycles SET state='ready',request_attempt_id=? "
+                "WHERE act_id=? AND state IN ('requesting','ready')",
+                (int(attempt_id), row["withdrawal_act_id"]))
+            if cursor.rowcount != 1:
+                raise pay_voucher.VoucherError("withdrawal cycle cannot accept request provenance")
+            self._db.execute("COMMIT")
+        except BaseException:
+            if self._db.in_transaction:
+                self._db.execute("ROLLBACK")
+            raise
+        self._secure()
+        return dict(self._db.execute(
+            "SELECT * FROM attempts WHERE id=?", (int(attempt_id),)).fetchone())
+
+    def withdraw_cycle_for_execute(self, escrow: str, generation: int) -> tuple[dict, dict]:
+        """Return only the current unconsumed request cycle; never historical rows."""
+        escrow_key = pay_chain.pubkey_text(escrow, "escrow")
+        cycle = self._db.execute(
+            "SELECT * FROM withdrawal_cycles WHERE escrow=? AND state!='consumed'",
+            (escrow_key,)).fetchone()
+        if cycle is None or int(cycle["generation"]) != int(generation):
+            raise pay_voucher.VoucherError(
+                "withdraw execute requires an active finalized withdraw-request record")
+        if cycle["state"] == "requesting" or cycle["request_attempt_id"] is None:
+            raise pay_voucher.VoucherError(
+                "withdraw execute requires an active finalized withdraw-request record")
+        request = self._db.execute(
+            "SELECT * FROM attempts WHERE id=?", (int(cycle["request_attempt_id"]),)).fetchone()
+        if (request is None or request["resolution"] != "succeeded"
+                or request["signature"] is None or request["withdrawal_at"] is None
+                or request["withdrawal_message_digest"] != request["message_sha256"]):
+            raise pay_voucher.VoucherError(
+                "withdraw execute requires an active finalized withdraw-request record")
+        return dict(cycle), dict(request)
+
+    def assert_withdraw_pending(self, rpc, request: dict) -> None:
+        """Require current finalized pending state to equal the request binding."""
+        info = rpc.account_info(request["escrow"], commitment="finalized")
+        if info is None:
+            raise pay_voucher.VoucherError("wallet escrow is missing before withdraw execute")
+        state = pay_chain.decode_escrow(info["data"])
+        pending = state["pending_withdraw"]
+        if (int(state["generation"]) != int(request["generation"]) or pending is None
+                or int(pending["amount"]) != int(request["withdrawal_amount"])
+                or int(pending["withdraw_at"]) != int(request["withdrawal_at"])):
+            raise pay_voucher.VoucherError(
+                "current pending withdrawal does not match the approved request record")
+
+    def consume_withdraw_request(self, request_id: int, act_id: str,
+                                 execute_logical_key: str) -> None:
+        """Link one request record to its sole execute act before broker enqueue."""
+        _text(act_id, "withdrawal act id")
+        _text(execute_logical_key, "execute logical key")
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            request = self._db.execute(
+                "SELECT * FROM attempts WHERE id=?", (int(request_id),)).fetchone()
+            cycle = self._db.execute(
+                "SELECT * FROM withdrawal_cycles WHERE act_id=?", (act_id,)).fetchone()
+            if (request is None or cycle is None or request["withdrawal_act_id"] != act_id
+                    or request["withdrawal_consumed_by"] not in {"", execute_logical_key}
+                    or cycle["execute_logical_key"] not in {"", execute_logical_key}
+                    or cycle["state"] not in {"ready", "executing"}):
+                raise pay_voucher.VoucherError(
+                    "withdraw request record was already consumed by another execute")
+            self._db.execute(
+                "UPDATE attempts SET withdrawal_consumed_by=? WHERE id=?",
+                (execute_logical_key, int(request_id)))
+            self._db.execute(
+                "UPDATE withdrawal_cycles SET state='executing',execute_logical_key=? "
+                "WHERE act_id=?", (execute_logical_key, act_id))
+            self._db.execute("COMMIT")
+        except BaseException:
+            if self._db.in_transaction:
+                self._db.execute("ROLLBACK")
+            raise
+        self._secure()
+
+    def complete_withdraw_execute(self, act_id: str) -> None:
+        """Close a cycle permanently after its execute reaches finalized success."""
+        cursor = self._db.execute(
+            "UPDATE withdrawal_cycles SET state='consumed' "
+            "WHERE act_id=? AND state='executing'", (act_id,))
+        if cursor.rowcount != 1:
+            raise pay_voucher.VoucherError("withdraw execute cycle is not active")
+        self._secure()
 
     def close(self) -> None:
         self._secure()

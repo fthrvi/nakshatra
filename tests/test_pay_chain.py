@@ -402,12 +402,21 @@ print('ok')
     assert result.stdout.strip() == "ok"
 
 
-def _escrow_data(owner: str, vault: str) -> bytes:
+def _escrow_data(owner: str, vault: str, *, pending=None, generation: int = 0) -> bytes:
     raw = bytearray(163)
     raw[:8] = hashlib.sha256(b"account:Escrow").digest()[:8]
     raw[8:40] = pay_chain.pubkey_bytes(owner)
     raw[40:72] = pay_chain.pubkey_bytes(vault)
-    raw[145:147] = b"\x01\x01"
+    struct.pack_into("<Q", raw, 104, generation)
+    if pending is None:
+        raw[112] = 0
+        offset = 113
+    else:
+        raw[112] = 1
+        struct.pack_into("<Qq", raw, 113, pending[0], pending[1])
+        offset = 129
+    raw[offset:offset + 32] = pay_chain.pubkey_bytes(owner)
+    raw[offset + 32:offset + 34] = b"\x01\x01"
     return bytes(raw)
 
 
@@ -500,7 +509,8 @@ def test_decode_escrow_rejects_invalid_pending_option_tag():
 
 class FakeRpc:
     def __init__(self, *, genesis="local-test", balance=100_000_000,
-                 node_balance=0, token_balance=0, send_delay=0, chain_time=None):
+                 node_balance=0, token_balance=0, send_delay=0, chain_time=None,
+                 reflect_withdrawals=False):
         self.genesis = genesis
         self.chain_time = int(time.time()) if chain_time is None else chain_time
         self.sent_raw: list[bytes] = []
@@ -511,6 +521,8 @@ class FakeRpc:
         self.methods: list[str] = []
         self.sent = 0
         self.ready = False
+        self.pending_withdraw = None
+        self.reflect_withdrawals = reflect_withdrawals
         self.owner = self.node = self.escrow = self.vault = self.delegate = ""
         outer = self
 
@@ -533,6 +545,15 @@ class FakeRpc:
                 elif method == "sendTransaction":
                     raw = base64.b64decode(params[0]); result = pay_chain.b58encode(raw[1:65])
                     outer.sent_raw.append(raw)
+                    if outer.reflect_withdrawals:
+                        request_disc = pay_chain.anchor_discriminator("escrow_withdraw_request")
+                        execute_disc = pay_chain.anchor_discriminator("escrow_withdraw_execute")
+                        request_offset = raw.find(request_disc)
+                        if request_offset >= 0:
+                            amount, = struct.unpack_from("<Q", raw, request_offset + 8)
+                            outer.pending_withdraw = (amount, outer.chain_time + 21_600)
+                        elif raw.find(execute_disc) >= 0:
+                            outer.pending_withdraw = None
                     if outer.send_delay:
                         time.sleep(outer.send_delay)
                     outer.sent += 1; outer.ready = True
@@ -556,7 +577,8 @@ class FakeRpc:
 
     def account(self, address: str):
         data = None
-        if self.ready and address == self.escrow: data = _escrow_data(self.owner, self.vault)
+        if self.ready and address == self.escrow:
+            data = _escrow_data(self.owner, self.vault, pending=self.pending_withdraw)
         elif self.ready and address == self.delegate: data = _delegate_data(self.escrow, self.node, expires=int(time.time()) + 30*86400)
         elif self.ready and address == self.vault:
             data = bytearray(165)
@@ -731,7 +753,8 @@ def test_cli_broker_withdraw_execute_requires_finalized_request_journal(
         bytes(range(101, 133))).public_key().public_bytes_raw()
     (_temp_home / ".nakshatra/pay/wallet.ed25519").unlink()
     (_temp_home / ".nakshatra/pay/custody").write_text("broker\n")
-    rpc = FakeRpc(node_balance=nak.NODE_SOL_TARGET); rpc.configure(wallet, node); rpc.ready = True
+    rpc = FakeRpc(node_balance=nak.NODE_SOL_TARGET, reflect_withdrawals=True)
+    rpc.configure(wallet, node); rpc.ready = True
     approvals = []
 
     def sign(message, _wallet_id, *, idempotency_key):
@@ -741,7 +764,7 @@ def test_cli_broker_withdraw_execute_requires_finalized_request_journal(
     monkeypatch.setattr(pay_wallet_custody, "wallet_sign", sign)
     with rpc as url:
         monkeypatch.setenv("NAK_PAY_RPC", url)
-        with pytest.raises(SystemExit, match="reconciled finalized withdraw-request"):
+        with pytest.raises(SystemExit, match="active finalized withdraw-request"):
             nak.main(["pay", "withdraw", "--execute"])
         assert approvals == []
         assert nak.main(["pay", "withdraw", "--amount", "0.5"]) == 0

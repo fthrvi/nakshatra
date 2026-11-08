@@ -1,12 +1,19 @@
-"""The single file-or-broker boundary for Solana pay-wallet signatures."""
+"""The single file-or-broker boundary for Solana pay-wallet signatures.
+
+The step-4 wallet importer must hold :func:`custody_lock` before changing
+``wallet.pub``, ``custody``, or the wallet seed.  Senders hold that same lock
+from custody preflight through their final pre-broadcast identity check.
+"""
 from __future__ import annotations
 
 import base64
 import binascii
+import fcntl
 import hashlib
 import json
 import os
 import re
+import stat
 import time
 import urllib.error
 import urllib.parse
@@ -40,6 +47,7 @@ _DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
 _SIGNATURE_RE = re.compile(r"[0-9a-f]{128}\Z")
 _EXPECTED_CUSTODY: ContextVar[str | None] = ContextVar(
     "pay_wallet_expected_custody", default=None)
+_CUSTODY_LOCK_TIMEOUT_S = 2.0
 
 
 @dataclass(frozen=True)
@@ -53,6 +61,73 @@ class _WalletAct:
     seed: bytes | None = field(repr=False)
     config: broker_transport.BrokerConfig | None
     principal: str | None
+
+
+class _CustodyLock:
+    def __init__(self, path: Path, timeout_s: float):
+        self.path = path
+        self.timeout_s = timeout_s
+        self.fd = -1
+
+    def __enter__(self):
+        old_umask = os.umask(0o077)
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.chmod(self.path.parent, 0o700)
+            flags = os.O_CREAT | os.O_RDWR
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            self.fd = os.open(self.path, flags, 0o600)
+            info = os.fstat(self.fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+                raise SystemExit(
+                    "wallet custody lock must be a uid-owned regular file; nothing was signed")
+            os.fchmod(self.fd, 0o600)
+        except SystemExit:
+            if self.fd >= 0:
+                os.close(self.fd)
+                self.fd = -1
+            raise
+        except OSError as exc:
+            if self.fd >= 0:
+                os.close(self.fd)
+                self.fd = -1
+            raise SystemExit(f"cannot secure wallet custody lock: {exc}; nothing was signed") from exc
+        finally:
+            os.umask(old_umask)
+
+        deadline = time.monotonic() + self.timeout_s
+        while True:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    os.close(self.fd)
+                    self.fd = -1
+                    raise SystemExit(
+                        "wallet custody is being changed by another process; nothing was signed")
+                time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+
+    def __exit__(self, _kind, _value, _traceback) -> None:
+        if self.fd >= 0:
+            fd, self.fd = self.fd, -1
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+
+def custody_lock(*, home: Path | None = None,
+                 timeout_s: float = _CUSTODY_LOCK_TIMEOUT_S) -> _CustodyLock:
+    """Serialize wallet acts with step-4 custody import.
+
+    The importer must take this same exclusive lock before replacing wallet
+    identity or custody files.  A sender never continues without acquiring it.
+    """
+    selected_home = Path.home() if home is None else Path(home)
+    return _CustodyLock(
+        selected_home / ".nakshatra" / "pay" / "custody.lock", float(timeout_s))
 
 
 def _net_dir(home: Path) -> Path:
@@ -160,13 +235,15 @@ def assert_wallet_act(wallet_id: str, expected_custody: str,
                       *, home: Path | None = None) -> dict:
     """Refuse an identity or custody change without loading broker configuration."""
     selected_home = Path.home() if home is None else Path(home)
+    custody_path = pay_wallet._paths(selected_home)[3]  # noqa: SLF001
+    current_custody = pay_wallet._read_custody(custody_path)  # noqa: SLF001
+    if current_custody != expected_custody:
+        raise SystemExit(
+            f"wallet custody mode changed from {expected_custody} to "
+            f"{current_custody} during this act; nothing was signed")
     identity = pay_wallet.load_wallet_identity(selected_home)
     if identity.get("address") != wallet_id:
         raise SystemExit("wallet identity changed during this act; nothing was signed")
-    if identity.get("custody") != expected_custody:
-        raise SystemExit(
-            f"wallet custody mode changed from {expected_custody} to "
-            f"{identity.get('custody')} during this act; nothing was signed")
     return identity
 
 

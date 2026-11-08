@@ -11,7 +11,8 @@ from pathlib import Path
 import pytest
 from cryptography.hazmat.primitives.asymmetric import ed25519
 
-from network import nakd, pay_chain, pay_wallet, pay_wallet_custody, pay_voucher
+from network import (nakd, pay_chain, pay_wallet, pay_wallet_attempts,
+                     pay_wallet_custody, pay_voucher)
 from network.store import Store
 
 
@@ -587,6 +588,33 @@ def test_chain_starter_broker_custody_signs_compiled_message_and_journals(
     assert calls[0][2] == row["chain_attempts"][0]["idempotency_key"]
     assert row["chain_attempts"][0]["message_sha256"] == hashlib.sha256(
         rpc.sent[0].message).hexdigest()
+
+
+def test_chain_starter_custody_flip_after_journal_refuses_before_broadcast(
+        chain_node, monkeypatch):
+    node, wallet, row = chain_node
+    home = Path(os.environ["HOME"])
+    private = ed25519.Ed25519PrivateKey.from_private_bytes(wallet["seed"])
+    (home / ".nakshatra/pay/wallet.ed25519").unlink()
+    custody = home / ".nakshatra/pay/custody"
+    custody.write_text("broker\n")
+    rpc = StarterRpc(wallet, vault_amount=2_000_000)
+    monkeypatch.setattr(pay_chain, "PayRpc", lambda _url: rpc)
+    monkeypatch.setattr(
+        pay_wallet_custody, "wallet_sign",
+        lambda message, _wallet_id, *, idempotency_key: private.sign(message))
+    original = pay_wallet_attempts.AttemptJournal.record_signed
+
+    def record_then_flip(self, attempt_id, signature):
+        original(self, attempt_id, signature)
+        custody.write_text("file\n")
+
+    monkeypatch.setattr(pay_wallet_attempts.AttemptJournal, "record_signed", record_then_flip)
+
+    with pytest.raises(SystemExit, match="custody mode changed.*nothing was signed"):
+        node._chain_starter(row)
+
+    assert not rpc.sent
 
 
 def test_chain_starter_refuses_fractional_micro_usdc(chain_node):

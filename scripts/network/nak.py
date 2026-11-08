@@ -991,36 +991,43 @@ def _pay_node_key() -> tuple[bytes, bytes]:
 
 
 def _pay_send(rpc, chain, instructions, wallet: dict, *, rent: int = 0,
-              operation: str = "", escrow: str = "", generation: int = 0) -> str:
-    if wallet.get("custody", "file") == "broker":
-        return _pay_send_broker(
-            rpc, chain, instructions, wallet, rent=rent, operation=operation,
-            escrow=escrow, generation=generation)
-    try:
-        from network.pay_wallet_custody import assert_wallet_act
+              operation: str = "", escrow: str = "", generation: int = 0,
+              withdrawal_amount: int | None = None) -> str:
+    from network import pay_wallet_custody
 
-        blockhash = rpc.latest_blockhash()
-        message = chain.compile_message(instructions, wallet["address"], blockhash)
-        fee = rpc.fee_for_message(message.data)
-        balance = rpc.balance(wallet["address"])
-        needed = int(rent) + fee
-        if balance < needed:
-            shortfall = needed - balance
-            raise SystemExit(
-                f"wallet {wallet['address']} has too little SOL: needs "
-                f"{_format_sol(needed)} SOL, has {_format_sol(balance)} SOL, "
-                f"shortfall {_format_sol(shortfall)} SOL; nothing was sent")
-        assert_wallet_act(wallet["address"], wallet.get("custody", "file"))
-        tx = chain.sign_transaction(
-            instructions, wallet["address"], blockhash,
-            {wallet["address"]: wallet["seed"]})
-        assert_wallet_act(wallet["address"], wallet.get("custody", "file"))
-        signature = rpc.send_and_confirm(tx)
-        cluster = rpc.cluster_label()
-    except SystemExit:
-        raise
-    except (ValueError, chain.VoucherError) as exc:
-        raise SystemExit(f"pay transaction refused: {exc}") from exc
+    with pay_wallet_custody.custody_lock():
+        pay_wallet_custody.assert_wallet_act(
+            wallet["address"], wallet.get("custody", "file"))
+        if wallet.get("custody", "file") == "broker":
+            return _pay_send_broker(
+                rpc, chain, instructions, wallet, rent=rent, operation=operation,
+                escrow=escrow, generation=generation,
+                withdrawal_amount=withdrawal_amount)
+        try:
+            blockhash = rpc.latest_blockhash()
+            message = chain.compile_message(instructions, wallet["address"], blockhash)
+            fee = rpc.fee_for_message(message.data)
+            balance = rpc.balance(wallet["address"])
+            needed = int(rent) + fee
+            if balance < needed:
+                shortfall = needed - balance
+                raise SystemExit(
+                    f"wallet {wallet['address']} has too little SOL: needs "
+                    f"{_format_sol(needed)} SOL, has {_format_sol(balance)} SOL, "
+                    f"shortfall {_format_sol(shortfall)} SOL; nothing was sent")
+            tx = chain.sign_transaction(
+                instructions, wallet["address"], blockhash,
+                {wallet["address"]: wallet["seed"]})
+            # This is deliberately the final operation before broadcast.  The
+            # custody lock makes it stable for cooperative importers as well.
+            pay_wallet_custody.assert_wallet_act(
+                wallet["address"], wallet.get("custody", "file"))
+            signature = rpc.send_and_confirm(tx)
+            cluster = rpc.cluster_label()
+        except SystemExit:
+            raise
+        except (ValueError, chain.VoucherError) as exc:
+            raise SystemExit(f"pay transaction refused: {exc}") from exc
     print(f"cluster: {cluster}")
     print(f"transaction: {signature}")
     print(f"explorer: {chain.explorer_link(signature, cluster)}")
@@ -1028,7 +1035,8 @@ def _pay_send(rpc, chain, instructions, wallet: dict, *, rent: int = 0,
 
 
 def _pay_send_broker(rpc, chain, instructions, wallet: dict, *, rent: int,
-                     operation: str, escrow: str, generation: int) -> str:
+                     operation: str, escrow: str, generation: int,
+                     withdrawal_amount: int | None = None) -> str:
     from network import pay_wallet_attempts, pay_wallet_custody
 
     if operation not in {"ensure", "withdraw-request", "withdraw-execute"}:
@@ -1037,10 +1045,22 @@ def _pay_send_broker(rpc, chain, instructions, wallet: dict, *, rent: int,
             f"broker custody refuses {label}; approved wallet templates are ensure on an "
             "existing escrow, withdraw request, and withdraw execute")
     try:
-        intent = pay_wallet_attempts.instruction_digest(instructions)
-        scope = pay_wallet_attempts.operation_scope(operation, escrow, generation)
-        logical = pay_wallet_attempts.logical_key(scope, intent)
         with pay_wallet_attempts.attempt_lock(), pay_wallet_attempts.AttemptJournal() as journal:
+            intent = pay_wallet_attempts.instruction_digest(instructions)
+            withdrawal_act_id = ""
+            request_record = None
+            if operation == "withdraw-request":
+                if withdrawal_amount is None:
+                    raise chain.VoucherError("withdraw request amount was not carried into its act")
+                withdrawal_act_id = journal.begin_withdraw_request(
+                    rpc, escrow, generation, withdrawal_amount)
+            elif operation == "withdraw-execute":
+                cycle, request_record = journal.withdraw_cycle_for_execute(
+                    escrow, generation)
+                withdrawal_act_id = cycle["act_id"]
+            scope = pay_wallet_attempts.operation_scope(
+                operation, escrow, generation, act_id=withdrawal_act_id)
+            logical = pay_wallet_attempts.logical_key(scope, intent)
             reconciled = journal.reconcile(scope, rpc, resumable_logical_key=logical)
             if reconciled.unresolved:
                 raise chain.VoucherError(
@@ -1050,6 +1070,11 @@ def _pay_send_broker(rpc, chain, instructions, wallet: dict, *, rent: int,
                 (row for row in reversed(reconciled.succeeded)
                  if row["logical_key"] == logical), None)
             if completed is not None:
+                if operation == "withdraw-request":
+                    completed = journal.bind_finalized_withdraw_request(
+                        rpc, int(completed["id"]))
+                elif operation == "withdraw-execute":
+                    journal.complete_withdraw_execute(withdrawal_act_id)
                 signature = completed["signature"]
                 cluster = rpc.cluster_label()
                 print(f"cluster: {cluster}")
@@ -1057,7 +1082,8 @@ def _pay_send_broker(rpc, chain, instructions, wallet: dict, *, rent: int,
                 print(f"explorer: {chain.explorer_link(signature, cluster)}")
                 return signature
             if operation == "withdraw-execute":
-                journal.require_finalized_withdraw_request(rpc, escrow, generation)
+                assert request_record is not None
+                journal.assert_withdraw_pending(rpc, request_record)
 
             blockhash_info = rpc.latest_blockhash_info()
             message = chain.compile_message(
@@ -1076,7 +1102,12 @@ def _pay_send_broker(rpc, chain, instructions, wallet: dict, *, rent: int,
                 wallet_id=wallet["address"], custody=wallet["custody"],
                 message=message.data, blockhash=blockhash_info["blockhash"],
                 last_valid_block_height=blockhash_info["lastValidBlockHeight"],
-                escrow=escrow, generation=generation)
+                escrow=escrow, generation=generation,
+                withdrawal_act_id=withdrawal_act_id,
+                withdrawal_amount=withdrawal_amount)
+            if operation == "withdraw-execute":
+                journal.consume_withdraw_request(
+                    int(request_record["id"]), withdrawal_act_id, logical)
             with pay_wallet_custody.pinned_custody(wallet["custody"]):
                 signature_bytes = pay_wallet_custody.wallet_sign(
                     approval.message, wallet["address"],
@@ -1085,14 +1116,22 @@ def _pay_send_broker(rpc, chain, instructions, wallet: dict, *, rent: int,
                 wallet["address"], wallet["custody"])
             transaction = chain.assemble_transaction(approval.message, signature_bytes)
             journal.record_signed(approval.id, transaction.signature)
+            # The signed attempt is now durable.  Re-read both custody and
+            # wallet.pub as the immediately preceding operation to broadcast.
+            pay_wallet_custody.assert_wallet_act(
+                wallet["address"], wallet["custody"])
             try:
                 signature = rpc.send_and_confirm(
                     transaction,
                     last_valid_block_height=approval.last_valid_block_height)
             except chain.TransactionDefiniteFailure as exc:
-                journal.resolve_signature(transaction.signature, "failed", str(exc))
+                journal.resolve_signature(transaction.signature, "failed", "send-refused")
                 raise
             journal.resolve_signature(transaction.signature, "succeeded")
+            if operation == "withdraw-request":
+                journal.bind_finalized_withdraw_request(rpc, approval.id)
+            elif operation == "withdraw-execute":
+                journal.complete_withdraw_execute(withdrawal_act_id)
             cluster = rpc.cluster_label()
     except SystemExit:
         raise
@@ -1485,7 +1524,8 @@ def _pay_command(args) -> None:
             amount = _pay_usdc(args.amount, "--amount")
             _pay_send(rpc, chain, chain.escrow_withdraw_request(
                 wallet["address"], amount, program), wallet,
-                operation="withdraw-request", escrow=escrow, generation=generation)
+                operation="withdraw-request", escrow=escrow, generation=generation,
+                withdrawal_amount=amount)
             current = rpc.account_info(escrow)
             pending = chain.decode_escrow(current["data"])["pending_withdraw"] if current else None
             if pending:
