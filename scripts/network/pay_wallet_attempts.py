@@ -16,6 +16,7 @@ import hashlib
 import os
 import secrets
 import sqlite3
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -81,6 +82,15 @@ class PreparedApproval:
 class ReconcileResult:
     unresolved: bool
     succeeded: tuple[dict, ...]
+    terminal_failures: tuple[dict, ...] = ()
+
+
+class DepositAmountMismatch(pay_voucher.VoucherError):
+    """The caller tried to replace the sole open deposit act with another amount."""
+
+    def __init__(self, amount_micro: int):
+        self.amount_micro = int(amount_micro)
+        super().__init__("open deposit act has a different amount")
 
 
 class AttemptJournal:
@@ -127,6 +137,16 @@ class AttemptJournal:
         self._db.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS withdrawal_one_active "
             "ON withdrawal_cycles(escrow) WHERE state!='consumed'")
+        self._db.execute(
+            "CREATE TABLE IF NOT EXISTS deposit_acts("
+            "act_id TEXT PRIMARY KEY, wallet TEXT NOT NULL, escrow TEXT NOT NULL, "
+            "amount_micro INTEGER NOT NULL, state TEXT NOT NULL, "
+            "created_at INTEGER NOT NULL DEFAULT 0, "
+            "CHECK(state IN ('open','completed','failed')))"
+        )
+        self._db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS deposit_one_open "
+            "ON deposit_acts(wallet,escrow) WHERE state='open'")
         self._db.execute(
             "CREATE INDEX IF NOT EXISTS attempts_scope ON attempts(operation_scope,id)")
         self._secure()
@@ -295,13 +315,21 @@ class AttemptJournal:
                 continue
             unresolved = True
         self._secure()
-        succeeded = tuple(row for row in self._rows(scope=scope)
-                          if row["resolution"] == "succeeded")
-        return ReconcileResult(unresolved, succeeded)
+        resolved = self._rows(scope=scope)
+        succeeded = tuple(row for row in resolved if row["resolution"] == "succeeded")
+        terminal_failures = tuple(
+            row for row in resolved if row["resolution"] in {"failed", "expired"})
+        return ReconcileResult(unresolved, succeeded, terminal_failures)
 
     def reconcile_operation(self, operation: str, wallet_id: str, escrow: str,
-                            generation: int, rpc) -> ReconcileResult:
-        """Reconcile every act scope for one wallet escrow generation."""
+                            generation: int, rpc, *,
+                            resumable_logical_key: str = "") -> ReconcileResult:
+        """Reconcile every relevant act scope for one wallet and escrow.
+
+        Deposits deliberately cross generation and scope boundaries: the wire
+        instruction does not carry an escrow generation, so an older or legacy
+        attempt can still land against the current escrow.
+        """
         if operation not in _OPERATIONS:
             raise ValueError("invalid broker wallet operation")
         wallet = pay_chain.pubkey_text(wallet_id, "wallet id")
@@ -310,15 +338,83 @@ class AttemptJournal:
             raise ValueError("escrow generation must be a non-negative integer")
         rows = self._rows(
             operation=operation, wallet_id=wallet, escrow=escrow_key,
-            generation=generation)
+            generation=(None if operation == "deposit" else generation))
         scopes = tuple(dict.fromkeys(row["operation_scope"] for row in rows))
         unresolved = False
         succeeded = []
+        terminal_failures = []
         for scope in scopes:
-            result = self.reconcile(scope, rpc)
+            result = self.reconcile(
+                scope, rpc, resumable_logical_key=resumable_logical_key)
             unresolved = unresolved or result.unresolved
             succeeded.extend(result.succeeded)
-        return ReconcileResult(unresolved, tuple(succeeded))
+            terminal_failures.extend(result.terminal_failures)
+        return ReconcileResult(
+            unresolved, tuple(succeeded), tuple(terminal_failures))
+
+    def begin_deposit(self, wallet_id: str, escrow: str, amount_micro: int,
+                      *, created_at: int | None = None) -> str:
+        """Create or resume the sole open deposit act for a wallet escrow."""
+        wallet = pay_chain.pubkey_text(wallet_id, "wallet id")
+        escrow_key = pay_chain.pubkey_text(escrow, "escrow")
+        if (isinstance(amount_micro, bool) or not isinstance(amount_micro, int)
+                or not 0 < amount_micro < 2**64):
+            raise ValueError("deposit amount must be a positive u64")
+        created = int(time.time()) if created_at is None else created_at
+        if isinstance(created, bool) or not isinstance(created, int) or created < 0:
+            raise ValueError("deposit creation time must be a non-negative integer")
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            active = self._db.execute(
+                "SELECT * FROM deposit_acts "
+                "WHERE wallet=? AND escrow=? AND state='open'",
+                (wallet, escrow_key)).fetchone()
+            if active is not None:
+                if int(active["amount_micro"]) != amount_micro:
+                    raise DepositAmountMismatch(int(active["amount_micro"]))
+                self._db.execute("COMMIT")
+                return str(active["act_id"])
+            act_id = secrets.token_hex(16)
+            self._db.execute(
+                "INSERT INTO deposit_acts("
+                "act_id,wallet,escrow,amount_micro,state,created_at) "
+                "VALUES(?,?,?,?,?,?)",
+                (act_id, wallet, escrow_key, amount_micro, "open", created))
+            self._db.execute("COMMIT")
+            self._secure()
+            return act_id
+        except BaseException:
+            if self._db.in_transaction:
+                self._db.execute("ROLLBACK")
+            raise
+
+    def open_deposit(self, wallet_id: str, escrow: str) -> dict | None:
+        """Return the sole open act, if any, for early admission checks."""
+        wallet = pay_chain.pubkey_text(wallet_id, "wallet id")
+        escrow_key = pay_chain.pubkey_text(escrow, "escrow")
+        row = self._db.execute(
+            "SELECT * FROM deposit_acts "
+            "WHERE wallet=? AND escrow=? AND state='open'",
+            (wallet, escrow_key)).fetchone()
+        return None if row is None else dict(row)
+
+    def complete_deposit(self, act_id: str) -> None:
+        """Close a deposit act only after its attempt has finalized successfully."""
+        cursor = self._db.execute(
+            "UPDATE deposit_acts SET state='completed' "
+            "WHERE act_id=? AND state='open'", (_text(act_id, "deposit act id"),))
+        if cursor.rowcount != 1:
+            raise pay_voucher.VoucherError("deposit act is not open")
+        self._secure()
+
+    def fail_deposit(self, act_id: str) -> None:
+        """Close a deposit act after a definite transaction failure or expiry."""
+        cursor = self._db.execute(
+            "UPDATE deposit_acts SET state='failed' "
+            "WHERE act_id=? AND state='open'", (_text(act_id, "deposit act id"),))
+        if cursor.rowcount != 1:
+            raise pay_voucher.VoucherError("deposit act is not open")
+        self._secure()
 
     def begin_withdraw_request(self, rpc, escrow: str, generation: int,
                                amount: int, *, created: int = 0) -> str:

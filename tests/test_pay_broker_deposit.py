@@ -57,9 +57,15 @@ def _delegate_data(escrow: str, node: str, *, expires: int) -> bytes:
     return bytes(raw)
 
 
-def _token_data(amount: int) -> bytes:
+def _token_data(
+        amount: int, *, mint: str = MINT, owner: str | None = None,
+        state: int = 1) -> bytes:
     raw = bytearray(165)
+    raw[:32] = pay_chain.pubkey_bytes(mint)
+    if owner is not None:
+        raw[32:64] = pay_chain.pubkey_bytes(owner)
     struct.pack_into("<Q", raw, 64, amount)
+    raw[108] = state
     return bytes(raw)
 
 
@@ -81,6 +87,7 @@ class FakeRpc:
         self.escrow_account_data = None
         self.ata_account_data = None
         self.vault_account_data = None
+        self.delegate_account_data = None
         self.vault_present = True
         self.vault_owner = pay_chain.TOKEN_PROGRAM_ID
         self.signature_status_result = {
@@ -116,14 +123,17 @@ class FakeRpc:
                     else _token_data(0))
             return {"owner": self.vault_owner, "data": data}
         if address == self.delegate and self.delegate_configured:
-            return {"owner": PROGRAM, "data": _delegate_data(
-                self.escrow, self.node, expires=30 * 86400 + 1_000_000)}
+            data = (self.delegate_account_data if self.delegate_account_data is not None
+                    else _delegate_data(
+                        self.escrow, self.node, expires=30 * 86400 + 1_000_000))
+            return {"owner": PROGRAM, "data": data}
         if address == pay_chain.owner_state_pda(self.owner, PROGRAM)[0]:
             return {"owner": PROGRAM, "data": bytes(17)}
         if address == self.ata and (self.wallet_token_balance is not None
                                     or self.ata_account_data is not None):
             data = (self.ata_account_data if self.ata_account_data is not None
-                    else _token_data(self.wallet_token_balance))
+                    else _token_data(
+                        self.wallet_token_balance, owner=self.owner))
             return {"owner": pay_chain.TOKEN_PROGRAM_ID,
                     "data": data}
         return None
@@ -282,9 +292,128 @@ def test_cli_two_same_amount_broker_deposits_are_distinct_acts(
     assert rpc.sent[0][0].signature != rpc.sent[1][0].signature
     with pay_wallet_attempts.AttemptJournal() as journal:
         rows = [row for row in journal.attempts() if row["operation"] == "deposit"]
+        act_states = [row[0] for row in journal._db.execute(  # noqa: SLF001
+            "SELECT state FROM deposit_acts ORDER BY created_at,act_id")]
     assert len(rows) == 2
     assert len({row["operation_scope"] for row in rows}) == 2
     assert all(row["resolution"] == "succeeded" for row in rows)
+    assert act_states == ["completed", "completed"]
+
+
+def test_cli_broker_deposit_resumes_same_act_after_prepare_crash(
+        _temp_home, monkeypatch):
+    wallet, private, node = _wallet(_temp_home, custody="broker")
+    rpc = FakeRpc(configured=True, wallet_token_balance=2_000_000)
+    rpc.configure(wallet, node)
+    _install_rpc(monkeypatch, rpc)
+    approvals = []
+
+    def sign(message, _wallet_id, *, idempotency_key):
+        approvals.append(idempotency_key)
+        if len(approvals) == 1:
+            raise RuntimeError("crash after prepare")
+        return private.sign(message)
+
+    monkeypatch.setattr(pay_wallet_custody, "wallet_sign", sign)
+
+    with pytest.raises(RuntimeError, match="crash after prepare"):
+        nak.main(["pay", "deposit", "--amount", "1"])
+    assert nak.main(["pay", "deposit", "--amount", "1"]) == 0
+
+    assert len(approvals) == 2
+    assert approvals[0] == approvals[1]
+    assert len(rpc.sent) == 1
+
+
+def test_cli_broker_deposit_reconciles_after_record_signed_crash(
+        _temp_home, monkeypatch):
+    wallet, private, node = _wallet(_temp_home, custody="broker")
+    rpc = FakeRpc(configured=True, wallet_token_balance=2_000_000)
+    rpc.configure(wallet, node)
+    _install_rpc(monkeypatch, rpc)
+    approvals = []
+    monkeypatch.setattr(
+        pay_wallet_custody, "wallet_sign",
+        lambda message, _wallet_id, *, idempotency_key: (
+            approvals.append(idempotency_key), private.sign(message))[1])
+    original = pay_wallet_attempts.AttemptJournal.record_signed
+    crashed = False
+
+    def record_then_crash(journal, attempt_id, signature):
+        nonlocal crashed
+        original(journal, attempt_id, signature)
+        if not crashed:
+            crashed = True
+            raise RuntimeError("crash after record_signed")
+
+    monkeypatch.setattr(
+        pay_wallet_attempts.AttemptJournal, "record_signed", record_then_crash)
+
+    with pytest.raises(RuntimeError, match="crash after record_signed"):
+        nak.main(["pay", "deposit", "--amount", "1"])
+    assert nak.main(["pay", "deposit", "--amount", "1"]) == 0
+
+    assert len(approvals) == 1
+    assert rpc.sent == []
+
+
+def test_cli_broker_deposit_reuses_finalized_signature_after_completion_crash(
+        _temp_home, monkeypatch, capsys):
+    wallet, private, node = _wallet(_temp_home, custody="broker")
+    rpc = FakeRpc(configured=True, wallet_token_balance=2_000_000)
+    rpc.configure(wallet, node)
+    _install_rpc(monkeypatch, rpc)
+    approvals = []
+    monkeypatch.setattr(
+        pay_wallet_custody, "wallet_sign",
+        lambda message, _wallet_id, *, idempotency_key: (
+            approvals.append(idempotency_key), private.sign(message))[1])
+    original = getattr(pay_wallet_attempts.AttemptJournal, "complete_deposit", None)
+    crashed = False
+
+    def complete_then_crash(journal, act_id):
+        nonlocal crashed
+        if not crashed:
+            crashed = True
+            raise RuntimeError("crash after finalize")
+        assert original is not None
+        return original(journal, act_id)
+
+    monkeypatch.setattr(
+        pay_wallet_attempts.AttemptJournal, "complete_deposit",
+        complete_then_crash, raising=False)
+
+    with pytest.raises(RuntimeError, match="crash after finalize"):
+        nak.main(["pay", "deposit", "--amount", "1"])
+    signature = rpc.sent[0][0].signature
+    assert nak.main(["pay", "deposit", "--amount", "1"]) == 0
+
+    assert len(approvals) == 1
+    assert len(rpc.sent) == 1
+    assert f"transaction: {signature}" in capsys.readouterr().out
+
+
+def test_cli_broker_deposit_refuses_different_amount_for_open_act(
+        _temp_home, monkeypatch):
+    wallet, _private, node = _wallet(_temp_home, custody="broker")
+    rpc = FakeRpc(configured=True, wallet_token_balance=3_000_000)
+    rpc.configure(wallet, node)
+    _install_rpc(monkeypatch, rpc)
+    with pay_wallet_attempts.AttemptJournal() as journal:
+        journal.begin_deposit(wallet["address"], rpc.escrow, 1_000_000)
+    monkeypatch.setattr(
+        pay_chain, "PayRpc",
+        lambda _url: pytest.fail("amount mismatch contacted the chain"))
+    monkeypatch.setattr(
+        pay_wallet_custody, "wallet_sign",
+        lambda *_args, **_kwargs: pytest.fail("amount mismatch contacted the broker"))
+
+    with pytest.raises(
+            SystemExit,
+            match=r"open deposit act is for 1 USDC.*re-run.*1.*nothing was signed$"):
+        nak.main(["pay", "deposit", "--amount", "2"])
+
+    assert rpc.sent == []
 
 
 def test_cli_broker_deposit_refuses_prior_act_unresolved_without_broker_contact(
@@ -317,6 +446,73 @@ def test_cli_broker_deposit_refuses_prior_act_unresolved_without_broker_contact(
             SystemExit,
             match=r"previous deposit is unresolved; retry after it settles; nothing was signed$"):
         nak.main(["pay", "deposit", "--amount", "1"])
+    assert contacted == []
+    assert rpc.sent == []
+
+
+def test_cli_broker_deposit_refuses_unresolved_older_generation(
+        _temp_home, monkeypatch):
+    wallet, _private, node = _wallet(_temp_home, custody="broker")
+    rpc = FakeRpc(configured=True, wallet_token_balance=2_000_000)
+    rpc.configure(wallet, node)
+    rpc.signature_status_result = None
+    _install_rpc(monkeypatch, rpc)
+    instructions = pay_chain.escrow_deposit(
+        wallet["address"], MINT, 1_000_000, PROGRAM)
+    scope = pay_wallet_attempts.operation_scope(
+        "deposit", rpc.escrow, 6, act_id="older-generation-act")
+    logical = pay_wallet_attempts.logical_key(
+        scope, pay_wallet_attempts.instruction_digest(instructions))
+    with pay_wallet_attempts.AttemptJournal() as journal:
+        approval = journal.prepare(
+            scope=scope, logical=logical, operation="deposit",
+            wallet_id=wallet["address"], custody="broker",
+            message=pay_chain.compile_message(
+                instructions, wallet["address"], BLOCKHASH).data,
+            blockhash=BLOCKHASH, last_valid_block_height=999,
+            escrow=rpc.escrow, generation=6)
+        journal.record_signed(approval.id, pay_chain.b58encode(b"g" * 64))
+    contacted = []
+    monkeypatch.setattr(
+        pay_wallet_custody, "wallet_sign",
+        lambda *_args, **_kwargs: contacted.append(True))
+
+    with pytest.raises(SystemExit, match=r"previous deposit is unresolved.*nothing was signed$"):
+        nak.main(["pay", "deposit", "--amount", "1"])
+
+    assert contacted == []
+    assert rpc.sent == []
+
+
+def test_cli_broker_deposit_refuses_unresolved_legacy_scope(
+        _temp_home, monkeypatch):
+    wallet, _private, node = _wallet(_temp_home, custody="broker")
+    rpc = FakeRpc(configured=True, wallet_token_balance=2_000_000)
+    rpc.configure(wallet, node)
+    rpc.signature_status_result = None
+    _install_rpc(monkeypatch, rpc)
+    instructions = pay_chain.escrow_deposit(
+        wallet["address"], MINT, 1_000_000, PROGRAM)
+    scope = pay_wallet_attempts.operation_scope("deposit", rpc.escrow, 7)
+    logical = pay_wallet_attempts.logical_key(
+        scope, pay_wallet_attempts.instruction_digest(instructions))
+    with pay_wallet_attempts.AttemptJournal() as journal:
+        approval = journal.prepare(
+            scope=scope, logical=logical, operation="deposit",
+            wallet_id=wallet["address"], custody="broker",
+            message=pay_chain.compile_message(
+                instructions, wallet["address"], BLOCKHASH).data,
+            blockhash=BLOCKHASH, last_valid_block_height=999,
+            escrow=rpc.escrow, generation=7)
+        journal.record_signed(approval.id, pay_chain.b58encode(b"l" * 64))
+    contacted = []
+    monkeypatch.setattr(
+        pay_wallet_custody, "wallet_sign",
+        lambda *_args, **_kwargs: contacted.append(True))
+
+    with pytest.raises(SystemExit, match=r"previous deposit is unresolved.*nothing was signed$"):
+        nak.main(["pay", "deposit", "--amount", "1"])
+
     assert contacted == []
     assert rpc.sent == []
 
@@ -407,6 +603,35 @@ def test_cli_broker_deposit_refuses_malformed_ata_before_signing(
     assert contacted == [] and rpc.sent == []
 
 
+@pytest.mark.parametrize(("name", "data", "message"), [
+    ("wrong-mint", _token_data(
+        2_000_000, mint=pay_chain.b58encode(bytes(range(33, 65)))), "mint"),
+    ("wrong-authority", _token_data(
+        2_000_000, owner=pay_chain.b58encode(bytes(range(34, 66)))), "authority"),
+    ("uninitialized", _token_data(2_000_000, state=0), "not initialized"),
+    ("frozen", _token_data(2_000_000, state=2), "frozen"),
+], ids=["wrong-mint", "wrong-authority", "uninitialized", "frozen"])
+def test_cli_broker_deposit_refuses_invalid_finalized_ata(
+        _temp_home, monkeypatch, name, data, message):
+    del name
+    wallet, _private, node = _wallet(_temp_home, custody="broker")
+    rpc = FakeRpc(configured=True, wallet_token_balance=2_000_000)
+    rpc.configure(wallet, node)
+    rpc.ata_account_data = bytearray(data)
+    if not any(rpc.ata_account_data[32:64]):
+        rpc.ata_account_data[32:64] = pay_chain.pubkey_bytes(wallet["address"])
+    _install_rpc(monkeypatch, rpc)
+    contacted = []
+    monkeypatch.setattr(
+        pay_wallet_custody, "wallet_sign",
+        lambda *_args, **_kwargs: contacted.append(True))
+
+    with pytest.raises(SystemExit, match=rf"{message}.*nothing was signed$"):
+        nak.main(["pay", "deposit", "--amount", "1"])
+
+    assert contacted == [] and rpc.sent == []
+
+
 def test_cli_broker_deposit_refuses_missing_vault_before_signing(
         _temp_home, monkeypatch):
     wallet, _private, node = _wallet(_temp_home, custody="broker")
@@ -474,6 +699,44 @@ def test_cli_broker_deposit_refuses_implicit_ensure_signing(
     with pytest.raises(
             SystemExit, match=r"requires.*configured first.*nothing was signed$"):
         nak.main(["pay", "deposit", "--amount", "1"])
+    assert contacted == [] and rpc.sent == []
+
+
+def test_cli_broker_deposit_ensure_refusal_for_mismatched_escrow_has_suffix(
+        _temp_home, monkeypatch):
+    wallet, _private, node = _wallet(_temp_home, custody="broker")
+    rpc = FakeRpc(configured=True, wallet_token_balance=2_000_000)
+    rpc.configure(wallet, node)
+    rpc.escrow_account_data = _escrow_data(
+        pay_chain.b58encode(bytes(range(41, 73))), rpc.vault)
+    _install_rpc(monkeypatch, rpc)
+    contacted = []
+    monkeypatch.setattr(
+        pay_wallet_custody, "wallet_sign",
+        lambda *_args, **_kwargs: contacted.append(True))
+
+    with pytest.raises(
+            SystemExit, match=r"configured wallet and vault; nothing was signed$"):
+        nak.main(["pay", "deposit", "--amount", "1"])
+
+    assert contacted == [] and rpc.sent == []
+
+
+def test_cli_broker_deposit_ensure_refusal_for_malformed_delegate_has_suffix(
+        _temp_home, monkeypatch):
+    wallet, _private, node = _wallet(_temp_home, custody="broker")
+    rpc = FakeRpc(configured=True, wallet_token_balance=2_000_000)
+    rpc.configure(wallet, node)
+    rpc.delegate_account_data = b"not-a-delegate"
+    _install_rpc(monkeypatch, rpc)
+    contacted = []
+    monkeypatch.setattr(
+        pay_wallet_custody, "wallet_sign",
+        lambda *_args, **_kwargs: contacted.append(True))
+
+    with pytest.raises(SystemExit, match=r"Delegate account; nothing was signed$"):
+        nak.main(["pay", "deposit", "--amount", "1"])
+
     assert contacted == [] and rpc.sent == []
 
 

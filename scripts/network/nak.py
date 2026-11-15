@@ -993,7 +993,9 @@ def _pay_node_key() -> tuple[bytes, bytes]:
 
 def _pay_send(rpc, chain, instructions, wallet: dict, *, rent: int = 0,
               operation: str = "", escrow: str = "", generation: int = 0,
-              withdrawal_amount: int | None = None) -> str:
+              withdrawal_amount: int | None = None,
+              deposit_amount: int | None = None,
+              pre_sign_guard=None) -> str:
     from network import pay_wallet_custody
 
     with pay_wallet_custody.custody_lock():
@@ -1003,7 +1005,8 @@ def _pay_send(rpc, chain, instructions, wallet: dict, *, rent: int = 0,
             return _pay_send_broker(
                 rpc, chain, instructions, wallet, rent=rent, operation=operation,
                 escrow=escrow, generation=generation,
-                withdrawal_amount=withdrawal_amount)
+                withdrawal_amount=withdrawal_amount,
+                deposit_amount=deposit_amount, pre_sign_guard=pre_sign_guard)
         try:
             blockhash = rpc.latest_blockhash()
             message = chain.compile_message(instructions, wallet["address"], blockhash)
@@ -1037,7 +1040,9 @@ def _pay_send(rpc, chain, instructions, wallet: dict, *, rent: int = 0,
 
 def _pay_send_broker(rpc, chain, instructions, wallet: dict, *, rent: int,
                      operation: str, escrow: str, generation: int,
-                     withdrawal_amount: int | None = None) -> str:
+                     withdrawal_amount: int | None = None,
+                     deposit_amount: int | None = None,
+                     pre_sign_guard=None) -> str:
     from network import pay_wallet_attempts, pay_wallet_custody
 
     if operation not in {"ensure", "deposit", "withdraw-request", "withdraw-execute"}:
@@ -1061,22 +1066,41 @@ def _pay_send_broker(rpc, chain, instructions, wallet: dict, *, rent: int,
                     escrow, generation)
                 withdrawal_act_id = cycle["act_id"]
             elif operation == "deposit":
-                earlier = journal.reconcile_operation(
-                    operation, wallet["address"], escrow, generation, rpc)
-                if earlier.unresolved:
+                if deposit_amount is None:
+                    raise chain.VoucherError("deposit amount was not carried into its act")
+                try:
+                    deposit_act_id = journal.begin_deposit(
+                        wallet["address"], escrow, deposit_amount)
+                except pay_wallet_attempts.DepositAmountMismatch as exc:
+                    amount = _pay_amount(exc.amount_micro)
                     raise chain.VoucherError(
-                        "previous deposit is unresolved; retry after it settles; "
-                        "nothing was signed")
-                deposit_act_id = secrets.token_hex(16)
+                        f"open deposit act is for {amount} USDC; re-run with "
+                        f"--amount {amount} to finish it") from exc
             scope = pay_wallet_attempts.operation_scope(
                 operation, escrow, generation,
                 act_id=withdrawal_act_id or deposit_act_id)
             logical = pay_wallet_attempts.logical_key(scope, intent)
-            reconciled = journal.reconcile(scope, rpc, resumable_logical_key=logical)
+            if operation == "deposit":
+                reconciled = journal.reconcile_operation(
+                    operation, wallet["address"], escrow, generation, rpc,
+                    resumable_logical_key=logical)
+            else:
+                reconciled = journal.reconcile(
+                    scope, rpc, resumable_logical_key=logical)
             if reconciled.unresolved:
+                if operation == "deposit":
+                    raise chain.VoucherError(
+                        "previous deposit is unresolved; retry after it settles")
                 raise chain.VoucherError(
                     f"previous {operation} transaction is still unresolved; "
                     "no new approval was requested")
+            terminal = next(
+                (row for row in reversed(reconciled.terminal_failures)
+                 if row["logical_key"] == logical), None)
+            if terminal is not None and operation == "deposit":
+                journal.fail_deposit(deposit_act_id)
+                raise chain.VoucherError(
+                    "previous deposit failed definitively; re-run to start a new deposit act")
             completed = next(
                 (row for row in reversed(reconciled.succeeded)
                  if row["logical_key"] == logical), None)
@@ -1086,6 +1110,8 @@ def _pay_send_broker(rpc, chain, instructions, wallet: dict, *, rent: int,
                         rpc, int(completed["id"]))
                 elif operation == "withdraw-execute":
                     journal.complete_withdraw_execute(withdrawal_act_id)
+                elif operation == "deposit":
+                    journal.complete_deposit(deposit_act_id)
                 signature = completed["signature"]
                 cluster = rpc.cluster_label()
                 print(f"cluster: {cluster}")
@@ -1122,6 +1148,8 @@ def _pay_send_broker(rpc, chain, instructions, wallet: dict, *, rent: int,
                 journal.consume_withdraw_request(
                     int(request_record["id"]), withdrawal_act_id, logical)
             with pay_wallet_custody.pinned_custody(wallet["custody"]):
+                if pre_sign_guard is not None:
+                    pre_sign_guard.start_signing()
                 signature_bytes = pay_wallet_custody.wallet_sign(
                     approval.message, wallet["address"],
                     idempotency_key=approval.idempotency_key)
@@ -1139,12 +1167,24 @@ def _pay_send_broker(rpc, chain, instructions, wallet: dict, *, rent: int,
                     last_valid_block_height=approval.last_valid_block_height)
             except chain.TransactionDefiniteFailure as exc:
                 journal.resolve_signature(transaction.signature, "failed", "send-refused")
+                if operation == "deposit":
+                    journal.fail_deposit(deposit_act_id)
+                raise
+            except chain.VoucherError:
+                if operation == "deposit":
+                    after_error = journal.reconcile(
+                        scope, rpc, resumable_logical_key=logical)
+                    if any(row["logical_key"] == logical
+                           for row in after_error.terminal_failures):
+                        journal.fail_deposit(deposit_act_id)
                 raise
             journal.resolve_signature(transaction.signature, "succeeded")
             if operation == "withdraw-request":
                 journal.bind_finalized_withdraw_request(rpc, approval.id)
             elif operation == "withdraw-execute":
                 journal.complete_withdraw_execute(withdrawal_act_id)
+            elif operation == "deposit":
+                journal.complete_deposit(deposit_act_id)
             cluster = rpc.cluster_label()
     except SystemExit:
         raise
@@ -1375,6 +1415,161 @@ def _pay_revoke(node_key_hex: str, *, allow_self: bool = False) -> None:
         wallet["address"], target, program), wallet)
 
 
+class _BrokerDepositPreSign:
+    """Give every broker-deposit refusal the same pre-sign safety promise."""
+
+    def __init__(self):
+        self.signing_started = False
+
+    def start_signing(self) -> None:
+        self.signing_started = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, kind, value, _traceback):
+        if kind is None or self.signing_started:
+            return False
+        from network import pay_chain
+        if not issubclass(kind, (SystemExit, ValueError, pay_chain.VoucherError)):
+            return False
+        message = str(value).rstrip()
+        if not message.endswith("nothing was signed"):
+            message = message.rstrip("; ") + "; nothing was signed"
+        raise SystemExit(message) from value
+
+
+def _pay_deposit(args, wallet: dict, *, pre_sign_guard=None) -> None:
+    """Run the file or broker deposit path without changing file-custody text."""
+    broker_deposit = wallet["custody"] == "broker"
+    broker_deposit_state = None
+    if broker_deposit:
+        try:
+            amount = _pay_usdc(args.amount, "--amount")
+        except SystemExit as exc:
+            raise SystemExit(
+                "broker custody deposit amount must be greater than 0 and no more than "
+                "5 USDC; nothing was signed") from exc
+        if amount > _BROKER_DEPOSIT_MAX:
+            raise SystemExit(
+                "broker custody deposit amount must be greater than 0 and no more than "
+                "5 USDC; nothing was signed")
+        # An open act is local durable state.  Check it before constructing an
+        # RPC client so an amount mismatch never depends on chain availability
+        # and never reaches the approval broker.
+        from network import pay_chain as local_chain, pay_wallet_attempts
+        local_program = local_chain.configured_pubkey(
+            os.environ, "NAK_PAY_PROGRAM")
+        local_escrow = local_chain.escrow_pda(
+            wallet["address"], local_program)[0]
+        with (pay_wallet_attempts.attempt_lock(),
+              pay_wallet_attempts.AttemptJournal() as journal):
+            active = journal.open_deposit(wallet["address"], local_escrow)
+        if active is not None and int(active["amount_micro"]) != amount:
+            open_amount = _pay_amount(int(active["amount_micro"]))
+            raise SystemExit(
+                f"open deposit act is for {open_amount} USDC; re-run with "
+                f"--amount {open_amount} to finish it; nothing was signed")
+        preflight_chain, preflight_rpc, preflight_program, preflight_mint = (
+            _pay_chain_settings())
+        escrow = preflight_chain.escrow_pda(
+            wallet["address"], preflight_program)[0]
+        escrow_info = preflight_rpc.account_info(escrow, commitment="finalized")
+        if escrow_info is None:
+            raise SystemExit("wallet escrow is missing; nothing was signed")
+        if escrow_info.get("owner") != preflight_program:
+            raise SystemExit(
+                "wallet escrow is owned by an unexpected program; nothing was signed")
+        try:
+            escrow_state = preflight_chain.decode_escrow(escrow_info["data"])
+            ata = preflight_chain.associated_token_address(
+                wallet["address"], preflight_mint)[0]
+            ata_info = preflight_rpc.account_info(ata, commitment="finalized")
+            if (ata_info is not None
+                    and ata_info.get("owner") != preflight_chain.TOKEN_PROGRAM_ID):
+                raise SystemExit(
+                    "wallet token account is owned by an unexpected program; "
+                    "nothing was signed")
+            ata_state = (None if ata_info is None
+                         else preflight_chain.decode_token_account(ata_info["data"]))
+            if ata_state is not None:
+                if ata_state["state"] == "uninitialized":
+                    raise SystemExit(
+                        "wallet token account is not initialized; nothing was signed")
+                if ata_state["state"] == "frozen":
+                    raise SystemExit("wallet token account is frozen; nothing was signed")
+                if ata_state["mint"] != preflight_mint:
+                    raise SystemExit(
+                        "wallet token account mint does not match NAK_PAY_MINT; "
+                        "nothing was signed")
+                if ata_state["owner"] != wallet["address"]:
+                    raise SystemExit(
+                        "wallet token account authority does not match the pay wallet; "
+                        "nothing was signed")
+            ata_balance = 0 if ata_state is None else int(ata_state["amount"])
+            vault = preflight_chain.vault_pda(escrow, preflight_program)[0]
+            vault_info = preflight_rpc.account_info(vault, commitment="finalized")
+            if vault_info is None:
+                raise SystemExit(
+                    "escrow exists but its canonical vault is missing; nothing was signed")
+            if vault_info.get("owner") != preflight_chain.TOKEN_PROGRAM_ID:
+                raise SystemExit(
+                    "escrow vault is not owned by the classic SPL Token program; "
+                    "nothing was signed")
+            preflight_chain.token_amount(vault_info["data"])
+        except (ValueError, preflight_chain.VoucherError) as exc:
+            raise SystemExit(
+                f"broker custody deposit refused: {exc}; nothing was signed") from exc
+        if ata_balance < amount:
+            raise SystemExit(
+                f"wallet token account has too little USDC: needs {_pay_amount(amount)}, "
+                f"has {_pay_amount(ata_balance)}; nothing was signed")
+        broker_deposit_state = (
+            amount, wallet["address"], escrow, int(escrow_state["generation"]))
+
+    _pay_ensure(allow_broker_signing=not broker_deposit)
+    wallet, _node_seed, _node_public = _pay_wallet_and_node()
+    chain, rpc, program, mint = _pay_chain_settings()
+    escrow = ""
+    generation = 0
+    if broker_deposit_state is None:
+        amount = _pay_usdc(args.amount, "--amount")
+    else:
+        amount, preflight_wallet, escrow, generation = broker_deposit_state
+        if wallet["custody"] != "broker" or wallet["address"] != preflight_wallet:
+            raise SystemExit(
+                "pay wallet identity or custody changed during broker deposit; "
+                "nothing was signed")
+    instructions = chain.escrow_deposit(wallet["address"], mint, amount, program)
+    vault = chain.vault_pda(chain.escrow_pda(wallet["address"], program)[0], program)[0]
+    vault_info = rpc.account_info(vault)
+    if vault_info is None:
+        ending = "; nothing was signed" if broker_deposit_state is not None else ""
+        raise SystemExit(f"escrow exists but its canonical vault is missing{ending}")
+    if vault_info["owner"] != chain.TOKEN_PROGRAM_ID:
+        ending = "; nothing was signed" if broker_deposit_state is not None else ""
+        raise SystemExit(
+            f"escrow vault is not owned by the classic SPL Token program{ending}")
+    try:
+        current_balance = chain.token_amount(vault_info["data"])
+    except ValueError as exc:
+        if broker_deposit_state is not None:
+            raise SystemExit(
+                f"broker custody deposit refused: {exc}; nothing was signed") from exc
+        raise
+    _warn_unbacked_pay_balance(current_balance + amount)
+    ata = chain.associated_token_address(wallet["address"], mint)[0]
+    rent = 0 if rpc.account_info(ata) is not None else rpc.rent_exemption(165)
+    send_kwargs = {
+        "rent": rent, "operation": "deposit", "escrow": escrow,
+        "generation": generation,
+    }
+    if broker_deposit_state is not None:
+        send_kwargs.update(
+            deposit_amount=amount, pre_sign_guard=pre_sign_guard)
+    _pay_send(rpc, chain, instructions, wallet, **send_kwargs)
+
+
 def _pay_command(args) -> None:
     from network.pay_wallet import bip39_mnemonic, load_wallet, load_wallet_identity
 
@@ -1501,99 +1696,18 @@ def _pay_command(args) -> None:
             f"{name} {value}" for name, value in result.items()))
         return
 
-    broker_deposit = args.pay_cmd == "deposit" and wallet["custody"] == "broker"
-    broker_deposit_state = None
-    if broker_deposit:
-        try:
-            amount = _pay_usdc(args.amount, "--amount")
-        except SystemExit as exc:
-            raise SystemExit(
-                "broker custody deposit amount must be greater than 0 and no more than "
-                "5 USDC; nothing was signed") from exc
-        if amount > _BROKER_DEPOSIT_MAX:
-            raise SystemExit(
-                "broker custody deposit amount must be greater than 0 and no more than "
-                "5 USDC; nothing was signed")
-        preflight_chain, preflight_rpc, preflight_program, preflight_mint = (
-            _pay_chain_settings())
-        escrow = preflight_chain.escrow_pda(
-            wallet["address"], preflight_program)[0]
-        escrow_info = preflight_rpc.account_info(escrow, commitment="finalized")
-        if escrow_info is None:
-            raise SystemExit("wallet escrow is missing; nothing was signed")
-        if escrow_info.get("owner") != preflight_program:
-            raise SystemExit(
-                "wallet escrow is owned by an unexpected program; nothing was signed")
-        try:
-            escrow_state = preflight_chain.decode_escrow(escrow_info["data"])
-            ata = preflight_chain.associated_token_address(
-                wallet["address"], preflight_mint)[0]
-            ata_info = preflight_rpc.account_info(ata, commitment="finalized")
-            if (ata_info is not None
-                    and ata_info.get("owner") != preflight_chain.TOKEN_PROGRAM_ID):
-                raise SystemExit(
-                    "wallet token account is owned by an unexpected program; "
-                    "nothing was signed")
-            ata_balance = (0 if ata_info is None
-                           else preflight_chain.token_amount(ata_info["data"]))
-            vault = preflight_chain.vault_pda(escrow, preflight_program)[0]
-            vault_info = preflight_rpc.account_info(vault, commitment="finalized")
-            if vault_info is None:
-                raise SystemExit(
-                    "escrow exists but its canonical vault is missing; nothing was signed")
-            if vault_info.get("owner") != preflight_chain.TOKEN_PROGRAM_ID:
-                raise SystemExit(
-                    "escrow vault is not owned by the classic SPL Token program; "
-                    "nothing was signed")
-            preflight_chain.token_amount(vault_info["data"])
-        except (ValueError, preflight_chain.VoucherError) as exc:
-            raise SystemExit(
-                f"broker custody deposit refused: {exc}; nothing was signed") from exc
-        if ata_balance < amount:
-            raise SystemExit(
-                f"wallet token account has too little USDC: needs {_pay_amount(amount)}, "
-                f"has {_pay_amount(ata_balance)}; nothing was signed")
-        broker_deposit_state = (
-            amount, wallet["address"], escrow, int(escrow_state["generation"]))
-    if args.pay_cmd in {"deposit", "withdraw"}:
-        _pay_ensure(allow_broker_signing=not broker_deposit)
-    wallet, _node_seed, _node_public = _pay_wallet_and_node()
-    chain, rpc, program, mint = _pay_chain_settings()
     if args.pay_cmd == "deposit":
-        escrow = ""
-        generation = 0
-        if broker_deposit_state is None:
-            amount = _pay_usdc(args.amount, "--amount")
+        if wallet["custody"] == "broker":
+            with _BrokerDepositPreSign() as pre_sign_guard:
+                _pay_deposit(args, wallet, pre_sign_guard=pre_sign_guard)
         else:
-            amount, preflight_wallet, escrow, generation = broker_deposit_state
-            if wallet["custody"] != "broker" or wallet["address"] != preflight_wallet:
-                raise SystemExit(
-                    "pay wallet identity or custody changed during broker deposit; "
-                    "nothing was signed")
-        instructions = chain.escrow_deposit(wallet["address"], mint, amount, program)
-        vault = chain.vault_pda(chain.escrow_pda(wallet["address"], program)[0], program)[0]
-        vault_info = rpc.account_info(vault)
-        if vault_info is None:
-            ending = "; nothing was signed" if broker_deposit_state is not None else ""
-            raise SystemExit(f"escrow exists but its canonical vault is missing{ending}")
-        if vault_info["owner"] != chain.TOKEN_PROGRAM_ID:
-            ending = "; nothing was signed" if broker_deposit_state is not None else ""
-            raise SystemExit(
-                f"escrow vault is not owned by the classic SPL Token program{ending}")
-        try:
-            current_balance = chain.token_amount(vault_info["data"])
-        except ValueError as exc:
-            if broker_deposit_state is not None:
-                raise SystemExit(
-                    f"broker custody deposit refused: {exc}; nothing was signed") from exc
-            raise
-        _warn_unbacked_pay_balance(current_balance + amount)
-        ata = chain.associated_token_address(wallet["address"], mint)[0]
-        rent = 0 if rpc.account_info(ata) is not None else rpc.rent_exemption(165)
-        _pay_send(
-            rpc, chain, instructions, wallet, rent=rent, operation="deposit",
-            escrow=escrow, generation=generation)
-    elif args.pay_cmd == "withdraw":
+            _pay_deposit(args, wallet)
+        return
+
+    if args.pay_cmd == "withdraw":
+        _pay_ensure()
+        wallet, _node_seed, _node_public = _pay_wallet_and_node()
+        chain, rpc, program, mint = _pay_chain_settings()
         escrow = chain.escrow_pda(wallet["address"], program)[0]
         generation = 0
         if wallet["custody"] == "broker":

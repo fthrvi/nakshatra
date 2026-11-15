@@ -808,6 +808,32 @@ def token_amount(data: bytes) -> int:
     return struct.unpack_from("<Q", raw, 64)[0]
 
 
+def decode_token_account(data: bytes) -> dict:
+    """Strictly decode the identity, balance, and state of a classic SPL account."""
+    raw = bytes(data)
+    if len(raw) != 165:
+        raise ValueError("classic SPL token account must contain 165 bytes")
+    delegate_tag, = struct.unpack_from("<I", raw, 72)
+    native_tag, = struct.unpack_from("<I", raw, 109)
+    close_authority_tag, = struct.unpack_from("<I", raw, 129)
+    if delegate_tag not in {0, 1}:
+        raise ValueError("classic SPL token account has an invalid delegate option")
+    if native_tag not in {0, 1}:
+        raise ValueError("classic SPL token account has an invalid native option")
+    if close_authority_tag not in {0, 1}:
+        raise ValueError("classic SPL token account has an invalid close authority option")
+    state = raw[108]
+    if state not in {0, 1, 2}:
+        raise ValueError("classic SPL token account has an invalid state")
+    return {
+        "mint": b58encode(raw[:32]),
+        "owner": b58encode(raw[32:64]),
+        "amount": struct.unpack_from("<Q", raw, 64)[0],
+        "delegate": (None if delegate_tag == 0 else b58encode(raw[76:108])),
+        "state": ("uninitialized", "initialized", "frozen")[state],
+    }
+
+
 def explorer_link(signature: str, cluster: str) -> str:
     if cluster == "devnet":
         return f"https://explorer.solana.com/tx/{signature}?cluster=devnet"

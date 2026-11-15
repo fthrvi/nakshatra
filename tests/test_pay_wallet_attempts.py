@@ -129,6 +129,28 @@ def test_existing_attempt_journal_migrates_with_withdrawal_cycle_fields(tmp_path
                 "withdrawal_consumed_by"} <= columns
         assert book._db.execute(  # noqa: SLF001 - migration assertion
             "SELECT name FROM sqlite_master WHERE name='withdrawal_cycles'").fetchone()
+        assert book._db.execute(  # noqa: SLF001 - migration assertion
+            "SELECT name FROM sqlite_master WHERE name='deposit_acts'").fetchone()
+
+
+def test_deposit_act_resumes_and_only_terminal_state_allows_replacement(tmp_path):
+    with pay_wallet_attempts.AttemptJournal(tmp_path / "attempts.sqlite") as book:
+        first = book.begin_deposit(WALLET, ESCROW, 1_000_000, created_at=123)
+        assert book.begin_deposit(WALLET, ESCROW, 1_000_000) == first
+        assert book.open_deposit(WALLET, ESCROW) == {
+            "act_id": first, "wallet": WALLET, "escrow": ESCROW,
+            "amount_micro": 1_000_000, "state": "open", "created_at": 123,
+        }
+        with pytest.raises(pay_wallet_attempts.DepositAmountMismatch) as caught:
+            book.begin_deposit(WALLET, ESCROW, 2_000_000)
+        assert caught.value.amount_micro == 1_000_000
+
+        book.fail_deposit(first)
+        second = book.begin_deposit(WALLET, ESCROW, 2_000_000)
+        assert second != first
+        book.complete_deposit(second)
+        third = book.begin_deposit(WALLET, ESCROW, 2_000_000)
+        assert third not in {first, second}
 
 
 def test_subprocess_exit_after_prebroadcast_record_preserves_attempt(tmp_path):
