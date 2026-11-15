@@ -23,7 +23,8 @@ Non-goals for this slice are mainnet, a generic Solana signer, session unlock, f
 moving the node key, changing the OpenAI-compatible service, or adding new on-chain instructions.
 Deposits, delegate revoke, escrow close, escrow creation, and the wallet-authority fallback for old
 channel-close requests are not silently admitted: they remain file-custody-only or fail closed until
-their exact transaction templates receive a separate review.
+their exact transaction templates receive a separate review. Deposit received that review on
+2026-11-15 and is now admitted as its own template (§4.2); the others stay closed.
 
 ## 2. Principal and one-time key import
 
@@ -66,6 +67,17 @@ The wallet import does the following:
    (`/home/prithvi/trisul@forgejo/main:infra/pillar-agent/deploy/prithvi-broker/README.md:292-305`). A
    failure before that boundary restores `custody=file` and the original source. A failure after it
    leaves the broker stopped or restores the complete old state; it never leaves two active copies.
+
+**§2 amendment, ratified 2026-11-09 (mesh mail ruling (a)); installed 2026-11-15.** Steps 5 and 6
+run in the opposite order: the installer retires the source seed *before* the final broker
+verification, so that at no instant are two signing-capable copies live. To keep rollback from
+resurrecting a key the broker has already used, rollback is refused (`rollback_blocked`) if the
+candidate broker's approval ledger holds any approval row for the wallet principal, and the installer
+requires a second, independent exposure witness before it reports the source retired. A refused
+rollback leaves the broker stopped with the seed retired; recovery is a forward fix, never a
+restore of file custody. The installed run on 2026-11-15 (package digest
+`7ecb641157cceeef51774397a996f2c8258f8f14f082c2217b9fc29ab7430972`) ended "wallet custody verified;
+sources retired" with exactly one declared seed copy.
 
 After success, the wallet key material visible to the node is exactly `wallet.pub` plus
 `custody=broker`. The existing public-only loader already supports that shape and returns no seed
@@ -180,6 +192,7 @@ fields below are little-endian.
 | `nakshatra_pay.delegate_set` (starter grant) | same discriminator/layout; `flags` must equal `OPEN_CHANNEL=1` | same account layout; delegate PDA must be derived from escrow and the decoded recipient node key | inviter wallet, recipient node, real pre-state spent/cap, explicit older-generation reset disclosure, resulting remaining capacity and total cap, expiry, actual and worst-case delegate rent, optional SOL top-up, escrow, digest | absolute encoded `cap_total` must be no greater than either `NAK_WALLET_MAX_STARTER_CAP_TOTAL_MICRO_USDC` or `NAK_WALLET_MAX_STARTER_MICRO_USDC`; expiry horizon `NAK_WALLET_MAX_STARTER_TTL_S`; rent and transfer ceilings below |
 | `nakshatra_pay.escrow_withdraw_request` | `f6f379c6f277d27a` + `amount:u64` | wallet **signer**; canonical config; canonical wallet escrow **writable**; canonical vault; event authority; program id | wallet, amount in micro-USDC and USDC, escrow, vault, earliest execute time from trusted chain state, digest | `NAK_WALLET_MAX_WITHDRAW_MICRO_USDC` |
 | `nakshatra_pay.escrow_withdraw_execute` | `ac5dcf14503aa8f1` only | wallet **signer**; canonical config; pinned mint; canonical escrow, vault and wallet ATA **writable**; classic Token Program; event authority; program id | wallet, pending amount, withdrawal ceiling and unlock time from trusted devnet state, escrow, vault, destination ATA, digest | pending amount must be at or below `NAK_WALLET_MAX_WITHDRAW_MICRO_USDC` |
+| `nakshatra_pay.escrow_deposit` (added 2026-11-15) | `8964fcdb8ccd92d7` + `amount:u64`; preceded by exactly one ATA create-idempotent for the wallet's canonical ATA | wallet **signer**; canonical config; pinned mint; canonical wallet escrow; canonical wallet ATA (source) **writable**; canonical vault **writable**; classic Token Program; event authority; program id | wallet, amount in micro-USDC and USDC, escrow, vault, source ATA, source and vault balances before, ATA rent shortfall, network fee, digest | `NAK_WALLET_MAX_DEPOSIT_MICRO_USDC` from the encoded amount alone, amount > 0; source balance must cover the amount (state may only refuse). No per-day ceiling: funds move only from the wallet to its own escrow and remain withdrawable |
 | System Program transfer | program `11111111111111111111111111111111`; data `2:u32` + `lamports:u64` | wallet **signer,writable**; decoded delegate node **writable** | destination node, lamports and SOL, whether self top-up or starter top-up | `NAK_WALLET_MAX_SELF_SOL_LAMPORTS` or `NAK_WALLET_MAX_STARTER_SOL_LAMPORTS` |
 | Associated Token Account create-idempotent | program `ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL`; data exactly `01` | wallet **signer,writable** payer; canonical wallet ATA **writable**; wallet owner; pinned mint; System Program; classic Token Program | wallet, mint, canonical ATA, actual zero-or-create shortfall and worst-case rent | `NAK_WALLET_MAX_ATA_RENT_LAMPORTS`; allowed once only in the execute template |
 
@@ -224,7 +237,7 @@ delegate key. The current starter builder uses exactly that order
 principal's own node followed by a self-form `delegate_set`; a transfer alone is allowed when the
 delegate needs no renewal. Current ensure can create the escrow too
 (`scripts/network/nak.py:1036-1102`), but `escrow_init` is intentionally not in this allowlist; import
-requires the escrow to exist. `escrow_init`, deposit, revoke, escrow close, and legacy
+requires the escrow to exist. `escrow_init`, revoke, escrow close, and legacy
 wallet-authority channel close remain outside the allowlist and fail closed; this review does not
 widen it.
 
@@ -247,6 +260,7 @@ install but may not raise them without another review.
 | `NAK_WALLET_MAX_STARTER_MICRO_USDC` | `1_000_000` micro-USDC resulting remaining capacity |
 | `NAK_WALLET_MAX_STARTER_TTL_S` | `2_592_000` (30 days) |
 | `NAK_WALLET_MAX_WITHDRAW_MICRO_USDC` | `5_000_000` micro-USDC |
+| `NAK_WALLET_MAX_DEPOSIT_MICRO_USDC` | `5_000_000` micro-USDC per deposit (added 2026-11-15) |
 | `NAK_WALLET_MAX_NETWORK_FEE_LAMPORTS` | `10_000` lamports |
 | `NAK_WALLET_MAX_DELEGATE_RENT_LAMPORTS` | `1_700_000` lamports (115-byte minimum currently `1_691_280`) |
 | `NAK_WALLET_MAX_ATA_RENT_LAMPORTS` | `2_040_000` lamports (165-byte minimum currently `2_039_280`) |
@@ -388,8 +402,9 @@ post-import shape. The comment in `tests/test_pay_redeemer.py:903` is not a call
   for only the approved ensure/withdraw templates; it currently reads `wallet["seed"]` directly
   (`scripts/network/nak.py:996-1012`). Every broker-backed `_pay_send`, including `ensure` and both
   withdrawal phases, must durably record the signed transaction's signature, message SHA-256,
-  blockhash, and `lastValidBlockHeight` before broadcast. Deposit and revoke stay explicitly
-  unsupported in broker mode. This record is required because `send_and_confirm` can report an
+  blockhash, and `lastValidBlockHeight` before broadcast. Revoke stays explicitly unsupported in
+  broker mode; deposit is admitted as its own reviewed template since 2026-11-15 (§4.2) and is
+  journalled the same way as `ensure`. This record is required because `send_and_confirm` can report an
   unknown final state after broadcast (`scripts/network/pay_chain.py:695-719`).
 - Every approved-withdraw journal record must carry the originating message digest, transaction signature,
   and escrow generation. Such records come only from reconciled, byte-ceiling-checked
@@ -531,7 +546,7 @@ digest and install. No mainnet enablement is bundled with this work.
 
 ## 9. Resolved answers and remaining decision
 
-1. **Existing escrow required.** Import requires an existing escrow. `escrow_init`, deposit, revoke,
+1. **Existing escrow required.** Import requires an existing escrow. `escrow_init`, revoke,
    escrow close, and legacy wallet-authority channel close stay outside this allowlist and fail
    closed. The current ensure path can emit `escrow_init` before `delegate_set`
    (`scripts/network/nak.py:1051-1098`), so that path must not use broker custody unless the escrow
