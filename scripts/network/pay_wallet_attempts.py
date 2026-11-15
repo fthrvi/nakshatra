@@ -241,10 +241,12 @@ class AttemptJournal:
         self._secure()
 
     def _rows(self, *, scope: str | None = None, operation: str | None = None,
-              escrow: str | None = None, generation: int | None = None) -> list[dict]:
+              wallet_id: str | None = None, escrow: str | None = None,
+              generation: int | None = None) -> list[dict]:
         clauses, values = [], []
         for column, value in (("operation_scope", scope), ("operation", operation),
-                              ("escrow", escrow), ("generation", generation)):
+                              ("wallet_id", wallet_id), ("escrow", escrow),
+                              ("generation", generation)):
             if value is not None:
                 clauses.append(f"{column}=?")
                 values.append(value)
@@ -296,6 +298,27 @@ class AttemptJournal:
         succeeded = tuple(row for row in self._rows(scope=scope)
                           if row["resolution"] == "succeeded")
         return ReconcileResult(unresolved, succeeded)
+
+    def reconcile_operation(self, operation: str, wallet_id: str, escrow: str,
+                            generation: int, rpc) -> ReconcileResult:
+        """Reconcile every act scope for one wallet escrow generation."""
+        if operation not in _OPERATIONS:
+            raise ValueError("invalid broker wallet operation")
+        wallet = pay_chain.pubkey_text(wallet_id, "wallet id")
+        escrow_key = pay_chain.pubkey_text(escrow, "escrow")
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+            raise ValueError("escrow generation must be a non-negative integer")
+        rows = self._rows(
+            operation=operation, wallet_id=wallet, escrow=escrow_key,
+            generation=generation)
+        scopes = tuple(dict.fromkeys(row["operation_scope"] for row in rows))
+        unresolved = False
+        succeeded = []
+        for scope in scopes:
+            result = self.reconcile(scope, rpc)
+            unresolved = unresolved or result.unresolved
+            succeeded.extend(result.succeeded)
+        return ReconcileResult(unresolved, tuple(succeeded))
 
     def begin_withdraw_request(self, rpc, escrow: str, generation: int,
                                amount: int, *, created: int = 0) -> str:

@@ -183,6 +183,26 @@ def test_status_appearing_on_expiry_reread_is_not_expired(tmp_path):
         assert rpc.status_calls == 2
 
 
+def test_reconcile_operation_covers_every_deposit_act_scope(tmp_path):
+    finalized = {"err": None, "confirmationStatus": "finalized"}
+    with pay_wallet_attempts.AttemptJournal(tmp_path / "attempts.sqlite") as book:
+        first_scope, _first_logical, first = _prepared(
+            book, operation="deposit", intent="1" * 64, act_id="first-act")
+        second_scope, _second_logical, second = _prepared(
+            book, operation="deposit", intent="2" * 64, act_id="second-act")
+        first_signature = pay_chain.b58encode(b"1" * 64)
+        book.record_signed(first.id, first_signature)
+        book.record_signed(second.id, pay_chain.b58encode(b"2" * 64))
+
+        result = book.reconcile_operation(
+            "deposit", WALLET, ESCROW, 7, Rpc([finalized, None], height=50))
+
+        assert result.unresolved is True
+        assert [row["signature"] for row in result.succeeded] == [first_signature]
+        assert {row["operation_scope"] for row in book.attempts()} == {
+            first_scope, second_scope}
+
+
 def test_two_absent_reads_expire_and_rebuild_gets_new_approval_key(tmp_path):
     with pay_wallet_attempts.AttemptJournal(tmp_path / "attempts.sqlite") as book:
         scope, logical, first = _prepared(book, lvh=60)
