@@ -140,7 +140,20 @@ def test_deposit_act_resumes_and_only_terminal_state_allows_replacement(tmp_path
         assert book.open_deposit(WALLET, ESCROW) == {
             "act_id": first, "wallet": WALLET, "escrow": ESCROW,
             "amount_micro": 1_000_000, "state": "open", "created_at": 123,
+            "completed_at": None,
         }
+        # An act nothing was ever prepared for is replaced by a new amount.
+        replaced = book.begin_deposit(WALLET, ESCROW, 3_000_000)
+        assert replaced != first
+        assert book.begin_deposit(WALLET, ESCROW, 1_000_000) not in {first, replaced}
+        first = book.open_deposit(WALLET, ESCROW)["act_id"]
+        scope = pay_wallet_attempts.operation_scope(
+            "deposit", ESCROW, 7, act_id=first)
+        book.prepare(
+            scope=scope, logical=pay_wallet_attempts.logical_key(scope, "d" * 64),
+            operation="deposit", wallet_id=WALLET, custody="broker",
+            message=b"deposit-msg", blockhash=BLOCKHASH, last_valid_block_height=60,
+            escrow=ESCROW, generation=7, deposit_act_id=first)
         with pytest.raises(pay_wallet_attempts.DepositAmountMismatch) as caught:
             book.begin_deposit(WALLET, ESCROW, 2_000_000)
         assert caught.value.amount_micro == 1_000_000

@@ -1083,7 +1083,7 @@ def _pay_send_broker(rpc, chain, instructions, wallet: dict, *, rent: int,
             if operation == "deposit":
                 reconciled = journal.reconcile_operation(
                     operation, wallet["address"], escrow, generation, rpc,
-                    resumable_logical_key=logical)
+                    resumable_logical_key=logical, resumable_act_id=deposit_act_id)
             else:
                 reconciled = journal.reconcile(
                     scope, rpc, resumable_logical_key=logical)
@@ -1094,16 +1094,21 @@ def _pay_send_broker(rpc, chain, instructions, wallet: dict, *, rent: int,
                 raise chain.VoucherError(
                     f"previous {operation} transaction is still unresolved; "
                     "no new approval was requested")
+            # A deposit act is decided by its id alone: an attempt prepared
+            # under an older escrow generation still counts.
+            completed = next(
+                (row for row in reversed(reconciled.succeeded)
+                 if (row["deposit_act_id"] == deposit_act_id
+                     if operation == "deposit" else row["logical_key"] == logical)),
+                None)
             terminal = next(
                 (row for row in reversed(reconciled.terminal_failures)
-                 if row["logical_key"] == logical), None)
-            if terminal is not None and operation == "deposit":
+                 if row["deposit_act_id"] == deposit_act_id), None
+            ) if operation == "deposit" else None
+            if terminal is not None and completed is None:
                 journal.fail_deposit(deposit_act_id)
                 raise chain.VoucherError(
                     "previous deposit failed definitively; re-run to start a new deposit act")
-            completed = next(
-                (row for row in reversed(reconciled.succeeded)
-                 if row["logical_key"] == logical), None)
             if completed is not None:
                 if operation == "withdraw-request":
                     completed = journal.bind_finalized_withdraw_request(
@@ -1143,16 +1148,20 @@ def _pay_send_broker(rpc, chain, instructions, wallet: dict, *, rent: int,
                 last_valid_block_height=blockhash_info["lastValidBlockHeight"],
                 escrow=escrow, generation=generation,
                 withdrawal_act_id=withdrawal_act_id,
-                withdrawal_amount=withdrawal_amount)
+                withdrawal_amount=withdrawal_amount,
+                deposit_act_id=deposit_act_id or None)
             if operation == "withdraw-execute":
                 journal.consume_withdraw_request(
                     int(request_record["id"]), withdrawal_act_id, logical)
             with pay_wallet_custody.pinned_custody(wallet["custody"]):
-                if pre_sign_guard is not None:
-                    pre_sign_guard.start_signing()
-                signature_bytes = pay_wallet_custody.wallet_sign(
-                    approval.message, wallet["address"],
-                    idempotency_key=approval.idempotency_key)
+                # "Nothing was signed" holds until the first broker request
+                # that can lead to a signature (the enqueue), not merely until
+                # wallet_sign() is entered.
+                with pay_wallet_custody.before_enqueue(
+                        None if pre_sign_guard is None else pre_sign_guard.start_signing):
+                    signature_bytes = pay_wallet_custody.wallet_sign(
+                        approval.message, wallet["address"],
+                        idempotency_key=approval.idempotency_key)
             pay_wallet_custody.assert_wallet_act(
                 wallet["address"], wallet["custody"])
             transaction = chain.assemble_transaction(approval.message, signature_bytes)
@@ -1196,19 +1205,20 @@ def _pay_send_broker(rpc, chain, instructions, wallet: dict, *, rent: int,
     return signature
 
 
-def _pay_ensure(*, allow_broker_signing: bool = True) -> None:
+def _pay_ensure(*, allow_broker_signing: bool = True, pre_sign_guard=None) -> None:
     from network import pay_autochannel, pay_chain
 
     try:
         with pay_autochannel.pay_lock():
-            _pay_ensure_locked(allow_broker_signing=allow_broker_signing)
+            _pay_ensure_locked(
+                allow_broker_signing=allow_broker_signing, pre_sign_guard=pre_sign_guard)
     except SystemExit:
         raise
     except (ValueError, pay_chain.VoucherError) as exc:
         raise SystemExit(f"pay ensure refused: {exc}") from exc
 
 
-def _pay_ensure_locked(*, allow_broker_signing: bool = True) -> None:
+def _pay_ensure_locked(*, allow_broker_signing: bool = True, pre_sign_guard=None) -> None:
     wallet, _node_seed, node_public = _pay_wallet_and_node()
     chain, rpc, program, mint = _pay_chain_settings()
     limits = _load_pay_limits()
@@ -1282,10 +1292,12 @@ def _pay_ensure_locked(*, allow_broker_signing: bool = True) -> None:
             raise SystemExit(
                 "broker custody deposit requires the pay escrow and node delegate to be "
                 "configured first; run `nak pay ensure` separately; nothing was signed")
+        send_kwargs = {} if pre_sign_guard is None else {"pre_sign_guard": pre_sign_guard}
         _pay_send(
             rpc, chain, instructions, wallet, rent=rent, operation="ensure",
             escrow=d["escrow"],
-            generation=(0 if escrow_state is None else int(escrow_state["generation"])))
+            generation=(0 if escrow_state is None else int(escrow_state["generation"])),
+            **send_kwargs)
     except SystemExit:
         raise
     except (ValueError, chain.VoucherError) as exc:
@@ -1439,6 +1451,13 @@ class _BrokerDepositPreSign:
         raise SystemExit(message) from value
 
 
+def _print_pay_receipt(chain, rpc, signature: str) -> None:
+    cluster = rpc.cluster_label()
+    print(f"cluster: {cluster}")
+    print(f"transaction: {signature}")
+    print(f"explorer: {chain.explorer_link(signature, cluster)}")
+
+
 def _pay_deposit(args, wallet: dict, *, pre_sign_guard=None) -> None:
     """Run the file or broker deposit path without changing file-custody text."""
     broker_deposit = wallet["custody"] == "broker"
@@ -1454,26 +1473,47 @@ def _pay_deposit(args, wallet: dict, *, pre_sign_guard=None) -> None:
             raise SystemExit(
                 "broker custody deposit amount must be greater than 0 and no more than "
                 "5 USDC; nothing was signed")
-        # An open act is local durable state.  Check it before constructing an
-        # RPC client so an amount mismatch never depends on chain availability
-        # and never reaches the approval broker.
-        from network import pay_chain as local_chain, pay_wallet_attempts
-        local_program = local_chain.configured_pubkey(
-            os.environ, "NAK_PAY_PROGRAM")
-        local_escrow = local_chain.escrow_pda(
-            wallet["address"], local_program)[0]
-        with (pay_wallet_attempts.attempt_lock(),
-              pay_wallet_attempts.AttemptJournal() as journal):
-            active = journal.open_deposit(wallet["address"], local_escrow)
-        if active is not None and int(active["amount_micro"]) != amount:
-            open_amount = _pay_amount(int(active["amount_micro"]))
-            raise SystemExit(
-                f"open deposit act is for {open_amount} USDC; re-run with "
-                f"--amount {open_amount} to finish it; nothing was signed")
+        # Settle durable deposit state BEFORE any mutable admission check: a
+        # landed-but-uncompleted act must finish even if the ATA has since
+        # dropped, and an unresolved one must refuse before anything is asked.
+        from network import pay_wallet_attempts
         preflight_chain, preflight_rpc, preflight_program, preflight_mint = (
             _pay_chain_settings())
         escrow = preflight_chain.escrow_pda(
             wallet["address"], preflight_program)[0]
+        with (pay_wallet_attempts.attempt_lock(),
+              pay_wallet_attempts.AttemptJournal() as journal):
+            settled = journal.settle_deposit(
+                wallet["address"], escrow, preflight_rpc)
+            recent = None
+            if settled.state == "none" and not getattr(args, "again", False):
+                recent = journal.recent_completed_deposit(
+                    wallet["address"], escrow, amount)
+        if settled.state == "completed":
+            _print_pay_receipt(preflight_chain, preflight_rpc, settled.signature)
+            return
+        if settled.state == "failed":
+            raise SystemExit(
+                "previous deposit failed definitively; re-run to start a new deposit "
+                "act; nothing was signed")
+        if settled.state == "unresolved":
+            raise SystemExit(
+                "previous deposit is unresolved; retry after it settles; "
+                "nothing was signed")
+        if (settled.state == "open" and settled.attempts
+                and settled.amount_micro != amount):
+            open_amount = _pay_amount(settled.amount_micro)
+            raise SystemExit(
+                f"open deposit act is for {open_amount} USDC; re-run with "
+                f"--amount {open_amount} to finish it; nothing was signed")
+        if recent is not None:
+            cluster = preflight_rpc.cluster_label()
+            raise SystemExit(
+                f"a deposit of {_pay_amount(amount)} USDC completed {recent['age_s']}s ago "
+                f"(transaction {recent['signature']}; explorer "
+                f"{preflight_chain.explorer_link(recent['signature'], cluster)}); "
+                "re-run with --again to make a second deposit of the same amount; "
+                "nothing was signed")
         escrow_info = preflight_rpc.account_info(escrow, commitment="finalized")
         if escrow_info is None:
             raise SystemExit("wallet escrow is missing; nothing was signed")
@@ -1610,7 +1650,11 @@ def _pay_command(args) -> None:
         _pay_revoke(args.node_key, allow_self=args.self)
         return
     if args.pay_cmd == "ensure":
-        _pay_ensure()
+        if wallet["custody"] == "broker":
+            with _BrokerDepositPreSign() as pre_sign_guard:
+                _pay_ensure(pre_sign_guard=pre_sign_guard)
+        else:
+            _pay_ensure()
         return
     if args.pay_cmd == "limits":
         values = {"cap_total": _pay_usdc(args.cap, "--cap"), "days": args.days,
@@ -3968,6 +4012,9 @@ def main(argv=None, *, http_post=None, http_get=None) -> int:
     q.add_argument("--per-day", required=True, help="local daily cap in USDC")
     q = paysub.add_parser("deposit", help="deposit USDC from the wallet's associated token account")
     q.add_argument("--amount", required=True, help="USDC amount")
+    q.add_argument("--again", action="store_true",
+                   help="make a second deposit of the same amount within 10 minutes "
+                        "of one that just completed")
     q = paysub.add_parser("withdraw", help="request a withdrawal, or execute it after six hours")
     withdraw = q.add_mutually_exclusive_group(required=True)
     withdraw.add_argument("--amount", help="USDC amount to request")

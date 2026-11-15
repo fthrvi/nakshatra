@@ -45,6 +45,7 @@ _NODE_ID_RE = re.compile(r"[0-9a-f]{64}\Z")
 _REQUEST_ID_RE = re.compile(r"[0-9a-f]{16}\Z")
 _DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
 _SIGNATURE_RE = re.compile(r"[0-9a-f]{128}\Z")
+_BEFORE_ENQUEUE: ContextVar = ContextVar("nak_pay_wallet_before_enqueue", default=None)
 _EXPECTED_CUSTODY: ContextVar[str | None] = ContextVar(
     "pay_wallet_expected_custody", default=None)
 _CUSTODY_LOCK_TIMEOUT_S = 2.0
@@ -259,6 +260,16 @@ def pinned_custody(expected_custody: str):
         _EXPECTED_CUSTODY.reset(token)
 
 
+@contextmanager
+def before_enqueue(callback):
+    """Run ``callback`` immediately before the first broker request that can sign."""
+    token = _BEFORE_ENQUEUE.set(callback)
+    try:
+        yield
+    finally:
+        _BEFORE_ENQUEUE.reset(token)
+
+
 def _preflight(wallet_id: str, *, home: Path, net_dir: Path | None,
                signer_dir: Path | None) -> _WalletAct:
     try:
@@ -361,6 +372,9 @@ def _broker_sign(raw_message: bytes, idempotency_key: str, act: _WalletAct) -> b
         "ttl": _TTL_S,
     }
     deadline = time.monotonic() + _TTL_S
+    hook = _BEFORE_ENQUEUE.get()
+    if hook is not None:
+        hook()
     request_id = _enqueue_until(act.config, enqueue_body, deadline=deadline, act=act)
 
     result_path = "/result/v1?" + urllib.parse.urlencode({"request_id": request_id})

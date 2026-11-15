@@ -285,7 +285,7 @@ def test_cli_two_same_amount_broker_deposits_are_distinct_acts(
     monkeypatch.setattr(pay_wallet_custody, "wallet_sign", sign)
 
     assert nak.main(["pay", "deposit", "--amount", "1"]) == 0
-    assert nak.main(["pay", "deposit", "--amount", "1"]) == 0
+    assert nak.main(["pay", "deposit", "--amount", "1", "--again"]) == 0
 
     assert len(approvals) == 2
     assert len(rpc.sent) == 2
@@ -400,10 +400,20 @@ def test_cli_broker_deposit_refuses_different_amount_for_open_act(
     rpc.configure(wallet, node)
     _install_rpc(monkeypatch, rpc)
     with pay_wallet_attempts.AttemptJournal() as journal:
-        journal.begin_deposit(wallet["address"], rpc.escrow, 1_000_000)
-    monkeypatch.setattr(
-        pay_chain, "PayRpc",
-        lambda _url: pytest.fail("amount mismatch contacted the chain"))
+        act = journal.begin_deposit(wallet["address"], rpc.escrow, 1_000_000)
+        instructions = pay_chain.escrow_deposit(
+            wallet["address"], MINT, 1_000_000, PROGRAM)
+        scope = pay_wallet_attempts.operation_scope(
+            "deposit", rpc.escrow, 7, act_id=act)
+        journal.prepare(
+            scope=scope,
+            logical=pay_wallet_attempts.logical_key(
+                scope, pay_wallet_attempts.instruction_digest(instructions)),
+            operation="deposit", wallet_id=wallet["address"], custody="broker",
+            message=pay_chain.compile_message(
+                instructions, wallet["address"], BLOCKHASH).data,
+            blockhash=BLOCKHASH, last_valid_block_height=999,
+            escrow=rpc.escrow, generation=7, deposit_act_id=act)
     monkeypatch.setattr(
         pay_wallet_custody, "wallet_sign",
         lambda *_args, **_kwargs: pytest.fail("amount mismatch contacted the broker"))
@@ -738,6 +748,220 @@ def test_cli_broker_deposit_ensure_refusal_for_malformed_delegate_has_suffix(
         nak.main(["pay", "deposit", "--amount", "1"])
 
     assert contacted == [] and rpc.sent == []
+
+
+def _crash_complete_once(monkeypatch):
+    """Let complete_deposit run, then die before the receipt prints."""
+    original = pay_wallet_attempts.AttemptJournal.complete_deposit
+    state = {"crashed": False}
+
+    def complete_then_crash(journal, act_id):
+        original(journal, act_id)
+        if not state["crashed"]:
+            state["crashed"] = True
+            raise RuntimeError("crash after complete_deposit")
+
+    monkeypatch.setattr(
+        pay_wallet_attempts.AttemptJournal, "complete_deposit", complete_then_crash)
+
+
+def _signing_rpc(monkeypatch, home, balance=3_000_000):
+    wallet, private, node = _wallet(home, custody="broker")
+    rpc = FakeRpc(configured=True, wallet_token_balance=balance)
+    rpc.configure(wallet, node)
+    _install_rpc(monkeypatch, rpc)
+    approvals = []
+    monkeypatch.setattr(
+        pay_wallet_custody, "wallet_sign",
+        lambda message, _wallet_id, *, idempotency_key: (
+            approvals.append(bytes(message)), private.sign(message))[1])
+    return wallet, rpc, approvals
+
+
+def test_cli_deposit_refuses_identical_rerun_after_completion_crash(
+        _temp_home, monkeypatch):
+    wallet, rpc, approvals = _signing_rpc(monkeypatch, _temp_home)
+    _crash_complete_once(monkeypatch)
+    with pytest.raises(RuntimeError, match="crash after complete_deposit"):
+        nak.main(["pay", "deposit", "--amount", "1"])
+    signature = rpc.sent[0][0].signature
+
+    with pytest.raises(SystemExit) as refused:
+        nak.main(["pay", "deposit", "--amount", "1"])
+    text = str(refused.value)
+    assert signature in text and "--again" in text and text.endswith("nothing was signed")
+    assert len(approvals) == 1 and len(rpc.sent) == 1
+
+
+def test_cli_deposit_again_makes_second_deposit_after_completion_crash(
+        _temp_home, monkeypatch):
+    wallet, rpc, approvals = _signing_rpc(monkeypatch, _temp_home)
+    rpc.blockhash_infos = [
+        {"blockhash": BLOCKHASH, "lastValidBlockHeight": 999},
+        {"blockhash": pay_chain.b58encode(bytes(range(31, 63))),
+         "lastValidBlockHeight": 1_000},
+    ]
+    _crash_complete_once(monkeypatch)
+    with pytest.raises(RuntimeError, match="crash after complete_deposit"):
+        nak.main(["pay", "deposit", "--amount", "1"])
+
+    assert nak.main(["pay", "deposit", "--amount", "1", "--again"]) == 0
+
+    assert len(approvals) == 2 and len(rpc.sent) == 2
+    with pay_wallet_attempts.AttemptJournal() as journal:
+        states = [row[0] for row in journal._db.execute(  # noqa: SLF001
+            "SELECT state FROM deposit_acts ORDER BY created_at,rowid")]
+    assert states == ["completed", "completed"]
+
+
+def test_cli_deposit_different_amount_within_window_is_a_new_act(
+        _temp_home, monkeypatch):
+    wallet, rpc, approvals = _signing_rpc(monkeypatch, _temp_home)
+    assert nak.main(["pay", "deposit", "--amount", "1"]) == 0
+    assert nak.main(["pay", "deposit", "--amount", "2"]) == 0
+    assert len(approvals) == 2 and len(rpc.sent) == 2
+
+
+def test_cli_deposit_same_amount_after_window_is_allowed(_temp_home, monkeypatch):
+    wallet, rpc, approvals = _signing_rpc(monkeypatch, _temp_home)
+    rpc.blockhash_infos = [
+        {"blockhash": BLOCKHASH, "lastValidBlockHeight": 999},
+        {"blockhash": pay_chain.b58encode(bytes(range(31, 63))),
+         "lastValidBlockHeight": 1_000},
+    ]
+    clock = [1_000_000.0]
+    monkeypatch.setattr(pay_wallet_attempts, "_now", lambda: clock[0])
+    assert nak.main(["pay", "deposit", "--amount", "1"]) == 0
+    clock[0] += 599
+    with pytest.raises(SystemExit, match="--again"):
+        nak.main(["pay", "deposit", "--amount", "1"])
+    clock[0] += 2
+    assert nak.main(["pay", "deposit", "--amount", "1"]) == 0
+    assert len(approvals) == 2 and len(rpc.sent) == 2
+
+
+def test_cli_deposit_completes_landed_act_even_when_ata_now_short(
+        _temp_home, monkeypatch, capsys):
+    wallet, rpc, approvals = _signing_rpc(monkeypatch, _temp_home)
+    original = pay_wallet_attempts.AttemptJournal.complete_deposit
+    state = {"crashed": False}
+
+    def crash_before_complete(journal, act_id):
+        if not state["crashed"]:
+            state["crashed"] = True
+            raise RuntimeError("crash before complete_deposit")
+        return original(journal, act_id)
+
+    monkeypatch.setattr(
+        pay_wallet_attempts.AttemptJournal, "complete_deposit", crash_before_complete)
+    with pytest.raises(RuntimeError, match="crash before complete_deposit"):
+        nak.main(["pay", "deposit", "--amount", "1"])
+    signature = rpc.sent[0][0].signature
+    capsys.readouterr()
+    rpc.wallet_token_balance = 0  # the landed deposit drained the ATA
+
+    assert nak.main(["pay", "deposit", "--amount", "1"]) == 0
+
+    assert f"transaction: {signature}" in capsys.readouterr().out
+    assert len(approvals) == 1 and len(rpc.sent) == 1
+    with pay_wallet_attempts.AttemptJournal() as journal:
+        assert [r[0] for r in journal._db.execute(  # noqa: SLF001
+            "SELECT state FROM deposit_acts")] == ["completed"]
+
+
+def test_cli_deposit_open_act_without_attempts_is_replaced_by_new_amount(
+        _temp_home, monkeypatch):
+    wallet, rpc, approvals = _signing_rpc(monkeypatch, _temp_home)
+    with pay_wallet_attempts.AttemptJournal() as journal:
+        journal.begin_deposit(wallet["address"], rpc.escrow, 1_000_000)
+
+    assert nak.main(["pay", "deposit", "--amount", "2"]) == 0
+
+    assert len(approvals) == 1 and len(rpc.sent) == 1
+    with pay_wallet_attempts.AttemptJournal() as journal:
+        states = [row[0] for row in journal._db.execute(  # noqa: SLF001
+            "SELECT state FROM deposit_acts ORDER BY rowid")]
+    assert states == ["failed", "completed"]
+
+
+def test_cli_deposit_attempt_under_older_generation_completes_open_act(
+        _temp_home, monkeypatch, capsys):
+    wallet, rpc, approvals = _signing_rpc(monkeypatch, _temp_home)
+    original = pay_wallet_attempts.AttemptJournal.complete_deposit
+    state = {"crashed": False}
+
+    def crash_before_complete(journal, act_id):
+        if not state["crashed"]:
+            state["crashed"] = True
+            raise RuntimeError("crash before complete_deposit")
+        return original(journal, act_id)
+
+    monkeypatch.setattr(
+        pay_wallet_attempts.AttemptJournal, "complete_deposit", crash_before_complete)
+    with pytest.raises(RuntimeError, match="crash before complete_deposit"):
+        nak.main(["pay", "deposit", "--amount", "1"])
+    signature = rpc.sent[0][0].signature
+    capsys.readouterr()
+    rpc.generation = 8  # the escrow moved on after the attempt landed
+
+    assert nak.main(["pay", "deposit", "--amount", "1"]) == 0
+
+    assert f"transaction: {signature}" in capsys.readouterr().out
+    assert len(approvals) == 1 and len(rpc.sent) == 1
+
+
+def test_attempt_journal_records_deposit_act_id_and_migrates_legacy_db(_temp_home):
+    import sqlite3
+    path = _temp_home / "legacy.sqlite"
+    db = sqlite3.connect(path)
+    db.execute("CREATE TABLE attempts(id INTEGER PRIMARY KEY, operation_scope TEXT, "
+               "logical_key TEXT, operation TEXT, wallet_id TEXT, custody TEXT, "
+               "idempotency_key TEXT UNIQUE, message BLOB, message_sha256 TEXT, "
+               "blockhash TEXT, last_valid_block_height INTEGER, signature TEXT UNIQUE, "
+               "escrow TEXT, generation INTEGER, resolution TEXT, "
+               "error TEXT NOT NULL DEFAULT '', created INTEGER NOT NULL DEFAULT 0)")
+    db.execute("CREATE TABLE deposit_acts(act_id TEXT PRIMARY KEY, wallet TEXT NOT NULL, "
+               "escrow TEXT NOT NULL, amount_micro INTEGER NOT NULL, state TEXT NOT NULL, "
+               "created_at INTEGER NOT NULL DEFAULT 0)")
+    db.commit()
+    db.close()
+    with pay_wallet_attempts.AttemptJournal(path) as journal:
+        cols = {r[1] for r in journal._db.execute("PRAGMA table_info(attempts)")}  # noqa: SLF001
+        acols = {r[1] for r in journal._db.execute("PRAGMA table_info(deposit_acts)")}  # noqa: SLF001
+    assert "deposit_act_id" in cols and "completed_at" in acols
+
+
+def test_cli_broker_deposit_missing_broker_config_has_suffix(
+        _temp_home, monkeypatch):
+    wallet, _private, node = _wallet(_temp_home, custody="broker")
+    rpc = FakeRpc(configured=True, wallet_token_balance=2_000_000)
+    rpc.configure(wallet, node)
+    _install_rpc(monkeypatch, rpc)
+    with pytest.raises(SystemExit) as refused:
+        nak.main(["pay", "deposit", "--amount", "1"])
+    assert str(refused.value).endswith("nothing was signed")
+    assert rpc.sent == []
+
+
+def test_cli_broker_ensure_pre_sign_refusal_has_suffix(_temp_home, monkeypatch):
+    wallet, _private, node = _wallet(_temp_home, custody="broker")
+    rpc = FakeRpc(configured=False, wallet_token_balance=2_000_000)
+    rpc.configure(wallet, node)
+    _install_rpc(monkeypatch, rpc)
+    with pytest.raises(
+            SystemExit, match=r"refuses escrow initialization.*nothing was signed$"):
+        nak.main(["pay", "ensure"])
+
+
+def test_cli_broker_ensure_broker_config_refusal_has_suffix(_temp_home, monkeypatch):
+    wallet, _private, node = _wallet(_temp_home, custody="broker")
+    rpc = FakeRpc(configured=True, wallet_token_balance=2_000_000,
+                  delegate_configured=False)
+    rpc.configure(wallet, node)
+    _install_rpc(monkeypatch, rpc)
+    with pytest.raises(SystemExit) as refused:
+        nak.main(["pay", "ensure"])
+    assert str(refused.value).endswith("nothing was signed")
 
 
 def test_cli_file_custody_deposit_path_still_sends_ensure_then_deposit(

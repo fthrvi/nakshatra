@@ -194,7 +194,7 @@ fields below are little-endian.
 | `nakshatra_pay.escrow_withdraw_execute` | `ac5dcf14503aa8f1` only | wallet **signer**; canonical config; pinned mint; canonical escrow, vault and wallet ATA **writable**; classic Token Program; event authority; program id | wallet, pending amount, withdrawal ceiling and unlock time from trusted devnet state, escrow, vault, destination ATA, digest | pending amount must be at or below `NAK_WALLET_MAX_WITHDRAW_MICRO_USDC` |
 | `nakshatra_pay.escrow_deposit` (added 2026-11-15) | `8964fcdb8ccd92d7` + `amount:u64`; preceded by exactly one ATA create-idempotent for the wallet's canonical ATA | wallet **signer**; canonical config; pinned mint; canonical wallet escrow; canonical wallet ATA (source) **writable**; canonical vault **writable**; classic Token Program; event authority; program id | wallet, amount in micro-USDC and USDC, escrow, vault, source ATA, source and vault balances before, ATA rent shortfall, network fee, digest | `NAK_WALLET_MAX_DEPOSIT_MICRO_USDC` from the encoded amount alone, amount > 0; source balance must cover the amount (state may only refuse). No per-day ceiling: funds move only from the wallet to its own escrow and remain withdrawable |
 | System Program transfer | program `11111111111111111111111111111111`; data `2:u32` + `lamports:u64` | wallet **signer,writable**; decoded delegate node **writable** | destination node, lamports and SOL, whether self top-up or starter top-up | `NAK_WALLET_MAX_SELF_SOL_LAMPORTS` or `NAK_WALLET_MAX_STARTER_SOL_LAMPORTS` |
-| Associated Token Account create-idempotent | program `ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL`; data exactly `01` | wallet **signer,writable** payer; canonical wallet ATA **writable**; wallet owner; pinned mint; System Program; classic Token Program | wallet, mint, canonical ATA, actual zero-or-create shortfall and worst-case rent | `NAK_WALLET_MAX_ATA_RENT_LAMPORTS`; allowed once only in the execute template |
+| Associated Token Account create-idempotent | program `ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL`; data exactly `01` | wallet **signer,writable** payer; canonical wallet ATA **writable**; wallet owner; pinned mint; System Program; classic Token Program | wallet, mint, canonical ATA, actual zero-or-create shortfall and worst-case rent | `NAK_WALLET_MAX_ATA_RENT_LAMPORTS`; allowed once, first, in the withdraw-execute and deposit templates |
 
 The account order and argument layouts above match the current Python builders
 (`scripts/network/pay_chain.py:219-231,257-290`) and the program account constraints
@@ -390,6 +390,13 @@ post-import shape. The comment in `tests/test_pay_redeemer.py:903` is not a call
 
 ### 5.2 Other signing boundaries that change or stay closed
 
+- A broker deposit is a durable **act** in the attempt journal: it is opened (or resumed) for a
+  wallet and escrow, every attempt carries its `deposit_act_id`, the act completes when any such
+  attempt finalizes (whatever the escrow generation), and it is settled against the chain before
+  any balance or escrow admission check. Once an act completes, an identical same-amount
+  `nak pay deposit` is refused for 600 seconds, naming the finished transaction, so a crash before
+  the receipt prints cannot silently become a second deposit; `--again` is the explicit
+  acknowledgment that a second deposit of that amount is wanted, and never bypasses an open act.
 - Add `scripts/network/pay_wallet_custody.py` as the single file-or-broker wallet-signing boundary,
   analogous to `person_custody`. It accepts only `(raw_message, wallet_id)`, authenticates the exact
   dynamic principal, verifies the echoed bytes/digest/signature, and returns one 64-byte signature.
@@ -467,6 +474,9 @@ expected typed plan:
 - self `delegate_set`; self transfer plus `delegate_set`; transfer-only self top-up;
 - starter `delegate_set`; starter plus SOL top-up;
 - withdraw request; ATA create-idempotent plus withdraw execute.
+- deposit: the exact two-instruction message (ATA create-idempotent, then `escrow_deposit`) at the
+  ceiling and below it; refusal one micro-USDC over `NAK_WALLET_MAX_DEPOSIT_MICRO_USDC`; refusal
+  for a wrong source ATA and for a wrong vault.
 
 Each golden asserts canonical parsing, exact account order and privileges, PDA/ATA derivation,
 operation classification, rendered fields, applicable ceilings, and SHA-256. A generation test may
