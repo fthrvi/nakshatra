@@ -24,7 +24,7 @@ from network import pay_chain, pay_voucher
 from network.pay_autochannel import _OpenLock
 
 
-_OPERATIONS = {"ensure", "starter-grant", "withdraw-request", "withdraw-execute"}
+_OPERATIONS = {"ensure", "deposit", "starter-grant", "withdraw-request", "withdraw-execute"}
 _ERROR_CODES = {"", "finalized-error", "send-refused", "rpc-unavailable", "status-unknown"}
 
 

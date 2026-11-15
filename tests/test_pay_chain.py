@@ -757,7 +757,6 @@ def test_cli_broker_existing_escrow_ensure_signs_compiled_message(
 
 
 @pytest.mark.parametrize(("argv", "match"), [
-    (["pay", "deposit", "--amount", "1"], "broker custody refuses escrow deposit"),
     (["pay", "revoke", "00" * 32], "broker custody refuses delegate revoke"),
 ])
 def test_cli_broker_refuses_unapproved_wallet_templates(

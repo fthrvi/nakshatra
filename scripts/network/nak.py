@@ -817,6 +817,7 @@ _PAY_DEFAULTS = {
     "per_tx": 1_000_000,
     "per_day": 5_000_000,
 }
+_BROKER_DEPOSIT_MAX = 5_000_000
 NODE_SOL_MIN = 10_000_000
 NODE_SOL_TARGET = 30_000_000
 
@@ -1039,11 +1040,11 @@ def _pay_send_broker(rpc, chain, instructions, wallet: dict, *, rent: int,
                      withdrawal_amount: int | None = None) -> str:
     from network import pay_wallet_attempts, pay_wallet_custody
 
-    if operation not in {"ensure", "withdraw-request", "withdraw-execute"}:
+    if operation not in {"ensure", "deposit", "withdraw-request", "withdraw-execute"}:
         label = operation or "this transaction"
         raise SystemExit(
             f"broker custody refuses {label}; approved wallet templates are ensure on an "
-            "existing escrow, withdraw request, and withdraw execute")
+            "existing escrow, deposit, withdraw request, and withdraw execute")
     try:
         with pay_wallet_attempts.attempt_lock(), pay_wallet_attempts.AttemptJournal() as journal:
             intent = pay_wallet_attempts.instruction_digest(instructions)
@@ -1143,19 +1144,19 @@ def _pay_send_broker(rpc, chain, instructions, wallet: dict, *, rent: int,
     return signature
 
 
-def _pay_ensure() -> None:
+def _pay_ensure(*, allow_broker_signing: bool = True) -> None:
     from network import pay_autochannel, pay_chain
 
     try:
         with pay_autochannel.pay_lock():
-            _pay_ensure_locked()
+            _pay_ensure_locked(allow_broker_signing=allow_broker_signing)
     except SystemExit:
         raise
     except (ValueError, pay_chain.VoucherError) as exc:
         raise SystemExit(f"pay ensure refused: {exc}") from exc
 
 
-def _pay_ensure_locked() -> None:
+def _pay_ensure_locked(*, allow_broker_signing: bool = True) -> None:
     wallet, _node_seed, node_public = _pay_wallet_and_node()
     chain, rpc, program, mint = _pay_chain_settings()
     limits = _load_pay_limits()
@@ -1225,6 +1226,10 @@ def _pay_ensure_locked() -> None:
         if not instructions:
             print("pay escrow and node delegate are already configured")
             return
+        if wallet["custody"] == "broker" and not allow_broker_signing:
+            raise SystemExit(
+                "broker custody deposit requires the pay escrow and node delegate to be "
+                "configured first; run `nak pay ensure` separately; nothing was signed")
         _pay_send(
             rpc, chain, instructions, wallet, rent=rent, operation="ensure",
             escrow=d["escrow"],
@@ -1484,14 +1489,58 @@ def _pay_command(args) -> None:
             f"{name} {value}" for name, value in result.items()))
         return
 
+    broker_deposit = args.pay_cmd == "deposit" and wallet["custody"] == "broker"
+    broker_deposit_state = None
+    if broker_deposit:
+        try:
+            amount = _pay_usdc(args.amount, "--amount")
+        except SystemExit as exc:
+            raise SystemExit(
+                "broker custody deposit amount must be greater than 0 and no more than "
+                "5 USDC; nothing was signed") from exc
+        if amount > _BROKER_DEPOSIT_MAX:
+            raise SystemExit(
+                "broker custody deposit amount must be greater than 0 and no more than "
+                "5 USDC; nothing was signed")
+        preflight_chain, preflight_rpc, preflight_program, preflight_mint = (
+            _pay_chain_settings())
+        escrow = preflight_chain.escrow_pda(
+            wallet["address"], preflight_program)[0]
+        escrow_info = preflight_rpc.account_info(escrow, commitment="finalized")
+        if escrow_info is None:
+            raise SystemExit("wallet escrow is missing; nothing was signed")
+        if escrow_info.get("owner") != preflight_program:
+            raise SystemExit(
+                "wallet escrow is owned by an unexpected program; nothing was signed")
+        escrow_state = preflight_chain.decode_escrow(escrow_info["data"])
+        ata = preflight_chain.associated_token_address(
+            wallet["address"], preflight_mint)[0]
+        ata_info = preflight_rpc.account_info(ata, commitment="finalized")
+        if ata_info is not None and ata_info.get("owner") != preflight_chain.TOKEN_PROGRAM_ID:
+            raise SystemExit(
+                "wallet token account is owned by an unexpected program; nothing was signed")
+        ata_balance = 0 if ata_info is None else preflight_chain.token_amount(ata_info["data"])
+        if ata_balance < amount:
+            raise SystemExit(
+                f"wallet token account has too little USDC: needs {_pay_amount(amount)}, "
+                f"has {_pay_amount(ata_balance)}; nothing was signed")
+        broker_deposit_state = (
+            amount, wallet["address"], escrow, int(escrow_state["generation"]))
     if args.pay_cmd in {"deposit", "withdraw"}:
-        if args.pay_cmd == "deposit" and wallet["custody"] == "broker":
-            raise SystemExit("broker custody refuses escrow deposit; nothing was signed")
-        _pay_ensure()
+        _pay_ensure(allow_broker_signing=not broker_deposit)
     wallet, _node_seed, _node_public = _pay_wallet_and_node()
     chain, rpc, program, mint = _pay_chain_settings()
     if args.pay_cmd == "deposit":
-        amount = _pay_usdc(args.amount, "--amount")
+        escrow = ""
+        generation = 0
+        if broker_deposit_state is None:
+            amount = _pay_usdc(args.amount, "--amount")
+        else:
+            amount, preflight_wallet, escrow, generation = broker_deposit_state
+            if wallet["custody"] != "broker" or wallet["address"] != preflight_wallet:
+                raise SystemExit(
+                    "pay wallet identity or custody changed during broker deposit; "
+                    "nothing was signed")
         instructions = chain.escrow_deposit(wallet["address"], mint, amount, program)
         vault = chain.vault_pda(chain.escrow_pda(wallet["address"], program)[0], program)[0]
         vault_info = rpc.account_info(vault)
@@ -1503,7 +1552,9 @@ def _pay_command(args) -> None:
         _warn_unbacked_pay_balance(current_balance + amount)
         ata = chain.associated_token_address(wallet["address"], mint)[0]
         rent = 0 if rpc.account_info(ata) is not None else rpc.rent_exemption(165)
-        _pay_send(rpc, chain, instructions, wallet, rent=rent, operation="deposit")
+        _pay_send(
+            rpc, chain, instructions, wallet, rent=rent, operation="deposit",
+            escrow=escrow, generation=generation)
     elif args.pay_cmd == "withdraw":
         escrow = chain.escrow_pda(wallet["address"], program)[0]
         generation = 0
