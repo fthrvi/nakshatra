@@ -840,6 +840,23 @@ def test_cli_deposit_same_amount_after_window_is_allowed(_temp_home, monkeypatch
     assert len(approvals) == 2 and len(rpc.sent) == 2
 
 
+def test_cli_deposit_ack_guard_holds_when_replacing_untouched_open_act(
+        _temp_home, monkeypatch):
+    # Round-4 review: deposit 1 completes; a 2 USDC act is opened but never
+    # prepared; re-running 1 USDC must still hit the 600 s acknowledgment guard
+    # instead of abandoning the 2 USDC act and signing a second 1 USDC deposit.
+    wallet, rpc, approvals = _signing_rpc(monkeypatch, _temp_home)
+    assert nak.main(["pay", "deposit", "--amount", "1"]) == 0
+    with pay_wallet_attempts.AttemptJournal() as journal:
+        journal.begin_deposit(wallet["address"], rpc.escrow, 2_000_000)
+
+    with pytest.raises(SystemExit) as refused:
+        nak.main(["pay", "deposit", "--amount", "1"])
+    text = str(refused.value)
+    assert "--again" in text and text.endswith("nothing was signed")
+    assert len(approvals) == 1 and len(rpc.sent) == 1
+
+
 def test_cli_deposit_completes_landed_act_even_when_ata_now_short(
         _temp_home, monkeypatch, capsys):
     wallet, rpc, approvals = _signing_rpc(monkeypatch, _temp_home)

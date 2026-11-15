@@ -1486,7 +1486,13 @@ def _pay_deposit(args, wallet: dict, *, pre_sign_guard=None) -> None:
             settled = journal.settle_deposit(
                 wallet["address"], escrow, preflight_rpc)
             recent = None
-            if settled.state == "none" and not getattr(args, "again", False):
+            # The acknowledgment guard applies whenever this run would start a NEW
+            # act: no open act, or an untouched open act of a different amount that
+            # begin_deposit() is about to replace.
+            starts_new_act = settled.state == "none" or (
+                settled.state == "open" and not settled.attempts
+                and settled.amount_micro != amount)
+            if starts_new_act and not getattr(args, "again", False):
                 recent = journal.recent_completed_deposit(
                     wallet["address"], escrow, amount)
         if settled.state == "completed":
