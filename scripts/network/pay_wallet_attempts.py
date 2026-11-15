@@ -102,6 +102,14 @@ class DepositSettlement:
     attempts: int = 0
 
 
+class RecentDepositExists(pay_voucher.VoucherError):
+    """A same-amount deposit completed inside the acknowledgment window."""
+
+    def __init__(self, recent: dict):
+        self.recent = dict(recent)
+        super().__init__("a same-amount deposit completed recently")
+
+
 class DepositAmountMismatch(pay_voucher.VoucherError):
     """The caller tried to replace the sole open deposit act with another amount."""
 
@@ -384,7 +392,8 @@ class AttemptJournal:
             unresolved, tuple(succeeded), tuple(terminal_failures))
 
     def begin_deposit(self, wallet_id: str, escrow: str, amount_micro: int,
-                      *, created_at: int | None = None) -> str:
+                      *, created_at: int | None = None,
+                      acknowledge_repeat: bool = True) -> str:
         """Create or resume the sole open deposit act for a wallet escrow."""
         wallet = pay_chain.pubkey_text(wallet_id, "wallet id")
         escrow_key = pay_chain.pubkey_text(escrow, "escrow")
@@ -414,6 +423,13 @@ class AttemptJournal:
                 self._db.execute(
                     "UPDATE deposit_acts SET state='failed' WHERE act_id=?",
                     (active["act_id"],))
+            # A NEW act is about to start. Check the acknowledgment window inside
+            # this same IMMEDIATE transaction so a concurrent completion cannot
+            # slip between the check and the insert.
+            if not acknowledge_repeat:
+                recent = self.recent_completed_deposit(wallet, escrow_key, amount_micro)
+                if recent is not None:
+                    raise RecentDepositExists(recent)
             act_id = secrets.token_hex(16)
             self._db.execute(
                 "INSERT INTO deposit_acts("

@@ -857,6 +857,34 @@ def test_cli_deposit_ack_guard_holds_when_replacing_untouched_open_act(
     assert len(approvals) == 1 and len(rpc.sent) == 1
 
 
+def test_cli_deposit_ack_guard_is_atomic_with_new_act_creation(
+        _temp_home, monkeypatch):
+    # Round-5 review: the early snapshot can miss a completion that lands
+    # between it and begin_deposit(); the guard must hold inside the same
+    # transaction that creates the new act.
+    wallet, rpc, approvals = _signing_rpc(monkeypatch, _temp_home)
+    assert nak.main(["pay", "deposit", "--amount", "1"]) == 0
+    real = pay_wallet_attempts.AttemptJournal.recent_completed_deposit
+    calls = {"n": 0}
+
+    def stale_first_snapshot(journal, *args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None  # the early check ran before the other completion committed
+        return real(journal, *args, **kwargs)
+
+    monkeypatch.setattr(pay_wallet_attempts.AttemptJournal, "recent_completed_deposit",
+                        stale_first_snapshot)
+    with pytest.raises(SystemExit) as refused:
+        nak.main(["pay", "deposit", "--amount", "1"])
+    text = str(refused.value)
+    assert "--again" in text and text.endswith("nothing was signed")
+    assert len(approvals) == 1 and len(rpc.sent) == 1
+    with pay_wallet_attempts.AttemptJournal() as journal:
+        assert [r[0] for r in journal._db.execute(  # noqa: SLF001
+            "SELECT state FROM deposit_acts")] == ["completed"]
+
+
 def test_cli_deposit_completes_landed_act_even_when_ata_now_short(
         _temp_home, monkeypatch, capsys):
     wallet, rpc, approvals = _signing_rpc(monkeypatch, _temp_home)

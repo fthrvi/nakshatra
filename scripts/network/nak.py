@@ -995,6 +995,7 @@ def _pay_send(rpc, chain, instructions, wallet: dict, *, rent: int = 0,
               operation: str = "", escrow: str = "", generation: int = 0,
               withdrawal_amount: int | None = None,
               deposit_amount: int | None = None,
+              deposit_again: bool = False,
               pre_sign_guard=None) -> str:
     from network import pay_wallet_custody
 
@@ -1006,7 +1007,8 @@ def _pay_send(rpc, chain, instructions, wallet: dict, *, rent: int = 0,
                 rpc, chain, instructions, wallet, rent=rent, operation=operation,
                 escrow=escrow, generation=generation,
                 withdrawal_amount=withdrawal_amount,
-                deposit_amount=deposit_amount, pre_sign_guard=pre_sign_guard)
+                deposit_amount=deposit_amount, deposit_again=deposit_again,
+                pre_sign_guard=pre_sign_guard)
         try:
             blockhash = rpc.latest_blockhash()
             message = chain.compile_message(instructions, wallet["address"], blockhash)
@@ -1042,6 +1044,7 @@ def _pay_send_broker(rpc, chain, instructions, wallet: dict, *, rent: int,
                      operation: str, escrow: str, generation: int,
                      withdrawal_amount: int | None = None,
                      deposit_amount: int | None = None,
+                     deposit_again: bool = False,
                      pre_sign_guard=None) -> str:
     from network import pay_wallet_attempts, pay_wallet_custody
 
@@ -1070,7 +1073,11 @@ def _pay_send_broker(rpc, chain, instructions, wallet: dict, *, rent: int,
                     raise chain.VoucherError("deposit amount was not carried into its act")
                 try:
                     deposit_act_id = journal.begin_deposit(
-                        wallet["address"], escrow, deposit_amount)
+                        wallet["address"], escrow, deposit_amount,
+                        acknowledge_repeat=deposit_again)
+                except pay_wallet_attempts.RecentDepositExists as exc:
+                    raise SystemExit(_recent_deposit_refusal(
+                        chain, rpc, deposit_amount, exc.recent)) from exc
                 except pay_wallet_attempts.DepositAmountMismatch as exc:
                     amount = _pay_amount(exc.amount_micro)
                     raise chain.VoucherError(
@@ -1458,6 +1465,16 @@ def _print_pay_receipt(chain, rpc, signature: str) -> None:
     print(f"explorer: {chain.explorer_link(signature, cluster)}")
 
 
+def _recent_deposit_refusal(chain, rpc, amount: int, recent: dict) -> str:
+    cluster = rpc.cluster_label()
+    return (
+        f"a deposit of {_pay_amount(amount)} USDC completed {recent['age_s']}s ago "
+        f"(transaction {recent['signature']}; explorer "
+        f"{chain.explorer_link(recent['signature'], cluster)}); "
+        "re-run with --again to make a second deposit of the same amount; "
+        "nothing was signed")
+
+
 def _pay_deposit(args, wallet: dict, *, pre_sign_guard=None) -> None:
     """Run the file or broker deposit path without changing file-custody text."""
     broker_deposit = wallet["custody"] == "broker"
@@ -1513,13 +1530,8 @@ def _pay_deposit(args, wallet: dict, *, pre_sign_guard=None) -> None:
                 f"open deposit act is for {open_amount} USDC; re-run with "
                 f"--amount {open_amount} to finish it; nothing was signed")
         if recent is not None:
-            cluster = preflight_rpc.cluster_label()
-            raise SystemExit(
-                f"a deposit of {_pay_amount(amount)} USDC completed {recent['age_s']}s ago "
-                f"(transaction {recent['signature']}; explorer "
-                f"{preflight_chain.explorer_link(recent['signature'], cluster)}); "
-                "re-run with --again to make a second deposit of the same amount; "
-                "nothing was signed")
+            raise SystemExit(_recent_deposit_refusal(
+                preflight_chain, preflight_rpc, amount, recent))
         escrow_info = preflight_rpc.account_info(escrow, commitment="finalized")
         if escrow_info is None:
             raise SystemExit("wallet escrow is missing; nothing was signed")
@@ -1612,7 +1624,8 @@ def _pay_deposit(args, wallet: dict, *, pre_sign_guard=None) -> None:
     }
     if broker_deposit_state is not None:
         send_kwargs.update(
-            deposit_amount=amount, pre_sign_guard=pre_sign_guard)
+            deposit_amount=amount, deposit_again=bool(getattr(args, "again", False)),
+            pre_sign_guard=pre_sign_guard)
     _pay_send(rpc, chain, instructions, wallet, **send_kwargs)
 
 
