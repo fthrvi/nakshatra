@@ -31,6 +31,9 @@ NAK_WALLET_MAX_STARTER_CAP_TOTAL_MICRO_USDC: Final = 1_000_000
 NAK_WALLET_MAX_STARTER_MICRO_USDC: Final = 1_000_000
 NAK_WALLET_MAX_STARTER_TTL_S: Final = 30 * 86400
 NAK_WALLET_MAX_WITHDRAW_MICRO_USDC: Final = 5_000_000
+# Keep outside the legacy adapter's NAK_WALLET_MAX_* discovery namespace.
+# During decoder-first upgrades that adapter must still accept legacy env/policy.
+_NAK_WALLET_MAX_DEPOSIT_MICRO_USDC: Final = 5_000_000
 NAK_WALLET_MAX_NETWORK_FEE_LAMPORTS: Final = 10_000
 NAK_WALLET_MAX_DELEGATE_RENT_LAMPORTS: Final = 1_700_000
 NAK_WALLET_MAX_ATA_RENT_LAMPORTS: Final = 2_040_000
@@ -40,6 +43,7 @@ NAK_WALLET_MAX_STARTER_SOL_LAMPORTS: Final = 10_000_000
 DELEGATE_SET_DISCRIMINATOR: Final = bytes.fromhex("8b10e667fea614a5")
 WITHDRAW_REQUEST_DISCRIMINATOR: Final = bytes.fromhex("f6f379c6f277d27a")
 WITHDRAW_EXECUTE_DISCRIMINATOR: Final = bytes.fromhex("ac5dcf14503aa8f1")
+ESCROW_DEPOSIT_DISCRIMINATOR: Final = bytes.fromhex("8964fcdb8ccd92d7")
 DELEGATE_ACCOUNT_SPACE: Final = 115
 ATA_ACCOUNT_SPACE: Final = 165
 CONFIG_ACCOUNT_SPACE: Final = 208
@@ -97,7 +101,8 @@ _PROTECTED_RUNTIME_IDS: Final = frozenset({
 REFUSAL_CODES: Final = frozenset({
     "account_index", "account_order", "account_template", "ata_state",
     "blockhash", "cap_ceiling", "cluster_state", "delegate_state",
-    "config_state", "duplicate_account", "escrow_state", "expiry_ceiling", "fee_ceiling",
+    "config_state", "deposit_ceiling", "deposit_disabled", "deposit_state", "duplicate_account",
+    "escrow_state", "expiry_ceiling", "fee_ceiling",
     "fee_payer", "header", "instruction_template", "malformed_message",
     "mint", "noncanonical_shortvec", "policy", "privilege_template",
     "program_hash", "program_state", "programdata", "rent_ceiling",
@@ -134,6 +139,8 @@ class WalletPolicy:
     max_starter_micro_usdc: int = NAK_WALLET_MAX_STARTER_MICRO_USDC
     max_starter_ttl_s: int = NAK_WALLET_MAX_STARTER_TTL_S
     max_withdraw_micro_usdc: int = NAK_WALLET_MAX_WITHDRAW_MICRO_USDC
+    # Missing authorization disables deposits, including older serialized policies.
+    max_deposit_micro_usdc: int | None = None
     max_network_fee_lamports: int = NAK_WALLET_MAX_NETWORK_FEE_LAMPORTS
     max_delegate_rent_lamports: int = NAK_WALLET_MAX_DELEGATE_RENT_LAMPORTS
     max_ata_rent_lamports: int = NAK_WALLET_MAX_ATA_RENT_LAMPORTS
@@ -595,7 +602,8 @@ def _decode_spl_token_account(data: bytes) -> dict[str, object]:
     if any(struct.unpack_from("<I", raw, offset)[0] not in (0, 1)
            for offset in (72, 109, 129)) or raw[108] not in (1, 2):
         _refuse("ata_state")
-    return {"mint": _b58encode(raw[:32]), "owner": _b58encode(raw[32:64])}
+    return {"mint": _b58encode(raw[:32]), "owner": _b58encode(raw[32:64]),
+            "amount": struct.unpack_from("<Q", raw, 64)[0]}
 
 
 def _validate_policy(policy: WalletPolicy, view: ClusterView) -> dict[str, str]:
@@ -620,6 +628,8 @@ def _validate_policy(policy: WalletPolicy, view: ClusterView) -> dict[str, str]:
             (policy.max_self_sol_lamports, NAK_WALLET_MAX_SELF_SOL_LAMPORTS),
             (policy.max_starter_sol_lamports, NAK_WALLET_MAX_STARTER_SOL_LAMPORTS),
         )
+        if policy.max_deposit_micro_usdc is not None:
+            ceilings += ((policy.max_deposit_micro_usdc, _NAK_WALLET_MAX_DEPOSIT_MICRO_USDC),)
         if any(isinstance(value, bool) or not isinstance(value, int)
                or value <= 0 or value > hard_max or value > U64_MAX
                for value, hard_max in ceilings):
@@ -756,6 +766,11 @@ def _expected_instructions(message: _Message, policy: WalletPolicy,
                     "amount": struct.unpack_from("<Q", data, 8)[0]}, data))
             elif data == WITHDRAW_EXECUTE_DISCRIMINATOR:
                 decoded.append(("withdraw_execute", {}, data))
+            elif data.startswith(ESCROW_DEPOSIT_DISCRIMINATOR):
+                if len(data) != 16:
+                    _refuse("unknown_instruction")
+                decoded.append(("escrow_deposit", {
+                    "amount": struct.unpack_from("<Q", data, 8)[0]}, data))
             else:
                 _refuse("unknown_instruction")
         elif instruction.program_id == SYSTEM_PROGRAM_ID:
@@ -777,6 +792,8 @@ def _expected_instructions(message: _Message, policy: WalletPolicy,
         operation = "withdraw_request"
     elif names == ("ata_create_idempotent", "withdraw_execute"):
         operation = "withdraw_execute"
+    elif names == ("ata_create_idempotent", "escrow_deposit"):
+        operation = "deposit"
     elif delegate_item is not None:
         operation = "self_delegate" if key == policy.node_id else "starter_grant"
     else:
@@ -792,6 +809,7 @@ def _expected_instructions(message: _Message, policy: WalletPolicy,
         "self_top_up": {("system_transfer",)},
         "withdraw_request": {("withdraw_request",)},
         "withdraw_execute": {("ata_create_idempotent", "withdraw_execute")},
+        "deposit": {("ata_create_idempotent", "escrow_deposit")},
     }
     if names not in allowed_by_operation[operation]:
         _refuse("instruction_template")
@@ -827,6 +845,14 @@ def _expected_instructions(message: _Message, policy: WalletPolicy,
                 (policy.wallet_id, True, True), (derived["ata"], False, True),
                 (policy.wallet_id, False, False), (policy.mint_id, False, False),
                 (SYSTEM_PROGRAM_ID, False, False), (TOKEN_PROGRAM_ID, False, False),
+            )
+        elif name == "escrow_deposit":
+            specs = (
+                (policy.wallet_id, True, False), (derived["config"], False, False),
+                (policy.mint_id, False, False), (derived["escrow"], False, False),
+                (derived["ata"], False, True), (derived["vault"], False, True),
+                (TOKEN_PROGRAM_ID, False, False), (derived["event"], False, False),
+                (policy.program_id, False, False),
             )
         else:
             specs = (
@@ -924,6 +950,8 @@ def decode_and_check(
     _existing_config(policy, cluster_view, derived, accounts)
     escrow = _existing_escrow(policy, cluster_view, derived, accounts)
     operation, expected, details = _expected_instructions(message, policy, derived)
+    if operation == "deposit" and policy.max_deposit_micro_usdc is None:
+        _refuse("deposit_disabled")
     roles = {
         "wallet": policy.wallet_id,
         "node": policy.node_id,
@@ -1048,6 +1076,38 @@ def decode_and_check(
                        PlanField("sol_lamports", lamports),
                        PlanField("sol_amount", _sol(lamports)),
                        PlanField("sol_ceiling_lamports", ceiling)))
+
+    if operation == "deposit":
+        # The signed amount is authoritative; RPC state can only tighten it.
+        amount = int(by_name["escrow_deposit"]["amount"])
+        if not 0 < amount <= policy.max_deposit_micro_usdc:
+            _refuse("deposit_ceiling")
+        rent_shortfall, rent_worst_case, source = _creation_state(
+            derived["ata"], TOKEN_PROGRAM_ID, cluster_view.ata_rent_exempt_lamports,
+            policy.max_ata_rent_lamports, accounts, "ata")
+        if source is not None and (source["mint"] != policy.mint_id
+                                   or source["owner"] != policy.wallet_id):
+            _refuse("ata_state")
+        source_balance = int(source["amount"]) if source is not None else 0
+        if source_balance < amount:
+            _refuse("deposit_state")
+        vault_account = accounts.get(derived["vault"])
+        if vault_account is None or vault_account.owner != TOKEN_PROGRAM_ID:
+            _refuse("ata_state")
+        vault = _decode_spl_token_account(vault_account.data)
+        if vault["mint"] != policy.mint_id or vault["owner"] != derived["escrow"]:
+            _refuse("ata_state")
+        fields.extend((
+            PlanField("mint", policy.mint_id), PlanField("vault", derived["vault"]),
+            PlanField("source_ata", derived["ata"]),
+            PlanField("amount_micro_usdc", amount), PlanField("amount_usdc", _money(amount)),
+            PlanField("source_balance_before_micro_usdc", source_balance),
+            PlanField("vault_balance_before_micro_usdc", int(vault["amount"])),
+            PlanField("deposit_ceiling_micro_usdc", policy.max_deposit_micro_usdc),
+            PlanField("ata_rent_shortfall_lamports", rent_shortfall),
+            PlanField("ata_rent_worst_case_lamports", rent_worst_case),
+            PlanField("ata_rent_ceiling_lamports", policy.max_ata_rent_lamports),
+        ))
 
     if operation == "withdraw_request":
         amount = int(by_name["withdraw_request"]["amount"])

@@ -198,7 +198,13 @@ def golden_messages() -> dict[str, tuple[bytes, wallet_policy.ClusterView]]:
 
 
 def _serialize_policy(policy: wallet_policy.WalletPolicy) -> dict[str, object]:
-    return asdict(policy)
+    result = asdict(policy)
+    # Frozen base vectors predate deposit authorization; an unset ceiling is
+    # serialized by omission so they stay byte-identical (and prove that an
+    # older serialized policy still loads with deposits disabled).
+    if result.get("max_deposit_micro_usdc") is None:
+        result.pop("max_deposit_micro_usdc", None)
+    return result
 
 
 def _serialize_view(view: wallet_policy.ClusterView) -> dict[str, object]:

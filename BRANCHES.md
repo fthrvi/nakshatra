@@ -5,6 +5,7 @@ On create add a row (status=active, owner). On merge flip to `merged→<sha>`.
 
 | branch | sector | description | base | status | owner |
 |---|---|---|---|---|---|
+| pay/vendor-deposit-policy | pay | Vendor broker pay_wallet_policy.py byte-for-byte from trisul 2a999a7a9 (sha cb79bb2f…, deposit decoder) and cover deposit in the policy tests. | forgejo/main@99180f4 | active | claude/network-lane |
 | pay/broker-wallet-deposit-client | pay | Allow broker-custody escrow deposits through the pinned two-instruction broker template with client-side amount, escrow, and ATA-balance checks. | forgejo/main@373a17d | merged→bce14db | codex/network-lane |
 | pay/broker-wallet-client | payments | M4c 2c step 5: pay_wallet_custody file-or-broker boundary, compile-once/assemble seam, rv5#3 + setup-rerun broker-custody fixes, durable attempt journal/reconciler for broker sends, CLI+starter wiring, fake-transport tests only. | forgejo/main@7af5f24 | merged→b12fc5a | codex for claude/trisul-aa network lane (hub) |
 | pay/broker-wallet-decoder | payments | M4c 2c step 3: pure stdlib decoder/policy for the broker-held pay wallet + golden/hostile fixtures; no broker wiring | forgejo/docs/pay-broker-wallet@0ece6ec | merged→68841c5 | codex for claude/trisul-aa network lane (hub) |

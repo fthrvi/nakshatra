@@ -604,14 +604,12 @@ def test_existing_escrow_is_required_even_for_transfer_only():
 @pytest.mark.parametrize("instructions", [
     lambda: pay_chain.escrow_init(
         fixture_generator.WALLET, fixture_generator.MINT, fixture_generator.PROGRAM),
-    lambda: pay_chain.escrow_deposit(
-        fixture_generator.WALLET, fixture_generator.MINT, 1, fixture_generator.PROGRAM),
     lambda: pay_chain.delegate_revoke(
         fixture_generator.WALLET, fixture_generator.NODE, fixture_generator.PROGRAM),
     lambda: pay_chain.channel_close_request(
         fixture_generator.WALLET, fixture_generator.WALLET, 7, 3,
         fixture_generator.PROGRAM),
-], ids=["escrow_init", "deposit", "delegate_revoke", "channel_close"])
+], ids=["escrow_init", "delegate_revoke", "channel_close"])
 def test_q1_excluded_program_operations_stay_closed(instructions):
     raw = pay_chain.compile_message(
         instructions(), fixture_generator.WALLET, fixture_generator.BLOCKHASH).data
@@ -619,6 +617,64 @@ def test_q1_excluded_program_operations_stay_closed(instructions):
     with pytest.raises(policy_module.PolicyRefusal) as refused:
         _decode(raw, view)
     assert refused.value.code == "unknown_instruction"
+
+
+def _deposit_raw(amount: int) -> bytes:
+    return pay_chain.compile_message(
+        pay_chain.escrow_deposit(
+            fixture_generator.WALLET, fixture_generator.MINT, amount,
+            fixture_generator.PROGRAM),
+        fixture_generator.WALLET, fixture_generator.BLOCKHASH).data
+
+
+def test_deposit_is_refused_when_policy_has_no_deposit_ceiling():
+    # Older serialized policies carry no ceiling: deposits stay closed for them.
+    assert fixture_generator.base_policy().max_deposit_micro_usdc is None
+    with pytest.raises(policy_module.PolicyRefusal) as refused:
+        _decode(_deposit_raw(1), fixture_generator.base_view())
+    assert refused.value.code == "deposit_disabled"
+
+
+@pytest.mark.parametrize("ceiling,amount", [(1_000_000, 1_000_001), (5_000_000, 5_000_001)])
+def test_deposit_over_policy_ceiling_is_refused(ceiling: int, amount: int):
+    wallet_policy = replace(fixture_generator.base_policy(), max_deposit_micro_usdc=ceiling)
+    with pytest.raises(policy_module.PolicyRefusal) as refused:
+        _decode(_deposit_raw(amount), fixture_generator.base_view(), wallet_policy)
+    assert refused.value.code == "deposit_ceiling"
+
+
+def test_deposit_ceiling_cannot_be_raised_above_the_hard_cap():
+    wallet_policy = replace(fixture_generator.base_policy(), max_deposit_micro_usdc=5_000_001)
+    with pytest.raises(policy_module.PolicyRefusal) as refused:
+        _decode(_deposit_raw(1), fixture_generator.base_view(), wallet_policy)
+    assert refused.value.code == "policy"
+
+
+def test_deposit_within_ceiling_is_accepted_as_two_instruction_template():
+    wallet_policy = replace(fixture_generator.base_policy(), max_deposit_micro_usdc=5_000_000)
+    raw = _deposit_raw(1_000_000)
+    derived = policy_module._derive(wallet_policy)
+
+    def with_ata(balance: int) -> policy_module.ClusterView:
+        data = bytearray(fixture_generator._ata_data())
+        data[64:72] = balance.to_bytes(8, "little")
+        view = fixture_generator._replace_account(
+            fixture_generator.base_view(), policy_module.AccountView(
+                derived["ata"], pay_chain.TOKEN_PROGRAM_ID, 2_039_280, bytes(data)))
+        return fixture_generator._replace_account(view, policy_module.AccountView(
+            derived["vault"], pay_chain.TOKEN_PROGRAM_ID, 2_039_280,
+            fixture_generator._ata_data(owner=derived["escrow"])))
+
+    plan = _decode(raw, with_ata(1_000_000), wallet_policy)
+    assert plan.raw_message is raw
+    assert plan.to_dict()["operation"] == "deposit"
+    fields = _fields(plan)
+    assert fields["amount_micro_usdc"] == 1_000_000
+    assert fields["deposit_ceiling_micro_usdc"] == 5_000_000
+    # One micro-USDC short of the signed amount: refused, never clamped.
+    with pytest.raises(policy_module.PolicyRefusal) as refused:
+        _decode(raw, with_ata(999_999), wallet_policy)
+    assert refused.value.code == "deposit_state"
 
 
 def test_refusal_code_set_is_closed():
