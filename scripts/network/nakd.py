@@ -2731,6 +2731,9 @@ class Node:
 
     def post_task(self, to, title: str, instructions: str, acceptance: list, reward: int = 0,
                   deadline_s: int = 3600) -> dict:
+        if reward:
+            from network import pay_network
+            pay_network.require_devnet_flow("task reward")
         names = to if isinstance(to, list) else [to]
         contacts = [c for c in self.store.contacts() if c["state"] == "active"]
         if names in (["*"], ["all"]):

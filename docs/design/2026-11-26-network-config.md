@@ -45,8 +45,12 @@ Commands:
   and mint, plus every mainnet gate.
 - `nak pay network use NAME` changes only `active`, keeps a timestamped backup,
   and names the installed user services that the operator must restart.
-- `nak pay network arm mainnet` is terminal-only and binds the arm record to the
-  exact mainnet genesis, program, and mint. Any later edit disarms it.
+- `nak pay network arm-request-info` prints this node's public key and the exact
+  mainnet RPC, program, limits file, and limits SHA-256 for the release hub.
+- `nak pay network arm mainnet --file FILE` verifies and installs a release-key
+  signature made after the owner approves the request with Face ID. The signed
+  statement binds the node key, genesis, RPC, program, mint, and exact
+  `limits.mainnet.json` bytes. Any later edit disarms it.
 - `nak pay network disarm` removes that arm record.
 
 ## Mainnet switch
@@ -56,11 +60,24 @@ funds a wallet, restarts a service, or enables mainnet by itself.
 
 1. Deploy and audit the escrow program on Solana mainnet.
 2. On each node, put the mainnet HTTPS RPC and audited program ID in
-   `network.json`; create explicit `~/.nakshatra/pay/limits.json` spend limits.
-3. Run `nak pay network arm mainnet`.
-4. Run `nak pay network use mainnet`, then restart the user services it prints.
-5. Fund the node with real USDC and enough SOL for fees and rent.
+   `network.json`; create explicit, mode-`0600`
+   `~/.nakshatra/pay/limits.mainnet.json` spend limits. Devnet continues to use
+   `limits.json` and may create its defaults automatically; mainnet never does.
+3. On the node, run `nak pay network arm-request-info`.
+4. On the release hub, use those exact values:
+   `python3 release/arm_mainnet.py --node-pubkey HEX --rpc HTTPS_URL
+   --program PUBKEY --limits /copied/limits.mainnet.json --out NODE.arm`.
+   Approve the broker request with Face ID, then copy `NODE.arm` to the node.
+5. On the node, run `nak pay network arm mainnet --file NODE.arm`, then
+   `nak pay network use mainnet`, and restart the user services it prints.
+6. Fund the node with real USDC and enough SOL for fees and rent.
+
+A process running as the same Unix user can still edit `network.json` or either
+limits file. It cannot produce a valid replacement arm statement: that requires
+the release key held behind the hub's Face ID approval broker. Editing a bound
+value therefore makes the mainnet gate fail closed until the owner signs a new
+statement.
 
 For a broker-custody wallet such as the hub's, the copied broker policy remains
 devnet-only. It needs its own reviewed policy update before that wallet can be
-used on mainnet.
+used on mainnet. That wallet-policy gate is separate from the release-key arm.

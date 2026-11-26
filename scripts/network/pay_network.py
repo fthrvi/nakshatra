@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import fcntl
+import base64
+import binascii
+import hashlib
 import json
 import os
 import re
@@ -12,7 +15,7 @@ import urllib.parse
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, Mapping, TextIO
+from typing import Iterator, Mapping
 
 
 DEVNET_GENESIS_HASH = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG"
@@ -20,6 +23,7 @@ MAINNET_GENESIS_HASH = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d"
 DEVNET_PROGRAM = "GLWqQsSqUsDkPvkc8rxcoQUyro7ZQd5denht21NtdTTo"
 DEVNET_MINT = "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU"
 MAINNET_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+MAINNET_ARM_SCHEMA = "nakshatra.mainnet-arm.v1"
 
 _B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 _B58_INDEX = {char: index for index, char in enumerate(_B58)}
@@ -27,6 +31,12 @@ _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 _NETWORK_NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 _EXPLORER_CLUSTER = re.compile(r"[A-Za-z0-9_-]{0,64}")
 _ENTRY_FIELDS = frozenset({"rpc", "genesis", "program", "mint"})
+_ARM_FIELDS = frozenset({
+    "schema", "node_pubkey", "network", "genesis", "rpc", "program", "mint",
+    "limits_sha256", "issued_at",
+})
+_HEX64 = re.compile(r"[0-9a-f]{64}\Z")
+_LIMIT_FIELDS = frozenset({"cap_total", "days", "per_tx", "per_day"})
 
 
 class NetworkConfigError(ValueError):
@@ -62,6 +72,38 @@ def arm_path(home: Path | None = None) -> Path:
 
 def limits_path(home: Path | None = None) -> Path:
     return network_path(home).with_name("limits.json")
+
+
+def mainnet_limits_path(home: Path | None = None) -> Path:
+    return network_path(home).with_name("limits.mainnet.json")
+
+
+def active_limits_path(home: Path | None = None) -> Path:
+    document = load_document(home=home)
+    return (mainnet_limits_path(home) if document is not None and document.active == "mainnet"
+            else limits_path(home))
+
+
+def validate_limits(value: object) -> dict[str, int]:
+    """Validate the one limits schema shared by CLI and spend paths."""
+    if not isinstance(value, dict) or set(value) != _LIMIT_FIELDS:
+        raise NetworkConfigError(
+            "pay limits must contain cap_total, days, per_tx, and per_day")
+    parsed: dict[str, int] = {}
+    for name in ("cap_total", "per_tx", "per_day"):
+        item = value[name]
+        if isinstance(item, bool) or not isinstance(item, int) or not 0 < item < 2**64:
+            raise NetworkConfigError(f"pay limit {name} must be a positive u64")
+        parsed[name] = item
+    days = value["days"]
+    if isinstance(days, bool) or not isinstance(days, int) or not 1 <= days <= 3650:
+        raise NetworkConfigError("pay limit days must be between 1 and 3650")
+    parsed["days"] = days
+    if parsed["per_tx"] > parsed["per_day"]:
+        raise NetworkConfigError("pay limit per-tx cannot exceed per-day")
+    if parsed["per_day"] > parsed["cap_total"]:
+        raise NetworkConfigError("pay limit per-day cannot exceed the on-chain cap")
+    return parsed
 
 
 def _decode_base58(value: str, field: str) -> bytes:
@@ -335,6 +377,11 @@ def _load_document_at(pay_fd: int, *, home: Path | None,
 def load_document(*, home: Path | None = None,
                   environ: Mapping[str, str] | None = None) -> NetworkDocument | None:
     """Load and strictly validate network.json, returning ``None`` only when absent."""
+    # Preserve the legacy path exactly when network.json does not exist.  In
+    # particular, old installations may have symlinked or foreign-owned parent
+    # directories; those become a refusal only once they opt into this file.
+    if not os.path.lexists(network_path(home)):
+        return None
     with _pay_directory(home, create=False) as pay_fd:
         if pay_fd is None:
             return None
@@ -342,22 +389,190 @@ def load_document(*, home: Path | None = None,
 
 
 def _require_limits_at(pay_fd: int | None, home: Path | None) -> tuple[bool, str]:
-    path = limits_path(home)
+    path = mainnet_limits_path(home)
     if pay_fd is None:
-        return False, "mainnet limits.json is required (no default spend limits on real money)"
+        return False, "mainnet limits.mainnet.json is required (no default spend limits on real money)"
     try:
         raw = _read_private_at(
-            pay_fd, path.name, path, "mainnet limits.json", missing_ok=True)
+            pay_fd, path.name, path, "mainnet limits.mainnet.json", missing_ok=True)
     except NetworkConfigError as exc:
         return False, str(exc)
     if raw is None:
-        return False, "mainnet limits.json is required (no default spend limits on real money)"
+        return False, "mainnet limits.mainnet.json is required (no default spend limits on real money)"
+    try:
+        validate_limits(_load_json(raw, f"mainnet limits {path}"))
+    except NetworkConfigError as exc:
+        return False, str(exc)
     return True, "ready"
 
 
 def _require_limits(home: Path | None) -> tuple[bool, str]:
     with _pay_directory(home, create=False) as pay_fd:
         return _require_limits_at(pay_fd, home)
+
+
+def _canonical(value: dict) -> bytes:
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def _node_public_key(home: Path | None) -> str:
+    from nakshatra_auth import load_worker_key
+
+    key_path = _home_path(home) / ".nakshatra" / "keys" / "worker.ed25519"
+    try:
+        _seed, public = load_worker_key(key_path)
+    except (OSError, ValueError, PermissionError) as exc:
+        raise NetworkConfigError(f"cannot load this node's signing key: {exc}") from exc
+    if _HEX64.fullmatch(public) is None:  # defensive: load_worker_key already guarantees this
+        raise NetworkConfigError("this node's signing public key is malformed")
+    return public
+
+
+def _installed_release_public(home: Path | None) -> str:
+    default = _home_path(home) / ".nakshatra-node"
+    root = Path(os.path.expanduser(os.environ.get("NAK_NODE_PREFIX", str(default))))
+    root_fd = None
+    fd = None
+    try:
+        root_fd = os.open(root, _directory_flags())
+        fd = os.open("config.json", _file_flags(), dir_fd=root_fd)
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+            raise NetworkConfigError(
+                "installed release config must be an owner-owned regular file")
+        chunks = []
+        total = 0
+        while True:
+            chunk = os.read(fd, min(65536, 1_048_577 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > 1_048_576:
+                raise NetworkConfigError("installed release config is too large")
+        value = _load_json(b"".join(chunks), f"installed release config {root / 'config.json'}")
+    except NetworkConfigError:
+        raise
+    except OSError as exc:
+        raise NetworkConfigError(
+            f"cannot read installed release config {root / 'config.json'}: {exc}") from exc
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if root_fd is not None:
+            os.close(root_fd)
+    public = value.get("pubkey") if isinstance(value, dict) else None
+    if not isinstance(public, str) or _HEX64.fullmatch(public) is None:
+        raise NetworkConfigError("installed release config has no valid pinned release public key")
+    return public
+
+
+def _decode_signed_arm(value: object) -> tuple[dict, bytes, dict]:
+    if not isinstance(value, dict) or set(value) != {"statement_b64", "signature"}:
+        raise NetworkConfigError("mainnet arm file has the wrong signed-file shape")
+    encoded, signature = value["statement_b64"], value["signature"]
+    if not isinstance(encoded, str):
+        raise NetworkConfigError("mainnet arm statement_b64 must be a string")
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise NetworkConfigError("mainnet arm statement_b64 is invalid") from exc
+    if len(raw) > 4096:
+        raise NetworkConfigError("mainnet arm statement is too large")
+    statement = _load_json(raw, "mainnet arm statement")
+    if (not isinstance(statement, dict) or set(statement) != _ARM_FIELDS
+            or statement.get("schema") != MAINNET_ARM_SCHEMA):
+        raise NetworkConfigError("mainnet arm statement has malformed fields")
+    if _canonical(statement) != raw:
+        raise NetworkConfigError("mainnet arm statement is not canonical JSON")
+    if not isinstance(signature, dict) or set(signature) != {"alg", "keyid", "value"}:
+        raise NetworkConfigError("mainnet arm signature has malformed fields")
+    return statement, raw, signature
+
+
+def _verify_release_signature(signature: dict, public_hex: str, raw: bytes) -> None:
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+
+    if signature.get("alg") != "Ed25519" or signature.get("keyid") != public_hex[:16]:
+        raise NetworkConfigError(
+            "mainnet arm signature does not name the installed pinned release key")
+    try:
+        encoded = signature.get("value")
+        if not isinstance(encoded, str):
+            raise ValueError("signature value is not a string")
+        raw_signature = base64.b64decode(encoded, validate=True)
+        if len(raw_signature) != 64:
+            raise ValueError("signature is not 64 bytes")
+        ed25519.Ed25519PublicKey.from_public_bytes(bytes.fromhex(public_hex)).verify(
+            raw_signature, raw)
+    except (ValueError, binascii.Error, InvalidSignature) as exc:
+        raise NetworkConfigError(
+            "mainnet arm signature does not verify under the installed release key") from exc
+
+
+def _verify_arm_document(value: object, *, network: PayNetwork, home: Path | None,
+                         pay_fd: int) -> dict:
+    statement, raw, signature = _decode_signed_arm(value)
+    public_hex = _installed_release_public(home)
+    _verify_release_signature(signature, public_hex, raw)
+    node_public = _node_public_key(home)
+    expected = {
+        "node_pubkey": node_public,
+        "network": "mainnet",
+        "genesis": network.genesis,
+        "rpc": network.rpc,
+        "program": network.program,
+        "mint": network.mint,
+    }
+    if statement.get("node_pubkey") != node_public:
+        raise NetworkConfigError("mainnet arm statement is for a different node signing key")
+    if any(statement.get(key) != wanted for key, wanted in expected.items()):
+        raise NetworkConfigError(
+            "mainnet arm file does not match the active mainnet entry")
+    if (not isinstance(statement.get("rpc"), str) or len(statement["rpc"]) > 512
+            or not statement["rpc"].startswith("https://")):
+        raise NetworkConfigError("mainnet arm statement rpc must be an HTTPS URL")
+    issued_at = statement.get("issued_at")
+    if isinstance(issued_at, bool) or not isinstance(issued_at, int) or issued_at <= 0:
+        raise NetworkConfigError("mainnet arm statement issued_at must be a positive integer")
+    limits = mainnet_limits_path(home)
+    limits_raw = _read_private_at(
+        pay_fd, limits.name, limits, "mainnet limits.mainnet.json", missing_ok=True)
+    if limits_raw is None:
+        raise NetworkConfigError(
+            "mainnet limits.mainnet.json is required (no default spend limits on real money)")
+    validate_limits(_load_json(limits_raw, f"mainnet limits {limits}"))
+    expected_hash = hashlib.sha256(limits_raw).hexdigest()
+    if statement.get("limits_sha256") != expected_hash:
+        raise NetworkConfigError("mainnet arm statement does not match limits.mainnet.json")
+    return statement
+
+
+def _read_source_file(path: Path) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise NetworkConfigError(f"cannot open signed mainnet arm file {path}: {exc}") from exc
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise NetworkConfigError("signed mainnet arm input must be a regular file")
+        chunks = []
+        total = 0
+        while True:
+            chunk = os.read(fd, min(65536, 16385 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > 16384:
+                raise NetworkConfigError("signed mainnet arm input is too large")
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
 
 
 def _arm_status_at(network: PayNetwork, home: Path | None,
@@ -373,18 +588,10 @@ def _arm_status_at(network: PayNetwork, home: Path | None,
         value = _load_json(raw, "mainnet arm file")
     except NetworkConfigError as exc:
         return False, str(exc)
-    required = {"network", "rpc", "genesis", "program", "mint", "armed_at"}
-    if not isinstance(value, dict) or set(value) != required:
-        return False, "mainnet arm file has the wrong shape; run `nak pay network arm mainnet`"
-    expected = {
-        "network": "mainnet", "rpc": network.rpc, "genesis": network.genesis,
-        "program": network.program, "mint": network.mint,
-    }
-    if any(value.get(key) != wanted for key, wanted in expected.items()):
-        return False, "mainnet arm file does not match network.json; run `nak pay network arm mainnet`"
-    armed_at = value.get("armed_at")
-    if isinstance(armed_at, bool) or not isinstance(armed_at, int) or armed_at <= 0:
-        return False, "mainnet arm file has an invalid armed_at; run `nak pay network arm mainnet`"
+    try:
+        _verify_arm_document(value, network=network, home=home, pay_fd=pay_fd)
+    except NetworkConfigError as exc:
+        return False, str(exc)
     return True, "ready"
 
 
@@ -507,6 +714,21 @@ def _atomic_write_json_at(pay_fd: int, path: Path, value: dict) -> None:
             os.fsync(pay_fd)
 
 
+def _atomic_write_bytes_at(pay_fd: int, path: Path, body: bytes) -> None:
+    temp = f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+    try:
+        _write_exclusive_at(pay_fd, temp, body)
+        os.replace(temp, path.name, src_dir_fd=pay_fd, dst_dir_fd=pay_fd)
+        os.fsync(pay_fd)
+    finally:
+        try:
+            os.unlink(temp, dir_fd=pay_fd)
+        except FileNotFoundError:
+            pass
+        else:
+            os.fsync(pay_fd)
+
+
 @contextmanager
 def _mutation_lock(home: Path | None) -> Iterator[int]:
     with _pay_directory(home, create=True) as pay_fd:
@@ -613,14 +835,9 @@ def use_network(name: str, *, home: Path | None = None,
         return document.path, backup
 
 
-def arm_mainnet(*, input_stream: TextIO, output_stream: TextIO,
-                home: Path | None = None,
-                environ: Mapping[str, str] | None = None,
-                armed_at: int | None = None) -> Path:
-    if (not getattr(input_stream, "isatty", lambda: False)()
-            or not getattr(output_stream, "isatty", lambda: False)()):
-        raise NetworkConfigError(
-            "nak pay network arm mainnet is interactive-only; run it in a terminal")
+def arm_request_info(*, home: Path | None = None,
+                     environ: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Return the exact values the release-key arm requester must bind."""
     with _mutation_lock(home) as pay_fd:
         document = _load_document_at(pay_fd, home=home, environ=environ)
         if document is None or "mainnet" not in document.networks:
@@ -633,31 +850,37 @@ def arm_mainnet(*, input_stream: TextIO, output_stream: TextIO,
         if not network.mint:
             raise NetworkConfigError("mainnet mint not configured")
         parsed = urllib.parse.urlsplit(network.rpc)
-        host = parsed.hostname or "invalid"
-        if parsed.port is not None:
-            host = f"{host}:{parsed.port}"
-        phrase = f"ARM MAINNET {network.program[:8]}"
-        output_stream.write(
-            f"mainnet rpc host: {host}\n"
-            f"mainnet program: {network.program}\n"
-            f"mainnet mint: {network.mint}\n"
-            f'type exactly "{phrase}": ')
-        output_stream.flush()
-        entered = input_stream.readline().rstrip("\r\n")
-        if entered != phrase:
-            raise NetworkConfigError(
-                "mainnet arm phrase did not match; mainnet remains disarmed")
-        reloaded = _load_document_at(pay_fd, home=home, environ=environ)
-        if reloaded is None or reloaded.source != document.source:
-            raise NetworkConfigError(
-                "network.json changed during the mainnet arm prompt; mainnet remains disarmed")
-        value = {
-            "network": "mainnet", "rpc": network.rpc, "genesis": network.genesis,
-            "program": network.program, "mint": network.mint,
-            "armed_at": int(time.time() if armed_at is None else armed_at),
+        if parsed.scheme != "https":
+            raise NetworkConfigError("mainnet rpc must use HTTPS before an arm can be requested")
+        limits = mainnet_limits_path(home)
+        raw = _read_private_at(
+            pay_fd, limits.name, limits, "mainnet limits.mainnet.json", missing_ok=False)
+        assert raw is not None
+        validate_limits(_load_json(raw, f"mainnet limits {limits}"))
+        return {
+            "node_pubkey": _node_public_key(home),
+            "rpc": network.rpc,
+            "program": network.program,
+            "limits": str(limits),
+            "limits_sha256": hashlib.sha256(raw).hexdigest(),
         }
+
+
+def arm_mainnet(source: Path, *, home: Path | None = None,
+                environ: Mapping[str, str] | None = None) -> Path:
+    """Verify and install a release-key-signed mainnet arm file."""
+    raw = _read_source_file(Path(source))
+    value = _load_json(raw, f"signed mainnet arm file {source}")
+    with _mutation_lock(home) as pay_fd:
+        document = _load_document_at(pay_fd, home=home, environ=environ)
+        if document is None or "mainnet" not in document.networks:
+            raise NetworkConfigError("mainnet is not configured in network.json")
+        network = document.networks["mainnet"]
+        if not network.rpc or not network.program or not network.mint:
+            raise NetworkConfigError("mainnet rpc, program, and mint must be configured")
+        _verify_arm_document(value, network=network, home=home, pay_fd=pay_fd)
         path = arm_path(home)
-        _atomic_write_json_at(pay_fd, path, value)
+        _atomic_write_bytes_at(pay_fd, path, raw)
         return path
 
 

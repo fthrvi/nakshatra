@@ -33,6 +33,10 @@ _PUBLIC_KEY = re.compile(r"[0-9a-f]{64}\Z")
 _SIGNATURE = re.compile(r"[0-9a-f]{128}\Z")
 _LATEST_KEYS = {"schema", "channel", "version", "manifest_sha256", "created", "expires_at"}
 _KEYROLL_KEYS = {"schema", "old_pubkey", "new_pubkey", "issued_at", "reason"}
+_MAINNET_ARM_KEYS = {
+    "schema", "node_pubkey", "network", "genesis", "rpc", "program", "mint",
+    "limits_sha256", "issued_at",
+}
 
 
 class BrokerSigningError(RuntimeError):
@@ -288,4 +292,19 @@ def sign_keyroll_new(statement: dict, config_dir: Path | None = None) -> dict:
         config_dir)
     if signed_by != public_hex or returned[0] != raw:
         raise BrokerSigningError("release broker substituted key-roll signing item")
+    return _verified_signature(public_hex, signatures[0], returned[0], 0)
+
+
+def sign_mainnet_arm(statement: dict, config_dir: Path | None = None) -> dict:
+    """Approve and sign one node-bound mainnet arm statement."""
+    if (not isinstance(statement, dict) or set(statement) != _MAINNET_ARM_KEYS
+            or statement.get("schema") != "nakshatra.mainnet-arm.v1"):
+        raise BrokerSigningError("mainnet arm statement has malformed fields")
+    raw = rk.canonical(statement)
+    signatures, returned, public_hex = _sign(
+        "mainnet_arm", [{"b64": base64.b64encode(raw).decode("ascii")}],
+        f"Arm Nakshatra node {str(statement.get('node_pubkey', ''))[:16]} for mainnet",
+        config_dir)
+    if returned[0] != raw:
+        raise BrokerSigningError("release broker substituted mainnet arm signing item")
     return _verified_signature(public_hex, signatures[0], returned[0], 0)

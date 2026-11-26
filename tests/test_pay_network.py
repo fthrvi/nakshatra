@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import io
+import base64
+import hashlib
 import json
 import os
 import stat
@@ -10,17 +12,22 @@ import threading
 from pathlib import Path
 
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ed25519
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from network import join_setup, nak, nakd, pay_chain, pay_network, pay_voucher  # noqa: E402
+from network import (join_setup, nak, nakd, pay_autochannel, pay_chain,
+                     pay_network, pay_voucher)  # noqa: E402
 
 
 PROGRAM = pay_network.DEVNET_PROGRAM
 MINT = pay_network.DEVNET_MINT
 MAINNET_PROGRAM = pay_chain.b58encode(bytes([73]) * 32)
 RPC = "http://127.0.0.1:18999"
+MAINNET_RPC = "https://mainnet-rpc.example.test/v1"
+_RELEASE_KEYS = {}
 
 
 @pytest.fixture(autouse=True)
@@ -32,10 +39,17 @@ def _clean_environment(tmp_path, monkeypatch):
         "NAK_PAY_RPC", "NAKSHATRA_PAY_RPC_URL", "NAK_PAY_PROGRAM", "NAK_PAY_MINT",
     ):
         monkeypatch.delenv(name, raising=False)
+    release_key = ed25519.Ed25519PrivateKey.generate()
+    release_pub = release_key.public_key().public_bytes_raw().hex()
+    prefix = home / ".nakshatra-node"
+    prefix.mkdir()
+    (prefix / "config.json").write_text(json.dumps({"pubkey": release_pub}))
+    monkeypatch.setenv("NAK_NODE_PREFIX", str(prefix))
+    _RELEASE_KEYS[home] = release_key
     return home
 
 
-def _value(*, active="devnet", devnet_rpc=RPC, mainnet_rpc=RPC,
+def _value(*, active="devnet", devnet_rpc=RPC, mainnet_rpc=MAINNET_RPC,
            mainnet_program=MAINNET_PROGRAM):
     return {
         "active": active,
@@ -70,20 +84,49 @@ def _config(home: Path, **kwargs):
 
 
 def _limits(home: Path):
-    return _write(pay_network.limits_path(home), {
+    return _write(pay_network.mainnet_limits_path(home), {
         "cap_total": 1_000_000, "days": 30,
         "per_tx": 100_000, "per_day": 200_000,
     })
 
 
-def _arm(home: Path, *, program=MAINNET_PROGRAM, rpc=RPC):
-    return _write(pay_network.arm_path(home), {
+def _arm(home: Path, *, program=MAINNET_PROGRAM, rpc=MAINNET_RPC,
+         node_pubkey=None, limits_sha256=None, release_key=None):
+    from nakshatra_auth import load_worker_key
+
+    node_path = home / ".nakshatra" / "keys" / "worker.ed25519"
+    if not node_path.exists():
+        node_key = ed25519.Ed25519PrivateKey.generate()
+        node_seed = node_key.private_bytes(
+            serialization.Encoding.Raw, serialization.PrivateFormat.Raw,
+            serialization.NoEncryption())
+        node_path.parent.mkdir(parents=True, exist_ok=True)
+        node_path.write_bytes(node_seed)
+        node_path.chmod(0o600)
+    _seed, actual_node = load_worker_key(node_path)
+    limits = pay_network.mainnet_limits_path(home)
+    statement = {
+        "schema": pay_network.MAINNET_ARM_SCHEMA,
+        "node_pubkey": node_pubkey or actual_node,
         "network": "mainnet",
-        "rpc": rpc,
         "genesis": pay_network.MAINNET_GENESIS_HASH,
+        "rpc": rpc,
         "program": program,
         "mint": pay_network.MAINNET_MINT,
-        "armed_at": 1_700_000_000,
+        "limits_sha256": (limits_sha256 or
+                           (hashlib.sha256(limits.read_bytes()).hexdigest()
+                            if limits.exists() else "0" * 64)),
+        "issued_at": 1_700_000_000,
+    }
+    raw = json.dumps(statement, sort_keys=True, separators=(",", ":")).encode()
+    key = release_key or _RELEASE_KEYS[home]
+    pub = key.public_key().public_bytes_raw().hex()
+    return _write(pay_network.arm_path(home), {
+        "statement_b64": base64.b64encode(raw).decode(),
+        "signature": {
+            "alg": "Ed25519", "keyid": pub[:16],
+            "value": base64.b64encode(key.sign(raw)).decode(),
+        },
     })
 
 
@@ -102,7 +145,8 @@ class _Response:
 
 
 def _rpc(genesis):
-    return pay_chain.PayRpc(RPC, opener=lambda _request, timeout: _Response(genesis))
+    url = pay_chain.configured_rpc_url(os.environ) or RPC
+    return pay_chain.PayRpc(url, opener=lambda _request, timeout: _Response(genesis))
 
 
 def test_absent_file_preserves_devnet_and_devnet_only_mainnet_text():
@@ -171,7 +215,7 @@ def test_bad_network_file_is_refused(_clean_environment, kind):
         ("program", "mainnet program not configured"),
         ("arm-missing", "arm file is missing"),
         ("arm-mismatch", "arm file does not match"),
-        ("limits", "limits.json is required"),
+        ("limits", "limits.mainnet.json is required"),
     ],
 )
 def test_each_mainnet_gate_names_its_refusal(_clean_environment, case, match):
@@ -252,67 +296,120 @@ def test_status_prints_rpc_host_without_path_query_or_keys(_clean_environment, c
     assert secret not in shown
 
 
-class _TTY(io.StringIO):
-    def isatty(self):
-        return True
-
-
-class _ChangingTTY(_TTY):
-    def __init__(self, value, change):
-        super().__init__(value)
-        self.change = change
-
-    def readline(self, *args, **kwargs):
-        self.change()
-        return super().readline(*args, **kwargs)
-
-
-def test_arm_requires_tty_and_exact_phrase_then_writes_private_file(
-        _clean_environment, monkeypatch):
+def test_arm_requires_release_signed_file_then_installs_exact_private_bytes(
+        _clean_environment):
     home = _clean_environment
     _config(home)
-    monkeypatch.setattr(nak.sys, "stdin", io.StringIO(""))
-    monkeypatch.setattr(nak.sys, "stdout", io.StringIO())
-    with pytest.raises(SystemExit, match="interactive-only"):
-        nak.main(["pay", "network", "arm", "mainnet"])
-
-    monkeypatch.setattr(nak.sys, "stdin", _TTY("WRONG\n"))
-    monkeypatch.setattr(nak.sys, "stdout", _TTY())
-    with pytest.raises(SystemExit, match="did not match"):
-        nak.main(["pay", "network", "arm", "mainnet"])
-    assert not pay_network.arm_path(home).exists()
-
-    phrase = f"ARM MAINNET {MAINNET_PROGRAM[:8]}\n"
-    monkeypatch.setattr(nak.sys, "stdin", _TTY(phrase))
-    monkeypatch.setattr(nak.sys, "stdout", _TTY())
-    assert nak.main(["pay", "network", "arm", "mainnet"]) == 0
+    _limits(home)
+    signed = _arm(home).with_name("from-hub.json")
+    pay_network.arm_path(home).replace(signed)
+    exact = signed.read_bytes()
+    assert nak.main(["pay", "network", "arm", "mainnet", "--file", str(signed)]) == 0
     arm = pay_network.arm_path(home)
     assert stat.S_IMODE(arm.stat().st_mode) == 0o600
-    armed = json.loads(arm.read_text())
-    assert armed["program"] == MAINNET_PROGRAM
-    assert armed["rpc"] == RPC
+    assert arm.read_bytes() == exact
 
 
-def test_arm_mainnet_owns_tty_prompt_and_refuses_changed_document(_clean_environment):
+def test_locally_invented_or_wrong_node_arm_cannot_be_installed(_clean_environment):
     home = _clean_environment
-    path = _config(home)
-    with pytest.raises(pay_network.NetworkConfigError, match="interactive-only"):
-        pay_network.arm_mainnet(
-            home=home, environ={}, input_stream=io.StringIO(), output_stream=io.StringIO())
-
-    def change_config():
-        changed = _value(mainnet_rpc="http://127.0.0.1:19000")
-        _write(path, changed)
-
-    shown = _TTY()
-    typed = _ChangingTTY(f"ARM MAINNET {MAINNET_PROGRAM[:8]}\n", change_config)
-    with pytest.raises(pay_network.NetworkConfigError, match="changed during.*prompt"):
-        pay_network.arm_mainnet(
-            home=home, environ={}, input_stream=typed, output_stream=shown)
-    assert "mainnet rpc host: 127.0.0.1:18999" in shown.getvalue()
-    assert f"mainnet program: {MAINNET_PROGRAM}" in shown.getvalue()
-    assert f"mainnet mint: {pay_network.MAINNET_MINT}" in shown.getvalue()
+    _config(home)
+    _limits(home)
+    outsider = ed25519.Ed25519PrivateKey.generate()
+    forged = _arm(home, release_key=outsider).with_name("forged.json")
+    pay_network.arm_path(home).replace(forged)
+    with pytest.raises(pay_network.NetworkConfigError, match="pinned release key"):
+        pay_network.arm_mainnet(forged, home=home, environ={})
+    wrong = _arm(home, node_pubkey="ab" * 32).with_name("wrong-node.json")
+    pay_network.arm_path(home).replace(wrong)
+    with pytest.raises(pay_network.NetworkConfigError, match="different node"):
+        pay_network.arm_mainnet(wrong, home=home, environ={})
     assert not pay_network.arm_path(home).exists()
+
+
+def test_arm_request_info_prints_exact_hub_arguments(_clean_environment, capsys):
+    home = _clean_environment
+    _config(home)
+    limits = _limits(home)
+    arm = _arm(home)
+    arm.unlink()
+    info = pay_network.arm_request_info(home=home, environ={})
+    assert info["rpc"] == MAINNET_RPC
+    assert info["program"] == MAINNET_PROGRAM
+    assert info["limits"] == str(limits)
+    assert info["limits_sha256"] == hashlib.sha256(limits.read_bytes()).hexdigest()
+    assert len(info["node_pubkey"]) == 64
+    assert nak.main(["pay", "network", "arm-request-info"]) == 0
+    shown = capsys.readouterr().out
+    for value in info.values():
+        assert value in shown
+
+
+def test_mainnet_uses_separate_validated_limits_for_cli_and_spend_path(
+        _clean_environment):
+    home = _clean_environment
+    _config(home, active="mainnet")
+    dev = _write(pay_network.limits_path(home), {
+        "cap_total": 9_000_000, "days": 9, "per_tx": 9, "per_day": 90,
+    })
+    mainnet = _limits(home)
+    _arm(home)
+    assert pay_autochannel.load_limits()["cap_total"] == 1_000_000
+    assert nak._load_pay_limits()["per_tx"] == 100_000
+    nak._save_pay_limits({
+        "cap_total": 2_000_000, "days": 10,
+        "per_tx": 20_000, "per_day": 200_000,
+    })
+    assert json.loads(mainnet.read_text())["cap_total"] == 2_000_000
+    assert json.loads(dev.read_text())["cap_total"] == 9_000_000
+
+
+def test_invalid_mainnet_limits_content_refuses_gate_and_arm_request(_clean_environment):
+    home = _clean_environment
+    _config(home, active="mainnet")
+    _write(pay_network.mainnet_limits_path(home), {
+        "cap_total": 10, "days": 30, "per_tx": 9, "per_day": 8,
+    })
+    _arm(home)
+    with pytest.raises(pay_network.NetworkConfigError, match="per-tx cannot exceed"):
+        pay_network.active_network(home=home, environ={})
+    with pytest.raises(pay_network.NetworkConfigError, match="per-tx cannot exceed"):
+        pay_network.arm_request_info(home=home, environ={})
+
+
+def test_editing_signed_limits_disarms_mainnet(_clean_environment):
+    home = _clean_environment
+    _config(home, active="mainnet")
+    limits = _limits(home)
+    _arm(home)
+    assert pay_network.active_network(home=home, environ={}).name == "mainnet"
+    limits.write_bytes(limits.read_bytes() + b" ")
+    with pytest.raises(pay_network.NetworkConfigError, match="does not match limits"):
+        pay_network.active_network(home=home, environ={})
+
+
+def test_limits_read_and_write_refuse_symlink_without_touching_target(_clean_environment):
+    home = _clean_environment
+    target = _write(home / "target-limits.json", {
+        "cap_total": 100, "days": 2, "per_tx": 10, "per_day": 20,
+    })
+    path = pay_network.limits_path(home)
+    path.parent.mkdir(parents=True)
+    path.symlink_to(target)
+    with pytest.raises(pay_voucher.VoucherError, match="cannot open pay limits"):
+        pay_autochannel.load_limits()
+    with pytest.raises(SystemExit, match="securely inspect"):
+        nak._save_pay_limits({
+            "cap_total": 200, "days": 2, "per_tx": 10, "per_day": 20,
+        })
+    assert json.loads(target.read_text())["cap_total"] == 100
+
+
+def test_nakd_paid_task_guard_runs_before_contacts_or_escrow(_clean_environment):
+    home = _clean_environment
+    _config(home, active="mainnet")
+    node = object.__new__(nakd.Node)
+    with pytest.raises(pay_network.NetworkConfigError, match="task reward is DEVNET-ONLY"):
+        node.post_task("anyone", "paid", "work", [{"max_words": 1}], reward=1)
 
 
 def test_changing_mainnet_rpc_disarms_existing_record(_clean_environment):
@@ -321,8 +418,8 @@ def test_changing_mainnet_rpc_disarms_existing_record(_clean_environment):
     _limits(home)
     _arm(home)
     assert pay_network.active_network(home=home, environ={}).name == "mainnet"
-    _write(path, _value(active="mainnet", mainnet_rpc="http://127.0.0.1:19000"))
-    with pytest.raises(pay_network.NetworkConfigError, match="arm file does not match"):
+    _write(path, _value(active="mainnet", mainnet_rpc="https://other.example.test"))
+    with pytest.raises(pay_network.NetworkConfigError, match="does not match the active"):
         pay_network.active_network(home=home, environ={})
 
 
@@ -401,7 +498,7 @@ def test_cached_mainnet_object_rechecks_disarm_for_reads_and_sends(_clean_enviro
     _limits(home)
     _arm(home)
     calls = []
-    rpc = pay_chain.PayRpc(RPC)
+    rpc = pay_chain.PayRpc(MAINNET_RPC)
 
     def call(method, _params):
         calls.append(method)
@@ -432,7 +529,7 @@ def test_send_rechecks_gates_immediately_before_broadcast(_clean_environment):
     _limits(home)
     _arm(home)
     calls = []
-    rpc = pay_chain.PayRpc(RPC)
+    rpc = pay_chain.PayRpc(MAINNET_RPC)
 
     def call(method, _params):
         calls.append(method)
@@ -467,26 +564,45 @@ def test_symlinked_payment_directories_are_refused(_clean_environment, component
     target = home / "redirected"
     target.mkdir()
     if component == ".nakshatra":
+        _write(target / "pay" / "network.json", _value())
         (home / ".nakshatra").symlink_to(target, target_is_directory=True)
     else:
         nak = home / ".nakshatra"
         nak.mkdir()
+        _write(target / "network.json", _value())
         (nak / "pay").symlink_to(target, target_is_directory=True)
     with pytest.raises(pay_network.NetworkConfigError, match="symlinked payment directory"):
         pay_network.load_document(home=home, environ={})
 
 
-@pytest.mark.parametrize("filename", ["mainnet.armed", "limits.json"])
+@pytest.mark.parametrize("component", [".nakshatra", "pay"])
+def test_symlinked_payment_directories_keep_legacy_behavior_without_network_file(
+        _clean_environment, component):
+    home = _clean_environment
+    target = home / "legacy-payment-root"
+    target.mkdir()
+    if component == ".nakshatra":
+        (home / ".nakshatra").symlink_to(target, target_is_directory=True)
+    else:
+        nak_dir = home / ".nakshatra"
+        nak_dir.mkdir()
+        (nak_dir / "pay").symlink_to(target, target_is_directory=True)
+    assert pay_network.load_document(home=home, environ={}) is None
+
+
+@pytest.mark.parametrize("filename", ["mainnet.armed", "limits.mainnet.json"])
 def test_mainnet_gate_files_are_opened_without_following_symlinks(
         _clean_environment, filename):
     home = _clean_environment
     _config(home, active="mainnet")
     if filename != "mainnet.armed":
+        _limits(home)
         _arm(home)
-    if filename != "limits.json":
+    if filename != "limits.mainnet.json":
         _limits(home)
     target = _write(home / f"real-{filename}", {})
     path = pay_network.network_path(home).with_name(filename)
+    path.unlink(missing_ok=True)
     path.symlink_to(target)
     with pytest.raises(pay_network.NetworkConfigError, match="regular file, not a symlink"):
         pay_network.active_network(home=home, environ={})

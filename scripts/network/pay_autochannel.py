@@ -9,6 +9,7 @@ import sqlite3
 import stat
 import sys
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Callable, Mapping
 
@@ -37,39 +38,140 @@ def _positive_u64(value: object, name: str) -> int:
     return value
 
 
-def load_limits(path: str | Path | None = None) -> dict[str, int]:
-    """Read only the operator-managed mode-0600 limits file."""
-    limits_path = Path(path or Path.home() / ".nakshatra" / "pay" / "limits.json")
-    if not limits_path.exists():
-        return dict(DEFAULT_LIMITS)
+def load_limits(path: str | Path | None = None, *, _already_locked: bool = False) -> dict[str, int]:
+    """Read the active operator-managed limits file under the host pay lock."""
+    from network import pay_network
+
     try:
-        info = limits_path.lstat()
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        limits_path = Path(path) if path is not None else pay_network.active_limits_path()
+    except pay_network.NetworkConfigError as exc:
+        raise pay_voucher.VoucherError(str(exc)) from exc
+    with (nullcontext() if _already_locked else pay_lock()):
+        return _load_limits_locked(limits_path, required=limits_path.name == "limits.mainnet.json")
+
+
+def _load_limits_locked(limits_path: Path, *, required: bool) -> dict[str, int]:
+    from network import pay_network
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(limits_path, flags)
+    except FileNotFoundError:
+        if required:
+            raise pay_voucher.VoucherError("mainnet limits.mainnet.json is required")
+        return dict(DEFAULT_LIMITS)
+    except OSError as exc:
+        raise pay_voucher.VoucherError(f"cannot open pay limits: {exc}") from exc
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
             raise pay_voucher.VoucherError("pay limits must be a regular file")
         if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600:
             raise pay_voucher.VoucherError("pay limits must be uid-owned mode 0600")
-        values = json.loads(limits_path.read_text(encoding="utf-8"))
+        chunks = []
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        values = json.loads(b"".join(chunks).decode("utf-8"))
     except pay_voucher.VoucherError:
         raise
     except (OSError, UnicodeError, ValueError) as exc:
         raise pay_voucher.VoucherError(f"cannot read pay limits: {exc}") from exc
-    if not isinstance(values, dict) or set(values) != set(DEFAULT_LIMITS):
-        raise pay_voucher.VoucherError(
-            "pay limits must contain cap_total, days, per_tx, and per_day")
-    parsed = {
-        name: _positive_u64(values[name], f"pay limit {name}")
-        for name in ("cap_total", "per_tx", "per_day")
-    }
-    days = values["days"]
-    if isinstance(days, bool) or not isinstance(days, int) or not 1 <= days <= 3650:
-        raise pay_voucher.VoucherError("pay limit days must be between 1 and 3650")
-    parsed["days"] = days
-    if parsed["per_tx"] > parsed["per_day"]:
-        raise pay_voucher.VoucherError("pay limit per-tx cannot exceed per-day")
-    if parsed["per_day"] > parsed["cap_total"]:
-        raise pay_voucher.VoucherError(
-            "pay limit per-day cannot exceed the on-chain cap")
+    finally:
+        os.close(fd)
+    try:
+        parsed = pay_network.validate_limits(values)
+    except pay_network.NetworkConfigError as exc:
+        raise pay_voucher.VoucherError(str(exc)) from exc
+    directory_fd = os.open(
+        limits_path.parent,
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
     return parsed
+
+
+def save_limits(values: dict, path: str | Path | None = None, *,
+                _already_locked: bool = False) -> Path:
+    """Atomically save active-network limits under the host pay lock."""
+    from network import pay_network
+
+    try:
+        parsed = pay_network.validate_limits(values)
+        limits_path = Path(path) if path is not None else pay_network.active_limits_path()
+    except pay_network.NetworkConfigError as exc:
+        raise pay_voucher.VoucherError(str(exc)) from exc
+    body = (json.dumps(parsed, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    with (nullcontext() if _already_locked else pay_lock()):
+        limits_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        existing_fd = None
+        try:
+            existing_fd = os.open(
+                limits_path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0))
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise pay_voucher.VoucherError(
+                f"cannot securely inspect existing pay limits: {exc}") from exc
+        if existing_fd is not None:
+            try:
+                existing = os.fstat(existing_fd)
+                if not stat.S_ISREG(existing.st_mode):
+                    raise pay_voucher.VoucherError("pay limits must be a regular file")
+                if (existing.st_uid != os.geteuid()
+                        or stat.S_IMODE(existing.st_mode) != 0o600):
+                    raise pay_voucher.VoucherError(
+                        "pay limits must be uid-owned mode 0600")
+            finally:
+                os.close(existing_fd)
+        temp = limits_path.with_name(
+            f".{limits_path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+        flags = (os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_CLOEXEC", 0)
+                 | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            fd = os.open(temp, flags, 0o600)
+            try:
+                info = os.fstat(fd)
+                if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+                    raise pay_voucher.VoucherError(
+                        "pay limits temporary file must be an owner-owned regular file")
+                os.fchmod(fd, 0o600)
+                view = memoryview(body)
+                while view:
+                    view = view[os.write(fd, view):]
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.replace(temp, limits_path)
+            installed = os.open(
+                limits_path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0))
+            try:
+                info = os.fstat(installed)
+                if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+                    raise pay_voucher.VoucherError(
+                        "installed pay limits must be an owner-owned regular file")
+            finally:
+                os.close(installed)
+            directory_fd = os.open(
+                limits_path.parent,
+                os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            try:
+                temp.unlink()
+            except FileNotFoundError:
+                pass
+    return limits_path
 
 
 class OpenLedger:
@@ -241,6 +343,14 @@ def ensure_channel(worker_key: str, required_micro_usdc: int, *,
         pass
 
     pay_dir = Path.home() / ".nakshatra" / "pay"
+    if limits_path is None:
+        from network import pay_network
+        try:
+            resolved_limits_path = pay_network.active_limits_path()
+        except pay_network.NetworkConfigError as exc:
+            raise pay_voucher.VoucherError(str(exc)) from exc
+    else:
+        resolved_limits_path = Path(limits_path)
     with pay_lock(lock_path):
         # A different gateway process may have completed an open while this
         # process waited for the host-wide lock.
@@ -266,7 +376,9 @@ def ensure_channel(worker_key: str, required_micro_usdc: int, *,
 
         # This check precedes every signing path and keeps mainnet refused.
         tx_rpc.ensure_cluster()
-        limits = load_limits(limits_path)
+        limits = _load_limits_locked(
+            resolved_limits_path,
+            required=resolved_limits_path.name == "limits.mainnet.json")
         ledger_file = Path(ledger_path or pay_dir / "opens.sqlite")
         with OpenLedger(ledger_file) as ledger:
             for attempt in range(2):

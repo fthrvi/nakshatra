@@ -822,7 +822,7 @@ def _pay_amount(value: int) -> str:
 
 
 def _pay_limits_path() -> Path:
-    return Path.home() / ".nakshatra" / "pay" / "limits.json"
+    return _pay_network_config.active_limits_path()
 
 
 def _pay_backup_ack_path() -> Path:
@@ -883,64 +883,28 @@ def _warn_unbacked_pay_balance(balance: int) -> None:
 
 
 def _validate_pay_limits(values: dict) -> dict:
-    required = {"cap_total", "days", "per_tx", "per_day"}
-    if set(values) != required:
-        raise SystemExit("pay limits must contain cap_total, days, per_tx, and per_day")
-    for key in ("cap_total", "per_tx", "per_day"):
-        if isinstance(values[key], bool) or not isinstance(values[key], int) or not 0 < values[key] < 2**64:
-            raise SystemExit(f"pay limit {key} must be a positive USDC amount")
-    if isinstance(values["days"], bool) or not isinstance(values["days"], int) or not 1 <= values["days"] <= 3650:
-        raise SystemExit("pay limit days must be between 1 and 3650")
-    if values["per_tx"] > values["per_day"]:
-        raise SystemExit("pay limit per-tx cannot exceed per-day")
-    if values["per_day"] > values["cap_total"]:
-        raise SystemExit("pay limit per-day cannot exceed the on-chain cap")
-    return dict(values)
-
-
-def _load_pay_limits() -> dict:
-    path = _pay_limits_path()
-    if not path.exists():
-        return dict(_PAY_DEFAULTS)
     try:
-        info = path.lstat()
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-            raise SystemExit(f"refusing {path}: pay limits must be a regular file")
-        if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600:
-            raise SystemExit(f"refusing {path}: pay limits must be uid-owned mode 0600")
-        values = json.loads(path.read_text(encoding="utf-8"))
-    except SystemExit:
-        raise
-    except (OSError, UnicodeError, ValueError) as exc:
-        raise SystemExit(f"cannot read pay limits at {path}: {exc}") from exc
-    if not isinstance(values, dict):
-        raise SystemExit("pay limits must be a JSON object")
-    return _validate_pay_limits(values)
+        return _pay_network_config.validate_limits(values)
+    except _pay_network_config.NetworkConfigError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
-def _save_pay_limits(values: dict) -> None:
-    values = _validate_pay_limits(values)
-    path = _pay_limits_path()
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(path.parent, 0o700)
-    if os.path.lexists(path) and path.is_symlink():
-        raise SystemExit(f"refusing {path}: pay limits must not be a symlink")
-    temp = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp")
-    body = (json.dumps(values, sort_keys=True, separators=(",", ":")) + "\n").encode()
+def _load_pay_limits(*, _already_locked: bool = False) -> dict:
+    from network import pay_autochannel, pay_voucher
+
     try:
-        fd = os.open(temp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        try:
-            os.fchmod(fd, 0o600)
-            view = memoryview(body)
-            while view:
-                view = view[os.write(fd, view):]
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        os.replace(temp, path)
-        os.chmod(path, 0o600)
-    finally:
-        temp.unlink(missing_ok=True)
+        return pay_autochannel.load_limits(_already_locked=_already_locked)
+    except (pay_voucher.VoucherError, _pay_network_config.NetworkConfigError) as exc:
+        raise SystemExit(str(exc)) from exc
+
+
+def _save_pay_limits(values: dict, *, _already_locked: bool = False) -> None:
+    from network import pay_autochannel, pay_voucher
+
+    try:
+        pay_autochannel.save_limits(values, _already_locked=_already_locked)
+    except (pay_voucher.VoucherError, _pay_network_config.NetworkConfigError) as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 def _pay_chain_settings(*, require_rpc: bool = True):
@@ -1015,9 +979,21 @@ def _pay_network_command(args) -> None:
         if args.network_cmd == "arm":
             if args.name != "mainnet":
                 raise SystemExit("only mainnet can be armed")
-            path = pay_network.arm_mainnet(
-                input_stream=sys.stdin, output_stream=sys.stdout)
-            print(f"mainnet armed for the exact configured program and mint: {path}")
+            path = pay_network.arm_mainnet(args.file)
+            print(f"mainnet armed by the pinned release key: {path}")
+            return
+        if args.network_cmd == "arm-request-info":
+            info = pay_network.arm_request_info()
+            print(f"node public key: {info['node_pubkey']}")
+            print(f"mainnet rpc: {info['rpc']}")
+            print(f"mainnet program: {info['program']}")
+            print(f"limits file: {info['limits']}")
+            print(f"limits sha256: {info['limits_sha256']}")
+            print("release requester arguments:")
+            print(f"  --node-pubkey {info['node_pubkey']}")
+            print(f"  --rpc {info['rpc']}")
+            print(f"  --program {info['program']}")
+            print(f"  --limits {info['limits']}")
             return
         if args.network_cmd == "disarm":
             removed = pay_network.disarm_mainnet()
@@ -1293,10 +1269,10 @@ def _pay_ensure(*, allow_broker_signing: bool = True, pre_sign_guard=None) -> No
 def _pay_ensure_locked(*, allow_broker_signing: bool = True, pre_sign_guard=None) -> None:
     wallet, _node_seed, node_public = _pay_wallet_and_node()
     chain, rpc, program, mint = _pay_chain_settings()
-    limits = _load_pay_limits()
+    limits = _load_pay_limits(_already_locked=True)
     path = _pay_limits_path()
     if not path.exists():
-        _save_pay_limits(limits)
+        _save_pay_limits(limits, _already_locked=True)
     d = chain._derived(wallet["address"], program)
     node_address = chain.b58encode(node_public)
     delegate_address = chain.delegate_pda(d["escrow"], node_public, program)[0]
@@ -4098,8 +4074,10 @@ def main(argv=None, *, http_post=None, http_get=None) -> int:
     nsub.add_parser("status", help="show the active public network configuration and gates")
     r = nsub.add_parser("use", help="atomically select a configured payment network")
     r.add_argument("name")
-    r = nsub.add_parser("arm", help="interactively arm an exact real-money configuration")
+    r = nsub.add_parser("arm", help="install a release-key-signed mainnet arm statement")
     r.add_argument("name", choices=["mainnet"])
+    r.add_argument("--file", required=True, type=Path, help="signed arm file from the release hub")
+    nsub.add_parser("arm-request-info", help="print the values needed for a signed arm request")
     nsub.add_parser("disarm", help="remove the mainnet arm file")
     paysub.add_parser("address", help="print the Solana pay address")
     paysub.add_parser("status", help="show the address, custody mode, and optional devnet SOL balance")
