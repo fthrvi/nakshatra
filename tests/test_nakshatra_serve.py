@@ -906,6 +906,9 @@ def test_parse_client_generated_count_takes_last_line_and_defaults_to_zero():
     assert ns._parse_client_generated_count(
         "[chain] generated 2 tokens in 1.00s  (2.00 tok/s)\n"
         "[chain] generated 5 tokens in 2.00s  (2.50 tok/s)\n") == 5
+    # A malformed huge count must not raise (that would 503 a paid answer).
+    assert ns._parse_client_generated_count(
+        "[chain] generated " + "9" * 5000 + " tokens in 1.00s\n") == 0
 
 
 def test_enforce_mode_receipt_counts_reach_openai_and_ollama_responses(

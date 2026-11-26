@@ -693,7 +693,8 @@ def _parse_client_output(stdout: str) -> str:
     return text
 
 
-_GENERATED_COUNT_RE = re.compile(r"^\[chain\] generated (\d+) tokens\b")
+# At most 9 digits, so int() can never raise on a malformed line.
+_GENERATED_COUNT_RE = re.compile(r"^\[chain\] generated (\d{1,9}) tokens\b")
 
 
 def _parse_client_generated_count(stdout: str) -> int:
