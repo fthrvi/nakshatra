@@ -2030,6 +2030,7 @@ def main():
             }
             chain_vouchers = pay_voucher.ConsumerVoucherManager(
                 book=book, state=state, program=program, private_key=private_key,
+                payees_by_worker=payees_by_worker,
                 chain_time=chain_clock,
                 plan=paid["plan"], max_cost_by_worker=max_costs,
                 channels_by_worker=chosen_channels,

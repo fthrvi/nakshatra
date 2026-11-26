@@ -385,6 +385,7 @@ def test_payer_crash_ceiling_is_not_reused_as_the_next_session_base(
         plan=[{"worker_keyid": WORKER_HEX, "layer_start": 0,
                "layer_end": 100}],
         max_cost_by_worker={WORKER_HEX: 200},
+        payees_by_worker={WORKER_HEX: PAY_WALLET_B58},
         session_id="crash-restart", hold_id="hold", model_id="model",
         max_prompt_tokens=1, max_output_tokens=1)
     claim = manager.claim(
@@ -432,7 +433,8 @@ def test_payer_adopts_worker_stored_voucher_before_signing_new_work(
         book=book, state=state, program=PROGRAM, private_key=PAYER_SEED,
         plan=[{"worker_keyid": WORKER_HEX, "layer_start": 0,
                "layer_end": 100}],
-        max_cost_by_worker={WORKER_HEX: 200}, session_id="adopt",
+        max_cost_by_worker={WORKER_HEX: 200},
+        payees_by_worker={WORKER_HEX: PAY_WALLET_B58}, session_id="adopt",
         hold_id="hold", model_id="model", max_prompt_tokens=1,
         max_output_tokens=1)
     claim = manager.claim(
@@ -448,6 +450,35 @@ def test_payer_adopts_worker_stored_voucher_before_signing_new_work(
     consumer.book.close()
     manager.store.close()
     vouchers.close()
+
+
+@pytest.mark.parametrize("chosen", [False, True], ids=["book-selects", "client-selected"])
+def test_consumer_manager_refuses_channel_not_bound_to_payee(tmp_path, chosen):
+    # A legacy channel whose on-chain worker is the node key must never get a
+    # voucher once the worker has bound a different pay wallet.
+    plan = [{"worker_keyid": WORKER_HEX, "layer_start": 0, "layer_end": 4}]
+    legacy = pay.FakeChannelState(
+        {CHANNEL: dataclasses.replace(_channel(), worker=WORKER_B58)},
+        {ESCROW: OWNER_B58}, program_id=PROGRAM)
+    book = pay.PayerChannelBook(tmp_path / "legacy.sqlite")
+    book.put(program=PROGRAM, channel=CHANNEL, worker_key=WORKER_HEX, cap=10_000)
+    selected = ({WORKER_HEX: pay.PayerChannel(
+        program=PROGRAM, channel=CHANNEL, worker_key=WORKER_HEX, cap=10_000,
+        channel_base=0, max_signed_total=0)} if chosen else None)
+    try:
+        with pytest.raises(pay.NoUsableChannel):
+            pay.ConsumerVoucherManager(
+                book=book, state=legacy, program=PROGRAM, private_key=PAYER_SEED,
+                plan=plan, max_cost_by_worker={WORKER_HEX: 100},
+                payees_by_worker={WORKER_HEX: PAY_WALLET_B58},
+                channels_by_worker=selected)
+        with pytest.raises(pay.VoucherError, match="bound payee wallet is missing"):
+            pay.ConsumerVoucherManager(
+                book=book, state=_state(), program=PROGRAM, private_key=PAYER_SEED,
+                plan=plan, max_cost_by_worker={WORKER_HEX: 100},
+                payees_by_worker={}, channels_by_worker=selected)
+    finally:
+        book.close()
 
 
 def test_payer_refuses_worker_base_above_ever_signed_ceiling(tmp_path):
@@ -467,14 +498,16 @@ def test_consumer_preflight_requires_chain_authority_and_capacity(tmp_path):
         pay.ConsumerVoucherManager(
             book=book, state=_state(cap=10), program=PROGRAM,
             private_key=WRONG_SEED, plan=plan,
-            max_cost_by_worker={WORKER_HEX: 100})
+            max_cost_by_worker={WORKER_HEX: 100},
+            payees_by_worker={WORKER_HEX: PAY_WALLET_B58})
     book.put(program=PROGRAM, channel=CHANNEL, worker_key=WORKER_HEX,
              cap=10, channel_base=10, max_signed_total=10)
     with pytest.raises(pay.VoucherError, match="insufficient"):
         pay.ConsumerVoucherManager(
             book=book, state=_state(cap=10, redeemed=10), program=PROGRAM,
             private_key=PAYER_SEED, plan=plan,
-            max_cost_by_worker={WORKER_HEX: 100})
+            max_cost_by_worker={WORKER_HEX: 100},
+            payees_by_worker={WORKER_HEX: PAY_WALLET_B58})
     book.close()
 
 
@@ -599,6 +632,7 @@ def _chain_admission(tmp_path, monkeypatch, *, session="session", cap=1000,
         plan=[{"worker_keyid": WORKER_HEX, "layer_start": 0,
                "layer_end": layers}],
         max_cost_by_worker={WORKER_HEX: 41 * layers},
+        payees_by_worker={WORKER_HEX: channel_worker},
         session_id=session, hold_id="hold", model_id="model",
         max_prompt_tokens=1, max_output_tokens=40)
     claim = manager.claim(

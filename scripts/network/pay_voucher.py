@@ -1403,6 +1403,7 @@ class ConsumerVoucherManager:
     def __init__(self, *, book: PayerChannelBook, state: ChannelState,
                  program: str, private_key: bytes, plan: list[Mapping[str, object]],
                  max_cost_by_worker: Mapping[str, int],
+                 payees_by_worker: Mapping[str, str],
                  channels_by_worker: Mapping[str, PayerChannel] | None = None,
                  chain_time: Callable[[], int] | None = None,
                  session_id: str | None = None, hold_id: str | None = None,
@@ -1432,12 +1433,22 @@ class ConsumerVoucherManager:
                         else channels_by_worker.get(worker_key))
             if channels_by_worker is not None and selected is None:
                 raise VoucherError("chosen payer channel is missing for worker")
+            bound = payees_by_worker.get(worker_key)
+            if bound is None:
+                raise VoucherError("bound payee wallet is missing for worker")
+            payee = _pubkey_text(bound, "bound payee wallet")
             self.channels[worker_key] = book.begin_session(
                 worker_key, program=self.program, state=state,
                 max_cost_credits=int(max_cost_by_worker[worker_key]),
-                channel=None if selected is None else selected.channel)
+                channel=None if selected is None else selected.channel,
+                payee_wallet=payee)
             account = state.read_channel(
                 self.channels[worker_key].channel, self.program)
+            # Revalidate on the fresh read: vouchers are signed only for a
+            # channel whose on-chain worker is the node-key-bound payee.
+            if account.worker != payee:
+                raise VoucherError(
+                    "payer channel worker does not match the bound payee wallet")
             owner = state.read_escrow_owner(account.escrow, self.program)
             signer = b58encode(public_key_bytes(self.private_key))
             if signer not in {account.voucher_signer, owner}:
