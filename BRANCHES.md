@@ -5,7 +5,7 @@ On create add a row (status=active, owner). On merge flip to `merged→<sha>`.
 
 | branch | sector | description | base | status | owner |
 |---|---|---|---|---|---|
-| pay/chain-payer-pubkey | pay | Chain admission resolves the authenticated payer keyid (a registry name) to its Ed25519 public key before the voucher-signer check, instead of hex-decoding the name. | forgejo/main@5f0fb26 | active | claude/network-lane |
+| pay/chain-payer-pubkey | pay | Chain admission resolves the authenticated payer keyid (a registry name) to its Ed25519 public key before the voucher-signer check, instead of hex-decoding the name. | forgejo/main@5f0fb26 | merged→3d8e5e1 | claude/network-lane |
 | pay/worker-payee-binding | pay | Chain-paid inference: consumer learns the worker's pay-wallet address through a node-key-signed binding and opens the channel to it (today it opens to the node key, which the worker always refuses). | forgejo/main@8f149ee | merged→ce2d1f5 | claude/network-lane |
 | pay/vendor-deposit-policy | pay | Vendor broker pay_wallet_policy.py byte-for-byte from trisul 2a999a7a9 (sha cb79bb2f…, deposit decoder) and cover deposit in the policy tests. | forgejo/main@99180f4 | merged→acabd31 | claude/network-lane |
 | pay/broker-wallet-deposit-client | pay | Allow broker-custody escrow deposits through the pinned two-instruction broker template with client-side amount, escrow, and ATA-balance checks. | forgejo/main@373a17d | merged→bce14db | codex/network-lane |
