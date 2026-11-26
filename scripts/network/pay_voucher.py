@@ -596,6 +596,8 @@ class JsonRpcChannelState:
                 if self.clock() - started + delay > RPC_RETRY_BUDGET_S:
                     raise
                 self.sleep(delay)
+                if self.clock() - started > RPC_RETRY_BUDGET_S:
+                    raise  # the wait overslept: never start a retry past budget
                 wait = min(wait * 2, RPC_RETRY_MAX_WAIT_S)
         raise AssertionError("unreachable")
 

@@ -1987,3 +1987,23 @@ def test_rpc_read_retry_after_is_honoured_within_cap(after, expected):
     with pytest.raises(pay.VoucherError):
         state.read_channel(CHANNEL, PROGRAM)  # port 1 refuses after the retry
     assert sleeps == [expected]
+
+
+def test_rpc_retry_never_starts_after_an_oversleep():
+    now = [0.0]
+    starts = []
+    flaky = _flaky_opener(10**6)[0]
+
+    def opener(request, timeout):
+        starts.append(now[0])
+        return flaky(request, timeout)
+
+    def late_sleep(delay):
+        now[0] += delay + 3.0  # the scheduler returns 3 s late
+    state = pay.JsonRpcChannelState(
+        "http://127.0.0.1:1", opener=opener, sleep=late_sleep,
+        clock=lambda: now[0])
+    with pytest.raises(pay.VoucherError):
+        state.read_channel(CHANNEL, PROGRAM)
+    assert starts == [0.0]
+    assert all(start <= pay.RPC_RETRY_BUDGET_S for start in starts)
