@@ -1136,7 +1136,10 @@ def test_worker_service_is_hardened_profiled_and_release_owned(tmp_path):
     ]
     assert "llama_cpp_python==0.3.28" not in worker_profile["requirements"]
     assert svc["hardening"] is True
-    assert svc["read_write_paths"] == ["{home}/.nakshatra/worker", "{home}/.nakshatra/tls"]
+    # Chain-paid workers keep their voucher store at ~/.nakshatra/pay/vouchers.sqlite
+    # (pay_voucher.WorkerVoucherStore); "-" lets non-chain workers without a pay dir start.
+    assert svc["read_write_paths"] == [
+        "{home}/.nakshatra/worker", "{home}/.nakshatra/tls", "-{home}/.nakshatra/pay"]
     assert svc["environment"]["NAKSHATRA_AUDIT_PATH"] == \
         "{home}/.nakshatra/worker/audit.jsonl"
     command = " ".join(svc["exec"])
@@ -1156,6 +1159,7 @@ def test_worker_service_is_hardened_profiled_and_release_owned(tmp_path):
     assert "ProtectSystem=strict" in text
     assert f"ReadWritePaths={Path.home()}/.nakshatra/worker" in text
     assert f"ReadWritePaths={Path.home()}/.nakshatra/tls" in text
+    assert f"ReadWritePaths=-{Path.home()}/.nakshatra/pay" in text
     assert f"EnvironmentFile=-{Path.home()}/.nakshatra/owner-lease.env" in text
     assert f"Environment=NAKSHATRA_AUDIT_PATH={Path.home()}/.nakshatra/worker/audit.jsonl" in text
 

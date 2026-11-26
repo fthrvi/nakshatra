@@ -290,7 +290,8 @@
    "hardening": true,
    "read_write_paths": [
     "{home}/.nakshatra/worker",
-    "{home}/.nakshatra/tls"
+    "{home}/.nakshatra/tls",
+    "-{home}/.nakshatra/pay"
    ],
    "components": [
     "nakshatra"
