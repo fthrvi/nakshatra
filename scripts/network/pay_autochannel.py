@@ -74,7 +74,14 @@ def _load_limits_locked(limits_path: Path, *, required: bool) -> dict[str, int]:
             if not chunk:
                 break
             chunks.append(chunk)
-        values = json.loads(b"".join(chunks).decode("utf-8"))
+        raw = b"".join(chunks)
+        if required:
+            # Mainnet: parse only bytes the Face-ID-signed arm statement names.
+            try:
+                pay_network.verify_mainnet_limits_bytes(raw)
+            except pay_network.NetworkConfigError as exc:
+                raise pay_voucher.VoucherError(str(exc)) from exc
+        values = json.loads(raw.decode("utf-8"))
     except pay_voucher.VoucherError:
         raise
     except (OSError, UnicodeError, ValueError) as exc:

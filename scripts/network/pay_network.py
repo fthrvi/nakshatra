@@ -513,7 +513,7 @@ def _verify_release_signature(signature: dict, public_hex: str, raw: bytes) -> N
 
 
 def _verify_arm_document(value: object, *, network: PayNetwork, home: Path | None,
-                         pay_fd: int) -> dict:
+                         pay_fd: int, limits_raw: bytes | None = None) -> dict:
     statement, raw, signature = _decode_signed_arm(value)
     public_hex = _installed_release_public(home)
     _verify_release_signature(signature, public_hex, raw)
@@ -538,8 +538,9 @@ def _verify_arm_document(value: object, *, network: PayNetwork, home: Path | Non
     if isinstance(issued_at, bool) or not isinstance(issued_at, int) or issued_at <= 0:
         raise NetworkConfigError("mainnet arm statement issued_at must be a positive integer")
     limits = mainnet_limits_path(home)
-    limits_raw = _read_private_at(
-        pay_fd, limits.name, limits, "mainnet limits.mainnet.json", missing_ok=True)
+    if limits_raw is None:
+        limits_raw = _read_private_at(
+            pay_fd, limits.name, limits, "mainnet limits.mainnet.json", missing_ok=True)
     if limits_raw is None:
         raise NetworkConfigError(
             "mainnet limits.mainnet.json is required (no default spend limits on real money)")
@@ -548,6 +549,27 @@ def _verify_arm_document(value: object, *, network: PayNetwork, home: Path | Non
     if statement.get("limits_sha256") != expected_hash:
         raise NetworkConfigError("mainnet arm statement does not match limits.mainnet.json")
     return statement
+
+
+def verify_mainnet_limits_bytes(limits_raw: bytes, *, home: Path | None = None) -> None:
+    """Refuse unless these exact limits bytes are the ones the signed arm names.
+
+    The spend path calls this with the bytes it is about to parse, so swapping
+    limits.mainnet.json after the gate check can never take effect.
+    """
+    document = load_document(home=home)
+    if document is None or document.active != "mainnet":
+        raise NetworkConfigError("mainnet limits are only valid while mainnet is active")
+    network = document.networks["mainnet"]
+    path = arm_path(home)
+    with _pay_directory(home, create=False) as pay_fd:
+        if pay_fd is None:
+            raise NetworkConfigError("mainnet arm file is missing; run `nak pay network arm mainnet`")
+        raw = _read_private_at(pay_fd, path.name, path, "mainnet arm file", missing_ok=True)
+        if raw is None:
+            raise NetworkConfigError("mainnet arm file is missing; run `nak pay network arm mainnet`")
+        _verify_arm_document(_load_json(raw, "mainnet arm file"), network=network,
+                             home=home, pay_fd=pay_fd, limits_raw=limits_raw)
 
 
 def _read_source_file(path: Path) -> bytes:

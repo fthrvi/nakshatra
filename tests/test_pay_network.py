@@ -707,3 +707,19 @@ def test_invalid_join_code_keeps_forgejo_main_setup_order(
     with pytest.raises(SystemExit, match="join code became invalid.*expired"):
         join_setup.main(["--invite", "invalid", "--home", str(home)])
     assert events == ["decode", "identity", "redeem", "decode"]
+
+
+def test_spend_path_refuses_limits_swapped_after_the_gate_check(_clean_environment):
+    # The gate verifies limits.mainnet.json against the signed arm; the spend
+    # path must parse only those exact bytes, never a file swapped in later.
+    home = _clean_environment
+    _config(home, active="mainnet")
+    limits = _limits(home)
+    _arm(home)
+    assert pay_autochannel.load_limits()["per_tx"] == json.loads(limits.read_text())["per_tx"]
+    raised = json.loads(limits.read_text())
+    raised["per_tx"] = raised["per_day"]
+    limits.write_text(json.dumps(raised) + "\n")
+    limits.chmod(0o600)
+    with pytest.raises(pay_voucher.VoucherError, match="does not match limits"):
+        pay_autochannel.load_limits()
