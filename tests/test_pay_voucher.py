@@ -64,6 +64,7 @@ def _key(seed_byte: int) -> tuple[bytes, bytes, str, str]:
 
 
 PAYER_SEED, PAYER_PUBLIC, PAYER_HEX, PAYER_B58 = _key(7)
+PAYER_NAME = "op-3ac68dc17064d7ab"
 OWNER_SEED, OWNER_PUBLIC, OWNER_HEX, OWNER_B58 = _key(8)
 WRONG_SEED, WRONG_PUBLIC, WRONG_HEX, WRONG_B58 = _key(9)
 WORKER_SEED, WORKER_PUBLIC, WORKER_HEX, WORKER_B58 = _key(10)
@@ -389,7 +390,8 @@ def test_payer_crash_ceiling_is_not_reused_as_the_next_session_base(
         session_id="crash-restart", hold_id="hold", model_id="model",
         max_prompt_tokens=1, max_output_tokens=1)
     claim = manager.claim(
-        PAYER_HEX, "crash-restart", consumer.first_wire(WORKER_HEX, TOKEN))
+        PAYER_HEX, "crash-restart", consumer.first_wire(WORKER_HEX, TOKEN),
+        payer_public_key_hex=PAYER_HEX)
     assert manager._chain_session(claim)["channel_base"] == 0
 
     receipt = _run_step(manager, claim, 1, 1)
@@ -438,7 +440,8 @@ def test_payer_adopts_worker_stored_voucher_before_signing_new_work(
         hold_id="hold", model_id="model", max_prompt_tokens=1,
         max_output_tokens=1)
     claim = manager.claim(
-        PAYER_HEX, "adopt", consumer.first_wire(WORKER_HEX, TOKEN))
+        PAYER_HEX, "adopt", consumer.first_wire(WORKER_HEX, TOKEN),
+        payer_public_key_hex=PAYER_HEX)
     assert manager._chain_session(claim)["channel_base"] == 2
 
     receipt = _run_step(manager, claim, 1, 1)
@@ -637,7 +640,8 @@ def _chain_admission(tmp_path, monkeypatch, *, session="session", cap=1000,
         max_prompt_tokens=1, max_output_tokens=40)
     claim = manager.claim(
         PAYER_HEX, session,
-        consumer.first_wire(WORKER_HEX, TOKEN))
+        consumer.first_wire(WORKER_HEX, TOKEN),
+        payer_public_key_hex=PAYER_HEX)
     return manager, consumer, claim, vouchers, ledger
 
 
@@ -727,10 +731,14 @@ def test_worker_reserves_one_session_per_channel_and_advances_base(
             max_signed_total=base if ceiling is None else ceiling)
 
     first = manager_for("reservation-a")
-    claim_a = first.claim(PAYER_HEX, "reservation-a", init_for("reservation-a", 10))
+    claim_a = first.claim(
+        PAYER_HEX, "reservation-a", init_for("reservation-a", 10),
+        payer_public_key_hex=PAYER_HEX)
     second = manager_for("reservation-b")
     with pytest.raises(admission.PaidAdmissionError, match="channel busy"):
-        second.claim(PAYER_HEX, "reservation-b", init_for("reservation-b", 10))
+        second.claim(
+            PAYER_HEX, "reservation-b", init_for("reservation-b", 10),
+            payer_public_key_hex=PAYER_HEX)
     with pytest.raises(pay.VoucherError, match="not held by this session"):
         vouchers.accept(
             _voucher(total=11), configured_program=PROGRAM, state=state,
@@ -751,9 +759,12 @@ def test_worker_reserves_one_session_per_channel_and_advances_base(
 
     with pytest.raises(admission.PaidAdmissionError,
                        match="exceeds the payer signing ceiling"):
-        second.claim(PAYER_HEX, "reservation-b", init_for("reservation-b", 10))
+        second.claim(
+            PAYER_HEX, "reservation-b", init_for("reservation-b", 10),
+            payer_public_key_hex=PAYER_HEX)
     claim_b = second.claim(
-        PAYER_HEX, "reservation-b", init_for("reservation-b", 10, 12))
+        PAYER_HEX, "reservation-b", init_for("reservation-b", 10, 12),
+        payer_public_key_hex=PAYER_HEX)
     assert second._chain_session(claim_b)["channel_base"] == 12
 
     second.release_chain_session(claim_b)
@@ -814,7 +825,8 @@ def test_voucher_silence_bound_counts_credits_before_rounding(
         PAYER_HEX, "rounding", pay.init_wire(
             TOKEN, program=PROGRAM, channel=CHANNEL, channel_base=10,
             hold_id="hold", session_id="rounding", model_id="model",
-            max_prompt_tokens=1, max_output_tokens=200))
+            max_prompt_tokens=1, max_output_tokens=200),
+        payer_public_key_hex=PAYER_HEX)
 
     stopped = False
     first_receipt_tokens = None
@@ -885,7 +897,8 @@ def test_worker_derives_channel_base_and_refuses_sender_value(tmp_path, monkeypa
         max_prompt_tokens=1, max_output_tokens=40)
     with pytest.raises(admission.PaidAdmissionError,
                        match="exceeds the worker-derived base"):
-        manager.claim(PAYER_HEX, "base", forged)
+        manager.claim(
+            PAYER_HEX, "base", forged, payer_public_key_hex=PAYER_HEX)
     store.close()
     vouchers.close()
 
@@ -906,7 +919,8 @@ def test_channel_base_at_cap_cannot_admit_ceil_max_cost(tmp_path, monkeypatch):
         hold_id="hold", session_id="full", model_id="model",
         max_prompt_tokens=1, max_output_tokens=40)
     with pytest.raises(admission.PaidAdmissionError, match="insufficient"):
-        manager.claim(PAYER_HEX, "full", init)
+        manager.claim(
+            PAYER_HEX, "full", init, payer_public_key_hex=PAYER_HEX)
     store.close()
     vouchers.close()
 
@@ -930,7 +944,8 @@ def test_closing_channel_refused_at_admission_and_voucher_accept(
         hold_id="hold", session_id="closing", model_id="model",
         max_prompt_tokens=1, max_output_tokens=40)
     with pytest.raises(admission.PaidAdmissionError, match="not open"):
-        manager.claim(PAYER_HEX, "closing", init)
+        manager.claim(
+            PAYER_HEX, "closing", init, payer_public_key_hex=PAYER_HEX)
     with pytest.raises(pay.VoucherError, match="close deadline"):
         vouchers.accept(
             _voucher(total=1), configured_program=PROGRAM, state=state,
@@ -961,25 +976,24 @@ def test_closing_channel_still_accepts_vouchers_before_close_at(tmp_path, monkey
         hold_id="hold", session_id="grace", model_id="model",
         max_prompt_tokens=1, max_output_tokens=40)
     with pytest.raises(admission.PaidAdmissionError, match="not open"):
-        manager.claim(PAYER_HEX, "grace", init)
+        manager.claim(
+            PAYER_HEX, "grace", init, payer_public_key_hex=PAYER_HEX)
     store.close()
     vouchers.close()
 
 
-@pytest.mark.parametrize(("payer", "admitted"), [
+@pytest.mark.parametrize(("payer_public_key_hex", "admitted"), [
     (PAYER_HEX, True), (OWNER_HEX, True), (WRONG_HEX, False)])
 def test_admission_binds_authenticated_payer_to_channel_signer(
-        tmp_path, monkeypatch, payer, admitted):
+        tmp_path, monkeypatch, payer_public_key_hex, admitted):
     monkeypatch.setenv("NAK_PAY_MODE", "chain")
     _install_pay_wallet(Path(os.environ["HOME"]))
     state = pay.FakeChannelState(
         {CHANNEL: _channel()}, {ESCROW: OWNER_B58}, program_id=PROGRAM)
     vouchers = pay.WorkerVoucherStore(tmp_path / "bind" / "vouchers.sqlite")
     store = admission.PaidAdmissionStore(tmp_path / "bind" / "paid.sqlite")
-    claim = _claim("bind")
-    claim["payer_keyid"] = payer
     manager = admission.PaidAdmission(
-        _Ledger(claim), store, WORKER_SEED, model_id="model",
+        _Ledger(_claim("bind")), store, WORKER_SEED, model_id="model",
         layer_start=0, layer_end=4, clock=lambda: 100,
         voucher_store=vouchers, channel_state=state, pay_program=PROGRAM)
     assert manager.check_ready()
@@ -988,11 +1002,102 @@ def test_admission_binds_authenticated_payer_to_channel_signer(
         hold_id="hold", session_id="bind", model_id="model",
         max_prompt_tokens=1, max_output_tokens=40)
     if admitted:
-        assert manager.claim(payer, "bind", init)
+        claim = manager.claim(
+            PAYER_NAME, "bind", init,
+            payer_public_key_hex=payer_public_key_hex)
+        assert claim["payer_keyid"] == PAYER_NAME
     else:
         with pytest.raises(admission.PaidAdmissionError, match="voucher signer or escrow owner"):
-            manager.claim(payer, "bind", init)
+            manager.claim(
+                PAYER_NAME, "bind", init,
+                payer_public_key_hex=payer_public_key_hex)
     store.close()
+    vouchers.close()
+
+
+@pytest.mark.parametrize("payer_public_key_hex", [
+    None, PAYER_HEX.upper(), PAYER_HEX[:-1],
+])
+def test_chain_admission_requires_canonical_resolved_payer_key(
+        tmp_path, monkeypatch, payer_public_key_hex):
+    monkeypatch.setenv("NAK_PAY_MODE", "chain")
+    _install_pay_wallet(Path(os.environ["HOME"]))
+    state = _state()
+    vouchers = pay.WorkerVoucherStore(
+        tmp_path / "missing-payer-key" / "vouchers.sqlite")
+    store = admission.PaidAdmissionStore(
+        tmp_path / "missing-payer-key" / "paid.sqlite")
+    manager = admission.PaidAdmission(
+        _Ledger(_claim("missing-payer-key")), store, WORKER_SEED,
+        model_id="model", layer_start=0, layer_end=4, clock=lambda: 100,
+        voucher_store=vouchers, channel_state=state, pay_program=PROGRAM)
+    assert manager.check_ready()
+    init = pay.init_wire(
+        TOKEN, program=PROGRAM, channel=CHANNEL, channel_base=0,
+        hold_id="hold", session_id="missing-payer-key", model_id="model",
+        max_prompt_tokens=1, max_output_tokens=40)
+
+    claim_kwargs = (
+        {} if payer_public_key_hex is None
+        else {"payer_public_key_hex": payer_public_key_hex})
+    with pytest.raises(admission.PaidAdmissionError, match="resolved.*public key"):
+        manager.claim(
+            PAYER_NAME, "missing-payer-key", init, **claim_kwargs)
+
+    assert vouchers._db.execute(
+        "SELECT count(*) FROM reservations").fetchone()[0] == 0
+    assert store.get_claim(PAYER_NAME, "missing-payer-key") is None
+    store.close()
+    vouchers.close()
+
+
+def test_named_authenticated_payer_completes_voucher_round_trip(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("NAK_PAY_MODE", "chain")
+    _install_pay_wallet(Path(os.environ["HOME"]))
+    state = _state()
+    vouchers = pay.WorkerVoucherStore(
+        tmp_path / "named-payer" / "worker-vouchers.sqlite")
+    store = admission.PaidAdmissionStore(
+        tmp_path / "named-payer" / "paid.sqlite")
+    manager = admission.PaidAdmission(
+        _Ledger(_claim("named-payer")), store, WORKER_SEED,
+        model_id="model", layer_start=0, layer_end=4, clock=lambda: 100,
+        voucher_store=vouchers, channel_state=state, pay_program=PROGRAM)
+    assert manager.check_ready()
+    book = pay.PayerChannelBook(
+        tmp_path / "named-payer" / "payer-channels.sqlite")
+    book.put(program=PROGRAM, channel=CHANNEL, worker_key=WORKER_HEX,
+             cap=10_000, channel_base=0, max_signed_total=0)
+    consumer = pay.ConsumerVoucherManager(
+        book=book, state=state, program=PROGRAM, private_key=PAYER_SEED,
+        plan=[{"worker_keyid": WORKER_HEX, "layer_start": 0,
+               "layer_end": 4}],
+        max_cost_by_worker={WORKER_HEX: 164},
+        payees_by_worker={WORKER_HEX: PAY_WALLET_B58},
+        session_id="named-payer", hold_id="hold", model_id="model",
+        max_prompt_tokens=1, max_output_tokens=40)
+
+    claim = manager.claim(
+        PAYER_NAME, "named-payer",
+        consumer.first_wire(WORKER_HEX, TOKEN),
+        payer_public_key_hex=PAYER_HEX)
+    assert claim["payer_keyid"] == PAYER_NAME
+    assert (PAYER_NAME, "named-payer") in manager._chain_sessions
+    reservation = vouchers._db.execute(
+        "SELECT reservation_id FROM reservations WHERE channel=?",
+        (CHANNEL,)).fetchone()
+    assert reservation["reservation_id"] == f"{PAYER_NAME}:named-payer"
+    receipt = _run_step(manager, claim, 1, 1)
+    assert receipt["payer_keyid"] == PAYER_NAME
+    consumer.observe(WORKER_HEX, manager.chain_receipt_wire(claim, receipt))
+    consumer.acknowledge_delivery(prompt_tokens=1, generated_tokens=1)
+    manager.accept_chain_control(claim, consumer.outgoing(WORKER_HEX))
+    assert vouchers.latest(CHANNEL) is not None
+
+    manager.release_chain_session(claim)
+    consumer.book.close()
+    manager.store.close()
     vouchers.close()
 
 
@@ -1018,7 +1123,9 @@ def test_starter_channel_binds_newcomer_voucher_signer_not_inviter_owner(
         hold_id="hold", session_id="starter-bind", model_id="model",
         max_prompt_tokens=1, max_output_tokens=40)
 
-    assert manager.claim(PAYER_HEX, "starter-bind", init)
+    assert manager.claim(
+        PAYER_HEX, "starter-bind", init,
+        payer_public_key_hex=PAYER_HEX)
 
     store.close()
     vouchers.close()
@@ -1149,7 +1256,8 @@ def test_final_partial_receipt_is_vouched_before_stream_close(tmp_path, monkeypa
         _Daemon(), "solo", 0, 4, "model", paid_admission=manager,
         refuse_unregistered_peers=False, refuse_unpinned_peers=False)
     servicer._check_grpc_auth = lambda *_args, **_kwargs: (
-        worker.AuthenticatedKeyId(PAYER_HEX, worker._wgrpcauth.ROLE_CONSUMER))
+        worker.AuthenticatedKeyId(
+            PAYER_HEX, worker._wgrpcauth.ROLE_CONSUMER, PAYER_HEX))
     requests = queue.Queue()
     sentinel = object()
 
@@ -1220,7 +1328,8 @@ def test_worker_error_releases_channel_reservation(tmp_path, monkeypatch):
         _Daemon(), "solo", 0, 4, "model", paid_admission=manager,
         refuse_unregistered_peers=False, refuse_unpinned_peers=False)
     servicer._check_grpc_auth = lambda *_args, **_kwargs: (
-        worker.AuthenticatedKeyId(PAYER_HEX, worker._wgrpcauth.ROLE_CONSUMER))
+        worker.AuthenticatedKeyId(
+            PAYER_HEX, worker._wgrpcauth.ROLE_CONSUMER, PAYER_HEX))
     first = pb.InferenceStep(
         session_id="release-error", step_id="step-1", prefix_length=0,
         spend_claim_token=consumer.first_wire(WORKER_HEX, TOKEN))

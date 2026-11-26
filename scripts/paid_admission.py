@@ -705,9 +705,16 @@ class PaidAdmission:
         return self.ready
 
     def claim(self, payer_keyid: str, session_id: str,
-              claim_token: str = "") -> dict:
+              claim_token: str = "", *,
+              payer_public_key_hex: Optional[str] = None) -> dict:
         if not self.ready:
             raise PaidAdmissionUnavailable("paid admission readiness is false")
+        if (self.chain_mode
+                and (not isinstance(payer_public_key_hex, str)
+                     or _HEX64.fullmatch(payer_public_key_hex) is None)):
+            raise PaidAdmissionError(
+                "chain admission requires the authenticated payer's resolved "
+                "64-character lowercase hexadecimal public key")
         chain_init = None
         raw_claim_token = claim_token
         if self.chain_mode and claim_token:
@@ -737,7 +744,9 @@ class PaidAdmission:
             if self.chain_mode and (payer_keyid, session_id) not in self._chain_sessions:
                 if chain_init is None:
                     raise PaidAdmissionError("first chain frame requires channel init")
-                self._admit_chain(existing, chain_init)
+                self._admit_chain(
+                    existing, chain_init,
+                    payer_public_key_hex=payer_public_key_hex)
             return existing
         if not raw_claim_token:
             raise PaidAdmissionError("first paid frame requires spend_claim_token")
@@ -755,7 +764,9 @@ class PaidAdmission:
         self._validate_scope(response, payer_keyid, session_id)
         saved = self.store.save_claim(response)
         if self.chain_mode:
-            self._admit_chain(saved, chain_init)
+            self._admit_chain(
+                saved, chain_init,
+                payer_public_key_hex=payer_public_key_hex)
         return saved
 
     def _chain_claim(self, payer_keyid: str, session_id: str,
@@ -794,7 +805,8 @@ class PaidAdmission:
             b"nakshatra-chain-meter-v1\0" + _canonical(response)).hexdigest()
         return response
 
-    def _admit_chain(self, claim: dict, init: dict) -> None:
+    def _admit_chain(self, claim: dict, init: dict, *,
+                     payer_public_key_hex: str) -> None:
         reservation_id = (
             f"{claim['payer_keyid']}:{claim['session_id']}")
         reserved = False
@@ -817,7 +829,8 @@ class PaidAdmission:
                     "channel worker does not match this worker pay wallet")
             # The authenticated payer must be able to sign this channel's vouchers; otherwise any
             # consumer could name someone else's channel and take the unpaid first step.
-            payer_address = self._pay.b58encode(bytes.fromhex(claim["payer_keyid"]))
+            payer_address = self._pay.b58encode(
+                bytes.fromhex(payer_public_key_hex))
             escrow_owner = self.channel_state.read_escrow_owner(
                 account.escrow, self.pay_program)
             if payer_address not in (account.voucher_signer, escrow_owner):

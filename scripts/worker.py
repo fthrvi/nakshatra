@@ -111,11 +111,13 @@ _PAY_FINAL_VOUCHER_WAIT_S = 15.0
 
 
 class AuthenticatedKeyId(str):
-    """Verified key id retaining the resolver's least-authority role."""
+    """Verified key id retaining its resolved key and least-authority role."""
 
-    def __new__(cls, value: str, role: str):
+    def __new__(cls, value: str, role: str,
+                public_key_hex: Optional[str] = None):
         instance = super().__new__(cls, value)
         instance.role = role
+        instance.public_key_hex = public_key_hex
         return instance
 
 
@@ -2249,9 +2251,16 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
         metadata = dict(context.invocation_metadata() or [])
         auth_header = metadata.get("authorization", "")
         try:
+            resolved_public_keys = {}
+
+            def resolve_for_auth(candidate_keyid):
+                public_key_hex = self.peer_resolver.resolve(candidate_keyid)
+                resolved_public_keys[candidate_keyid] = public_key_hex
+                return public_key_hex
+
             keyid = _wgrpcauth.verify_grpc_call(
                 method_path, auth_header, body_bytes,
-                pubkey_resolver=self.peer_resolver.resolve,
+                pubkey_resolver=resolve_for_auth,
                 is_streaming=is_streaming,
             )
             role = _wgrpcauth.ROLE_PEER
@@ -2267,7 +2276,8 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                     raise _wgrpcauth.AuthError(
                         f"consumer keyid {keyid!r} is not authorized for "
                         f"{method_path}")
-            return AuthenticatedKeyId(keyid, role)
+            return AuthenticatedKeyId(
+                keyid, role, resolved_public_keys.get(keyid))
         except _wgrpcauth.AuthError as e:
             self._authz_rejections += 1
             peer = "?"
@@ -3015,9 +3025,13 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                             raise _paid.PaidAdmissionError(
                                 "paid sessions require direct greedy inference; "
                                 "chain, next_server, push, speculation, and fabric are forbidden")
+                        claim_kwargs = {}
+                        if paid_admission.chain_mode:
+                            claim_kwargs["payer_public_key_hex"] = getattr(
+                                authenticated_keyid, "public_key_hex", None)
                         paid_claim = paid_admission.claim(
                             str(authenticated_keyid), stream_session_id,
-                            step.spend_claim_token)
+                            step.spend_claim_token, **claim_kwargs)
                         paid_session_lock = paid_admission.session_lock(paid_claim)
                         paid_session_lock.acquire()
                     else:

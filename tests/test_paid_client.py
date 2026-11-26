@@ -422,7 +422,8 @@ def test_chain_consumer_opens_to_bound_wallet_and_worker_accepts_claim(
     def accept_claim_then_stop(**kwargs):
         consumer = real_manager(**kwargs)
         claim = worker_admission.claim(
-            payer_keyid, "session", consumer.first_wire(KEY1, "A" * 43))
+            payer_keyid, "session", consumer.first_wire(KEY1, "A" * 43),
+            payer_public_key_hex=payer_keyid)
         assert claim["worker_account_at_authorize"] == PAY_WALLET
         raise RuntimeError("stop after worker accepted bound-wallet channel")
 

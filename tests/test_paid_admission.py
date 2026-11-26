@@ -744,6 +744,7 @@ def test_consumer_authority_is_narrowly_inference_only(tmp_path):
             method_path=method, is_streaming=streaming)
         assert str(identity) == public
         assert identity.role == grpc_auth.ROLE_CONSUMER
+        assert identity.public_key_hex == public
 
     denied = (
         "/nakshatra.Nakshatra/SignParticipation",
@@ -757,3 +758,52 @@ def test_consumer_authority_is_narrowly_inference_only(tmp_path):
             servicer._check_grpc_auth(
                 _Context([("authorization", header)]), body,
                 method_path=method, is_streaming=False)
+
+
+def test_chain_claim_receives_public_key_used_by_grpc_auth():
+    private, public = auth.generate_keypair()
+    payer_name = "op-3ac68dc17064d7ab"
+
+    class Resolver:
+        def resolve(self, keyid):
+            return public if keyid == payer_name else None
+
+        def resolve_identity(self, keyid):
+            if keyid != payer_name:
+                return None
+            return grpc_auth.ResolvedIdentity(
+                payer_name, public, grpc_auth.ROLE_CONSUMER)
+
+    class CapturingAdmission:
+        ready = True
+        chain_mode = True
+
+        def __init__(self):
+            self.calls = []
+            self.store = SimpleNamespace(get_claim=lambda *_args: None)
+
+        def claim(self, payer_keyid, session_id, claim_token, **kwargs):
+            self.calls.append(
+                (payer_keyid, session_id, claim_token, dict(kwargs)))
+            raise paid.PaidAdmissionError("captured chain claim")
+
+    admission = CapturingAdmission()
+    servicer = worker.WorkerServicer(
+        _Daemon(), "last", 0, 4, MODEL, auth_required=True,
+        peer_resolver=Resolver(), paid_admission=admission,
+        refuse_unregistered_peers=False, refuse_unpinned_peers=False)
+    step = pb.InferenceStep(
+        session_id="named-payer", step_id="step-1",
+        spend_claim_token=TOKEN)
+    step.token_ids.ids.append(1)
+    header = grpc_auth.build_grpc_auth_header(
+        private, payer_name, "/nakshatra.Nakshatra/Inference",
+        step.SerializeToString(), is_streaming=True)
+    context = _Context([("authorization", header)])
+
+    assert list(servicer.Inference(iter([step]), context)) == []
+    assert context._code == grpc.StatusCode.PERMISSION_DENIED
+    assert admission.calls == [(
+        payer_name, "named-payer", TOKEN,
+        {"payer_public_key_hex": public},
+    )]
