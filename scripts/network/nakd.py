@@ -471,9 +471,13 @@ class Node:
     def _closing_redeem_pending(self) -> bool:
         """Read only local voucher facts; failure keeps the normal cadence."""
         try:
-            from network.pay_voucher import WorkerVoucherStore
-            with WorkerVoucherStore() as vouchers:
-                return vouchers.has_unredeemed_closing()
+            from network.pay_voucher import open_worker_voucher_stores_for_redeem
+            stores = open_worker_voucher_stores_for_redeem()
+            try:
+                return any(store.has_unredeemed_closing() for store in stores)
+            finally:
+                for store in stores:
+                    store.close()
         except BaseException as exc:
             self.log(f"WARNING: pay closing-poll check failed: "
                      f"{type(exc).__name__}: {exc}")

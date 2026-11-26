@@ -1015,6 +1015,62 @@ def test_admission_binds_authenticated_payer_to_channel_signer(
     vouchers.close()
 
 
+def test_chain_resume_stays_bound_to_first_resolved_payer_key(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("NAK_PAY_MODE", "chain")
+    _install_pay_wallet(Path(os.environ["HOME"]))
+    state = _state()
+    vouchers = pay.WorkerVoucherStore(
+        tmp_path / "resume-key" / "vouchers.sqlite")
+    store = admission.PaidAdmissionStore(
+        tmp_path / "resume-key" / "paid.sqlite")
+    manager = admission.PaidAdmission(
+        _Ledger(_claim("resume-key")), store, WORKER_SEED,
+        model_id="model", layer_start=0, layer_end=4, clock=lambda: 100,
+        voucher_store=vouchers, channel_state=state, pay_program=PROGRAM)
+    assert manager.check_ready()
+    init = pay.init_wire(
+        TOKEN, program=PROGRAM, channel=CHANNEL, channel_base=0,
+        hold_id="hold", session_id="resume-key", model_id="model",
+        max_prompt_tokens=1, max_output_tokens=40)
+
+    admitted = manager.claim(
+        PAYER_NAME, "resume-key", init, payer_public_key_hex=PAYER_HEX)
+    session_before = dict(manager._chain_sessions[(PAYER_NAME, "resume-key")])
+
+    with pytest.raises(admission.PaidAdmissionError, match="resolved payer public key"):
+        manager.claim(
+            PAYER_NAME, "resume-key", payer_public_key_hex=WRONG_HEX)
+
+    assert manager._chain_sessions[(PAYER_NAME, "resume-key")] == session_before
+    assert manager.claim(
+        PAYER_NAME, "resume-key", payer_public_key_hex=PAYER_HEX) == admitted
+
+    outcomes = queue.Queue()
+
+    def resume(key):
+        try:
+            outcomes.put((key, manager.claim(
+                PAYER_NAME, "resume-key", payer_public_key_hex=key)))
+        except Exception as exc:  # asserted below, across the thread boundary
+            outcomes.put((key, exc))
+
+    threads = [threading.Thread(target=resume, args=(key,))
+               for key in (PAYER_HEX, WRONG_HEX)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    results = dict(outcomes.get() for _thread in threads)
+    assert results[PAYER_HEX] == admitted
+    assert isinstance(results[WRONG_HEX], admission.PaidAdmissionError)
+    assert manager._chain_sessions[(PAYER_NAME, "resume-key")] == session_before
+
+    manager.release_chain_session(admitted)
+    store.close()
+    vouchers.close()
+
+
 @pytest.mark.parametrize("payer_public_key_hex", [
     None, PAYER_HEX.upper(), PAYER_HEX[:-1],
 ])
@@ -1049,6 +1105,58 @@ def test_chain_admission_requires_canonical_resolved_payer_key(
     assert store.get_claim(PAYER_NAME, "missing-payer-key") is None
     store.close()
     vouchers.close()
+
+
+@pytest.mark.parametrize("legacy_rows", [0, 1])
+def test_chain_admission_refuses_only_nonempty_legacy_worker_store(
+        tmp_path, monkeypatch, legacy_rows):
+    monkeypatch.setenv("NAK_PAY_MODE", "chain")
+    home = Path(os.environ["HOME"])
+    _install_pay_wallet(home)
+    legacy = pay.WorkerVoucherStore(
+        home / ".nakshatra" / "pay" / "vouchers.sqlite")
+    if legacy_rows:
+        legacy._db.execute(
+            "INSERT INTO vouchers(channel,program,total,signature) VALUES(?,?,?,?)",
+            (CHANNEL, PROGRAM, "1", b"x" * 64))
+    legacy.close()
+    vouchers = pay.WorkerVoucherStore(
+        home / ".nakshatra" / "pay" / "worker" / "vouchers.sqlite")
+    store = admission.PaidAdmissionStore(tmp_path / "legacy" / "paid.sqlite")
+
+    if legacy_rows:
+        with pytest.raises(
+                admission.PaidAdmissionUnavailable,
+                match="legacy worker voucher store.*migrate"):
+            admission.PaidAdmission(
+                _Ledger(_claim("legacy")), store, WORKER_SEED,
+                model_id="model", layer_start=0, layer_end=4,
+                voucher_store=vouchers, channel_state=_state(),
+                pay_program=PROGRAM)
+    else:
+        manager = admission.PaidAdmission(
+            _Ledger(_claim("legacy")), store, WORKER_SEED,
+            model_id="model", layer_start=0, layer_end=4,
+            voucher_store=vouchers, channel_state=_state(),
+            pay_program=PROGRAM)
+        assert manager.voucher_store.path == (
+            home / ".nakshatra" / "pay" / "worker" / "vouchers.sqlite")
+
+    store.close()
+    vouchers.close()
+
+
+def test_default_worker_and_redeemer_stores_use_worker_subdirectory():
+    home = Path(os.environ["HOME"])
+    expected = home / ".nakshatra" / "pay" / "worker" / "vouchers.sqlite"
+    with pay.WorkerVoucherStore() as vouchers:
+        assert vouchers.path == expected
+    stores = pay.open_worker_voucher_stores_for_redeem()
+    try:
+        assert [store.path for store in stores] == [expected]
+    finally:
+        for store in stores:
+            store.close()
 
 
 def test_named_authenticated_payer_completes_voucher_round_trip(

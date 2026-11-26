@@ -1043,11 +1043,68 @@ def _reservation_id(value: object) -> str:
     return value
 
 
+def worker_voucher_store_path(home: Path | None = None) -> Path:
+    """Current sandbox-scoped worker voucher database path."""
+    root = Path.home() if home is None else Path(home)
+    return root / ".nakshatra" / "pay" / "worker" / "vouchers.sqlite"
+
+
+def legacy_worker_voucher_store_path(home: Path | None = None) -> Path:
+    root = Path.home() if home is None else Path(home)
+    return root / ".nakshatra" / "pay" / "vouchers.sqlite"
+
+
+def legacy_worker_voucher_count(home: Path | None = None) -> int:
+    """Inspect the old store without creating, migrating, or chmodding it."""
+    path = legacy_worker_voucher_store_path(home)
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return 0
+    except OSError as exc:
+        raise VoucherError(f"cannot inspect legacy worker voucher store ({exc})") from exc
+    if (stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()):
+        raise VoucherError(
+            "legacy worker voucher store must be a uid-owned regular file")
+    uri = "file:" + urllib.parse.quote(str(path.absolute())) + "?mode=ro"
+    try:
+        db = sqlite3.connect(uri, uri=True)
+        try:
+            table = db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='vouchers'"
+            ).fetchone()
+            if table is None:
+                return 0
+            return int(db.execute("SELECT count(*) FROM vouchers").fetchone()[0])
+        finally:
+            db.close()
+    except sqlite3.Error as exc:
+        raise VoucherError(
+            f"cannot inspect legacy worker voucher store ({exc})") from exc
+
+
+def open_worker_voucher_stores_for_redeem(
+        home: Path | None = None) -> list[WorkerVoucherStore]:
+    """Open the current store plus a nonempty legacy store for redemption."""
+    stores: list[WorkerVoucherStore] = []
+    try:
+        stores.append(WorkerVoucherStore(worker_voucher_store_path(home)))
+        if legacy_worker_voucher_count(home):
+            stores.append(WorkerVoucherStore(
+                legacy_worker_voucher_store_path(home)))
+        return stores
+    except Exception:
+        for store in stores:
+            store.close()
+        raise
+
+
 class WorkerVoucherStore(_Book):
     """Latest verified voucher per channel, committed before work resumes."""
 
     def __init__(self, path: str | Path | None = None):
-        super().__init__(path or Path.home() / ".nakshatra" / "pay" / "vouchers.sqlite")
+        super().__init__(path or worker_voucher_store_path())
         self._db.execute(
             "CREATE TABLE IF NOT EXISTS vouchers("
             "channel TEXT PRIMARY KEY, program TEXT NOT NULL, total TEXT NOT NULL, "

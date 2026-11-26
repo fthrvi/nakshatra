@@ -1136,10 +1136,10 @@ def test_worker_service_is_hardened_profiled_and_release_owned(tmp_path):
     ]
     assert "llama_cpp_python==0.3.28" not in worker_profile["requirements"]
     assert svc["hardening"] is True
-    # Chain-paid workers keep their voucher store at ~/.nakshatra/pay/vouchers.sqlite
-    # (pay_voucher.WorkerVoucherStore); "-" lets non-chain workers without a pay dir start.
+    # The worker can write only its voucher-store subtree, never wallet or custody files.
     assert svc["read_write_paths"] == [
-        "{home}/.nakshatra/worker", "{home}/.nakshatra/tls", "-{home}/.nakshatra/pay"]
+        "{home}/.nakshatra/worker", "{home}/.nakshatra/tls",
+        "-{home}/.nakshatra/pay/worker"]
     assert svc["environment"]["NAKSHATRA_AUDIT_PATH"] == \
         "{home}/.nakshatra/worker/audit.jsonl"
     command = " ".join(svc["exec"])
@@ -1159,9 +1159,40 @@ def test_worker_service_is_hardened_profiled_and_release_owned(tmp_path):
     assert "ProtectSystem=strict" in text
     assert f"ReadWritePaths={Path.home()}/.nakshatra/worker" in text
     assert f"ReadWritePaths={Path.home()}/.nakshatra/tls" in text
-    assert f"ReadWritePaths=-{Path.home()}/.nakshatra/pay" in text
+    assert f"ReadWritePaths=-{Path.home()}/.nakshatra/pay/worker" in text
+    assert f"ReadWritePaths=-{Path.home()}/.nakshatra/pay\n" not in text
     assert f"EnvironmentFile=-{Path.home()}/.nakshatra/owner-lease.env" in text
     assert f"Environment=NAKSHATRA_AUDIT_PATH={Path.home()}/.nakshatra/worker/audit.jsonl" in text
+
+
+def test_installing_worker_unit_precreates_store_only_below_existing_pay_dir(
+        tmp_path):
+    spec = json.loads((Path(__file__).resolve().parent.parent /
+                       "release" / "spec.json").read_text())
+    home = tmp_path / "home"
+    state = home / ".nakshatra"
+    state.mkdir(parents=True)
+    worker_env = state / "worker.env"
+    worker_env.write_text("PORT=50051\n")
+    svc = dict(spec["services"]["nakshatra-worker"],
+               requires=str(worker_env), env_file=str(worker_env))
+    man = {"version": "0.1.0", "components": [
+        {"name": "nakshatra", "pythonpath": "scripts"}],
+        "services": {"nakshatra-worker": svc}, "profiles": {}}
+    inst = I.Installer(tmp_path / "node", systemd=False, make_venv=False,
+                       unit_dir=tmp_path / "units")
+    inst.prefix.mkdir()
+    real_ctx = inst._ctx
+    inst._ctx = lambda manifest: {**real_ctx(manifest), "home": home}
+
+    inst.write_units(man)
+    assert not (state / "pay").exists()
+
+    (state / "pay").mkdir(mode=0o700)
+    inst.write_units(man)
+    worker_store_dir = state / "pay" / "worker"
+    assert worker_store_dir.is_dir()
+    assert stat.S_IMODE(worker_store_dir.stat().st_mode) == 0o700
 
 
 def test_enabling_a_profiled_service_installs_its_signed_lock(tmp_path, monkeypatch):

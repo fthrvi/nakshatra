@@ -805,6 +805,34 @@ class Installer:
         # The Description marker recognizes units written by pre-marker installers during upgrade.
         return UNIT_MARKER in head or "(managed by nakshatra-node install.py)" in head
 
+    @staticmethod
+    def _prepare_service_state(name: str, ctx: dict) -> None:
+        """Create the worker store mountpoint without touching wallet files."""
+        if name != "nakshatra-worker":
+            return
+        pay_dir = Path(ctx["home"]) / ".nakshatra" / "pay"
+        try:
+            info = pay_dir.lstat()
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise InstallError(f"cannot inspect worker pay directory: {exc}") from exc
+        if (stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode)
+                or info.st_uid != os.geteuid()):
+            raise InstallError(
+                "worker pay directory must be a uid-owned regular directory")
+        worker_dir = pay_dir / "worker"
+        try:
+            worker_dir.mkdir(mode=0o700, exist_ok=True)
+            child = worker_dir.lstat()
+        except OSError as exc:
+            raise InstallError(f"cannot create worker voucher directory: {exc}") from exc
+        if (stat.S_ISLNK(child.st_mode) or not stat.S_ISDIR(child.st_mode)
+                or child.st_uid != os.geteuid()):
+            raise InstallError(
+                "worker voucher directory must be a uid-owned regular directory")
+        os.chmod(worker_dir, 0o700)
+
     def write_units(self, man: dict) -> list:
         ctx, names = self._ctx(man), []
         self.unit_dir.mkdir(parents=True, exist_ok=True)
@@ -826,6 +854,7 @@ class Installer:
                 continue
             if unit_path.exists() and not self._managed_unit(unit_path):
                 raise InstallError(f"refusing to replace operator-owned unit {unit_path}")
+            self._prepare_service_state(name, ctx)
             unit_path.write_text(self._unit_text(svc, ctx, man))
             names.append(name)
         bin_dir = self.prefix / "bin"
@@ -939,7 +968,9 @@ class Installer:
         if unit.exists() and not self._managed_unit(unit):
             raise InstallError(f"refusing to replace operator-owned unit {unit}")
         self._ensure_service_profile(svc, man)
-        unit.write_text(self._unit_text(svc, self._ctx(man), man))
+        ctx = self._ctx(man)
+        self._prepare_service_state(name, ctx)
+        unit.write_text(self._unit_text(svc, ctx, man))
         if subprocess.run(["systemctl", "--user", "daemon-reload"], check=False).returncode != 0:
             raise InstallError("systemctl --user daemon-reload failed; service was not enabled")
         started = subprocess.run(
@@ -1002,7 +1033,9 @@ class Installer:
         if enabled.returncode != 0:
             raise InstallError(f"{name}.service is not enabled")
         self._ensure_service_profile(svc, man)
-        unit.write_text(self._unit_text(svc, self._ctx(man), man))
+        ctx = self._ctx(man)
+        self._prepare_service_state(name, ctx)
+        unit.write_text(self._unit_text(svc, ctx, man))
         if subprocess.run(["systemctl", "--user", "daemon-reload"], check=False).returncode != 0:
             raise InstallError("systemctl --user daemon-reload failed; service was not restarted")
         restarted = subprocess.run(

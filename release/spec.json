@@ -291,7 +291,7 @@
    "read_write_paths": [
     "{home}/.nakshatra/worker",
     "{home}/.nakshatra/tls",
-    "-{home}/.nakshatra/pay"
+    "-{home}/.nakshatra/pay/worker"
    ],
    "components": [
     "nakshatra"

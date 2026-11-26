@@ -2512,6 +2512,8 @@ def _worker_enable_locked(_sp, args) -> None:
     # useful refusal and TLS can create this node's certificate on its first start.
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     (Path.home() / ".nakshatra" / "tls").mkdir(parents=True, exist_ok=True, mode=0o700)
+    from network.pay_wallet import ensure_worker_store_dir
+    ensure_worker_store_dir(Path.home())
     old_env = env_path.read_bytes() if env_path.exists() else None
     p2p_env, p2p_owner = _gateway_p2p_paths()
     old_p2p_env = p2p_env.read_bytes() if p2p_env.exists() else None

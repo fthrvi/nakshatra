@@ -227,6 +227,28 @@ def _write_new(path: Path, data: bytes, mode: int) -> None:
                 raise
 
 
+def ensure_worker_store_dir(home: Path) -> Path:
+    """Create only the worker-writable voucher subtree, with mode 0700."""
+    pay_dir = Path(home) / ".nakshatra" / "pay"
+    if not _path_present(pay_dir):
+        pay_dir.mkdir(parents=True, mode=0o700)
+        os.chmod(pay_dir, 0o700)
+    _check_pay_dir(pay_dir)
+    worker_dir = pay_dir / "worker"
+    try:
+        info = worker_dir.lstat()
+    except FileNotFoundError:
+        worker_dir.mkdir(mode=0o700)
+        info = worker_dir.lstat()
+    if (stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != os.geteuid()):
+        raise SystemExit(
+            f"refusing {worker_dir}: worker voucher directory must be a "
+            "uid-owned regular directory")
+    os.chmod(worker_dir, 0o700)
+    return worker_dir
+
+
 def ensure_wallet(home: Path) -> dict:
     """Create the local pay wallet once, or validate and return the existing wallet."""
     home = Path(home)
@@ -234,14 +256,15 @@ def ensure_wallet(home: Path) -> dict:
 
     # A corrupt existing seed must stop the operation before mkdir, chmod, or any other write.
     preflight_wallet(home)
-    if _path_present(custody_path) and _read_custody(custody_path) == "broker":
-        # A completed broker import deliberately leaves no node-readable seed.  Setup reruns
-        # validate and project that identity; they must never manufacture or rewrite key state.
-        return load_wallet_identity(home)
     if not _path_present(pay_dir):
         pay_dir.mkdir(parents=True, mode=0o700)
         os.chmod(pay_dir, 0o700)
     _check_pay_dir(pay_dir)
+    ensure_worker_store_dir(home)
+    if _path_present(custody_path) and _read_custody(custody_path) == "broker":
+        # A completed broker import deliberately leaves no node-readable seed.  Setup reruns
+        # validate and project that identity; they must never manufacture or rewrite key state.
+        return load_wallet_identity(home)
 
     if not _path_present(seed_path):
         seed = os.urandom(32)

@@ -185,6 +185,23 @@ def test_redeem_records_signed_attempt_before_broadcast(tmp_path):
         assert book.timing(CHANNEL) == (rpc.now, rpc.now)
 
 
+def test_default_redeemer_reads_nonempty_legacy_worker_store(
+        tmp_path, file_wallet_home):
+    legacy_path = file_wallet_home / ".nakshatra" / "pay" / "vouchers.sqlite"
+    legacy = _worker_store(legacy_path.parent, total=2_000_000, redeemed=0)
+    legacy.close()
+    rpc = Rpc(tmp_path / "redeems.sqlite")
+
+    result = pay_redeemer.run_redeemer(
+        rpc=rpc, wallet=WALLET, program=PROGRAM, mint=MINT,
+        attempts_path=tmp_path / "redeems.sqlite",
+        lock_path=tmp_path / "redeem.lock")
+
+    assert result["examined"] == 1
+    assert result["sent"] == 1
+    assert rpc.sent == 1
+
+
 def test_file_redeem_holds_custody_lock_until_broadcast_and_keeps_transaction_bytes(
         tmp_path, file_wallet_home):
     voucher_store = VoucherStore()

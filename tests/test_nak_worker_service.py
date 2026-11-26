@@ -96,6 +96,16 @@ def test_nak_worker_on_writes_env_once_and_uses_verified_installer(tmp_path, mon
     _fake_release(prefix)
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("NAK_NODE_PREFIX", str(prefix))
+    pay_dir = home / ".nakshatra" / "pay"
+    pay_dir.mkdir(parents=True, mode=0o700)
+    wallet_paths = [pay_dir / "wallet.ed25519", pay_dir / "wallet.pub",
+                    pay_dir / "custody"]
+    for path, body in zip(wallet_paths, (b"seed", b"address\n", b"file\n")):
+        path.write_bytes(body)
+    wallet_before = {
+        path: (path.read_bytes(), path.stat().st_mode, path.stat().st_mtime_ns)
+        for path in wallet_paths
+    }
     calls = []
 
     def run(args, **kwargs):
@@ -131,6 +141,13 @@ def test_nak_worker_on_writes_env_once_and_uses_verified_installer(tmp_path, mon
     inference_env = home / ".nakshatra" / "inference.env"
     assert not inference_env.exists()
     assert (home / ".nakshatra" / "tls").is_dir()
+    worker_store_dir = home / ".nakshatra" / "pay" / "worker"
+    assert worker_store_dir.is_dir()
+    assert worker_store_dir.stat().st_mode & 0o777 == 0o700
+    assert {
+        path: (path.read_bytes(), path.stat().st_mode, path.stat().st_mtime_ns)
+        for path in wallet_paths
+    } == wallet_before
     installer = prefix / "current" / "nakshatra" / "release" / "install.py"
     assert calls[-1] == [sys.executable, str(installer), "--prefix", str(prefix),
                          "enable", "nakshatra-worker"]

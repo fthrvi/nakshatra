@@ -86,12 +86,23 @@ def test_first_join_creates_wallet_and_second_join_keeps_seed_identical():
     assert stat.S_IMODE(public_path.stat().st_mode) == 0o644
     assert public_path.read_text().strip() == pay_wallet.base58_encode(expected_public)
     assert custody_path.read_text().strip() == "file"
+    worker_store_dir = seed_path.parent / "worker"
+    assert worker_store_dir.is_dir()
+    assert stat.S_IMODE(worker_store_dir.stat().st_mode) == 0o700
     assert first["pay_address"] == public_path.read_text().strip()
 
+    wallet_files_before = {
+        path: (path.read_bytes(), path.stat().st_mode, path.stat().st_mtime_ns)
+        for path in (seed_path, public_path, custody_path)
+    }
     seed_mtime = seed_path.stat().st_mtime_ns
     second = join_setup.ensure_identity(home)
     assert seed_path.read_bytes() == seed
     assert seed_path.stat().st_mtime_ns == seed_mtime
+    assert {
+        path: (path.read_bytes(), path.stat().st_mode, path.stat().st_mtime_ns)
+        for path in (seed_path, public_path, custody_path)
+    } == wallet_files_before
     assert second["pay_address"] == first["pay_address"]
 
 

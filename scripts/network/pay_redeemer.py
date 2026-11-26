@@ -408,8 +408,9 @@ def run_redeemer(*, store: pay_voucher.WorkerVoucherStore | None = None,
     threshold = _positive(threshold, "redeem threshold")
     max_age_s = _positive(max_age_s, "maximum redeem age")
     wanted = None if channel is None else pay_chain.pubkey_text(channel, "channel")
-    owned_store = store is None
-    vouchers = store or pay_voucher.WorkerVoucherStore()
+    owned_stores = store is None
+    voucher_stores = ([store] if store is not None else
+                      pay_voucher.open_worker_voucher_stores_for_redeem())
     result = {"examined": 0, "sent": 0, "would_send": 0,
               "finalized": 0, "skipped": 0}
     try:
@@ -448,7 +449,18 @@ def run_redeemer(*, store: pay_voucher.WorkerVoucherStore | None = None,
             # Known-Closing channels first, earliest deadline first: an earlier
             # send may block for up to a poll, and a Closing voucher reached
             # too late is unredeemable once the margin passes.
-            for voucher in redeem_order(vouchers.all_latest()):
+            # A migration may briefly leave a channel in both files. Redeem
+            # only its greatest cumulative voucher, with ties preferring the
+            # current worker/ store opened first above.
+            by_channel = {}
+            for voucher_store in voucher_stores:
+                for record in voucher_store.all_latest():
+                    previous = by_channel.get(record.channel)
+                    if previous is None or record.total > previous[0].total:
+                        by_channel[record.channel] = (record, voucher_store)
+            for voucher in redeem_order(
+                    [record for record, _source in by_channel.values()]):
+                vouchers = by_channel[voucher.channel][1]
                 if wanted is not None and voucher.channel != wanted:
                     continue
                 result["examined"] += 1
@@ -570,8 +582,9 @@ def run_redeemer(*, store: pay_voucher.WorkerVoucherStore | None = None,
                             dry_run=dry_run, log=log):
                         result["finalized"] += 1
     finally:
-        if owned_store:
-            vouchers.close()
+        if owned_stores:
+            for voucher_store in voucher_stores:
+                voucher_store.close()
     return result
 
 

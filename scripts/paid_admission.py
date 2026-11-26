@@ -666,10 +666,18 @@ class PaidAdmission:
                 from network import pay_voucher
                 from network.pay_wallet import load_wallet_identity
                 self._pay = pay_voucher
+                legacy_rows = pay_voucher.legacy_worker_voucher_count()
+                if legacy_rows:
+                    raise PaidAdmissionUnavailable(
+                        "legacy worker voucher store contains earned vouchers; "
+                        "run `nak pay redeem`, then migrate it to "
+                        "~/.nakshatra/pay/worker/vouchers.sqlite")
                 self.pay_program = pay_program or pay_voucher.configured_program()
                 self.channel_state = channel_state or pay_voucher.configured_state()
                 self.voucher_store = voucher_store or pay_voucher.WorkerVoucherStore()
                 self.pay_wallet_address = load_wallet_identity(Path.home())["address"]
+            except PaidAdmissionUnavailable:
+                raise
             except SystemExit as exc:
                 raise PaidAdmissionUnavailable(
                     f"chain pay wallet is unavailable ({exc})") from exc
@@ -689,7 +697,12 @@ class PaidAdmission:
 
     def session_lock(self, claim: Mapping[str, object]) -> threading.RLock:
         """Return the in-process lock serializing one durable paid session."""
-        key = (str(claim["payer_keyid"]), str(claim["session_id"]))
+        return self._session_lock_for(
+            str(claim["payer_keyid"]), str(claim["session_id"]))
+
+    def _session_lock_for(self, payer_keyid: str,
+                          session_id: str) -> threading.RLock:
+        key = (str(payer_keyid), str(session_id))
         with self._session_locks_lock:
             return self._session_locks.setdefault(key, threading.RLock())
 
@@ -734,6 +747,21 @@ class PaidAdmission:
                 raw_claim_token = chain_init["claim_token"]
             except Exception as exc:
                 raise PaidAdmissionError(f"chain voucher init refused ({exc})") from exc
+        if self.chain_mode:
+            # worker.py holds this same lock for the stream lifetime.  Holding
+            # it here makes resume-key validation and first admission one
+            # atomic check/create operation.
+            with self._session_lock_for(payer_keyid, session_id):
+                return self._claim_locked(
+                    payer_keyid, session_id, raw_claim_token, chain_init,
+                    payer_public_key_hex)
+        return self._claim_locked(
+            payer_keyid, session_id, raw_claim_token, chain_init,
+            payer_public_key_hex)
+
+    def _claim_locked(self, payer_keyid: str, session_id: str,
+                      raw_claim_token: str, chain_init: Optional[dict],
+                      payer_public_key_hex: Optional[str]) -> dict:
         existing = self.store.get_claim(payer_keyid, session_id)
         if existing is not None:
             if raw_claim_token:
@@ -741,12 +769,21 @@ class PaidAdmission:
                 if digest != existing["token_sha256"]:
                     raise PaidAdmissionConflict("paid session token differs from durable claim")
             self._validate_scope(existing, payer_keyid, session_id)
-            if self.chain_mode and (payer_keyid, session_id) not in self._chain_sessions:
-                if chain_init is None:
-                    raise PaidAdmissionError("first chain frame requires channel init")
-                self._admit_chain(
-                    existing, chain_init,
-                    payer_public_key_hex=payer_public_key_hex)
+            if self.chain_mode:
+                session = self._chain_sessions.get((payer_keyid, session_id))
+                if session is None:
+                    # Chain sessions are not reconstructed from the durable
+                    # meter alone after restart: a fresh init must re-read
+                    # finalized channel state and re-admit the resolved key.
+                    if chain_init is None:
+                        raise PaidAdmissionError("first chain frame requires channel init")
+                    self._admit_chain(
+                        existing, chain_init,
+                        payer_public_key_hex=payer_public_key_hex)
+                elif session["payer_public_key_hex"] != payer_public_key_hex:
+                    raise PaidAdmissionError(
+                        "chain session resolved payer public key differs from "
+                        "the admitted key")
             return existing
         if not raw_claim_token:
             raise PaidAdmissionError("first paid frame requires spend_claim_token")
@@ -859,6 +896,7 @@ class PaidAdmission:
                 "channel": init["channel"], "channel_base": base,
                 "pending_total": None, "channel_closing": False,
                 "reservation_id": reservation_id,
+                "payer_public_key_hex": payer_public_key_hex,
             }
         except Exception as exc:
             if reserved:
@@ -878,16 +916,17 @@ class PaidAdmission:
         if not self.chain_mode:
             return
         key = (str(claim["payer_keyid"]), str(claim["session_id"]))
-        session = self._chain_sessions.get(key)
-        if session is None:
-            return
-        try:
-            self.voucher_store.release_reservation(
-                session["channel"], session["reservation_id"])
-        except Exception as exc:
-            raise PaidAdmissionError(
-                f"chain channel reservation release failed ({exc})") from exc
-        self._chain_sessions.pop(key, None)
+        with self._session_lock_for(*key):
+            session = self._chain_sessions.get(key)
+            if session is None:
+                return
+            try:
+                self.voucher_store.release_reservation(
+                    session["channel"], session["reservation_id"])
+            except Exception as exc:
+                raise PaidAdmissionError(
+                    f"chain channel reservation release failed ({exc})") from exc
+            self._chain_sessions.pop(key, None)
 
     def accept_chain_control(self, claim: dict, value: str) -> None:
         """Verify and durably store a voucher before this method returns."""
