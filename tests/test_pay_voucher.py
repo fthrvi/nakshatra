@@ -1847,3 +1847,73 @@ def test_finalized_chain_time_source_refreshes_after_thirty_seconds():
     monotonic[0] = 40.0
     assert source() == 1_030
     assert len(reads) == 2
+
+
+def _flaky_opener(failures, status=429, retry_after=None):
+    """Raise HTTP `status` for the first `failures` opens, then use the real opener."""
+    import email.message
+    import urllib.error
+    opens = []
+
+    def opener(request, timeout):
+        opens.append(request.full_url)
+        if len(opens) <= failures:
+            headers = email.message.Message()
+            if retry_after is not None:
+                headers["Retry-After"] = retry_after
+            raise urllib.error.HTTPError(
+                request.full_url, status, "refused", headers, None)
+        return pay._RPC_OPENER.open(request, timeout=timeout)
+    return opener, opens
+
+
+def test_rpc_read_retries_rate_limit_then_succeeds():
+    server, calls = _rpc_server(DEVNET_GENESIS, _channel_fixture())
+    try:
+        opener, opens = _flaky_opener(2)
+        sleeps = []
+        state = pay.JsonRpcChannelState(
+            f"http://127.0.0.1:{server.server_port}", timeout=2,
+            opener=opener, sleep=sleeps.append)
+        assert state.read_channel(CHANNEL, PROGRAM).cap == 10_000
+        assert sleeps == [0.5, 1.0]
+        assert calls == ["getGenesisHash", "getAccountInfo"]
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_rpc_read_rate_limit_retries_are_bounded():
+    opener, opens = _flaky_opener(10**6)
+    sleeps = []
+    state = pay.JsonRpcChannelState(
+        "http://127.0.0.1:1", opener=opener, sleep=sleeps.append)
+    with pytest.raises(pay.VoucherError, match="getGenesisHash failed"):
+        state.read_channel(CHANNEL, PROGRAM)
+    assert len(opens) == pay.RPC_RETRY_ATTEMPTS + 1
+    assert len(sleeps) == pay.RPC_RETRY_ATTEMPTS
+    assert all(0 <= s <= pay.RPC_RETRY_MAX_WAIT_S for s in sleeps)
+
+
+def test_rpc_read_does_not_retry_other_http_errors():
+    opener, opens = _flaky_opener(10**6, status=400)
+    sleeps = []
+    state = pay.JsonRpcChannelState(
+        "http://127.0.0.1:1", opener=opener, sleep=sleeps.append)
+    with pytest.raises(pay.VoucherError, match="getGenesisHash failed"):
+        state.read_channel(CHANNEL, PROGRAM)
+    assert len(opens) == 1 and sleeps == []
+
+
+@pytest.mark.parametrize(("after", "expected"), [
+    ("30", pay.RPC_RETRY_MAX_WAIT_S), ("0.25", 0.25),
+    ("nan", pay.RPC_RETRY_BASE_WAIT_S), ("-5", pay.RPC_RETRY_BASE_WAIT_S),
+    ("soon", pay.RPC_RETRY_BASE_WAIT_S)])
+def test_rpc_read_retry_after_is_honoured_within_cap(after, expected):
+    opener, _opens = _flaky_opener(1, status=503, retry_after=after)
+    sleeps = []
+    state = pay.JsonRpcChannelState(
+        "http://127.0.0.1:1", opener=opener, sleep=sleeps.append)
+    with pytest.raises(pay.VoucherError):
+        state.read_channel(CHANNEL, PROGRAM)  # port 1 refuses after the retry
+    assert sleeps == [expected]

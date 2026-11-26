@@ -52,6 +52,7 @@ import stat
 import struct
 import threading
 import time
+import urllib.error
 import urllib.request
 import urllib.parse
 from dataclasses import dataclass
@@ -467,11 +468,19 @@ _RPC_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _Refu
 RPC_RESPONSE_MAX = 1 << 20  # a Channel/Escrow account reply is a few KiB
 
 
+# Bounded retry for read-only channel RPC (public devnet rate-limits bursts).
+RPC_RETRY_STATUSES = frozenset({429, 503})
+RPC_RETRY_ATTEMPTS = 3
+RPC_RETRY_BASE_WAIT_S = 0.5
+RPC_RETRY_MAX_WAIT_S = 2.0
+
+
 class JsonRpcChannelState:
     """Devnet/local ``getAccountInfo`` reader with strict owner checks."""
 
     def __init__(self, rpc_url: str, *, timeout: float = 5.0,
-                 opener: Callable = _RPC_OPENER.open):
+                 opener: Callable = _RPC_OPENER.open,
+                 sleep: Callable[[float], None] = time.sleep):
         if not isinstance(rpc_url, str) or not rpc_url:
             raise VoucherError("Solana RPC URL is required")
         parts = urllib.parse.urlsplit(rpc_url)
@@ -487,6 +496,7 @@ class JsonRpcChannelState:
         self.rpc_url = rpc_url
         self.timeout = float(timeout)
         self.opener = opener
+        self.sleep = sleep
         self._request_id = 0
         self._lock = threading.Lock()
         self._cluster_checked = False
@@ -504,7 +514,7 @@ class JsonRpcChannelState:
             self.rpc_url, data=body, method="POST",
             headers={"Content-Type": "application/json"})
         try:
-            with self.opener(request, timeout=self.timeout) as response:
+            with self._open_with_retry(request) as response:
                 raw = response.read(RPC_RESPONSE_MAX + 1)
                 if len(raw) > RPC_RESPONSE_MAX:
                     raise VoucherError(f"Solana RPC {method} response is too large")
@@ -535,6 +545,35 @@ class JsonRpcChannelState:
         except Exception as exc:
             raise VoucherError(
                 f"Solana RPC {method} failed ({type(exc).__name__})") from exc
+
+    def _open_with_retry(self, request):
+        """Open one read-only RPC request, retrying only rate-limit/unavailable.
+
+        Every method this reader sends is a read (getGenesisHash,
+        getAccountInfo), so a repeat cannot change chain state.  Public devnet
+        RPC answers bursts with HTTP 429; without a retry one refused read
+        fails a whole paid request.  Bounded: RPC_RETRY_ATTEMPTS retries, each
+        wait capped by RPC_RETRY_MAX_WAIT_S (Retry-After honoured within it).
+        """
+        for attempt in range(RPC_RETRY_ATTEMPTS + 1):
+            try:
+                return self.opener(request, timeout=self.timeout)
+            except urllib.error.HTTPError as exc:
+                if (exc.code not in RPC_RETRY_STATUSES
+                        or attempt >= RPC_RETRY_ATTEMPTS):
+                    raise
+                wait = RPC_RETRY_BASE_WAIT_S * (2 ** attempt)
+                try:
+                    after = exc.headers.get("Retry-After") if exc.headers else None
+                    if after is not None:
+                        wait = float(after)
+                except (TypeError, ValueError):
+                    pass
+                if not (wait >= 0):  # NaN or negative
+                    wait = RPC_RETRY_BASE_WAIT_S
+                exc.close()
+                self.sleep(min(wait, RPC_RETRY_MAX_WAIT_S))
+        raise AssertionError("unreachable")
 
     def _ensure_cluster(self) -> None:
         with self._lock:
