@@ -701,6 +701,10 @@ class PayRpc(JsonRpcChannelState):
                      or not isinstance(last_valid_block_height, int)
                      or last_valid_block_height < 0)):
             raise ValueError("last_valid_block_height must be a non-negative integer")
+        # Re-read network.json and the real-money gates at the last possible
+        # point before broadcast.  The genesis result remains cached, but an
+        # operator disarm or network edit must stop this already-live object.
+        self._ensure_cluster()
         try:
             returned = self._rpc("sendTransaction", [
                 base64.b64encode(transaction.data).decode("ascii"),

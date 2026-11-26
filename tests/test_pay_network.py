@@ -76,9 +76,10 @@ def _limits(home: Path):
     })
 
 
-def _arm(home: Path, *, program=MAINNET_PROGRAM):
+def _arm(home: Path, *, program=MAINNET_PROGRAM, rpc=RPC):
     return _write(pay_network.arm_path(home), {
         "network": "mainnet",
+        "rpc": rpc,
         "genesis": pay_network.MAINNET_GENESIS_HASH,
         "program": program,
         "mint": pay_network.MAINNET_MINT,
@@ -235,6 +236,7 @@ def test_init_migrates_environment_to_private_file_and_will_not_overwrite(
     environ = {"NAK_PAY_RPC": RPC, "NAK_PAY_PROGRAM": PROGRAM, "NAK_PAY_MINT": MINT}
     path = pay_network.initialize_from_environment(home=home, environ=environ)
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(path.with_name(".network.lock").stat().st_mode) == 0o600
     assert json.loads(path.read_text())["networks"]["devnet"]["rpc"] == RPC
     with pytest.raises(pay_network.NetworkConfigError, match="refusing to overwrite"):
         pay_network.initialize_from_environment(home=home, environ=environ)
@@ -253,6 +255,16 @@ def test_status_prints_rpc_host_without_path_query_or_keys(_clean_environment, c
 class _TTY(io.StringIO):
     def isatty(self):
         return True
+
+
+class _ChangingTTY(_TTY):
+    def __init__(self, value, change):
+        super().__init__(value)
+        self.change = change
+
+    def readline(self, *args, **kwargs):
+        self.change()
+        return super().readline(*args, **kwargs)
 
 
 def test_arm_requires_tty_and_exact_phrase_then_writes_private_file(
@@ -276,7 +288,42 @@ def test_arm_requires_tty_and_exact_phrase_then_writes_private_file(
     assert nak.main(["pay", "network", "arm", "mainnet"]) == 0
     arm = pay_network.arm_path(home)
     assert stat.S_IMODE(arm.stat().st_mode) == 0o600
-    assert json.loads(arm.read_text())["program"] == MAINNET_PROGRAM
+    armed = json.loads(arm.read_text())
+    assert armed["program"] == MAINNET_PROGRAM
+    assert armed["rpc"] == RPC
+
+
+def test_arm_mainnet_owns_tty_prompt_and_refuses_changed_document(_clean_environment):
+    home = _clean_environment
+    path = _config(home)
+    with pytest.raises(pay_network.NetworkConfigError, match="interactive-only"):
+        pay_network.arm_mainnet(
+            home=home, environ={}, input_stream=io.StringIO(), output_stream=io.StringIO())
+
+    def change_config():
+        changed = _value(mainnet_rpc="http://127.0.0.1:19000")
+        _write(path, changed)
+
+    shown = _TTY()
+    typed = _ChangingTTY(f"ARM MAINNET {MAINNET_PROGRAM[:8]}\n", change_config)
+    with pytest.raises(pay_network.NetworkConfigError, match="changed during.*prompt"):
+        pay_network.arm_mainnet(
+            home=home, environ={}, input_stream=typed, output_stream=shown)
+    assert "mainnet rpc host: 127.0.0.1:18999" in shown.getvalue()
+    assert f"mainnet program: {MAINNET_PROGRAM}" in shown.getvalue()
+    assert f"mainnet mint: {pay_network.MAINNET_MINT}" in shown.getvalue()
+    assert not pay_network.arm_path(home).exists()
+
+
+def test_changing_mainnet_rpc_disarms_existing_record(_clean_environment):
+    home = _clean_environment
+    path = _config(home, active="mainnet")
+    _limits(home)
+    _arm(home)
+    assert pay_network.active_network(home=home, environ={}).name == "mainnet"
+    _write(path, _value(active="mainnet", mainnet_rpc="http://127.0.0.1:19000"))
+    with pytest.raises(pay_network.NetworkConfigError, match="arm file does not match"):
+        pay_network.active_network(home=home, environ={})
 
 
 def test_devnet_starter_guard_refuses_mainnet(_clean_environment):
@@ -346,3 +393,201 @@ def test_loopback_test_network_is_still_allowed(_clean_environment):
         "program": PROGRAM, "mint": MINT}
     _write(pay_network.network_path(home), value)
     assert pay_network.active_network(home=home).name == "local"
+
+
+def test_cached_mainnet_object_rechecks_disarm_for_reads_and_sends(_clean_environment):
+    home = _clean_environment
+    _config(home, active="mainnet")
+    _limits(home)
+    _arm(home)
+    calls = []
+    rpc = pay_chain.PayRpc(RPC)
+
+    def call(method, _params):
+        calls.append(method)
+        if method == "getGenesisHash":
+            return pay_network.MAINNET_GENESIS_HASH
+        if method == "getBlockHeight":
+            return 10
+        if method == "sendTransaction":
+            pytest.fail("a disarmed mainnet transaction was broadcast")
+        raise AssertionError(method)
+
+    rpc._rpc = call
+    assert rpc.block_height() == 10
+    assert calls.count("getGenesisHash") == 1
+    assert pay_network.disarm_mainnet(home=home)
+    with pytest.raises(pay_voucher.VoucherError, match="arm file is missing"):
+        rpc.block_height()
+    transaction = pay_chain.SignedTransaction(b"tx", b"message", (), "signature")
+    with pytest.raises(pay_voucher.VoucherError, match="arm file is missing"):
+        rpc.send_and_confirm(transaction)
+    assert "sendTransaction" not in calls
+    assert calls.count("getGenesisHash") == 1
+
+
+def test_send_rechecks_gates_immediately_before_broadcast(_clean_environment):
+    home = _clean_environment
+    _config(home, active="mainnet")
+    _limits(home)
+    _arm(home)
+    calls = []
+    rpc = pay_chain.PayRpc(RPC)
+
+    def call(method, _params):
+        calls.append(method)
+        if method == "getGenesisHash":
+            return pay_network.MAINNET_GENESIS_HASH
+        if method == "sendTransaction":
+            pytest.fail("sendTransaction ran after the arm was removed")
+        raise AssertionError(method)
+
+    rpc._rpc = call
+    ensure = rpc._ensure_cluster
+    checks = 0
+
+    def disarm_after_first_check():
+        nonlocal checks
+        ensure()
+        checks += 1
+        if checks == 1:
+            pay_network.disarm_mainnet(home=home)
+
+    rpc._ensure_cluster = disarm_after_first_check
+    transaction = pay_chain.SignedTransaction(b"tx", b"message", (), "signature")
+    with pytest.raises(pay_voucher.VoucherError, match="arm file is missing"):
+        rpc.send_and_confirm(transaction)
+    assert checks == 1
+    assert calls == ["getGenesisHash"]
+
+
+@pytest.mark.parametrize("component", [".nakshatra", "pay"])
+def test_symlinked_payment_directories_are_refused(_clean_environment, component):
+    home = _clean_environment
+    target = home / "redirected"
+    target.mkdir()
+    if component == ".nakshatra":
+        (home / ".nakshatra").symlink_to(target, target_is_directory=True)
+    else:
+        nak = home / ".nakshatra"
+        nak.mkdir()
+        (nak / "pay").symlink_to(target, target_is_directory=True)
+    with pytest.raises(pay_network.NetworkConfigError, match="symlinked payment directory"):
+        pay_network.load_document(home=home, environ={})
+
+
+@pytest.mark.parametrize("filename", ["mainnet.armed", "limits.json"])
+def test_mainnet_gate_files_are_opened_without_following_symlinks(
+        _clean_environment, filename):
+    home = _clean_environment
+    _config(home, active="mainnet")
+    if filename != "mainnet.armed":
+        _arm(home)
+    if filename != "limits.json":
+        _limits(home)
+    target = _write(home / f"real-{filename}", {})
+    path = pay_network.network_path(home).with_name(filename)
+    path.symlink_to(target)
+    with pytest.raises(pay_network.NetworkConfigError, match="regular file, not a symlink"):
+        pay_network.active_network(home=home, environ={})
+
+
+def test_network_file_swap_between_stat_and_open_is_refused(
+        _clean_environment, monkeypatch):
+    home = _clean_environment
+    path = _config(home)
+    replacement = _write(home / "replacement.json", _value(active="mainnet"))
+    real_open = os.open
+    swapped = False
+
+    def swapping_open(name, flags, *args, **kwargs):
+        nonlocal swapped
+        if name == path.name and kwargs.get("dir_fd") is not None and not swapped:
+            swapped = True
+            os.replace(replacement, path)
+        return real_open(name, flags, *args, **kwargs)
+
+    monkeypatch.setattr(pay_network.os, "open", swapping_open)
+    with pytest.raises(pay_network.NetworkConfigError, match="changed while opening"):
+        pay_network.load_document(home=home, environ={})
+
+
+def test_concurrent_use_calls_serialize_backup_and_update(
+        _clean_environment, monkeypatch):
+    home = _clean_environment
+    path = _config(home)
+    _limits(home)
+    _arm(home)
+    first_inside = threading.Event()
+    release_first = threading.Event()
+    second_done = threading.Event()
+    original_atomic = pay_network._atomic_write_json_at
+    results = {}
+    errors = []
+
+    def controlled_atomic(pay_fd, target, value):
+        if threading.current_thread().name == "use-mainnet" and target.name == path.name:
+            first_inside.set()
+            assert release_first.wait(2)
+        return original_atomic(pay_fd, target, value)
+
+    monkeypatch.setattr(pay_network, "_atomic_write_json_at", controlled_atomic)
+
+    def switch(label, network):
+        try:
+            results[label] = pay_network.use_network(network, home=home, environ={})
+        except Exception as exc:  # surfaced below with the originating thread
+            errors.append(exc)
+        finally:
+            if label == "second":
+                second_done.set()
+
+    first = threading.Thread(
+        target=switch, args=("first", "mainnet"), name="use-mainnet")
+    second = threading.Thread(
+        target=switch, args=("second", "devnet"), name="use-devnet")
+    first.start()
+    assert first_inside.wait(2)
+    second.start()
+    assert not second_done.wait(0.1), "the second use call bypassed the mutation lock"
+    release_first.set()
+    first.join(2)
+    second.join(2)
+    assert not first.is_alive() and not second.is_alive()
+    assert errors == []
+    assert json.loads(results["first"][1].read_text())["active"] == "devnet"
+    assert json.loads(results["second"][1].read_text())["active"] == "mainnet"
+    assert json.loads(path.read_text())["active"] == "devnet"
+
+
+def test_invalid_join_code_keeps_forgejo_main_setup_order(
+        _clean_environment, monkeypatch):
+    from network import client
+    import joincode
+
+    home = _clean_environment
+    events = []
+
+    def invalid(_value):
+        events.append("decode")
+        raise ValueError("expired")
+
+    class Client:
+        def __init__(self, _sock):
+            pass
+
+        def redeem(self, *_args, **_kwargs):
+            events.append("redeem")
+            return {"state": "pending", "name": "friend"}
+
+    def identity(_home):
+        events.append("identity")
+        return {key: "ready" for key in ("node_key", "person_key", "signer", "agent")}
+
+    monkeypatch.setattr(joincode, "decode_invite", invalid)
+    monkeypatch.setattr(join_setup, "ensure_identity", identity)
+    monkeypatch.setattr(client, "NakClient", Client)
+    monkeypatch.setenv("NAK_JOIN_NO_SYSTEMD", "1")
+    with pytest.raises(SystemExit, match="join code became invalid.*expired"):
+        join_setup.main(["--invite", "invalid", "--home", str(home)])
+    assert events == ["decode", "identity", "redeem", "decode"]

@@ -615,11 +615,17 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
     import joincode
     try:
-        inv = (joincode.decode_address(a.invite) if a.invite.startswith(joincode.ADDRESS_PREFIX)
-               else joincode.decode_invite(a.invite))
-    except ValueError as e:
-        raise SystemExit(f"join code became invalid during setup: {e}")
-    _require_devnet_starter(a.home, inv)
+        starter_invite = (joincode.decode_address(a.invite)
+                          if a.invite.startswith(joincode.ADDRESS_PREFIX)
+                          else joincode.decode_invite(a.invite))
+    except ValueError:
+        # Preserve forgejo/main's handling for invalid/expired codes: the
+        # authoritative decode remains after redeem.  This early, best-effort
+        # decode exists only to stop a valid devnet-starter invite on mainnet
+        # before setup changes local state.
+        pass
+    else:
+        _require_devnet_starter(a.home, starter_invite)
     print("setting up this node:")
     done = ensure_identity(a.home)
     for k in ("node_key", "person_key", "signer", "agent"):
@@ -637,6 +643,12 @@ def main(argv=None) -> int:
     if r.get("state") == "request refused":
         print(f"\nrequest refused: {r.get('why') or 'the person is not accepting this request'}")
         return 1
+    try:
+        inv = (joincode.decode_address(a.invite)
+               if a.invite.startswith(joincode.ADDRESS_PREFIX)
+               else joincode.decode_invite(a.invite))
+    except ValueError as e:
+        raise SystemExit(f"join code became invalid during setup: {e}")
     inviter_name = inv.get("from_name") or r.get("name") or inv["inviter"][:12]
     if inv.get("kind") == "address":
         print(f"\nyour request was sent; nothing is shared until {inviter_name} accepts")

@@ -1,6 +1,7 @@
 """Single-source payment network configuration and mainnet safety gates."""
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
@@ -8,9 +9,10 @@ import secrets
 import stat
 import time
 import urllib.parse
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
+from typing import Iterator, Mapping, TextIO
 
 
 DEVNET_GENESIS_HASH = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG"
@@ -47,6 +49,7 @@ class NetworkDocument:
     active: str
     networks: Mapping[str, PayNetwork]
     raw: dict
+    source: bytes = b""
 
 
 def network_path(home: Path | None = None) -> Path:
@@ -107,21 +110,124 @@ def validate_rpc_url(value: object, field: str = "payment RPC", *, allow_empty: 
     return value
 
 
-def _read_private_regular(path: Path, description: str) -> bytes:
+def _home_path(home: Path | None) -> Path:
+    return Path.home() if home is None else Path(home)
+
+
+def _directory_flags() -> int:
+    return (os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+
+
+def _file_flags() -> int:
+    return os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+
+
+def _open_child_directory(parent_fd: int, name: str, path: Path, *,
+                          create: bool) -> int | None:
     try:
-        info = path.lstat()
+        before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        if not create:
+            return None
+        try:
+            os.mkdir(name, 0o700, dir_fd=parent_fd)
+        except FileExistsError:
+            pass
+        before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise NetworkConfigError(f"cannot inspect payment directory {path}: {exc}") from exc
+    if stat.S_ISLNK(before.st_mode):
+        raise NetworkConfigError(f"refusing symlinked payment directory {path}")
+    if not stat.S_ISDIR(before.st_mode):
+        raise NetworkConfigError(f"refusing {path}: payment path component is not a directory")
+    if before.st_uid != os.geteuid():
+        raise NetworkConfigError(
+            f"refusing {path}: payment directory must be owned by uid {os.geteuid()}")
+    try:
+        fd = os.open(name, _directory_flags(), dir_fd=parent_fd)
+    except OSError as exc:
+        raise NetworkConfigError(f"cannot securely open payment directory {path}: {exc}") from exc
+    opened = os.fstat(fd)
+    if ((opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+            or not stat.S_ISDIR(opened.st_mode)):
+        os.close(fd)
+        raise NetworkConfigError(f"refusing {path}: payment directory changed while opening")
+    return fd
+
+
+@contextmanager
+def _pay_directory(home: Path | None, *, create: bool) -> Iterator[int | None]:
+    home_path = _home_path(home)
+    try:
+        home_fd = os.open(home_path, _directory_flags())
+    except OSError as exc:
+        raise NetworkConfigError(f"cannot securely open home directory {home_path}: {exc}") from exc
+    nak_fd = None
+    pay_fd = None
+    try:
+        nak_path = home_path / ".nakshatra"
+        nak_fd = _open_child_directory(home_fd, ".nakshatra", nak_path, create=create)
+        if nak_fd is None:
+            yield None
+            return
+        pay_path = nak_path / "pay"
+        pay_fd = _open_child_directory(nak_fd, "pay", pay_path, create=create)
+        yield pay_fd
+    finally:
+        if pay_fd is not None:
+            os.close(pay_fd)
+        if nak_fd is not None:
+            os.close(nak_fd)
+        os.close(home_fd)
+
+
+def _read_private_at(pay_fd: int, filename: str, path: Path, description: str,
+                     *, missing_ok: bool = False) -> bytes | None:
+    try:
+        before = os.stat(filename, dir_fd=pay_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        if missing_ok:
+            return None
+        raise NetworkConfigError(f"cannot read {description} at {path}: file is missing")
     except OSError as exc:
         raise NetworkConfigError(f"cannot inspect {description} at {path}: {exc}") from exc
-    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-        raise NetworkConfigError(f"refusing {path}: {description} must be a regular file, not a symlink")
-    if info.st_uid != os.geteuid():
-        raise NetworkConfigError(f"refusing {path}: {description} must be owned by uid {os.geteuid()}")
-    if stat.S_IMODE(info.st_mode) != 0o600:
-        raise NetworkConfigError(f"refusing {path}: {description} must have mode 0600")
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise NetworkConfigError(
+            f"refusing {path}: {description} must be a regular file, not a symlink")
     try:
-        return path.read_bytes()
+        fd = os.open(filename, _file_flags(), dir_fd=pay_fd)
     except OSError as exc:
-        raise NetworkConfigError(f"cannot read {description} at {path}: {exc}") from exc
+        raise NetworkConfigError(f"cannot securely open {description} at {path}: {exc}") from exc
+    try:
+        opened = os.fstat(fd)
+        if ((opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+                or not stat.S_ISREG(opened.st_mode)):
+            raise NetworkConfigError(f"refusing {path}: {description} changed while opening")
+        if opened.st_uid != os.geteuid():
+            raise NetworkConfigError(
+                f"refusing {path}: {description} must be owned by uid {os.geteuid()}")
+        if stat.S_IMODE(opened.st_mode) != 0o600:
+            raise NetworkConfigError(f"refusing {path}: {description} must have mode 0600")
+        chunks = []
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after_fd = os.fstat(fd)
+    finally:
+        os.close(fd)
+    try:
+        after_path = os.stat(filename, dir_fd=pay_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise NetworkConfigError(f"refusing {path}: {description} changed while reading") from exc
+    identity = (opened.st_dev, opened.st_ino)
+    if ((after_path.st_dev, after_path.st_ino) != identity
+            or (after_fd.st_size, after_fd.st_mtime_ns)
+            != (opened.st_size, opened.st_mtime_ns)):
+        raise NetworkConfigError(f"refusing {path}: {description} changed while reading")
+    return b"".join(chunks)
 
 
 def _json_object(pairs: list[tuple[str, object]]) -> dict:
@@ -195,13 +301,13 @@ def _check_environment(network: PayNetwork, environ: Mapping[str, str], path: Pa
                 f"{name} disagrees with {path}; network.json is the only payment network source")
 
 
-def load_document(*, home: Path | None = None,
-                  environ: Mapping[str, str] | None = None) -> NetworkDocument | None:
-    """Load and strictly validate network.json, returning ``None`` only when absent."""
+def _load_document_at(pay_fd: int, *, home: Path | None,
+                      environ: Mapping[str, str] | None) -> NetworkDocument | None:
     path = network_path(home)
-    if not os.path.lexists(path):
+    raw_bytes = _read_private_at(
+        pay_fd, path.name, path, "payment network config", missing_ok=True)
+    if raw_bytes is None:
         return None
-    raw_bytes = _read_private_regular(path, "payment network config")
     try:
         value = _load_json(raw_bytes, f"payment network config {path}")
     except NetworkConfigError:
@@ -221,36 +327,57 @@ def load_document(*, home: Path | None = None,
         networks[name] = _parse_entry(name, entry)
     if active not in networks:
         raise NetworkConfigError(f"active payment network {active!r} is not configured")
-    document = NetworkDocument(path, active, networks, value)
+    document = NetworkDocument(path, active, networks, value, raw_bytes)
     _check_environment(networks[active], os.environ if environ is None else environ, path)
     return document
 
 
-def _require_limits(home: Path | None) -> tuple[bool, str]:
+def load_document(*, home: Path | None = None,
+                  environ: Mapping[str, str] | None = None) -> NetworkDocument | None:
+    """Load and strictly validate network.json, returning ``None`` only when absent."""
+    with _pay_directory(home, create=False) as pay_fd:
+        if pay_fd is None:
+            return None
+        return _load_document_at(pay_fd, home=home, environ=environ)
+
+
+def _require_limits_at(pay_fd: int | None, home: Path | None) -> tuple[bool, str]:
     path = limits_path(home)
-    if not os.path.lexists(path):
+    if pay_fd is None:
         return False, "mainnet limits.json is required (no default spend limits on real money)"
     try:
-        _read_private_regular(path, "mainnet limits.json")
+        raw = _read_private_at(
+            pay_fd, path.name, path, "mainnet limits.json", missing_ok=True)
     except NetworkConfigError as exc:
         return False, str(exc)
+    if raw is None:
+        return False, "mainnet limits.json is required (no default spend limits on real money)"
     return True, "ready"
 
 
-def _arm_status(network: PayNetwork, home: Path | None) -> tuple[bool, str]:
+def _require_limits(home: Path | None) -> tuple[bool, str]:
+    with _pay_directory(home, create=False) as pay_fd:
+        return _require_limits_at(pay_fd, home)
+
+
+def _arm_status_at(network: PayNetwork, home: Path | None,
+                   pay_fd: int | None) -> tuple[bool, str]:
     path = arm_path(home)
-    if not os.path.lexists(path):
+    if pay_fd is None:
         return False, "mainnet arm file is missing; run `nak pay network arm mainnet`"
     try:
-        raw = _read_private_regular(path, "mainnet arm file")
+        raw = _read_private_at(
+            pay_fd, path.name, path, "mainnet arm file", missing_ok=True)
+        if raw is None:
+            return False, "mainnet arm file is missing; run `nak pay network arm mainnet`"
         value = _load_json(raw, "mainnet arm file")
     except NetworkConfigError as exc:
         return False, str(exc)
-    required = {"network", "genesis", "program", "mint", "armed_at"}
+    required = {"network", "rpc", "genesis", "program", "mint", "armed_at"}
     if not isinstance(value, dict) or set(value) != required:
         return False, "mainnet arm file has the wrong shape; run `nak pay network arm mainnet`"
     expected = {
-        "network": "mainnet", "genesis": network.genesis,
+        "network": "mainnet", "rpc": network.rpc, "genesis": network.genesis,
         "program": network.program, "mint": network.mint,
     }
     if any(value.get(key) != wanted for key, wanted in expected.items()):
@@ -261,7 +388,27 @@ def _arm_status(network: PayNetwork, home: Path | None) -> tuple[bool, str]:
     return True, "ready"
 
 
+def _arm_status(network: PayNetwork, home: Path | None) -> tuple[bool, str]:
+    with _pay_directory(home, create=False) as pay_fd:
+        return _arm_status_at(network, home, pay_fd)
+
+
 def mainnet_gates(network: PayNetwork, *, home: Path | None = None) -> dict[str, tuple[bool, str]]:
+    configured = bool(network.rpc and network.program and network.mint)
+    configured_reason = ("ready" if configured else
+                         "mainnet program not configured" if not network.program else
+                         "mainnet rpc not configured" if not network.rpc else
+                         "mainnet mint not configured")
+    with _pay_directory(home, create=False) as pay_fd:
+        return {
+            "configuration": (configured, configured_reason),
+            "arm": _arm_status_at(network, home, pay_fd),
+            "limits": _require_limits_at(pay_fd, home),
+        }
+
+
+def _mainnet_gates_at(network: PayNetwork, *, home: Path | None,
+                      pay_fd: int) -> dict[str, tuple[bool, str]]:
     configured = bool(network.rpc and network.program and network.mint)
     configured_reason = ("ready" if configured else
                          "mainnet program not configured" if not network.program else
@@ -269,13 +416,21 @@ def mainnet_gates(network: PayNetwork, *, home: Path | None = None) -> dict[str,
                          "mainnet mint not configured")
     return {
         "configuration": (configured, configured_reason),
-        "arm": _arm_status(network, home),
-        "limits": _require_limits(home),
+        "arm": _arm_status_at(network, home, pay_fd),
+        "limits": _require_limits_at(pay_fd, home),
     }
 
 
 def require_mainnet_ready(network: PayNetwork, *, home: Path | None = None) -> None:
     for _name, (ready, reason) in mainnet_gates(network, home=home).items():
+        if not ready:
+            raise NetworkConfigError(reason)
+
+
+def _require_mainnet_ready_at(network: PayNetwork, *, home: Path | None,
+                              pay_fd: int) -> None:
+    for _name, (ready, reason) in _mainnet_gates_at(
+            network, home=home, pay_fd=pay_fd).items():
         if not ready:
             raise NetworkConfigError(reason)
 
@@ -318,127 +473,204 @@ def legacy_pubkey_value(environ: Mapping[str, str], name: str) -> str:
     return environ.get(name, "").strip()
 
 
-def _atomic_write_json(path: Path, value: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(path.parent, 0o700)
-    temp = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp")
+def _write_all(fd: int, body: bytes) -> None:
+    view = memoryview(body)
+    while view:
+        view = view[os.write(fd, view):]
+
+
+def _write_exclusive_at(pay_fd: int, filename: str, body: bytes) -> None:
+    flags = (os.O_CREAT | os.O_EXCL | os.O_WRONLY
+             | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0))
+    fd = os.open(filename, flags, 0o600, dir_fd=pay_fd)
+    try:
+        os.fchmod(fd, 0o600)
+        _write_all(fd, body)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _atomic_write_json_at(pay_fd: int, path: Path, value: dict) -> None:
+    temp = f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
     body = (json.dumps(value, indent=2, sort_keys=False) + "\n").encode("utf-8")
     try:
-        fd = os.open(temp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        try:
-            os.fchmod(fd, 0o600)
-            view = memoryview(body)
-            while view:
-                view = view[os.write(fd, view):]
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        os.replace(temp, path)
-        os.chmod(path, 0o600)
+        _write_exclusive_at(pay_fd, temp, body)
+        os.replace(temp, path.name, src_dir_fd=pay_fd, dst_dir_fd=pay_fd)
+        os.fsync(pay_fd)
     finally:
-        temp.unlink(missing_ok=True)
+        try:
+            os.unlink(temp, dir_fd=pay_fd)
+        except FileNotFoundError:
+            pass
+        else:
+            os.fsync(pay_fd)
+
+
+@contextmanager
+def _mutation_lock(home: Path | None) -> Iterator[int]:
+    with _pay_directory(home, create=True) as pay_fd:
+        assert pay_fd is not None
+        name = ".network.lock"
+        flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            lock_fd = os.open(name, flags | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=pay_fd)
+            os.fchmod(lock_fd, 0o600)
+        except FileExistsError:
+            try:
+                lock_fd = os.open(name, flags, dir_fd=pay_fd)
+            except OSError as exc:
+                raise NetworkConfigError(f"cannot securely open payment network lock: {exc}") from exc
+        try:
+            info = os.fstat(lock_fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+                raise NetworkConfigError("payment network lock must be a regular owner file")
+            if stat.S_IMODE(info.st_mode) != 0o600:
+                raise NetworkConfigError("payment network lock must have mode 0600")
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            current = os.stat(name, dir_fd=pay_fd, follow_symlinks=False)
+            if ((current.st_dev, current.st_ino) != (info.st_dev, info.st_ino)
+                    or stat.S_ISLNK(current.st_mode)):
+                raise NetworkConfigError("payment network lock changed while locking")
+            yield pay_fd
+        finally:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(lock_fd)
 
 
 def initialize_from_environment(*, home: Path | None = None,
                                 environ: Mapping[str, str] | None = None) -> Path:
     environ = os.environ if environ is None else environ
     path = network_path(home)
-    if os.path.lexists(path):
-        raise NetworkConfigError(f"refusing to overwrite existing payment network config {path}")
-    rpc = legacy_rpc_url(environ)
-    program = legacy_pubkey_value(environ, "NAK_PAY_PROGRAM")
-    mint = legacy_pubkey_value(environ, "NAK_PAY_MINT")
-    if not rpc:
-        raise NetworkConfigError("NAK_PAY_RPC is required to initialize network.json")
-    if not program:
-        raise NetworkConfigError("NAK_PAY_PROGRAM is required to initialize network.json")
-    if not mint:
-        raise NetworkConfigError("NAK_PAY_MINT is required to initialize network.json")
-    validate_rpc_url(rpc, "NAK_PAY_RPC")
-    _pubkey(program, "NAK_PAY_PROGRAM")
-    _pubkey(mint, "NAK_PAY_MINT")
-    value = {
-        "active": "devnet",
-        "networks": {
-            "devnet": {
-                "rpc": rpc, "genesis": DEVNET_GENESIS_HASH,
-                "program": program, "mint": mint, "explorer_cluster": "devnet",
+    with _mutation_lock(home) as pay_fd:
+        try:
+            os.stat(path.name, dir_fd=pay_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise NetworkConfigError(
+                f"refusing to overwrite existing payment network config {path}")
+        rpc = legacy_rpc_url(environ)
+        program = legacy_pubkey_value(environ, "NAK_PAY_PROGRAM")
+        mint = legacy_pubkey_value(environ, "NAK_PAY_MINT")
+        if not rpc:
+            raise NetworkConfigError("NAK_PAY_RPC is required to initialize network.json")
+        if not program:
+            raise NetworkConfigError("NAK_PAY_PROGRAM is required to initialize network.json")
+        if not mint:
+            raise NetworkConfigError("NAK_PAY_MINT is required to initialize network.json")
+        validate_rpc_url(rpc, "NAK_PAY_RPC")
+        _pubkey(program, "NAK_PAY_PROGRAM")
+        _pubkey(mint, "NAK_PAY_MINT")
+        value = {
+            "active": "devnet",
+            "networks": {
+                "devnet": {
+                    "rpc": rpc, "genesis": DEVNET_GENESIS_HASH,
+                    "program": program, "mint": mint, "explorer_cluster": "devnet",
+                },
+                "mainnet": {
+                    "rpc": "", "genesis": MAINNET_GENESIS_HASH,
+                    "program": "", "mint": MAINNET_MINT, "explorer_cluster": "",
+                },
             },
-            "mainnet": {
-                "rpc": "", "genesis": MAINNET_GENESIS_HASH,
-                "program": "", "mint": MAINNET_MINT, "explorer_cluster": "",
-            },
-        },
-    }
-    _atomic_write_json(path, value)
+        }
+        _atomic_write_json_at(pay_fd, path, value)
     return path
 
 
 def use_network(name: str, *, home: Path | None = None,
                 environ: Mapping[str, str] | None = None) -> tuple[Path, Path]:
-    document = load_document(home=home, environ=environ)
-    if document is None:
-        raise NetworkConfigError("payment network config is absent; run `nak pay network init`")
-    if name not in document.networks:
-        raise NetworkConfigError(f"unknown payment network {name!r}")
-    target = document.networks[name]
-    target_environ = os.environ if environ is None else environ
-    _check_environment(target, target_environ, document.path)
-    if not target.rpc:
-        raise NetworkConfigError(f"{name} rpc not configured")
-    if not target.program:
-        raise NetworkConfigError("mainnet program not configured" if name == "mainnet" else f"{name} program not configured")
-    if not target.mint:
-        raise NetworkConfigError(f"{name} mint not configured")
-    if name == "mainnet":
-        require_mainnet_ready(target, home=home)
-    original = _read_private_regular(document.path, "payment network config")
-    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-    backup = document.path.with_name(f"{document.path.name}.{stamp}.{time.time_ns()}.bak")
-    fd = os.open(backup, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    try:
-        os.fchmod(fd, 0o600)
-        view = memoryview(original)
-        while view:
-            view = view[os.write(fd, view):]
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    updated = dict(document.raw)
-    updated["active"] = name
-    _atomic_write_json(document.path, updated)
-    return document.path, backup
+    with _mutation_lock(home) as pay_fd:
+        document = _load_document_at(pay_fd, home=home, environ=environ)
+        if document is None:
+            raise NetworkConfigError("payment network config is absent; run `nak pay network init`")
+        if name not in document.networks:
+            raise NetworkConfigError(f"unknown payment network {name!r}")
+        target = document.networks[name]
+        target_environ = os.environ if environ is None else environ
+        _check_environment(target, target_environ, document.path)
+        if not target.rpc:
+            raise NetworkConfigError(f"{name} rpc not configured")
+        if not target.program:
+            raise NetworkConfigError(
+                "mainnet program not configured" if name == "mainnet"
+                else f"{name} program not configured")
+        if not target.mint:
+            raise NetworkConfigError(f"{name} mint not configured")
+        if name == "mainnet":
+            _require_mainnet_ready_at(target, home=home, pay_fd=pay_fd)
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        backup = document.path.with_name(
+            f"{document.path.name}.{stamp}.{time.time_ns()}.bak")
+        _write_exclusive_at(pay_fd, backup.name, document.source)
+        os.fsync(pay_fd)
+        updated = dict(document.raw)
+        updated["active"] = name
+        _atomic_write_json_at(pay_fd, document.path, updated)
+        return document.path, backup
 
 
-def arm_mainnet(*, home: Path | None = None,
+def arm_mainnet(*, input_stream: TextIO, output_stream: TextIO,
+                home: Path | None = None,
                 environ: Mapping[str, str] | None = None,
                 armed_at: int | None = None) -> Path:
-    document = load_document(home=home, environ=environ)
-    if document is None or "mainnet" not in document.networks:
-        raise NetworkConfigError("mainnet is not configured in network.json")
-    network = document.networks["mainnet"]
-    if not network.program:
-        raise NetworkConfigError("mainnet program not configured")
-    if not network.rpc:
-        raise NetworkConfigError("mainnet rpc not configured")
-    if not network.mint:
-        raise NetworkConfigError("mainnet mint not configured")
-    value = {
-        "network": "mainnet", "genesis": network.genesis,
-        "program": network.program, "mint": network.mint,
-        "armed_at": int(time.time() if armed_at is None else armed_at),
-    }
-    path = arm_path(home)
-    _atomic_write_json(path, value)
-    return path
+    if (not getattr(input_stream, "isatty", lambda: False)()
+            or not getattr(output_stream, "isatty", lambda: False)()):
+        raise NetworkConfigError(
+            "nak pay network arm mainnet is interactive-only; run it in a terminal")
+    with _mutation_lock(home) as pay_fd:
+        document = _load_document_at(pay_fd, home=home, environ=environ)
+        if document is None or "mainnet" not in document.networks:
+            raise NetworkConfigError("mainnet is not configured in network.json")
+        network = document.networks["mainnet"]
+        if not network.program:
+            raise NetworkConfigError("mainnet program not configured")
+        if not network.rpc:
+            raise NetworkConfigError("mainnet rpc not configured")
+        if not network.mint:
+            raise NetworkConfigError("mainnet mint not configured")
+        parsed = urllib.parse.urlsplit(network.rpc)
+        host = parsed.hostname or "invalid"
+        if parsed.port is not None:
+            host = f"{host}:{parsed.port}"
+        phrase = f"ARM MAINNET {network.program[:8]}"
+        output_stream.write(
+            f"mainnet rpc host: {host}\n"
+            f"mainnet program: {network.program}\n"
+            f"mainnet mint: {network.mint}\n"
+            f'type exactly "{phrase}": ')
+        output_stream.flush()
+        entered = input_stream.readline().rstrip("\r\n")
+        if entered != phrase:
+            raise NetworkConfigError(
+                "mainnet arm phrase did not match; mainnet remains disarmed")
+        reloaded = _load_document_at(pay_fd, home=home, environ=environ)
+        if reloaded is None or reloaded.source != document.source:
+            raise NetworkConfigError(
+                "network.json changed during the mainnet arm prompt; mainnet remains disarmed")
+        value = {
+            "network": "mainnet", "rpc": network.rpc, "genesis": network.genesis,
+            "program": network.program, "mint": network.mint,
+            "armed_at": int(time.time() if armed_at is None else armed_at),
+        }
+        path = arm_path(home)
+        _atomic_write_json_at(pay_fd, path, value)
+        return path
 
 
 def disarm_mainnet(*, home: Path | None = None) -> bool:
     path = arm_path(home)
-    existed = os.path.lexists(path)
-    if existed:
-        path.unlink()
-    return existed
+    with _mutation_lock(home) as pay_fd:
+        try:
+            os.stat(path.name, dir_fd=pay_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        os.unlink(path.name, dir_fd=pay_fd)
+        os.fsync(pay_fd)
+        return True
 
 
 def installed_user_services(*, home: Path | None = None) -> tuple[str, ...]:

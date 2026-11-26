@@ -1015,20 +1015,8 @@ def _pay_network_command(args) -> None:
         if args.network_cmd == "arm":
             if args.name != "mainnet":
                 raise SystemExit("only mainnet can be armed")
-            document = pay_network.load_document()
-            if document is None or "mainnet" not in document.networks:
-                raise SystemExit("mainnet is not configured in network.json")
-            network = document.networks["mainnet"]
-            if not network.program:
-                raise SystemExit("mainnet program not configured")
-            if not network.rpc:
-                raise SystemExit("mainnet rpc not configured")
-            if not sys.stdin.isatty() or not sys.stdout.isatty():
-                raise SystemExit("nak pay network arm mainnet is interactive-only; run it in a terminal")
-            phrase = f"ARM MAINNET {network.program[:8]}"
-            if input(f'type exactly "{phrase}": ') != phrase:
-                raise SystemExit("mainnet arm phrase did not match; mainnet remains disarmed")
-            path = pay_network.arm_mainnet()
+            path = pay_network.arm_mainnet(
+                input_stream=sys.stdin, output_stream=sys.stdout)
             print(f"mainnet armed for the exact configured program and mint: {path}")
             return
         if args.network_cmd == "disarm":

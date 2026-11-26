@@ -604,9 +604,35 @@ class JsonRpcChannelState:
         raise AssertionError("unreachable")
 
     def _ensure_cluster(self) -> None:
+        # network.json is mutable operator state.  Cache the RPC's genesis,
+        # never the file-level selection or the mainnet arm/limits gates.
+        try:
+            configured = pay_network.active_network()
+        except pay_network.NetworkConfigError as exc:
+            raise VoucherError(str(exc)) from exc
         with self._lock:
             if self._cluster_checked:
+                genesis = self._cluster_genesis
+            else:
+                genesis = None
+        if genesis is not None:
+            if configured is not None:
+                if self.rpc_url != configured.rpc:
+                    raise VoucherError(
+                        "payment RPC differs from the active network.json RPC")
+                if genesis != configured.genesis:
+                    raise VoucherError(
+                        f"Solana RPC genesis does not match active payment network "
+                        f"{configured.name}")
                 return
+            host = (urllib.parse.urlsplit(self.rpc_url).hostname or "").lower()
+            if genesis == MAINNET_GENESIS_HASH:
+                raise VoucherError(
+                    "Solana mainnet RPC is forbidden: Nakshatra payments are DEVNET-ONLY")
+            if genesis != DEVNET_GENESIS_HASH and host not in _LOOPBACK_HOSTS:
+                raise VoucherError(
+                    "Solana RPC cluster is neither devnet nor a loopback test validator")
+            return
         genesis = self._rpc("getGenesisHash", [])
         if not isinstance(genesis, str) or not genesis:
             raise VoucherError("Solana RPC returned malformed getGenesisHash response")
