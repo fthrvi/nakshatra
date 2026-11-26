@@ -860,6 +860,54 @@ def test_chain_paid_gateway_http_uses_no_legacy_credit_routes(
     assert ledger.calls == []
 
 
+def test_chain_paid_openai_usage_reports_generated_tokens(tmp_path, monkeypatch):
+    """Chain mode used to drop the generated count: completion_tokens was 0."""
+    worker_key = "11" * 32
+    config = tmp_path / "chain-paid.yaml"
+    config.write_text(
+        "workers:\n"
+        "  - id: paid-worker\n"
+        f"    public_key_hex: '{worker_key}'\n"
+        f"    peer_spki_hash: '{'22' * 32}'\n"
+        "    address: 127.0.0.1\n"
+        "    port: 1\n"
+        "    layer_range: [0, 4]\n")
+    entry = ns.ModelEntry(
+        name="chain-paid", tokenizer_gguf="/tokenizer", chain_yaml=str(config))
+    backend = ns.ChainChatBackend(paid_admission=True)
+    backend._paid_prompt_tokens = lambda _entry, _prompt: 3
+
+    def chain_client(cmd, *, pass_fds, **_kwargs):
+        progress_fd = int(cmd[cmd.index("--paid-progress-fd") + 1])
+        paid_client.write_invocation_event(progress_fd, worker_key)
+        return SimpleNamespace(returncode=0, stderr="", stdout=(
+            "[chain] step 1: 'Kath'\n"
+            "[chain] step 2: 'mandu.'\n"
+            "[chain] generated 3 tokens in 0.50s  (6.00 tok/s)\n"
+            "[chain] gen:  'Kathmandu.'\n"))
+
+    monkeypatch.setenv("NAK_PAY_MODE", "chain")
+    monkeypatch.setattr("subprocess.run", chain_client)
+    with _running_chat({entry.name: entry}, backend) as port:
+        status, body = _post(port, "/v1/chat/completions", {
+            "model": entry.name,
+            "messages": [{"role": "user", "content": "capital of Nepal?"}],
+            "stream": False,
+        })
+
+    assert status == 200
+    assert body["choices"][0]["message"]["content"] == "Kathmandu."
+    assert body["usage"] == {
+        "prompt_tokens": 3, "completion_tokens": 3, "total_tokens": 6}
+
+
+def test_parse_client_generated_count_takes_last_line_and_defaults_to_zero():
+    assert ns._parse_client_generated_count("[chain] gen:  'x'\n") == 0
+    assert ns._parse_client_generated_count(
+        "[chain] generated 2 tokens in 1.00s  (2.00 tok/s)\n"
+        "[chain] generated 5 tokens in 2.00s  (2.50 tok/s)\n") == 5
+
+
 def test_enforce_mode_receipt_counts_reach_openai_and_ollama_responses(
         tmp_path, monkeypatch):
     monkeypatch.setenv("NAKSHATRA_LEDGER_MODE", "enforce")

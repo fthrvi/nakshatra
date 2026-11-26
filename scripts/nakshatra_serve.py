@@ -693,6 +693,22 @@ def _parse_client_output(stdout: str) -> str:
     return text
 
 
+_GENERATED_COUNT_RE = re.compile(r"^\[chain\] generated (\d+) tokens\b")
+
+
+def _parse_client_generated_count(stdout: str) -> int:
+    """Generated-token count from client.py's ``[chain] generated N tokens``
+    summary line (the LAST one, matching ``_parse_client_output``). This is
+    ``len(generated)``, the same count client.py acknowledges to workers for
+    vouchers. Display only: a missing line reports 0, never a failure."""
+    count = 0
+    for line in stdout.splitlines():
+        m = _GENERATED_COUNT_RE.match(line)
+        if m:
+            count = int(m.group(1))
+    return count
+
+
 def _quiet_unlink(path):
     try:
         os.unlink(path)
@@ -1183,6 +1199,7 @@ class ChainChatBackend(ChatBackend):
         config_path = None
         config_owned = False
         prompt_tokens = 0
+        generated_count = 0
         text = None
         client_stderr = ""
         claim_token = secrets.token_urlsafe(32)
@@ -1232,6 +1249,7 @@ class ChainChatBackend(ChatBackend):
                     raise paid_client.PaidAdmissionError(
                         f"paid client exited {out.returncode}")
                 text = _parse_client_output(out.stdout)
+                generated_count = _parse_client_generated_count(out.stdout)
             finally:
                 token_file.close()
                 for fd in (progress_read, progress_write):
@@ -1249,7 +1267,9 @@ class ChainChatBackend(ChatBackend):
             if config_owned and config_path:
                 _quiet_unlink(config_path)
 
-        return GenerationResult(text=text, prompt_eval_count=prompt_tokens)
+        return GenerationResult(
+            text=text, eval_count=generated_count,
+            prompt_eval_count=prompt_tokens)
 
     def generate(self, entry, prompt, max_tokens, options):
         import subprocess, tempfile
