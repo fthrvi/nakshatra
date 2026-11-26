@@ -76,7 +76,17 @@ A process running as the same Unix user can still edit `network.json` or either
 limits file. It cannot produce a valid replacement arm statement: that requires
 the release key held behind the hub's Face ID approval broker. Editing a bound
 value therefore makes the mainnet gate fail closed until the owner signs a new
-statement.
+statement. The spend path parses only the limits bytes the signed statement
+names, so swapping the limits file after a check cannot take effect.
+
+What this does NOT protect against: code that is hostile and running as that
+same user. Such code can rewrite the pinned release key in
+`~/.nakshatra-node/config.json` or the installed Nakshatra code itself, and on a
+file-custody node it can simply read `~/.nakshatra/pay/wallet.ed25519` and sign
+mainnet transactions without Nakshatra at all. The Face ID arm stops mistakes,
+misconfiguration and agents acting through `nak` from moving real money; it is
+not a sandbox. A node that must resist hostile local code needs broker custody
+(the wallet key outside the user's reach, like the hub).
 
 For a broker-custody wallet such as the hub's, the copied broker policy remains
 devnet-only. It needs its own reviewed policy update before that wallet can be
