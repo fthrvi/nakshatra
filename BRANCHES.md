@@ -5,7 +5,7 @@ On create add a row (status=active, owner). On merge flip to `merged→<sha>`.
 
 | branch | sector | description | base | status | owner |
 |---|---|---|---|---|---|
-| pay/worker-payee-binding | pay | Chain-paid inference: consumer learns the worker's pay-wallet address through a node-key-signed binding and opens the channel to it (today it opens to the node key, which the worker always refuses). | forgejo/main@8f149ee | active | claude/network-lane |
+| pay/worker-payee-binding | pay | Chain-paid inference: consumer learns the worker's pay-wallet address through a node-key-signed binding and opens the channel to it (today it opens to the node key, which the worker always refuses). | forgejo/main@8f149ee | merged→ce2d1f5 | claude/network-lane |
 | pay/vendor-deposit-policy | pay | Vendor broker pay_wallet_policy.py byte-for-byte from trisul 2a999a7a9 (sha cb79bb2f…, deposit decoder) and cover deposit in the policy tests. | forgejo/main@99180f4 | merged→acabd31 | claude/network-lane |
 | pay/broker-wallet-deposit-client | pay | Allow broker-custody escrow deposits through the pinned two-instruction broker template with client-side amount, escrow, and ATA-balance checks. | forgejo/main@373a17d | merged→bce14db | codex/network-lane |
 | pay/broker-wallet-client | payments | M4c 2c step 5: pay_wallet_custody file-or-broker boundary, compile-once/assemble seam, rv5#3 + setup-rerun broker-custody fixes, durable attempt journal/reconciler for broker sends, CLI+starter wiring, fake-transport tests only. | forgejo/main@7af5f24 | merged→b12fc5a | codex for claude/trisul-aa network lane (hub) |
