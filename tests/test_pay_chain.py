@@ -1068,17 +1068,21 @@ send(rpc,[pay.config_init({'authority':authority.pubkey(),'config':config,'progr
             authority_seed).public_key().public_bytes_raw().hex()
         with pay_voucher.PayerChannelBook() as book:
             channel = pay_autochannel.ensure_channel(
-                worker_key, 1, owner=wallet["address"], book=book, state=rpc,
+                worker_key, 1, payee_wallet=pay_chain.b58encode(bytes.fromhex(worker_key)),
+                owner=wallet["address"], book=book, state=rpc,
                 program=PROGRAM, private_key=node_seed, rpc=rpc)
             reused = pay_autochannel.ensure_channel(
-                worker_key, 1, owner=wallet["address"], book=book, state=rpc,
+                worker_key, 1, payee_wallet=pay_chain.b58encode(bytes.fromhex(worker_key)),
+                owner=wallet["address"], book=book, state=rpc,
                 program=PROGRAM, private_key=node_seed, rpc=rpc)
             assert reused.channel == channel.channel
             other_worker = ed25519.Ed25519PrivateKey.from_private_bytes(
                 bytes([77]) * 32).public_key().public_bytes_raw().hex()
             with pytest.raises(pay_voucher.VoucherError, match="24-hour"):
                 pay_autochannel.ensure_channel(
-                    other_worker, 1, owner=wallet["address"], book=book,
+                    other_worker, 1,
+                    payee_wallet=pay_chain.b58encode(bytes.fromhex(other_worker)),
+                    owner=wallet["address"], book=book,
                     state=rpc, program=PROGRAM, private_key=node_seed, rpc=rpc)
         assert rpc.account_info(channel.channel) is not None
 
@@ -1115,7 +1119,9 @@ send(rpc,[pay.config_init({'authority':authority.pubkey(),'config':config,'progr
             bytes([80]) * 32).public_key().public_bytes_raw().hex()
         with pay_voucher.PayerChannelBook(starter_dir / "channels.sqlite") as starter_book:
             starter_channel = pay_autochannel.ensure_channel(
-                starter_worker, 1, owner=newcomer_wallet, book=starter_book,
+                starter_worker, 1,
+                payee_wallet=pay_chain.b58encode(bytes.fromhex(starter_worker)),
+                owner=newcomer_wallet, book=starter_book,
                 state=rpc, program=PROGRAM, private_key=newcomer_seed, rpc=rpc,
                 limits_path=limits, ledger_path=starter_dir / "opens.sqlite",
                 lock_path=starter_dir / "open.lock")
@@ -1132,7 +1138,9 @@ send(rpc,[pay.config_init({'authority':authority.pubkey(),'config':config,'progr
         with pay_voucher.PayerChannelBook(starter_dir / "channels-2.sqlite") as starter_book:
             with pytest.raises(pay_voucher.VoucherError, match="starter is disabled"):
                 pay_autochannel.ensure_channel(
-                    (bytes([81]) * 32).hex(), 1, owner=newcomer_wallet,
+                    (bytes([81]) * 32).hex(), 1,
+                    payee_wallet=pay_chain.b58encode(bytes([81]) * 32),
+                    owner=newcomer_wallet,
                     book=starter_book, state=rpc, program=PROGRAM,
                     private_key=newcomer_seed, rpc=rpc, limits_path=limits,
                     ledger_path=starter_dir / "opens-2.sqlite",

@@ -80,6 +80,10 @@ message InfoResponse {
   // then the challenge.
   string worker_keyid       = 13;
   bytes  identity_signature = 14;
+  // Chain-paid workers additionally return a canonical JSON
+  // nakshatra-payee-binding dict signed by worker_keyid. Empty in every
+  // non-chain mode so legacy/readiness Info bytes remain unchanged.
+  bytes  payee_binding_json = 15;
 }
 
 message ForwardRequest {

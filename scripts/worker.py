@@ -2359,6 +2359,7 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
                           "worker starting: " + (self.starting_reason or "registration with the pillar not finished"))
         worker_keyid = ""
         identity_signature = b""
+        payee_binding_json = b""
         if challenge:
             if not self._worker_identity_ready:
                 context.abort(
@@ -2367,6 +2368,15 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
             worker_keyid = self.worker_pub_hex
             identity_signature = ed25519.Ed25519PrivateKey.from_private_bytes(
                 self.worker_priv).sign(_INFO_ATTESTATION_DOMAIN + challenge)
+            paid_admission = getattr(self, "paid_admission", None)
+            if (paid_admission is not None
+                    and paid_admission.ready
+                    and paid_admission.chain_mode):
+                binding = paid_admission._pay.sign_payee_binding(
+                    self.worker_priv,
+                    paid_admission.pay_wallet_address,
+                    paid_admission.pay_program)
+                payee_binding_json = paid_admission._pay.encode_payee_binding(binding)
         return pb.InfoResponse(
             protocol_version="0.1.0",
             backend="llamacpp-cpu-patched",
@@ -2381,6 +2391,7 @@ class WorkerServicer(pb_grpc.NakshatraServicer):
             has_lm_head=(self.mode in ("last", "solo")),
             worker_keyid=worker_keyid,
             identity_signature=identity_signature,
+            payee_binding_json=payee_binding_json,
             # v0.5 §9.1 closure — advertised features so the client can
             # negotiate push at session start without runtime probing.
             # v1.0 §7 — append control/vN tokens so the client can negotiate

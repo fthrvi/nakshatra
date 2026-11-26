@@ -64,6 +64,11 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 
 VOUCHER_DOMAIN = b"NAK_PAY_VOUCHER1"
 VOUCHER_MESSAGE_LEN = 88
+PAYEE_BINDING_DOMAIN = b"nakshatra-payee-binding-v1\0"
+PAYEE_BINDING_KIND = "nakshatra-payee-binding"
+PAYEE_BINDING_FIELDS = frozenset({
+    "v", "kind", "worker_keyid", "pay_wallet", "program", "signature",
+})
 RATE = 100
 REDEEM_MARGIN = 600
 CLOSING_POLL_S = 60
@@ -186,6 +191,105 @@ def verify_voucher(public_key: object, signature: bytes, program_id: object,
         return True
     except (InvalidSignature, TypeError, ValueError):
         return False
+
+
+def payee_binding_message(worker_keyid: object, pay_wallet: object,
+                          program: object) -> bytes:
+    """Return the fixed-width node-signed worker payee statement."""
+    if (not isinstance(worker_keyid, str)
+            or re.fullmatch(r"[0-9a-f]{64}", worker_keyid) is None):
+        raise VoucherError("payee binding worker keyid must be 32-byte lowercase hex")
+    return (
+        PAYEE_BINDING_DOMAIN
+        + bytes.fromhex(worker_keyid)
+        + _pubkey_bytes(pay_wallet, "payee binding wallet")
+        + _pubkey_bytes(program, "payee binding program")
+    )
+
+
+def sign_payee_binding(node_key: object, pay_wallet: object,
+                       program: object) -> dict:
+    """Bind this worker's Solana pay wallet to its persistent node key."""
+    private = _private_key(node_key)
+    worker_keyid = private.public_key().public_bytes_raw().hex()
+    wallet_text = _pubkey_text(pay_wallet, "payee binding wallet")
+    program_text = _pubkey_text(program, "payee binding program")
+    signature = private.sign(payee_binding_message(
+        worker_keyid, wallet_text, program_text)).hex()
+    return {
+        "v": 1,
+        "kind": PAYEE_BINDING_KIND,
+        "worker_keyid": worker_keyid,
+        "pay_wallet": wallet_text,
+        "program": program_text,
+        "signature": signature,
+    }
+
+
+def encode_payee_binding(binding: Mapping[str, object]) -> bytes:
+    """Encode the small binding dict canonically for the Info protobuf field."""
+    return json.dumps(
+        dict(binding), sort_keys=True, separators=(",", ":"),
+        ensure_ascii=True).encode("ascii")
+
+
+def decode_payee_binding(raw: object) -> dict:
+    """Decode a bounded binding object, rejecting duplicate JSON members."""
+    try:
+        encoded = bytes(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise VoucherError("payee binding is not bytes") from exc
+    if not encoded or len(encoded) > 2048:
+        raise VoucherError("payee binding is missing or too large")
+
+    def pairs(values):
+        result = {}
+        for key, value in values:
+            if key in result:
+                raise VoucherError("payee binding contains a duplicate field")
+            result[key] = value
+        return result
+
+    try:
+        value = json.loads(encoded.decode("ascii"), object_pairs_hook=pairs)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise VoucherError("payee binding is invalid JSON") from exc
+    if not isinstance(value, dict):
+        raise VoucherError("payee binding must be an object")
+    return value
+
+
+def verify_payee_binding(binding: Mapping[str, object], *,
+                         worker_keyid: str, program: object) -> str:
+    """Verify one exact binding against the planned node key and program."""
+    if not isinstance(binding, Mapping) or set(binding) != PAYEE_BINDING_FIELDS:
+        raise VoucherError("unknown payee binding schema")
+    if isinstance(binding.get("v"), bool) or binding.get("v") != 1:
+        raise VoucherError("unknown payee binding version")
+    if binding.get("kind") != PAYEE_BINDING_KIND:
+        raise VoucherError("unknown payee binding kind")
+    if (not isinstance(worker_keyid, str)
+            or re.fullmatch(r"[0-9a-f]{64}", worker_keyid) is None):
+        raise VoucherError("planned worker keyid is invalid")
+    if binding.get("worker_keyid") != worker_keyid:
+        raise VoucherError("payee binding signature worker differs from the paid plan")
+    configured_program = _pubkey_text(program, "configured payee binding program")
+    binding_program = _pubkey_text(
+        binding.get("program"), "payee binding program")
+    if binding_program != configured_program:
+        raise VoucherError("payee binding program differs from configured program")
+    wallet = _pubkey_text(binding.get("pay_wallet"), "payee binding wallet")
+    signature_hex = binding.get("signature")
+    if (not isinstance(signature_hex, str)
+            or re.fullmatch(r"[0-9a-f]{128}", signature_hex) is None):
+        raise VoucherError("payee binding signature must be 64-byte lowercase hex")
+    try:
+        ed25519.Ed25519PublicKey.from_public_bytes(bytes.fromhex(worker_keyid)).verify(
+            bytes.fromhex(signature_hex),
+            payee_binding_message(worker_keyid, wallet, binding_program))
+    except (InvalidSignature, TypeError, ValueError) as exc:
+        raise VoucherError("payee binding signature is invalid") from exc
+    return wallet
 
 
 def credits_to_total(channel_base: int, cumulative_credits: int) -> int:
@@ -712,7 +816,8 @@ class PayerChannelBook(_Book):
     def begin_session(self, worker_key: str, *, program: str, state: ChannelState,
                       max_cost_credits: int | None = None,
                       required_micro_usdc: int | None = None,
-                      channel: str | None = None) -> PayerChannel:
+                      channel: str | None = None,
+                      payee_wallet: str | None = None) -> PayerChannel:
         configured = _pubkey_text(program, "program id")
         if (max_cost_credits is None) == (required_micro_usdc is None):
             raise VoucherError(
@@ -721,6 +826,8 @@ class PayerChannelBook(_Book):
                     if required_micro_usdc is not None
                     else required_capacity_micro_usdc(max_cost_credits))
         worker = str(worker_key).lower()
+        expected_payee = (None if payee_wallet is None else
+                          _pubkey_text(payee_wallet, "bound payee wallet"))
         preferred = None if channel is None else _pubkey_text(channel, "channel")
         chosen = None
         with self._lock:
@@ -744,6 +851,9 @@ class PayerChannelBook(_Book):
                                 or str(exc).startswith("account does not exist:")):
                             continue
                         raise
+                    if (expected_payee is not None
+                            and channel_state.worker != expected_payee):
+                        continue
                     try:
                         # Payer selection is status-only.  On-chain Open accounts
                         # have close_at=0; worker admission owns the chain-time

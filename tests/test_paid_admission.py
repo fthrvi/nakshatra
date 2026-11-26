@@ -373,6 +373,7 @@ def test_info_identity_attestation_interoperates_with_gateway_verifier():
 
     assert response.worker_keyid == public
     assert len(response.identity_signature) == 64
+    assert response.payee_binding_json == b""
     ed25519.Ed25519PublicKey.from_public_bytes(bytes.fromhex(public)).verify(
         response.identity_signature,
         b"nakshatra-paid-info-v1\0" + challenge)
@@ -392,6 +393,7 @@ def test_empty_info_challenge_is_byte_identical_to_legacy_probe():
     assert keyed_response.SerializeToString() == legacy_response.SerializeToString()
     assert keyed_response.worker_keyid == ""
     assert keyed_response.identity_signature == b""
+    assert keyed_response.payee_binding_json == b""
 
 
 @pytest.mark.parametrize("challenge", [b"x", b"x" * 31, b"x" * 33])

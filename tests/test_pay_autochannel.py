@@ -309,7 +309,9 @@ def _ensure(tmp_path, rpc, *, worker=WORKER, required=1, state=None, clock=None)
     try:
         kwargs = {} if clock is None else {"clock": clock}
         return auto.ensure_channel(
-            worker, required, owner=OWNER, book=book, state=state or rpc,
+            worker, required,
+            payee_wallet=pay_chain.b58encode(bytes.fromhex(worker)),
+            owner=OWNER, book=book, state=state or rpc,
             program=PROGRAM, private_key=NODE_SEED, rpc=rpc,
             limits_path=paths["limits"], ledger_path=paths["ledger"],
             lock_path=paths["lock"], **kwargs)
@@ -569,7 +571,8 @@ def test_post_open_verification_rejects_each_mutated_field(
                 voucher.VoucherError,
                 match="finalized channel does not match the requested open"):
             auto.ensure_channel(
-                WORKER, 1, owner=OWNER, book=book, state=rpc,
+                WORKER, 1, payee_wallet=pay_chain.b58encode(WORKER_PUBLIC),
+                owner=OWNER, book=book, state=rpc,
                 program=PROGRAM, private_key=NODE_SEED, rpc=rpc,
                 limits_path=paths["limits"], ledger_path=paths["ledger"],
                 lock_path=paths["lock"])

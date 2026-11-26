@@ -367,6 +367,8 @@ def test_client_chain_voucher_setup_needs_only_broker_public_identity(
     worker_seed = bytes.fromhex("11" * 32)
     worker_key = ed25519.Ed25519PrivateKey.from_private_bytes(
         worker_seed).public_key().public_bytes_raw().hex()
+    program = pay_voucher.b58encode(bytes([71]) * 32)
+    worker_pay_wallet = pay_voucher.b58encode(bytes([72]) * 32)
     worker_path = home / ".nakshatra" / "keys" / "worker.ed25519"
     worker_path.parent.mkdir(parents=True)
     worker_path.write_bytes(worker_seed)
@@ -397,15 +399,18 @@ def test_client_chain_voucher_setup_needs_only_broker_public_identity(
         assert timeout == 10.0
         signature = ed25519.Ed25519PrivateKey.from_private_bytes(worker_seed).sign(
             paid_client.INFO_ATTESTATION_DOMAIN + request.identity_challenge)
+        binding = pay_voucher.sign_payee_binding(
+            worker_seed, worker_pay_wallet, program)
         return client.pb.InfoResponse(
             protocol_version="0.1.0", layer_start=0, layer_end=2,
             hidden_size=8, has_token_embd=True, has_lm_head=True,
             protocol_capabilities=list(paid_client.REQUIRED_PAID_CAPABILITIES),
-            worker_keyid=worker_key, identity_signature=signature)
+            worker_keyid=worker_key, identity_signature=signature,
+            payee_binding_json=pay_voucher.encode_payee_binding(binding))
 
     monkeypatch.setattr(client, "info_with_startup_wait", info)
     monkeypatch.setattr(client, "tokenize_local", lambda *_args: ([1, 2, 3], object()))
-    monkeypatch.setattr(pay_voucher, "configured_program", lambda: "program")
+    monkeypatch.setattr(pay_voucher, "configured_program", lambda: program)
     monkeypatch.setattr(pay_voucher, "configured_state", lambda: "state")
     monkeypatch.setattr(pay_chain, "configured_rpc_url", lambda _env: "loopback-fake")
     monkeypatch.setattr(
@@ -417,6 +422,7 @@ def test_client_chain_voucher_setup_needs_only_broker_public_identity(
 
     def ensure_channel(*_args, **kwargs):
         owners.append(kwargs["owner"])
+        assert kwargs["payee_wallet"] == worker_pay_wallet
         return "channel"
 
     monkeypatch.setattr(pay_autochannel, "ensure_channel", ensure_channel)

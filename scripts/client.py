@@ -1827,6 +1827,14 @@ def main():
         return w["candidates"][w["cursor"]]
 
     rpc_policies = {}
+    chain_pay_program = None
+    chain_pay_voucher = None
+    if paid is not None and os.environ.get("NAK_PAY_MODE", "") == "chain":
+        try:
+            from network import pay_voucher as chain_pay_voucher
+            chain_pay_program = chain_pay_voucher.configured_program()
+        except Exception as exc:
+            sys.exit(f"[paid] payee binding refused: {exc}")
 
     def _setup_chain(context="chain"):
         """Open channels + call Info on each worker's current candidate.
@@ -1859,12 +1867,24 @@ def main():
                 stub, pb.InfoRequest(identity_challenge=identity_challenge),
                 timeout=10.0)
             attested_worker_keyid = None
+            attested_payee_wallet = None
             if paid is not None:
                 try:
                     attested_worker_keyid = paid_client.verify_info_attestation(
                         info, identity_challenge)
                 except paid_client.PaidAdmissionError as exc:
                     sys.exit(f"[paid] pre-compute admission refused: {exc}")
+                if chain_pay_voucher is not None:
+                    try:
+                        binding = chain_pay_voucher.decode_payee_binding(
+                            info.payee_binding_json)
+                        attested_payee_wallet = (
+                            chain_pay_voucher.verify_payee_binding(
+                                binding,
+                                worker_keyid=attested_worker_keyid,
+                                program=chain_pay_program))
+                    except Exception as exc:
+                        sys.exit(f"[paid] payee binding refused: {exc}")
             caps = list(info.protocol_capabilities)
             # v1.0 §7 — negotiate the control-protocol version on the same
             # handshake. Refuse to build a chain with a worker we can't speak
@@ -1894,6 +1914,8 @@ def main():
             active_w.update(resolved_spec)
             if attested_worker_keyid is not None:
                 active_w["_paid_attested_worker_keyid"] = attested_worker_keyid
+            if attested_payee_wallet is not None:
+                active_w["_paid_payee_wallet"] = attested_payee_wallet
             policy_key = (
                 active_w.get("node_id") or active_w.get("id"),
                 active_w.get(_CLIENT_DIAL_ADDRESS),
@@ -1993,10 +2015,15 @@ def main():
                 for stage in paid["plan"]
             }
             owner = load_wallet_identity(Path.home())["address"]
+            payees_by_worker = {
+                w["_paid_attested_worker_keyid"]: w["_paid_payee_wallet"]
+                for w, _stub, _info in sorted_stubs
+            }
             chosen_channels = {
                 worker_key: pay_autochannel.ensure_channel(
                     worker_key,
                     pay_voucher.required_capacity_micro_usdc(max_cost),
+                    payee_wallet=payees_by_worker[worker_key],
                     owner=owner, book=book, state=state, program=program,
                     private_key=private_key)
                 for worker_key, max_cost in max_costs.items()

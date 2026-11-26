@@ -215,7 +215,8 @@ def _limiting_refusal(required: int, candidates: Mapping[str, int]) -> str:
             f"{_amount(cap)} USDC; add funds with `nak pay deposit`")
 
 
-def ensure_channel(worker_key: str, required_micro_usdc: int, *, owner: str,
+def ensure_channel(worker_key: str, required_micro_usdc: int, *,
+                   payee_wallet: str, owner: str,
                    book: pay_voucher.PayerChannelBook | None = None,
                    state: pay_voucher.ChannelState | None = None,
                    program: str | None = None, private_key: bytes | None = None,
@@ -223,18 +224,19 @@ def ensure_channel(worker_key: str, required_micro_usdc: int, *, owner: str,
                    ledger_path: str | Path | None = None,
                    lock_path: str | Path | None = None,
                    clock: Callable[[], float] = time.time) -> pay_voucher.PayerChannel:
-    """Return a usable worker channel, opening one with the node delegate if needed."""
+    """Return a channel to the explicit bound payee, opening it if needed."""
     required = _positive_u64(required_micro_usdc, "required channel capacity")
     if re.fullmatch(r"[0-9a-f]{64}", str(worker_key)) is None:
         raise pay_voucher.VoucherError("worker key must be 32-byte lowercase hex")
     configured_program = (pay_voucher.configured_program() if program is None
                           else pay_chain.pubkey_text(program, "program id"))
+    worker_address = pay_chain.pubkey_text(payee_wallet, "bound payee wallet")
     channel_book = book or pay_voucher.PayerChannelBook()
     channel_state = state or pay_voucher.configured_state()
     try:
         return channel_book.begin_session(
             worker_key, program=configured_program, state=channel_state,
-            required_micro_usdc=required)
+            required_micro_usdc=required, payee_wallet=worker_address)
     except pay_voucher.NoUsableChannel:
         pass
 
@@ -245,7 +247,7 @@ def ensure_channel(worker_key: str, required_micro_usdc: int, *, owner: str,
         try:
             return channel_book.begin_session(
                 worker_key, program=configured_program, state=channel_state,
-                required_micro_usdc=required)
+                required_micro_usdc=required, payee_wallet=worker_address)
         except pay_voucher.NoUsableChannel:
             pass
 
@@ -255,7 +257,6 @@ def ensure_channel(worker_key: str, required_micro_usdc: int, *, owner: str,
         node_public = pay_voucher.public_key_bytes(node_seed)
         node_address = pay_chain.b58encode(node_public)
         owner_address = pay_chain.pubkey_text(owner, "escrow owner")
-        worker_address = pay_chain.b58encode(bytes.fromhex(worker_key))
         tx_rpc = rpc
         if tx_rpc is None:
             rpc_url = pay_chain.configured_rpc_url(os.environ)
@@ -428,7 +429,8 @@ def ensure_channel(worker_key: str, required_micro_usdc: int, *, owner: str,
                     max_signed_total=0, last_voucher_at=int(now))
                 chosen = channel_book.begin_session(
                     worker_key, program=configured_program, state=tx_rpc,
-                    required_micro_usdc=required, channel=channel_address)
+                    required_micro_usdc=required, channel=channel_address,
+                    payee_wallet=worker_address)
                 print(
                     f"[paid] opened channel for {worker_key[:12]} "
                     f"cap={_amount(cap)} USDC signature={signature}",

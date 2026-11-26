@@ -22,8 +22,10 @@ import ledger_client  # noqa: E402
 import client  # noqa: E402
 import nakshatra_serve as serve  # noqa: E402
 import nakshatra_pb2 as pb  # noqa: E402
+import paid_admission  # noqa: E402
 import paid_client as paid  # noqa: E402
 from sidecar_key import peer_id_from_node_pub  # noqa: E402
+from network import pay_autochannel, pay_chain, pay_voucher, pay_wallet  # noqa: E402
 
 
 PRIV1 = bytes.fromhex("11" * 32)
@@ -42,6 +44,10 @@ KEY2 = _public_key(PRIV2)
 PAYER = "c" * 64
 SPKI1 = "d" * 64
 SPKI2 = "e" * 64
+PAY_PROGRAM = pay_voucher.b58encode(bytes([1]) * 32)
+PAY_WALLET = pay_voucher.b58encode(bytes([2]) * 32)
+PAY_CHANNEL = pay_voucher.b58encode(bytes([3]) * 32)
+PAY_ESCROW = pay_voucher.b58encode(bytes([4]) * 32)
 
 
 def _plan():
@@ -233,6 +239,213 @@ def test_info_attestation_rejects_wrong_signature_and_unattested_runtime():
             [{"worker_keyid": KEY1, "layer_start": 0, "layer_end": 2}],
             [({}, object(), SimpleNamespace(layer_start=0, layer_end=2))],
         )
+
+
+@pytest.mark.parametrize("mutation", [
+    "wrong-signer", "other-program", "wrong-kind", "wrong-version",
+    "malformed-wallet",
+])
+def test_chain_payee_binding_refuses_before_channel_open_or_compute(
+        mutation, tmp_path, monkeypatch):
+    config = tmp_path / "chain.yaml"
+    config.write_text(
+        "model: {id: model}\nworkers:\n"
+        f"  - id: one\n    public_key_hex: {KEY1}\n"
+        f"    peer_spki_hash: {SPKI1}\n"
+        "    address: 127.0.0.1\n    port: 5540\n"
+        "    layer_range: [0, 2]\n    mode: solo\n")
+    envelope = paid.make_paid_envelope(
+        claim_token="A" * 43, hold_id="hold", session_id="session",
+        model_id="model", max_prompt_tokens=3, max_output_tokens=2,
+        plan=[{"worker_keyid": KEY1, "layer_start": 0, "layer_end": 2}])
+    admission_read, admission_write = os.pipe()
+    progress_read, progress_write = os.pipe()
+    os.write(admission_write, json.dumps(envelope).encode())
+    os.close(admission_write)
+    opened = []
+
+    binding_key = PRIV2 if mutation == "wrong-signer" else PRIV1
+    binding_program = (
+        pay_voucher.b58encode(bytes([3]) * 32)
+        if mutation == "other-program" else PAY_PROGRAM)
+    binding = pay_voucher.sign_payee_binding(
+        binding_key, PAY_WALLET, binding_program)
+    if mutation == "wrong-signer":
+        binding["worker_keyid"] = KEY1
+    elif mutation == "wrong-kind":
+        binding["kind"] = "other-kind"
+    elif mutation == "wrong-version":
+        binding["v"] = 2
+    elif mutation == "malformed-wallet":
+        binding["pay_wallet"] = "not-a-pubkey"
+
+    monkeypatch.setenv("NAK_PAY_MODE", "chain")
+    monkeypatch.setattr(pay_voucher, "configured_program", lambda: PAY_PROGRAM)
+    monkeypatch.setattr(client, "_TLS_AVAILABLE", True)
+    monkeypatch.setattr(client, "_open_chain_channel", lambda *_args: object())
+    monkeypatch.setattr(client.pb_grpc, "NakshatraStub", lambda _channel: object())
+    monkeypatch.setattr(
+        pay_autochannel, "ensure_channel",
+        lambda *_args, **_kwargs: opened.append((_args, _kwargs)))
+
+    def info(_stub, request, timeout):
+        assert timeout == 10.0
+        signature = ed25519.Ed25519PrivateKey.from_private_bytes(PRIV1).sign(
+            paid.INFO_ATTESTATION_DOMAIN + request.identity_challenge)
+        return pb.InfoResponse(
+            protocol_version="0.1.0", layer_start=0, layer_end=2,
+            hidden_size=8, has_token_embd=True, has_lm_head=True,
+            protocol_capabilities=list(paid.REQUIRED_PAID_CAPABILITIES),
+            worker_keyid=KEY1, identity_signature=signature,
+            payee_binding_json=json.dumps(
+                binding, sort_keys=True, separators=(",", ":")).encode())
+
+    monkeypatch.setattr(client, "info_with_startup_wait", info)
+    monkeypatch.setattr(
+        client, "tokenize_local",
+        lambda *_args, **_kwargs: pytest.fail("invalid binding reached compute"))
+    monkeypatch.setattr(sys, "argv", [
+        "client.py", "--config", str(config), "--model-id", "model",
+        "--model-path", "/unused.gguf", "--prompt", "prompt",
+        "--max-tokens", "2", "--use-streaming",
+        "--paid-admission-fd", str(admission_read),
+        "--paid-progress-fd", str(progress_write),
+    ])
+    try:
+        with pytest.raises(SystemExit, match="payee binding"):
+            client.main()
+    finally:
+        os.close(progress_read)
+        os.close(progress_write)
+
+    assert opened == []
+
+
+def test_chain_consumer_opens_to_bound_wallet_and_worker_accepts_claim(
+        tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    key_dir = home / ".nakshatra" / "keys"
+    key_dir.mkdir(parents=True, mode=0o700)
+    payer_seed = bytes.fromhex("33" * 32)
+    payer_public = ed25519.Ed25519PrivateKey.from_private_bytes(
+        payer_seed).public_key().public_bytes_raw()
+    payer_keyid = payer_public.hex()
+    payer_address = pay_voucher.b58encode(payer_public)
+    key_path = key_dir / "worker.ed25519"
+    key_path.write_bytes(payer_seed)
+    key_path.chmod(0o600)
+    owner = pay_voucher.b58encode(bytes([5]) * 32)
+
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("NAK_PAY_MODE", "chain")
+    monkeypatch.setattr(
+        pay_wallet, "load_wallet_identity",
+        lambda _home: {"address": PAY_WALLET})
+    state = pay_voucher.FakeChannelState(
+        {}, {PAY_ESCROW: owner}, program_id=PAY_PROGRAM)
+    worker_store = paid_admission.PaidAdmissionStore(tmp_path / "worker-paid.sqlite")
+    worker_vouchers = pay_voucher.WorkerVoucherStore(
+        tmp_path / "worker-vouchers.sqlite")
+    worker_admission = paid_admission.PaidAdmission(
+        SimpleNamespace(worker_keyid=KEY1), worker_store, PRIV1,
+        model_id="model", layer_start=0, layer_end=2,
+        voucher_store=worker_vouchers, channel_state=state,
+        pay_program=PAY_PROGRAM, chain_time=lambda: 100)
+    assert worker_admission.check_ready()
+    monkeypatch.setattr(
+        pay_wallet, "load_wallet_identity",
+        lambda _home: {"address": owner})
+
+    config = tmp_path / "chain.yaml"
+    config.write_text(
+        "model: {id: model}\nworkers:\n"
+        f"  - id: one\n    public_key_hex: {KEY1}\n"
+        f"    peer_spki_hash: {SPKI1}\n"
+        "    address: 127.0.0.1\n    port: 5540\n"
+        "    layer_range: [0, 2]\n    mode: solo\n")
+    envelope = paid.make_paid_envelope(
+        claim_token="A" * 43, hold_id="hold", session_id="session",
+        model_id="model", max_prompt_tokens=3, max_output_tokens=2,
+        plan=[{"worker_keyid": KEY1, "layer_start": 0, "layer_end": 2}])
+    admission_read, admission_write = os.pipe()
+    progress_read, progress_write = os.pipe()
+    os.write(admission_write, json.dumps(envelope).encode())
+    os.close(admission_write)
+    opened_payees = []
+
+    binding = pay_voucher.sign_payee_binding(PRIV1, PAY_WALLET, PAY_PROGRAM)
+    monkeypatch.setattr(client, "_TLS_AVAILABLE", True)
+    monkeypatch.setattr(client, "_open_chain_channel", lambda *_args: object())
+    monkeypatch.setattr(client.pb_grpc, "NakshatraStub", lambda _channel: object())
+
+    def info(_stub, request, timeout):
+        assert timeout == 10.0
+        signature = ed25519.Ed25519PrivateKey.from_private_bytes(PRIV1).sign(
+            paid.INFO_ATTESTATION_DOMAIN + request.identity_challenge)
+        return pb.InfoResponse(
+            protocol_version="0.1.0", layer_start=0, layer_end=2,
+            hidden_size=8, has_token_embd=True, has_lm_head=True,
+            protocol_capabilities=list(paid.REQUIRED_PAID_CAPABILITIES),
+            worker_keyid=KEY1, identity_signature=signature,
+            payee_binding_json=pay_voucher.encode_payee_binding(binding))
+
+    monkeypatch.setattr(client, "info_with_startup_wait", info)
+    monkeypatch.setattr(client, "tokenize_local", lambda *_args: ([1, 2, 3], object()))
+    monkeypatch.setattr(pay_voucher, "configured_program", lambda: PAY_PROGRAM)
+    monkeypatch.setattr(pay_voucher, "configured_state", lambda: state)
+    monkeypatch.setattr(pay_chain, "configured_rpc_url", lambda _env: "loopback-fake")
+    monkeypatch.setattr(
+        pay_chain, "PayRpc",
+        lambda _url: SimpleNamespace(chain_time=lambda: 100))
+
+    def ensure_channel(worker_key, required, *, payee_wallet, book, **_kwargs):
+        assert worker_key == KEY1
+        assert required == 1
+        assert payee_wallet == PAY_WALLET
+        assert payee_wallet != pay_voucher.b58encode(bytes.fromhex(worker_key))
+        opened_payees.append(payee_wallet)
+        state.channels[PAY_CHANNEL] = pay_voucher.ChannelAccount(
+            escrow=PAY_ESCROW, generation=0, seq=0, worker=payee_wallet,
+            voucher_signer=payer_address, delegate=None, cap=100, redeemed=0,
+            fee_bps_snapshot=300, status="Open", close_at=0,
+            rent_payer=payer_address, bump=1)
+        book.put(
+            program=PAY_PROGRAM, channel=PAY_CHANNEL, worker_key=worker_key,
+            cap=100)
+        return book.begin_session(
+            worker_key, program=PAY_PROGRAM, state=state,
+            required_micro_usdc=required, payee_wallet=payee_wallet)
+
+    monkeypatch.setattr(pay_autochannel, "ensure_channel", ensure_channel)
+    real_manager = pay_voucher.ConsumerVoucherManager
+
+    def accept_claim_then_stop(**kwargs):
+        consumer = real_manager(**kwargs)
+        claim = worker_admission.claim(
+            payer_keyid, "session", consumer.first_wire(KEY1, "A" * 43))
+        assert claim["worker_account_at_authorize"] == PAY_WALLET
+        raise RuntimeError("stop after worker accepted bound-wallet channel")
+
+    monkeypatch.setattr(
+        pay_voucher, "ConsumerVoucherManager", accept_claim_then_stop)
+    monkeypatch.setattr(sys, "argv", [
+        "client.py", "--config", str(config), "--model-id", "model",
+        "--model-path", "/unused.gguf", "--prompt", "prompt",
+        "--max-tokens", "2", "--use-streaming",
+        "--paid-admission-fd", str(admission_read),
+        "--paid-progress-fd", str(progress_write),
+    ])
+    try:
+        with pytest.raises(
+                SystemExit, match="stop after worker accepted bound-wallet channel"):
+            client.main()
+    finally:
+        os.close(progress_read)
+        os.close(progress_write)
+        worker_store.close()
+        worker_vouchers.close()
+
+    assert opened_payees == [PAY_WALLET]
 
 
 def test_paid_mode_refuses_push_and_non_greedy_locally():

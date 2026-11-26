@@ -129,6 +129,90 @@ def test_sign_verify_and_tampered_total():
     assert not pay.verify_voucher(PAYER_B58, signature, PROGRAM, _addr(98), 88)
 
 
+def test_payee_binding_round_trip_and_wrong_node_key():
+    binding = pay.sign_payee_binding(WORKER_SEED, PAY_WALLET_B58, PROGRAM)
+
+    assert binding == {
+        "v": 1,
+        "kind": "nakshatra-payee-binding",
+        "worker_keyid": WORKER_HEX,
+        "pay_wallet": PAY_WALLET_B58,
+        "program": PROGRAM,
+        "signature": binding["signature"],
+    }
+    assert pay.verify_payee_binding(
+        binding, worker_keyid=WORKER_HEX, program=PROGRAM) == PAY_WALLET_B58
+    wrong_signature = pay.sign_payee_binding(
+        WRONG_SEED, PAY_WALLET_B58, PROGRAM)
+    wrong_signature["worker_keyid"] = WORKER_HEX
+    with pytest.raises(pay.VoucherError, match="signature"):
+        pay.verify_payee_binding(
+            wrong_signature, worker_keyid=WORKER_HEX, program=PROGRAM)
+
+
+@pytest.mark.parametrize(("field", "value", "match"), [
+    ("v", 2, "version"),
+    ("kind", "other-kind", "kind"),
+    ("program", _addr(99), "program"),
+    ("pay_wallet", "not-a-solana-pubkey", "wallet"),
+])
+def test_payee_binding_rejects_wrong_scope_and_malformed_wallet(
+        field, value, match):
+    binding = pay.sign_payee_binding(WORKER_SEED, PAY_WALLET_B58, PROGRAM)
+    binding[field] = value
+
+    with pytest.raises(pay.VoucherError, match=match):
+        pay.verify_payee_binding(
+            binding, worker_keyid=WORKER_HEX, program=PROGRAM)
+
+
+def test_payer_book_does_not_reuse_node_key_channel_for_bound_wallet(tmp_path):
+    stale_channel = _addr(90)
+    wallet_channel = _addr(91)
+    stale = dataclasses.replace(_channel(), worker=WORKER_B58)
+    bound = dataclasses.replace(_channel(), worker=PAY_WALLET_B58)
+    state = pay.FakeChannelState(
+        {stale_channel: stale, wallet_channel: bound},
+        {ESCROW: OWNER_B58}, program_id=PROGRAM)
+
+    with pay.PayerChannelBook(tmp_path / "channels.sqlite") as book:
+        book.put(
+            program=PROGRAM, channel=stale_channel, worker_key=WORKER_HEX,
+            cap=stale.cap)
+        book.put(
+            program=PROGRAM, channel=wallet_channel, worker_key=WORKER_HEX,
+            cap=bound.cap)
+        chosen = book.begin_session(
+            WORKER_HEX, program=PROGRAM, state=state,
+            required_micro_usdc=1, payee_wallet=PAY_WALLET_B58)
+
+    assert chosen.channel == wallet_channel
+
+
+def test_chain_info_carries_node_signed_payee_binding(tmp_path, monkeypatch):
+    monkeypatch.setenv("NAK_PAY_MODE", "chain")
+    _install_pay_wallet(Path(os.environ["HOME"]))
+    state = pay.FakeChannelState({}, {}, program_id=PROGRAM)
+    store = admission.PaidAdmissionStore(tmp_path / "paid.sqlite")
+    manager = admission.PaidAdmission(
+        _Ledger(_claim("binding")), store, WORKER_SEED,
+        model_id="model", layer_start=0, layer_end=4,
+        voucher_store=pay.WorkerVoucherStore(tmp_path / "vouchers.sqlite"),
+        channel_state=state, pay_program=PROGRAM)
+    assert manager.check_ready()
+    servicer = worker.WorkerServicer(
+        _Daemon(), "last", 0, 4, "model", paid_admission=manager,
+        worker_priv=WORKER_SEED, worker_pub_hex=WORKER_HEX)
+    challenge = bytes(range(32))
+
+    response = servicer.Info(
+        pb.InfoRequest(identity_challenge=challenge), _Context())
+    binding = json.loads(response.payee_binding_json)
+
+    assert pay.verify_payee_binding(
+        binding, worker_keyid=WORKER_HEX, program=PROGRAM) == PAY_WALLET_B58
+
+
 def test_worker_store_trusts_only_chain_signers_and_is_monotonic(tmp_path):
     store = pay.WorkerVoucherStore(tmp_path / "worker" / "vouchers.sqlite")
     state = _state()
