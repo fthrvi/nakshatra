@@ -470,9 +470,23 @@ RPC_RESPONSE_MAX = 1 << 20  # a Channel/Escrow account reply is a few KiB
 
 # Bounded retry for read-only channel RPC (public devnet rate-limits bursts).
 RPC_RETRY_STATUSES = frozenset({429, 503})
+# Explicit allowlist: only these READ methods are ever retried.  Anything not
+# listed (sendTransaction above all) keeps the single-attempt behaviour.
+RPC_RETRY_METHODS = frozenset({
+    "getAccountInfo", "getBalance", "getBlockHeight", "getBlockTime",
+    "getFeeForMessage", "getGenesisHash", "getLatestBlockhash",
+    "getMinimumBalanceForRentExemption", "getProgramAccounts",
+    "getSignatureStatuses", "getSlot",
+})
 RPC_RETRY_ATTEMPTS = 3
-RPC_RETRY_BASE_WAIT_S = 0.5
-RPC_RETRY_MAX_WAIT_S = 2.0
+RPC_RETRY_BASE_WAIT_S = 0.25
+RPC_RETRY_MAX_WAIT_S = 1.0
+# Wall-clock budget for one call's retries (time spent in failed attempts plus
+# waits).  A retry is attempted only if it can START within this budget, so a
+# slow refusal is not repeated and live payment-stream deadlines (15 s final
+# voucher wait, 60 s stream idle) keep their headroom: at most this much extra
+# per read, plus one final attempt's normal timeout.
+RPC_RETRY_BUDGET_S = 2.0
 
 
 class JsonRpcChannelState:
@@ -480,7 +494,8 @@ class JsonRpcChannelState:
 
     def __init__(self, rpc_url: str, *, timeout: float = 5.0,
                  opener: Callable = _RPC_OPENER.open,
-                 sleep: Callable[[float], None] = time.sleep):
+                 sleep: Callable[[float], None] = time.sleep,
+                 clock: Callable[[], float] = time.monotonic):
         if not isinstance(rpc_url, str) or not rpc_url:
             raise VoucherError("Solana RPC URL is required")
         parts = urllib.parse.urlsplit(rpc_url)
@@ -497,6 +512,7 @@ class JsonRpcChannelState:
         self.timeout = float(timeout)
         self.opener = opener
         self.sleep = sleep
+        self.clock = clock
         self._request_id = 0
         self._lock = threading.Lock()
         self._cluster_checked = False
@@ -514,7 +530,7 @@ class JsonRpcChannelState:
             self.rpc_url, data=body, method="POST",
             headers={"Content-Type": "application/json"})
         try:
-            with self._open_with_retry(request) as response:
+            with self._open_with_retry(method, request) as response:
                 raw = response.read(RPC_RESPONSE_MAX + 1)
                 if len(raw) > RPC_RESPONSE_MAX:
                     raise VoucherError(f"Solana RPC {method} response is too large")
@@ -546,33 +562,41 @@ class JsonRpcChannelState:
             raise VoucherError(
                 f"Solana RPC {method} failed ({type(exc).__name__})") from exc
 
-    def _open_with_retry(self, request):
-        """Open one read-only RPC request, retrying only rate-limit/unavailable.
+    def _open_with_retry(self, method: str, request):
+        """Open one RPC request, retrying only rate-limit/unavailable READS.
 
-        Every method this reader sends is a read (getGenesisHash,
-        getAccountInfo), so a repeat cannot change chain state.  Public devnet
-        RPC answers bursts with HTTP 429; without a retry one refused read
-        fails a whole paid request.  Bounded: RPC_RETRY_ATTEMPTS retries, each
-        wait capped by RPC_RETRY_MAX_WAIT_S (Retry-After honoured within it).
+        Public devnet RPC answers bursts with HTTP 429; without a retry one
+        refused read fails a whole paid request.  Only methods in
+        RPC_RETRY_METHODS (reads, so a repeat cannot change chain state) are
+        retried, at most RPC_RETRY_ATTEMPTS times, each wait capped by
+        RPC_RETRY_MAX_WAIT_S (Retry-After honoured within it), and never past
+        RPC_RETRY_BUDGET_S of wall clock.  Every refused response is closed.
         """
+        retryable = method in RPC_RETRY_METHODS
+        started = self.clock()
+        wait = RPC_RETRY_BASE_WAIT_S
         for attempt in range(RPC_RETRY_ATTEMPTS + 1):
             try:
                 return self.opener(request, timeout=self.timeout)
             except urllib.error.HTTPError as exc:
-                if (exc.code not in RPC_RETRY_STATUSES
+                exc.close()
+                if (not retryable or exc.code not in RPC_RETRY_STATUSES
                         or attempt >= RPC_RETRY_ATTEMPTS):
                     raise
-                wait = RPC_RETRY_BASE_WAIT_S * (2 ** attempt)
-                try:
-                    after = exc.headers.get("Retry-After") if exc.headers else None
-                    if after is not None:
-                        wait = float(after)
-                except (TypeError, ValueError):
-                    pass
-                if not (wait >= 0):  # NaN or negative
-                    wait = RPC_RETRY_BASE_WAIT_S
-                exc.close()
-                self.sleep(min(wait, RPC_RETRY_MAX_WAIT_S))
+                delay = wait
+                after = exc.headers.get("Retry-After") if exc.headers else None
+                if after is not None:
+                    try:
+                        hinted = float(after)
+                    except (TypeError, ValueError):
+                        hinted = None
+                    if hinted is not None and hinted >= 0:  # rejects NaN too
+                        delay = hinted
+                delay = min(delay, RPC_RETRY_MAX_WAIT_S)
+                if self.clock() - started + delay > RPC_RETRY_BUDGET_S:
+                    raise
+                self.sleep(delay)
+                wait = min(wait * 2, RPC_RETRY_MAX_WAIT_S)
         raise AssertionError("unreachable")
 
     def _ensure_cluster(self) -> None:

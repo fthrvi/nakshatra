@@ -1849,7 +1849,20 @@ def test_finalized_chain_time_source_refreshes_after_thirty_seconds():
     assert len(reads) == 2
 
 
-def _flaky_opener(failures, status=429, retry_after=None):
+
+class _ClosingBody:
+    def __init__(self):
+        self.closed = False
+
+    def read(self, *_args):
+        return b""
+
+    def close(self):
+        self.closed = True
+
+
+def _flaky_opener(failures, status=429, retry_after=None, headers=True,
+                  bodies=None):
     """Raise HTTP `status` for the first `failures` opens, then use the real opener."""
     import email.message
     import urllib.error
@@ -1858,11 +1871,16 @@ def _flaky_opener(failures, status=429, retry_after=None):
     def opener(request, timeout):
         opens.append(request.full_url)
         if len(opens) <= failures:
-            headers = email.message.Message()
-            if retry_after is not None:
-                headers["Retry-After"] = retry_after
+            hdrs = None
+            if headers:
+                hdrs = email.message.Message()
+                if retry_after is not None:
+                    hdrs["Retry-After"] = retry_after
+            body = _ClosingBody()
+            if bodies is not None:
+                bodies.append(body)
             raise urllib.error.HTTPError(
-                request.full_url, status, "refused", headers, None)
+                request.full_url, status, "refused", hdrs, body)
         return pay._RPC_OPENER.open(request, timeout=timeout)
     return opener, opens
 
@@ -1876,39 +1894,91 @@ def test_rpc_read_retries_rate_limit_then_succeeds():
             f"http://127.0.0.1:{server.server_port}", timeout=2,
             opener=opener, sleep=sleeps.append)
         assert state.read_channel(CHANNEL, PROGRAM).cap == 10_000
-        assert sleeps == [0.5, 1.0]
+        assert sleeps == [0.25, 0.5]
         assert calls == ["getGenesisHash", "getAccountInfo"]
     finally:
         server.shutdown()
         server.server_close()
 
 
-def test_rpc_read_rate_limit_retries_are_bounded():
+def test_rpc_read_rate_limit_retries_are_bounded_and_close_every_response():
+    bodies = []
+    opener, opens = _flaky_opener(10**6, bodies=bodies)
+    sleeps = []
+    closed_before_wait = []
+
+    def sleep(delay):
+        # The refused response must already be closed, not left to the GC.
+        closed_before_wait.append(bodies[-1].closed)
+        sleeps.append(delay)
+    state = pay.JsonRpcChannelState(
+        "http://127.0.0.1:1", opener=opener, sleep=sleep)
+    with pytest.raises(pay.VoucherError, match="getGenesisHash failed") as info:
+        state.read_channel(CHANNEL, PROGRAM)
+    assert info.value.__cause__ is not None  # terminal error still referenced
+    assert len(opens) == pay.RPC_RETRY_ATTEMPTS + 1
+    assert len(sleeps) == pay.RPC_RETRY_ATTEMPTS
+    assert sum(sleeps) <= pay.RPC_RETRY_BUDGET_S
+    assert closed_before_wait == [True] * pay.RPC_RETRY_ATTEMPTS
+    assert bodies[-1].closed
+
+
+def test_rpc_read_does_not_retry_other_http_errors():
+    bodies = []
+    opener, opens = _flaky_opener(10**6, status=400, bodies=bodies)
+    sleeps = []
+    state = pay.JsonRpcChannelState(
+        "http://127.0.0.1:1", opener=opener, sleep=sleeps.append)
+    with pytest.raises(pay.VoucherError, match="getGenesisHash failed") as info:
+        state.read_channel(CHANNEL, PROGRAM)
+    assert info.value.__cause__ is not None  # terminal error still referenced
+    assert len(opens) == 1 and sleeps == []
+    assert bodies[0].closed
+
+
+def test_rpc_never_retries_send_transaction():
+    assert "sendTransaction" not in pay.RPC_RETRY_METHODS
     opener, opens = _flaky_opener(10**6)
     sleeps = []
     state = pay.JsonRpcChannelState(
         "http://127.0.0.1:1", opener=opener, sleep=sleeps.append)
-    with pytest.raises(pay.VoucherError, match="getGenesisHash failed"):
-        state.read_channel(CHANNEL, PROGRAM)
-    assert len(opens) == pay.RPC_RETRY_ATTEMPTS + 1
-    assert len(sleeps) == pay.RPC_RETRY_ATTEMPTS
-    assert all(0 <= s <= pay.RPC_RETRY_MAX_WAIT_S for s in sleeps)
-
-
-def test_rpc_read_does_not_retry_other_http_errors():
-    opener, opens = _flaky_opener(10**6, status=400)
-    sleeps = []
-    state = pay.JsonRpcChannelState(
-        "http://127.0.0.1:1", opener=opener, sleep=sleeps.append)
-    with pytest.raises(pay.VoucherError, match="getGenesisHash failed"):
-        state.read_channel(CHANNEL, PROGRAM)
+    with pytest.raises(pay.VoucherError, match="sendTransaction failed"):
+        state._rpc("sendTransaction", ["AA=="])
     assert len(opens) == 1 and sleeps == []
 
 
+def test_rpc_retry_stops_at_the_wall_clock_budget():
+    # Each refusal takes 2 s to arrive: the first retry would start past
+    # the 2 s budget, so a slow refusal is not repeated.
+    now = [0.0]
+
+    def slow_opener(request, timeout):
+        now[0] += 2.0
+        return _flaky_opener(10**6)[0](request, timeout)
+    sleeps = []
+    state = pay.JsonRpcChannelState(
+        "http://127.0.0.1:1", opener=slow_opener, sleep=sleeps.append,
+        clock=lambda: now[0])
+    with pytest.raises(pay.VoucherError):
+        state.read_channel(CHANNEL, PROGRAM)
+    assert sleeps == []
+
+
+def test_rpc_retry_without_headers_uses_backoff():
+    opener, _opens = _flaky_opener(1, headers=False)
+    sleeps = []
+    state = pay.JsonRpcChannelState(
+        "http://127.0.0.1:1", opener=opener, sleep=sleeps.append)
+    with pytest.raises(pay.VoucherError):
+        state.read_channel(CHANNEL, PROGRAM)  # port 1 refuses after the retry
+    assert sleeps == [pay.RPC_RETRY_BASE_WAIT_S]
+
+
 @pytest.mark.parametrize(("after", "expected"), [
-    ("30", pay.RPC_RETRY_MAX_WAIT_S), ("0.25", 0.25),
+    ("30", pay.RPC_RETRY_MAX_WAIT_S), ("inf", pay.RPC_RETRY_MAX_WAIT_S),
+    ("1e400", pay.RPC_RETRY_MAX_WAIT_S), ("0.1", 0.1),
     ("nan", pay.RPC_RETRY_BASE_WAIT_S), ("-5", pay.RPC_RETRY_BASE_WAIT_S),
-    ("soon", pay.RPC_RETRY_BASE_WAIT_S)])
+    ("Wed, 21 Oct 2026 07:28:00 GMT", pay.RPC_RETRY_BASE_WAIT_S)])
 def test_rpc_read_retry_after_is_honoured_within_cap(after, expected):
     opener, _opens = _flaky_opener(1, status=503, retry_after=after)
     sleeps = []
