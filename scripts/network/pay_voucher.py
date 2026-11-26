@@ -62,6 +62,8 @@ from typing import Callable, Mapping, Protocol
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric import ed25519
 
+from network import pay_network
+
 
 VOUCHER_DOMAIN = b"NAK_PAY_VOUCHER1"
 VOUCHER_MESSAGE_LEN = 88
@@ -79,8 +81,8 @@ CONTROL_REQUEST = b"nak-pay-control-v1"
 CONTROL_OK = b"nak-pay-control-ok"
 CONTROL_FINAL_REQUEST = b"nak-pay-final-request-v1"
 CONTROL_FINAL_RECEIPT = b"nak-pay-final-receipt-v1"
-DEVNET_GENESIS_HASH = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG"
-MAINNET_GENESIS_HASH = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d"
+DEVNET_GENESIS_HASH = pay_network.DEVNET_GENESIS_HASH
+MAINNET_GENESIS_HASH = pay_network.MAINNET_GENESIS_HASH
 _B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 _B58_INDEX = {char: index for index, char in enumerate(_B58)}
 _CHANNEL_DISCRIMINATOR = hashlib.sha256(b"account:Channel").digest()[:8]
@@ -608,6 +610,22 @@ class JsonRpcChannelState:
         genesis = self._rpc("getGenesisHash", [])
         if not isinstance(genesis, str) or not genesis:
             raise VoucherError("Solana RPC returned malformed getGenesisHash response")
+        try:
+            configured = pay_network.active_network()
+        except pay_network.NetworkConfigError as exc:
+            raise VoucherError(str(exc)) from exc
+        if configured is not None:
+            if self.rpc_url != configured.rpc:
+                raise VoucherError(
+                    "payment RPC differs from the active network.json RPC")
+            if genesis != configured.genesis:
+                raise VoucherError(
+                    f"Solana RPC genesis does not match active payment network "
+                    f"{configured.name}")
+            with self._lock:
+                self._cluster_checked = True
+                self._cluster_genesis = genesis
+            return
         host = (urllib.parse.urlsplit(self.rpc_url).hostname or "").lower()
         local = host in _LOOPBACK_HOSTS
         if genesis == MAINNET_GENESIS_HASH:
@@ -1673,15 +1691,24 @@ class ConsumerVoucherManager:
 
 
 def configured_program() -> str:
-    value = os.environ.get("NAK_PAY_PROGRAM", "").strip()
+    try:
+        network = pay_network.active_network()
+    except pay_network.NetworkConfigError as exc:
+        raise VoucherError(str(exc)) from exc
+    if network is not None:
+        return _pubkey_text(network.program, "configured program id")
+    value = pay_network.legacy_pubkey_value(os.environ, "NAK_PAY_PROGRAM")
     if not value:
         raise VoucherError("NAK_PAY_PROGRAM is required in chain mode")
     return _pubkey_text(value, "configured program id")
 
 
 def configured_state() -> JsonRpcChannelState:
-    url = (os.environ.get("NAK_PAY_RPC", "").strip()
-           or os.environ.get("NAKSHATRA_PAY_RPC_URL", "").strip())
+    try:
+        network = pay_network.active_network()
+    except pay_network.NetworkConfigError as exc:
+        raise VoucherError(str(exc)) from exc
+    url = network.rpc if network is not None else pay_network.legacy_rpc_url(os.environ)
     if not url:
         raise VoucherError("NAK_PAY_RPC is required in chain mode")
     return JsonRpcChannelState(url)

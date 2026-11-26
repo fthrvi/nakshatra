@@ -12,9 +12,8 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Iterable, Mapping, Sequence
 
+from network import pay_network
 from network.pay_voucher import (
-    DEVNET_GENESIS_HASH,
-    MAINNET_GENESIS_HASH,
     JsonRpcChannelState,
     VoucherError,
     _private_key,
@@ -22,6 +21,9 @@ from network.pay_voucher import (
     b58encode,
     voucher_message,
 )
+
+DEVNET_GENESIS_HASH = pay_network.DEVNET_GENESIS_HASH
+MAINNET_GENESIS_HASH = pay_network.MAINNET_GENESIS_HASH
 
 
 SYSTEM_PROGRAM_ID = "11111111111111111111111111111111"
@@ -526,6 +528,12 @@ class PayRpc(JsonRpcChannelState):
 
     def cluster_label(self) -> str:
         genesis = self.ensure_cluster()
+        try:
+            network = pay_network.active_network()
+        except pay_network.NetworkConfigError as exc:
+            raise VoucherError(str(exc)) from exc
+        if network is not None:
+            return network.explorer if network.explorer is not None else "local"
         return "devnet" if genesis == DEVNET_GENESIS_HASH else "local"
 
     def chain_time(self) -> int:
@@ -835,20 +843,38 @@ def decode_token_account(data: bytes) -> dict:
 
 
 def explorer_link(signature: str, cluster: str) -> str:
-    if cluster == "devnet":
-        return f"https://explorer.solana.com/tx/{signature}?cluster=devnet"
-    return "local"
+    if cluster == "local":
+        return "local"
+    base = f"https://explorer.solana.com/tx/{signature}"
+    return base if not cluster else f"{base}?cluster={cluster}"
 
 
 def configured_rpc_url(environ: Mapping[str, str]) -> str:
-    value = environ.get("NAK_PAY_RPC", "").strip()
-    if value:
-        return value
-    return environ.get("NAKSHATRA_PAY_RPC_URL", "").strip()
+    try:
+        network = pay_network.active_network(environ=environ)
+    except pay_network.NetworkConfigError as exc:
+        raise SystemExit(str(exc)) from exc
+    if network is not None:
+        return network.rpc
+    return pay_network.legacy_rpc_url(environ)
+
+
+def configured_pubkey_value(environ: Mapping[str, str], name: str) -> str:
+    try:
+        network = pay_network.active_network(environ=environ)
+    except pay_network.NetworkConfigError as exc:
+        raise SystemExit(str(exc)) from exc
+    configured = {"NAK_PAY_PROGRAM": "program", "NAK_PAY_MINT": "mint"}
+    if network is not None and name in configured:
+        return str(getattr(network, configured[name]))
+    try:
+        return pay_network.legacy_pubkey_value(environ, name)
+    except pay_network.NetworkConfigError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 def configured_pubkey(environ: Mapping[str, str], name: str) -> str:
-    value = environ.get(name, "").strip()
+    value = configured_pubkey_value(environ, name)
     if not value:
         raise SystemExit(f"{name} is required for on-chain payment commands")
     try:

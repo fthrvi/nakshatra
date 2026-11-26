@@ -49,6 +49,7 @@ from network.person_custody import (  # noqa: E402
     person_sign, person_sign_batch, plain)
 from network.units import AmountError, MAX_SPEND_CAP, format_amount, parse_amount  # noqa: E402
 from network.dlp import outbound_problem  # noqa: E402
+from network import pay_network as _pay_network_config  # noqa: E402
 
 
 def call(sock_path: Path, req: dict) -> dict:
@@ -761,10 +762,6 @@ def _wallet_command(args) -> None:
         raise SystemExit(f"wallet refused: {exc}") from exc
 
 
-_SOLANA_DEVNET_GENESIS = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG"
-_SOLANA_MAINNET_GENESIS = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d"
-
-
 class _NoPayRedirects(HTTPRedirectHandler):
     """Do not let an explicitly chosen RPC silently redirect to another host."""
 
@@ -772,18 +769,9 @@ class _NoPayRedirects(HTTPRedirectHandler):
         raise HTTPError(req.full_url, code, "pay RPC redirect refused", headers, fp)
 
 
-def _pay_rpc_url(value: str) -> tuple[str, bool]:
-    try:
-        parsed = urlsplit(value)
-        port = parsed.port
-    except (TypeError, ValueError) as exc:
-        raise SystemExit(f"NAK_PAY_RPC is not a valid URL: {exc}") from exc
-    if (parsed.scheme not in {"http", "https"} or not parsed.hostname
-            or parsed.username is not None or parsed.password is not None
-            or parsed.fragment or (port is not None and not 1 <= port <= 65535)):
-        raise SystemExit("NAK_PAY_RPC must be an http(s) URL without credentials or a fragment")
-    local = parsed.hostname.lower() in {"localhost", "127.0.0.1", "::1"}
-    return value, local
+# Compatibility names for callers/tests; the values now have one code source.
+_SOLANA_DEVNET_GENESIS = _pay_network_config.DEVNET_GENESIS_HASH
+_SOLANA_MAINNET_GENESIS = _pay_network_config.MAINNET_GENESIS_HASH
 
 
 def _pay_rpc_request(opener, url: str, method: str, params: list) -> object:
@@ -970,6 +958,95 @@ def _pay_chain_settings(*, require_rpc: bool = True):
     except (ValueError, pay_chain.VoucherError) as exc:
         raise SystemExit(str(exc)) from exc
     return pay_chain, rpc, program, mint
+
+
+def _pay_network_command(args) -> None:
+    from network import pay_network
+
+    try:
+        if args.network_cmd == "init":
+            path = pay_network.initialize_from_environment()
+            print(f"payment network config initialized: {path}")
+            return
+        if args.network_cmd == "status":
+            from network import pay_chain
+
+            document = pay_network.load_document()
+            if document is None:
+                print("source: legacy environment (network.json absent)")
+                print("active: devnet (legacy DEVNET-ONLY mode)")
+                rpc = pay_chain.configured_rpc_url(os.environ)
+                if rpc:
+                    parsed = urlsplit(rpc)
+                    host = parsed.hostname or "invalid"
+                    if parsed.port is not None:
+                        host = f"{host}:{parsed.port}"
+                    print(f"rpc host: {host}")
+                else:
+                    print("rpc host: not configured")
+                program = pay_chain.configured_pubkey_value(os.environ, "NAK_PAY_PROGRAM")
+                mint = pay_chain.configured_pubkey_value(os.environ, "NAK_PAY_MINT")
+                print(f"program: {program or 'not configured'}")
+                print(f"mint: {mint or 'not configured'}")
+                return
+            network = document.networks[document.active]
+            parsed = urlsplit(network.rpc) if network.rpc else None
+            host = (parsed.hostname or "not configured") if parsed is not None else "not configured"
+            if parsed is not None and parsed.port is not None:
+                host = f"{host}:{parsed.port}"
+            print(f"active: {network.name}")
+            print(f"rpc host: {host}")
+            print(f"program: {network.program or 'not configured'}")
+            print(f"mint: {network.mint or 'not configured'}")
+            if network.name == "mainnet":
+                for gate, (ready, reason) in pay_network.mainnet_gates(network).items():
+                    print(f"mainnet {gate}: {'ready' if ready else 'REFUSED — ' + reason}")
+            return
+        if args.network_cmd == "use":
+            _path, backup = pay_network.use_network(args.name)
+            print(f"active payment network: {args.name}")
+            print(f"backup: {backup}")
+            services = pay_network.installed_user_services()
+            if services:
+                print("restart these user services: " + ", ".join(services))
+            else:
+                print("restart installed payment user services (none detected)")
+            return
+        if args.network_cmd == "arm":
+            if args.name != "mainnet":
+                raise SystemExit("only mainnet can be armed")
+            document = pay_network.load_document()
+            if document is None or "mainnet" not in document.networks:
+                raise SystemExit("mainnet is not configured in network.json")
+            network = document.networks["mainnet"]
+            if not network.program:
+                raise SystemExit("mainnet program not configured")
+            if not network.rpc:
+                raise SystemExit("mainnet rpc not configured")
+            if not sys.stdin.isatty() or not sys.stdout.isatty():
+                raise SystemExit("nak pay network arm mainnet is interactive-only; run it in a terminal")
+            phrase = f"ARM MAINNET {network.program[:8]}"
+            if input(f'type exactly "{phrase}": ') != phrase:
+                raise SystemExit("mainnet arm phrase did not match; mainnet remains disarmed")
+            path = pay_network.arm_mainnet()
+            print(f"mainnet armed for the exact configured program and mint: {path}")
+            return
+        if args.network_cmd == "disarm":
+            removed = pay_network.disarm_mainnet()
+            print("mainnet disarmed" if removed else "mainnet was already disarmed")
+            return
+        raise SystemExit("unknown pay network command")
+    except pay_network.NetworkConfigError as exc:
+        raise SystemExit(str(exc)) from exc
+
+
+def _require_devnet_payment_flow(flow: str) -> None:
+    from network import pay_network
+
+    try:
+        pay_network.require_devnet_flow(flow)
+    except pay_network.NetworkConfigError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 def _pay_wallet_and_node(*, signing: bool = True):
@@ -1332,8 +1409,8 @@ def _pay_status(wallet: dict) -> None:
             print(f"node balance: {_format_sol(rpc.balance(node_address))} SOL")
         except (OSError, ValueError, PermissionError) as exc:
             print(f"node balance: unavailable ({exc})")
-        program_value = os.environ.get("NAK_PAY_PROGRAM", "").strip()
-        mint_value = os.environ.get("NAK_PAY_MINT", "").strip()
+        program_value = chain.configured_pubkey_value(os.environ, "NAK_PAY_PROGRAM")
+        mint_value = chain.configured_pubkey_value(os.environ, "NAK_PAY_MINT")
         if not program_value or not mint_value:
             print("escrow: set NAK_PAY_PROGRAM and NAK_PAY_MINT to show on-chain payment state")
             return
@@ -1631,6 +1708,10 @@ def _pay_deposit(args, wallet: dict, *, pre_sign_guard=None) -> None:
 
 def _pay_command(args) -> None:
     from network.pay_wallet import bip39_mnemonic, load_wallet, load_wallet_identity
+
+    if args.pay_cmd == "network":
+        _pay_network_command(args)
+        return
 
     if args.pay_cmd == "backup":
         if not sys.stdin.isatty() or not sys.stdout.isatty():
@@ -4023,6 +4104,15 @@ def main(argv=None, *, http_post=None, http_get=None) -> int:
     q.add_argument("usdc", help="USDC amount (at least 1, up to 6 decimal places)")
     p = sub.add_parser("pay", help="inspect or export this device's non-custodial Solana wallet")
     paysub = p.add_subparsers(dest="pay_cmd", required=True)
+    q = paysub.add_parser("network", help="initialize, inspect, or switch payment networks")
+    nsub = q.add_subparsers(dest="network_cmd", required=True)
+    nsub.add_parser("init", help="migrate the current devnet NAK_PAY_* environment")
+    nsub.add_parser("status", help="show the active public network configuration and gates")
+    r = nsub.add_parser("use", help="atomically select a configured payment network")
+    r.add_argument("name")
+    r = nsub.add_parser("arm", help="interactively arm an exact real-money configuration")
+    r.add_argument("name", choices=["mainnet"])
+    nsub.add_parser("disarm", help="remove the mainnet arm file")
     paysub.add_parser("address", help="print the Solana pay address")
     paysub.add_parser("status", help="show the address, custody mode, and optional devnet SOL balance")
     paysub.add_parser("ensure", help="idempotently initialize escrow and renew this node's delegate")
@@ -4412,6 +4502,8 @@ def main(argv=None, *, http_post=None, http_get=None) -> int:
             raise SystemExit(f"--starter {exc}") from exc
         if a.kind != "consumer" and a.starter:
             raise SystemExit("--starter is only valid with --kind consumer")
+        if a.starter:
+            _require_devnet_payment_flow("consumer starter")
         name_file = Path(os.environ.get("NAK_NET_DIR", Path.home() / ".nakshatra" / "net")) / "name"
         from_name = a.from_name or (name_file.read_text().strip() if name_file.exists() else "")
         summary_parts = [f"Create {a.kind} invite"]
@@ -4791,6 +4883,8 @@ def main(argv=None, *, http_post=None, http_get=None) -> int:
                 reward = _cli_amount(a.reward) if isinstance(a.reward, str) else a.reward
             except SystemExit as exc:
                 raise SystemExit(f"--reward {exc}") from exc
+            if reward:
+                _require_devnet_payment_flow("task reward")
             r = call(s, {"op": "task_post", "to": a.to, "title": a.title, "instructions": a.instructions,
                          "acceptance": rules, "reward": reward, "deadline_s": a.deadline})
             esc = (f"; escrow open {format_amount(r['escrow']['amount'])} (devnet credits)"

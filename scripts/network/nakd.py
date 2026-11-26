@@ -1306,8 +1306,13 @@ class Node:
 
     def _chain_starter(self, row: dict, *, deadline: Optional[int] = None) -> dict:
         """Grant one inviter-funded OPEN_CHANNEL delegate and optional node SOL float."""
-        from network import pay_autochannel, pay_chain
+        from network import pay_autochannel, pay_chain, pay_network
         from network.pay_wallet import load_wallet_identity
+
+        try:
+            pay_network.require_devnet_flow("consumer starter")
+        except pay_network.NetworkConfigError as exc:
+            raise _StarterRefusal(str(exc)) from exc
 
         credits = int(row["amount"])
         if credits <= 0 or credits % STARTER_RATE:
@@ -1572,6 +1577,13 @@ class Node:
             if not rows:
                 return False
             row = rows[0]
+            from network import pay_network
+            try:
+                pay_network.require_devnet_flow("consumer starter")
+            except pay_network.NetworkConfigError as exc:
+                self.store.starter_update(
+                    invite_id, state="pending", reason=str(exc)[:200])
+                return False
             chain_mode = os.environ.get("NAK_PAY_MODE", "").strip().lower() == "chain"
             recorded_chain_attempts = bool(row.get("chain_attempts"))
             chain_only = chain_mode or recorded_chain_attempts
@@ -1579,7 +1591,8 @@ class Node:
                 from network import pay_chain
 
                 if (not pay_chain.configured_rpc_url(os.environ)
-                        or not os.environ.get("NAK_PAY_PROGRAM", "").strip()):
+                        or not pay_chain.configured_pubkey_value(
+                            os.environ, "NAK_PAY_PROGRAM")):
                     self.store.starter_update(
                         invite_id, state="pending",
                         reason=("chain starter attempts recorded; chain pay config is required "

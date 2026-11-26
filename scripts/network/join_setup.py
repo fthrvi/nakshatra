@@ -595,12 +595,31 @@ def _mcp_command() -> str:
     return "nakc mcp" if os.environ.get("NAK_CONTAINER") == "1" else "~/.local/bin/nak-mcp"
 
 
+def _require_devnet_starter(home: Path, invite: dict) -> None:
+    if (invite.get("kind", "contact") != "consumer"
+            or int(invite["consumer"].get("starter", 0)) <= 0):
+        return
+    from network import pay_network
+    try:
+        pay_network.require_devnet_flow(
+            "consumer starter", home=home, environ=os.environ)
+    except pay_network.NetworkConfigError as exc:
+        raise SystemExit(str(exc)) from exc
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Nakshatra join setup (run by install.py join)")
     ap.add_argument("--invite", required=True)
     ap.add_argument("--name", default="friend")
     ap.add_argument("--home", type=Path, default=Path.home())
     a = ap.parse_args(argv)
+    import joincode
+    try:
+        inv = (joincode.decode_address(a.invite) if a.invite.startswith(joincode.ADDRESS_PREFIX)
+               else joincode.decode_invite(a.invite))
+    except ValueError as e:
+        raise SystemExit(f"join code became invalid during setup: {e}")
+    _require_devnet_starter(a.home, inv)
     print("setting up this node:")
     done = ensure_identity(a.home)
     for k in ("node_key", "person_key", "signer", "agent"):
@@ -618,12 +637,6 @@ def main(argv=None) -> int:
     if r.get("state") == "request refused":
         print(f"\nrequest refused: {r.get('why') or 'the person is not accepting this request'}")
         return 1
-    import joincode
-    try:
-        inv = (joincode.decode_address(a.invite) if a.invite.startswith(joincode.ADDRESS_PREFIX)
-               else joincode.decode_invite(a.invite))
-    except ValueError as e:
-        raise SystemExit(f"join code became invalid during setup: {e}")
     inviter_name = inv.get("from_name") or r.get("name") or inv["inviter"][:12]
     if inv.get("kind") == "address":
         print(f"\nyour request was sent; nothing is shared until {inviter_name} accepts")
